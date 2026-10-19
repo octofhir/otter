@@ -330,6 +330,13 @@ pub struct GcHeap {
     new_space: NewSpace,
     old_space: OldSpace,
     large_space: LargeObjectSpace,
+    /// Young large cells: counted against the nursery's capacity, kept in
+    /// place by a scavenge, which moves a survivor's page to
+    /// [`Self::large_space`] and releases the rest.
+    young_large_space: LargeObjectSpace,
+    /// Bytes the scavenges since the nursery's last capacity growth kept
+    /// alive; past one capacity's worth the capacity doubles.
+    survived_since_last_expansion: usize,
     trace_table: TraceTable,
     /// Isolate-local interner for the non-GC addresses bodies point at.
     /// Per-heap, not process-global, so index order is a property of
@@ -590,6 +597,8 @@ impl GcHeap {
             tenure_all: false,
             old_space: OldSpace::new(),
             large_space: LargeObjectSpace::new(),
+            young_large_space: LargeObjectSpace::new_young(),
+            survived_since_last_expansion: 0,
             trace_table: TraceTable::new(),
             external_refs: ExternalRefTable::new(),
             host_refs: crate::host_refs::HostRefTable::default(),
@@ -1378,11 +1387,14 @@ impl GcHeap {
         let mut s = self.stats;
         s.new_allocated_bytes = self.new_space.allocated_bytes();
         s.old_allocated_bytes = self.old_space.allocated_bytes();
-        s.allocated_bytes =
-            s.new_allocated_bytes + s.old_allocated_bytes + self.large_space.allocated_bytes();
+        s.allocated_bytes = s.new_allocated_bytes
+            + s.old_allocated_bytes
+            + self.large_space.allocated_bytes()
+            + self.young_large_space.allocated_bytes();
         s.page_count = self.new_space.from_page_count() * 2
             + self.old_space.page_count()
-            + self.large_space.page_count();
+            + self.large_space.page_count()
+            + self.young_large_space.page_count();
         s.tracked_bytes = self.effective_tracked_bytes();
         s.reserved_bytes = self.effective_reserved_bytes();
         s.max_heap_bytes = self.max_heap_bytes;
@@ -1945,8 +1957,17 @@ impl GcHeap {
         // scavenger would try to evacuate an object sitting on an
         // old-space page.
         let mut placed_in_old = !young;
+        // A large body the nursery admits is young, on its own page.
+        let mut young_large = false;
         let offset = if !young {
-            self.large_space.alloc(aligned)?
+            match self.admit_young_large(aligned, &mut allocation_roots)? {
+                Some(offset) => {
+                    placed_in_old = false;
+                    young_large = true;
+                    offset
+                }
+                None => self.large_space.alloc(aligned)?,
+            }
         } else {
             // Try young-gen first; if full, scavenge then retry.
             match self.new_space.alloc(aligned) {
@@ -2001,7 +2022,9 @@ impl GcHeap {
             } else {
                 GcHeader::new_young(T::TYPE_TAG, aligned as u32)
             };
-            if !placed_in_old && self.trace_table.needs_cleanup(T::TYPE_TAG) {
+            // A young large cell's page is walked when the scavenge
+            // releases it; only nursery cells are tracked.
+            if !placed_in_old && !young_large && self.trace_table.needs_cleanup(T::TYPE_TAG) {
                 self.new_space.track_cleanup(offset);
             }
             std::ptr::write(header_ptr, header);
@@ -2449,7 +2472,8 @@ impl GcHeap {
             old_bytes: self.old_generation_page_bytes(),
             old_allocated_bytes: (self.old_space.allocated_bytes()
                 + self.large_space.allocated_bytes()) as u64,
-            young_bytes: self.new_space.allocated_bytes() as u64,
+            young_bytes: (self.new_space.allocated_bytes()
+                + self.young_large_space.allocated_bytes()) as u64,
         }
     }
 
@@ -2486,6 +2510,61 @@ impl GcHeap {
     pub fn collect_minor(&mut self, _roots: EmptyRoots) -> Result<(), OutOfMemory> {
         let empty: fn(&mut dyn FnMut(*mut RawGc)) = |_| {};
         self.collect_minor_internal(&mut |v| empty(v))
+    }
+
+    /// A young large-object page for `aligned` bytes, when the nursery
+    /// admits it: the young large cells already allocated plus this one stay
+    /// within the nursery's capacity, a scavenge first making room when they
+    /// would not. `None` places the body in the old large object space: a
+    /// body larger than the nursery itself, or an allocation inside a
+    /// collection.
+    fn admit_young_large(
+        &mut self,
+        aligned: usize,
+        allocation_roots: &mut RootSlotVisitor<'_>,
+    ) -> Result<Option<u32>, OutOfMemory> {
+        let capacity = self.new_space.capacity_bytes();
+        if self.always_allocate_depth != 0 || aligned > capacity {
+            return Ok(None);
+        }
+        if self.young_large_space.allocated_bytes() + aligned > capacity {
+            self.collect_minor_observed(allocation_roots, GcPauseTrigger::NurseryCapacity)?;
+        }
+        Ok(Some(self.young_large_space.alloc(aligned)?))
+    }
+
+    /// After a scavenge: the young large cells it promoted move with their
+    /// pages to the old large object space, and every other young large
+    /// page is released after its body's reclamation hooks run. Returns the
+    /// released bytes.
+    fn finish_young_large(&mut self) -> usize {
+        let trace_table = &self.trace_table;
+        let host_refs = &mut self.host_refs;
+        self.young_large_space
+            .promote_or_release(&mut self.large_space, |page| {
+                let mut promoted = false;
+                // SAFETY: STW after the scavenge; the page holds one
+                // initialized cell of a registered type.
+                unsafe {
+                    page.for_each_object(|header, _| {
+                        if !(*header).is_young() {
+                            promoted = true;
+                            return;
+                        }
+                        let tag = (*header).type_tag();
+                        if let Some(release) = trace_table.get_host_release(tag) {
+                            release(header, host_refs);
+                        }
+                        if let Some(finalize) = trace_table.get_finalize(tag) {
+                            finalize(header);
+                        }
+                        if let Some(drop_fn) = trace_table.get_drop(tag) {
+                            drop_fn(header);
+                        }
+                    });
+                }
+                promoted
+            })
     }
 
     /// Run a minor GC with caller-supplied root visitor.
@@ -2584,6 +2663,18 @@ impl GcHeap {
         for raw in promoted_gray {
             // SAFETY: the scavenge promoted this cell gray just now.
             unsafe { self.marking.push_gray(raw.as_header_ptr()) };
+        }
+        let released_large = self.finish_young_large();
+        stats.reclaimed_bytes += released_large;
+        // The nursery grows once the scavenges since its last growth kept
+        // a whole capacity alive: its objects outlive the space they get.
+        self.survived_since_last_expansion +=
+            stats.copied_bytes + stats.promoted_bytes + stats.promoted_large_bytes;
+        if !self.new_space.at_maximum()
+            && self.survived_since_last_expansion > self.new_space.capacity_bytes()
+        {
+            self.new_space.grow_capacity();
+            self.survived_since_last_expansion = 0;
         }
         self.allocation_sites.digest(nursery_at_maximum);
         stats.minor_pause_ns = scavenge_start.elapsed().as_nanos() as u64;
@@ -3170,6 +3261,7 @@ impl GcHeap {
         };
         self.old_space.pages().iter().for_each(check);
         self.large_space.pages().iter().for_each(check);
+        self.young_large_space.pages().iter().for_each(check);
     }
 
     fn shade_roots(&mut self, external_visit: &mut RootSlotVisitor<'_>) {
@@ -3633,6 +3725,9 @@ impl GcHeap {
             for page in self.large_space.pages() {
                 page.for_each_object(|h, _| visitor(h));
             }
+            for page in self.young_large_space.pages() {
+                page.for_each_object(|h, _| visitor(h));
+            }
         }
     }
 
@@ -3706,14 +3801,18 @@ impl GcHeap {
     }
 
     /// Page lists for every space, in census order: old, young
-    /// from-space, large. Lets [`crate::census`] attribute objects
-    /// to a space without opening up the space fields.
-    pub(crate) fn census_spaces(&self) -> [(crate::page::SpaceKind, &[crate::page::Page]); 3] {
+    /// from-space, large, young large. Lets [`crate::census`] attribute
+    /// objects to a space without opening up the space fields.
+    pub(crate) fn census_spaces(&self) -> [(crate::page::SpaceKind, &[crate::page::Page]); 4] {
         self.sync_lab();
         [
             (crate::page::SpaceKind::Old, self.old_space.pages()),
             (crate::page::SpaceKind::NewFrom, self.new_space.from_pages()),
             (crate::page::SpaceKind::Large, self.large_space.pages()),
+            (
+                crate::page::SpaceKind::NewLarge,
+                self.young_large_space.pages(),
+            ),
         ]
     }
 
@@ -3766,6 +3865,7 @@ impl std::fmt::Debug for GcHeap {
             .field("new_pages", &self.new_space.from_page_count())
             .field("old_pages", &self.old_space.page_count())
             .field("large_pages", &self.large_space.page_count())
+            .field("young_large_pages", &self.young_large_space.page_count())
             .field("handles", &self.handle_stack.len())
             .field("is_marking", &self.marking.is_marking())
             .finish()
@@ -3810,6 +3910,9 @@ impl Drop for GcHeap {
             dispose_page(page);
         }
         for page in self.large_space.pages() {
+            dispose_page(page);
+        }
+        for page in self.young_large_space.pages() {
             dispose_page(page);
         }
     }

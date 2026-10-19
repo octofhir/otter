@@ -96,6 +96,10 @@ pub enum SpaceKind {
     Old = 2,
     /// Large object space (one large object per page).
     Large = 3,
+    /// Young large object space: one young large object per page, kept in
+    /// place by a scavenge that promotes it by moving the page to
+    /// [`SpaceKind::Large`].
+    NewLarge = 4,
 }
 
 /// Per-page flag bitfield.
@@ -607,11 +611,13 @@ mod tests {
     fn page_drop_returns_to_cage() {
         let _guard = CAGE_TEST_LOCK.lock().expect("cage test lock");
         ensure_cage();
-        let before = Cage::free_page_count();
-        {
-            let _p = Page::new(SpaceKind::NewFrom).expect("page");
-            assert_eq!(Cage::free_page_count(), before - 1);
-        }
-        assert_eq!(Cage::free_page_count(), before);
+        // Other tests share the cage, so the page itself is observed, not
+        // the global free count.
+        let offset = {
+            let page = Page::new(SpaceKind::NewFrom).expect("page");
+            assert!(!Cage::is_free_page(page.cage_offset()));
+            page.cage_offset()
+        };
+        assert!(Cage::is_free_page(offset));
     }
 }

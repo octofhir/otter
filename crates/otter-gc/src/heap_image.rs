@@ -270,7 +270,8 @@ impl GcHeap {
     /// space; the image would then describe only part of the graph.
     pub fn capture_old_space(&self) -> Result<HeapImage, ImageError> {
         let census = self.census();
-        let stray = census.young.object_count + census.large.object_count;
+        let stray =
+            census.young.object_count + census.large.object_count + census.young_large.object_count;
         if stray != 0 {
             return Err(ImageError::NurseryNotEmpty { objects: stray });
         }

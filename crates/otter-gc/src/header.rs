@@ -446,6 +446,13 @@ impl GcHeader {
         self.flags.fetch_and(!FLAG_YOUNG, Ordering::Relaxed);
     }
 
+    /// Clear the young flag; `true` for the one caller that cleared it,
+    /// `false` when the cell was already old.
+    #[inline]
+    pub fn try_promote_in_place(&self) -> bool {
+        self.flags.fetch_and(!FLAG_YOUNG, Ordering::AcqRel) & FLAG_YOUNG != 0
+    }
+
     /// Set the young flag.
     #[inline]
     pub fn set_young(&self) {

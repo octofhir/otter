@@ -29,6 +29,9 @@ fn cage_exhaustion_surfaces_out_of_memory() {
     // Use a small cage so we can actually exhaust it.
     let _ = init_cage_with_size(SMALL_CAGE);
     let mut heap = GcHeap::new().expect("heap");
+    // Old large placement: unrooted young large cells would be released by
+    // the scavenges their nursery accounting triggers.
+    let _tenured = heap.always_allocate_scope();
     let mut allocations = 0;
     loop {
         match heap.alloc_trailing_with_roots(Big { _length: 0 }, BIG_TRAILING_BYTES, &mut |_| {}) {

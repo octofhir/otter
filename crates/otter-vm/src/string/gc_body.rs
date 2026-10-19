@@ -379,6 +379,12 @@ impl otter_gc::SafeTraceable for JsStringBody {
             }
         }
     }
+
+    /// Visited concurrently under the layout lock: flattening rewrites a
+    /// rope's pointer words in place through
+    /// [`GcHeap::with_payload_relayout`], which holds the same lock.
+    const CONCURRENT_MARKING: bool = true;
+    const LAYOUT_LOCKED: bool = true;
 }
 
 /// Allocate a flat WTF-16 string body.
@@ -947,14 +953,14 @@ pub fn flatten_in_place(
         if bytes.len() <= INLINE_LATIN1_CAP {
             let mut inline = [0u8; INLINE_LATIN1_CAP];
             inline[..bytes.len()].copy_from_slice(&bytes);
-            heap.with_payload(rooted, |b| {
+            heap.with_payload_relayout(rooted, |b| {
                 b.repr = JsStringBodyRepr::InlineLatin1(inline);
                 true
             });
             return Ok(());
         }
         let flat = alloc_latin1_string_body_with_roots(heap, &bytes, &mut visit)?;
-        heap.with_payload(rooted, |b| {
+        heap.with_payload_relayout(rooted, |b| {
             b.repr = JsStringBodyRepr::Sliced {
                 parent: flat,
                 start: 0,
@@ -967,14 +973,14 @@ pub fn flatten_in_place(
     if units.len() <= INLINE_FLAT_CAP {
         let mut inline = [0u16; INLINE_FLAT_CAP];
         inline[..units.len()].copy_from_slice(&units);
-        heap.with_payload(rooted, |b| {
+        heap.with_payload_relayout(rooted, |b| {
             b.repr = JsStringBodyRepr::InlineFlat(inline);
             true
         });
         return Ok(());
     }
     let flat = alloc_flat_string_body_with_roots(heap, &units, &mut visit)?;
-    heap.with_payload(rooted, |b| {
+    heap.with_payload_relayout(rooted, |b| {
         b.repr = JsStringBodyRepr::Sliced {
             parent: flat,
             start: 0,
@@ -1381,7 +1387,7 @@ pub fn ensure_utf16_cache(
         external_visit(visitor);
     };
     let widened = alloc_flat_string_body_with_roots(heap, &units, &mut visit)?;
-    heap.with_payload(rooted, |b| {
+    heap.with_payload_relayout(rooted, |b| {
         b.utf16_cache = widened;
         true
     });

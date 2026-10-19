@@ -481,6 +481,7 @@ impl CodeBlock {
                 header_flags_byte: otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32,
                 young_flag: otter_gc::header::GENERATION_YOUNG_FLAG as u32,
                 remembered_flag: otter_gc::header::REMEMBERED_FLAG as u32,
+                mark_color_bits: u32::from(otter_gc::header::MARK_COLOR_BITS),
             },
             shape_prototype_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::SHAPE_BODY_PROTOTYPE_OFFSET as u32,

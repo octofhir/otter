@@ -27,6 +27,17 @@ enum Layout {
     Array(JitArrayLiteralAllocationPlan),
 }
 
+/// The header word a cell of `site` is born with when the marking flag reads
+/// `marking`: an old cell carved while marking runs is black.
+fn born(site: JitAllocationSite, marking: u8, word: u64) -> u64 {
+    if site.mode == JitSiteMode::Old && marking != 0 {
+        word | u64::from(otter_vm::jit::JIT_GC_BLACK_COLOR)
+            << (8 * otter_vm::jit::JIT_HEADER_FLAGS_BYTE)
+    } else {
+        word
+    }
+}
+
 fn execute(
     layout: &Layout,
     site: JitAllocationSite,
@@ -60,6 +71,9 @@ fn execute(
     let lab_ptr: *mut LinearAllocationArea = &mut lab;
     let mut thread = VmThread::empty();
     thread.active_realm_cell = std::ptr::addr_of!(actual_realm) as u64;
+    // Odd input counts run as if marking were active.
+    let marking = u8::from(values.len() % 2 == 1);
+    thread.marking_flag_cell = std::ptr::addr_of!(marking) as u64;
     let mut ctx = JitCtx {
         thread: &mut thread,
         native_frame: std::ptr::null_mut(),
@@ -174,7 +188,7 @@ fn execute(
     match layout {
         Layout::Object(plan) => {
             let mut expected = vec![0; body.len()];
-            expected[0] = site.header_word(plan.header_word);
+            expected[0] = born(site, marking, site.header_word(plan.header_word));
             expected[plan.shape_byte as usize / 8] = u64::from(plan.shape);
             for index in 0..plan.inline_capacity {
                 let byte = plan
@@ -199,9 +213,9 @@ fn execute(
                 2
             };
             let mut expected = vec![0; body.len()];
-            expected[0] = site.header_word(p.shell.header_word);
+            expected[0] = born(site, marking, site.header_word(p.shell.header_word));
             expected[slab] = if site.mode == JitSiteMode::Old {
-                site.header_word(p.slab_header_word)
+                born(site, marking, site.header_word(p.slab_header_word))
             } else {
                 p.slab_header_word
             };

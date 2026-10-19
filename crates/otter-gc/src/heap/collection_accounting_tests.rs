@@ -203,15 +203,17 @@ fn every_completed_sweep_publishes_reclaimed_cap_without_another_collection() {
             "incremental" => {
                 heap.start_incremental_mark_phase(&mut |_| {}).unwrap();
                 let _ = heap.incremental_mark_step(1);
-                heap.finish_incremental_mark_phase(&mut |_| {});
+                heap.finish_incremental_mark_phase(&mut |_| {}).unwrap();
                 heap.run_post_mark_processing();
                 heap.sweep_phase();
             }
             _ => unreachable!(),
         }
+        // An incremental cycle scavenges as it starts and as it finishes.
+        let minors = if mode == "incremental" { 2 } else { 1 };
         assert_eq!(
             heap.gc_cycle_counts(),
-            (cycles.0 + 1, cycles.1 + 1),
+            (cycles.0 + minors, cycles.1 + 1),
             "{mode}"
         );
         for (current, previous) in [first.get().offset(), last.get().offset()]

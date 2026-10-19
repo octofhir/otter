@@ -108,10 +108,20 @@ pub(crate) fn emit_concat(
         ; add WSP(r.scratch),WSP(r.scratch),1
         ; cmp WSP(r.scratch),p.max_rope_depth as u32 ; b.hi =>slow);
     if placement.old() {
+        // An old cons is born black while marking runs, so a white child would
+        // be an edge no visit follows: the canonical allocator shades it.
+        dynasm!(ops ; .arch aarch64
+            ; ldr x16, [X(context), crate::entry::THREAD_OFFSET]
+            ; ldr x16, [x16, crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET]
+            ; ldrb W(r.scratch), [x16]);
         for input in inputs {
+            let next = ops.new_dynamic_label();
             emit_value(ops, 16, input);
             dynasm!(ops ; .arch aarch64 ; ldrb w17, [x16, JIT_HEADER_FLAGS_BYTE]
-                ; tbnz w17, JIT_GC_YOUNG_FLAG.trailing_zeros(), =>slow);
+                ; tbnz w17, JIT_GC_YOUNG_FLAG.trailing_zeros(), =>slow
+                ; cbz W(r.scratch), =>next
+                ; tst w17, #3 ; b.eq =>slow
+                ; =>next);
         }
     }
     initialize(ops, context, p, inputs, r, placement, slow);
@@ -176,6 +186,9 @@ fn initialize(
     }
     emit_load_u64(ops, 16, placement.header_word(p.header_word));
     dynasm!(ops ; .arch aarch64 ; str x16,[X(r.candidate)]);
+    if placement.old() {
+        super::emit_black_when_marking(ops, context, r.candidate);
+    }
     emit_value(ops, 16, inputs[0]);
     dynasm!(ops ; .arch aarch64 ; ldr W(r.scratch),[x16,p.string_len_byte]);
     emit_value(ops, 16, inputs[1]);
@@ -193,6 +206,11 @@ fn publish(
     dynasm!(ops ; .arch aarch64 ; ldr X(r.buffer),[X(context),lab_offset(placement)]
         ; add XSP(r.end),XSP(r.candidate),p.cell_bytes);
     emit_publish(ops, r);
+    if placement.old() {
+        // The initialized cell is visible before any store publishes it to
+        // the concurrent marker.
+        dynasm!(ops ; .arch aarch64 ; dmb ishst);
+    }
     // A tracked birth counts toward the site's survival ratio.
     match placement {
         ConcatPlacement::Site(site) if site.mode == JitSiteMode::Track => {

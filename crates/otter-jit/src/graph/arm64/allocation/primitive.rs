@@ -21,9 +21,9 @@
 use super::super::Condition;
 use super::*;
 use crate::allocation::ConcatPlacement;
-use otter_vm::jit::JIT_SITE_TENURE;
 use crate::entry::VM_THREAD_GC_HEAP_OFFSET;
 use crate::template::arm64::values::emit_load_symbol_u64;
+use otter_vm::jit::JIT_SITE_TENURE;
 
 impl Codegen<'_> {
     fn primitive_inputs(&self, node: NodeId) -> Result<[AllocationValue; 2], crate::Unsupported> {

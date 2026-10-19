@@ -3599,7 +3599,16 @@ impl<'a> Codegen<'a> {
             ; ldr x16, [x20, THREAD_OFFSET]
             ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
             ; ldrb w16, [x16]
-            ; cbnz w16, =>slow
+            ; cbz w16, >generational
+            // While marking runs, a white old shape owes the insertion barrier.
+            ; ldrb w16, [X(child), flags_byte]
+            ; movz w17, u32::from(young)
+            ; tst w16, w17
+            ; b.ne >generational
+            ; movz w17, self.view.gc_barrier.mark_color_bits
+            ; tst w16, w17
+            ; b.eq =>slow
+            ; generational:
             ; ldrb w16, [X(receiver), flags_byte]
             ; movz w17, u32::from(settled)
             ; tst w16, w17
@@ -3736,7 +3745,16 @@ impl<'a> Codegen<'a> {
             ; ldr x16, [x20, THREAD_OFFSET]
             ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
             ; ldrb w16, [x16]
-            ; cbnz w16, =>slow
+            ; cbz w16, >generational
+            // While marking runs, a white old shape owes the insertion barrier.
+            ; ldrb w16, [X(child), flags_byte]
+            ; movz w17, u32::from(young)
+            ; tst w16, w17
+            ; b.ne >generational
+            ; movz w17, self.view.gc_barrier.mark_color_bits
+            ; tst w16, w17
+            ; b.eq =>slow
+            ; generational:
             ; ldrb w16, [X(receiver), flags_byte]
             ; movz w17, u32::from(settled)
             ; tst w16, w17
@@ -4258,7 +4276,16 @@ impl<'a> Codegen<'a> {
             ; ldr x16, [x20, THREAD_OFFSET]
             ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
             ; ldrb w16, [x16]
-            ; cbnz w16, =>slow
+            ; cbz w16, >generational
+            // While marking runs, a white old child owes the insertion barrier.
+            ; ldrb w16, [X(value), flags_byte]
+            ; movz w17, u32::from(young)
+            ; tst w16, w17
+            ; b.ne >generational
+            ; movz w17, self.view.gc_barrier.mark_color_bits
+            ; tst w16, w17
+            ; b.eq =>slow
+            ; generational:
             ; ldrb w16, [X(value), flags_byte]
             ; movz w17, u32::from(young)
             ; tst w16, w17
@@ -4328,12 +4355,22 @@ impl<'a> Codegen<'a> {
             crate::template::arm64::values::CellTest::IsNotCell,
             done,
         );
+        let generational = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
             ; ldr x16, [x20, THREAD_OFFSET]
             ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
             ; ldrb w16, [x16]
-            ; cbnz w16, =>slow
+            ; cbz w16, =>generational
+            // While marking runs, a white old child owes the insertion barrier.
+            ; ldrb w16, [X(value), flags_byte]
+            ; movz w17, u32::from(young)
+            ; tst w16, w17
+            ; b.ne =>generational
+            ; movz w17, self.view.gc_barrier.mark_color_bits
+            ; tst w16, w17
+            ; b.eq =>slow
+            ; =>generational
             ; ldrb w16, [X(object), flags_byte]
             ; movz w17, u32::from(settled)
             ; tst w16, w17

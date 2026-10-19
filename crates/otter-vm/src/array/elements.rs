@@ -417,8 +417,10 @@ impl ElementSlabBody {
             unsafe { *self.values_ptr().add(index) = value };
         }
         self.hole_count = 0;
-        // Publication is last: the tracer must never see Tagged while any live
-        // word still contains raw double bits.
+        // Publication is last, released: a tracer, the concurrent marker
+        // included, must never see Tagged while any live word it reads still
+        // holds raw double bits.
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         self.kind = DenseElementKind::Tagged;
     }
 
@@ -464,6 +466,29 @@ impl otter_gc::SafeTraceable for ElementSlabBody {
             // GC cell, so the collector may rewrite each slot in place.
             unsafe { (&mut *self.values_ptr().add(index)).trace_value_slot_mut(visitor) };
         }
+    }
+
+    const CONCURRENT_MARKING: bool = true;
+
+    /// The tagged live prefix, read beside the mutator. The kind is read
+    /// before the words and acquired against the conversion's release, so a
+    /// tagged kind always comes with tagged words; the length stays inside
+    /// the fixed capacity, and every word past a live prefix still holds a
+    /// value or zero.
+    fn trace_concurrent_safe(&mut self, visitor: &mut SlotVisitor<'_>) -> bool {
+        // SAFETY: the kind field is a plain byte of this live body.
+        let kind = unsafe { std::ptr::read_volatile(&raw const self.kind) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        if kind != DenseElementKind::Tagged {
+            return true;
+        }
+        // SAFETY: as above.
+        let len = unsafe { std::ptr::read_volatile(&raw const self.len) } as usize;
+        for index in 0..len.min(self.capacity()) {
+            // SAFETY: the index lies inside the slab's reserved words.
+            unsafe { (&mut *self.values_ptr().add(index)).trace_value_slot_mut(visitor) };
+        }
+        true
     }
 
     fn trace_pending_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {

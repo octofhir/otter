@@ -14,7 +14,8 @@
 //!   RawGc` so the GC can update the slot in place when an object
 //!   moves.
 //! - [`TraceTable`] — the 256-entry dispatch array; `register::<T>`
-//!   is the public entry point.
+//!   is the public entry point. It also keeps the concurrent-marking visit
+//!   of each type that opted in.
 //!
 //! # Invariants
 //!
@@ -65,6 +66,12 @@ pub type EphemeronVisitor<'a> = dyn FnMut(*mut RawGc, &mut EphemeronValueVisitor
 /// enforces this invariant by storing only generated wrappers
 /// keyed by the registering type.
 pub type TraceFn = unsafe fn(header: *mut GcHeader, visitor: &mut SlotVisitor<'_>);
+
+/// Function-pointer signature of a concurrent-marking visit: `false` when the
+/// body's current layout cannot be read beside the mutator, and the final
+/// pause must visit it instead.
+pub type ConcurrentTraceFn =
+    unsafe fn(header: *mut GcHeader, visitor: &mut SlotVisitor<'_>) -> bool;
 
 /// Function-pointer signature for type-specific ephemeron tracing.
 pub type EphemeronTraceFn = unsafe fn(header: *mut GcHeader, visitor: &mut EphemeronVisitor<'_>);
@@ -154,6 +161,34 @@ pub trait Traceable: 'static {
     ///
     /// Same payload-validity contract as [`Self::trace_slots`].
     unsafe fn trace_ephemeron_slots(_this: *mut Self, _visitor: &mut EphemeronVisitor<'_>) {}
+
+    /// Whether the concurrent marker may visit an old body of this type
+    /// through [`Self::trace_concurrent`] while the mutator runs. A body that
+    /// does not opt in is visited in the final marking pause instead.
+    const CONCURRENT_MARKING: bool = false;
+
+    /// Whether the mutator rewrites pointer words of an old body of this type
+    /// in place: the concurrent marker then visits it under the cell's layout
+    /// lock ([`crate::header::GcHeader::lock_layout`]), which such a rewrite
+    /// takes while marking runs.
+    const LAYOUT_LOCKED: bool = false;
+
+    /// Visit the strong slots of an old body while the mutator may change
+    /// it. Reads only words of the body and of cells it owns, never writes,
+    /// and never reads a slot the mutator might be filling with a non-pointer
+    /// word: a pointer stored after the visit is shaded by the write barrier.
+    /// Returns `false`, having visited whatever it liked, when the body's
+    /// current layout cannot be read this way; the final pause visits it.
+    ///
+    /// # Safety
+    ///
+    /// Same payload-validity contract as [`Self::trace_slots`]; the body is
+    /// old and marking is active.
+    unsafe fn trace_concurrent(this: *mut Self, visitor: &mut SlotVisitor<'_>) -> bool {
+        // SAFETY: an opted-in body's ordinary trace satisfies the contract.
+        unsafe { Self::trace_slots(this, visitor) };
+        true
+    }
 }
 
 /// Reclamation-time finalizer hook for GC bodies.
@@ -257,6 +292,18 @@ pub trait SafeTraceable: 'static {
     /// Most heap objects are not ephemeron tables and keep this
     /// no-op implementation.
     fn trace_ephemeron_slots_safe(&mut self, _visitor: &mut EphemeronVisitor<'_>) {}
+
+    /// Safe counterpart to [`Traceable::CONCURRENT_MARKING`].
+    const CONCURRENT_MARKING: bool = false;
+
+    /// Safe counterpart to [`Traceable::LAYOUT_LOCKED`].
+    const LAYOUT_LOCKED: bool = false;
+
+    /// Safe counterpart to [`Traceable::trace_concurrent`].
+    fn trace_concurrent_safe(&mut self, visitor: &mut SlotVisitor<'_>) -> bool {
+        self.trace_slots_safe(visitor);
+        true
+    }
 }
 
 impl<T: SafeTraceable> Traceable for T {
@@ -297,6 +344,14 @@ impl<T: SafeTraceable> Traceable for T {
         // SAFETY: same payload-validity contract as `trace_slots`.
         unsafe { (*this).trace_remembered_slots_safe(visitor) }
     }
+
+    const CONCURRENT_MARKING: bool = <Self as SafeTraceable>::CONCURRENT_MARKING;
+    const LAYOUT_LOCKED: bool = <Self as SafeTraceable>::LAYOUT_LOCKED;
+
+    unsafe fn trace_concurrent(this: *mut Self, visitor: &mut SlotVisitor<'_>) -> bool {
+        // SAFETY: same payload-validity contract as `trace_slots`.
+        unsafe { (*this).trace_concurrent_safe(visitor) }
+    }
 }
 
 /// A 256-entry array of [`TraceFn`] pointers, indexed by
@@ -304,6 +359,9 @@ impl<T: SafeTraceable> Traceable for T {
 pub struct TraceTable {
     table: [Option<TraceFn>; 256],
     remembered_table: [Option<TraceFn>; 256],
+    /// Concurrent-marking visits of the types that opted in, with whether
+    /// each takes the cell's layout lock.
+    concurrent_table: [Option<(ConcurrentTraceFn, bool)>; 256],
     ephemeron_table: [Option<EphemeronTraceFn>; 256],
     /// Drop functions used by the sweeper to invoke `T`'s `Drop`
     /// on dead objects (so e.g. boxed strings get their backing
@@ -338,6 +396,7 @@ impl TraceTable {
         Self {
             table: [None; 256],
             remembered_table: [None; 256],
+            concurrent_table: [None; 256],
             ephemeron_table: [None; 256],
             drop_table: [None; 256],
             finalize_table: [None; 256],
@@ -402,6 +461,19 @@ impl TraceTable {
                 T::trace_remembered_slots(payload, visitor);
             }
         }
+        unsafe fn concurrent_wrapper<T: Traceable>(
+            header: *mut GcHeader,
+            visitor: &mut SlotVisitor<'_>,
+        ) -> bool {
+            // SAFETY: the registered header precedes a valid T payload.
+            unsafe {
+                let payload = header
+                    .cast::<u8>()
+                    .add(std::mem::size_of::<GcHeader>())
+                    .cast::<T>();
+                T::trace_concurrent(payload, visitor)
+            }
+        }
         unsafe fn ephemeron_wrapper<T: Traceable>(
             header: *mut GcHeader,
             visitor: &mut EphemeronVisitor<'_>,
@@ -424,6 +496,8 @@ impl TraceTable {
         }
         self.table[tag] = Some(trace_wrapper::<T>);
         self.remembered_table[tag] = Some(remembered_wrapper::<T>);
+        self.concurrent_table[tag] =
+            T::CONCURRENT_MARKING.then_some((concurrent_wrapper::<T>, T::LAYOUT_LOCKED));
         self.ephemeron_table[tag] = Some(ephemeron_wrapper::<T>);
         self.name_table[tag] = Some(std::any::type_name::<T>());
         self.map_word_table[tag] = T::MAP_WORD;
@@ -455,6 +529,13 @@ impl TraceTable {
     #[inline]
     pub fn get(&self, tag: u8) -> Option<TraceFn> {
         self.table[tag as usize]
+    }
+
+    /// The concurrent-marking visit of every registered type and whether it
+    /// takes the layout lock, `None` for a type the final pause visits.
+    #[must_use]
+    pub(crate) fn concurrent_entries(&self) -> [Option<(ConcurrentTraceFn, bool)>; 256] {
+        self.concurrent_table
     }
 
     /// Rust type name registered under `tag`, or `None` when no

@@ -40,6 +40,17 @@ fn put32(words: &mut [u64], byte: u32, value: u32) {
     words[byte as usize / 8] |= u64::from(value) << (byte % 8 * 8);
 }
 
+/// The header word a cell of `site` is born with when the marking flag reads
+/// `marking`: an old cell carved while marking runs is black.
+fn born(site: JitAllocationSite, marking: u8, word: u64) -> u64 {
+    if site.mode == JitSiteMode::Old && marking != 0 {
+        word | u64::from(otter_vm::jit::JIT_GC_BLACK_COLOR)
+            << (8 * otter_vm::jit::JIT_HEADER_FLAGS_BYTE)
+    } else {
+        word
+    }
+}
+
 fn execute(
     layout: &Layout,
     site: JitAllocationSite,
@@ -87,6 +98,9 @@ fn execute(
     let lab_ptr: *mut LinearAllocationArea = &mut lab;
     let mut thread = VmThread::empty();
     thread.active_realm_cell = std::ptr::addr_of!(actual_realm) as u64;
+    // Odd input counts run as if marking were active.
+    let marking = u8::from(values.len() % 2 == 1);
+    thread.marking_flag_cell = std::ptr::addr_of!(marking) as u64;
     let mut ctx = JitCtx {
         thread: &mut thread,
         native_frame: std::ptr::null_mut(),
@@ -231,7 +245,7 @@ fn execute(
                 expected[1] = plan.map_word;
             }
             Layout::Object(plan) => {
-                expected[0] = site.header_word(plan.header_word);
+                expected[0] = born(site, marking, site.header_word(plan.header_word));
                 put32(&mut expected, plan.shape_byte, plan.shape);
                 for index in 0..plan.inline_capacity {
                     let byte = plan
@@ -254,9 +268,9 @@ fn execute(
                 } else {
                     2
                 };
-                expected[0] = site.header_word(plan.shell.header_word);
+                expected[0] = born(site, marking, site.header_word(plan.shell.header_word));
                 expected[slab] = if site.mode == JitSiteMode::Old {
-                    site.header_word(plan.slab_header_word)
+                    born(site, marking, site.header_word(plan.slab_header_word))
                 } else {
                     plan.slab_header_word
                 };

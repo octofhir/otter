@@ -630,13 +630,23 @@ pub(crate) fn emit_write_barrier_with_context(
     let settled = young | view.gc_barrier.remembered_flag;
     let slow = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
+    let generational = ops.new_dynamic_label();
     dynasm!(ops
         ; .arch aarch64
         ; cbz W(child), =>done
         ; ldr x14, [X(context), THREAD_OFFSET]
         ; ldr x14, [x14, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
         ; ldrb w14, [x14]
-        ; cbnz w14, =>slow
+        ; cbz w14, =>generational
+        // While marking runs, a white old child owes the insertion barrier.
+        ; ldrb w14, [X(child), flags_byte]
+        ; movz w15, young
+        ; tst w14, w15
+        ; b.ne =>generational
+        ; movz w15, view.gc_barrier.mark_color_bits
+        ; tst w14, w15
+        ; b.eq =>slow
+        ; =>generational
         ; ldrb w14, [X(parent), flags_byte]
         ; movz w15, settled
         ; tst w14, w15

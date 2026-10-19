@@ -115,6 +115,19 @@ pub(crate) use context::{emit_copy_context, emit_create_context};
 mod closure;
 pub(crate) use closure::emit_closure;
 
+/// Paint the old cell `cell` black while marking runs: no visit follows a
+/// cell born during a cycle. Its initializing edges are barriered by the
+/// caller or proven marked. Clobbers r10.
+pub(crate) fn emit_black_when_marking(ops: &mut Assembler, context: u8, cell: u8) {
+    use otter_vm::jit::{JIT_GC_BLACK_COLOR, JIT_HEADER_FLAGS_BYTE};
+    dynasm!(ops ; .arch x64
+        ; mov r10, [Rq(context) + crate::entry::THREAD_OFFSET as i32]
+        ; mov r10, [r10 + crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
+        ; cmp BYTE [r10], 0 ; je >unmarked
+        ; or BYTE [Rq(cell) + JIT_HEADER_FLAGS_BYTE as i32], JIT_GC_BLACK_COLOR as i8
+        ; unmarked:);
+}
+
 /// Read one explicit value without allocating or changing any other register.
 pub(crate) fn emit_value(ops: &mut Assembler, destination: u8, value: AllocationValue) {
     match value {

@@ -170,22 +170,11 @@ fn current_policy_changes_refuse_ensure_without_top_or_cell_publication() {
     heap.set_tenure_all(false);
     assert!(heap.machine_allocation_allowed());
     heap.start_incremental_mark_phase(&mut |_| {}).unwrap();
-    assert!(!heap.machine_allocation_allowed());
-    let before = heap.gc_stats().clone();
-    let lab = heap.lab;
     assert!(
-        !heap
-            .ensure_machine_allocation_with_roots(32, &mut |_| {})
-            .unwrap()
+        heap.machine_allocation_allowed(),
+        "marking leaves both buffers live"
     );
-    assert_eq!(heap.lab, lab);
-    assert_eq!(heap.gc_stats().alloc_bytes_total, before.alloc_bytes_total);
-    assert!(!heap.oom_flag.load(Ordering::Relaxed));
-    heap.finish_incremental_mark_phase(&mut |_| {});
-    assert!(
-        !heap.machine_allocation_allowed(),
-        "finished marking remains active until canonical sweep"
-    );
+    heap.finish_incremental_mark_phase(&mut |_| {}).unwrap();
     heap.sweep_phase();
     assert!(heap.machine_allocation_allowed());
 }

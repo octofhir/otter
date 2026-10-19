@@ -9,10 +9,10 @@
 //!    store buffer, deduped by `GcHeader` `FLAG_REMEMBERED`). The
 //!    scavenger re-traces every remembered parent and evacuates its
 //!    young children even when no other root references them.
-//! 2. **Insertion (Dijkstra) barrier** (dormant while the STW
-//!    marker leaves marking inactive) — while marking is active,
-//!    shading a fresh white child gray on every insertion
-//!    preserves the strong tri-color invariant.
+//! 2. **Insertion (Dijkstra) barrier** — while a marking cycle is
+//!    active, shading every white old child gray on insertion preserves
+//!    the strong tri-color invariant against the concurrent marker. Young
+//!    children are left alone: the cycle never marks young cells.
 //!
 //! # Contents
 //!

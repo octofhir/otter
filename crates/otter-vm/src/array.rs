@@ -159,6 +159,17 @@ impl otter_gc::SafeTraceable for ArrayBody {
         }
         self.refresh_element_cache();
     }
+
+    const CONCURRENT_MARKING: bool = true;
+
+    /// The three handles, without republishing the element cache: marking
+    /// moves nothing, and the mutator owns the cache.
+    fn trace_concurrent_safe(&mut self, visitor: &mut SlotVisitor<'_>) -> bool {
+        visitor(std::ptr::from_mut(&mut self.slab).cast());
+        visitor(std::ptr::from_mut(&mut self.exotic).cast());
+        visitor(std::ptr::from_mut(&mut self.expando).cast());
+        true
+    }
 }
 
 impl Default for ArrayBody {

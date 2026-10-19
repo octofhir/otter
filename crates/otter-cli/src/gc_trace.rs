@@ -23,6 +23,7 @@ fn kind_name(kind: GcPauseKind) -> &'static str {
     match kind {
         GcPauseKind::Minor => "Scavenge",
         GcPauseKind::Full => "Mark-sweep",
+        GcPauseKind::MarkStart => "Concurrent mark start",
         GcPauseKind::SplitMark => "Mark",
         GcPauseKind::SplitStep => "Mark step",
         GcPauseKind::SplitSweep => "Sweep",
@@ -79,6 +80,7 @@ pub(crate) fn render(capture: &GcPauseCapture) -> String {
     for kind in [
         GcPauseKind::Minor,
         GcPauseKind::Full,
+        GcPauseKind::MarkStart,
         GcPauseKind::SplitMark,
         GcPauseKind::SplitStep,
         GcPauseKind::SplitSweep,

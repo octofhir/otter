@@ -136,6 +136,10 @@ impl otter_gc::SafeTraceable for SlotSlabBody {
     /// pending copy on the stack has nothing to trace: everything
     /// `trace_slots_safe` walks is storage that does not exist yet.
     fn trace_pending_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
+
+    /// A slab's capacity never changes and every word holds a value, so its
+    /// visit reads the same words beside the mutator.
+    const CONCURRENT_MARKING: bool = true;
 }
 
 /// Allocate a slab that can hold `capacity` words.

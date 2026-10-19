@@ -86,6 +86,10 @@ pub(crate) fn emit_object_literal(
     let candidate = regs.candidate;
     emit_load_u64(ops, 10, site.header_word(plan.header_word));
     dynasm!(ops ; .arch x64 ; mov [Rq(candidate)], r10);
+    if site.mode == JitSiteMode::Old {
+        // Its fields are barriered by the graph's own nodes.
+        super::emit_black_when_marking(ops, context, candidate);
+    }
     let start = plan
         .fields
         .inline_byte(otter_vm::object::FieldLocation::inline(0));
@@ -221,6 +225,11 @@ pub(crate) fn emit_boilerplate_array(
     let shell = regs.candidate;
     emit_load_u64(ops, 10, site.header_word(plan.shell.header_word));
     dynasm!(ops ; .arch x64 ; mov [Rq(shell)], r10);
+    if site.mode == JitSiteMode::Old {
+        // Its one edge is the boilerplate slab, an old cell the isolate's
+        // boilerplate table roots.
+        super::emit_black_when_marking(ops, context, shell);
+    }
     emit_load_u64(ops, 10, plan.shell.map_word);
     dynasm!(ops ; .arch x64 ; mov [Rq(shell) + 8], r10);
     for byte in (16..plan.shell.cell_bytes).step_by(8) {
@@ -287,6 +296,12 @@ fn emit_dense_array(
     }
     emit_load_u64(ops, 10, slab_site.header_word(plan.slab_header_word));
     dynasm!(ops ; .arch x64 ; mov [Rq(slab)], r10);
+    if site.mode == JitSiteMode::Old {
+        // A tenured literal is carved only numeric: neither cell has an
+        // edge but the shell's to its slab, born black beside it.
+        super::emit_black_when_marking(ops, context, shell);
+        super::emit_black_when_marking(ops, context, slab);
+    }
     for byte in (8..plan.slab_bytes).step_by(8) {
         dynasm!(ops ; .arch x64 ; mov QWORD [Rq(slab) + byte as i32], 0);
     }

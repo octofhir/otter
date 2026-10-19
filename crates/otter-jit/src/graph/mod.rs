@@ -64,6 +64,7 @@ pub(crate) mod effects;
 pub(crate) mod emission;
 pub(crate) mod feedback;
 pub(crate) mod frame;
+mod inline_plan;
 pub(crate) mod ir;
 pub(crate) mod licm;
 pub(crate) mod liveness;
@@ -341,6 +342,11 @@ pub(crate) fn compile_optimized(
         register_count: view.code_block.register_count,
         allocator_spill_slot_count: allocation.tagged_slots + allocation.untagged_slots,
         spill_slot_count: allocation.tagged_slots + allocation.untagged_slots,
+        inlined_instructions: built
+            .inline_views
+            .iter()
+            .map(|body| body.code_block.instruction_count())
+            .sum(),
     };
     let code = CompiledCode::new(
         emission.buffer,
@@ -471,7 +477,7 @@ fn inline_diagnostics(
             byte_pc: body.call_byte_pc,
             callee_function_id: body.function_id,
             depth,
-            cost: view.code_block.bytecode_byte_len(),
+            cost: view.code_block.instruction_count(),
             outcome: otter_vm::JitInlineLoweringOutcome::Inlined,
         });
     }

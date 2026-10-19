@@ -405,7 +405,7 @@ pub enum JitCompilerDiagnostic {
         /// Depth below the optimized unit's root.
         depth: u32,
         /// Exact units charged by the backend's inline budget; Graph uses
-        /// the accepted body's encoded bytecode byte length.
+        /// the accepted body's bytecode instruction count.
         cost: u32,
         /// Complete pipeline decision.
         outcome: JitInlineLoweringOutcome,
@@ -600,7 +600,7 @@ pub enum JitDebugEvent {
         /// Depth below the optimized unit's root.
         depth: u32,
         /// Exact units charged by the backend's inline budget; Graph uses
-        /// the accepted body's encoded bytecode byte length.
+        /// the accepted body's bytecode instruction count.
         cost: u32,
         /// Final splice result.
         outcome: JitInlineLoweringOutcome,

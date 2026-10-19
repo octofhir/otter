@@ -305,6 +305,11 @@ fn interpreter_turn(ctx: *mut JitCtx, entering: bool) -> NativeResultPair {
     // shape decides the rest of the first-entry work.
     if fresh_entry && !tier_completion && unsafe { (*frame).header.pc } == 0 {
         vm.record_runtime_bytecode_call();
+        if vm.jit_hook.is_some()
+            && let Some(function) = function
+        {
+            function.note_interpreted_entry();
+        }
         let suspendable =
             function.is_some_and(|function| function.is_generator || function.is_async);
         if suspendable

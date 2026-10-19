@@ -247,11 +247,19 @@ const _: () = {
 pub const JIT_INLINE_DEPTH: u8 = 3;
 /// The deepest nesting a small body is inlined at.
 pub const JIT_SMALL_INLINE_DEPTH: u8 = 8;
-/// The longest body inlined at one call, in encoded bytecode bytes.
-pub const JIT_MAX_INLINED_BYTECODE_BYTES: u32 = 460;
-/// The longest small body in encoded bytecode bytes: a body of a few
+/// The longest body inlined at one call, in bytecode instructions.
+pub const JIT_MAX_INLINED_INSTRUCTIONS: u32 = 160;
+/// The longest small body in bytecode instructions: a body of a few
 /// instructions, which costs less inlined than its call does.
-pub const JIT_SMALL_INLINE_BYTECODE_BYTES: u32 = 80;
+pub const JIT_SMALL_INLINE_INSTRUCTIONS: u32 = 10;
+/// The most bytecode instructions one compilation inlines from bodies that
+/// are not small.
+pub const JIT_MAX_INLINED_INSTRUCTIONS_CUMULATIVE: u32 = 320;
+/// The most bytecode instructions one compilation inlines from any bodies.
+pub const JIT_MAX_INLINED_INSTRUCTIONS_ABSOLUTE: u32 = 1600;
+/// The fewest calls per run of the compiled function at which a call site is
+/// inlined: a site reached more rarely is left a call.
+pub const JIT_MIN_INLINING_FREQUENCY: f32 = 0.15;
 
 /// Bytes of the BigInt cell generated code carves: header, body and one
 /// digit, rounded to the cell size.
@@ -878,6 +886,14 @@ pub struct JitCompileSnapshot {
     /// and splices accepted bodies under an identity guard; a failed guard
     /// side-exits at the exact caller PC.
     pub inline_callees: rustc_hash::FxHashMap<u32, JitInlineCallee>,
+    /// Calls per interpreted entry of this body at each call and method
+    /// site with call feedback, keyed by byte PC: what an optimizing caller
+    /// weighs its inline candidates by. Baked with the call-site plans.
+    pub call_frequencies: rustc_hash::FxHashMap<u32, f32>,
+    /// What the function's installed optimized code inlined, in bytecode
+    /// instructions, when this snapshot is a body to inline: a caller that
+    /// builds it builds those again.
+    pub optimized_inlined_instructions: u32,
     /// Inline-candidate methods for `Op::CallMethodValue` sites, keyed by the
     /// caller's call byte-PC. Populated for monomorphic method sites whose method
     /// is a tiny body of sealed property loads/stores and pure ops; baked by
@@ -2334,6 +2350,8 @@ impl JitCompileSnapshot {
             direct_constructs: rustc_hash::FxHashMap::default(),
             direct_methods: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
+            call_frequencies: rustc_hash::FxHashMap::default(),
+            optimized_inlined_instructions: 0,
             inline_methods: rustc_hash::FxHashMap::default(),
             inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
@@ -2708,6 +2726,13 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// independently on each entry.
     fn spliced_functions(&self) -> &[u32] {
         &[]
+    }
+
+    /// Bytecode instructions of the bodies this code built in place of their
+    /// calls: what inlining the function elsewhere costs on top of its own
+    /// body when a caller would build those again.
+    fn inlined_instructions(&self) -> u32 {
+        0
     }
 
     /// Base address of the complete executable mapping, retained by this owner.

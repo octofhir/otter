@@ -28,6 +28,8 @@
 //!   dropped when it finishes.
 //! - With no compiler threads the requesting thread compiles at once and the
 //!   caller installs the result before the request returns.
+//! - Compiler threads start on demand: one more whenever the compilations in
+//!   flight outnumber the threads, up to the configured count.
 //! - Compiler threads belong to the isolate: dropping the queue stops and
 //!   joins them, and requests not yet started are dropped. A compiler panic
 //!   resumes on the isolate thread when its result is collected.
@@ -117,23 +119,27 @@ struct CompilerPool {
 }
 
 impl CompilerPool {
-    fn start(threads: usize) -> Self {
-        let shared = Arc::new(PoolShared {
-            queue: Mutex::default(),
-            wake: Condvar::new(),
-            finished: AtomicBool::new(false),
-        });
-        let threads = (0..threads)
-            .filter_map(|index| {
-                let shared = Arc::clone(&shared);
-                std::thread::Builder::new()
-                    .name(format!("otter-jit-compiler-{index}"))
-                    .stack_size(COMPILER_THREAD_STACK_BYTES)
-                    .spawn(move || compile_requests(&shared))
-                    .ok()
-            })
-            .collect();
-        Self { shared, threads }
+    fn new() -> Self {
+        Self {
+            shared: Arc::new(PoolShared {
+                queue: Mutex::default(),
+                wake: Condvar::new(),
+                finished: AtomicBool::new(false),
+            }),
+            threads: Vec::new(),
+        }
+    }
+
+    /// Start one more compiler thread.
+    fn spawn_thread(&mut self) {
+        let shared = Arc::clone(&self.shared);
+        if let Ok(thread) = std::thread::Builder::new()
+            .name(format!("otter-jit-compiler-{}", self.threads.len()))
+            .stack_size(COMPILER_THREAD_STACK_BYTES)
+            .spawn(move || compile_requests(&shared))
+        {
+            self.threads.push(thread);
+        }
     }
 }
 
@@ -203,8 +209,8 @@ pub(crate) struct OptimizingCompileQueue {
 }
 
 impl OptimizingCompileQueue {
-    /// Compile on `threads` compiler threads; zero compiles on the requesting
-    /// thread. A pool already started keeps its threads.
+    /// Compile on up to `threads` compiler threads; zero compiles on the
+    /// requesting thread. A pool already started keeps its threads.
     pub(crate) fn set_threads(&mut self, threads: usize) {
         self.threads = threads;
     }
@@ -243,10 +249,11 @@ impl OptimizingCompileQueue {
         self.pending_functions
             .insert(pending.function_id, code_object_id);
         self.pending.insert(code_object_id, pending);
-        let threads = self.threads;
-        let pool = self
-            .pool
-            .get_or_insert_with(|| CompilerPool::start(threads));
+        let in_flight = self.pending.len();
+        let pool = self.pool.get_or_insert_with(CompilerPool::new);
+        if pool.threads.len() < self.threads.min(in_flight) {
+            pool.spawn_thread();
+        }
         pool.shared.lock().requests.push_back(job);
         pool.shared.wake.notify_one();
         None

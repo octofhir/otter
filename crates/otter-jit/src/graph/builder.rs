@@ -631,8 +631,8 @@ struct Builder<'a> {
     /// The inlined call the body being visited runs for; `None` in the
     /// compiled function's own body.
     inline: Option<Box<InlineFrame>>,
-    /// Bytecode bytes of every body inlined so far.
-    inlined_bytes: u32,
+    /// The prepared bodies this compilation builds in place of their calls.
+    inline_plan: super::inline_plan::InlinePlan,
     /// The snapshot of each inlined body, by origin minus one.
     inline_views: Vec<Arc<JitCompileSnapshot>>,
     /// Owner guards required by a consumed value bound.
@@ -644,11 +644,6 @@ struct Builder<'a> {
     closure_contexts: FxHashMap<NodeId, (*const JitCompileSnapshot, u16)>,
 }
 
-/// The most bytecode bytes inlined into one compilation by bodies that are
-/// not small.
-const MAX_INLINED_BYTECODE_CUMULATIVE: u32 = 920;
-/// The most bytecode bytes inlined into one compilation by any bodies.
-const MAX_INLINED_BYTECODE_ABSOLUTE: u32 = 4600;
 /// The most actual arguments a spliced body's elided `arguments[i]` selects
 /// among; a call with more keeps the body out of line.
 const MAX_SELECTED_ARGUMENTS: usize = 8;
@@ -804,7 +799,7 @@ fn build_once(
         pc: 0,
         undefined,
         inline: None,
-        inlined_bytes: 0,
+        inline_plan: super::inline_plan::InlinePlan::choose(view),
         inline_views: Vec::new(),
         required_field_guards: FxHashSet::default(),
         field_nullish_candidates: FxHashMap::default(),
@@ -1041,24 +1036,23 @@ impl<'a> Builder<'a> {
     }
 
     /// Whether `body` may be built in place of a call from the current
-    /// body: a loop-free function without handlers, within the size, depth
-    /// and cumulative budgets (wider for a small body), called from outside
+    /// body: a function without handlers the inline plan chose, within the
+    /// size and depth bounds (deeper for a small body), called from outside
     /// any exception region of the compiled function.
     fn inlinable(&self, body: &JitCompileSnapshot) -> bool {
         let code = body.code_block.as_ref();
-        let bytes = code.bytecode_byte_len();
+        let instructions = code.instruction_count();
         let depth = self.inline.as_ref().map_or(0, |inline| inline.depth);
         let outer_pc = self.graph.outer_pc_at(self.graph.origin, self.pc);
         // A small body costs less inlined than its call does, so it is
-        // inlined past the cumulative budget and deeper.
-        let within_budget = if bytes <= otter_vm::jit::JIT_SMALL_INLINE_BYTECODE_BYTES {
+        // inlined deeper.
+        let within_depth = if instructions <= otter_vm::jit::JIT_SMALL_INLINE_INSTRUCTIONS {
             depth < otter_vm::jit::JIT_SMALL_INLINE_DEPTH
-                && self.inlined_bytes + bytes <= MAX_INLINED_BYTECODE_ABSOLUTE
         } else {
             depth < otter_vm::jit::JIT_INLINE_DEPTH
-                && self.inlined_bytes + bytes <= MAX_INLINED_BYTECODE_CUMULATIVE
         };
-        within_budget
+        within_depth
+            && self.inline_plan.admits(body)
             && code.admits_graph_inlining()
             && self.graph.inlined.len() < usize::from(u16::MAX)
             && self.root_handler_at(outer_pc).is_none()
@@ -1170,7 +1164,6 @@ impl<'a> Builder<'a> {
             return false;
         };
         let code = body.code_block.as_ref();
-        let bytes = code.bytecode_byte_len();
         let checkpoint = self.graph.checkpoint(block);
         let frame_states = self.graph.frame_states.len();
         let views = self.inline_views.len();
@@ -1283,7 +1276,6 @@ impl<'a> Builder<'a> {
         self.swap_scope(&mut scope);
         self.graph.origin = origin;
         self.graph.position = 0;
-        self.inlined_bytes += bytes;
         // Loop headers recorded from here on belong to this body or to bodies
         // spliced into it; an abandoned body drops all of them.
         let inline_loop_headers = self.inline_loop_headers.len();
@@ -1300,7 +1292,6 @@ impl<'a> Builder<'a> {
         self.graph.position = caller_position;
         let frame = scope.inline.take().expect("the callee's inline frame");
         if frame.abandoned {
-            self.inlined_bytes -= bytes;
             // Loops of the abandoned body, and of bodies spliced into it,
             // go with it; their origins are reused.
             self.inline_loop_headers.truncate(inline_loop_headers);

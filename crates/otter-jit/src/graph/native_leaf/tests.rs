@@ -124,7 +124,14 @@ fn declaration_arity_effects_and_identity_layout_have_one_admission() {
     assert!(super::admit(&view, target(u32::MAX, 1), 1).is_none());
     let mut absent = view.clone();
     absent.native_call_layout = JitNativeCallLayout::default();
-    assert!(super::admit(&absent, target(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 1), 1).is_none());
+    assert!(
+        super::admit(
+            &absent,
+            target(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 1),
+            1
+        )
+        .is_none()
+    );
 }
 #[test]
 fn char_code_at_reads_its_unit_inline_from_the_evaluated_operands() {

@@ -2449,17 +2449,18 @@ impl Interpreter {
         fid: u32,
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
+        site_frequency: Option<f32>,
         receiver: Option<ConstructReceiver>,
     ) -> Option<std::sync::Arc<jit::JitCompileSnapshot>> {
         // An inline body shares the physical caller's active-global cells.
         // Source identity alone does not make a foreign realm's globals active.
         // Refuse the optional splice before preparing any ambient proofs.
-        let small = context.exec_function(fid).is_some_and(|function| {
-            function.bytecode_byte_len() <= jit::JIT_SMALL_INLINE_BYTECODE_BYTES
-        });
+        let instructions = context
+            .exec_function(fid)
+            .map_or(u32::MAX, |function| function.instruction_count());
         if self.jit_retraining_blocks(fid)
             || self.foreign_function_realm(fid).is_some()
-            || !budget.enter(small)
+            || !budget.enter(instructions, site_frequency)
         {
             return None;
         }
@@ -2487,6 +2488,11 @@ impl Interpreter {
                 self.bake_unique_closure_context(&mut body);
             }
             self.bake_optimized_exit_profile(&mut body, fid);
+            body.optimized_inlined_instructions = self
+                .jit_optimized_code
+                .get(&fid)
+                .and_then(Option::as_ref)
+                .map_or(0, |code| code.inlined_instructions());
             Some(std::sync::Arc::new(body))
         })();
         budget.leave();
@@ -2608,6 +2614,14 @@ impl Interpreter {
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
     ) {
+        view.call_frequencies = view
+            .instructions
+            .iter()
+            .filter_map(|instr| {
+                let index = instr.instruction_pc(&view.code_block) as usize;
+                Some((instr.byte_pc, view.code_block.call_frequency_at(index)?))
+            })
+            .collect();
         let call_sites: Vec<_> = view
             .instructions
             .iter()
@@ -2926,6 +2940,7 @@ impl Interpreter {
                     callee_fid,
                     tier,
                     budget,
+                    view.call_frequencies.get(&call_byte_pc).copied(),
                     construct_receiver,
                 ) else {
                     self.record_jit_inline_candidate(
@@ -3032,6 +3047,7 @@ impl Interpreter {
                     target_count,
                     tier,
                     budget,
+                    view.call_frequencies.get(&snap.call_byte_pc).copied(),
                 ) {
                     Ok(mut method) => {
                         if snap.accessor_byte.is_some() {
@@ -3189,6 +3205,7 @@ impl Interpreter {
         target_count: u32,
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
+        site_frequency: Option<f32>,
     ) -> Result<jit::JitDirectMethod, jit_debug::JitDirectCallRejectionReason> {
         let method_context = context
             .for_function(target.method_fid)
@@ -3212,7 +3229,16 @@ impl Interpreter {
         let mut body = (tier == jit_debug::JitDebugTier::Optimizing
             && !method.requires_argument_frame()
             && method.admits_graph_inlining())
-        .then(|| self.bake_inline_body(&method_context, target.method_fid, tier, budget, None))
+        .then(|| {
+            self.bake_inline_body(
+                &method_context,
+                target.method_fid,
+                tier,
+                budget,
+                site_frequency,
+                None,
+            )
+        })
         .flatten();
         // A proven holder slot fixes the closure the body runs as, so the
         // body may read that closure's watched context slots as constants.
@@ -3585,6 +3611,7 @@ mod tests {
                     0,
                     crate::jit_debug::JitDebugTier::Optimizing,
                     &mut budget,
+                    None,
                     None
                 )
                 .is_none()

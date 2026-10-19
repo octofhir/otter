@@ -133,19 +133,21 @@ fn setup(mutual: bool) -> String {
     format!(
         r#"
 recursiveStress(0);
-globalThis.__recursiveNext = 1;
+// The next depth is an element of generic storage: a body reads it without
+// a speculation on its value, so the miss reaches the innermost body.
+globalThis.__recursiveNext = [1, {{}}];
 globalThis.__recursiveSentinel = {{ child: {{ tag: 17 }} }};
 globalThis.__recursiveCoercions = 0;
 globalThis.__recursiveThrow = false;
 globalThis.__recursiveGarbage = {{ phase: 0 }};
 function recursiveA(n, retained) {{
   if (n <= 0) return retained;
-  const next = n === 2 ? globalThis.__recursiveNext : n - 1;
+  const next = n === 2 ? globalThis.__recursiveNext[0] : n - 1;
   return {callee}(next, retained);
 }}
 function recursiveB(n, retained) {{
   if (n <= 0) return retained;
-  const next = n === 2 ? globalThis.__recursiveNext : n - 1;
+  const next = n === 2 ? globalThis.__recursiveNext[0] : n - 1;
   return recursiveA(next, retained);
 }}
 globalThis.__recursiveCoercible = {{
@@ -177,7 +179,7 @@ fn miss(throwing: bool) -> String {
         r#"
 (function recursiveMissProbe() {{
 recursiveStress(0);
-globalThis.__recursiveNext = globalThis.__recursiveCoercible;
+globalThis.__recursiveNext[0] = globalThis.__recursiveCoercible;
 globalThis.__recursiveCoercions = 0;
 globalThis.__recursiveThrow = {throwing};
 globalThis.__recursiveSentinel = {{ child: {{ tag: 17 }} }};
@@ -323,9 +325,9 @@ fn recursive_splices_keep_distinct_frames_and_move_recovered_aliases_once() {
                     .iter()
                     .all(|&(parent, callee, _, cost)| fids.contains(&parent)
                         && fids.contains(&callee)
-                        && cost <= 460)
+                        && cost <= otter_vm::jit::JIT_MAX_INLINED_INSTRUCTIONS)
             );
-            assert!(splices.iter().map(|splice| splice.3).sum::<u32>() <= 920);
+            assert!(splices.iter().map(|splice| splice.3).sum::<u32>() <= 1600);
             assert_eq!(splices.iter().any(|splice| splice.0 == splice.1), !mutual);
             let artifacts = warm.jit_artifacts().unwrap();
             assert!(!artifacts.truncated());

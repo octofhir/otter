@@ -200,7 +200,7 @@ fn captured_splices_report_exact_nested_source_owners_and_budget_bytes() {
                 byte_pc: 0,
                 callee_function_id: 92,
                 depth: 1,
-                cost: middle.code_block.bytecode_byte_len(),
+                cost: middle.code_block.instruction_count(),
                 outcome: JitInlineLoweringOutcome::Inlined,
             },
             JitCompilerDiagnostic::InlineLowered {
@@ -209,7 +209,7 @@ fn captured_splices_report_exact_nested_source_owners_and_budget_bytes() {
                 byte_pc: 0,
                 callee_function_id: 91,
                 depth: 2,
-                cost: leaf.code_block.bytecode_byte_len(),
+                cost: leaf.code_block.instruction_count(),
                 outcome: JitInlineLoweringOutcome::Inlined,
             },
         ]

@@ -67,8 +67,7 @@ struct Edge {
 /// enters, jumping to a block that is no loop header.
 fn edge(graph: &Graph, branch: BlockId, split: BlockId) -> Option<Edge> {
     let data = graph.block(split);
-    if data.predecessors.as_slice() != [branch] || !data.phis.is_empty() || !data.body.is_empty()
-    {
+    if data.predecessors.as_slice() != [branch] || !data.phis.is_empty() || !data.body.is_empty() {
         return None;
     }
     let Kind::Jump(target) = graph.node(data.control?).kind else {

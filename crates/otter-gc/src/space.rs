@@ -1,15 +1,20 @@
-//! Heap spaces: young (semispace), old (free-list), large object.
+//! Heap spaces: young (semispace), old (free-list), large object (old and
+//! young).
 //!
 //! # Contents
 //!
 //! - [`NewSpace`] — pair of semispaces with bump alloc in
-//!   from-space, flipped on scavenge.
+//!   from-space, flipped on scavenge; its capacity starts at
+//!   [`DEFAULT_NEW_SPACE_PAGES`] and doubles once the scavenges since its
+//!   last growth kept a whole capacity alive.
 //! - [`OldSpace`] — list of pages plus a size-classed free list over
 //!   swept holes, with intrusive links and a nonempty-class bitmap;
 //!   allocation reuses holes first, then bumps, then
 //!   grows; pages get marked-and-swept on a full GC.
 //! - [`LargeObjectSpace`] — one region per oversized allocation,
-//!   spanning as many consecutive pages as the body needs.
+//!   spanning as many consecutive pages as the body needs. The young one
+//!   holds large bodies the nursery admitted; a scavenge hands survivors'
+//!   regions to the old one and releases the rest.
 //!
 //! # Invariants
 //!
@@ -22,6 +27,8 @@
 //! - Old allocation reuses swept holes, then available page tails. Promotion
 //!   preflight guarantees capacity before the first forwarding write; existing
 //!   contiguous tail space can satisfy that guarantee without standby pages.
+//! - A semispace never holds more pages than its capacity: allocation past
+//!   it is a scavenge, never a growth.
 //! - Unused standby pages stay reserved across scavenges, so a steady nursery
 //!   cycle neither zeroes nor re-faults promotion pages. A full collection's
 //!   page reap returns them to the cage.
@@ -35,13 +42,13 @@ use crate::oom::OutOfMemory;
 use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, PAGE_PAYLOAD_SIZE, PAGE_SIZE};
 use crate::page::{LARGE_OBJECT_THRESHOLD, Page, SpaceKind, align_up};
 
-/// Young-gen pages per semispace at creation. With 256 KiB pages
-/// this gives a 4 MiB nursery.
+/// Young-gen pages per semispace at creation, its starting capacity. With
+/// 256 KiB pages this gives a 4 MiB nursery.
 pub const DEFAULT_NEW_SPACE_PAGES: usize = 16;
 
-/// Most pages a semispace grows to: 32 MiB. A larger nursery gives
-/// short-lived objects more allocation to die in before a scavenge copies
-/// them.
+/// Most pages a semispace's capacity grows to: 32 MiB. A larger nursery
+/// gives short-lived objects more allocation to die in before a scavenge
+/// copies them.
 pub const MAX_NEW_SPACE_PAGES: usize = 128;
 
 /// Two-semispace young generation.
@@ -58,7 +65,10 @@ pub struct NewSpace {
     /// Pages before it are full for every request: each object is at most
     /// half a page, so a page is left only once it is more than half full.
     to_active: usize,
-    /// Maximum pages each semispace may grow to.
+    /// Pages each semispace holds before a scavenge is due: the nursery's
+    /// capacity, doubled by [`Self::grow_capacity`] once enough survives.
+    capacity: usize,
+    /// Most pages the capacity may grow to.
     max_pages: usize,
 }
 
@@ -66,13 +76,8 @@ impl NewSpace {
     /// Create a fresh new-space with `initial_pages` pages on
     /// each side.
     pub fn new(initial_pages: usize) -> Result<Self, OutOfMemory> {
-        // The nursery STARTS at `initial_pages` and GROWS up to
-        // `MAX_NEW_SPACE_PAGES`. The previous `clamp(initial, DEFAULT,
-        // MAX)` set the cap *equal to* the initial size (16), so the
-        // semispace could never grow — every nursery-sized live set
-        // deadlocked the copying scavenger (no room freed) and fell
-        // back to old-space overflow on every alloc. Cap at the real
-        // maximum; only the starting page count comes from the arg.
+        // The capacity starts at `initial_pages` and grows, after scavenges
+        // whose survivors filled it, up to `MAX_NEW_SPACE_PAGES`.
         let max_pages = MAX_NEW_SPACE_PAGES;
         let initial_pages = initial_pages.clamp(1, max_pages);
         let mut from = Vec::with_capacity(initial_pages);
@@ -87,14 +92,27 @@ impl NewSpace {
             cleanup: Vec::new(),
             active: 0,
             to_active: 0,
+            capacity: initial_pages,
             max_pages,
         })
     }
 
-    /// Whether each semispace already holds its largest page count.
+    /// Whether the capacity is already at its largest page count.
     #[must_use]
     pub fn at_maximum(&self) -> bool {
-        self.from.len() >= self.max_pages
+        self.capacity >= self.max_pages
+    }
+
+    /// The nursery's capacity in bytes: one semispace's pages.
+    #[must_use]
+    pub fn capacity_bytes(&self) -> usize {
+        self.capacity * crate::page::PAGE_SIZE
+    }
+
+    /// Double the capacity, up to its maximum. The pages arrive as
+    /// allocation reaches them.
+    pub fn grow_capacity(&mut self) {
+        self.capacity = (self.capacity * 2).min(self.max_pages);
     }
 
     /// Track a fresh from-space body whose type has a reclamation hook.
@@ -130,7 +148,7 @@ impl NewSpace {
                 continue;
             }
             // No bump slot in current pages; grow if quota allows.
-            if self.from.len() < self.max_pages {
+            if self.from.len() < self.capacity {
                 let extra_from = Page::new(SpaceKind::NewFrom)?;
                 let extra_to = Page::new(SpaceKind::NewTo)?;
                 self.from.push(extra_from);
@@ -165,7 +183,7 @@ impl NewSpace {
                 active += 1;
                 continue;
             }
-            if self.from.len() < self.max_pages {
+            if self.from.len() < self.capacity {
                 let extra_from = Page::new(SpaceKind::NewFrom)?;
                 let extra_to = Page::new(SpaceKind::NewTo)?;
                 self.from.push(extra_from);
@@ -195,7 +213,7 @@ impl NewSpace {
     /// True if we hold no allocation room in `from` without
     /// growing past the cap.
     pub fn from_full(&self) -> bool {
-        self.active >= self.from.len() && self.from.len() >= self.max_pages
+        self.active >= self.from.len() && self.from.len() >= self.capacity
     }
 
     /// Iterate over the from-space pages.
@@ -696,15 +714,52 @@ impl Default for OldSpace {
 
 /// Large-object space: one page per oversized allocation.
 /// Allocations whose total size exceeds [`LARGE_OBJECT_THRESHOLD`]
-/// land here regardless of generation.
+/// land in the old one, or in the young one ([`SpaceKind::NewLarge`])
+/// while the nursery admits them.
 pub struct LargeObjectSpace {
+    kind: SpaceKind,
     pages: Vec<Page>,
 }
 
 impl LargeObjectSpace {
-    /// Empty LOS.
+    /// Empty old LOS.
     pub fn new() -> Self {
-        Self { pages: Vec::new() }
+        Self::of_kind(SpaceKind::Large)
+    }
+
+    /// Empty young LOS.
+    pub fn new_young() -> Self {
+        Self::of_kind(SpaceKind::NewLarge)
+    }
+
+    fn of_kind(kind: SpaceKind) -> Self {
+        debug_assert!(matches!(kind, SpaceKind::Large | SpaceKind::NewLarge));
+        Self {
+            kind,
+            pages: Vec::new(),
+        }
+    }
+
+    /// Hand every page to `old` (whose kind it takes) when `promoted` holds
+    /// for its object, and release the others; returns the released pages'
+    /// allocated bytes. The young space ends empty.
+    pub fn promote_or_release(
+        &mut self,
+        old: &mut Self,
+        mut promoted: impl FnMut(&Page) -> bool,
+    ) -> usize {
+        debug_assert_eq!(self.kind, SpaceKind::NewLarge);
+        debug_assert_eq!(old.kind, SpaceKind::Large);
+        let mut released = 0;
+        for page in self.pages.drain(..) {
+            if promoted(&page) {
+                page.set_space(SpaceKind::Large);
+                old.pages.push(page);
+            } else {
+                released += page.header().allocated_bytes;
+            }
+        }
+        released
     }
 
     /// Allocate one page for `size_aligned` bytes (caller has
@@ -725,7 +780,7 @@ impl LargeObjectSpace {
             requested_bytes: size_aligned as u64,
             max_bytes: u64::from(u32::MAX) * PAGE_SIZE as u64,
         })?;
-        let page = Page::new_spanning(SpaceKind::Large, span).ok_or(OutOfMemory::CageExhausted)?;
+        let page = Page::new_spanning(self.kind, span).ok_or(OutOfMemory::CageExhausted)?;
         let offset = page
             .bump_alloc(size_aligned)
             .ok_or(OutOfMemory::CageExhausted)?;

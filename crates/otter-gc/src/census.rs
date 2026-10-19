@@ -92,6 +92,8 @@ pub struct HeapCensus {
     pub young: SpaceCensus,
     /// Large-object space.
     pub large: SpaceCensus,
+    /// Young large-object space.
+    pub young_large: SpaceCensus,
 }
 
 impl HeapCensus {
@@ -99,7 +101,7 @@ impl HeapCensus {
     #[must_use]
     pub fn render_text(&self) -> String {
         let mut out = String::with_capacity(4096);
-        for space in [&self.old, &self.young, &self.large] {
+        for space in [&self.old, &self.young, &self.large, &self.young_large] {
             render_space(&mut out, space);
         }
         out
@@ -232,11 +234,17 @@ impl GcHeap {
             }
             (space, acc.finish(self, space, pages.len(), allocated))
         });
-        // `census_spaces` yields old, young, large in that order.
+        // `census_spaces` yields old, young, large, young large in that order.
+        let young_large = std::mem::replace(&mut spaces[3].1, empty_space(SpaceKind::NewLarge));
         let large = std::mem::replace(&mut spaces[2].1, empty_space(SpaceKind::Large));
         let young = std::mem::replace(&mut spaces[1].1, empty_space(SpaceKind::NewFrom));
         let old = std::mem::replace(&mut spaces[0].1, empty_space(SpaceKind::Old));
-        HeapCensus { old, young, large }
+        HeapCensus {
+            old,
+            young,
+            large,
+            young_large,
+        }
     }
 
     /// Visit every live body whose type tag is `T::TYPE_TAG`,

@@ -562,7 +562,7 @@ unsafe fn visit_concurrent(
             // cell's header may still be in the mutator's hands.
             if !matches!(
                 Page::space_of(child as *const u8),
-                SpaceKind::NewFrom | SpaceKind::NewTo
+                SpaceKind::NewFrom | SpaceKind::NewTo | SpaceKind::NewLarge
             ) && (*child).try_shade_gray()
             {
                 local.push(child as usize);

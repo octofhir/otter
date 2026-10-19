@@ -39,10 +39,12 @@ fn failed_group_promotion_preserves_roots_and_a_smaller_canonical_source_prefix(
     heap.collect_minor_with_roots(&mut |_| {}).unwrap();
     let aged = survivor;
     // Each actual large allocation occupies a cage page. Retain the cells in
-    // the nursery-independent large space; no collection occurs on cage OOM.
+    // the old large space, outside the nursery's capacity; no collection
+    // occurs on cage OOM.
     // SAFETY: the heap-owned handle arena outlives every pressure handle.
     let pressure_scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
     let mut large = Vec::new();
+    let tenured = heap.always_allocate_scope();
     loop {
         match heap.alloc_trailing_with_roots(Cell { word: 0xdead }, 200 * 1024, &mut |_| {}) {
             Ok(value) => large.push(pressure_scope.local(value)),
@@ -50,6 +52,7 @@ fn failed_group_promotion_preserves_roots_and_a_smaller_canonical_source_prefix(
             Err(error) => panic!("unexpected real cage pressure: {error:?}"),
         }
     }
+    drop(tenured);
     assert!(!large.is_empty());
     let allocate = heap.always_allocate_scope();
     let cell_bytes = otter_gc::header::HEADER_SIZE + std::mem::size_of::<Cell>();

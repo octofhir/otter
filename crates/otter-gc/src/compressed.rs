@@ -689,8 +689,7 @@ impl Cage {
         // while the mutex is held.
         unsafe {
             let page_ptr = cage.base.add(idx as usize * PAGE_SIZE);
-            core::ptr::write_bytes(page_ptr, 0, count as usize * PAGE_SIZE);
-            advise_freed_page(page_ptr);
+            decommit_zeroed(page_ptr, count as usize * PAGE_SIZE);
         }
         cage.release_run(idx, count);
     }
@@ -701,24 +700,28 @@ impl Cage {
         debug_assert!(offset.is_multiple_of(PAGE_SIZE as u32));
         debug_assert!(offset / (PAGE_SIZE as u32) < cage.page_count);
         let idx = offset / (PAGE_SIZE as u32);
-        // Zero the page so reuse always sees a fresh PageHeader.
         // SAFETY: `idx` is in-range, so this address is inside the cage page
         // currently being returned to the free-list.
         let page_ptr = unsafe { cage.base.add(idx as usize * PAGE_SIZE) };
         // SAFETY: `page_ptr` is in-range, page memory belongs to the cage and
         // is owned by the cage allocator (we hold the mutex).
-        unsafe {
-            core::ptr::write_bytes(page_ptr, 0, PAGE_SIZE);
-        }
-        advise_freed_page(page_ptr);
+        unsafe { decommit_zeroed(page_ptr, PAGE_SIZE) };
         cage.release_run(idx, 1);
     }
 
-    /// Return the cage's free-page count for diagnostics.
+    /// Whether the page at cage offset `offset` is free: in a released run
+    /// or the untouched tail.
     #[cfg(test)]
-    pub(crate) fn free_page_count() -> usize {
+    pub(crate) fn is_free_page(offset: u32) -> bool {
         let guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
-        guard.as_ref().map(Cage::available_pages).unwrap_or(0)
+        let cage = guard.as_ref().expect("cage not initialised");
+        let index = offset / PAGE_SIZE as u32;
+        index >= cage.next_fresh
+            || cage
+                .free_runs
+                .range(..=index)
+                .next_back()
+                .is_some_and(|(&start, &len)| index < start + len)
     }
 
     pub(crate) fn stats() -> Option<CageStats> {
@@ -739,18 +742,39 @@ impl Cage {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn advise_freed_page(page: *mut u8) {
-    // The cage keeps freed pages for reuse, but macOS otherwise tends to keep
-    // their physical footprint charged to the process. `MADV_FREE` preserves
-    // cheap reuse while letting the kernel reclaim zeroed pages under pressure.
-    // SAFETY: `page` is PAGE_SIZE-aligned, lies inside the cage reservation, and
-    // no live GC object may reference it after `Cage::free_page`'s precondition.
-    let _ = unsafe { libc::madvise(page.cast::<libc::c_void>(), PAGE_SIZE, libc::MADV_FREE) };
+/// Give the physical memory of `len` freed cage bytes at `ptr` back to the
+/// system and leave them reading as zero, so reuse sees a fresh page header.
+/// A fresh anonymous mapping over the range releases the memory at once,
+/// where zeroing would fault every page in and a lazy advice would leave it
+/// charged to the process until memory pressure; the address range stays
+/// reserved and writable. Should the remap fail, the range is zeroed in
+/// place.
+///
+/// # Safety
+///
+/// `ptr..ptr + len` is page-aligned, inside the cage reservation, and no
+/// live GC object refers to it.
+unsafe fn decommit_zeroed(ptr: *mut u8, len: usize) {
+    #[cfg(unix)]
+    {
+        // SAFETY: per docstring; MAP_FIXED replaces exactly this owned range.
+        let mapped = unsafe {
+            libc::mmap(
+                ptr.cast::<libc::c_void>(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if mapped == ptr.cast::<libc::c_void>() {
+            return;
+        }
+    }
+    // SAFETY: per docstring.
+    unsafe { core::ptr::write_bytes(ptr, 0, len) };
 }
-
-#[cfg(not(target_os = "macos"))]
-fn advise_freed_page(_page: *mut u8) {}
 
 impl Drop for Cage {
     fn drop(&mut self) {

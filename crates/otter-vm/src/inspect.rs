@@ -464,7 +464,12 @@ impl HeapSnapshotSummary {
     pub fn from_census(census: &otter_gc::HeapCensus) -> Self {
         let mut bytes = [0u64; 256];
         let mut counts = [0u64; 256];
-        for space in [&census.old, &census.young, &census.large] {
+        for space in [
+            &census.old,
+            &census.young,
+            &census.large,
+            &census.young_large,
+        ] {
             for row in &space.rows {
                 let tag = row.type_tag as usize;
                 bytes[tag] = bytes[tag].saturating_add(row.bytes);

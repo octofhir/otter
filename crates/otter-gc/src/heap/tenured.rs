@@ -116,27 +116,26 @@ impl GcHeap {
         {
             return Ok(self.publish_old_lab_cell(address, aligned, value, extra_bytes, initialize));
         }
-        if aligned <= LARGE_OBJECT_THRESHOLD && self.machine_allocation_allowed() {
-            let pending_value = std::ptr::addr_of_mut!(value);
-            let mut allocation_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                external_visit(visitor);
-                // SAFETY: `pending_value` is the unpublished payload on this
-                // frame; a collection may rewrite its slots before the copy.
-                unsafe { T::trace_pending_slots(pending_value, visitor) };
-            };
+        let pending_value = std::ptr::addr_of_mut!(value);
+        let mut allocation_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            // SAFETY: `pending_value` is the unpublished payload on this
+            // frame; a collection may rewrite its slots before the copy.
+            unsafe { T::trace_pending_slots(pending_value, visitor) };
+        };
+        // Old growth answers to the old-generation limit, a large body's
+        // page included.
+        if aligned > LARGE_OBJECT_THRESHOLD || self.machine_allocation_allowed() {
             self.maybe_major_gc(&mut allocation_roots)?;
-            if self.machine_allocation_allowed() && self.refill_old_lab(aligned) {
-                let Some(address) = self.old_lab.bump(aligned) else {
-                    unreachable!("a refilled old buffer holds the cell it was sized for");
-                };
-                return Ok(self.publish_old_lab_cell(
-                    address,
-                    aligned,
-                    value,
-                    extra_bytes,
-                    initialize,
-                ));
-            }
+        }
+        if aligned <= LARGE_OBJECT_THRESHOLD
+            && self.machine_allocation_allowed()
+            && self.refill_old_lab(aligned)
+        {
+            let Some(address) = self.old_lab.bump(aligned) else {
+                unreachable!("a refilled old buffer holds the cell it was sized for");
+            };
+            return Ok(self.publish_old_lab_cell(address, aligned, value, extra_bytes, initialize));
         }
         self.alloc_old_with_roots_inner(value, true, extra_bytes, external_visit, initialize)
     }

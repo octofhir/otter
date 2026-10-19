@@ -54,6 +54,11 @@
 //! its page's age. Children of remembered old parents and of freshly promoted
 //! bodies are promoted at once.
 //!
+//! A young large cell is never copied. The first visit to reach it clears
+//! its young bit in one atomic step and queues it like a promoted copy; the
+//! heap then moves its region to the old large object space and releases
+//! every young large region no visit reached.
+//!
 //! # Contents
 //!
 //! - [`ScavengeStats`] — counters returned by `scavenge`.
@@ -100,6 +105,9 @@ pub struct ScavengeStats {
     pub copied_bytes: usize,
     /// Physical aligned cell bytes promoted to old-space.
     pub promoted_bytes: usize,
+    /// Young large cells promoted in place: their pages join the old large
+    /// object space.
+    pub promoted_large_bytes: usize,
     /// Physical nursery bytes reclaimed after successful evacuation. The
     /// preflight already totals exact allocated input bytes; copied/promoted
     /// cells retain their aligned header sizes and are deducted once.
@@ -131,6 +139,7 @@ impl ScavengeStats {
     fn absorb(&mut self, other: &Self) {
         self.copied_bytes += other.copied_bytes;
         self.promoted_bytes += other.promoted_bytes;
+        self.promoted_large_bytes += other.promoted_large_bytes;
         self.slot_updates += other.slot_updates;
         self.root_slots_scanned += other.root_slots_scanned;
         self.dirty_cards_scanned += other.dirty_cards_scanned;
@@ -694,6 +703,13 @@ impl<'s> Worker<'s> {
             // new-space pages are exactly the young ones.
             match Page::space_of(header_ptr as *const u8) {
                 SpaceKind::Old | SpaceKind::Large => {}
+                // A young large cell stays where it is; the first visit
+                // promotes it, so the slot never needs remembering.
+                SpaceKind::NewLarge => {
+                    if (*header_ptr).is_young() {
+                        self.promote_large(header_ptr);
+                    }
+                }
                 SpaceKind::NewTo => {
                     // Already evacuated during this scavenge: still young.
                     if self.parent_old {
@@ -756,10 +772,7 @@ impl<'s> Worker<'s> {
             let Some(parent_header) = parent_header else {
                 return;
             };
-            debug_assert!(matches!(
-                Page::space_of(parent_header as *const u8),
-                SpaceKind::Old | SpaceKind::Large
-            ));
+            debug_assert!(is_old_body(parent_header));
             if !(*parent_header).is_remembered() {
                 (*parent_header).set_remembered();
                 // Parent is old/large and in-cage; old objects do not move
@@ -768,6 +781,36 @@ impl<'s> Worker<'s> {
                 let offset = (parent_header as usize - self.shared.cage as usize) as u32;
                 self.remembered.push(RawGc(offset));
             }
+        }
+    }
+
+    /// Promote a young large cell in place: the visit that clears its young
+    /// bit queues it for tracing as a promoted body; the heap moves its page
+    /// to the old large object space after the scavenge.
+    ///
+    /// # Safety
+    ///
+    /// `header` must reference a cell on a young large object page.
+    #[inline(never)]
+    unsafe fn promote_large(&mut self, header: *mut GcHeader) {
+        // SAFETY: per docstring; only the winning visit writes the header.
+        unsafe {
+            if !(*header).try_promote_in_place() {
+                return;
+            }
+            let offset = (header as usize - self.shared.cage as usize) as u32;
+            let site = (*header).allocation_site();
+            if site != 0 {
+                self.shared.sites.record_found(site);
+                GcHeader::set_allocation_site(header, 0);
+            }
+            if self.shared.marking {
+                // An old cell born while marking runs: the marker visits it.
+                (*header).set_mark_color(crate::header::MarkColor::Gray);
+                self.promoted_gray.push(RawGc(offset));
+            }
+            self.stats.promoted_large_bytes += (*header).size_bytes() as usize;
+            self.local.push(offset | PROMOTED_ENTRY);
         }
     }
 
@@ -1155,7 +1198,11 @@ impl<'s> Worker<'s> {
                 // Fixpoint progress = new evacuations only: a re-scanned slot
                 // that merely rewrites to an existing forwarding target is
                 // not progress.
-                let before = (self.stats.copied_bytes, self.stats.promoted_bytes);
+                let before = (
+                    self.stats.copied_bytes,
+                    self.stats.promoted_bytes,
+                    self.stats.promoted_large_bytes,
+                );
 
                 for &slot in ephemeron_registry_slots {
                     if !self.update_registry_slot_if_forwarded(slot) {
@@ -1171,7 +1218,12 @@ impl<'s> Worker<'s> {
 
                 self.drain_local();
 
-                if (self.stats.copied_bytes, self.stats.promoted_bytes) == before {
+                if (
+                    self.stats.copied_bytes,
+                    self.stats.promoted_bytes,
+                    self.stats.promoted_large_bytes,
+                ) == before
+                {
                     break;
                 }
             }
@@ -1263,10 +1315,12 @@ unsafe fn copy_cell(src: *const u8, dst: *mut u8, bytes: usize) {
 #[inline]
 unsafe fn is_old_body(header: *const GcHeader) -> bool {
     // SAFETY: per docstring, the page header precedes the object.
-    matches!(
-        unsafe { Page::space_of(header.cast::<u8>()) },
-        SpaceKind::Old | SpaceKind::Large
-    )
+    match unsafe { Page::space_of(header.cast::<u8>()) } {
+        SpaceKind::Old | SpaceKind::Large => true,
+        // Promoted in place earlier in this scavenge.
+        SpaceKind::NewLarge => unsafe { !(*header).is_young() },
+        _ => false,
+    }
 }
 
 /// Whether a body came from the old remembered set or a worklist.

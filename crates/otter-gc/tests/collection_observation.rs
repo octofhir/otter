@@ -81,12 +81,18 @@ fn natural_major_pressure_includes_nested_minor_and_accounting_in_one_event() {
     heap.set_initial_old_generation_size(8 * 1024 * 1024);
     heap.start_gc_pause_capture(32).expect("capture");
     let before = heap.gc_stats().gc_cycles;
-    // Each dead large cell consumes an actual old/large page. This crosses the
-    // configured initial old-generation limit; there is no manual collection
-    // or stress tick.
+    // Each dead tenured large cell consumes an actual old large page. This
+    // crosses the configured initial old-generation limit; there is no manual
+    // collection or stress tick.
     for i in 0..80u64 {
-        heap.alloc_trailing_with_roots(OpaqueLeaf { payload: i }, 200 * 1024, &mut |_| {})
-            .expect("dead large traffic");
+        heap.alloc_trailing_at_site_with_roots_initialized(
+            OpaqueLeaf { payload: i },
+            200 * 1024,
+            otter_gc::SitePlacement::Old,
+            &mut |_| {},
+            |_| {},
+        )
+        .expect("dead large traffic");
     }
     let after = heap.gc_stats().gc_cycles;
     let capture = heap.take_gc_pause_capture().expect("take");

@@ -76,9 +76,7 @@ impl Interpreter {
         let (fid, pc) = crate::runtime_activation::semantic_source::frame_semantic_source(
             self, context, caller,
         )?;
-        let owner = context
-            .for_function(fid)
-            .map_err(|_| VmError::InvalidOperand)?;
+        let owner = self.owner_of(context, fid)?;
         let function = owner.exec_function(fid).ok_or(VmError::InvalidOperand)?;
         let instruction = function
             .instr_at_index(pc as usize)

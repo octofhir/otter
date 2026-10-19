@@ -189,9 +189,7 @@ impl Interpreter {
         parent: u16,
         scope_index: u32,
     ) -> Result<(), VmError> {
-        let resolved = context
-            .for_function(frame.function_id())
-            .map_err(|_| VmError::InvalidOperand)?;
+        let resolved = self.owner_of(context, frame.function_id())?;
         self.frame_create_context(&resolved, frame, dst, parent, scope_index)
     }
 

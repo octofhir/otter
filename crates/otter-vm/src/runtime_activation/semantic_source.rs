@@ -53,6 +53,17 @@ pub(crate) fn frame_semantic_source(
 }
 
 impl RuntimeCall<'_> {
+    /// The owner of `function_id` as this call's admitted context names it,
+    /// through the isolate's owner cache.
+    pub(super) fn owner(
+        &self,
+        function_id: u32,
+    ) -> Result<crate::code_space::ResolvedCtx<'_>, VmError> {
+        // SAFETY: RuntimeCall retains the VM; the owner lookup reads its cache
+        // and ends before any exclusive VM borrow.
+        unsafe { self.vm.as_ref() }.owner_of(&self.context, function_id)
+    }
+
     pub(super) fn semantic_source(&self) -> Result<(u32, u32), VmError> {
         // SAFETY: RuntimeCall retains these published records. Metadata reads
         // end before any exclusive VM borrow, allocation or JavaScript reentry.
@@ -65,10 +76,7 @@ impl RuntimeCall<'_> {
 impl RuntimeCall<'_> {
     pub(super) fn published_opcode(&self) -> Result<Op, VmError> {
         let (function_id, instruction_pc) = self.semantic_source()?;
-        let context = self
-            .context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
+        let context = self.owner(function_id)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -84,10 +92,7 @@ impl RuntimeCall<'_> {
     /// The published instruction's string-constant operand at `operand`.
     pub(super) fn published_const_index(&self, operand: u8) -> Result<u32, VmError> {
         let (function_id, instruction_pc) = self.semantic_source()?;
-        let context = self
-            .context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
+        let context = self.owner(function_id)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;

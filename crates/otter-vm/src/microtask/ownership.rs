@@ -33,6 +33,30 @@ impl Interpreter {
         }
     }
 
+    /// The owner of `function_id` as `admitted` names it: `admitted` itself
+    /// when the function runs in its chunk, otherwise the isolate's stable
+    /// cached owner, without searching the code space or copying a context.
+    /// An admitted context of another code space resolves through its own.
+    pub(crate) fn owner_of<'a>(
+        &self,
+        admitted: &'a ExecutionContext,
+        function_id: u32,
+    ) -> Result<crate::code_space::ResolvedCtx<'a>, VmError> {
+        if admitted.resolves_locally(function_id) {
+            return Ok(crate::code_space::ResolvedCtx::Ambient(admitted));
+        }
+        if !std::sync::Arc::ptr_eq(admitted.space(), &self.code_space) {
+            return admitted
+                .for_function(function_id)
+                .map_err(|_| VmError::InvalidOperand);
+        }
+        let owner = self.stable_foreign_owner(function_id)?;
+        // SAFETY: a cached owner keeps its address until the cache releases
+        // its retired owners, which happens only once no execution is in
+        // progress; the admitted context's borrow ends inside the execution.
+        Ok(crate::code_space::ResolvedCtx::Ambient(unsafe { &*owner }))
+    }
+
     /// The owner of a function id outside the ambient chunk, through the
     /// isolate's owner cache: a call into another chunk — a lazily compiled
     /// body is one — resolves its owner without searching the code space.

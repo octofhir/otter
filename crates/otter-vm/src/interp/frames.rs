@@ -145,9 +145,8 @@ impl Interpreter {
         let generator_anchor = self.push_iteration_anchor(Value::generator(generator)) - 1;
         let callee_anchor = self.push_iteration_anchor(callee) - 1;
         let result = (|| -> Result<Value, CommittedValueError> {
-            let owner = context
-                .for_function(function_id)
-                .map_err(|_| VmError::InvalidOperand)
+            let owner = self
+                .owner_of(context, function_id)
                 .map_err(CommittedValueError::Fatal)?;
             let closure = self
                 .iteration_anchor(callee_anchor)

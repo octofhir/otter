@@ -928,9 +928,52 @@ pub(crate) fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     // A RegExp receiver and a string subject need no coercion: the match
     // roots both before it allocates.
     let receiver = *ctx.this_value();
-    if receiver.as_regexp().is_some()
+    if let Some(regexp) = receiver.as_regexp()
         && let Some(input) = args.first().and_then(|input| input.as_string(ctx.heap()))
     {
+        // An int32 `lastIndex` and a contiguous subject match directly; the
+        // array then comes from one reservation, or the scoped builder.
+        if !regexp.flags(ctx.heap()).has_indices {
+            let mut receiver = receiver;
+            let mut argument = Value::string(input);
+            let interp = ctx.interp_mut();
+            match crate::regexp_fast::exec_direct(interp, receiver, argument, false) {
+                Some(Ok(crate::regexp_fast::DirectExec::Done(value))) => return Ok(value),
+                Some(Ok(crate::regexp_fast::DirectExec::Matched(matched))) => {
+                    match crate::regexp_result::build_match_result_folded(
+                        interp,
+                        &mut receiver,
+                        &mut argument,
+                        &matched,
+                    ) {
+                        Ok(Some(result)) => return Ok(result),
+                        Ok(None) => {}
+                        Err(error) => {
+                            return Err(crate::native_function::vm_to_native_error(
+                                interp, error, "RegExp",
+                            ));
+                        }
+                    }
+                    return ctx.scope(|mut scope| {
+                        let input = scope.value(argument);
+                        let result = crate::regexp_prototype::build_match_result_native(
+                            &matched.as_match(),
+                            input,
+                            false,
+                            &mut scope,
+                        )?;
+                        Ok(scope.finish(result))
+                    });
+                }
+                Some(Err(error)) => {
+                    let interp = ctx.interp_mut();
+                    return Err(crate::native_function::vm_to_native_error(
+                        interp, error, "RegExp",
+                    ));
+                }
+                None => {}
+            }
+        }
         return crate::regexp_prototype::exec_once_native(&receiver, input, ctx);
     }
     ctx.scope(|mut scope| {

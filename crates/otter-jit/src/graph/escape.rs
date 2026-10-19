@@ -11,7 +11,8 @@
 //! # Contents
 //! - [`eliminate_allocations`] — select the receivers that do not escape,
 //!   track their fields through the graph and rewrite it.
-//! - [`fold_conversions`] — a number boxed and unboxed again is the number.
+//! - [`fold_conversions`] — a number boxed and unboxed again is the number,
+//!   or the direct conversion between its two representations.
 //! - [`remove_dead_values`] — drop pure values nothing reads.
 //!
 //! # Invariants
@@ -806,9 +807,13 @@ fn copy_chain(
     graph.add_frame_state(copy)
 }
 
-/// Replace a number boxed and unboxed again by the number.
+/// Replace a number boxed and unboxed again by the number, or by the
+/// direct conversion when the two representations differ: a boxed double is
+/// an int32 word exactly when it is an integral int32 other than -0, which is
+/// when the exact conversion succeeds, and a boxed int32 is always a number.
 pub(crate) fn fold_conversions(graph: &mut Graph, layout: &[BlockId]) {
     let mut replace: FxHashMap<NodeId, NodeId> = FxHashMap::default();
+    let mut convert: Vec<(NodeId, Kind, NodeId)> = Vec::new();
     for &block in layout {
         for &node in &graph.block(block).body {
             let data = graph.node(node);
@@ -821,9 +826,24 @@ pub(crate) fn fold_conversions(graph: &mut Graph, layout: &[BlockId]) {
                 | (Kind::CheckedTaggedToInt32, Kind::Int32ToTagged) => {
                     replace.insert(node, boxed.inputs[0]);
                 }
+                (Kind::CheckedTaggedToInt32, Kind::Float64ToTagged) => {
+                    convert.push((node, Kind::CheckedFloat64ToInt32, boxed.inputs[0]));
+                }
+                (Kind::CheckedTaggedToFloat64, Kind::Int32ToTagged) => {
+                    convert.push((node, Kind::Int32ToFloat64, boxed.inputs[0]));
+                }
                 _ => {}
             }
         }
+    }
+    for (node, kind, value) in convert {
+        let data = graph.node_mut(node);
+        // A widening never leaves; an exact narrowing keeps its exit.
+        if kind == Kind::Int32ToFloat64 {
+            data.eager = None;
+        }
+        data.kind = kind;
+        data.inputs = [value].into_iter().collect();
     }
     if replace.is_empty() {
         return;

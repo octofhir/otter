@@ -1935,6 +1935,30 @@ impl<'a> Codegen<'a> {
                     ; mov W(destination), w16
                 );
             }
+            Kind::LoadBackedgeFuel => {
+                let destination = Self::gp(result.expect("a result"));
+                crate::arm64::emit_load_backedge_fuel_cell(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    16,
+                    self.view.backedge_fuel_cell,
+                );
+                dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x16]);
+            }
+            Kind::DecrementBackedgeFuel => {
+                let (fuel, destination) = (Self::gp(input(0)), Self::gp(result.expect("a result")));
+                dynasm!(self.ops ; .arch aarch64 ; sub XSP(destination), XSP(fuel), #1);
+            }
+            Kind::StoreBackedgeFuel => {
+                let fuel = Self::gp(input(0));
+                crate::arm64::emit_load_backedge_fuel_cell(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    16,
+                    self.view.backedge_fuel_cell,
+                );
+                dynasm!(self.ops ; .arch aarch64 ; str X(fuel), [x16]);
+            }
             Kind::LoadTypedArrayLength => {
                 let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
@@ -5402,21 +5426,39 @@ impl<'a> Codegen<'a> {
     fn emit_backedge_poll(&mut self, control: NodeId) -> Result<(), Unsupported> {
         let slow = self.ops.new_dynamic_label();
         let resume = self.ops.new_dynamic_label();
-        crate::arm64::emit_load_backedge_fuel_cell(
-            &mut self.ops,
-            &mut self.relocations,
-            16,
-            self.view.backedge_fuel_cell,
-        );
-        dynasm!(self.ops
-            ; .arch aarch64
-            // An interrupt trip zeroes the countdown.
-            ; ldr x17, [x16]
-            ; subs x17, x17, #1
-            ; str x17, [x16]
-            ; b.le =>slow
-            ; =>resume
-        );
+        let fuel_cell = self.view.backedge_fuel_cell;
+        // A loop whose countdown lives in a register tests it here; the
+        // shared cell is read again after the poll re-armed it.
+        let register_fuel = self
+            .allocation
+            .node(control)
+            .inputs
+            .first()
+            .map(|&location| Self::gp(location));
+        if let Some(fuel) = register_fuel {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp XSP(fuel), #0
+                ; b.le =>slow
+                ; =>resume
+            );
+        } else {
+            crate::arm64::emit_load_backedge_fuel_cell(
+                &mut self.ops,
+                &mut self.relocations,
+                16,
+                fuel_cell,
+            );
+            dynasm!(self.ops
+                ; .arch aarch64
+                // An interrupt trip zeroes the countdown.
+                ; ldr x17, [x16]
+                ; subs x17, x17, #1
+                ; str x17, [x16]
+                ; b.le =>slow
+                ; =>resume
+            );
+        }
         let live = self.allocation.node(control).live_homes.clone();
         let header_pc = self
             .graph
@@ -5493,6 +5535,17 @@ impl<'a> Codegen<'a> {
                     dynasm!(codegen.ops ; .arch aarch64 ; =>label);
                     for &(location, home) in &live {
                         codegen.emit_move(home, location);
+                    }
+                    if let Some(fuel) = register_fuel
+                        && target == resume
+                    {
+                        crate::arm64::emit_load_backedge_fuel_cell(
+                            &mut codegen.ops,
+                            &mut codegen.relocations,
+                            16,
+                            fuel_cell,
+                        );
+                        dynasm!(codegen.ops ; .arch aarch64 ; ldr X(fuel), [x16]);
                     }
                     dynasm!(codegen.ops ; .arch aarch64 ; b =>target);
                 }

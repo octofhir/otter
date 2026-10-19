@@ -206,11 +206,11 @@ fn yielding_microtask_chain_keeps_generation_order() {
         SourceInput::from_javascript(
             r#"
                 globalThis.workOrder = [];
-                queueMicrotask(() => {
+                Promise.resolve().then(() => {
                     workOrder.push(1);
-                    queueMicrotask(() => workOrder.push(3));
+                    Promise.resolve().then(() => workOrder.push(3));
                 });
-                queueMicrotask(() => workOrder.push(2));
+                Promise.resolve().then(() => workOrder.push(2));
             "#,
         ),
         "<work-yield-microtasks>",

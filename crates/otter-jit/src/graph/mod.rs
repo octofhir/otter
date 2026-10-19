@@ -52,6 +52,7 @@
 mod allocation_groups;
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod arm64;
+mod backedge_fuel;
 mod branch_fold;
 mod branch_thread;
 pub(crate) mod builder;
@@ -181,6 +182,7 @@ pub(crate) fn compile(
     branch_thread::thread_boolean_phis(&mut built.graph, &mut built.layout);
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);
     let dependencies = dependency_checks::place(&mut built.graph, view, &built.inline_views);
+    backedge_fuel::carry_in_registers(&mut built.graph, &mut built.layout, &built.loop_headers);
     #[cfg(target_arch = "aarch64")]
     let registers = registers::AARCH64;
     #[cfg(target_arch = "x86_64")]

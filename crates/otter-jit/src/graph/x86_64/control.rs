@@ -183,16 +183,28 @@ impl<'a> Codegen<'a> {
     pub(super) fn emit_backedge_poll(&mut self, node: NodeId) -> Result<(), Unsupported> {
         let slow = self.ops.new_dynamic_label();
         let resume = self.ops.new_dynamic_label();
-        crate::x86_64::values::emit_load_backedge_fuel_cell(
-            &mut self.ops,
-            &mut self.relocations,
-            10,
-            self.view.backedge_fuel_cell,
-        );
-        dynasm!(self.ops ; .arch x64
-            // An interrupt trip zeroes the countdown.
-            ; sub QWORD [r10], 1 ; jle =>slow ; =>resume
-        );
+        let fuel_cell = self.view.backedge_fuel_cell;
+        // A loop whose countdown lives in a register tests it here; the
+        // shared cell is read again after the poll re-armed it.
+        let register_fuel = self
+            .loc(node)
+            .inputs
+            .first()
+            .map(|&location| Self::gp(location));
+        if let Some(fuel) = register_fuel {
+            dynasm!(self.ops ; .arch x64 ; cmp Rq(fuel), 0 ; jle =>slow ; =>resume);
+        } else {
+            crate::x86_64::values::emit_load_backedge_fuel_cell(
+                &mut self.ops,
+                &mut self.relocations,
+                10,
+                fuel_cell,
+            );
+            dynasm!(self.ops ; .arch x64
+                // An interrupt trip zeroes the countdown.
+                ; sub QWORD [r10], 1 ; jle =>slow ; =>resume
+            );
+        }
         let pc = self
             .graph
             .node(node)
@@ -229,6 +241,17 @@ impl<'a> Codegen<'a> {
             ] {
                 dynasm!(codegen.ops ; .arch x64 ; =>label);
                 codegen.restore_live_homes(node);
+                if let Some(fuel) = register_fuel
+                    && target == resume
+                {
+                    crate::x86_64::values::emit_load_backedge_fuel_cell(
+                        &mut codegen.ops,
+                        &mut codegen.relocations,
+                        10,
+                        fuel_cell,
+                    );
+                    dynasm!(codegen.ops ; .arch x64 ; mov Rq(fuel), [r10]);
+                }
                 dynasm!(codegen.ops ; .arch x64 ; jmp =>target);
             }
         }));

@@ -227,7 +227,7 @@ impl Interpreter {
         functions
             .into_iter()
             .filter_map(|fid| {
-                let owner = context.for_function(fid).ok()?;
+                let owner = self.owner_of(context, fid).ok()?;
                 let function = owner.exec_function(fid)?;
                 Some(
                     crate::constructor_fast_path::match_constructor_shape_stores(&owner, function)
@@ -253,7 +253,7 @@ impl Interpreter {
         root: crate::object::ShapeHandle,
         roots: &SyncJsCallRoots,
     ) -> Result<Option<(crate::object::ShapeHandle, usize)>, VmError> {
-        let Ok(owner) = context.for_function(function_id) else {
+        let Ok(owner) = self.owner_of(context, function_id) else {
             return Ok(None);
         };
         let context = &*owner;
@@ -470,7 +470,7 @@ impl Interpreter {
         }
         let mut store_count = 0usize;
         for function_id in chain_functions {
-            let Ok(owner) = context.for_function(function_id) else {
+            let Ok(owner) = self.owner_of(context, function_id) else {
                 continue;
             };
             let Some(function) = owner.exec_function(function_id) else {
@@ -550,8 +550,8 @@ impl Interpreter {
         }
         let derived_function_id = new_target_function_id.filter(|&function_id| {
             function_id != base_function_id
-                && context
-                    .for_function(function_id)
+                && self
+                    .owner_of(context, function_id)
                     .ok()
                     .and_then(|owner| {
                         owner
@@ -602,7 +602,7 @@ impl Interpreter {
         let mut slot = 0u16;
         let mut seen = rustc_hash::FxHashSet::default();
         'functions: for function_id in functions {
-            let Ok(owner) = context.for_function(function_id) else {
+            let Ok(owner) = self.owner_of(context, function_id) else {
                 return Ok(usize::from(slot));
             };
             let Some(function) = owner.exec_function(function_id) else {

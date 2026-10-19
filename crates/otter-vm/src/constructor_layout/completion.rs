@@ -140,9 +140,7 @@ impl Interpreter {
                 let (fid, pc) = crate::runtime_activation::semantic_source::frame_semantic_source(
                     self, context, caller,
                 )?;
-                let source = context
-                    .for_function(fid)
-                    .map_err(|_| crate::VmError::InvalidOperand)?;
+                let source = self.owner_of(context, fid)?;
                 let function = source
                     .exec_function(fid)
                     .ok_or(crate::VmError::InvalidOperand)?;
@@ -241,9 +239,9 @@ pub unsafe extern "C" fn constructor_terminal(
     // unrelated-space admission resolves through this VM's actual CodeSpace.
     // No owned copy of an already resolved context is needed by this leaf.
     let context = match unsafe { activation.context.as_ref() } {
-        Some(context) if std::sync::Arc::ptr_eq(context.space(), &vm.code_space) => context
-            .for_function(frame.header.function_id)
-            .map_err(|_| crate::VmError::InvalidOperand),
+        Some(context) if std::sync::Arc::ptr_eq(context.space(), &vm.code_space) => {
+            vm.owner_of(context, frame.header.function_id)
+        }
         _ => vm
             .function_context(None, frame.header.function_id)
             .map(crate::code_space::ResolvedCtx::Owned),

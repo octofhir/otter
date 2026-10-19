@@ -50,10 +50,7 @@ impl RuntimeCall<'_> {
     pub fn construct_values(&mut self, values: &[Value]) -> Result<Value, VmError> {
         let (callee, args) = values.split_first().ok_or(VmError::InvalidOperand)?;
         let (function_id, call_pc) = self.semantic_source()?;
-        let context = self
-            .context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
+        let context = self.owner(function_id)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -87,10 +84,7 @@ impl RuntimeCall<'_> {
         let (callee, rest) = values.split_first().ok_or(VmError::InvalidOperand)?;
         let (receiver, args) = rest.split_first().ok_or(VmError::InvalidOperand)?;
         let (function_id, call_pc) = self.semantic_source()?;
-        let context = self
-            .context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
+        let context = self.owner(function_id)?;
         let function = context
             .exec_function(function_id)
             .ok_or(VmError::InvalidOperand)?;
@@ -139,9 +133,7 @@ impl RuntimeCall<'_> {
             .map_err(CommittedValueError::Fatal)?;
         let (function_id, call_pc) = self.semantic_source().map_err(CommittedValueError::Fatal)?;
         let context = self
-            .context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)
+            .owner(function_id)
             .map_err(CommittedValueError::Fatal)?;
         let function = context
             .exec_function(function_id)
@@ -198,9 +190,7 @@ impl RuntimeCall<'_> {
         };
         let (function_id, call_pc) = self.semantic_source().map_err(CommittedValueError::Fatal)?;
         let context = self
-            .context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)
+            .owner(function_id)
             .map_err(CommittedValueError::Fatal)?;
         let function = context
             .exec_function(function_id)
@@ -352,10 +342,7 @@ impl RuntimeCall<'_> {
         // SAFETY: the branded runtime call exclusively owns VM access and its
         // published native roots remain active through the shared allocator.
         let (function_id, pc) = self.semantic_source()?;
-        let owner = self
-            .context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
+        let owner = self.owner(function_id)?;
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let placement = vm.literal_site_placement(
             owner
@@ -396,10 +383,7 @@ impl RuntimeCall<'_> {
     /// copied before collection.
     pub fn new_object_literal_value(&mut self, values: &[Value]) -> Result<Value, VmError> {
         let (function_id, pc) = self.semantic_source()?;
-        let owner = self
-            .context
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)?;
+        let owner = self.owner(function_id)?;
         let first_key = {
             let function = owner
                 .exec_function(function_id)
@@ -552,10 +536,8 @@ impl RuntimeCall<'_> {
     ) -> Result<Value, CommittedValueError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let ambient = &self.context;
-        let context = ambient
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)
+        let context = self
+            .owner(function_id)
             .map_err(CommittedValueError::Fatal)?;
         vm.jit_runtime_load_property_value(stack, &context, function_id, instruction_pc, receiver)
     }
@@ -572,10 +554,8 @@ impl RuntimeCall<'_> {
     ) -> Result<(), CommittedValueError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         let stack = unsafe { &mut *self.stack.as_ptr() };
-        let ambient = &self.context;
-        let context = ambient
-            .for_function(function_id)
-            .map_err(|_| VmError::InvalidOperand)
+        let context = self
+            .owner(function_id)
             .map_err(CommittedValueError::Fatal)?;
         // Every tier enters the same committed store and publishes the same
         // eligible action facts for subsequent live shared-table probes.

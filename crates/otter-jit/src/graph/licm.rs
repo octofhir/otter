@@ -150,6 +150,7 @@ fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
             &[R::InvalidElementIndex]
         }
         Kind::CheckBounds => &[R::BoundsGuard],
+        Kind::StringCharCodeAt => &[R::TypeMismatch, R::BoundsGuard],
         Kind::Int32Add | Kind::Int32Sub | Kind::Int32Negate => &[R::Int32Overflow, R::NegativeZero],
         Kind::Int32Mul
         | Kind::Int32MulIdentifyZeros

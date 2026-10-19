@@ -4173,6 +4173,20 @@ impl<'a> Builder<'a> {
             &[callee],
             Repr::None,
         );
+        // `String.prototype.charCodeAt` of a flat string at an index within
+        // it reads the code unit inline; anything else leaves, and the
+        // recompile after such an exit calls the leaf.
+        if target.leaf_stub_id == otter_vm::native_abi::STUB_STRING_CHAR_CODE_AT_LEAF.id
+            && declaration.this_operand
+            && arguments.len() == 1
+            && !self.exited_for(ExitReason::TypeMismatch)
+            && !self.exited_for(ExitReason::BoundsGuard)
+        {
+            let index = self.int32(arguments[0]);
+            let unit = self.add(Kind::StringCharCodeAt, &[this, index], Repr::Int32);
+            self.write(instruction.writes[0], unit);
+            return;
+        }
         let mut inputs: SmallVec<[NodeId; 2]> = SmallVec::new();
         if declaration.this_operand {
             inputs.push(this);

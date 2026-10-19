@@ -48,6 +48,57 @@ use crate::{
 };
 
 impl Codegen<'_> {
+    /// `Rd(destination)` = the code unit of the string `Rq(receiver)` at the
+    /// int32 index `Rd(index)`: a flat string (inline or sequential, Latin-1
+    /// or UTF-16) or a slice of one, with the index inside it. Anything else
+    /// jumps to `miss` before `Rd(destination)` changes. Clobbers `Rq(base)`,
+    /// r10 and r11.
+    fn emit_string_char_code_at(
+        &mut self,
+        [receiver, index, base]: [u8; 3],
+        destination: u8,
+        miss: DynamicLabel,
+    ) {
+        let p = self.view.string_layout;
+        let map = p.map_atom_word as u32;
+        let flat = self.ops.new_dynamic_label();
+        let inline_latin1 = self.ops.new_dynamic_label();
+        let seq_latin1 = self.ops.new_dynamic_label();
+        let inline_flat = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        self.emit_cell_guard(receiver, miss);
+        dynasm!(self.ops ; .arch x64
+            ; cmp DWORD [Rq(receiver) + otter_vm::jit::JIT_MAP_WORD_BYTE as i32], map as i32 ; jne =>miss
+            ; cmp Rd(index), [Rq(receiver) + p.string_len_byte as i32] ; jae =>miss
+            ; mov Rq(base), Rq(receiver)
+            ; mov r11d, Rd(index)
+            ; movzx r10d, BYTE [Rq(receiver) + p.string_repr_byte as i32]
+            ; cmp r10d, i32::from(p.sliced_tag) ; jne =>flat
+            // A slice views its flat parent from a start offset.
+            ; add r11d, [Rq(receiver) + p.sliced_start_byte as i32]
+            ; mov r10d, [Rq(receiver) + p.sliced_parent_byte as i32]);
+        self.load_immediate(base, 0xffff_ffff_0000_0000);
+        dynasm!(self.ops ; .arch x64
+            ; and Rq(base), Rq(receiver) ; add Rq(base), r10
+            ; movzx r10d, BYTE [Rq(base) + p.string_repr_byte as i32]
+            ; =>flat
+            ; cmp r10d, i32::from(p.inline_latin1_tag) ; je =>inline_latin1
+            ; cmp r10d, i32::from(p.seq_latin1_tag) ; je =>seq_latin1
+            ; cmp r10d, i32::from(p.inline_flat_tag) ; je =>inline_flat
+            ; cmp r10d, i32::from(p.seq_flat_tag) ; jne =>miss
+            ; movzx Rd(destination), WORD [Rq(base) + r11 * 2 + p.string_body_size as i32]
+            ; jmp =>done
+            ; =>inline_flat
+            ; movzx Rd(destination), WORD [Rq(base) + r11 * 2 + p.string_repr_payload_byte as i32]
+            ; jmp =>done
+            ; =>seq_latin1
+            ; movzx Rd(destination), BYTE [Rq(base) + r11 + p.string_body_size as i32]
+            ; jmp =>done
+            ; =>inline_latin1
+            ; movzx Rd(destination), BYTE [Rq(base) + r11 + p.string_repr_payload_byte as i32]
+            ; =>done);
+    }
+
     /// `Rq(destination)` = the own-property bag of the closure or native
     /// function `Rq(receiver)` whose named lookup starts there: the bag
     /// exists, no `[[Prototype]]` override is installed and the default realm
@@ -105,6 +156,14 @@ impl Codegen<'_> {
                     &mut self.ops,
                     layout,
                     input(0),
+                    result(),
+                    exit,
+                );
+            }
+            Kind::StringCharCodeAt => {
+                let exit = self.eager_exit(node, DeoptReason::WrongType);
+                self.emit_string_char_code_at(
+                    [input(0), input(1), assigned.gp_temps[0]],
                     result(),
                     exit,
                 );

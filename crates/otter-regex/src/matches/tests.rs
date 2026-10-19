@@ -65,7 +65,7 @@ fn misses_retain_no_names_and_captureless_records_allocate_no_slots() {
         .collect_first()
         .unwrap()
         .unwrap();
-    assert_eq!(single.captures.capacity(), 0);
+    assert!(single.captures.is_empty() && !single.captures.spilled());
     assert_eq!(single.as_match().group(0), Some(0..1));
 }
 

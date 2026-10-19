@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - Static shaped objects and tagged/numeric dense two-cell arrays.
+//! - Array shells over a literal boilerplate's shared slab.
 //! - Immutable input recipes and full shell/slab initialization.
 //!
 //! # Invariants
@@ -31,8 +32,8 @@ use crate::field_store::FieldStoreOwner;
 use crate::x86_64::values::{emit_load_symbol_u64, emit_load_u64};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::jit::{
-    JitAllocationSite, JitArrayLiteralAllocationPlan, JitDenseArrayAllocationPlan,
-    JitObjectLiteralAllocationPlan, JitSiteMode,
+    JitAllocationSite, JitArrayLiteralAllocationPlan, JitBoilerplateArrayAllocationPlan,
+    JitDenseArrayAllocationPlan, JitObjectLiteralAllocationPlan, JitSiteMode,
 };
 
 /// The window offset of the buffer a site's cells are carved from.
@@ -195,6 +196,57 @@ pub(crate) fn emit_array_literal(
         );
     }
     dynasm!(ops ; .arch x64 ; =>done);
+}
+
+/// Carve one array shell over a literal boilerplate's shared slab. The slab
+/// is old and immutable, so the shell owes no barrier wherever it is born.
+pub(crate) fn emit_boilerplate_array(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    context: u8,
+    realm: u32,
+    cage_base: u64,
+    plan: JitBoilerplateArrayAllocationPlan,
+    site: JitAllocationSite,
+    regs: LabRegisters,
+    slow: DynamicLabel,
+) {
+    if realm != 0 {
+        dynasm!(ops ; .arch x64 ; jmp =>slow);
+        return;
+    }
+    emit_source_realm_guard(ops, context, realm, regs.scratch, slow);
+    emit_load_u64(ops, regs.size, u64::from(plan.shell.cell_bytes));
+    emit_bump_probe_in(ops, context, lab_offset(site), regs, slow);
+    let shell = regs.candidate;
+    emit_load_u64(ops, 10, site.header_word(plan.shell.header_word));
+    dynasm!(ops ; .arch x64 ; mov [Rq(shell)], r10);
+    emit_load_u64(ops, 10, plan.shell.map_word);
+    dynasm!(ops ; .arch x64 ; mov [Rq(shell) + 8], r10);
+    for byte in (16..plan.shell.cell_bytes).step_by(8) {
+        dynasm!(ops ; .arch x64 ; mov QWORD [Rq(shell) + byte as i32], 0);
+    }
+    dynasm!(ops ; .arch x64
+        ; mov DWORD [Rq(shell) + plan.shell_length_byte as i32], plan.len as i32
+        ; mov DWORD [Rq(shell) + plan.shell_len_byte as i32], plan.len as i32
+        ; mov DWORD [Rq(shell) + plan.shell_slab_byte as i32], plan.slab as i32
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        10,
+        cage_base,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops ; .arch x64
+        ; mov r11d, plan.slab as i32
+        ; add r10, r11
+        ; add r10, plan.data_byte as i32
+        ; mov [Rq(shell) + plan.shell_data_byte as i32], r10
+        ; mov BYTE [Rq(shell) + plan.shell_kind_byte as i32], plan.kind as i8
+        ; mov BYTE [Rq(shell) + plan.shell_own_guard_byte as i32], plan.own_guard as i8
+    );
+    emit_publish(ops, regs);
 }
 
 fn emit_dense_array(

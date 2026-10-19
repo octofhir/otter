@@ -1397,39 +1397,76 @@ impl Interpreter {
             return Ok(o);
         }
         let bounded_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
-        for lower in 0..(bounded_len / 2) {
-            let upper = len - lower - 1;
-            let lower_key = lower.to_string();
-            let upper_key = format_index_key(upper as f64);
-            let lower_exists = self.array_method_has_property(stack, context, o, &lower_key)?;
-            let lower_value = if lower_exists {
-                Some(self.array_method_get_property(stack, context, o, &lower_key)?)
-            } else {
-                None
-            };
-            let upper_exists = self.array_method_has_property(stack, context, o, &upper_key)?;
-            let upper_value = if upper_exists {
-                Some(self.array_method_get_property(stack, context, o, &upper_key)?)
-            } else {
-                None
-            };
-            match (lower_value, upper_value) {
-                (Some(l), Some(u)) => {
-                    self.array_set_property_throwing(stack, context, o, &lower_key, u)?;
-                    self.array_set_property_throwing(stack, context, o, &upper_key, l)?;
-                }
-                (Some(l), None) => {
-                    self.array_delete_property_throwing(stack, context, o, &lower_key)?;
-                    self.array_set_property_throwing(stack, context, o, &upper_key, l)?;
-                }
-                (None, Some(u)) => {
-                    self.array_set_property_throwing(stack, context, o, &lower_key, u)?;
-                    self.array_delete_property_throwing(stack, context, o, &upper_key)?;
-                }
-                (None, None) => {}
+        // Every `[[Get]]`/`[[Set]]` can allocate (an accessor, or copying shared
+        // literal storage out), so the receiver and the two moved values stay
+        // in handles across them.
+        self.with_handle_scope(|interp, scope| {
+            let o_root = interp.scoped_value(scope, o);
+            for lower in 0..(bounded_len / 2) {
+                interp.with_handle_scope(|interp, step| {
+                    let upper = len - lower - 1;
+                    let lower_key = lower.to_string();
+                    let upper_key = format_index_key(upper as f64);
+                    let o = interp.escape_scoped(o_root);
+                    let lower_exists =
+                        interp.array_method_has_property(stack, context, o, &lower_key)?;
+                    let lower_value = if lower_exists {
+                        let o = interp.escape_scoped(o_root);
+                        let value =
+                            interp.array_method_get_property(stack, context, o, &lower_key)?;
+                        Some(interp.scoped_value(step, value))
+                    } else {
+                        None
+                    };
+                    let o = interp.escape_scoped(o_root);
+                    let upper_exists =
+                        interp.array_method_has_property(stack, context, o, &upper_key)?;
+                    let upper_value = if upper_exists {
+                        let o = interp.escape_scoped(o_root);
+                        let value =
+                            interp.array_method_get_property(stack, context, o, &upper_key)?;
+                        Some(interp.scoped_value(step, value))
+                    } else {
+                        None
+                    };
+                    match (lower_value, upper_value) {
+                        (Some(l), Some(u)) => {
+                            let (o, u_value) =
+                                (interp.escape_scoped(o_root), interp.escape_scoped(u));
+                            interp.array_set_property_throwing(
+                                stack, context, o, &lower_key, u_value,
+                            )?;
+                            let (o, l_value) =
+                                (interp.escape_scoped(o_root), interp.escape_scoped(l));
+                            interp.array_set_property_throwing(
+                                stack, context, o, &upper_key, l_value,
+                            )?;
+                        }
+                        (Some(l), None) => {
+                            let o = interp.escape_scoped(o_root);
+                            interp.array_delete_property_throwing(stack, context, o, &lower_key)?;
+                            let (o, l_value) =
+                                (interp.escape_scoped(o_root), interp.escape_scoped(l));
+                            interp.array_set_property_throwing(
+                                stack, context, o, &upper_key, l_value,
+                            )?;
+                        }
+                        (None, Some(u)) => {
+                            let (o, u_value) =
+                                (interp.escape_scoped(o_root), interp.escape_scoped(u));
+                            interp.array_set_property_throwing(
+                                stack, context, o, &lower_key, u_value,
+                            )?;
+                            let o = interp.escape_scoped(o_root);
+                            interp.array_delete_property_throwing(stack, context, o, &upper_key)?;
+                        }
+                        (None, None) => {}
+                    }
+                    Ok::<(), CommittedValueError>(())
+                })?;
             }
-        }
-        Ok(o)
+            Ok(interp.escape_scoped(o_root))
+        })
     }
 
     /// §23.1.3.7 live `Array.prototype.fill`.
@@ -1452,45 +1489,61 @@ impl Interpreter {
         let start = self.array_relative_index(stack, context, args.get(1), 0.0, len)?;
         let end = self.array_relative_index(stack, context, args.get(2), len as f64, len)?;
         let bounded_end = end.min(start.saturating_add(MAX_ARRAY_LIKE_PROBE_LEN));
-        if let Some(arr) = o.as_array()
-            && crate::array::can_fast_fill_dense_range(arr, self.gc_heap(), start, bounded_end)
-            && !self
-                .array_prototype_chain_has_indexed_property(start, bounded_end)
-                .map_err(CommittedValueError::JavaScript)?
-        {
-            let receiver_root = o;
-            let value_root = value;
-            let mut external_visit = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                receiver_root.trace_value_slots(visit);
-                value_root.trace_value_slots(visit);
-                for root in roots {
-                    for value in *root {
-                        value.trace_value_slots(visit);
+        // Filling can allocate (growth, copying shared literal storage out, an
+        // accessor), so the receiver and the value live in handles.
+        self.with_handle_scope(|interp, scope| {
+            let o_root = interp.scoped_value(scope, o);
+            let value_root = interp.scoped_value(scope, value);
+            if let Some(arr) = o.as_array()
+                && crate::array::can_fast_fill_dense_range(
+                    arr,
+                    interp.gc_heap(),
+                    start,
+                    bounded_end,
+                )
+                && !interp
+                    .array_prototype_chain_has_indexed_property(start, bounded_end)
+                    .map_err(CommittedValueError::JavaScript)?
+            {
+                let arr = interp
+                    .escape_scoped(o_root)
+                    .as_array()
+                    .expect("rooted fill receiver");
+                let value = interp.escape_scoped(value_root);
+                let mut external_visit = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for root in roots {
+                        for value in *root {
+                            value.trace_value_slots(visit);
+                        }
                     }
-                }
-            };
-            crate::array::fill_dense_range_with_roots(
-                arr,
-                self.gc_heap_mut(),
-                start,
-                bounded_end,
-                value,
-                &mut external_visit,
-            )
-            .map_err(|_| self.err_range(("Invalid array length".to_string()).into()))
-            .map_err(CommittedValueError::JavaScript)?;
-            return Ok(o);
-        }
-        for k in start..bounded_end {
-            self.array_set_property_throwing(
-                stack,
-                context,
-                o,
-                &format_index_key(k as f64),
-                value,
-            )?;
-        }
-        Ok(o)
+                };
+                crate::array::fill_dense_range_with_roots(
+                    arr,
+                    interp.gc_heap_mut(),
+                    start,
+                    bounded_end,
+                    value,
+                    &mut external_visit,
+                )
+                .map_err(|_| interp.err_range(("Invalid array length".to_string()).into()))
+                .map_err(CommittedValueError::JavaScript)?;
+                return Ok(interp.escape_scoped(o_root));
+            }
+            for k in start..bounded_end {
+                let (o, value) = (
+                    interp.escape_scoped(o_root),
+                    interp.escape_scoped(value_root),
+                );
+                interp.array_set_property_throwing(
+                    stack,
+                    context,
+                    o,
+                    &format_index_key(k as f64),
+                    value,
+                )?;
+            }
+            Ok(interp.escape_scoped(o_root))
+        })
     }
 
     fn array_prototype_chain_has_indexed_property(
@@ -3077,47 +3130,82 @@ impl Interpreter {
         }
 
         let backwards = from < to && to < from.saturating_add(count);
-        if count <= MAX_ARRAY_LIKE_PROBE_LEN {
-            if backwards {
-                for offset in (0..count).rev() {
-                    self.copy_within_move_index(stack, context, o, from + offset, to + offset)?;
+        // Each move's `[[Set]]` can allocate, so the receiver stays in a handle.
+        self.with_handle_scope(|interp, scope| {
+            let o_root = interp.scoped_value(scope, o);
+            if count <= MAX_ARRAY_LIKE_PROBE_LEN {
+                if backwards {
+                    for offset in (0..count).rev() {
+                        interp.copy_within_move_index(
+                            stack,
+                            context,
+                            o_root,
+                            from + offset,
+                            to + offset,
+                        )?;
+                    }
+                } else {
+                    for offset in 0..count {
+                        interp.copy_within_move_index(
+                            stack,
+                            context,
+                            o_root,
+                            from + offset,
+                            to + offset,
+                        )?;
+                    }
                 }
             } else {
-                for offset in 0..count {
-                    self.copy_within_move_index(stack, context, o, from + offset, to + offset)?;
+                let o = interp.escape_scoped(o_root);
+                let mut offsets = interp
+                    .copy_within_sparse_offsets(o, len, from, to, count)
+                    .map_err(CommittedValueError::JavaScript)?;
+                if backwards {
+                    while let Some(offset) = offsets.pop_last() {
+                        interp.copy_within_move_index(
+                            stack,
+                            context,
+                            o_root,
+                            from + offset,
+                            to + offset,
+                        )?;
+                    }
+                } else {
+                    for offset in offsets {
+                        interp.copy_within_move_index(
+                            stack,
+                            context,
+                            o_root,
+                            from + offset,
+                            to + offset,
+                        )?;
+                    }
                 }
             }
-        } else {
-            let mut offsets = self
-                .copy_within_sparse_offsets(o, len, from, to, count)
-                .map_err(CommittedValueError::JavaScript)?;
-            if backwards {
-                while let Some(offset) = offsets.pop_last() {
-                    self.copy_within_move_index(stack, context, o, from + offset, to + offset)?;
-                }
-            } else {
-                for offset in offsets {
-                    self.copy_within_move_index(stack, context, o, from + offset, to + offset)?;
-                }
-            }
-        }
-        Ok(o)
+            Ok(interp.escape_scoped(o_root))
+        })
     }
 
     fn copy_within_move_index(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        o: Value,
+        o_root: crate::handles::Local<'_>,
         from_index: usize,
         to_index: usize,
     ) -> Result<(), CommittedValueError> {
         let from = format_index_key(from_index as f64);
         let to = format_index_key(to_index as f64);
+        let o = self.escape_scoped(o_root);
         let has = self.array_method_has_property(stack, context, o, &from)?;
+        let o = self.escape_scoped(o_root);
         if has {
-            let value = self.array_method_get_property(stack, context, o, &from)?;
-            self.array_set_property_throwing(stack, context, o, &to, value)
+            self.with_handle_scope(|interp, step| {
+                let value = interp.array_method_get_property(stack, context, o, &from)?;
+                let value = interp.scoped_value(step, value);
+                let (o, value) = (interp.escape_scoped(o_root), interp.escape_scoped(value));
+                interp.array_set_property_throwing(stack, context, o, &to, value)
+            })
         } else {
             self.array_delete_property_throwing(stack, context, o, &to)
         }

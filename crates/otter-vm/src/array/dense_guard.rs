@@ -6,8 +6,10 @@
 //!   conservative rejection of everything that reaches them.
 //!
 //! # Invariants
-//! - A zero byte proves default own data semantics only for a present slot.
-//!   It never permits a hole to bypass a prototype lookup.
+//! - A clear exotic bit proves default own data semantics only for a present
+//!   slot. It never permits a hole to bypass a prototype lookup.
+//! - The shared bit marks copy-on-write storage: reads only test the exotic
+//!   bit, while every in-place write requires the whole byte to be zero.
 //! - Managed named state never aliases an index, so the expando leaves the
 //!   byte zero. A RegExp match
 //!   result (`index`, `input`, `groups`) keeps native element access.
@@ -22,6 +24,13 @@
 
 use super::{ArrayBody, ArrayExoticSlots, DenseElementKind, JsArray};
 use crate::jit::JitElementFamily;
+
+/// Own-guard bit: an indexed slot may lack default own data semantics.
+/// Every native element access requires it clear.
+pub(crate) const DENSE_OWN_GUARD_EXOTIC: u8 = 1;
+/// Own-guard bit: the dense storage is a literal site's shared boilerplate.
+/// Native reads ignore it; native writes require the whole byte clear.
+pub(crate) const DENSE_OWN_GUARD_SHARED: u8 = 2;
 
 impl ArrayExoticSlots {
     /// Whether every present dense slot still has default own data
@@ -47,11 +56,11 @@ impl ArrayExoticSlots {
 
 impl ArrayBody {
     pub(super) fn current_dense_own_guard(&self) -> u8 {
-        u8::from(
-            !self
-                .exotic()
-                .is_none_or(ArrayExoticSlots::leaves_dense_slots_ordinary),
-        )
+        let exotic = !self
+            .exotic()
+            .is_none_or(ArrayExoticSlots::leaves_dense_slots_ordinary);
+        let shared = super::elements::is_shared(self.slab);
+        u8::from(exotic) * DENSE_OWN_GUARD_EXOTIC + u8::from(shared) * DENSE_OWN_GUARD_SHARED
     }
 
     pub(crate) fn refresh_dense_own_guard(&self) {
@@ -65,7 +74,9 @@ impl ArrayBody {
 pub(crate) fn element_family(array: JsArray, heap: &otter_gc::GcHeap) -> JitElementFamily {
     heap.read_payload(array, |body| {
         debug_assert_eq!(body.dense_own_guard.get(), body.current_dense_own_guard());
-        if body.dense_own_guard.get() != 0 {
+        // Shared storage reads like any present dense prefix; a store at the
+        // same site copies it out before writing.
+        if body.dense_own_guard.get() & DENSE_OWN_GUARD_EXOTIC != 0 {
             return JitElementFamily::Generic;
         }
         match body.dense_kind() {

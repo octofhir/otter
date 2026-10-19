@@ -44,8 +44,8 @@
 
 use crate::wordcode::{FunctionCode, INLINE_OPERAND_WORDS, Instruction};
 use crate::{
-    ArgumentBindingStorage, ArgumentsObjectKind, BytecodeModule, ClassHintSite, Constant,
-    ExceptionHandler, Function, LazyEnvironment, LazyForm, LazyFunction, LazyImport,
+    ArgumentBindingStorage, ArgumentsObjectKind, BoilerplateElement, BytecodeModule, ClassHintSite,
+    Constant, ExceptionHandler, Function, LazyEnvironment, LazyForm, LazyFunction, LazyImport,
     LazyMethodKind, MappedArgumentBinding, ModuleInit, ModuleResolution, Preparse, ScopeDescriptor,
     ScopeFlags, ScopeKind, SkippedFunction, SlotDescriptor, SlotKind, SourceKind, SpanTable,
     TemplateSite,
@@ -503,6 +503,32 @@ impl Writer {
                 self.utf16(pattern_utf16);
                 self.string(flags);
             }
+            Constant::ArrayBoilerplate { elements } => {
+                self.u8(5);
+                self.seq(elements, |writer, element| {
+                    writer.boilerplate_element(element)
+                });
+            }
+        }
+    }
+
+    fn boilerplate_element(&mut self, element: &BoilerplateElement) {
+        match element {
+            BoilerplateElement::Number { bits } => {
+                self.u8(0);
+                self.u64(*bits);
+            }
+            BoilerplateElement::String { utf16 } => {
+                self.u8(1);
+                self.utf16(utf16);
+            }
+            BoilerplateElement::Boolean { value } => {
+                self.u8(2);
+                self.bool(*value);
+            }
+            BoilerplateElement::Null => self.u8(3),
+            BoilerplateElement::Undefined => self.u8(4),
+            BoilerplateElement::Hole => self.u8(5),
         }
     }
 
@@ -957,6 +983,25 @@ impl<'a> Reader<'a> {
                 pattern_utf16: self.utf16()?,
                 flags: self.string()?,
             },
+            5 => Constant::ArrayBoilerplate {
+                elements: self.seq(Self::boilerplate_element)?,
+            },
+            _ => return None,
+        })
+    }
+
+    fn boilerplate_element(&mut self) -> Option<BoilerplateElement> {
+        Some(match self.u8()? {
+            0 => BoilerplateElement::Number { bits: self.u64()? },
+            1 => BoilerplateElement::String {
+                utf16: self.utf16()?,
+            },
+            2 => BoilerplateElement::Boolean {
+                value: self.bool()?,
+            },
+            3 => BoilerplateElement::Null,
+            4 => BoilerplateElement::Undefined,
+            5 => BoilerplateElement::Hole,
             _ => return None,
         })
     }
@@ -1505,6 +1550,18 @@ mod tests {
                 Constant::RegExp {
                     pattern_utf16: vec![0x61, 0x2B],
                     flags: "gu".to_string(),
+                },
+                Constant::ArrayBoilerplate {
+                    elements: vec![
+                        BoilerplateElement::Number {
+                            bits: 1.5f64.to_bits(),
+                        },
+                        BoilerplateElement::String { utf16: vec![0x61] },
+                        BoilerplateElement::Boolean { value: true },
+                        BoilerplateElement::Null,
+                        BoilerplateElement::Undefined,
+                        BoilerplateElement::Hole,
+                    ],
                 },
             ],
             module_resolutions: vec![ModuleResolution {

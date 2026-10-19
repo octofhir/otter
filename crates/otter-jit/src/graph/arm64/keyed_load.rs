@@ -53,7 +53,7 @@ impl Codegen<'_> {
             ; cmp w17, u32::from(storage.type_tag)
             ; b.ne =>other
             ; ldrb w17, [X(receiver), storage.own_guard_byte]
-            ; cbnz w17, =>runtime
+            ; tbnz w17, storage.own_exotic_bit, =>runtime
             // A non-negative int32 key below the live dense length.
             ; asr x16, X(key), super::INT32_TAG_SHIFT
             ; cmn x16, 1

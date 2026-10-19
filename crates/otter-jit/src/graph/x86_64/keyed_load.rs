@@ -53,7 +53,7 @@ impl Codegen<'_> {
         dynasm!(self.ops ; .arch x64
             ; test Rq(receiver), r10 ; jnz =>other
             ; cmp BYTE [Rq(receiver)], storage.type_tag as i8 ; jne =>other
-            ; cmp BYTE [Rq(receiver) + storage.own_guard_byte as i32], 0 ; jne =>runtime
+            ; test BYTE [Rq(receiver) + storage.own_guard_byte as i32], (1 << storage.own_exotic_bit) as i8 ; jne =>runtime
             // A non-negative int32 key below the live dense length.
             ; mov r10, Rq(key) ; sar r10, 49 ; cmp r10, -1 ; jne =>runtime
             ; test Rd(key), Rd(key) ; js =>runtime

@@ -412,7 +412,9 @@ impl TypedFeedbackSlot {
             | Op::NewSpread
             | Op::SuperConstruct
             | Op::SuperConstructSpread => Self::Call(Box::default()),
-            Op::NewObjectLiteral | Op::NewArray => Self::AllocationSite(AtomicU16::new(0)),
+            Op::NewObjectLiteral | Op::NewArray | Op::NewArrayBoilerplate => {
+                Self::AllocationSite(AtomicU16::new(0))
+            }
             _ => Self::None,
         }
     }

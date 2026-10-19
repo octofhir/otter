@@ -842,5 +842,6 @@ mod tests {
         Op::DeclareEvalVar,
         Op::StoreVarScope,
         Op::NewObjectLiteral,
+        Op::NewArrayBoilerplate,
     ];
 }

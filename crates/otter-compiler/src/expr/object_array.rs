@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - [`compile_object_literal`] — lowers object literals.
-//! - [`compile_array_literal`] — lowers array literals.
+//! - [`compile_array_literal`] — lowers array literals; one whose every
+//!   element is a primitive constant or a hole becomes a boilerplate.
 //!
 //! # See also
 //! - [`super`] — expression dispatch and shared helpers.
@@ -28,6 +29,16 @@ pub(crate) fn compile_array_literal(
     // threshold leaves headroom for the leading `(dst, count)` slots
     // plus a safety margin against future format changes.
     const DENSE_NEW_ARRAY_MAX_ELEMENTS: usize = 240;
+    if let Some(elements) = boilerplate_elements(arr) {
+        let boilerplate = cx.intern_array_boilerplate(elements);
+        let dst = cx.alloc_scratch();
+        cx.emit(
+            Op::NewArrayBoilerplate,
+            [Operand::Register(dst), Operand::ConstIndex(boilerplate)],
+            span,
+        );
+        return Ok(dst);
+    }
     if !has_spread && arr.elements.len() <= DENSE_NEW_ARRAY_MAX_ELEMENTS {
         let mut element_regs: Vec<u16> = Vec::with_capacity(arr.elements.len());
         for el in &arr.elements {
@@ -107,6 +118,60 @@ pub(crate) fn compile_array_literal(
         }
         Ok(dst)
     }
+}
+
+/// The constant elements of a literal that evaluates to the same values every
+/// time and runs no code: numbers (a negated numeric literal included),
+/// strings, booleans, `null`, `void` of a literal, and holes.
+fn boilerplate_elements(
+    arr: &ArrayExpression<'_>,
+) -> Option<Vec<otter_bytecode::BoilerplateElement>> {
+    use otter_bytecode::BoilerplateElement;
+    use oxc_ast::ast::{ArrayExpressionElement, Expression, UnaryOperator};
+    const MAX_BOILERPLATE_ELEMENTS: usize = 1 << 16;
+    if arr.elements.is_empty() || arr.elements.len() > MAX_BOILERPLATE_ELEMENTS {
+        return None;
+    }
+    fn constant(expr: &Expression<'_>) -> Option<BoilerplateElement> {
+        Some(match expr {
+            Expression::NumericLiteral(lit) => BoilerplateElement::Number {
+                bits: lit.value.to_bits(),
+            },
+            Expression::StringLiteral(lit) => BoilerplateElement::String {
+                utf16: if lit.lone_surrogates {
+                    crate::synthetic::decode_lone_surrogate_string(&lit.value)
+                } else {
+                    lit.value.encode_utf16().collect()
+                },
+            },
+            Expression::BooleanLiteral(lit) => BoilerplateElement::Boolean { value: lit.value },
+            Expression::NullLiteral(_) => BoilerplateElement::Null,
+            Expression::UnaryExpression(unary) => match (&unary.operator, &unary.argument) {
+                (UnaryOperator::UnaryNegation, Expression::NumericLiteral(lit)) => {
+                    BoilerplateElement::Number {
+                        bits: (-lit.value).to_bits(),
+                    }
+                }
+                (
+                    UnaryOperator::Void,
+                    Expression::NumericLiteral(_)
+                    | Expression::StringLiteral(_)
+                    | Expression::BooleanLiteral(_)
+                    | Expression::NullLiteral(_),
+                ) => BoilerplateElement::Undefined,
+                _ => return None,
+            },
+            _ => return None,
+        })
+    }
+    arr.elements
+        .iter()
+        .map(|element| match element {
+            ArrayExpressionElement::Elision(_) => Some(BoilerplateElement::Hole),
+            ArrayExpressionElement::SpreadElement(_) => None,
+            other => constant(other.to_expression()),
+        })
+        .collect()
 }
 
 pub(crate) fn compile_object_literal(

@@ -821,6 +821,7 @@ impl BaselinePlan {
                 Op::MakeFunction
                 | Op::LoadString
                 | Op::LoadRegExp
+                | Op::NewArrayBoilerplate
                 | Op::LoadBigInt
                 | Op::SymbolLoad
                 | Op::TemporalLoad

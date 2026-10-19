@@ -21,6 +21,9 @@
 //!   publish it; the removed slot is cleared to `undefined`, which needs none.
 //! - The Array's dense length, its slab's length and its `length` move
 //!   together, as the VM's own append and truncation do.
+//! - Storage shared with a literal boilerplate reports no capacity, so an
+//!   append grows it into private storage and clears the shared mark; a
+//!   removal from it completes in the builtin, which copies it out.
 //!
 //! # See also
 //! - `otter_vm::jit::JitArrayStorage` for the words read and written.
@@ -122,6 +125,7 @@ impl Codegen<'_> {
             ; str w17, [X(receiver), storage.capacity_byte]
             ; mov w17, u32::from(storage.tagged_kind)
             ; strb w17, [X(receiver), storage.numeric.kind_byte]
+            ; strb wzr, [X(receiver), storage.own_guard_byte]
             ; str w16, [X(receiver), storage.length_byte]
             ; str w16, [X(receiver), storage.logical_length_byte]
         );
@@ -173,6 +177,8 @@ impl Codegen<'_> {
         self.emit_whole_prefix(storage, receiver, length, false, runtime);
         dynasm!(self.ops
             ; .arch aarch64
+            ; ldrb w16, [X(receiver), storage.own_guard_byte]
+            ; cbnz w16, =>runtime
             ; cbz W(length), =>empty
             ; sub WSP(length), WSP(length), #1
             ; ldr X(base), [X(receiver), storage.base_byte]

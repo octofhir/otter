@@ -825,6 +825,13 @@ pub struct Interpreter {
     /// site. Values are traced from [`RuntimeState::trace_roots`] so moving
     /// collection rewrites them in place without invalidating relocations.
     literal_cells: rustc_hash::FxHashMap<(usize, u32), Box<Value>>,
+    /// Shared copy-on-write element slabs of array-literal boilerplate
+    /// constants, keyed like [`Self::literal_cells`]. Each slab and every
+    /// string it holds is old and never written, so arrays of every site that
+    /// names the constant share it until their first write, and compiled code
+    /// may bake its address.
+    array_boilerplates:
+        rustc_hash::FxHashMap<(usize, u32), crate::array::elements::ElementSlabHandle>,
     /// Decimal strings for small non-negative integers, served on demand.
     /// Integer → string is one of the most repeated allocations in real code
     /// (`"" + n`, `(n).toString()`, integer keys); caching
@@ -1498,6 +1505,12 @@ impl Interpreter {
     /// Root-tracing view of the literal cells.
     pub(crate) fn literal_cells_for_trace(&self) -> impl Iterator<Item = &Value> {
         self.literal_cells.values().map(Box::as_ref)
+    }
+
+    pub(crate) fn array_boilerplates_for_trace(
+        &self,
+    ) -> impl Iterator<Item = &crate::array::elements::ElementSlabHandle> {
+        self.array_boilerplates.values()
     }
 
     #[cfg(test)]

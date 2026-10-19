@@ -106,9 +106,9 @@ pub struct JitPropertyAccess {
 mod literal_allocations;
 pub use literal_allocations::{
     JIT_SITE_CREATED_OFFSET, JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET, JitAllocationSite,
-    JitArrayLiteralAllocationPlan, JitDenseArrayAllocationPlan, JitEmptyArrayAllocationPlan,
-    JitEmptyObjectAllocationPlan, JitLiteralAllocationPlans, JitObjectLiteralAllocationPlan,
-    JitSiteMode, ordinary_object_header_word,
+    JitArrayLiteralAllocationPlan, JitBoilerplateArrayAllocationPlan, JitDenseArrayAllocationPlan,
+    JitEmptyArrayAllocationPlan, JitEmptyObjectAllocationPlan, JitLiteralAllocationPlans,
+    JitObjectLiteralAllocationPlan, JitSiteMode, ordinary_object_header_word,
 };
 
 mod string_layout;
@@ -1011,9 +1011,16 @@ pub struct JitBodyGuard {
     pub width: JitGuardWidth,
     /// Value the word must hold for the layout to apply.
     pub expect: u32,
+    /// Bits of the word the guard compares; [`JitBodyGuard::WHOLE`] compares
+    /// all of it. A narrower mask names one bit that must read clear, with a
+    /// zero `expect`.
+    pub mask: u32,
 }
 
 impl JitBodyGuard {
+    /// The mask that compares the whole word.
+    pub const WHOLE: u32 = u32::MAX;
+
     /// A word that must read zero: an absent expando, a null sidecar, a clear
     /// flag.
     #[must_use]
@@ -1022,7 +1029,40 @@ impl JitBodyGuard {
             byte,
             width,
             expect: 0,
+            mask: Self::WHOLE,
         }
+    }
+
+    /// A word whose one `bit` must read clear, whatever its other bits hold.
+    #[must_use]
+    pub const fn clear_bit(byte: u32, width: JitGuardWidth, bit: u32) -> Self {
+        Self {
+            byte,
+            width,
+            expect: 0,
+            mask: 1 << bit,
+        }
+    }
+
+    /// The single bit a partial guard tests, or `None` for a whole-word one.
+    #[must_use]
+    pub const fn tested_bit(self) -> Option<u32> {
+        if self.mask == Self::WHOLE {
+            None
+        } else {
+            Some(self.mask.trailing_zeros())
+        }
+    }
+
+    /// Whether a word that passed this guard also passes `wanted`: the same
+    /// guard, or a whole-word compare whose expected value has `wanted`'s
+    /// masked bits.
+    #[must_use]
+    pub const fn implies(self, wanted: Self) -> bool {
+        self.byte == wanted.byte
+            && self.width as u8 == wanted.width as u8
+            && (self.mask == wanted.mask && self.expect == wanted.expect
+                || self.mask == Self::WHOLE && self.expect & wanted.mask == wanted.expect)
     }
 }
 
@@ -1916,8 +1956,11 @@ pub struct JitArrayStorage {
     /// The Array cell tag.
     pub type_tag: u8,
     /// Byte that reads zero while present dense slots have default own data
-    /// semantics.
+    /// semantics in private storage: an in-place write requires it zero.
     pub own_guard_byte: u32,
+    /// Bit of that byte a read requires clear: storage shared with a literal
+    /// boilerplate sets another bit, which only writes reject.
+    pub own_exotic_bit: u32,
     /// Compressed exotic-sidecar handle: zero while the array has neither a
     /// custom prototype nor exotic own state, so that, while the realm's
     /// array-index accessor protector also holds, a store into a hole is an
@@ -1965,6 +2008,7 @@ impl JitArrayStorage {
         Self {
             type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             own_guard_byte: header + crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET as u32,
+            own_exotic_bit: crate::array::DENSE_OWN_GUARD_EXOTIC.trailing_zeros(),
             exotic_byte: header + crate::array::ARRAY_BODY_EXOTIC_OFFSET as u32,
             length_byte: header + crate::array::ARRAY_BODY_DENSE_LEN_OFFSET as u32,
             capacity_byte: header + crate::array::ARRAY_BODY_DENSE_CAP_OFFSET as u32,
@@ -2079,6 +2123,33 @@ pub struct JitHoleBitmap {
 }
 
 impl JitElementAccess {
+    /// Whether a receiver proved to have this layout also has `wanted`'s:
+    /// the same addressing, with every guard `wanted` needs implied by this
+    /// one's guard in the same position. A write's proof serves a read.
+    #[must_use]
+    pub fn implies(&self, wanted: &Self) -> bool {
+        self.addresses_like(wanted)
+            && self
+                .guards
+                .iter()
+                .zip(wanted.guards)
+                .all(|(proved, wanted)| match (proved, wanted) {
+                    (_, None) => true,
+                    (Some(proved), Some(wanted)) => proved.implies(wanted),
+                    (None, Some(_)) => false,
+                })
+    }
+
+    /// Whether this layout reads its count and elements exactly as `wanted`
+    /// does, whatever either one guards.
+    #[must_use]
+    pub fn addresses_like(&self, wanted: &Self) -> bool {
+        Self {
+            guards: wanted.guards,
+            ..*self
+        } == *wanted
+    }
+
     /// Build the VM's complete packed-double own Array access program.
     /// A prototype-only sidecar is legal because every accessed slot is present.
     #[must_use]
@@ -2115,6 +2186,7 @@ impl JitElementAccess {
             byte,
             width: JitGuardWidth::Byte,
             expect: crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE,
+            mask: JitBodyGuard::WHOLE,
         }
     }
 
@@ -2141,6 +2213,7 @@ impl JitElementAccess {
             && own.byte == header + crate::array::ARRAY_BODY_DENSE_OWN_GUARD_OFFSET as u32
             && own.width == JitGuardWidth::Byte
             && own.expect == 0
+            && own.mask == JitBodyGuard::WHOLE
             && kind.byte == header + crate::array::ARRAY_BODY_DENSE_KIND_OFFSET as u32
             && kind.width == JitGuardWidth::Byte
             && kind.expect == crate::array::DENSE_ELEMENT_KIND_PACKED_DOUBLE

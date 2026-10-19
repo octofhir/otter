@@ -59,7 +59,7 @@ pub(crate) use empty::emit_empty_literal;
 mod slab;
 pub(crate) use slab::emit_grow_tagged_slab;
 mod literal;
-pub(crate) use literal::{emit_array_literal, emit_object_literal};
+pub(crate) use literal::{emit_array_literal, emit_boilerplate_array, emit_object_literal};
 mod receiver;
 pub(crate) use receiver::{
     emit_receiver_bump, emit_receiver_candidate_probe, emit_receiver_fit, emit_receiver_guards,

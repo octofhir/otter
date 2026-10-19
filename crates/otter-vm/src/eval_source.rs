@@ -43,6 +43,13 @@ pub(crate) fn decode_module(module: &mut BytecodeModule) {
         match constant {
             Constant::String { utf16 } => decode_units(utf16),
             Constant::RegExp { pattern_utf16, .. } => decode_units(pattern_utf16),
+            Constant::ArrayBoilerplate { elements } => {
+                for element in elements {
+                    if let otter_bytecode::BoilerplateElement::String { utf16 } = element {
+                        decode_units(utf16);
+                    }
+                }
+            }
             Constant::Number { .. } | Constant::FunctionId { .. } | Constant::BigInt { .. } => {}
         }
     }

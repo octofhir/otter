@@ -194,6 +194,8 @@ impl Interpreter {
             .retain(|(function_base, _), _| !bases.contains(function_base));
         self.literal_cells
             .retain(|(identity, _), _| !identities.contains(identity));
+        self.array_boilerplates
+            .retain(|(identity, _), _| !identities.contains(identity));
         self.simple_constructor_init_cache
             .retain(|id, _| outside(id));
         self.simple_constructor_absence.retain(|id, _| outside(id));

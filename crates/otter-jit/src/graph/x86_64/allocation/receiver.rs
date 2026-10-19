@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - Live family/prototype proof of the new.target, then one LAB fit.
+//! - The same proof alone for a receiver escape analysis removed.
 //! - A collecting buffer refill and one retried fit on a space miss.
 //!
 //! # Invariants
@@ -19,6 +20,24 @@ use super::*;
 use crate::graph::ir::DeoptReason;
 
 impl Codegen<'_> {
+    /// The proofs of `plan` with no allocation: a scalar-replaced receiver
+    /// still needs its family and prototype.
+    pub(in crate::graph::x86_64) fn emit_check_receiver_plan(
+        &mut self,
+        node: NodeId,
+        plan: otter_vm::jit::JitReceiverAllocationPlan,
+    ) {
+        let view = self.view_of(node);
+        let guard_miss = self.eager_exit(node, DeoptReason::WrongValue);
+        crate::x86_64::allocation::emit_receiver_guards(
+            &mut self.ops,
+            &mut self.relocations,
+            view,
+            plan,
+            guard_miss,
+        );
+    }
+
     pub(in crate::graph::x86_64) fn emit_new_receiver(
         &mut self,
         node: NodeId,

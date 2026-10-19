@@ -185,8 +185,16 @@ impl SitePlan {
                 .lazy
                 .filter(|_| data.origin != 0)
                 .map(|state| {
-                    super::frame::deopt_frames(graph, slots, state, &allocation.node(node).lazy)
-                        .into_vec()
+                    // A lazy state names no scalar-replaced object: escape
+                    // analysis keeps every object such a state reads.
+                    let (frames, virtual_objects) = super::frame::deopt_frames(
+                        graph,
+                        slots,
+                        state,
+                        &allocation.node(node).lazy,
+                    );
+                    debug_assert!(virtual_objects.is_empty());
+                    frames.into_vec()
                 })
                 .unwrap_or_default();
             let mut frames = Vec::new();

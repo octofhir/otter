@@ -22,7 +22,10 @@
 //! - [`super::regalloc`] for final physical homes and representation ownership.
 //! - `otter_vm::deopt` for the one interpreter reconstruction contract.
 
-use otter_vm::deopt::{DeoptFrame, DeoptFrameEntry, DeoptLocation, DeoptRepr, DeoptSlot};
+use otter_vm::deopt::{
+    DeoptFrame, DeoptFrameEntry, DeoptLocation, DeoptRepr, DeoptSlot, VirtualObject,
+    VirtualObjectId, VirtualObjectKind,
+};
 use otter_vm::{
     native_abi::{self, ExitAction, ExitReason},
     value::tag::VALUE_UNDEFINED,
@@ -158,12 +161,11 @@ pub(crate) fn deopt_frames(
     slots: SlotLayout,
     state: FrameStateId,
     locations: &[Location],
-) -> Box<[DeoptFrame]> {
+) -> (Box<[DeoptFrame]>, Box<[VirtualObject<DeoptSlot>]>) {
     let mut locations = locations.iter().copied();
-    let mut slot = |value: NodeId| {
-        let location = locations.next().expect("a location per state value");
-        deopt_slot(graph, slots, value, location)
-    };
+    let mut virtual_objects: Vec<(NodeId, VirtualObject<DeoptSlot>)> = Vec::new();
+    let mut slot =
+        |value: NodeId| recipe_slot(graph, slots, value, &mut locations, &mut virtual_objects);
     let frames = graph
         .state_chain(state)
         .into_iter()
@@ -206,7 +208,47 @@ pub(crate) fn deopt_frames(
         locations.next().is_none(),
         "one canonical location per reconstruction value"
     );
-    frames
+    let virtual_objects = virtual_objects
+        .into_iter()
+        .map(|(_, object)| object)
+        .collect();
+    (frames, virtual_objects)
+}
+
+/// The recipe slot of one state value. A virtual object's fields consume
+/// their locations at its first occurrence, as
+/// [`Graph::state_values`] lists them, and its recipe follows the recipes
+/// of the virtual objects its fields name, so every reference points back.
+fn recipe_slot(
+    graph: &Graph,
+    slots: SlotLayout,
+    value: NodeId,
+    locations: &mut impl Iterator<Item = Location>,
+    virtual_objects: &mut Vec<(NodeId, VirtualObject<DeoptSlot>)>,
+) -> DeoptSlot {
+    let Kind::VirtualObject { shape } = graph.node(value).kind else {
+        let location = locations.next().expect("a location per state value");
+        return deopt_slot(graph, slots, value, location);
+    };
+    if let Some((_, object)) = virtual_objects.iter().find(|(node, _)| *node == value) {
+        return DeoptSlot::virtual_object(object.id);
+    }
+    let fields: Box<[DeoptSlot]> = graph
+        .node(value)
+        .inputs
+        .iter()
+        .map(|&field| recipe_slot(graph, slots, field, locations, virtual_objects))
+        .collect();
+    let id = VirtualObjectId(virtual_objects.len() as u32);
+    virtual_objects.push((
+        value,
+        VirtualObject {
+            id,
+            kind: VirtualObjectKind::Shaped { shape },
+            fields,
+        },
+    ));
+    DeoptSlot::virtual_object(id)
 }
 
 fn deopt_slot(graph: &Graph, slots: SlotLayout, value: NodeId, location: Location) -> DeoptSlot {

@@ -75,6 +75,7 @@ impl Interpreter {
                 1,
                 tier,
                 budget,
+                None,
                 view.call_frequencies.get(&byte_pc).copied(),
             ) {
                 view.direct_methods.insert(byte_pc, vec![method]);

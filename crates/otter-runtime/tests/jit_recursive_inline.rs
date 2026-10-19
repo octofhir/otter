@@ -13,7 +13,7 @@
 //!
 //! # See also
 //! - `inline_snapshot_budget` bounds cold preparation of owned descendants.
-//! - `graph::builder` charges the existing encoded-bytecode and depth budgets.
+//! - `graph::builder` charges the instruction, depth and recursion budgets.
 //! - `interp::jit_calls::deopt` reconstructs ordered source activations.
 
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -313,12 +313,19 @@ fn recursive_splices_keep_distinct_frames_and_move_recovered_aliases_once() {
                     _ => None,
                 })
                 .collect();
+            // A function runs at most `JIT_INLINE_RECURSION` times on one
+            // inline path; two alternating functions reach the depth bound.
+            let deepest = if mutual {
+                u32::from(otter_vm::jit::JIT_INLINE_DEPTH)
+            } else {
+                otter_vm::jit::JIT_INLINE_RECURSION as u32 - 1
+            };
             assert_eq!(
                 splices
                     .iter()
                     .map(|splice| splice.2)
                     .collect::<BTreeSet<_>>(),
-                BTreeSet::from([1, 2, 3])
+                (1..=deepest).collect::<BTreeSet<_>>()
             );
             assert!(
                 splices

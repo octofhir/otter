@@ -33,6 +33,7 @@ impl Interpreter {
         body: Option<std::sync::Arc<jit::JitCompileSnapshot>>,
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
+        call_byte_pc: u32,
     ) -> Option<jit::JitInlineMethod> {
         let method_context = context.for_function(target.method_fid).ok()?;
         let context = &*method_context;
@@ -50,7 +51,15 @@ impl Interpreter {
         }
         let method_view = match body {
             Some(body) => body,
-            None => self.bake_inline_body(context, target.method_fid, tier, budget, None, None)?,
+            None => self.bake_inline_body(
+                context,
+                target.method_fid,
+                tier,
+                budget,
+                Some(call_byte_pc),
+                None,
+                None,
+            )?,
         };
         // Resolve every body `LoadProperty`/`StoreProperty` to a logical own
         // field; bail out if a property is absent or an accessor. The shape

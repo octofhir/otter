@@ -1052,10 +1052,24 @@ impl<'a> Builder<'a> {
             depth < otter_vm::jit::JIT_INLINE_DEPTH
         };
         within_depth
+            && self.inline_recursion(code.id) < otter_vm::jit::JIT_INLINE_RECURSION
             && self.inline_plan.admits(body)
             && code.admits_graph_inlining()
             && self.graph.inlined.len() < usize::from(u16::MAX)
             && self.root_handler_at(outer_pc).is_none()
+    }
+
+    /// How many bodies on the current inline path, the compiled function
+    /// included, run `function_id`.
+    fn inline_recursion(&self, function_id: u32) -> usize {
+        let mut count = usize::from(self.root.code_block.id == function_id);
+        let mut origin = self.graph.origin;
+        while origin != 0 {
+            let body = self.graph.inlined[usize::from(origin) - 1];
+            count += usize::from(body.function_id == function_id);
+            origin = body.parent;
+        }
+        count
     }
 
     /// The exception handler of the compiled function covering `pc`.

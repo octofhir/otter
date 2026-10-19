@@ -221,6 +221,16 @@ pub(crate) enum Kind {
     /// the live family and prototype are proved. A failed proof, or a
     /// buffer the collector cannot refill, resumes the construct.
     NewReceiver(otter_vm::jit::JitReceiverAllocationPlan),
+    /// The proofs of a [`Self::NewReceiver`] whose allocation escape analysis
+    /// removed: the live `new.target` (input0) is the plan's family and its
+    /// prototype holds. Eager deopt otherwise, which resumes the construct.
+    CheckReceiverPlan(otter_vm::jit::JitReceiverAllocationPlan),
+    /// A scalar-replaced ordinary object of the exact hidden class `shape`,
+    /// whose slots hold the inputs in order. It is never placed or emitted:
+    /// frame states name it, and a deopt materializes it.
+    VirtualObject {
+        shape: u32,
+    },
     /// `ArrayCreate(input0)` for the original `%Array%` constructor called
     /// with at most one argument: an array of that exact nonnegative int32
     /// length, all holes. Any other length resumes the operation.
@@ -792,6 +802,7 @@ impl Kind {
             Self::ConstTagged(_)
             | Self::ConstInt32(_)
             | Self::ConstFloat64(_)
+            | Self::VirtualObject { .. }
             | Self::InitialRegister(_)
             | Self::LoadNewTarget
             | Self::LoadClosure
@@ -909,6 +920,11 @@ impl Kind {
                 may_collect: true,
                 ..Properties::default()
             },
+            Self::CheckReceiverPlan(_) => Properties {
+                eager_deopt: true,
+                effectful: true,
+                ..Properties::default()
+            },
             Self::StoreNamedProperty { .. } | Self::StoreBodySlot(_) => Properties {
                 eager_deopt: true,
                 writes: true,
@@ -994,15 +1010,17 @@ impl Kind {
             fixed_gp_clobbers: SmallVec::new(),
         };
         match self {
-            Self::ConstTagged(_) | Self::ConstInt32(_) | Self::ConstFloat64(_) | Self::Phi => {
-                Constraints {
-                    inputs: (0..input_count).map(|_| Any).collect(),
-                    result: ResultPolicy::Register,
-                    gp_temps: 0,
-                    fp_temps: 0,
-                    fixed_gp_clobbers: SmallVec::new(),
-                }
-            }
+            Self::ConstTagged(_)
+            | Self::ConstInt32(_)
+            | Self::ConstFloat64(_)
+            | Self::Phi
+            | Self::VirtualObject { .. } => Constraints {
+                inputs: (0..input_count).map(|_| Any).collect(),
+                result: ResultPolicy::Register,
+                gp_temps: 0,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
             Self::PrimitiveAdd => Constraints {
                 inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
                 result: ResultPolicy::Register,
@@ -1043,6 +1061,16 @@ impl Kind {
                 Constraints {
                     inputs: smallvec::smallvec![FixedGp(fixed.new_target)],
                     result: ResultPolicy::FixedGp(fixed.result),
+                    gp_temps: 0,
+                    fp_temps: 0,
+                    fixed_gp_clobbers: fixed.clobbers.iter().copied().collect(),
+                }
+            }
+            Self::CheckReceiverPlan(_) => {
+                let fixed = target.receiver_allocation;
+                Constraints {
+                    inputs: smallvec::smallvec![FixedGp(fixed.new_target)],
+                    result: ResultPolicy::None,
                     gp_temps: 0,
                     fp_temps: 0,
                     fixed_gp_clobbers: fixed.clobbers.iter().copied().collect(),
@@ -1591,18 +1619,48 @@ impl Graph {
     /// Every value the frame states of `id`'s chain read, outermost frame
     /// first: an inlined frame's entry bindings (`this`, closure,
     /// `new.target`, recorded actual arguments), then each frame's live
-    /// registers.
+    /// registers. A [`Kind::VirtualObject`] reads its fields in its place, at
+    /// its first occurrence in the chain only; later occurrences read
+    /// nothing.
     pub(crate) fn state_values(&self, id: FrameStateId) -> SmallVec<[NodeId; 16]> {
         let mut values = SmallVec::new();
+        let mut expanded: SmallVec<[NodeId; 4]> = SmallVec::new();
         for state in self.state_chain(id) {
             let data = self.frame_state(state);
             if let Some(caller) = &data.caller {
-                values.extend([caller.this, caller.closure, caller.new_target]);
-                values.extend(caller.arguments.iter().flatten().copied());
+                for value in [caller.this, caller.closure, caller.new_target]
+                    .into_iter()
+                    .chain(caller.arguments.iter().flatten().copied())
+                {
+                    self.push_state_value(value, &mut values, &mut expanded);
+                }
             }
-            values.extend(data.registers.iter().map(|&(_, value)| value));
+            for &(_, value) in &data.registers {
+                self.push_state_value(value, &mut values, &mut expanded);
+            }
         }
         values
+    }
+
+    /// Append `value` to a state's values, or a virtual object's fields at
+    /// its first occurrence.
+    fn push_state_value(
+        &self,
+        value: NodeId,
+        values: &mut SmallVec<[NodeId; 16]>,
+        expanded: &mut SmallVec<[NodeId; 4]>,
+    ) {
+        if !matches!(self.node(value).kind, Kind::VirtualObject { .. }) {
+            values.push(value);
+            return;
+        }
+        if expanded.contains(&value) {
+            return;
+        }
+        expanded.push(value);
+        for &field in &self.node(value).inputs {
+            self.push_state_value(field, values, expanded);
+        }
     }
 
     /// [`Self::state_values`] of every frame state, flattened once the graph

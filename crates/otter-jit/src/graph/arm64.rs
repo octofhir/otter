@@ -2064,6 +2064,7 @@ impl<'a> Codegen<'a> {
                 self.emit_literal_allocation(node, destination)?;
             }
             Kind::NewReceiver(plan) => self.emit_new_receiver(node, *plan)?,
+            Kind::CheckReceiverPlan(plan) => self.emit_check_receiver_plan(node, *plan),
             Kind::CheckCellValue(cell) => {
                 let value = Self::gp(input(0));
                 let exit = self.eager_exit(node, DeoptReason::WrongValue);

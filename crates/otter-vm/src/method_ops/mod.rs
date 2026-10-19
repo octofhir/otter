@@ -66,8 +66,12 @@ impl otter_gc::ExtraRootSource for ArrayFastDispatchRoots<'_> {
         self.interp_roots.sweep_weak(heap);
     }
 
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
-        self.interp_roots.visit(visitor);
+    fn visit_extra_roots(
+        &self,
+        roots: otter_gc::RootSet,
+        visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+    ) {
+        self.interp_roots.visit(roots, visitor);
         self.recv.trace_value_slots(visitor);
         for value in self.args {
             value.trace_value_slots(visitor);
@@ -95,8 +99,12 @@ impl otter_gc::ExtraRootSource for CollectionFastDispatchRoots<'_> {
         self.interp_roots.sweep_weak(heap);
     }
 
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
-        self.interp_roots.visit(visitor);
+    fn visit_extra_roots(
+        &self,
+        roots: otter_gc::RootSet,
+        visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+    ) {
+        self.interp_roots.visit(roots, visitor);
         self.recv.trace_value_slots(visitor);
         for value in self.args {
             value.trace_value_slots(visitor);

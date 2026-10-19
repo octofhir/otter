@@ -290,7 +290,7 @@ impl Interpreter {
         }
         let field_count = init.fields.len();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            otter_gc::ExtraRootSource::visit_extra_roots(roots, visitor);
+            otter_gc::ExtraRootSource::visit_extra_roots(roots, otter_gc::RootSet::All, visitor);
         };
         let shape = self.simple_constructor_shape_with_roots(
             function_id,
@@ -633,7 +633,11 @@ impl Interpreter {
                     break 'functions;
                 }
                 let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-                    otter_gc::ExtraRootSource::visit_extra_roots(roots, visitor);
+                    otter_gc::ExtraRootSource::visit_extra_roots(
+                        roots,
+                        otter_gc::RootSet::All,
+                        visitor,
+                    );
                 };
                 shape = if let Some(child) = self.shape_runtime.child_if_cached(
                     &self.gc_heap,

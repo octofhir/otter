@@ -203,7 +203,7 @@ impl SyncJsCallRoots {
 }
 
 impl otter_gc::ExtraRootSource for SyncJsCallRoots {
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+    fn visit_extra_roots(&self, _roots: otter_gc::RootSet, visitor: &mut dyn FnMut(*mut RawGc)) {
         self.current.trace(visitor);
         // SAFETY: the registered provider owns this initialized canonical slot
         // during collection. A layout is a strong old-space handle.

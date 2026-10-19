@@ -1146,7 +1146,7 @@ struct MicrotaskLocalsRoot {
 }
 
 impl otter_gc::ExtraRootSource for MicrotaskLocalsRoot {
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+    fn visit_extra_roots(&self, _roots: otter_gc::RootSet, visitor: &mut dyn FnMut(*mut RawGc)) {
         // SAFETY: `invoke_microtask` pops this registration before the
         // pointed-at locals go out of scope, so the reads always see
         // the live locals.

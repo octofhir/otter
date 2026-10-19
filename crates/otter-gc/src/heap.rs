@@ -85,7 +85,7 @@ use crate::compressed::{Cage, Gc, RawGc, cage_base, cage_size};
 use crate::ephemeron::EphemeronRegistry;
 use crate::external::{ExternalMemory, SharedExternalMemory, SharedExternalState};
 use crate::external_refs::ExternalRefTable;
-use crate::extra_roots::{ExtraRoots, ExtraRootsGuard};
+use crate::extra_roots::{ExtraRoots, ExtraRootsGuard, RootSet};
 use crate::finalize::WeakFinalizationRegistry;
 use crate::frame_roots::{FrameRootProviders, FrameRoots, FrameRootsGuard};
 use crate::handle::{GlobalHandleTable, HandleStack};
@@ -2073,7 +2073,23 @@ impl GcHeap {
         value: T,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<Gc<T>, OutOfMemory> {
-        self.alloc_old_with_roots_inner(value, true, 0, external_visit, |_| {})
+        self.alloc_old_trailing_with_roots(value, 0, external_visit)
+    }
+
+    /// [`Self::alloc_old_with_roots`] for a body followed by `extra_bytes`
+    /// of zeroed trailing storage.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::alloc_old`].
+    #[inline]
+    pub fn alloc_old_trailing_with_roots<T: Traceable>(
+        &mut self,
+        value: T,
+        extra_bytes: usize,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Gc<T>, OutOfMemory> {
+        self.alloc_old_with_roots_inner(value, true, extra_bytes, external_visit, |_| {})
     }
 
     /// Allocate a diagnostic object directly in old-space without
@@ -2441,7 +2457,7 @@ impl GcHeap {
             external_visit(visitor);
             // SAFETY: STW pause; the heap owns the registration stack for the
             // duration of this root walk.
-            visit_extra_roots_deduped(unsafe { &*extra_roots }, visitor);
+            visit_extra_roots_deduped(unsafe { &*extra_roots }, RootSet::Young, visitor);
             // SAFETY: STW pause; the heap owns the registry for the duration of
             // this root walk.
             unsafe { (*frame_root_providers).trace(visitor) };
@@ -2926,7 +2942,7 @@ impl GcHeap {
         }
         self.trace_embedder_roots(&mut shade);
         external_visit(&mut shade);
-        visit_extra_roots_deduped(&self.extra_roots, &mut shade);
+        visit_extra_roots_deduped(&self.extra_roots, RootSet::All, &mut shade);
         self.frame_root_providers.trace(&mut shade);
     }
 
@@ -3490,12 +3506,16 @@ impl GcHeap {
 /// scopes re-register the same interpreter; tracing it once per pause
 /// keeps the root walk linear in distinct sources. Visiting is
 /// idempotent, so a false-negative match only costs a redundant walk.
-fn visit_extra_roots_deduped(entries: &[ExtraRoots], visitor: &mut dyn FnMut(*mut RawGc)) {
+fn visit_extra_roots_deduped(
+    entries: &[ExtraRoots],
+    roots: RootSet,
+    visitor: &mut dyn FnMut(*mut RawGc),
+) {
     for (i, entry) in entries.iter().enumerate() {
         if entries[..i].iter().any(|prev| prev.same_source(entry)) {
             continue;
         }
-        entry.visit(visitor);
+        entry.visit(roots, visitor);
     }
 }
 

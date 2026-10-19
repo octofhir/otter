@@ -230,7 +230,7 @@ impl NativeCallInfo {
 }
 
 impl otter_gc::ExtraRootSource for NativeCallInfo {
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+    fn visit_extra_roots(&self, _roots: otter_gc::RootSet, visitor: &mut dyn FnMut(*mut RawGc)) {
         self.this_value.trace_value_slots(visitor);
         if let Some(new_target) = &self.new_target {
             new_target.trace_value_slots(visitor);
@@ -266,8 +266,8 @@ impl<'a> NativeCallRoots<'a> {
 }
 
 impl otter_gc::ExtraRootSource for NativeCallRoots<'_> {
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        otter_gc::ExtraRootSource::visit_extra_roots(self.call_info, visitor);
+    fn visit_extra_roots(&self, roots: otter_gc::RootSet, visitor: &mut dyn FnMut(*mut RawGc)) {
+        otter_gc::ExtraRootSource::visit_extra_roots(self.call_info, roots, visitor);
         for value in self.value_roots {
             value.trace_value_slots(visitor);
         }

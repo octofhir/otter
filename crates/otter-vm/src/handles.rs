@@ -242,7 +242,7 @@ impl PendingValues {
 }
 
 impl otter_gc::ExtraRootSource for PendingValues {
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+    fn visit_extra_roots(&self, _roots: otter_gc::RootSet, visitor: &mut dyn FnMut(*mut RawGc)) {
         for slot in &self.slots {
             if slot.occupied {
                 slot.value.trace_value_slots(visitor);

@@ -63,7 +63,7 @@ fn binary(
         return NativeResultPair::miss();
     };
     let mut roots = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        otter_gc::ExtraRootSource::visit_extra_roots(&frame_roots, visitor);
+        otter_gc::ExtraRootSource::visit_extra_roots(&frame_roots, otter_gc::RootSet::All, visitor);
     };
     match operator.function()(&mut vm.gc_heap, lhs, rhs, &mut roots) {
         Ok(value) => NativeResultPair::success(Value::big_int(value)),

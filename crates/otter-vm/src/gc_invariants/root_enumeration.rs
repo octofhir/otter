@@ -38,7 +38,7 @@ fn root_walker_runs_with_empty_state() {
     let interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let state = RuntimeState::new(&interp);
     let mut count = 0usize;
-    state.trace_roots(&mut |_slot| {
+    state.trace_roots(otter_gc::RootSet::All, &mut |_slot| {
         count = count.wrapping_add(1);
     });
     assert!(
@@ -60,7 +60,7 @@ fn pending_uncaught_throw_is_enumerated_as_a_root() {
         .pending_uncaught_throw_for_trace()
         .expect("pending throw") as *const crate::Value as *mut RawGc;
     let mut found = false;
-    RuntimeState::new(&interp).trace_roots(&mut |slot| {
+    RuntimeState::new(&interp).trace_roots(otter_gc::RootSet::All, &mut |slot| {
         found |= slot == expected_slot;
     });
 

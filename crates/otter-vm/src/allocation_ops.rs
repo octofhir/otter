@@ -61,7 +61,7 @@ impl Interpreter {
         // stack on its own, so snapshot the runtime + frame roots here to keep
         // a collection at this site sound.
         let mut roots = Vec::new();
-        RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
+        RuntimeState::new(self).trace_roots(otter_gc::RootSet::All, &mut |slot| roots.push(slot));
         let pool = self.cold_frames();
         for frame in stack.iter() {
             frame.trace_frame_slots(&mut |slot| roots.push(slot));
@@ -86,7 +86,7 @@ impl Interpreter {
             return Vec::new();
         }
         let mut roots = Vec::new();
-        RuntimeState::new(self).trace_roots(&mut |slot| roots.push(slot));
+        RuntimeState::new(self).trace_roots(otter_gc::RootSet::All, &mut |slot| roots.push(slot));
         self.gc_heap
             .trace_frame_root_providers(&mut |slot| roots.push(slot));
         roots

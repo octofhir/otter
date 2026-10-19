@@ -21,7 +21,8 @@
 //!   [`crate::property_atom::AtomId`] values.
 //! - This runtime owns the isolate's [`NameInterner`], the single authority
 //!   for a name's atom. `key_strings` holds, per atom the shape layer has
-//!   keyed, the GC string body shape nodes and key enumeration hold.
+//!   keyed, the GC string body shape nodes and key enumeration hold. Those
+//!   bodies live as long as the isolate and are allocated in old space.
 //! - Hidden classes are collectable: the id and transition tables hold
 //!   shapes weakly, and a shape lives while an object, a compiled code object
 //!   or a strong cache names it. [`Self::sweep_dead`] forgets every shape the
@@ -63,7 +64,8 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::inspect::{ShapeTransitionEvent, ShapeTransitionObserver};
 use crate::property_atom::{AtomId, NameInterner};
-use crate::string::{JsStringHandle, alloc_flat_string_body_with_roots};
+use crate::string::JsStringHandle;
+use crate::string::gc_body::alloc_old_flat_string_body_with_roots;
 
 use super::descriptor::PropertyFlags;
 use super::shape_body::{
@@ -236,7 +238,7 @@ impl ShapeRuntime {
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
         let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            self.trace_roots(visitor);
+            self.trace_roots(otter_gc::RootSet::All, visitor);
             external_visit(visitor);
         };
         let root = alloc_root_shape_body_with_roots(
@@ -294,7 +296,7 @@ impl ShapeRuntime {
             for node in &mut nodes {
                 visitor(std::ptr::from_mut(node).cast::<RawGc>());
             }
-            self.trace_roots(visitor);
+            self.trace_roots(otter_gc::RootSet::All, visitor);
             external_visit(visitor);
         };
         let dictionary = super::shape_body::alloc_dictionary_shape_body_with_roots(
@@ -336,7 +338,7 @@ impl ShapeRuntime {
             return Ok(shape);
         }
         let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            self.trace_roots(visitor);
+            self.trace_roots(otter_gc::RootSet::All, visitor);
             external_visit(visitor);
         };
         let result = super::state_transition::prepare_state_shape(heap, source, state, &mut visit)?;
@@ -376,7 +378,11 @@ impl ShapeRuntime {
 
     /// Yield the strong handles: the interned key strings and the pinned
     /// shapes. The id and transition tables are weak ([`Self::sweep_dead`]).
-    pub(crate) fn trace_roots(&self, visitor: &mut SlotVisitor<'_>) {
+    /// Both are old-space cells, so a scavenge visits none of them.
+    pub(crate) fn trace_roots(&self, roots: otter_gc::RootSet, visitor: &mut SlotVisitor<'_>) {
+        if roots == otter_gc::RootSet::Young {
+            return;
+        }
         for handle in self.key_strings.values() {
             let p = handle.as_ptr() as *mut RawGc;
             visitor(p);
@@ -450,10 +456,11 @@ impl ShapeRuntime {
         }
         let units: Vec<u16> = crate::wtf16_escape::units(key).collect();
         let mut visit_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            self.trace_roots(visitor);
+            self.trace_roots(otter_gc::RootSet::All, visitor);
             external_visit(visitor);
         };
-        let handle = alloc_flat_string_body_with_roots(heap, &units, &mut visit_roots)?;
+        // An interned key lives as long as the isolate.
+        let handle = alloc_old_flat_string_body_with_roots(heap, &units, &mut visit_roots)?;
         let atom = self.names.intern(key);
         heap.with_payload(handle, |body| body.set_cached_atom(atom));
         self.key_strings.insert(atom, Cell::new(handle));
@@ -532,7 +539,7 @@ impl ShapeRuntime {
         }
 
         let mut visit_child_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            self.trace_roots(visitor);
+            self.trace_roots(otter_gc::RootSet::All, visitor);
             external_visit(visitor);
         };
         let child = alloc_child_shape_body_with_roots(
@@ -659,7 +666,7 @@ mod tests {
         };
         assert_eq!(pinned(), expected);
         let mut slots = 0;
-        runtime.trace_roots(&mut |_| slots += 1);
+        runtime.trace_roots(otter_gc::RootSet::All, &mut |_| slots += 1);
         assert_eq!(slots, expected.len() + runtime.interned_key_count());
         let dictionary_id = heap.read_payload(dictionary, ShapeBody::id);
         assert!(runtime.handle_for_id(dictionary_id).is_none());

@@ -8,7 +8,8 @@
 //! # Invariants
 //! - Values use the production interpreter handle scope and actual caller slots.
 //! - Pressure setup does not collect after fresh nursery children are created.
-//! - Every claimed moving child or key compares exact before/after offsets.
+//! - Every claimed moving child compares exact before/after offsets; interned
+//!   keys live in old space and keep theirs.
 //! - OOM is an ordinary typed return; the mutation never panics or bypasses cap.
 //!
 //! # See also
@@ -131,10 +132,10 @@ fn state_preparation_moves_keys_and_distinct_bank_children_without_changing_sour
             }
             let keys = shape_body::shape_keys_ordered(&vm.gc_heap, source);
             for ((key, _), before) in keys.into_iter().zip(key_offsets) {
-                assert_ne!(
+                assert_eq!(
                     key.offset(),
                     before,
-                    "source key actually moved during preparation"
+                    "interned source keys live in old space and never move"
                 );
             }
             for (index, (child, before)) in [first, last].into_iter().zip(child_offsets).enumerate()
@@ -370,7 +371,7 @@ fn collecting_prototype_change_roots_receiver_prototype_keys_and_both_banks() {
                 .into_iter()
                 .zip(keys)
             {
-                assert_ne!(key.offset(), old, "source lineage keys really moved");
+                assert_eq!(key.offset(), old, "interned lineage keys never move");
             }
             for (slot, child) in [(0, first), (capacity.max(4), last)] {
                 assert_eq!(

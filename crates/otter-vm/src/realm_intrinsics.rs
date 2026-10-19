@@ -513,7 +513,7 @@ mod tests {
 
     fn collect_minor_with_runtime_roots(interp: &mut Interpreter) {
         let mut roots = Vec::new();
-        RuntimeState::new(interp).trace_roots(&mut |slot| roots.push(slot));
+        RuntimeState::new(interp).trace_roots(otter_gc::RootSet::All, &mut |slot| roots.push(slot));
         interp
             .gc_heap_mut()
             .collect_minor_with_roots(&mut |visitor| {

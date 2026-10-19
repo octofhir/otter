@@ -4,6 +4,8 @@
 //!
 //! - [`ExtraRootSource`] — root owners, pre-collection observation hooks, and
 //!   the post-mark weak pass over owner-held tables.
+//! - [`RootSet`] — which roots a collection needs: every root, or only those
+//!   that may name a young cell.
 //! - [`ExtraRoots`] — raw-pointer trampoline stored by [`crate::heap::GcHeap`].
 //! - [`ExtraRootsGuard`] — RAII registration removed on return or unwind.
 //!
@@ -17,6 +19,9 @@
 //!   a collection triggered inside the inner scope.
 //! - The VM crate implements only the safe trait; the raw pointer dereference is
 //!   kept inside this crate's audited unsafe boundary.
+//! - A scavenge asks for [`RootSet::Young`]. A source may then skip a slot
+//!   only when the slot can never hold a young cell: a scavenge neither
+//!   moves nor frees old-space cells, so such a slot is never rewritten.
 //!
 //! # See also
 //!
@@ -24,6 +29,16 @@
 
 use crate::compressed::RawGc;
 use crate::heap::GcHeap;
+
+/// Which roots one collection visits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RootSet {
+    /// Every root: a full collection marks from them and may move any cell.
+    All,
+    /// A scavenge: roots that may name a young cell. Slots that only ever
+    /// hold old-space cells may be skipped.
+    Young,
+}
 
 /// Safe callback surface for owner-managed root slots not stored in the heap's
 /// handle stack or global handle table.
@@ -44,15 +59,15 @@ pub trait ExtraRootSource {
     /// JavaScript or retain the heap reference; it may only forget entries.
     fn sweep_weak(&self, _heap: &GcHeap) {}
 
-    /// Visit every mutable raw root slot owned by this source.
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc));
+    /// Visit the mutable raw root slots of `roots` owned by this source.
+    fn visit_extra_roots(&self, roots: RootSet, visitor: &mut dyn FnMut(*mut RawGc));
 }
 
 /// Type-erased root source registration held by [`crate::heap::GcHeap`].
 #[derive(Clone, Copy)]
 pub struct ExtraRoots {
     data: *const (),
-    thunk: unsafe fn(*const (), &mut dyn FnMut(*mut RawGc)),
+    thunk: unsafe fn(*const (), RootSet, &mut dyn FnMut(*mut RawGc)),
     prepare: unsafe fn(*const (), &GcHeap),
     sweep: unsafe fn(*const (), &GcHeap),
 }
@@ -61,11 +76,15 @@ impl ExtraRoots {
     /// Create a registration for `source`.
     #[must_use]
     pub fn new<S: ExtraRootSource>(source: &S) -> Self {
-        unsafe fn thunk<S: ExtraRootSource>(data: *const (), visitor: &mut dyn FnMut(*mut RawGc)) {
+        unsafe fn thunk<S: ExtraRootSource>(
+            data: *const (),
+            roots: RootSet,
+            visitor: &mut dyn FnMut(*mut RawGc),
+        ) {
             // SAFETY: `ExtraRoots::new` records the concrete `S` pointer, and
             // the heap registration contract requires the source to outlive the
             // installed `ExtraRoots` value.
-            unsafe { (&*(data as *const S)).visit_extra_roots(visitor) };
+            unsafe { (&*(data as *const S)).visit_extra_roots(roots, visitor) };
         }
 
         unsafe fn prepare<S: ExtraRootSource>(data: *const (), heap: &GcHeap) {
@@ -105,10 +124,10 @@ impl ExtraRoots {
     /// argument roots on top of the interpreter's runtime roots) can
     /// re-dispatch into an inner registration without the VM crate
     /// needing raw-pointer dereference of its own.
-    pub fn visit(self, visitor: &mut dyn FnMut(*mut RawGc)) {
+    pub fn visit(self, roots: RootSet, visitor: &mut dyn FnMut(*mut RawGc)) {
         // SAFETY: callers install `ExtraRoots` only for scopes where `data`
         // still points at the original `ExtraRootSource`.
-        unsafe { (self.thunk)(self.data, visitor) };
+        unsafe { (self.thunk)(self.data, roots, visitor) };
     }
 
     /// `true` when both registrations dispatch to the same source
@@ -158,7 +177,7 @@ mod tests {
     struct EmptySource;
 
     impl ExtraRootSource for EmptySource {
-        fn visit_extra_roots(&self, _visitor: &mut dyn FnMut(*mut RawGc)) {}
+        fn visit_extra_roots(&self, _roots: RootSet, _visitor: &mut dyn FnMut(*mut RawGc)) {}
     }
 
     #[test]
@@ -179,7 +198,7 @@ mod tests {
                         .set(heap.read_payload(handle, |body| body.payload));
                 }
             }
-            fn visit_extra_roots(&self, _visitor: &mut dyn FnMut(*mut RawGc)) {
+            fn visit_extra_roots(&self, _roots: RootSet, _visitor: &mut dyn FnMut(*mut RawGc)) {
                 assert!(
                     self.pending.get().is_none(),
                     "observations must not enter tracing"
@@ -199,8 +218,8 @@ mod tests {
             fn prepare_collection(&self, heap: &GcHeap) {
                 self.0.prepare_collection(heap);
             }
-            fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-                self.0.visit(visitor);
+            fn visit_extra_roots(&self, roots: RootSet, visitor: &mut dyn FnMut(*mut RawGc)) {
+                self.0.visit(roots, visitor);
             }
         }
         let composite = Composite(ExtraRoots::new(&source));
@@ -259,7 +278,7 @@ mod tests {
         struct OtherSource(u8);
 
         impl ExtraRootSource for OtherSource {
-            fn visit_extra_roots(&self, _visitor: &mut dyn FnMut(*mut RawGc)) {
+            fn visit_extra_roots(&self, _roots: RootSet, _visitor: &mut dyn FnMut(*mut RawGc)) {
                 let _ = self.0;
             }
         }

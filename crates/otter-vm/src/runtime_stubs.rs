@@ -485,7 +485,11 @@ impl<'a> AllocSafepointFrameRoots<'a> {
 }
 
 impl otter_gc::ExtraRootSource for AllocSafepointFrameRoots<'_> {
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+    fn visit_extra_roots(
+        &self,
+        _roots: otter_gc::RootSet,
+        visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+    ) {
         // SAFETY: the constructor's contract keeps the packet's frame and
         // registry published while this source is registered.
         let record = unsafe { alloc_safepoint_record(self.ctx, self.safepoint) }
@@ -539,8 +543,12 @@ impl<'a> AllocValueStubCallRoots<'a> {
 }
 
 impl otter_gc::ExtraRootSource for AllocValueStubCallRoots<'_> {
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
-        self.frame_roots.visit_extra_roots(visitor);
+    fn visit_extra_roots(
+        &self,
+        roots: otter_gc::RootSet,
+        visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+    ) {
+        self.frame_roots.visit_extra_roots(roots, visitor);
         for value in &self.values {
             // SAFETY: `UnsafeCell` makes these stub-local ABI value copies
             // legitimate mutable root slots for a moving collection.
@@ -3459,8 +3467,10 @@ mod tests {
             frame_roots,
             [arg_value, Value::undefined(), Value::undefined()],
         );
-        heap.collect_minor_with_roots(&mut |visitor| roots.visit_extra_roots(visitor))
-            .expect("minor GC");
+        heap.collect_minor_with_roots(&mut |visitor| {
+            roots.visit_extra_roots(otter_gc::RootSet::All, visitor)
+        })
+        .expect("minor GC");
 
         let frame_after = Value::from_abi_bits(slots[0])
             .as_raw_gc()
@@ -3830,10 +3840,12 @@ mod tests {
         validate_alloc_safepoint_frame_roots(&ctx, &record).expect("spill root validates");
         let roots = unsafe { AllocSafepointFrameRoots::new(&ctx, record.id) }.expect("publisher");
         let mut visited = 0usize;
-        roots.visit_extra_roots(&mut |_p| visited += 1);
+        roots.visit_extra_roots(otter_gc::RootSet::All, &mut |_p| visited += 1);
         assert_eq!(visited, 1, "the spill-slot pointer is traced exactly once");
-        heap.collect_minor_with_roots(&mut |visitor| roots.visit_extra_roots(visitor))
-            .expect("real moving collection through the lazy frame's spill map");
+        heap.collect_minor_with_roots(&mut |visitor| {
+            roots.visit_extra_roots(otter_gc::RootSet::All, visitor)
+        })
+        .expect("real moving collection through the lazy frame's spill map");
         let moved = Value::from_abi_bits(spill[0]);
         assert_ne!(
             moved.as_raw_gc().expect("collector-rewritten spill root"),

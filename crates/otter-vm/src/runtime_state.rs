@@ -22,6 +22,9 @@
 //!   microtask queue, dynamic-import registry, module error
 //!   cache, symbol registry, error-class registry,
 //!   function-user-prop bag.
+//! - A scavenge ([`otter_gc::RootSet::Young`]) skips only tables whose
+//!   slots name hidden classes or interned key strings, which are always
+//!   old-space cells.
 //!
 //! # See also
 //!
@@ -31,6 +34,7 @@
 
 use crate::Interpreter;
 use crate::gc_trace::{GcRootVisitor, GcTrace};
+use otter_gc::RootSet;
 
 /// Borrowed view over an [`Interpreter`] used by the GC root
 /// walker. Holds no state of its own; the lifetime is tied to
@@ -64,7 +68,11 @@ impl<'a> RuntimeState<'a> {
     /// - error-class registry;
     /// - function-user-prop bag;
     /// - pending generator / uncaught throw side-channels.
-    pub fn trace_roots(&self, visitor: &mut GcRootVisitor<'_>) {
+    ///
+    /// For [`RootSet::Young`] the tables that name only hidden classes and
+    /// interned key strings are skipped: both are allocated in old space,
+    /// which a scavenge neither moves nor frees.
+    pub fn trace_roots(&self, roots: RootSet, visitor: &mut GcRootVisitor<'_>) {
         let interp = self.interp;
         // 1) Shared globalThis.
         interp.global_this().trace_gc_roots(visitor);
@@ -167,12 +175,14 @@ impl<'a> RuntimeState<'a> {
         // 7) Hidden classes: the root shape and interned keys (the id and
         //    transition tables are weak), the constructor and arguments shape
         //    caches, and every shape a cached object layout names.
-        interp.shape_runtime_for_trace().trace_roots(visitor);
-        interp.trace_layout_shapes(visitor);
+        interp.shape_runtime_for_trace().trace_roots(roots, visitor);
         interp.trace_compiled_shapes(visitor);
-        for shape in interp.simple_constructor_shapes_for_trace() {
-            let p = shape as *const crate::object::ShapeHandle as *mut otter_gc::raw::RawGc;
-            visitor(p);
+        if roots == RootSet::All {
+            interp.trace_layout_shapes(visitor);
+            for shape in interp.simple_constructor_shapes_for_trace() {
+                let p = shape as *const crate::object::ShapeHandle as *mut otter_gc::raw::RawGc;
+                visitor(p);
+            }
         }
         for layout in interp.function_constructor_layouts_for_trace() {
             if !layout.is_null() {
@@ -183,7 +193,9 @@ impl<'a> RuntimeState<'a> {
             }
         }
         // 7b) The shared property action table retains cached shape transitions.
-        interp.trace_property_ic_roots(visitor);
+        if roots == RootSet::All {
+            interp.trace_property_ic_roots(visitor);
+        }
         // 8) Pending throw side-channels retain arbitrary JS values. They are
         //    roots even while no frame or job queue references the thrown
         //    value, and a moving collection must rewrite their slots in place.

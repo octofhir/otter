@@ -390,37 +390,64 @@ pub fn alloc_flat_string_body_with_roots(
     units: &[u16],
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
+    alloc_flat_string_body_in(heap, units, false, external_visit)
+}
+
+/// Allocate a flat WTF-16 string body directly in old space, for a string
+/// that lives as long as the isolate: no scavenge copies it, and a root
+/// naming it need not be visited by one.
+///
+/// # Errors
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub(crate) fn alloc_old_flat_string_body_with_roots(
+    heap: &mut GcHeap,
+    units: &[u16],
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
+    alloc_flat_string_body_in(heap, units, true, external_visit)
+}
+
+fn alloc_flat_string_body_in(
+    heap: &mut GcHeap,
+    units: &[u16],
+    old: bool,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
     let len = units.len() as u32;
     let hash = 0;
     if units.len() <= INLINE_FLAT_CAP {
         let mut inline = [0u16; INLINE_FLAT_CAP];
         inline[..units.len()].copy_from_slice(units);
-        return heap.alloc_with_roots(
-            JsStringBody {
-                map: otter_gc::cell_map::TypeMap::NEW,
-                atom: 0,
-                len,
-                hash,
-                repr: JsStringBodyRepr::InlineFlat(inline),
-                utf16_cache: JsStringHandle::null(),
-            },
-            external_visit,
-        );
-    }
-    // The code units live in the same cell as the body, so they are part of
-    // the GC allocation and need no separate cap reservation.
-    let handle = heap.alloc_trailing_with_roots(
-        JsStringBody {
+        let body = JsStringBody {
             map: otter_gc::cell_map::TypeMap::NEW,
             atom: 0,
             len,
             hash,
-            repr: JsStringBodyRepr::SeqFlat,
+            repr: JsStringBodyRepr::InlineFlat(inline),
             utf16_cache: JsStringHandle::null(),
-        },
-        JsStringBody::trailing_bytes(false, units.len()),
-        external_visit,
-    )?;
+        };
+        return if old {
+            heap.alloc_old_with_roots(body, external_visit)
+        } else {
+            heap.alloc_with_roots(body, external_visit)
+        };
+    }
+    // The code units live in the same cell as the body, so they are part of
+    // the GC allocation and need no separate cap reservation.
+    let body = JsStringBody {
+        map: otter_gc::cell_map::TypeMap::NEW,
+        atom: 0,
+        len,
+        hash,
+        repr: JsStringBodyRepr::SeqFlat,
+        utf16_cache: JsStringHandle::null(),
+    };
+    let trailing = JsStringBody::trailing_bytes(false, units.len());
+    let handle = if old {
+        heap.alloc_old_trailing_with_roots(body, trailing, external_visit)?
+    } else {
+        heap.alloc_trailing_with_roots(body, trailing, external_visit)?
+    };
     heap.with_payload(handle, |body| {
         body.init_seq_flat(units);
         true

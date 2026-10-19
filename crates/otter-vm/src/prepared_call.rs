@@ -178,7 +178,7 @@ impl std::ops::DerefMut for PreparedCall {
 }
 
 impl otter_gc::ExtraRootSource for PreparedCall {
-    fn visit_extra_roots(&self, visitor: &mut SlotVisitor<'_>) {
+    fn visit_extra_roots(&self, _roots: otter_gc::RootSet, visitor: &mut SlotVisitor<'_>) {
         self.trace_slots(visitor);
     }
 }

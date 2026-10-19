@@ -722,7 +722,11 @@ fn finish_builder(
                 stack: *const [Builder],
             }
             impl otter_gc::ExtraRootSource for ObjectBuildRoots {
-                fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+                fn visit_extra_roots(
+                    &self,
+                    _roots: otter_gc::RootSet,
+                    visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+                ) {
                     // SAFETY: the source outlives its registration (popped below),
                     // and only the STW collector reads it, while the mutator is
                     // paused inside an allocation.

@@ -483,7 +483,11 @@ impl RealmState {
 }
 
 impl otter_gc::ExtraRootSource for RealmState {
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+    fn visit_extra_roots(
+        &self,
+        _roots: otter_gc::RootSet,
+        visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
+    ) {
         self.trace_roots(visitor);
     }
 }
@@ -1621,8 +1625,8 @@ impl otter_gc::ExtraRootSource for Interpreter {
         self.code_space.sweep_property_ics(heap);
         self.constructor_families.sweep_dead(heap);
     }
-    fn visit_extra_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
-        crate::runtime_state::RuntimeState::new(self).trace_roots(visitor);
+    fn visit_extra_roots(&self, roots: otter_gc::RootSet, visitor: &mut dyn FnMut(*mut RawGc)) {
+        crate::runtime_state::RuntimeState::new(self).trace_roots(roots, visitor);
     }
 }
 

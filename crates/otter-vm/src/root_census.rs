@@ -287,7 +287,10 @@ impl Interpreter {
         );
         push(
             "shape_runtime",
-            count(|v| self.shape_runtime_for_trace().trace_roots(v)),
+            count(|v| {
+                self.shape_runtime_for_trace()
+                    .trace_roots(otter_gc::RootSet::All, v)
+            }),
         );
         push(
             "simple_constructor_shapes",

@@ -2200,6 +2200,8 @@ pub struct JitInstructionMetadata {
     pub property_attempted: bool,
     /// Whether this `length` read has run and read only Arrays.
     pub length_reads_arrays_only: bool,
+    /// Whether this `length` read has run and read only typed arrays.
+    pub length_reads_typed_arrays_only: bool,
     /// Arithmetic representation observations frozen for this canonical PC.
     pub(crate) arith_feedback: ArithFeedback,
     /// Address of the live arithmetic observation byte baseline code
@@ -2221,6 +2223,7 @@ impl JitInstructionMetadata {
             call_attempted: false,
             property_attempted: false,
             length_reads_arrays_only: false,
+            length_reads_typed_arrays_only: false,
             arith_feedback: ArithFeedback::default(),
             arith_cell: 0,
             call_count_cell: 0,

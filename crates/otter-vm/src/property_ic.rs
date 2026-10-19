@@ -201,6 +201,7 @@ const STATE_COUNT_MASK: u32 = 0xff;
 const STATE_ATTEMPTED: u32 = 1 << 8;
 const STATE_MEGAMORPHIC: u32 = 1 << 9;
 const STATE_LENGTH_NON_ARRAY: u32 = 1 << 10;
+const STATE_LENGTH_NON_TYPED_ARRAY: u32 = 1 << 11;
 
 /// One `(receiver shape, handler)` pair, read by generated code.
 #[derive(Debug)]
@@ -744,6 +745,25 @@ impl PropertyIcSlot {
     #[must_use]
     pub(crate) fn length_read_non_array(&self) -> bool {
         self.state() & STATE_LENGTH_NON_ARRAY != 0
+    }
+
+    /// Whether this `length` site has read something other than a typed
+    /// array.
+    #[must_use]
+    pub(crate) fn length_read_non_typed_array(&self) -> bool {
+        self.state() & STATE_LENGTH_NON_TYPED_ARRAY != 0
+    }
+
+    /// Mark a `length` read of a receiver that is not a typed array.
+    /// Returns whether this was the first.
+    pub(crate) fn record_length_non_typed_array(&self) -> bool {
+        let state = self.state();
+        if state & STATE_LENGTH_NON_TYPED_ARRAY != 0 {
+            return false;
+        }
+        self.state
+            .store(state | STATE_LENGTH_NON_TYPED_ARRAY, Ordering::Relaxed);
+        true
     }
 
     /// Mark a `length` read of a receiver that is not an Array. Returns

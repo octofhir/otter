@@ -242,6 +242,7 @@ fn proves_inputs(kind: &Kind) -> bool {
             receiver_proved, ..
         } => !receiver_proved,
         Kind::LoadArrayLength { array_proved } => !array_proved,
+        Kind::LoadTypedArrayLength => true,
         Kind::LoadArrayExpando(_) | Kind::LoadFunctionBag | Kind::StringCharCodeAt => true,
         _ => false,
     }
@@ -346,6 +347,10 @@ fn heap_effects(kind: &Kind) -> Effects {
             }
         }
         Kind::LoadElementsLength { .. } => Effects::deref(&[H::ElementStorage]),
+        // A view's count is fixed while its storage is; a named property
+        // only appears through an appending store, which writes the map
+        // words, or the runtime.
+        Kind::LoadTypedArrayLength => Effects::reads(&[H::ElementStorage, H::MapWords]),
         Kind::LoadElementsBase { off_heap, .. } => {
             if *off_heap {
                 Effects::deref(&[H::ElementStorage])

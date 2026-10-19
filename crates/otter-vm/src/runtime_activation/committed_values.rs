@@ -339,7 +339,7 @@ impl Interpreter {
         // operands in a handle scope before their first coercion, so they need
         // no second root frame here.
         if let ObjectProtocolValueOp::Binary(operator) = operation {
-            return self.binary_operator_value(stack, context, operator, value0, value1);
+            return self.binary_operator_value(stack, context, operator, value0, value1, None);
         }
         // `index in array` on a plain array is its own storage's answer: no
         // key to spell, no prototype walk.
@@ -530,6 +530,24 @@ impl RuntimeCall<'_> {
     ) -> Result<Value, CommittedValueError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
         vm.record_jit_runtime_stub_class(crate::native_abi::RuntimeStubClass::Reentrant);
+        // A compiled `+` places its concatenation at its own site.
+        if let ObjectProtocolValueOp::Binary(operator @ crate::BinaryOperator::Add) = operation {
+            let (function_id, pc) = self.semantic_source().map_err(CommittedValueError::Fatal)?;
+            let owner = self
+                .owner(function_id)
+                .map_err(CommittedValueError::Fatal)?;
+            let site = owner
+                .exec_function(function_id)
+                .and_then(|function| function.allocation_site_at(pc as usize));
+            return vm.binary_operator_value(
+                unsafe { &mut *self.stack.as_ptr() },
+                &self.context,
+                operator,
+                value0,
+                value1,
+                site,
+            );
+        }
         vm.object_protocol_value(
             unsafe { &mut *self.stack.as_ptr() },
             &self.context,

@@ -22,12 +22,14 @@ pub(super) fn emit_concat_fit(
     dst: u16,
     lhs: u16,
     rhs: u16,
+    site: otter_vm::jit::JitAllocationSite,
     slow: DynamicLabel,
     done: DynamicLabel,
 ) {
-    use super::shared_property::{CONCAT_LHS, CONCAT_RESULT, CONCAT_RHS};
+    use super::shared_property::{CONCAT_LHS, CONCAT_RESULT, CONCAT_RHS, CONCAT_SITE};
     emit_load_reg(ops, CONCAT_LHS, lhs);
     emit_load_reg(ops, CONCAT_RHS, rhs);
+    emit_load_u64(ops, CONCAT_SITE, site.record);
     let routine = shared.concat_label(ops);
     dynasm!(ops ; .arch x64 ; call =>routine ; test edx, edx ; jnz =>slow);
     emit_store_reg(ops, CONCAT_RESULT, dst);

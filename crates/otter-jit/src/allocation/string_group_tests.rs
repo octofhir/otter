@@ -163,6 +163,7 @@ fn run(
                 *layout,
                 [input[0], input[1]],
                 regs,
+                crate::allocation::ConcatPlacement::YOUNG,
                 slow,
             ),
             Recipe::Group { realm, members } => crate::arm64::allocation::emit_fixed_group(
@@ -221,6 +222,7 @@ fn run(
                 *layout,
                 [input[0], input[1]],
                 regs,
+                crate::allocation::ConcatPlacement::YOUNG,
                 slow,
             ),
             Recipe::Group { realm, members } => crate::x86_64::allocation::emit_fixed_group(

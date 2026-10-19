@@ -46,7 +46,8 @@ pub struct JitLiteralAllocationPlans {
     pub arrays: rustc_hash::FxHashMap<u32, JitArrayLiteralAllocationPlan>,
     /// Shared-boilerplate array shells by own logical instruction PC.
     pub boilerplates: rustc_hash::FxHashMap<u32, JitBoilerplateArrayAllocationPlan>,
-    /// Allocation sites of object and array literals by own logical PC.
+    /// Allocation sites of object and array literals and of concatenating
+    /// `+` instructions by own logical PC.
     pub sites: rustc_hash::FxHashMap<u32, JitAllocationSite>,
 }
 
@@ -94,6 +95,14 @@ impl JitAllocationSite {
 pub const JIT_SITE_CREATED_OFFSET: u32 = otter_gc::pretenuring::SITE_CREATED_OFFSET as u32;
 /// Byte offset of a site record's decision byte.
 pub const JIT_SITE_DECISION_OFFSET: u32 = otter_gc::pretenuring::SITE_DECISION_OFFSET as u32;
+/// Header-relative byte of a cell's GC flags, which hold the young flag.
+pub const JIT_HEADER_FLAGS_BYTE: u32 = otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32;
+/// Header-relative bytes of a young cell's `u16` allocation-site tag.
+pub const JIT_HEADER_SITE_BYTES: u32 = otter_gc::header::HEADER_BODY_BYTES_OFFSET as u32;
+/// Byte offset of a site record's own `u16` id.
+pub const JIT_SITE_ID_OFFSET: u32 = otter_gc::pretenuring::SITE_ID_OFFSET as u32;
+/// Decision byte of a tenured site.
+pub const JIT_SITE_TENURE: u8 = otter_gc::pretenuring::PretenureDecision::Tenure as u8;
 /// Decision bit only final decisions carry.
 pub const JIT_SITE_DECIDED_BIT: u8 = otter_gc::pretenuring::DECIDED_BIT;
 

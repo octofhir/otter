@@ -1400,6 +1400,16 @@ impl Interpreter {
                             .insert(u32::try_from(pc).ok()?, plan);
                     }
                 }
+                // A `+` that concatenated places its strings at its site.
+                Op::Add | Op::AddImm
+                    if instruction.arith_feedback().bits() & crate::jit_feedback::ARITH_STRING
+                        != 0 =>
+                {
+                    let site = self.jit_allocation_site(view.code_block.allocation_site_at(pc));
+                    view.literal_allocations
+                        .sites
+                        .insert(u32::try_from(pc).ok()?, site);
+                }
                 Op::NewArray => {
                     let count = instruction.const_index(&view.code_block, 1)? as usize;
                     if count != 0 {

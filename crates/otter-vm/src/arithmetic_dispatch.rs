@@ -23,6 +23,8 @@
 //! - Generic `+` roots both operands and allocated string intermediates in a
 //!   handle scope before any moving-GC allocation.
 //! - Mixed Number/BigInt arithmetic is rejected with `TypeMismatch`.
+//! - A `+` instruction's allocation site places every string its
+//!   concatenation creates; a numeric sum never registers the site.
 //! - BigInt operators read their operand bodies in place and allocate only
 //!   their result ([`bigint::ops`]).
 //!
@@ -462,7 +464,8 @@ impl Interpreter {
             return commit_frame_result(unsafe { &mut *frame }, dst, result)
                 .map_err(CommittedValueError::Fatal);
         }
-        let result = self.add_value(stack, context, lhs, rhs)?;
+        let site = add_site(context, unsafe { &*frame });
+        let result = self.add_value(stack, context, lhs, rhs, site)?;
         record_arith_result(feedback, result);
         commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
@@ -496,7 +499,8 @@ impl Interpreter {
             )
             .map_err(CommittedValueError::Fatal);
         }
-        let result = self.add_value(stack, context, lval, Value::number_i32(imm))?;
+        let site = add_site(context, unsafe { &*frame });
+        let result = self.add_value(stack, context, lval, Value::number_i32(imm), site)?;
         commit_frame_result(unsafe { &mut *frame }, dst, result).map_err(CommittedValueError::Fatal)
     }
 
@@ -595,12 +599,16 @@ impl Interpreter {
     /// Step 1 sends both operands through `ToPrimitive(default)`, left first,
     /// before the String-concatenation test decides between concatenation and
     /// numeric addition.
+    ///
+    /// `site` is the instruction's allocation-site cell, which places the
+    /// strings a concatenation creates.
     pub(crate) fn add_value(
         &mut self,
         stack: &mut ActivationStack,
         context: &crate::execution_context::ExecutionContext,
         lhs: Value,
         rhs: Value,
+        site: Option<&std::sync::atomic::AtomicU16>,
     ) -> Result<Value, CommittedValueError> {
         // Number + Number is the dominant shape and allocates nothing, so it
         // needs neither the handle scope nor the `ToNumeric` ladder: both
@@ -627,19 +635,21 @@ impl Interpreter {
             // primitive is a String, concatenate; otherwise apply ToNumeric
             // to each primitive and fold via the numeric / BigInt rules.
             if lhs_value.is_string() || rhs_value.is_string() {
-                if let Some(fast) = interp.try_concat_string_int32(lhs_value, rhs_value) {
+                let placement = interp.literal_site_placement(site);
+                if let Some(fast) = interp.try_concat_string_int32(lhs_value, rhs_value, placement)
+                {
                     return fast
                         .map_err(oom_to_vm)
                         .map_err(CommittedValueError::JavaScript);
                 }
 
                 let lhs_string = interp
-                    .js_string_for_concat(lhs_value)
+                    .js_string_for_concat(lhs_value, placement)
                     .map_err(CommittedValueError::JavaScript)?;
                 let lhs_string = interp.scoped_value(scope, Value::string(lhs_string));
                 let rhs_value = interp.escape_scoped(rhs);
                 let rhs_string = interp
-                    .js_string_for_concat(rhs_value)
+                    .js_string_for_concat(rhs_value, placement)
                     .map_err(CommittedValueError::JavaScript)?;
                 let rhs_string = interp.scoped_value(scope, Value::string(rhs_string));
                 let lhs_string = interp
@@ -652,7 +662,8 @@ impl Interpreter {
                     .as_string(&interp.gc_heap)
                     .ok_or(VmError::TypeMismatch)
                     .map_err(CommittedValueError::JavaScript)?;
-                let result = JsString::concat(lhs_string, rhs_string, interp.gc_heap_mut());
+                let result =
+                    JsString::concat_at(lhs_string, rhs_string, interp.gc_heap_mut(), placement);
                 result.map(Value::string).map_err(|error| {
                     CommittedValueError::JavaScript(crate::string::concat_error_to_vm(
                         interp, error,
@@ -689,6 +700,7 @@ impl Interpreter {
     /// Complete one generic binary operator over boxed operands through the
     /// interpreter's own kernels, including every observable coercion. A
     /// committed compiled site uses this when its feedback is not numeric.
+    /// `site` is the instruction's allocation-site cell, used by `+`.
     pub(crate) fn binary_operator_value(
         &mut self,
         stack: &mut ActivationStack,
@@ -696,10 +708,11 @@ impl Interpreter {
         operator: crate::BinaryOperator,
         lhs: Value,
         rhs: Value,
+        site: Option<&std::sync::atomic::AtomicU16>,
     ) -> Result<Value, CommittedValueError> {
         use crate::BinaryOperator as B;
         match operator {
-            B::Add => self.add_value(stack, context, lhs, rhs),
+            B::Add => self.add_value(stack, context, lhs, rhs, site),
             B::Sub => numeric_binary_value(
                 self,
                 stack,
@@ -1375,6 +1388,16 @@ fn bigint_to_vm_error(interp: &Interpreter, err: bigint::ops::OpError) -> VmErro
     }
 }
 
+/// The allocation-site cell of the `+` instruction `frame` is executing.
+pub(crate) fn add_site<'a>(
+    context: &'a crate::execution_context::ExecutionContext,
+    frame: &Frame,
+) -> Option<&'a std::sync::atomic::AtomicU16> {
+    context
+        .exec_function(frame.header.function_id)?
+        .allocation_site_at(frame.header.pc as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1457,6 +1480,97 @@ mod tests {
     }
 
     #[test]
+    fn add_places_its_concatenation_and_number_text_at_its_site() {
+        use otter_gc::pretenuring::PretenureDecision;
+        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
+        interp.gc_heap.set_gc_stress(0, false);
+        let mut stack = crate::ActivationStack::new();
+        let context = crate::execution_context::ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("add-site-placement-test.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
+        .expect("valid bytecode fixture");
+        let prefix = Value::string(
+            JsString::from_str("String for the leaf node of key ", interp.gc_heap_mut())
+                .expect("prefix"),
+        );
+        let cell = std::sync::atomic::AtomicU16::new(0);
+        let header = |interp: &Interpreter, value: Value| {
+            let string = value.as_string(interp.gc_heap()).expect("string result");
+            string.handle().as_header_ptr()
+        };
+        let sum = interp
+            .add_value(
+                &mut stack,
+                &context,
+                Value::number_i32(2),
+                Value::number_i32(3),
+                Some(&cell),
+            )
+            .expect("numeric sum");
+        assert_eq!(sum, Value::number_i32(5));
+        assert_eq!(
+            cell.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a sum registers no site"
+        );
+
+        let tracked = interp
+            .add_value(
+                &mut stack,
+                &context,
+                prefix,
+                Value::number_f64(0.25),
+                Some(&cell),
+            )
+            .expect("tracked concatenation");
+        let site = cell.load(std::sync::atomic::Ordering::Relaxed);
+        assert_ne!(site, 0);
+        // SAFETY: no collection ran since the allocation.
+        unsafe {
+            assert!((*header(&interp, tracked)).is_young());
+            assert_eq!((*header(&interp, tracked)).allocation_site(), site);
+        }
+
+        interp
+            .gc_heap
+            .allocation_sites_mut()
+            .set_decision_for_test(site, PretenureDecision::Tenure);
+        let tenured = interp
+            .add_value(
+                &mut stack,
+                &context,
+                prefix,
+                Value::number_f64(0.75),
+                Some(&cell),
+            )
+            .expect("tenured concatenation");
+        let right = {
+            let string = tenured.as_string(interp.gc_heap()).expect("string result");
+            interp
+                .gc_heap()
+                .read_payload(string.handle(), |body| match body.repr {
+                    crate::string::gc_body::JsStringBodyRepr::Cons { right, .. } => Some(right),
+                    _ => None,
+                })
+                .expect("a cons result")
+        };
+        // SAFETY: as above.
+        unsafe {
+            assert!(!(*header(&interp, tenured)).is_young());
+            assert!(
+                !(*right.as_header_ptr()).is_young(),
+                "the number text is old too"
+            );
+        }
+        let text = tenured
+            .as_string(interp.gc_heap())
+            .expect("string result")
+            .to_lossy_string(interp.gc_heap());
+        assert_eq!(text, "String for the leaf node of key 0.75");
+    }
+
+    #[test]
     fn add_kernel_roots_string_operands_without_frame_storage() {
         let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let lhs_text = "rooted-string-value-that-is-longer-than-inline-";
@@ -1470,7 +1584,7 @@ mod tests {
         )
         .expect("valid bytecode fixture");
         let result = interp
-            .add_value(&mut stack, &context, lhs, Value::number_i32(7))
+            .add_value(&mut stack, &context, lhs, Value::number_i32(7), None)
             .expect("string addition");
         let text = result
             .as_string(interp.gc_heap())

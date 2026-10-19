@@ -11,7 +11,7 @@
 //!   A young cell's header body bytes carry its site id until its first
 //!   evacuation clears them, so each cell is found at most once.
 //! - Records live in fixed chunks and never move: generated code may bake a
-//!   record address for the heap's lifetime.
+//!   record address for the heap's lifetime. Each record holds its own id.
 //! - A scavenge digests every record: a site that created at least
 //!   [`MINIMUM_CREATED`] cells decides from its survival ratio, then all
 //!   counters restart. Survival of at least [`PRETENURE_RATIO`] tenures the
@@ -77,12 +77,17 @@ pub struct SiteRecord {
     pub found: u32,
     /// [`PretenureDecision`] as a byte.
     pub decision: u8,
+    /// This record's own site id, which code shared by many sites reads to
+    /// tag a cell.
+    pub id: u16,
 }
 
 /// Byte offset of [`SiteRecord::created`].
 pub const SITE_CREATED_OFFSET: usize = std::mem::offset_of!(SiteRecord, created);
 /// Byte offset of [`SiteRecord::decision`].
 pub const SITE_DECISION_OFFSET: usize = std::mem::offset_of!(SiteRecord, decision);
+/// Byte offset of [`SiteRecord::id`].
+pub const SITE_ID_OFFSET: usize = std::mem::offset_of!(SiteRecord, id);
 
 /// Concurrent access to the found counters of an [`AllocationSites`] table
 /// during one scavenge, which keeps the table borrowed.
@@ -133,6 +138,8 @@ impl AllocationSites {
             self.chunks
                 .push((0..CHUNK).map(|_| SiteRecord::default()).collect());
         }
+        let site = self.len;
+        self.record_mut(site).id = site;
         self.len
     }
 
@@ -241,6 +248,7 @@ mod tests {
         }
         assert_eq!(sites.record_address(first), address);
         assert_eq!(first, 1);
+        assert_eq!(sites.record(1001).id, 1001, "a record holds its own id");
         assert!(sites.contains(1001) && !sites.contains(1002) && !sites.contains(0));
     }
 

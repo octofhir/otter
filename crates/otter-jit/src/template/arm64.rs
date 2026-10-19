@@ -1204,6 +1204,11 @@ pub(crate) fn emit_operation<'a>(
                 rhs,
                 alloc_roots.packet(concat_safepoint),
                 arith::ArithSite::of(view, instr.pc),
+                view.literal_allocations
+                    .sites
+                    .get(&instr.pc)
+                    .copied()
+                    .unwrap_or_default(),
                 threw,
                 fatal,
             )?;

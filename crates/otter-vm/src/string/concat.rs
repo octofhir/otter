@@ -3,14 +3,20 @@
 //! # Contents
 //! - Traced small-integer string cache and canonical primitive conversion.
 //! - One-result short Latin-1/int32 concatenation without a temporary string.
+//! - Allocation-site placement of the strings one concatenation creates.
 //!
 //! # Invariants
 //! The VM alone owns conversion and caching. The short path copies source bytes
 //! into fixed stack storage before allocation; its integer input cannot move.
 //! The general caller keeps every string operand in its handle arena.
+//! Every string a concatenation creates for its result, including a number's
+//! decimal text, takes the site's placement; cached small-integer strings are
+//! shared and keep theirs.
 //!
 //! # See also
 //! - `crate::runtime_stubs::string` owns compiled collecting root publication.
+
+use otter_gc::SitePlacement;
 
 use crate::{Interpreter, JsString, Value, VmError, conversion, number};
 
@@ -43,7 +49,13 @@ impl Interpreter {
     /// `ToString` of a primitive operand for string concatenation, routing small
     /// non-negative integers through the [`Self::small_int_string`] cache to
     /// avoid re-allocating their decimal text on every concatenation.
-    pub(crate) fn js_string_for_concat(&mut self, value: Value) -> Result<JsString, VmError> {
+    /// A number's fresh decimal text is placed for the concatenation's site,
+    /// which the result will retain.
+    pub(crate) fn js_string_for_concat(
+        &mut self,
+        value: Value,
+        placement: SitePlacement,
+    ) -> Result<JsString, VmError> {
         if let Some(n) = value.as_number() {
             let f = n.as_f64();
             if f >= 0.0
@@ -53,6 +65,16 @@ impl Interpreter {
             {
                 return Ok(s);
             }
+            let mut text = [0u8; number::ecma::ECMA_BUF_LEN];
+            let len = number::ecma::f64_to_ecma_string_buf(f, &mut text);
+            let mut roots = crate::string::no_extra_roots;
+            return JsString::from_latin1_at(
+                &text[..len],
+                &mut self.gc_heap,
+                placement,
+                &mut roots,
+            )
+            .map_err(crate::oom_to_vm);
         }
         conversion::to_js_string_primitive(&value, self.gc_heap_mut())
     }
@@ -70,6 +92,7 @@ impl Interpreter {
         &mut self,
         lhs: Value,
         rhs: Value,
+        placement: SitePlacement,
     ) -> Option<Result<Value, otter_gc::OutOfMemory>> {
         let (handle, n, number_first) = match (
             lhs.as_string(&self.gc_heap),
@@ -98,8 +121,9 @@ impl Interpreter {
         out[..first.len()].copy_from_slice(first);
         out[first.len()..first.len() + second.len()].copy_from_slice(second);
         let total = first.len() + second.len();
+        let mut roots = crate::string::no_extra_roots;
         Some(
-            crate::string::JsString::from_latin1(&out[..total], &mut self.gc_heap)
+            JsString::from_latin1_at(&out[..total], &mut self.gc_heap, placement, &mut roots)
                 .map(Value::string),
         )
     }

@@ -1,7 +1,8 @@
 //! Primitive Number/String operations over canonical Graph operands.
 //!
 //! # Contents
-//! - Native string LAB fits and Number addition on one source operation.
+//! - Native string LAB fits and Number addition on one source operation,
+//!   placed by the `+` instruction's allocation site.
 //! - BigInt binary operators through their allocating Probe.
 //! - Typed UTF-16/numeric ordering through the VM's NoAlloc boundary.
 //!
@@ -10,6 +11,8 @@
 //! every eager exit. Neither content ordering nor native fits can collect or
 //! reenter. No character pointer escapes the node. Unsupported values leave
 //! before observable coercion at the exact source instruction.
+//! A tracking site leaves before any effect once it tenures; one the
+//! collector declined keeps tagging cells, which only its counters see.
 //!
 //! # See also
 //! - `super::lexical` owns the sole collecting fixed-value Probe packet.
@@ -17,6 +20,8 @@
 
 use super::super::Condition;
 use super::*;
+use crate::allocation::ConcatPlacement;
+use otter_vm::jit::JIT_SITE_TENURE;
 use crate::entry::VM_THREAD_GC_HEAP_OFFSET;
 use crate::template::arm64::values::emit_load_symbol_u64;
 
@@ -73,8 +78,31 @@ impl Codegen<'_> {
         dynasm!(self.ops ; .arch aarch64 ; fadd D(float),D(float),d31);
         self.emit_box_float64(float, destination);
         dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>strings);
-        let layout = self.view_of(node).string_layout;
-        crate::arm64::allocation::emit_concat(&mut self.ops, 20, layout, values, regs, slow);
+        let source = self.view_of(node);
+        let layout = source.string_layout;
+        let site = source
+            .literal_allocations
+            .sites
+            .get(&self.graph.node(node).pc)
+            .copied()
+            .unwrap_or_default();
+        if site.mode == JitSiteMode::Track {
+            // A tenured site leaves before any effect and recompiles old.
+            let exit = self.eager_exit(node, DeoptReason::AllocationSiteDecided);
+            self.load_immediate(16, site.record);
+            dynasm!(self.ops ; .arch aarch64
+                ; ldrb w17, [x16, JIT_SITE_DECISION_OFFSET]
+                ; cmp w17, u32::from(JIT_SITE_TENURE) ; b.eq =>exit);
+        }
+        crate::arm64::allocation::emit_concat(
+            &mut self.ops,
+            20,
+            layout,
+            values,
+            regs,
+            ConcatPlacement::Site(site),
+            slow,
+        );
         dynasm!(self.ops ; .arch aarch64 ; mov X(destination),X(regs.candidate) ; b =>done ; =>slow);
         self.emit_probe_allocation(
             node,
@@ -82,7 +110,7 @@ impl Codegen<'_> {
             [
                 values[0],
                 values[1],
-                AllocationValue::Constant(crate::entry::VALUE_UNDEFINED),
+                AllocationValue::Constant(ConcatPlacement::stub_operand(site)),
             ],
             Some(destination),
         )?;

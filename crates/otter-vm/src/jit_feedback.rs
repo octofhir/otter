@@ -385,8 +385,9 @@ enum TypedFeedbackSlot {
     Property(Box<PropertyIcSlot>),
     Method(Box<PropertyIcSlot>, Box<AtomicCallFeedback>),
     Call(Box<AtomicCallFeedback>),
-    /// The isolate's allocation site of an object or array literal; zero
-    /// until the site's first allocation registers it.
+    /// The isolate's allocation site of an object or array literal, or of
+    /// the strings a `+` concatenation creates; zero until the site's first
+    /// allocation registers it.
     AllocationSite(AtomicU16),
 }
 
@@ -412,9 +413,11 @@ impl TypedFeedbackSlot {
             | Op::NewSpread
             | Op::SuperConstruct
             | Op::SuperConstructSpread => Self::Call(Box::default()),
-            Op::NewObjectLiteral | Op::NewArray | Op::NewArrayBoilerplate => {
-                Self::AllocationSite(AtomicU16::new(0))
-            }
+            Op::NewObjectLiteral
+            | Op::NewArray
+            | Op::NewArrayBoilerplate
+            | Op::Add
+            | Op::AddImm => Self::AllocationSite(AtomicU16::new(0)),
             _ => Self::None,
         }
     }

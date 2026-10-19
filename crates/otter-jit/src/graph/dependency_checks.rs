@@ -293,6 +293,7 @@ mod tests {
     fn observing_store() -> Kind {
         Kind::StoreOwnField {
             field: otter_vm::object::FieldLocation::inline(0),
+            atom: 0,
             owners: smallvec![(
                 40,
                 FieldStoreOwner {

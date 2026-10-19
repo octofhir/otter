@@ -153,7 +153,7 @@ fn own_fields_keep_the_bank_in_a_single_access_and_barrier_the_receiver() {
                 .filter(|node| {
                     matches!(
                         node.kind,
-                        Kind::LoadOwnField(_) | Kind::StoreOwnField { .. }
+                        Kind::LoadOwnField { .. } | Kind::StoreOwnField { .. }
                     )
                 })
                 .collect();
@@ -164,10 +164,11 @@ fn own_fields_keep_the_bank_in_a_single_access_and_barrier_the_receiver() {
                 if store {
                     Kind::StoreOwnField {
                         field,
+                        atom: 1,
                         owners: smallvec::SmallVec::new(),
                     }
                 } else {
-                    Kind::LoadOwnField(field)
+                    Kind::LoadOwnField { field, atom: 1 }
                 }
             );
             assert_eq!(built.graph.node(access.inputs[0]).repr, Repr::Tagged);
@@ -338,6 +339,7 @@ fn inline_appends_and_existing_suffix_overwrites_still_specialize() {
         assert!(built.graph.nodes.iter().any(|node| node.kind
             == Kind::StoreOwnField {
                 field,
+                atom: 1,
                 owners: smallvec::SmallVec::new()
             }));
         assert!(
@@ -466,13 +468,13 @@ fn prior_receiver_proofs_select_own_banks_and_preserve_uncovered_shape_checks() 
             },
         );
         let built = load_graph(&view);
-        assert!(
-            built
-                .graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == Kind::LoadOwnField(FieldLocation::inline(1)))
-        );
+        assert!(built.graph.nodes.iter().any(|node| {
+            node.kind
+                == Kind::LoadOwnField {
+                    field: FieldLocation::inline(1),
+                    atom: 1,
+                }
+        }));
         let checks: Vec<_> = built
             .graph
             .nodes
@@ -778,7 +780,7 @@ fn array_expando_fields_use_tagged_storage_while_eager_state_keeps_array() {
                 .find(|node| {
                     matches!(
                         node.kind,
-                        Kind::StoreOwnField { .. } | Kind::LoadOwnField(_)
+                        Kind::StoreOwnField { .. } | Kind::LoadOwnField { .. }
                     )
                 })
                 .unwrap();

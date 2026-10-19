@@ -57,7 +57,7 @@ impl Codegen<'_> {
                     Some(output()),
                 )?;
             }
-            Kind::LoadOwnField(field) => crate::x86_64::fields::emit_own_field(
+            Kind::LoadOwnField { field, .. } => crate::x86_64::fields::emit_own_field(
                 &mut self.ops,
                 self.view.field_layout,
                 Self::gp(input(0)),
@@ -69,7 +69,7 @@ impl Codegen<'_> {
                     crate::field_access::FieldAccess::LoadTagged
                 },
             ),
-            Kind::StoreOwnField { field, owners } => {
+            Kind::StoreOwnField { field, owners, .. } => {
                 let object = Self::gp(input(0));
                 let value = Self::gp(input(1));
                 crate::x86_64::fields::emit_own_field(

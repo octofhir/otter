@@ -47,6 +47,8 @@ pub(crate) struct OwnDataLoad {
     pub(crate) shapes: SmallVec<[u32; 4]>,
     /// Immutable storage bank and bank-relative word index.
     pub(crate) field: otter_vm::object::FieldLocation,
+    /// The key's atom: every program of one site names the same property.
+    pub(crate) atom: u32,
 }
 
 /// Native load programs selected from one source-owned feedback bank.
@@ -141,6 +143,7 @@ pub(crate) fn own_data_load(
     let selected = load_program_indices(programs, receivers)?;
     let mut shapes = SmallVec::new();
     let mut location = None;
+    let mut atom = None;
     let mut projection = None;
     for index in selected {
         let program = &programs[index as usize];
@@ -156,9 +159,9 @@ pub(crate) fn own_data_load(
             },
             JitCacheIrOp::GuardAtomSlot {
                 object: slot_operand,
+                atom: slot_atom,
                 field,
                 writable: false,
-                ..
             },
             JitCacheIrOp::LoadField {
                 object: load_operand,
@@ -176,16 +179,20 @@ pub(crate) fn own_data_load(
             return None;
         }
         i32::try_from(field.byte_offset()).ok()?;
-        if location.is_some_and(|known| known != *field) {
+        if location.is_some_and(|known| known != *field)
+            || atom.is_some_and(|known| known != *slot_atom)
+        {
             return None;
         }
         location = Some(*field);
+        atom = Some(*slot_atom);
         shapes.push(*shape);
     }
     Some(OwnDataLoad {
         projection: projection?,
         shapes,
         field: location?,
+        atom: atom?,
     })
 }
 
@@ -228,6 +235,7 @@ pub(crate) fn own_data_store(
     }
     let mut shapes = SmallVec::new();
     let mut location = None;
+    let mut atom = None;
     let mut projection = None;
     for program in programs {
         if let (Some(receivers), Some(JitCacheIrOp::GuardShape { object: 0, shape })) =
@@ -248,9 +256,9 @@ pub(crate) fn own_data_store(
             },
             JitCacheIrOp::GuardAtomSlot {
                 object: slot_operand,
+                atom: slot_atom,
                 field,
                 writable: true,
-                ..
             },
             JitCacheIrOp::StoreField {
                 object: store_operand,
@@ -268,16 +276,20 @@ pub(crate) fn own_data_store(
             return None;
         }
         i32::try_from(field.byte_offset()).ok()?;
-        if location.is_some_and(|known| known != *field) {
+        if location.is_some_and(|known| known != *field)
+            || atom.is_some_and(|known| known != *slot_atom)
+        {
             return None;
         }
         location = Some(*field);
+        atom = Some(*slot_atom);
         shapes.push(*shape);
     }
     Some(OwnDataLoad {
         projection: projection?,
         shapes,
         field: location?,
+        atom: atom?,
     })
 }
 
@@ -610,6 +622,7 @@ mod tests {
                 projection: PropertyStorageProjection::Receiver,
                 shapes: smallvec::smallvec![16],
                 field: FieldLocation::overflow(0),
+                atom: 1,
             }
         );
         assert_eq!(

@@ -11,6 +11,8 @@
 //! - [`phi_repr`] — unboxed int32 phis.
 //! - [`range`] — int32 ranges dropping overflow and `-0` checks.
 //! - [`truncation`] — wrapping int32 additions under truncating uses.
+//! - [`effects`] — abstract heaps each node reads and writes.
+//! - [`dominators`] — immediate dominators of the block graph.
 //! - [`licm`] — loop-invariant checks and loads run once before their loop.
 //! - `branch_fold` — truthiness branches test the value under `!` and
 //!   ToBoolean.
@@ -56,7 +58,9 @@ pub(crate) mod builder;
 pub(crate) mod bytecode;
 pub(crate) mod call;
 mod dependency_checks;
+pub(crate) mod dominators;
 mod dump;
+pub(crate) mod effects;
 pub(crate) mod emission;
 pub(crate) mod feedback;
 pub(crate) mod frame;

@@ -1682,7 +1682,7 @@ impl<'a> Codegen<'a> {
                 let element = *element;
                 self.emit_store_element(element, base, index, input(2))?;
             }
-            Kind::LoadOwnField(field) => {
+            Kind::LoadOwnField { field, .. } => {
                 let object = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
                 own_fields::emit(
@@ -1698,7 +1698,7 @@ impl<'a> Codegen<'a> {
                     },
                 );
             }
-            Kind::StoreOwnField { field, owners } => {
+            Kind::StoreOwnField { field, owners, .. } => {
                 let owners = owners.clone();
                 let (object, value) = (Self::gp(input(0)), Self::gp(input(1)));
                 own_fields::emit(
@@ -3712,24 +3712,18 @@ impl<'a> Codegen<'a> {
                             continue;
                         }
                         let header = object(operand);
+                        // A baked shape is never null, and only an object of
+                        // that shape holds it as its map word.
                         if operand == 0 {
                             dynasm!(self.ops
                                 ; .arch aarch64
                                 ; tst X(header), #0xfffe_0000_0000_0007
                                 ; b.ne =>next
-                                ; ldrb w16, [X(header)]
-                                ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
-                                ; b.ne =>next
                             );
                         }
-                        let shape_byte = self.view.object_shape_byte;
-                        dynasm!(self.ops
-                            ; .arch aarch64
-                            ; ldr w16, [X(header), shape_byte]
-                            ; cbz w16, =>next
-                        );
-                        self.load_immediate(17, u64::from(shape));
-                        dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>next);
+                        dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(header), JIT_MAP_WORD_BYTE]);
+                        self.emit_compare_w16(shape);
+                        dynasm!(self.ops ; .arch aarch64 ; b.ne =>next);
                     }
                     Op::GuardDictionaryLayout { layout, .. } => {
                         let shape_byte = self.view.object_shape_byte;

@@ -144,7 +144,7 @@ fn case(extra: bool) {
         ir.matches("LoadArrayLength { array_proved: true }").count() >= 2,
         "{ir}"
     );
-    assert!(ir.contains("object_proved: true"), "{ir}");
+    assert!(ir.contains("cell_proved: true"), "{ir}");
     let map = json(bundle, JitArtifactFileName::CodeMap);
     let lengths: Vec<_> = map["regions"]
         .as_array()

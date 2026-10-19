@@ -519,6 +519,9 @@ fn symbolic_target(target: &RelocationTarget) -> String {
         RelocationTarget::ArithFeedbackCell { function_id, pc } => {
             format!("arithFeedbackCell(function={function_id},pc={pc})")
         }
+        RelocationTarget::CallCountCell { function_id, pc } => {
+            format!("callCountCell(function={function_id},pc={pc})")
+        }
         RelocationTarget::SourceWorkCell { function_id } => {
             format!("sourceWorkCell(function={function_id})")
         }

@@ -259,7 +259,7 @@ pub const JIT_MAX_INLINED_INSTRUCTIONS_CUMULATIVE: u32 = 320;
 pub const JIT_MAX_INLINED_INSTRUCTIONS_ABSOLUTE: u32 = 1600;
 /// The fewest calls per run of the compiled function at which a call site is
 /// inlined: a site reached more rarely is left a call.
-pub const JIT_MIN_INLINING_FREQUENCY: f32 = 0.15;
+pub const JIT_MIN_INLINING_FREQUENCY: f32 = 0.10;
 
 /// Bytes of the BigInt cell generated code carves: header, body and one
 /// digit, rounded to the cell size.
@@ -886,7 +886,7 @@ pub struct JitCompileSnapshot {
     /// and splices accepted bodies under an identity guard; a failed guard
     /// side-exits at the exact caller PC.
     pub inline_callees: rustc_hash::FxHashMap<u32, JitInlineCallee>,
-    /// Calls per interpreted entry of this body at each call and method
+    /// Calls per entry of this body at each call and method
     /// site with call feedback, keyed by byte PC: what an optimizing caller
     /// weighs its inline candidates by. Baked with the call-site plans.
     pub call_frequencies: rustc_hash::FxHashMap<u32, f32>,
@@ -2202,6 +2202,9 @@ pub struct JitInstructionMetadata {
     /// Address of the live arithmetic observation byte baseline code
     /// records into, or zero when the instruction has no feedback cell.
     pub arith_cell: u64,
+    /// Address of the call site's execution count baseline code increments,
+    /// or zero when the instruction has no call feedback.
+    pub call_count_cell: u64,
 }
 
 impl JitInstructionMetadata {
@@ -2217,6 +2220,7 @@ impl JitInstructionMetadata {
             length_reads_arrays_only: false,
             arith_feedback: ArithFeedback::default(),
             arith_cell: 0,
+            call_count_cell: 0,
         }
     }
 }

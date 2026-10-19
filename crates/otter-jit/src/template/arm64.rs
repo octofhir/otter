@@ -871,6 +871,42 @@ pub(crate) struct OperationContext<'c, 'a> {
 ///
 /// The caller has bound the operation's label and stamped its PC when the
 /// operation requires one.
+/// Count one execution of the call at `pc` into its live feedback, the way
+/// the interpreter counts it: optimizing callers weigh their inline
+/// candidates by these counts. Clobbers `x14` and `x16`.
+fn emit_count_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    pc: u32,
+) {
+    let Some(cell) = view
+        .instructions
+        .get(pc as usize)
+        .map(|instruction| instruction.call_count_cell)
+        .filter(|&cell| cell != 0)
+    else {
+        return;
+    };
+    values::emit_load_symbol_u64(
+        ops,
+        relocations,
+        16,
+        cell,
+        crate::artifact::relocation::RelocationTarget::CallCountCell {
+            function_id: view.code_block.id,
+            pc,
+        },
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr w14, [x16]
+        ; adds w14, w14, 1
+        ; csinv w14, w14, wzr, cc
+        ; str w14, [x16]
+    );
+}
+
 pub(crate) fn emit_operation<'a>(
     context: OperationContext<'_, 'a>,
     instr: &super::plan::TemplateInstr,
@@ -904,6 +940,7 @@ pub(crate) fn emit_operation<'a>(
     };
     let return_sites = &mut call_source;
     super::mark_direct_call_site_reached(direct_call_events.as_mut(), instr.byte_pc);
+    emit_count_call(ops, relocations, view, instr.pc);
     let OperationExits {
         type_mismatch_exit,
         identity_guard_exit,

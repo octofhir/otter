@@ -626,6 +626,10 @@ impl CodeBlock {
                     arith_cell: self
                         .feedback_at(index)
                         .map_or(0, crate::feedback::InstructionFeedback::arith_cell_address),
+                    call_count_cell: self
+                        .feedback
+                        .call_slot(index)
+                        .map_or(0, crate::feedback::CallFeedbackSlot::executions_address),
                 })
                 .collect(),
             // Baked by `Interpreter::bake_global_lexical_loads`, which owns the
@@ -853,13 +857,23 @@ impl CodeBlock {
     /// Count one interpreted entry of this function.
     #[inline]
     pub(crate) fn note_interpreted_entry(&self) {
-        self.feedback.note_entry();
+        self.source_work.note_entry();
     }
 
-    /// Calls per interpreted entry of the call at one canonical instruction.
+    /// Count one execution of the call at one canonical instruction.
+    #[inline]
+    pub(crate) fn note_call_execution(&self, index: usize) {
+        if let Some(slot) = self.feedback.call_slot(index) {
+            slot.note_execution();
+        }
+    }
+
+    /// Calls per entry of this function of the call at one canonical
+    /// instruction.
     #[must_use]
     pub(crate) fn call_frequency_at(&self, index: usize) -> Option<f32> {
-        self.feedback.call_frequency(index)
+        self.feedback
+            .call_frequency(index, self.source_work.entries())
     }
 
     /// Bounded ordinary-call distribution at one canonical instruction.

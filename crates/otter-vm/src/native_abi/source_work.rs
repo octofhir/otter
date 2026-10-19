@@ -1,8 +1,9 @@
 //! Address-stable source-opcode work shared by the VM and Template code.
 //!
 //! # Contents
-//! - [`SourceWork`] stores one function's monotone entered-opcode attempts.
-//! - The compiled ABI exposes its aligned word while retaining the same Arc.
+//! - [`SourceWork`] stores one function's monotone entered-opcode attempts
+//!   and its entries, the denominator of its call sites' frequencies.
+//! - The compiled ABI exposes its aligned words while retaining the same Arc.
 //!
 //! # Invariants
 //! - One isolate mutator writes; compiler and diagnostic readers may read.
@@ -24,8 +25,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Debug)]
 pub struct SourceWork {
     total: AtomicU64,
+    /// Entries of the function by the interpreter and by baseline code.
+    entries: AtomicU64,
     _lease: otter_resource::ResourceLease,
 }
+
+/// Byte offset of [`SourceWork`]'s entry count from its native address.
+pub const SOURCE_WORK_ENTRIES_OFFSET: usize = std::mem::offset_of!(SourceWork, entries);
 
 impl SourceWork {
     /// Admit the one physical source-work cell before retaining its address.
@@ -38,6 +44,7 @@ impl SourceWork {
         )?;
         Ok(Self {
             total: AtomicU64::new(0),
+            entries: AtomicU64::new(0),
             _lease: lease,
         })
     }
@@ -59,6 +66,19 @@ impl SourceWork {
             .store(self.total().saturating_add(attempts), Ordering::Relaxed);
     }
 
+    /// Entries of the function so far.
+    #[must_use]
+    pub fn entries(&self) -> u64 {
+        self.entries.load(Ordering::Relaxed)
+    }
+
+    /// Count one entry on the exclusive isolate mutator.
+    #[inline]
+    pub(crate) fn note_entry(&self) {
+        self.entries
+            .store(self.entries().saturating_add(1), Ordering::Relaxed);
+    }
+
     /// Aligned atomic-word address consumed only by the compiled-code ABI.
     /// The emitted code must retain this allocation and obey the single-writer
     /// and saturating-store contract above.
@@ -69,6 +89,7 @@ impl SourceWork {
 }
 
 const _: [(); 0] = [(); std::mem::offset_of!(SourceWork, total)];
+const _: [(); 8] = [(); SOURCE_WORK_ENTRIES_OFFSET];
 const _: [(); 8] = [(); std::mem::align_of::<SourceWork>()];
 
 #[cfg(test)]

@@ -352,6 +352,8 @@ pub(crate) fn emit_call_entry(
         );
         // A Template activation charges its body's opcode count once on entry,
         // the way an interrupt budget charges a return; loops charge at polls.
+        // It counts the entry beside that work, the denominator of its call
+        // sites' frequencies.
         let work = i32::try_from(crate::frame::entry_work(view)).unwrap_or(i32::MAX);
         let charged = ops.new_dynamic_label();
         dynasm!(ops ; .arch x64
@@ -361,6 +363,7 @@ pub(crate) fn emit_call_entry(
             ; mov r11, -1
             ; =>charged
             ; mov [r10], r11
+            ; inc QWORD [r10 + otter_vm::native_abi::SOURCE_WORK_ENTRIES_OFFSET as i32]
             ; cmp r11, [r9 + CODE_ENTRY_TIERING_WORK_TARGET_OFFSET as i32]
             ; jae =>check
             ; =>back

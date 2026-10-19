@@ -363,6 +363,8 @@ pub(crate) fn emit_call_entry(
         );
         // A Template activation charges its body's opcode count once on entry,
         // the way an interrupt budget charges a return; loops charge at polls.
+        // It counts the entry beside that work, the denominator of its call
+        // sites' frequencies.
         emit_load_u64(ops, 11, crate::frame::entry_work(view));
         dynasm!(ops
             ; .arch aarch64
@@ -370,6 +372,9 @@ pub(crate) fn emit_call_entry(
             ; adds x10, x10, x11
             ; csinv x10, x10, xzr, cc
             ; str x10, [x9]
+            ; ldr x11, [x9, otter_vm::native_abi::SOURCE_WORK_ENTRIES_OFFSET as u32]
+            ; add x11, x11, 1
+            ; str x11, [x9, otter_vm::native_abi::SOURCE_WORK_ENTRIES_OFFSET as u32]
             ; ldr x11, [x8, CODE_ENTRY_TIERING_WORK_TARGET_OFFSET]
             ; cmp x10, x11
             ; b.hs =>check

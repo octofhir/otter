@@ -16,8 +16,8 @@
 //! - A candidate below [`otter_vm::jit::JIT_MIN_INLINING_FREQUENCY`] is never
 //!   admitted unless it is small, nor is anything below it. A small body
 //!   costs no more built in place than its call does, and the frequencies
-//!   come from interpreted runs only, which may not have reached a branch
-//!   that later turns hot.
+//!   come from runs before the function was optimized, which may not have
+//!   reached a branch that later turns hot.
 //! - A small body (at most [`otter_vm::jit::JIT_SMALL_INLINE_INSTRUCTIONS`])
 //!   is admitted as soon as it is reached and charges only the absolute
 //!   budget, [`otter_vm::jit::JIT_MAX_INLINED_INSTRUCTIONS_ABSOLUTE`].

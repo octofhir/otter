@@ -61,11 +61,16 @@ impl Interpreter {
             for program in programs {
                 let operand = if matches!(
                     program.ops.first(),
-                    Some(JitCacheIrOp::LoadArrayExpando {
-                        object: 0,
-                        result: 1,
-                        ..
-                    })
+                    Some(
+                        JitCacheIrOp::LoadArrayExpando {
+                            object: 0,
+                            result: 1,
+                            ..
+                        } | JitCacheIrOp::LoadFunctionBag {
+                            object: 0,
+                            result: 1,
+                        }
+                    )
                 ) {
                     1
                 } else {

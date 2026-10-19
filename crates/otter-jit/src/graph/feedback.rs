@@ -63,12 +63,28 @@ pub(crate) struct NamedLoadPrograms {
 
 /// Select programs whose first receiver proof can match an ordinary object
 /// of a known shape. An unrecognized proof stays selected for validation.
+/// A function's bag program stands only with others of its kind: beside an
+/// ordinary receiver's it is left out, as the site's unseen receivers are.
 fn load_program_indices(
     programs: &[otter_vm::JitCacheIrProgram],
     receivers: Option<&[u32]>,
 ) -> Option<SmallVec<[u32; 4]>> {
+    let function_bag = |program: &otter_vm::JitCacheIrProgram| {
+        matches!(
+            program.ops.first(),
+            Some(JitCacheIrOp::LoadFunctionBag {
+                object: 0,
+                result: 1
+            })
+        )
+    };
+    let only_bags = programs.iter().all(function_bag);
     let mut selected = SmallVec::new();
     for (index, program) in programs.iter().enumerate() {
+        if function_bag(program) && (!only_bags || receivers.is_some()) {
+            // Known ordinary receiver shapes exclude function cells.
+            continue;
+        }
         if let Some(receivers) = receivers {
             match program.ops.first() {
                 Some(JitCacheIrOp::GuardShape { object: 0, shape })
@@ -127,6 +143,15 @@ fn own_storage_program(
     )) = program.ops.split_first()
     {
         (PropertyStorageProjection::ArrayExpando, 1, rest)
+    } else if let Some((
+        JitCacheIrOp::LoadFunctionBag {
+            object: 0,
+            result: 1,
+        },
+        rest,
+    )) = program.ops.split_first()
+    {
+        (PropertyStorageProjection::LookupStart, 1, rest)
     } else {
         (PropertyStorageProjection::Receiver, 0, &program.ops)
     }
@@ -537,6 +562,47 @@ mod tests {
         assert_eq!(
             named_load_programs(&view, 0, None).unwrap().receiver_shapes,
             None
+        );
+    }
+
+    #[test]
+    fn function_bag_programs_stand_only_with_their_kind() {
+        let mut view = JitCompileSnapshot::without_feedback(1, 0, 1, Vec::new());
+        let field = FieldLocation::inline(0);
+        let bag = otter_vm::JitCacheIrProgram {
+            ops: Box::new([
+                JitCacheIrOp::LoadFunctionBag {
+                    object: 0,
+                    result: 1,
+                },
+                JitCacheIrOp::GuardShape {
+                    object: 1,
+                    shape: 128,
+                },
+                JitCacheIrOp::GuardAtomSlot {
+                    object: 1,
+                    atom: 1,
+                    field,
+                    writable: false,
+                },
+                JitCacheIrOp::LoadField { object: 1, field },
+            ]),
+        };
+        view.property_programs.insert(0, vec![bag.clone()]);
+        let access = own_data_load(&view, 0, None).unwrap();
+        assert_eq!(access.projection, PropertyStorageProjection::LookupStart);
+        assert_eq!(access.shapes.as_slice(), &[128]);
+        assert!(
+            own_data_load(&view, 0, Some(&[128])).is_none(),
+            "ordinary receiver shapes exclude function cells"
+        );
+        view.property_programs
+            .insert(0, vec![bag, own_program(8, FieldLocation::inline(0))]);
+        let access = own_data_load(&view, 0, None).unwrap();
+        assert_eq!(
+            (access.projection, access.shapes.as_slice()),
+            (PropertyStorageProjection::Receiver, &[8][..]),
+            "beside an ordinary receiver a bag program is left out"
         );
     }
 

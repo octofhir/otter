@@ -136,7 +136,9 @@ fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
         | Kind::CheckElements { .. }
         | Kind::LoadArrayLength { .. }
         | Kind::LoadGuardedMethod { .. }
-        | Kind::LoadNamedProperty { .. } => return header.hoist,
+        | Kind::LoadNamedProperty { .. }
+        | Kind::LoadArrayExpando(_)
+        | Kind::LoadFunctionBag => return header.hoist,
         Kind::CheckedTaggedToInt32
         | Kind::CheckedTaggedToFloat64
         | Kind::CheckedFloat64ToInt32

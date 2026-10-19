@@ -1156,9 +1156,13 @@ impl PropertyIcSlot {
         use crate::jit::JitCacheIrOp;
         let mut programs = Vec::with_capacity(self.entry_count());
         for entry in self.live() {
-            // Lookup-start receivers have no CacheIR lowering in the optimizing
-            // tier; they reach its generic node like unseen shapes.
-            if entry.projection() == PropertyStorageProjection::LookupStart {
+            // A lookup-start receiver lowers only as a function's bag owning
+            // the data slot; an inherited or absent key, or another receiver
+            // kind's start object, reaches the generic node like an unseen
+            // shape.
+            if entry.projection() == PropertyStorageProjection::LookupStart
+                && entry.kind() != IcHandlerKind::OwnField
+            {
                 continue;
             }
             let receiver = entry.shape_handle();
@@ -1236,6 +1240,23 @@ impl PropertyIcSlot {
                 }
                 IcHandlerKind::NonExistent | IcHandlerKind::Empty => continue,
             };
+            if entry.projection() == PropertyStorageProjection::LookupStart {
+                for op in &mut ops {
+                    match op {
+                        JitCacheIrOp::GuardShape { object, .. }
+                        | JitCacheIrOp::GuardAtomSlot { object, .. }
+                        | JitCacheIrOp::LoadField { object, .. } => *object = 1,
+                        _ => unreachable!("a function bag lowers existing own slots only"),
+                    }
+                }
+                ops.insert(
+                    0,
+                    JitCacheIrOp::LoadFunctionBag {
+                        object: 0,
+                        result: 1,
+                    },
+                );
+            }
             if entry.projection() == PropertyStorageProjection::ArrayExpando {
                 if !matches!(
                     entry.kind(),

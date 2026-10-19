@@ -63,6 +63,9 @@ pub(crate) enum AbstractHeap {
     BodySlots,
     /// The named-property bag of every Array.
     ArrayExpandos,
+    /// The own-property bag of every function and the lookup facts that
+    /// route a named load to it.
+    FunctionBags,
     /// The activation: its `this`, window registers and actual arguments.
     Frame,
     /// The dependency flag of the generation and the facts it subscribes to.
@@ -87,7 +90,8 @@ impl AbstractHeap {
             | Self::Elements
             | Self::ContextSlots
             | Self::BodySlots
-            | Self::ArrayExpandos => Self::Heap,
+            | Self::ArrayExpandos
+            | Self::FunctionBags => Self::Heap,
         })
     }
 
@@ -229,6 +233,7 @@ fn proves_inputs(kind: &Kind) -> bool {
             receiver_proved, ..
         } => !receiver_proved,
         Kind::LoadArrayLength { array_proved } => !array_proved,
+        Kind::LoadArrayExpando(_) | Kind::LoadFunctionBag => true,
         _ => false,
     }
 }
@@ -337,6 +342,8 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::LoadElementUint32ToFloat64
         | Kind::LoadHoleyFloat64Element(_) => Effects::deref(&[H::Elements]),
         Kind::LoadArrayExpando(_) => Effects::reads(&[H::ArrayExpandos]),
+        // The active realm changes only across a call.
+        Kind::LoadFunctionBag => Effects::reads(&[H::FunctionBags]),
         Kind::LoadNamedProperty { .. } => Effects::reads(&[H::Heap, H::Dependencies]),
         Kind::LoadGuardedMethod {
             receiver_proved, ..

@@ -59,10 +59,10 @@ function repeatedLoop(count) {
   return sum;
 }
 
-var first = repeatedLoop(200);
+var first = repeatedLoop(200000);
 repeated.value = 7;
-var second = repeatedLoop(200);
-[stableLoop(200), accessorLoop(200), branchLoop(200), first, second].join(",")
+var second = repeatedLoop(200000);
+[stableLoop(200000), accessorLoop(200000), branchLoop(200000), first, second].join(",")
 "#;
 
 fn run(root: &std::path::Path, jitless: bool) -> Output {
@@ -99,7 +99,7 @@ fn property_loop_versioning_matches_the_interpreter_oracle() {
     assert_eq!(production.stdout, interpreter.stdout);
     assert_eq!(
         String::from_utf8_lossy(&production.stdout).trim(),
-        "800,20100,1300,400,1400"
+        "800000,20000100000,1300000,400000,1400000"
     );
 
     let report: serde_json::Value = serde_json::from_slice(

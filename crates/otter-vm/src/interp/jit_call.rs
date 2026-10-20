@@ -350,7 +350,7 @@ impl Interpreter {
 
     /// Whether a baseline exit is a back-edge poll handing its loop to the
     /// interpreter (a relink or an OSR hand-off), not a failed operation.
-    fn is_poll_handoff(exit: SideExit) -> bool {
+    pub(crate) fn is_poll_handoff(exit: SideExit) -> bool {
         exit.reason() == native_abi::ExitReason::Interrupt
             && exit.action() == native_abi::ExitAction::Resume
     }

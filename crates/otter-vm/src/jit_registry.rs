@@ -1101,14 +1101,14 @@ impl JitCodeRegistry {
         }
     }
 
-    /// Current generated-call health for one exact generation.
-    /// The generation's state as it takes one side exit, counted in its
-    /// feedback.
-    pub(crate) fn generated_deopt_state(
+    /// The state of one exact generation as it takes a side exit. A deopt is
+    /// counted in its feedback; a hand-off (`deopt` false) is not.
+    pub(crate) fn generated_exit_state(
         &mut self,
         code_object_id: u64,
         function_id: u32,
         frame_kind: NativeFrameKind,
+        deopt: bool,
     ) -> Option<GeneratedDeoptState> {
         let cell = &self.entry_cells.get(&code_object_id)?.cell;
         let tier = if cell.flags & CODE_ENTRY_OPTIMIZING_TIER == 0 {
@@ -1119,14 +1119,16 @@ impl JitCodeRegistry {
         if cell.native_frame_header.function_id != function_id || tier != frame_kind {
             return None;
         }
-        cell.generated_deopts
-            .set(cell.generated_deopts.get().saturating_add(1));
         let state = GeneratedDeoptState {
             function_id: cell.native_frame_header.function_id,
             tier,
             linked: cell.entry_addr.load(std::sync::atomic::Ordering::Acquire) != 0,
         };
-        self.watch_generated_feedback(code_object_id);
+        if deopt {
+            cell.generated_deopts
+                .set(cell.generated_deopts.get().saturating_add(1));
+            self.watch_generated_feedback(code_object_id);
+        }
         Some(state)
     }
 
@@ -1770,9 +1772,16 @@ mod tests {
             (7, 3, 3)
         );
         assert!(registry.take_generated_feedback().is_empty());
+        // A hand-off is no deopt: nothing is counted or drained.
         assert!(
             registry
-                .generated_deopt_state(302, 8, NativeFrameKind::Optimizing)
+                .generated_exit_state(302, 8, NativeFrameKind::Optimizing, false)
+                .is_some()
+        );
+        assert!(registry.take_generated_feedback().is_empty());
+        assert!(
+            registry
+                .generated_exit_state(302, 8, NativeFrameKind::Optimizing, true)
                 .is_some()
         );
         let feedback = registry.take_generated_feedback();

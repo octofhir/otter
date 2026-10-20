@@ -11,7 +11,8 @@
 //! (the block itself when it heads a loop) retire the entries they overlap.
 //!
 //! # Contents
-//! - [`eliminate`] — replace every redundant node in `layout`.
+//! - [`eliminate`] — replace every redundant node in `layout`; a field or
+//!   context-slot store's value also answers later reads of the same word.
 //!
 //! # Invariants
 //! - A node whose payload names a site of the body it was built for (a
@@ -21,6 +22,9 @@
 //!   lazily, and are values or guards take part. A guard that passed with
 //!   the same inputs over the same memory passes again; a load over the same
 //!   memory reads the same word; a value of the same inputs is the same.
+//! - A store's value stands for a later read of exactly the word it wrote
+//!   (the same object or base input, field or offset), in the read's
+//!   representation: the tagged value, or the int32 it tagged.
 //! - What a node reads and writes is [`effects::clobberize`]; an entry lives
 //!   only while nothing that overlaps its reads may have run since it.
 //! - Nodes whose value differs between two runs with the same inputs (the
@@ -130,9 +134,46 @@ fn key(graph: &Graph, node: NodeId) -> Key {
 }
 
 struct Entry {
+    /// The node that stands for later matches.
     node: NodeId,
+    /// The operation and table key a later node matches: the node's own,
+    /// or for a value a store made available, the load that reads it.
+    kind: Kind,
+    key: Key,
     reads: SmallVec<[AbstractHeap; 2]>,
     live: bool,
+}
+
+/// The loads a store makes answerable by its value: `(load kind, input,
+/// representation, value)`. A field store's value answers a tagged read of
+/// the same field of the same object, and its untagged int32 an int32
+/// read; a context-slot store answers a read of the same slot.
+fn forwarded(graph: &Graph, node: NodeId) -> SmallVec<[(Kind, NodeId, Repr, NodeId); 2]> {
+    let data = graph.node(node);
+    let mut out = SmallVec::new();
+    match data.kind {
+        Kind::StoreOwnField { field, atom, .. } => {
+            let (object, value) = (data.inputs[0], data.inputs[1]);
+            let load = Kind::LoadOwnField { field, atom };
+            if graph.node(value).repr == Repr::Tagged {
+                out.push((load.clone(), object, Repr::Tagged, value));
+            }
+            let stored = graph.node(value);
+            if stored.kind == Kind::Int32ToTagged
+                && graph.node(stored.inputs[0]).repr == Repr::Int32
+            {
+                out.push((load, object, Repr::Int32, stored.inputs[0]));
+            }
+        }
+        Kind::StoreTaggedField(offset) => {
+            let (base, value) = (data.inputs[0], data.inputs[1]);
+            if graph.node(value).repr == Repr::Tagged {
+                out.push((Kind::LoadTaggedField(offset), base, Repr::Tagged, value));
+            }
+        }
+        _ => {}
+    }
+    out
 }
 
 /// Whether `kind` may stand for another node of the same operation and
@@ -258,7 +299,7 @@ pub(crate) fn eliminate(graph: &mut Graph, layout: &[BlockId]) -> usize {
                 }
                 while entries.len() > added {
                     let entry = entries.pop().expect("an added entry");
-                    if let Some(slots) = index.get_mut(&key(graph, entry.node)) {
+                    if let Some(slots) = index.get_mut(&entry.key) {
                         slots.pop();
                     }
                 }
@@ -302,17 +343,18 @@ pub(crate) fn eliminate(graph: &mut Graph, layout: &[BlockId]) -> usize {
                                 .iter()
                                 .rev()
                                 .map(|&slot| &entries[slot])
-                                .find(|entry| {
-                                    entry.live && graph.node(entry.node).kind == data.kind
-                                })
+                                .find(|entry| entry.live && entry.kind == data.kind)
                         });
                         if let Some(entry) = found {
                             replaced.insert(node, entry.node);
                             continue;
                         }
-                        index.entry(key).or_default().push(entries.len());
+                        let kind = data.kind.clone();
+                        index.entry(key.clone()).or_default().push(entries.len());
                         entries.push(Entry {
                             node,
+                            kind,
+                            key,
                             reads: effects.reads.clone(),
                             live: true,
                         });
@@ -322,6 +364,25 @@ pub(crate) fn eliminate(graph: &mut Graph, layout: &[BlockId]) -> usize {
                             heaps.add(heap);
                         }
                         kill(&mut entries, &heaps);
+                        // What the store wrote is what the same word reads
+                        // until the next overlapping write.
+                        for (load, input, repr, value) in forwarded(graph, node) {
+                            let reads = effects::clobberize(&load).reads;
+                            let key: Key = (
+                                std::mem::discriminant(&load),
+                                smallvec::smallvec![input],
+                                repr,
+                                0,
+                            );
+                            index.entry(key.clone()).or_default().push(entries.len());
+                            entries.push(Entry {
+                                node: value,
+                                kind: load,
+                                key,
+                                reads,
+                                live: true,
+                            });
+                        }
                     }
                     kept.push(node);
                 }

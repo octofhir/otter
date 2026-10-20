@@ -185,6 +185,8 @@ pub(crate) fn compile(
     truncation::wrap_truncated_arithmetic(&mut built.graph, &built.layout);
     licm::hoist_invariants(&mut built.graph, &mut built.layout, &built.loop_headers);
     redundancy::eliminate(&mut built.graph, &built.layout);
+    // A forwarded store leaves its value's conversions to fold again.
+    escape::fold_conversions(&mut built.graph, &built.layout);
     fold::fold(&mut built.graph, &mut built.layout, &mut built.loop_headers);
     branch_fold::fold_branch_negations(&mut built.graph);
     branch_thread::thread_boolean_phis(&mut built.graph, &mut built.layout);

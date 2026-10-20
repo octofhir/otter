@@ -828,6 +828,13 @@ impl ObjectBody {
     #[inline]
     pub(crate) fn adopt_shape(&mut self, shape: ShapeHandle) {
         if self.shape != shape {
+            // A dictionary object's state lives in its shape, beside the slot
+            // layout its proofs stand for: any shape change retires them.
+            if shape_body::state_of(self.shape).is_dictionary()
+                && let Some(exotic) = self.exotic()
+            {
+                exotic.layout_watchpoint.invalidate();
+            }
             let live = self.slot_count();
             let shared = shape_body::parent_of(shape) == self.shape
                 || shape_body::parent_of(self.shape) == shape;
@@ -1018,6 +1025,9 @@ impl ExoticSlot {
 pub struct ExoticSlots {
     /// Mutation subscriptions and the current proof of this prototype chain.
     prototype_watchpoints: prototype_validity::PrototypeWatchpoints,
+    /// The proof of a dictionary-mode object's current slot layout
+    /// ([`Self::dictionary_layout`]), retired whenever that epoch advances.
+    layout_watchpoint: prototype_validity::LayoutWatchpoint,
     /// Root shape of the objects whose `[[Prototype]]` is this object,
     /// created on first use. The root holds this object as its prototype, so
     /// the pair lives and dies together.
@@ -1105,6 +1115,7 @@ impl otter_gc::trace::SeverRestoredPayload for ExoticSlots {
         unsafe {
             std::ptr::write(&mut self.host_data, None);
             std::ptr::write(&mut self.prototype_watchpoints, Default::default());
+            std::ptr::write(&mut self.layout_watchpoint, Default::default());
         }
     }
 }
@@ -2050,6 +2061,7 @@ impl ObjectBody {
         exotic.dictionary_shape_id = id;
         if advance_layout {
             exotic.dictionary_layout = exotic.dictionary_layout.saturating_add(1);
+            exotic.layout_watchpoint.invalidate();
         }
         self.adopt_shape(dictionary);
     }
@@ -2060,6 +2072,7 @@ impl ObjectBody {
         if !self.exotic.is_null() {
             let exotic = self.exotic_mut();
             exotic.dictionary_layout = exotic.dictionary_layout.saturating_add(1);
+            exotic.layout_watchpoint.invalidate();
         }
     }
 
@@ -3879,6 +3892,36 @@ pub(crate) fn watch_dictionary_slot(obj: JsObject, heap: &mut otter_gc::GcHeap, 
             _ => false,
         }
     })
+}
+
+/// The proof of dictionary-mode `obj`'s current slot layout: a validity cell
+/// retired when [`dictionary_layout`] advances or by
+/// [`invalidate_dictionary_layout_proof`]. While it holds, every existing
+/// key keeps its slot, kind and attributes. `None` when `obj` is shaped or
+/// has no sidecar yet.
+pub(crate) fn dictionary_layout_validity(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Option<std::sync::Arc<prototype_validity::PrototypeValidity>> {
+    heap.read_payload(obj, |body| {
+        if !body.is_dictionary() {
+            return None;
+        }
+        let identity = body.dictionary_shape_id();
+        body.exotic()
+            .map(|exotic| exotic.layout_watchpoint.current_or_new(identity))
+    })
+}
+
+/// Retire the compiled proofs of `obj`'s slot layout without changing it:
+/// a global lexical declaration now shadows one of the global object's
+/// properties, which those proofs read as the binding.
+pub(crate) fn invalidate_dictionary_layout_proof(obj: JsObject, heap: &otter_gc::GcHeap) {
+    heap.read_payload(obj, |body| {
+        if let Some(exotic) = body.exotic() {
+            exotic.layout_watchpoint.invalidate();
+        }
+    });
 }
 
 pub(crate) fn shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {

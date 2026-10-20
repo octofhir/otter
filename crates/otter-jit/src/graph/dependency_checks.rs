@@ -3,7 +3,8 @@
 //! The builder places a stability, field-summary or context-slot proof
 //! before every use of such a fact, as if each re-read its word after any
 //! operation that may have run code, and an inherited method load names the
-//! prototype-chain validity cell it relies on. The generation instead
+//! prototype-chain validity cell it relies on, and a dictionary global
+//! object read the slot-layout proof it reads through. The generation instead
 //! subscribes to those facts at installation, and a writer that breaks one
 //! sets its dependency flag. This pass collects the facts as the
 //! generation's dependencies and keeps one flag test where a fact is first
@@ -24,8 +25,9 @@
 //!   no predecessor starts unchecked; a join is checked only when every
 //!   predecessor leaves checked.
 //! - Each removed proof is dominated, within an effect-free stretch, by a
-//!   kept test, and keeps no frame state. A method load reached unchecked
-//!   gets a test of its own before it, leaving through its eager state.
+//!   kept test, and keeps no frame state. A method load or layout-proved
+//!   global read reached unchecked gets a test of its own before it,
+//!   leaving through its eager state.
 //!
 //! # See also
 //! - [`otter_vm::code_dependencies`] for subscription and firing.
@@ -63,13 +65,20 @@ fn is_proof(kind: &Kind) -> bool {
     )
 }
 
-/// The validity cell an inherited method load relies on.
+/// The validity cell an inherited method load or a dictionary global
+/// object read relies on.
 fn method_validity(
     view: &JitCompileSnapshot,
     inline_views: &[Arc<JitCompileSnapshot>],
     graph: &Graph,
     node: NodeId,
 ) -> Option<usize> {
+    if let Kind::LoadGlobalBinding(byte_pc) = graph.node(node).kind {
+        return global_layout_validity(
+            super::metadata::source_view(view, inline_views, graph, node),
+            byte_pc,
+        );
+    }
     let Kind::LoadGuardedMethod {
         byte_pc, target, ..
     } = graph.node(node).kind
@@ -83,6 +92,19 @@ fn method_validity(
         .guard
         .prototype_validity
         .map(|validity| validity.address)
+}
+
+/// The slot-layout proof a global-object binding read at `byte_pc` reads
+/// through: the code subscribes to it instead of guarding the layout.
+pub(crate) fn global_layout_validity(view: &JitCompileSnapshot, byte_pc: u32) -> Option<usize> {
+    match view.binding_hit_proofs.get(&byte_pc)? {
+        otter_vm::jit::BindingHitProof::GlobalObject {
+            dictionary: true,
+            layout: Some(layout),
+            ..
+        } => Some(layout.address),
+        _ => None,
+    }
 }
 
 /// Rewrite the graph's stability and field-summary proofs into dependency
@@ -452,6 +474,59 @@ mod tests {
             identity: 7,
             expected: 0,
         }));
+    }
+
+    #[test]
+    fn a_layout_proved_global_read_is_tested_once_per_effect_region() {
+        let mut view = view();
+        let global = |layout: Option<otter_vm::jit::JitPrototypeValidity>| {
+            otter_vm::jit::BindingHitProof::GlobalObject {
+                shape: 3,
+                dictionary: layout.is_some(),
+                field: otter_vm::object::FieldLocation::overflow(2),
+                global_lexical_epoch: 0,
+                writable: true,
+                layout,
+            }
+        };
+        let cell = otter_vm::jit::JitPrototypeValidity {
+            address: 0x1000,
+            identity: 9,
+        };
+        view.binding_hit_proofs.insert(12, global(Some(cell)));
+        view.binding_hit_proofs.insert(20, global(None));
+        let mut graph = Graph::default();
+        let entry = graph.new_block();
+        for kind in [
+            Kind::LoadGlobalBinding(12),
+            Kind::LoadGlobalBinding(12),
+            generic(),
+            Kind::LoadGlobalBinding(20),
+            Kind::LoadGlobalBinding(12),
+        ] {
+            append(&mut graph, entry, kind);
+        }
+        let dependencies = place(&mut graph, &view, &[]);
+        assert_eq!(
+            kinds(&graph, entry),
+            [
+                &Kind::CheckDependencies,
+                &Kind::LoadGlobalBinding(12),
+                &Kind::LoadGlobalBinding(12),
+                &generic(),
+                &Kind::LoadGlobalBinding(20),
+                &Kind::CheckDependencies,
+                &Kind::LoadGlobalBinding(12),
+            ]
+        );
+        assert_eq!(
+            dependencies.as_ref(),
+            [CodeDependency {
+                kind: CodeDependencyKind::PrototypeValidity,
+                identity: 0,
+                expected: 0x1000,
+            }]
+        );
     }
 
     #[test]

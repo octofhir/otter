@@ -205,6 +205,31 @@ impl PrototypeWatchpoints {
     }
 }
 
+/// A dictionary-mode object's slot-layout proof: one validity cell for the
+/// current [`super::ExoticSlots`] slot-layout epoch, invalidated the moment
+/// the epoch advances. Generated code that reads an existing key's slot
+/// through a subscribed cell needs no epoch, shape or bounds guard of its own.
+#[derive(Debug, Default)]
+pub(super) struct LayoutWatchpoint(Mutex<Option<Arc<PrototypeValidity>>>);
+
+impl LayoutWatchpoint {
+    /// The layout changed: retire the current proof and its subscribers.
+    pub(super) fn invalidate(&self) {
+        if let Some(cell) = self.0.lock().expect("layout watchpoint").take() {
+            cell.invalidate();
+        }
+    }
+
+    /// The proof of the current layout, created on first use.
+    pub(super) fn current_or_new(&self, identity: ShapeId) -> Arc<PrototypeValidity> {
+        let mut current = self.0.lock().expect("layout watchpoint");
+        match current.as_ref().filter(|cell| cell.is_valid()) {
+            Some(cell) => Arc::clone(cell),
+            None => Arc::clone(current.insert(PrototypeValidity::new(identity))),
+        }
+    }
+}
+
 /// Capture the chain starting at `first`, including that prototype itself.
 /// An opaque or cyclic chain cannot supply an ordinary-chain proof.
 pub(crate) fn chain_validity(

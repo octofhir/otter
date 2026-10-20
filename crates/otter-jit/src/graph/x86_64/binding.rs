@@ -1,7 +1,8 @@
 //! Native x86-64 Graph reads of canonical source-owned global bindings.
 //!
 //! # Contents
-//! - Eligible lexical/object reads through the one shared binding emitter.
+//! - Eligible lexical/object reads through the one shared binding emitter; a
+//!   dictionary global object read through its subscribed slot-layout proof.
 //! - Pre-effect WrongShape recovery at the actual owning source instruction.
 //! - The source realm's global object behind the same realm guard.
 //!
@@ -34,6 +35,21 @@ impl Codegen<'_> {
         let destination = Self::gp(allocation.result.expect("global binding result"));
         let temps = [allocation.gp_temps[0], allocation.gp_temps[1]];
         let miss = self.eager_exit(node, DeoptReason::WrongShape);
+        // The dependency pass subscribed this generation to the global
+        // object's slot-layout proof and tested the flag before the read.
+        if let otter_vm::jit::BindingHitProof::GlobalObject { field, .. } = proof
+            && super::super::dependency_checks::global_layout_validity(source, byte_pc).is_some()
+        {
+            return crate::x86_64::binding::emit_global_object_proved_read(
+                &mut self.ops,
+                &mut self.relocations,
+                source,
+                field,
+                destination,
+                temps,
+                miss,
+            );
+        }
         crate::x86_64::binding::emit_global_read(
             &mut self.ops,
             &mut self.relocations,

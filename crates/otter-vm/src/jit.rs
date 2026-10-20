@@ -106,12 +106,11 @@ pub struct JitPropertyAccess {
 mod literal_allocations;
 pub use literal_allocations::{
     JIT_CELL_SIZE, JIT_GC_BLACK_COLOR, JIT_HEADER_FLAGS_BYTE, JIT_HEADER_SITE_BYTES,
-    JIT_HEADER_SIZE_BYTE, JIT_SITE_CREATED_OFFSET,
-    JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET, JIT_SITE_ID_OFFSET, JIT_SITE_TENURE,
-    JitAllocationSite, JitArrayLiteralAllocationPlan, JitBoilerplateArrayAllocationPlan,
-    JitDenseArrayAllocationPlan, JitEmptyArrayAllocationPlan, JitEmptyObjectAllocationPlan,
-    JitLiteralAllocationPlans, JitObjectLiteralAllocationPlan, JitSiteMode,
-    ordinary_object_header_word,
+    JIT_HEADER_SIZE_BYTE, JIT_SITE_CREATED_OFFSET, JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET,
+    JIT_SITE_ID_OFFSET, JIT_SITE_TENURE, JitAllocationSite, JitArrayLiteralAllocationPlan,
+    JitBoilerplateArrayAllocationPlan, JitDenseArrayAllocationPlan, JitEmptyArrayAllocationPlan,
+    JitEmptyObjectAllocationPlan, JitLiteralAllocationPlans, JitObjectLiteralAllocationPlan,
+    JitSiteMode, ordinary_object_header_word,
 };
 
 mod string_layout;
@@ -1728,6 +1727,12 @@ pub enum BindingHitProof {
         global_lexical_epoch: u64,
         /// Whether the proven own data descriptor is writable.
         writable: bool,
+        /// The dictionary global object's slot-layout proof, retained by the
+        /// generation. A tier that subscribes to it reads `field` with no
+        /// layout, lexical-epoch or bounds guard: the cell is retired when the
+        /// layout advances or a global lexical declaration shadows a global
+        /// object property.
+        layout: Option<JitPrototypeValidity>,
     },
 }
 

@@ -291,6 +291,7 @@ pub(super) fn emit_binding_value(
                         field,
                         global_lexical_epoch,
                         writable: true,
+                        ..
                     } if view.cage_base != 0 => {
                         native_binding::emit_global_object_guard(
                             ops,

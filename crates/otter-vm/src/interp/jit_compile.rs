@@ -2384,6 +2384,10 @@ impl Interpreter {
                 };
                 (u64::from(shape), false)
             };
+            let layout = dictionary
+                .then(|| crate::object::dictionary_layout_validity(self.global_this, &self.gc_heap))
+                .flatten()
+                .and_then(|cell| self.bake_prototype_validity(&cell));
             view.binding_hit_proofs.insert(
                 instruction.byte_pc,
                 jit::BindingHitProof::GlobalObject {
@@ -2396,6 +2400,7 @@ impl Interpreter {
                     ),
                     global_lexical_epoch: self.global_lexical_epoch,
                     writable: flags.writable(),
+                    layout,
                 },
             );
         }

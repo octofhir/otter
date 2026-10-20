@@ -4,6 +4,8 @@
 //! - Permanent source-attributed lexical cell addressing and live TDZ guards.
 //! - Current global object epoch, ordinary shape or dictionary-layout guards.
 //! - Current field-bank selection and complete tagged reads.
+//! - Reads of a dictionary global object whose generation subscribes to its
+//!   slot-layout proof, guarded by the realm alone.
 //!
 //! # Invariants
 //! The VM's existing BindingHitProof and opcode schema own source and semantics.
@@ -265,6 +267,51 @@ pub(crate) fn emit_global_read(
     };
     dynasm!(ops ; .arch aarch64 ; mov X(destination), x16);
     Ok(guard_end)
+}
+
+/// Read `field` of the realm's dictionary global object for a generation
+/// subscribed to the object's slot-layout proof: the proof stands for the
+/// lexical epoch, the layout and the field's presence, so only the realm is
+/// guarded. The bank is read afresh, since appending globals may move a
+/// slab without changing the layout.
+pub(crate) fn emit_global_object_proved_read(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    field: FieldLocation,
+    destination: u8,
+    temps @ [header, base]: [u8; 2],
+    miss: DynamicLabel,
+) {
+    registers(temps);
+    debug_assert!(destination < 31 && !matches!(destination, 16 | 17));
+    emit_global_realm_guard(ops, view, miss);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        17,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops ; .arch aarch64
+        ; ldr x16, [x20, GLOBAL_THIS_OFFSET_PTR_OFFSET] ; ldr W(header), [x16]
+        ; add X(header), x17, X(header));
+    if field.is_inline() {
+        dynasm!(ops ; .arch aarch64
+            ; add XSP(base), XSP(header), #view.field_layout.inline_values_byte);
+    } else {
+        dynasm!(ops ; .arch aarch64
+            ; ldr W(base), [X(header), view.field_layout.slab_handle_byte]
+            ; add X(base), x17, X(base)
+            ; add XSP(base), XSP(base), #view.field_layout.slab_words_byte);
+    }
+    let byte = field.byte_offset();
+    if byte <= 32760 {
+        dynasm!(ops ; .arch aarch64 ; ldr X(destination), [X(base), byte]);
+    } else {
+        emit_load_u64(ops, 17, u64::from(byte));
+        dynasm!(ops ; .arch aarch64 ; ldr X(destination), [X(base), x17]);
+    }
 }
 
 #[cfg(test)]

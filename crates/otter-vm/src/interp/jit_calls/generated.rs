@@ -16,6 +16,9 @@
 //!   entered it is not consulted.
 //! - Counted cold exits mark the existing outer feedback transaction pending,
 //!   including Graph-only chains without hot entry accounting.
+//! - A baseline back-edge poll that hands its loop to the interpreter is a
+//!   transition, not a deopt: it is neither counted in the generation's
+//!   feedback nor charged to the entry bail policy, as at interpreter entry.
 //! - Only a current exact generation charges exit policy. Old active exits
 //!   still report history and new source widening, which retires changed
 //!   source guards rather than unrelated replacement bodies.
@@ -44,10 +47,15 @@ impl Interpreter {
         if callee_code_object_id == 0 {
             return Err(VmError::InvalidOperand);
         }
-        let Some(state) = self.jit_code_registry.generated_deopt_state(
+        // A baseline back-edge poll handing its loop to the interpreter (a
+        // relink or an OSR hand-off) is a transition, not a failed operation.
+        let handoff =
+            callee.header.kind == NativeFrameKind::Baseline && Self::is_poll_handoff(exit);
+        let Some(state) = self.jit_code_registry.generated_exit_state(
             callee_code_object_id,
             callee.header.function_id,
             callee.header.kind,
+            !handoff,
         ) else {
             return Err(VmError::InvalidOperand);
         };
@@ -62,9 +70,11 @@ impl Interpreter {
                 return Err(VmError::InvalidOperand);
             }
         };
-        // Graph entries omit hot entry accounting and its dirty store. This
+        // Graph entries omit hot entry accounting and its dirty store. A
         // counted cold exit must still reach the outer reconciliation pass.
-        self.jit_generated_feedback_pending = true;
+        if !handoff {
+            self.jit_generated_feedback_pending = true;
+        }
         let callee_function_id = callee.header.function_id;
         let callee_resume_pc = callee.header.pc;
         self.record_jit_debug_event(|| JitDebugEvent::EnteredGenerationDeopt {
@@ -122,7 +132,7 @@ impl Interpreter {
         // Only a linked generation may charge the shared cost policy:
         // invalidation unlinks it, while already-active callers can still
         // report later deopts during unwind.
-        if state.tier == NativeFrameKind::Baseline && state.linked {
+        if state.tier == NativeFrameKind::Baseline && state.linked && !handoff {
             self.note_jit_entry_bail(context, callee_function_id);
         }
         Ok(())

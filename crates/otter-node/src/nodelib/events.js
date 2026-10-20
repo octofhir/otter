@@ -88,9 +88,11 @@ const kCapture = Symbol('kCapture');
 const kErrorMonitor = Symbol('events.errorMonitor');
 const kShapeMode = Symbol('shapeMode');
 const kEmitting = Symbol('events.emitting');
-const kMaxEventTargetListeners = Symbol('events.maxEventTargetListeners');
+// The web EventTarget, built before this module loads, keeps its listener
+// limit under these same registered symbols.
+const kMaxEventTargetListeners = SymbolFor('otter.EventTarget.maxListeners');
 const kMaxEventTargetListenersWarned =
-  Symbol('events.maxEventTargetListenersWarned');
+  SymbolFor('otter.EventTarget.maxListenersWarned');
 const kWatermarkData = SymbolFor('nodejs.watermarkData');
 
 let EventEmitterAsyncResource;

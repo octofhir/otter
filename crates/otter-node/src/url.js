@@ -32,6 +32,12 @@ const URLSearchParamsCtor = globalThis.URLSearchParams || class URLSearchParams 
   toString() { return this.value; }
 };
 
+// A WHATWG URL as node recognizes one: an href and a protocol, and none of
+// the fields only a legacy `url.parse()` result has.
+function isURL(value) {
+  return Boolean(value?.href && value.protocol && value.auth === undefined && value.path === undefined);
+}
+
 function invalidArgType(name, value) {
   const received = typeof value === 'string' ? `type string ('${value}')` :
     value === null ? 'null' : `type ${typeof value} (${String(value)})`;
@@ -102,7 +108,7 @@ function pathToFileURL(path, options) {
 function fileURLToPath(input, options) {
   let url;
   if (typeof input === 'string') url = new URLCtor(input);
-  else if (input && typeof input.href === 'string') url = input;
+  else if (isURL(input)) url = input;
   else throw invalidArgType('path', input);
   if (url.protocol !== 'file:') {
     const error = new TypeError('The URL must be of scheme file');
@@ -210,7 +216,7 @@ function format(value, options) {
   if (!value || typeof value !== 'object') {
     throw invalidArgType('urlObject', value);
   }
-  if (value instanceof URLCtor || (value && typeof value.href === 'string')) {
+  if (isURL(value)) {
     if (options !== undefined && (options === null || typeof options !== 'object')) {
       throw invalidArgType('options', options);
     }

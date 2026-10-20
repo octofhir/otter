@@ -19,6 +19,11 @@
 //!   the binary translates it through `OtterError::exit_code`.
 //! - JSON outputs (`--json`, `--dump-bytecode=json`, error payloads)
 //!   match the documented CLI and bytecode-dump wire formats.
+//! - The hidden `startup-image` step writes only into the running
+//!   executable, from a runtime built for the launch surface under a fixed
+//!   empty run state (sandbox grants, no environment, no arguments). It
+//!   replaces the executable only by renaming a fully patched copy over it,
+//!   and a failed step leaves no copy behind.
 
 /// The process allocator. The engine's Rust-side allocation is dominated by
 /// many small, short-lived buffers (compiler IR and allocation tables,
@@ -776,6 +781,19 @@ enum Command {
     Test(TestArgs),
     /// Print build/runtime feature flags.
     Info,
+    /// Write this build's startup image into the executable at `target`
+    /// (a post-link product step; launches then restore it instead of
+    /// bootstrapping). The image is built under a fixed empty run state, so
+    /// permission and execution flags do not reach it.
+    #[command(hide = true)]
+    StartupImage(StartupImageArgs),
+}
+
+#[derive(Debug, Args)]
+struct StartupImageArgs {
+    /// The executable to write the image into: the running executable
+    /// itself, since the image records this build's code layout.
+    target: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -1072,6 +1090,7 @@ async fn main() -> ExitCode {
             run_test_runner(&globs, &caps, &execution, &startup_timer).await
         }
         (Some(Command::Info), _) => run_info(json, &execution),
+        (Some(Command::StartupImage(args)), _) => write_startup_image(&args.target),
         // `--test` is Node's: the switch turns the run into a test run, and
         // the positionals name what to test rather than what to execute.
         (None, _) if test_mode => {
@@ -2380,13 +2399,32 @@ fn cli_otter_builder(
     caps: &CapabilitySet,
     execution: &CliExecutionConfig,
 ) -> otter_runtime::OtterBuilder {
-    let builder = otter_runtime::Otter::builder()
+    let builder = cli_surface_builder()
         .capabilities(caps.clone())
+        .process_env(project_env_files())
+        .startup_image(true);
+    execution.apply_otter_builder(builder)
+}
+
+/// The API surface every launch declares. A startup image is written for
+/// this surface, and a launch restores one only when its own surface
+/// fingerprint matches the image's.
+fn cli_surface_builder() -> otter_runtime::OtterBuilder {
+    otter_runtime::Otter::builder()
         .with_node_apis()
         .with_otter_modules()
         .with_web_apis()
-        .process_env(project_env_files());
-    execution.apply_otter_builder(builder)
+}
+
+/// What a startup image captures: the surface every launch declares, under a
+/// fixed run state that holds nothing of the writer's own — no grant, no
+/// process or project environment, no arguments and no execution flags. The
+/// image ships inside the executable, and each launch writes its own run
+/// state over the `process` it restores.
+fn startup_image_builder() -> otter_runtime::OtterBuilder {
+    cli_surface_builder()
+        .capabilities(CapabilitySet::sandbox())
+        .process_argv(std::iter::empty::<String>())
 }
 
 /// Variables declared by the project's `.env` files, nearest file last.
@@ -3497,6 +3535,92 @@ fn pm_io_error(path: &Path, err: std::io::Error) -> OtterError {
 pub(crate) fn pm_config_error(message: impl Into<String>) -> OtterError {
     OtterError::Usage {
         message: message.into(),
+    }
+}
+
+/// Write the startup image of the surface every launch declares into
+/// `target`, which must be this running executable: the image records this
+/// build's code layout, which another build would restore as foreign. The
+/// image is written into a copy that replaces `target` by rename, so a
+/// running copy keeps its own; on macOS the patched copy is signed again ad
+/// hoc first. A failed step leaves `target` as it was and no copy beside it.
+fn write_startup_image(target: &Path) -> Result<ExitCode, OtterError> {
+    let running = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|error| {
+            pm_config_error(format!("the running executable is not found: {error}"))
+        })?;
+    let canonical_target =
+        std::fs::canonicalize(target).map_err(|error| pm_io_error(target, error))?;
+    if canonical_target != running {
+        return Err(pm_config_error(format!(
+            "startup-image writes the image of the running executable; run {0} startup-image {0}",
+            target.display()
+        )));
+    }
+    let staged = StagedCopy::of(target)?;
+    let len = startup_image_builder().write_startup_image(staged.path())?;
+    if cfg!(target_vendor = "apple") {
+        let signed = std::process::Command::new("codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(staged.path())
+            .status()
+            .map_err(|error| pm_config_error(format!("codesign could not run: {error}")))?;
+        if !signed.success() {
+            return Err(pm_config_error(
+                "codesign failed on the patched executable".to_string(),
+            ));
+        }
+    }
+    staged.place(target)?;
+    eprintln!(
+        "startup image: {len} bytes written into {}",
+        target.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A copy of an executable made beside it, to be patched and then renamed
+/// over it. Until that rename succeeds the copy is this value's to remove,
+/// and dropping the value removes it, so no failure leaves one behind.
+struct StagedCopy {
+    path: PathBuf,
+    placed: bool,
+}
+
+impl StagedCopy {
+    /// Copy `target` to a sibling whose name extends the target's own, so
+    /// the two can never name the same file.
+    fn of(target: &Path) -> Result<Self, OtterError> {
+        let mut path = target.as_os_str().to_owned();
+        path.push(".startup-image");
+        let staged = Self {
+            path: PathBuf::from(path),
+            placed: false,
+        };
+        // A copy that fails halfway is removed with `staged`.
+        std::fs::copy(target, &staged.path).map_err(|error| pm_io_error(&staged.path, error))?;
+        Ok(staged)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Rename the copy over `target`.
+    fn place(mut self, target: &Path) -> Result<(), OtterError> {
+        std::fs::rename(&self.path, target).map_err(|error| pm_io_error(target, error))?;
+        self.placed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedCopy {
+    fn drop(&mut self) {
+        if !self.placed {
+            // Best effort: the failure that got here is the one reported.
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -4762,6 +4886,38 @@ export let value = inner;
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_startup_image_goes_only_into_the_running_executable_and_leaves_no_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("otter");
+        std::fs::write(&other, b"another build").unwrap();
+        let staged_path = tmp.path().join("otter.startup-image");
+
+        let refused = write_startup_image(&other).expect_err("another executable is refused");
+        assert!(
+            refused
+                .to_string()
+                .contains("writes the image of the running executable"),
+            "{refused}"
+        );
+        assert!(!staged_path.exists(), "a refusal stages nothing");
+
+        // A copy dropped before its rename is removed and the target kept.
+        let staged = StagedCopy::of(&other).expect("stage a copy");
+        assert_eq!(staged.path(), staged_path);
+        assert!(staged_path.exists());
+        drop(staged);
+        assert!(!staged_path.exists(), "an unplaced copy is removed");
+        assert_eq!(std::fs::read(&other).unwrap(), b"another build");
+
+        // A placed copy replaces the target and leaves nothing beside it.
+        let staged = StagedCopy::of(&other).expect("stage a copy again");
+        std::fs::write(staged.path(), b"patched").unwrap();
+        staged.place(&other).expect("rename over the target");
+        assert_eq!(std::fs::read(&other).unwrap(), b"patched");
+        assert!(!staged_path.exists());
     }
 
     #[tokio::test]

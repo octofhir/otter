@@ -278,6 +278,19 @@ impl Interpreter {
 }
 
 impl Interpreter {
+    /// Install one host service natives read by type. See
+    /// [`crate::host_services::HostServices`].
+    pub fn insert_host_service<T: std::any::Any + Send + Sync>(&mut self, service: T) {
+        self.host_services.insert(service);
+    }
+
+    /// Declare that the host's run services give a bootstrap host object
+    /// whose payload is a `T` a fresh payload after a restore. A snapshot
+    /// refuses a host object whose payload type is not declared.
+    pub fn declare_restorable_host_data<T: std::any::Any>(&mut self) {
+        self.host_services.declare_restorable_host_data::<T>();
+    }
+
     /// Replace the sink used by `console.*` methods.
     pub fn set_console_sink(&mut self, sink: console::ConsoleSinkHandle) {
         self.console_sink = sink;

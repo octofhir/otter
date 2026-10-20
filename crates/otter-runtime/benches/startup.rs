@@ -85,6 +85,16 @@ fn bench_runtime_startup(c: &mut Criterion) {
         });
     });
     // What a CLI run actually pays for: every API surface a program can see.
+    build.bench_function("runtime_full_surface", |b| {
+        iter_startup_bench(b, || {
+            Runtime::builder()
+                .with_node_apis()
+                .with_otter_modules()
+                .with_web_apis()
+                .build()
+                .expect("runtime")
+        });
+    });
     build.bench_function("otter_builder_full_surface", |b| {
         iter_startup_bench(b, || {
             Otter::builder()
@@ -93,6 +103,20 @@ fn bench_runtime_startup(c: &mut Criterion) {
                 .with_web_apis()
                 .build()
                 .expect("otter")
+        });
+    });
+    // The same surface restored from an image of a built runtime instead.
+    let image = Runtime::builder()
+        .with_node_apis()
+        .with_otter_modules()
+        .with_web_apis()
+        .build()
+        .expect("runtime")
+        .capture_isolate_snapshot()
+        .expect("capture");
+    build.bench_function("full_surface_restore", |b| {
+        iter_startup_bench(b, || {
+            Runtime::from_isolate_snapshot(&image).expect("restore")
         });
     });
     build.finish();

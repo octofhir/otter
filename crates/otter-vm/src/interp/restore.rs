@@ -7,7 +7,8 @@
 //! The restore is the mirror of `snapshot::IsolateSnapshot`'s three
 //! parts: put the old-space pages back (relocated), write the fixed
 //! root walk's handles into a shell interpreter, and replay the keyed
-//! side state — atoms, global lexicals, dynamic-native closures. What
+//! side state — atoms, global lexicals, registered symbols, dynamic-native
+//! closures, regexp and array records by body handle. What
 //! is neither pages nor roots nor keyed state is a cache, and caches
 //! start empty: the shape runtime's side tables refill on use (only
 //! its id registry is re-populated from the restored shape bodies),
@@ -17,11 +18,15 @@
 //!
 //! # Invariants
 //!
-//! - In-process only: static native bodies carry entry
-//!   addresses verbatim (valid within the process), admitted bytecode is
-//!   shared by `Arc`, and dynamic closures are Arc-clones at their
-//!   captured host-ref indices. No byte decoder or cross-process restore
-//!   path exists.
+//! - A snapshot comes from this process, or from the startup image this
+//!   executable carries: static native entries then move by the image
+//!   slide, and the image names no dynamic closure. In process, admitted
+//!   bytecode is shared by `Arc` and dynamic closures are Arc-clones at
+//!   their captured host-ref indices.
+//! - Weak collections, `WeakRef`s and `FinalizationRegistry`s rejoin the
+//!   collector's weak registries before anything can collect.
+//! - Host payloads are severed; the host's run services give the declared
+//!   bootstrap host objects fresh ones.
 //! - Supplied account admission precedes page restoration and shape-floor publication.
 //! - Each restored code directory owns fresh feedback and atom tables.
 //!   IC shapes and validity cells never refer to the donor's heap.
@@ -101,10 +106,16 @@ impl Interpreter {
         gc_heap.set_external_bytes_account(account)?;
         object::register_gc_traceables(&mut gc_heap);
         // SAFETY: `IsolateSnapshot` has no public constructor or mutable raw
-        // fields and is produced only by this VM's same-process capture path.
+        // fields; it is produced by this VM's capture, or decoded under
+        // `IsolateSnapshot::decode`'s contract from bytes this executable
+        // wrote.
         // The trace/sever registrations above are the same registrations used
         // by the source interpreter.
         let relocation = unsafe { gc_heap.restore_old_space(&snapshot.image) }?;
+        // The collector reaches weak bodies through its registries, never
+        // through the pages; each restored one joins them as its allocation
+        // did, before anything can collect.
+        crate::weak_refs::register_restored_weak_bodies(&mut gc_heap);
         let iterator_prototype_roots =
             relocate_object_roots(&relocation, &snapshot.iterator_prototype_roots)?;
         let function_kind_prototypes =
@@ -116,8 +127,8 @@ impl Interpreter {
         // no process-global side effect, and before any later code can mint a
         // shape that would collide with restored bodies.
         object::bump_next_shape_id_to(snapshot.next_shape_id);
-        // Static entry points are process-local addresses. Rebuild the table at
-        // identical indices without translating them.
+        // Static entry points rebuild at identical indices; a startup image
+        // read in another process already moved them by the image slide.
         gc_heap.restore_external_refs(snapshot.external_ref_addrs.iter().copied());
 
         // Keyed side state uses the admitted directory's atom replay.
@@ -278,6 +289,7 @@ impl Interpreter {
             regexp_offsets: Vec::new(),
             tracer: None,
             cpu_profiler: None,
+            host_services: crate::host_services::HostServices::default(),
         };
 
         interp.jit_code_registry.set_account(account.clone());
@@ -314,7 +326,8 @@ impl Interpreter {
             .well_known_symbols
             .refresh_from_bodies(&interp.gc_heap);
 
-        // Keyed state: global lexicals and dynamic-native closures.
+        // Keyed state: global lexicals, registered symbols and dynamic-native
+        // closures.
         for (name, cell, is_const) in &snapshot.global_lexicals {
             let relocated = relocation
                 .relocate_raw(*cell)
@@ -326,51 +339,55 @@ impl Interpreter {
                 .global_lexicals
                 .insert(name.clone(), (cell, *is_const));
         }
+        for (key, symbol) in &snapshot.registered_symbols {
+            let relocated = relocation
+                .relocate_raw(*symbol)
+                .expect("registered symbol points into the image");
+            // SAFETY: the captured handle named a `SymbolBody`; the
+            // relocated offset names its restored copy.
+            let handle = unsafe { crate::symbol::SymbolHandle::from_offset(relocated.0) };
+            interp
+                .symbol_registry
+                .restore_entry(key, crate::JsSymbol::from_handle(&interp.gc_heap, handle));
+        }
         for (index, payload) in &snapshot.dynamic_natives {
             crate::native_function::install_dynamic_native(&mut interp.gc_heap, *index, payload);
+        }
+        // A startup image written by another process of this executable
+        // recorded static entry points where its program image loaded.
+        if snapshot.image_slide != 0 {
+            crate::native_function::slide_static_entries(&interp.gc_heap, snapshot.image_slide);
         }
 
         // Rebuild the one payload the page image cannot carry: every
         // regexp's compiled matcher and pattern text, from the
         // snapshot's own records. Host-data boxes and array sidecars
         // were already severed inside the page restore, before the
-        // relocation walk could touch a foreign vtable. The live walk
-        // here visits bodies in the same page order the capture walk
-        // did, so the records zip positionally.
+        // relocation walk could touch a foreign vtable. Each record names
+        // its body by the handle it was captured at.
         {
-            let heap = &interp.gc_heap;
-            let mut regexps: Vec<*mut crate::regexp::JsRegExpBody> = Vec::new();
-            heap.for_each_live_payload::<crate::regexp::JsRegExpBody, _>(|_space, body| {
-                regexps.push(body as *const _ as *mut _);
-            });
-            assert_eq!(
-                regexps.len(),
-                snapshot.regexp_payloads.len(),
-                "regexp record count must match the restored bodies"
-            );
-            let mut array_sidecars: Vec<*mut crate::array::ArrayExoticSlots> = Vec::new();
-            heap.for_each_live_payload::<crate::array::ArrayExoticSlots, _>(|_space, body| {
-                array_sidecars.push(body as *const _ as *mut _);
-            });
-            assert_eq!(
-                array_sidecars.len(),
-                snapshot.array_indexed_records.len(),
-                "array-sidecar record count must match the restored bodies"
-            );
-            // SAFETY: single mutator, no allocation between collect and
-            // write; each pointer names a live payload of its type.
-            unsafe {
-                for (body, (pattern_utf16, source)) in
-                    regexps.into_iter().zip(&snapshot.regexp_payloads)
-                {
-                    (*body).rebuild_after_restore(pattern_utf16, source);
-                }
-                for (body, records) in array_sidecars
-                    .into_iter()
-                    .zip(&snapshot.array_indexed_records)
-                {
-                    (*body).restore_indexed_snapshot(records);
-                }
+            let heap = &mut interp.gc_heap;
+            for (body, pattern_utf16, source) in &snapshot.regexp_payloads {
+                let body = relocation
+                    .relocate_raw(*body)
+                    .expect("a captured regexp body is in the image");
+                // SAFETY: the record was taken from a live `JsRegExpBody`
+                // at this captured offset; relocation names its copy.
+                let body: otter_gc::Gc<crate::regexp::JsRegExpBody> =
+                    unsafe { otter_gc::Gc::from_offset(body.0) };
+                heap.with_payload(body, |body| {
+                    body.rebuild_after_restore(pattern_utf16, source)
+                });
+            }
+            for (sidecar, record) in &snapshot.array_indexed_records {
+                let sidecar = relocation
+                    .relocate_raw(*sidecar)
+                    .expect("a captured array sidecar is in the image");
+                // SAFETY: the record was taken from a live `ArrayExoticSlots`
+                // at this captured offset; relocation names its copy.
+                let sidecar: otter_gc::Gc<crate::array::ArrayExoticSlots> =
+                    unsafe { otter_gc::Gc::from_offset(sidecar.0) };
+                heap.with_payload(sidecar, |sidecar| sidecar.restore_indexed_snapshot(record));
             }
             heap.for_each_live_payload::<crate::array::ArrayBody, _>(|_space, body| {
                 body.refresh_dense_own_guard();
@@ -409,6 +426,47 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::Interpreter;
+
+    #[test]
+    fn an_encoded_image_restores_and_runs() {
+        let mut source = Interpreter::new().expect("fixture interpreter bootstrap");
+        // A registration lives in the registry, beside the page image.
+        source
+            .symbol_for_key("otter.image.registered")
+            .expect("register a symbol");
+        source.collect_minor_tracing_runtime_roots();
+        source.force_gc().expect("promote the registered symbol");
+        let snapshot = source.capture_isolate_snapshot().expect("capture");
+        let natives = source.startup_native_names(&snapshot);
+        let mut out = otter_gc::image_codec::ImageWriter::new();
+        snapshot.encode(&mut out, &natives);
+        // A leaked copy stands in for the executable's own static section.
+        let bytes: &'static [u8] = Box::leak(out.into_bytes().into_boxed_slice());
+        let account = otter_resource::ResourceAccount::default();
+        let mut input = otter_gc::image_codec::ImageReader::new(bytes);
+        // SAFETY: the bytes were encoded by this executable just above.
+        let decoded = unsafe {
+            crate::snapshot::IsolateSnapshot::decode(&mut input, &mut |_| None, &account)
+        }
+        .expect("decode");
+        assert!(input.is_empty());
+        assert_eq!(decoded.atom_names, snapshot.atom_names);
+        let restored = Interpreter::from_isolate_snapshot(&decoded, &account).expect("restore");
+        assert!(restored.array_iterator_prototype.get().is_some());
+        let registered = restored.symbol_registry().snapshot_entries();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(&*registered[0].0, "otter.image.registered");
+        assert_eq!(
+            restored
+                .symbol_registry()
+                .key_for(crate::JsSymbol::from_handle(
+                    &restored.gc_heap,
+                    // SAFETY: the registry holds a restored `SymbolBody` handle.
+                    unsafe { crate::symbol::SymbolHandle::from_offset(registered[0].1.0) },
+                )),
+            Some("otter.image.registered".to_owned())
+        );
+    }
 
     #[test]
     fn exact_image_cap_restore_does_not_allocate_or_panic() {

@@ -1601,6 +1601,14 @@ impl<'rt> NativeCtx<'rt> {
         Ok(handle)
     }
 
+    /// The interpreter's host service of type `T`, cloned out so the
+    /// caller keeps this context free to use. See
+    /// [`crate::host_services::HostServices`].
+    #[must_use]
+    pub fn host_service<T: std::any::Any + Send + Sync + Clone>(&self) -> Option<T> {
+        self.cx.interp.host_services.get::<T>().cloned()
+    }
+
     /// Borrow the owning interpreter for native functions that need
     /// isolate services outside the heap (microtasks, string tables,
     /// intrinsic registries).
@@ -2384,6 +2392,32 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         })?;
         self.ctx.heap_mut().record_write(object, &value_raw);
         Ok(())
+    }
+
+    /// Give a host object whose payload a snapshot restore severed a fresh
+    /// payload of `T`; `false` when it already holds one. See
+    /// [`object::restore_host_data`].
+    ///
+    /// # Errors
+    /// A `TypeError` when `host` is not a host object.
+    pub fn restore_host_data<T: std::any::Any>(
+        &mut self,
+        host: Local<'_>,
+        data: T,
+    ) -> Result<bool, NativeError> {
+        let object = self
+            .raw(host)
+            .as_object()
+            .ok_or_else(|| NativeError::TypeError {
+                name: "NativeScope::restore_host_data",
+                reason: "host value is not an object".to_string(),
+            })?;
+        object::restore_host_data(object, self.ctx.heap_mut(), data).map_err(|error| {
+            NativeError::TypeError {
+                name: "NativeScope::restore_host_data",
+                reason: error.to_string(),
+            }
+        })
     }
 
     /// Root and return one declared traced host-data slot.

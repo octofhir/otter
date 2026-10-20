@@ -3795,9 +3795,20 @@ impl GcHeap {
     }
 
     /// Book the bytes a restored image brought in against the heap cap and
-    /// the growth trigger, as an ordinary old-space allocation would have.
-    pub(crate) fn account_restored_image(&mut self, live_bytes: u64) {
+    /// the growth trigger, and its bodies (`(count, bytes)` per type tag) in
+    /// the statistics, as ordinary old-space allocations would have.
+    pub(crate) fn account_restored_image(&mut self, live_bytes: u64, by_type: &[(usize, usize)]) {
         self.tracked_bytes = self.tracked_bytes.saturating_add(live_bytes);
+        for (tag, &(count, bytes)) in by_type.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            self.gc_stats.live_objects = self.gc_stats.live_objects.wrapping_add(count);
+            self.gc_stats.live_bytes = self.gc_stats.live_bytes.wrapping_add(bytes);
+            let row = &mut self.gc_stats.by_type[tag];
+            row.live_bytes = row.live_bytes.wrapping_add(bytes);
+            row.live_count = row.live_count.wrapping_add(count as u64);
+        }
     }
 
     /// Page lists for every space, in census order: old, young

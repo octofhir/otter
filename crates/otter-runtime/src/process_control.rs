@@ -21,11 +21,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use otter_vm::{
-    ErrorKind, Local, NativeCall, NativeCtx, NativeError, NativeFn, NativeScope, Value,
-};
-
-use crate::CapabilitySet;
+use otter_vm::{ErrorKind, Local, NativeCall, NativeCtx, NativeError, NativeScope, Value};
 
 /// The process working directory shared by `process.cwd()` and
 /// `process.chdir()`.
@@ -60,15 +56,13 @@ pub(crate) const CAPTURE_SLOT: &str = "__otter_uncaught_capture__";
 pub(crate) fn install(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
-    capabilities: &CapabilitySet,
-    cwd: &WorkingDirectory,
 ) -> Result<(), NativeError> {
     crate::process::define_process_method(
         scope,
         process,
         "chdir",
         1,
-        chdir_call(capabilities, cwd),
+        NativeCall::Static(process_chdir),
     )?;
     crate::process::define_process_method(scope, process, "kill", 2, NativeCall::Static(kill))?;
     crate::process::define_process_method(
@@ -101,7 +95,7 @@ pub(crate) fn install(
         NativeCall::Static(get_active_resources_info),
     )?;
     install_credentials(scope, process)?;
-    crate::process_execve::install(scope, process, capabilities)?;
+    crate::process_execve::install(scope, process)?;
     let empty = scope.undefined();
     scope.define(
         process,
@@ -180,55 +174,52 @@ fn has_uncaught_exception_capture_callback(
 /// `process.chdir(directory)` — move the host process and record where it
 /// landed. A relative argument resolves against the current directory, which is
 /// what makes repeated relative `chdir` calls compose.
-fn chdir_call(capabilities: &CapabilitySet, cwd: &WorkingDirectory) -> NativeCall {
-    let capabilities = capabilities.clone();
-    let cwd = cwd.clone();
-    let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
-        let directory = match args.first().copied() {
-            Some(value) if value.as_string(ctx.heap()).is_some() => value
-                .as_string(ctx.heap())
-                .expect("string checked above")
-                .to_lossy_string(ctx.heap()),
-            other => {
-                return Err(invalid_arg_type(
-                    ctx,
-                    "directory",
-                    "string",
-                    other.unwrap_or_else(Value::undefined),
-                ));
-            }
-        };
-
-        let current = cwd.get();
-        let target = if PathBuf::from(&directory).is_absolute() {
-            PathBuf::from(&directory)
-        } else {
-            current.join(&directory)
-        };
-
-        if !capabilities.read.matches_path(&target) {
-            return Err(chdir_failure(
-                "EACCES",
-                "permission denied",
-                access_denied_errno(),
-                &current,
-                &directory,
+fn process_chdir(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let host = crate::process::process_host(ctx)?;
+    let (capabilities, cwd) = (host.capabilities, host.cwd);
+    let directory = match args.first().copied() {
+        Some(value) if value.as_string(ctx.heap()).is_some() => value
+            .as_string(ctx.heap())
+            .expect("string checked above")
+            .to_lossy_string(ctx.heap()),
+        other => {
+            return Err(invalid_arg_type(
+                ctx,
+                "directory",
+                "string",
+                other.unwrap_or_else(Value::undefined),
             ));
         }
+    };
 
-        std::env::set_current_dir(&target).map_err(|error| {
-            chdir_failure(
-                errno_code(&error),
-                errno_description(&error),
-                error.raw_os_error().unwrap_or(0),
-                &current,
-                &directory,
-            )
-        })?;
-        cwd.set(std::env::current_dir().unwrap_or(target));
-        Ok(Value::undefined())
-    });
-    NativeCall::Dynamic(call)
+    let current = cwd.get();
+    let target = if PathBuf::from(&directory).is_absolute() {
+        PathBuf::from(&directory)
+    } else {
+        current.join(&directory)
+    };
+
+    if !capabilities.read.matches_path(&target) {
+        return Err(chdir_failure(
+            "EACCES",
+            "permission denied",
+            access_denied_errno(),
+            &current,
+            &directory,
+        ));
+    }
+
+    std::env::set_current_dir(&target).map_err(|error| {
+        chdir_failure(
+            errno_code(&error),
+            errno_description(&error),
+            error.raw_os_error().unwrap_or(0),
+            &current,
+            &directory,
+        )
+    })?;
+    cwd.set(std::env::current_dir().unwrap_or(target));
+    Ok(Value::undefined())
 }
 
 /// Shape a failed `chdir` the way Node does: the message names both operands

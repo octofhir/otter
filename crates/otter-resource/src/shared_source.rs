@@ -113,6 +113,17 @@ impl SharedSource {
         }
     }
 
+    /// The text, when it lives in the program image
+    /// ([`Self::from_static`]): a startup image refers to such text by its
+    /// place in the executable instead of copying it.
+    #[must_use]
+    pub fn program_image_text(&self) -> Option<&'static str> {
+        match self.inner.text {
+            Cow::Borrowed(text) => text.get(self.range.clone()),
+            Cow::Owned(_) => None,
+        }
+    }
+
     /// Return the UTF-8 byte length of this source.
     #[must_use]
     pub fn len(&self) -> usize {

@@ -10,7 +10,8 @@ See [AGENTS.md](./AGENTS.md) for detailed coding agent instructions.
 ```bash
 # Build
 cargo build                              # Debug build
-cargo build --release -p otter-cli         # Release CLI binary
+cargo build --release -p otter-cli         # Release CLI binary (no startup image)
+just release                             # Release CLI + its startup image (what ships and what to benchmark)
 
 # Test
 cargo test --all --all-features          # All tests

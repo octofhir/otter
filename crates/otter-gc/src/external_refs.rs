@@ -1,9 +1,11 @@
 //! Isolate-local table of external (non-GC) references held by heap bodies.
 //!
 //! Some bodies point at things the collector does not own and cannot move:
-//! Rust function entry addresses, most of all. An opaque in-process heap image
-//! stores only their dense indices and shares the exact address list; no raw
-//! address is serialized or accepted from bytes.
+//! Rust function entry addresses, most of all. A heap image stores only their
+//! dense indices beside the address list. An in-process restore shares the
+//! exact list; a startup image records each address as its displacement from
+//! the executable's image anchor, and the reading process adds its own anchor,
+//! since the executable moves as one unit.
 //!
 //! This table gives every such address a small, dense, isolate-local
 //! index. A body stores the index; the address is looked up here when
@@ -95,7 +97,8 @@ impl ExternalRefTable {
         self.addrs.get(index as usize - 1).copied()
     }
 
-    /// Rebuild the table from a same-process captured address list, preserving
+    /// Rebuild the table from a captured address list (already moved to this
+    /// process for a startup image), preserving
     /// indices. The table must be empty — restore precedes any interning in a
     /// restored isolate.
     ///

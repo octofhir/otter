@@ -14,9 +14,16 @@
 //! - JavaScript worker construction, phased message admission, typed
 //!   [`RuntimeTask`] delivery in both directions, transfer commit, and
 //!   deterministic termination.
+//! - `insert_main_worker_host` gives the main runtime its `MainWorkerHost`:
+//!   the worker table and parent task spawner the `Worker` constructor
+//!   reads. A runtime restored from a startup image already holds the
+//!   constructor and receives only this host.
 //!
 //! # Invariants
 //!
+//! - The `Worker` constructor is a static native that captures nothing and
+//!   reads the run's worker table and spawner from its `MainWorkerHost`, so
+//!   a startup image carries it as is and each run inserts its own host.
 //! - Every worker owns a separate admitted runtime; no ordinary VM value,
 //!   moving GC handle, or [`otter_vm::ExecutionContext`] crosses a `Send` boundary.
 //!   Parent- and child-side dispatch state lives inside the owning isolate
@@ -331,6 +338,19 @@ struct WorkerChildShared {
 }
 
 pub(crate) fn install_main_worker_globals(runtime: &mut Runtime) -> Result<(), OtterError> {
+    insert_main_worker_host(runtime);
+    runtime.install_native_constructor_global_call(
+        "Worker",
+        2,
+        NativeCall::Static(worker_constructor),
+    )?;
+    Ok(())
+}
+
+/// The `Worker` constructor's view of this run: its worker table and the
+/// parent's task spawner. A runtime restored from a startup image already
+/// holds the constructor and gets only this.
+pub(crate) fn insert_main_worker_host(runtime: &mut Runtime) {
     let family = runtime
         .config
         .worker_family
@@ -343,43 +363,48 @@ pub(crate) fn install_main_worker_globals(runtime: &mut Runtime) -> Result<(), O
         family,
         workers: Mutex::new(HashMap::new()),
     });
-    runtime.install_native_constructor_global_call(
-        "Worker",
-        2,
-        worker_constructor_call(host, parent_spawner),
-    )?;
-    Ok(())
+    runtime.interp.insert_host_service(MainWorkerHost {
+        host,
+        parent_spawner,
+    });
 }
 
-fn worker_constructor_call(
+/// What the `Worker` constructor reads about this run instead of capturing
+/// it: the worker table it registers into and the parent's task spawner.
+#[derive(Clone)]
+struct MainWorkerHost {
     host: Arc<WorkerHostState>,
     parent_spawner: Option<RuntimeTaskSpawner>,
-) -> NativeCall {
-    let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
-        // A direct runtime has no managed inbox: fail synchronously before
-        // any resource effect.
-        let Some(parent_spawner) = parent_spawner.clone() else {
-            return Err(type_err(
-                "Worker",
-                "Worker requires a managed RuntimeHandle/Otter runtime".to_string(),
-            ));
-        };
-        let specifier = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
-        // Validate the narrowing request before any spawn effect.
-        let requested_capabilities = parse_worker_capability_request(ctx, args.get(1))?;
-        let record =
-            spawn_managed_worker(&host, &parent_spawner, specifier, requested_capabilities)?;
-        let result = build_worker_object(ctx, &host, &record);
-        if result.is_err()
-            && let Some(record) = host.remove(record.id.get())
-        {
-            record.request_terminate();
-            record.join();
-            record.release_keep_alive();
-        }
-        result
-    });
-    NativeCall::Dynamic(call)
+}
+
+fn worker_constructor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let MainWorkerHost {
+        host,
+        parent_spawner,
+    } = ctx
+        .host_service::<MainWorkerHost>()
+        .ok_or_else(|| type_err("Worker", "the worker host is not installed".to_string()))?;
+    // A direct runtime has no managed inbox: fail synchronously before
+    // any resource effect.
+    let Some(parent_spawner) = parent_spawner.clone() else {
+        return Err(type_err(
+            "Worker",
+            "Worker requires a managed RuntimeHandle/Otter runtime".to_string(),
+        ));
+    };
+    let specifier = value_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
+    // Validate the narrowing request before any spawn effect.
+    let requested_capabilities = parse_worker_capability_request(ctx, args.get(1))?;
+    let record = spawn_managed_worker(&host, &parent_spawner, specifier, requested_capabilities)?;
+    let result = build_worker_object(ctx, &host, &record);
+    if result.is_err()
+        && let Some(record) = host.remove(record.id.get())
+    {
+        record.request_terminate();
+        record.join();
+        record.release_keep_alive();
+    }
+    result
 }
 
 fn spawn_managed_worker(

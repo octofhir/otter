@@ -4,6 +4,8 @@
 //! - The existing hidden realm cache and owned, shared initialization state.
 //! - Atomic publication of the Engine, Store and well-known native JSTag.
 //! - Scoped cache construction independent of expensive native initialization.
+//! - [`restore_run_state`] — fresh payloads for the carrier and JSTag after a
+//!   startup-image restore.
 //!
 //! # Invariants
 //! Bootstrap may create the realm carrier and canonical JSTag wrapper without
@@ -12,6 +14,9 @@
 //! published only after Engine and tag construction succeed, so failures retain
 //! the empty owner and their canonical typed cause. Every tag shell retains its
 //! originating realm; there is no process Engine cache or parallel registry.
+//! A restore severs both bootstrap payloads; the run services give the
+//! carrier a new empty owner and the JSTag shell that same owner, as a build
+//! does.
 //!
 //! # See also
 //! - `super::WasmTag` owns the stable JavaScript wrapper.
@@ -20,13 +25,18 @@
 use std::sync::{Arc, Mutex};
 
 use otter_macros::HostClass;
-use otter_runtime::marshal::{IntoJs, JsError, JsValue, MarshalCx, class_instance};
-use otter_runtime::{RuntimeErrorKind, RuntimeNativeError, object};
+use otter_runtime::marshal::{HostInstance, IntoJs, JsError, JsValue, MarshalCx, class_instance};
+use otter_runtime::{
+    OtterError, RuntimeErrorKind, RuntimeExtensionContext, RuntimeNativeError, object,
+};
 use wasmtime::{Config, Engine, Store, Tag, ValType};
 
 use super::{SharedStore, StoreState, from_wasmtime, make_tag};
 
 const REALM_KEY: &str = "__otterWasmRealm";
+
+/// The carrier's host class.
+const REALM_CLASS: &str = "WebAssembly.__Realm";
 
 #[derive(Clone, HostClass)]
 pub(super) struct WasmRealm {
@@ -79,7 +89,7 @@ impl WasmRealm {
 
 impl IntoJs for WasmRealm {
     fn into_js<'s>(self, cx: &mut MarshalCx<'_, '_, 's>) -> Result<JsValue<'s>, JsError> {
-        class_instance(cx, "WebAssembly.__Realm", self)
+        class_instance(cx, REALM_CLASS, self)
     }
 }
 
@@ -108,6 +118,39 @@ pub(super) fn realm_handle(cx: &mut MarshalCx<'_, '_, '_>) -> Result<WasmRealm, 
         object::PropertyFlags::new(false, false, false),
     )?;
     Ok(realm)
+}
+
+/// Give the realm carrier and `WebAssembly.JSTag` their payloads back after
+/// a startup-image restore severed them: one new empty owner, shared by the
+/// JSTag shell. A build runs this before the namespace exists and finds
+/// nothing to restore.
+///
+/// # Errors
+/// A failed property read or payload install on the realm's own objects.
+pub(crate) fn restore_run_state(
+    runtime: &mut RuntimeExtensionContext<'_>,
+) -> Result<(), OtterError> {
+    runtime.declare_restorable_host_data::<WasmRealm>();
+    runtime.declare_restorable_host_data::<super::WasmTag>();
+    runtime.with_global_scope(|scope, global| {
+        let carrier = scope.get(global, REALM_KEY)?;
+        if !scope.is_object(carrier) {
+            return Ok(());
+        }
+        scope.restore_host_data(carrier, HostInstance::new(REALM_CLASS, WasmRealm::new()))?;
+        let realm = scope.with_host_data::<WasmRealm, _>(carrier, Clone::clone)?;
+        let namespace = scope.get(global, "WebAssembly")?;
+        if scope.is_object(namespace) {
+            let tag = scope.get(namespace, "JSTag")?;
+            if scope.is_object(tag) {
+                scope.restore_host_data(
+                    tag,
+                    HostInstance::new("WebAssembly.Tag", super::WasmTag::js_tag(realm)),
+                )?;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Most entry points require Engine and Store but do not use JSTag directly.

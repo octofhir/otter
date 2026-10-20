@@ -28,6 +28,13 @@ ensure_otter_bin() {
     echo "error: release otter binary not found after build: $bin" >&2
     exit 1
   fi
+  # A cargo build links the binary without its startup image; write it back
+  # so the benchmarks measure the executable as it ships. Stdout carries only
+  # the binary path.
+  if ! "$bin" startup-image "$bin" >&2; then
+    echo "error: could not write the startup image into $bin" >&2
+    exit 1
+  fi
   printf '%s\n' "$bin"
 }
 

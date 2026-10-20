@@ -81,6 +81,7 @@ mod realm;
 mod references;
 
 use boundary::{catchable_value, from_wasmtime, intrinsic, throw_value};
+pub(crate) use realm::restore_run_state;
 use realm::{WasmRealm, realm, realm_handle};
 use references::{
     extern_ref_from_js, extern_ref_to_js, js_to_val, js_to_val_in, val_to_js, val_to_js_in,

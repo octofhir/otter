@@ -20,6 +20,7 @@
 //! - [`encode_module`] — a module as flat bytes.
 //! - [`encode_module_bounded`] — the same encoding with a hard output budget.
 //! - [`decode_module`] — flat bytes into an immutable verified carrier.
+//! - [`decode_startup_image_module`] — a linked chunk of the startup image.
 //! - [`encode_module_bounded_detached`] / [`decode_module_with_source`] — the
 //!   pair for a store keyed by the compile input, which leaves that input out.
 //!
@@ -198,6 +199,20 @@ pub fn decode_build_artifact(
 ) -> Result<VerifiedBytecodeModule, ModuleDecodeError> {
     let module = decode_unverified_module(bytes).ok_or(ModuleDecodeError::MalformedEncoding)?;
     VerifiedBytecodeModule::from_build_artifact(module).map_err(ModuleDecodeError::Verify)
+}
+
+/// [`decode_build_artifact`] for a linked chunk the executable's startup
+/// image carries, its function ids already based at `function_base`.
+///
+/// # Errors
+/// Returns [`ModuleDecodeError`] for malformed bytes.
+pub fn decode_startup_image_module(
+    bytes: &'static [u8],
+    function_base: u32,
+) -> Result<VerifiedBytecodeModule, ModuleDecodeError> {
+    let module = decode_unverified_module(bytes).ok_or(ModuleDecodeError::MalformedEncoding)?;
+    VerifiedBytecodeModule::from_build_artifact_at_base(module, function_base)
+        .map_err(ModuleDecodeError::Verify)
 }
 
 /// Decode and verify a normal base-zero module.

@@ -672,6 +672,22 @@ impl SymbolRegistry {
             f(sym);
         }
     }
+
+    /// Every registration as its key and the symbol's body handle, in
+    /// registration order, for an isolate snapshot.
+    pub(crate) fn snapshot_entries(&self) -> Vec<(Box<str>, otter_gc::raw::RawGc)> {
+        self.entries
+            .borrow()
+            .iter()
+            .map(|(key, sym)| (Box::from(key.as_str()), sym.handle().raw()))
+            .collect()
+    }
+
+    /// Register a restored symbol under the key it was captured with, after
+    /// every entry restored before it.
+    pub(crate) fn restore_entry(&self, key: &str, sym: JsSymbol) {
+        self.entries.borrow_mut().push((key.to_owned(), sym));
+    }
 }
 
 /// Failure modes returned by [`SymbolRegistry::for_key`].

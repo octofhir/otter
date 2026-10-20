@@ -647,7 +647,7 @@ fn restored_indexed_readonly_flags_refresh_guard_after_metadata_rebuild() {
         snapshot
             .array_indexed_records
             .iter()
-            .flat_map(|record| &record.property_flags)
+            .flat_map(|(_, record)| &record.property_flags)
             .any(|(key, flags)| *key == 0 && !flags.writable())
     );
     let mut restored =

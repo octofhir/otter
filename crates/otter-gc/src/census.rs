@@ -305,6 +305,25 @@ impl<'h> LivePayload<'h> {
         unsafe { (*self.header).type_tag() }
     }
 
+    /// The body's handle.
+    #[must_use]
+    pub fn raw(self) -> crate::compressed::RawGc {
+        crate::compressed::RawGc(
+            (self.header as usize - crate::compressed::cage_base_addr()) as u32,
+        )
+    }
+
+    /// The body's typed handle, when it is a `T`.
+    #[must_use]
+    pub fn handle<T: Traceable>(self) -> Option<crate::compressed::Gc<T>> {
+        if self.type_tag() != T::TYPE_TAG {
+            return None;
+        }
+        // SAFETY: a header tagged `T::TYPE_TAG` precedes exactly one `T`
+        // payload (see `downcast`), and a handle names a body by its header.
+        Some(unsafe { crate::compressed::Gc::from_offset(self.raw().0) })
+    }
+
     /// The body as `T`, when it is one.
     #[must_use]
     pub fn downcast<T: Traceable>(self) -> Option<&'h T> {

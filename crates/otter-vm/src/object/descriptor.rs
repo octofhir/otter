@@ -51,6 +51,18 @@ impl PropertyFlags {
     /// `[[Configurable]]` bit.
     pub const CONFIGURABLE: u8 = 0b0100;
 
+    /// The flag bits, as a startup image records them.
+    #[must_use]
+    pub(crate) const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// Flags from bits [`Self::bits`] reported.
+    #[must_use]
+    pub(crate) const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
     /// All three attributes set — the default for an object-literal
     /// data property created by source like `{ x: 1 }`.
     #[must_use]

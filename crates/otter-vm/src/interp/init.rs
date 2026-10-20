@@ -328,6 +328,7 @@ impl Interpreter {
             regexp_offsets: Vec::new(),
             tracer: None,
             cpu_profiler: None,
+            host_services: crate::host_services::HostServices::default(),
         };
         interp.prime_realm_caches()?;
         // The realm is complete; anything allocated from here is mutator work

@@ -29,6 +29,7 @@
 //! - [`extra_roots`] — heap-registered callbacks for runtime-owned roots.
 //! - [`frame_roots`] — active interpreter frame-stack root registry.
 //! - [`finalize`] — raw weak-reference and finalization bookkeeping.
+//! - [`image_codec`] — byte writer/reader of the startup image.
 //! - [`oom`] — `OutOfMemory` error.
 //! - [`os_memory`] — resident set and host free memory from the OS.
 //! - [`stats`] — per-heap counters and per-type rows.
@@ -86,6 +87,7 @@ pub mod header;
 pub mod heap;
 pub mod heap_image;
 pub mod host_refs;
+pub mod image_codec;
 pub mod lab;
 #[doc(hidden)]
 pub mod marking;

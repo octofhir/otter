@@ -145,6 +145,21 @@ impl NativeCallHeader {
             | (u8::from(overridden) * Self::PROTOTYPE_OVERRIDE);
     }
 
+    /// Move a static entry point by `slide`: the program image it points
+    /// into loaded `slide` bytes away from where the startup image was
+    /// written. Other kinds hold no address.
+    pub(super) fn slide_entry(&mut self, slide: isize) {
+        if matches!(
+            self.kind,
+            NativeEntryKind::Static | NativeEntryKind::StaticWithCaptures
+        ) {
+            // SAFETY: both static kinds initialize the payload with a
+            // function pointer, one word wide.
+            let address = unsafe { self.payload.bits } as usize;
+            self.payload.bits = address.wrapping_add_signed(slide) as u64;
+        }
+    }
+
     pub(super) fn host_ref(self) -> Option<u32> {
         match self.kind {
             NativeEntryKind::Dynamic | NativeEntryKind::LocalDynamic => {

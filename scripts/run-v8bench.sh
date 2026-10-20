@@ -2,7 +2,8 @@
 #
 # Run the classic V8 benchmark suite (v8-v7, from mozilla/arewefastyet) on the otter engine.
 # Downloads the benchmark JS into ./v8-v7 (gitignored) on first run, builds the `otter` CLI in
-# release mode, concatenates the suite into one realm, and prints per-benchmark scores plus the
+# release mode and writes its startup image into it (as `just release` does), concatenates the
+# suite into one realm, and prints per-benchmark scores plus the
 # composite score. Higher is better; scores are normalized to a 2008 reference machine at 100.
 #
 #   scripts/run-v8bench.sh              # full suite
@@ -23,6 +24,9 @@ if [ ! -f "$DEST/base.js" ]; then
 fi
 
 cargo build --release -q -p otter-cli --bin otter
+# A cargo build links the binary without its startup image; write it back so
+# the scores are those of the executable as it ships.
+"$ROOT/target/release/otter" startup-image "$ROOT/target/release/otter"
 
 if [ $# -ge 1 ]; then
   SUITES=("$@")

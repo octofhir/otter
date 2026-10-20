@@ -189,6 +189,7 @@ impl Fixture {
             field,
             global_lexical_epoch: EPOCH,
             writable: false,
+            layout: None,
         }
     }
     fn lexical_byte(&self) -> usize {

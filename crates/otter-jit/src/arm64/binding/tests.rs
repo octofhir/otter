@@ -278,6 +278,7 @@ fn global_reader_proves_current_alias_epoch_identity_state_and_bank_bounds() {
                 field,
                 global_lexical_epoch: EPOCH,
                 writable: true,
+                layout: None,
             };
             let code = executable(&view, proof, 12);
             let current = if field.is_inline() {

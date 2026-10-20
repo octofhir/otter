@@ -1,7 +1,8 @@
 //! Native Graph global binding reads with exact eager source recovery.
 //!
 //! # Contents
-//! - One source-body proof lookup and shared physical read.
+//! - One source-body proof lookup and shared physical read; a dictionary
+//!   global object read through its subscribed slot-layout proof.
 //! - The source realm's global object behind the same realm guard.
 //! - The existing WrongShape eager exit for TDZ or revoked physical facts.
 //!
@@ -34,6 +35,22 @@ impl Codegen<'_> {
             .get(&byte_pc)
             .copied()
             .ok_or(Unsupported::OperandShape("Graph source binding proof"))?;
+        // The dependency pass subscribed this generation to the global
+        // object's slot-layout proof and tested the flag before the read.
+        if let otter_vm::jit::BindingHitProof::GlobalObject { field, .. } = proof
+            && super::super::dependency_checks::global_layout_validity(view, byte_pc).is_some()
+        {
+            crate::arm64::binding::emit_global_object_proved_read(
+                &mut self.ops,
+                &mut self.relocations,
+                view,
+                field,
+                destination,
+                temps,
+                miss,
+            );
+            return Ok(());
+        }
         crate::arm64::binding::emit_global_read(
             &mut self.ops,
             &mut self.relocations,

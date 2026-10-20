@@ -572,6 +572,7 @@ impl Interpreter {
         // own property: a lexical that shadows none invalidates no such read.
         if shadowed.is_some() {
             self.global_lexical_epoch = self.global_lexical_epoch.wrapping_add(1);
+            crate::object::invalidate_dictionary_layout_proof(self.global_this, &self.gc_heap);
         }
         self.global_object_load_ic.clear();
         Ok(())

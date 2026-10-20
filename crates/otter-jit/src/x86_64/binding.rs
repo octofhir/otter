@@ -1,6 +1,8 @@
 //! Live global binding geometry shared by x86-64 native tiers.
 //!
 //! # Contents
+//! - Reads of a dictionary global object whose generation subscribes to its
+//!   slot-layout proof, guarded by the realm alone.
 //! - Source-identified permanent lexical-cell address and live TDZ guards.
 //! - Current global epoch, ordinary shape and watched dictionary guards.
 //! - Shape-selected persistent-prefix/suffix banks and eligible global reads.
@@ -135,6 +137,41 @@ pub(crate) fn emit_global_field_bank(
             ; cmp DWORD [Rq(base) + view.field_layout.slab_capacity_byte as i32], field.index() as i32 ; jbe =>miss);
     }
     emit_field_base(ops, relocations, view, header, base, 10, field);
+}
+
+/// Read `field` of the realm's dictionary global object for a generation
+/// subscribed to the object's slot-layout proof: the proof stands for the
+/// lexical epoch, the layout and the field's presence, so only the realm is
+/// guarded. The bank is read afresh, since appending globals may move a
+/// slab without changing the layout.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_global_object_proved_read(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    field: FieldLocation,
+    destination: u8,
+    [header, base]: [u8; 2],
+    miss: DynamicLabel,
+) -> Result<(), Unsupported> {
+    validate_temps([header, base]);
+    let offset = i32::try_from(field.byte_offset())
+        .map_err(|_| Unsupported::OperandShape("global field displacement"))?;
+    emit_global_realm_guard(ops, view, miss);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        11,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops ; .arch x64
+        ; mov Rq(base), [r15 + GLOBAL_THIS_OFFSET_PTR_OFFSET as i32]
+        ; mov Rd(header), [Rq(base)]
+        ; add Rq(header), r11);
+    emit_field_base(ops, relocations, view, header, base, 10, field);
+    dynasm!(ops ; .arch x64 ; mov Rq(destination), [Rq(base) + offset]);
+    Ok(())
 }
 
 /// Materialize an admitted permanent cell. `false` means no hit was emitted;

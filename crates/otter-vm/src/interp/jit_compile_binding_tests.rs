@@ -143,12 +143,26 @@ fn assert_proofs(
         &interpreter.gc_heap,
         u32::from(hit.slot),
     );
+    // A dictionary global's proof carries the slot-layout cell the
+    // generation subscribes to; a shaped one guards its shape instead.
+    let layout = dictionary
+        .then(|| object::dictionary_layout_validity(interpreter.global_this, &interpreter.gc_heap))
+        .flatten()
+        .map(|cell| {
+            assert!(cell.is_valid());
+            jit::JitPrototypeValidity {
+                address: cell.address(),
+                identity: cell.identity(),
+            }
+        });
+    assert_eq!(layout.is_some(), dictionary);
     let expected = jit::BindingHitProof::GlobalObject {
         shape,
         dictionary,
         field,
         global_lexical_epoch: interpreter.global_lexical_epoch,
         writable,
+        layout,
     };
     let mut binding_pcs = Vec::new();
     let mut load_pcs = Vec::new();
@@ -383,6 +397,36 @@ fn dictionary_binding_watches_preserve_values_and_unrelated_descriptor_changes()
     let frozen = bake(&mut interpreter, &context);
     assert_proofs(&interpreter, &frozen, true, false);
     assert_ne!(frozen.binding_hit_proofs, before.binding_hit_proofs);
+    // The slot-layout proof subscribed generations read through retires
+    // with the layout; the next compile gets a fresh one.
+    let layout_of = |view: &jit::JitCompileSnapshot| match view.binding_hit_proofs.values().next() {
+        Some(jit::BindingHitProof::GlobalObject {
+            layout: Some(layout),
+            ..
+        }) => *layout,
+        other => panic!("dictionary proof carries its layout cell: {other:?}"),
+    };
+    let (old, fresh) = (layout_of(&before), layout_of(&frozen));
+    assert_ne!(old.address, fresh.address);
+    // SAFETY: the compile roots retain both cells; the address is each
+    // cell's validity word.
+    let valid = |address: usize| unsafe {
+        (*(address as *const std::sync::atomic::AtomicU32))
+            .load(std::sync::atomic::Ordering::Acquire)
+    };
+    assert_eq!(
+        valid(old.address),
+        0,
+        "the advanced layout retired its proof"
+    );
+    assert_eq!(valid(fresh.address), 1);
+    // A global lexical declaration shadowing a global object property
+    // retires the current proof without advancing the layout.
+    crate::object::invalidate_dictionary_layout_proof(
+        interpreter.global_this,
+        &interpreter.gc_heap,
+    );
+    assert_eq!(valid(fresh.address), 0);
 }
 
 fn realm_binding_module() -> otter_bytecode::BytecodeModule {

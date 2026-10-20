@@ -150,6 +150,15 @@ impl<'a> Codegen<'a> {
                         }
                         dynasm!(self.ops ; .arch x64 ; je =>true_label);
                     }
+                    // Every mismatch leaves for the false successor.
+                    BranchKind::Native(identity) => {
+                        let a = Self::gp(allocation.inputs[0]);
+                        self.emit_native_identity(a, identity, false_label);
+                        if next != Some(if_true) {
+                            dynasm!(self.ops ; .arch x64 ; jmp =>true_label);
+                        }
+                        return Ok(());
+                    }
                     BranchKind::Nullish => {
                         let a = Self::gp(allocation.inputs[0]);
                         dynasm!(self.ops ; .arch x64

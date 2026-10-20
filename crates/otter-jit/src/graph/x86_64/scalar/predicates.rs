@@ -193,6 +193,14 @@ impl<'a> Codegen<'a> {
             ; mov r11, Rq(a) ; or r11, NULLISH_BIT ; cmp r11, NULLISH ; je =>a_nullish
             ; mov r11, Rq(b) ; or r11, NULLISH_BIT ; cmp r11, NULLISH ; je =>b_nullish
         );
+        // Two booleans that are not the same word differ.
+        let not_both_booleans = self.ops.new_dynamic_label();
+        self.load_immediate(10, tag::VALUE_TRUE);
+        dynasm!(self.ops ; .arch x64
+            ; mov r11, Rq(a) ; or r11, 1 ; cmp r11, r10 ; jne =>not_both_booleans
+            ; mov r11, Rq(b) ; or r11, 1 ; cmp r11, r10 ; je =>outcomes.differ
+            ; =>not_both_booleans
+        );
         // A boolean or function-id immediate converts or compares against a
         // converted cell: the runtime decides.
         self.load_immediate(10, tag::NOT_CELL_MASK);

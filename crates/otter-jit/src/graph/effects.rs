@@ -306,6 +306,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::Float64Div
         | Kind::Float64Negate
         | Kind::Float64Mod
+        | Kind::Float64Math(_)
         | Kind::Float64Compare(_)
         | Kind::CheckedTaggedToInt32
         | Kind::CheckedTaggedToFloat64

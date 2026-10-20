@@ -156,6 +156,87 @@ pub(crate) enum BranchKind {
     Nullish,
     /// The word `input0` equals this constant.
     WordEqual(u32),
+    /// `input0` is the native function whose external reference index is
+    /// this constant.
+    Native(u32),
+}
+
+/// A `Math` method on float64 operands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MathOp {
+    Abs,
+    Sqrt,
+    Floor,
+    Ceil,
+    Trunc,
+    Round,
+    Min,
+    Max,
+    Sin,
+    Cos,
+    Tan,
+    Atan,
+    Exp,
+    Log,
+    Atan2,
+    Pow,
+}
+
+impl MathOp {
+    /// The method a static native `Math` leaf computes on Number operands.
+    pub(crate) fn of_leaf(stub: otter_vm::native_abi::RuntimeStubId) -> Option<Self> {
+        use otter_vm::native_abi as abi;
+        Some(match stub {
+            id if id == abi::STUB_MATH_ABS_LEAF.id => Self::Abs,
+            id if id == abi::STUB_MATH_SQRT_LEAF.id => Self::Sqrt,
+            id if id == abi::STUB_MATH_FLOOR_LEAF.id => Self::Floor,
+            id if id == abi::STUB_MATH_CEIL_LEAF.id => Self::Ceil,
+            id if id == abi::STUB_MATH_TRUNC_LEAF.id => Self::Trunc,
+            id if id == abi::STUB_MATH_ROUND_LEAF.id => Self::Round,
+            id if id == abi::STUB_MATH_MIN_LEAF.id => Self::Min,
+            id if id == abi::STUB_MATH_MAX_LEAF.id => Self::Max,
+            id if id == abi::STUB_MATH_SIN_LEAF.id => Self::Sin,
+            id if id == abi::STUB_MATH_COS_LEAF.id => Self::Cos,
+            id if id == abi::STUB_MATH_TAN_LEAF.id => Self::Tan,
+            id if id == abi::STUB_MATH_ATAN_LEAF.id => Self::Atan,
+            id if id == abi::STUB_MATH_EXP_LEAF.id => Self::Exp,
+            id if id == abi::STUB_MATH_LOG_LEAF.id => Self::Log,
+            id if id == abi::STUB_MATH_ATAN2_LEAF.id => Self::Atan2,
+            id if id == abi::STUB_MATH_POW_LEAF.id => Self::Pow,
+            _ => return None,
+        })
+    }
+
+    /// The operands the method reads.
+    pub(crate) fn arity(self) -> usize {
+        match self {
+            Self::Min | Self::Max | Self::Atan2 | Self::Pow => 2,
+            _ => 1,
+        }
+    }
+
+    /// The method's typed id, as the shared `Math` leaf takes it.
+    pub(crate) fn method(self) -> otter_bytecode::method_id::MathMethod {
+        use otter_bytecode::method_id::MathMethod as M;
+        match self {
+            Self::Abs => M::Abs,
+            Self::Sqrt => M::Sqrt,
+            Self::Floor => M::Floor,
+            Self::Ceil => M::Ceil,
+            Self::Trunc => M::Trunc,
+            Self::Round => M::Round,
+            Self::Min => M::Min,
+            Self::Max => M::Max,
+            Self::Sin => M::Sin,
+            Self::Cos => M::Cos,
+            Self::Tan => M::Tan,
+            Self::Atan => M::Atan,
+            Self::Exp => M::Exp,
+            Self::Log => M::Log,
+            Self::Atan2 => M::Atan2,
+            Self::Pow => M::Pow,
+        }
+    }
 }
 
 /// Every graph operation.
@@ -290,6 +371,10 @@ pub(crate) enum Kind {
     Float64Negate,
     /// `fmod` through a leaf call.
     Float64Mod,
+    /// `Math.<op>` of [`MathOp::arity`] float64 inputs, producing a float64:
+    /// one instruction where the target has it, otherwise the shared typed
+    /// `Math` leaf with every live register saved around it.
+    Float64Math(MathOp),
     /// Float64 compare producing a tagged boolean; unordered satisfies only `!=`.
     Float64Compare(Condition),
 
@@ -876,7 +961,7 @@ impl Kind {
                     pure
                 }
             }
-            Self::Float64Mod => pure,
+            Self::Float64Mod | Self::Float64Math(_) => pure,
             Self::Int32Add
             | Self::Int32Sub
             | Self::Int32Mul
@@ -1322,6 +1407,13 @@ impl Kind {
             },
             Self::Float64Mod => Constraints {
                 inputs: registers(2),
+                result: ResultPolicy::Register,
+                gp_temps: 0,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::Float64Math(op) => Constraints {
+                inputs: registers(op.arity()),
                 result: ResultPolicy::Register,
                 gp_temps: 0,
                 fp_temps: 0,

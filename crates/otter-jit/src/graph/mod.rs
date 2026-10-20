@@ -10,6 +10,7 @@
 //! - [`feedback`] — the snapshot's per-site feedback as speculation.
 //! - [`phi_repr`] — unboxed int32 phis.
 //! - [`range`] — int32 ranges dropping overflow and `-0` checks.
+//! - `division` — signed int32 division by a constant as a multiply-high.
 //! - [`truncation`] — wrapping int32 additions under truncating uses.
 //! - [`effects`] — abstract heaps each node reads and writes.
 //! - [`dominators`] — immediate dominators of the block graph.
@@ -63,6 +64,8 @@ pub(crate) mod builder;
 pub(crate) mod bytecode;
 pub(crate) mod call;
 mod dependency_checks;
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+mod division;
 pub(crate) mod dominators;
 mod dump;
 pub(crate) mod effects;

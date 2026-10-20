@@ -343,8 +343,10 @@ fn assert_no_template_entry(
     );
 }
 
-/// A cold miss proves optimized execution by crossing the committed method
-/// boundary, which only generated code uses; a hit by [`assert_ran_optimized`].
+/// A cold miss proves optimized execution by calling the method it read
+/// without an interpreted property load: through the committed method
+/// boundary, which only generated code uses, or by the generation's own call
+/// of the replaced method. A hit proves it by [`assert_ran_optimized`].
 fn assert_math_method_delta(
     before: RuntimeExecutionStats,
     after: RuntimeExecutionStats,
@@ -361,9 +363,14 @@ fn assert_math_method_delta(
         "{source}"
     );
     if expect_cold {
+        let committed =
+            after.jit_reentrant_stub_transitions > before.jit_reentrant_stub_transitions;
+        let called = after.native_calls > before.native_calls
+            && (after.property_load_hits, after.property_load_misses)
+                == (before.property_load_hits, before.property_load_misses);
         assert!(
-            after.jit_reentrant_stub_transitions > before.jit_reentrant_stub_transitions,
-            "the miss must use the committed method boundary: {source}"
+            committed || called,
+            "the miss must call the replaced method from optimized code: {source}"
         );
     } else {
         assert_ran_optimized(before, after, source);

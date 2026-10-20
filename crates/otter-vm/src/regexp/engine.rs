@@ -2,6 +2,8 @@
 //!
 //! # Contents
 //! - Pattern compilation and width-preserving first/all searches.
+//! - [`MatchOffsets`] — one match's group offsets in the interpreter's
+//!   reused buffer, for the direct `exec`/`test` path.
 //! - Sticky searches anchored at their start, one candidate per match.
 //! - Scratch handoff and backtrack work transferred to the VM ledger.
 //!
@@ -13,7 +15,38 @@
 //! # See also
 //! - [`super::RegexSearch`] owns isolate-local scratch and work limits.
 
-pub use otter_regex::{ExecError, Match, MatchBatch, MatchRecord, Regex};
+pub use otter_regex::{ExecError, Match, MatchBatch, MatchRecord, NO_OFFSET, Regex};
+
+/// One match's group offsets: `[start, end)` per group, group zero first,
+/// [`NO_OFFSET`] for both ends of a group that did not participate. The buffer
+/// is the interpreter's, lent to one match and handed back when it is used.
+pub(crate) struct MatchOffsets(pub(crate) Vec<u32>);
+
+impl MatchOffsets {
+    /// The whole match.
+    #[inline]
+    pub(crate) fn range(&self) -> std::ops::Range<usize> {
+        self.0[0] as usize..self.0[1] as usize
+    }
+
+    /// Groups, group zero included.
+    #[inline]
+    pub(crate) fn groups(&self) -> usize {
+        self.0.len() / 2
+    }
+
+    /// Group `index`, `None` when it did not participate.
+    #[inline]
+    pub(crate) fn group(&self, index: usize) -> Option<std::ops::Range<usize>> {
+        let start = self.0[2 * index];
+        (start != NO_OFFSET).then(|| start as usize..self.0[2 * index + 1] as usize)
+    }
+
+    /// Capture groups, group zero excluded.
+    pub(crate) fn captures(&self) -> impl Iterator<Item = Option<std::ops::Range<usize>>> + '_ {
+        (1..self.groups()).map(|index| self.group(index))
+    }
+}
 
 /// One matcher result plus the exact work charged to the VM ledger.
 pub(crate) struct Execution<T> {
@@ -115,6 +148,47 @@ pub(crate) fn find_one(
             search,
         ),
     }
+}
+
+/// [`find_one`] writing the match's offsets into `out` instead of building a
+/// record: `Ok(true)` on a hit.
+pub(crate) fn find_first_offsets(
+    re: &Regex,
+    text: crate::string::CodeUnits<'_>,
+    start: usize,
+    sticky: bool,
+    search: &super::RegexSearch<'_>,
+    out: &mut Vec<u32>,
+) -> Execution<bool> {
+    let config = otter_regex::ExecConfig {
+        step_limit: search.step_limit,
+    };
+    let scratch = search.scratch.take();
+    match text {
+        crate::string::CodeUnits::Latin1(bytes) => first_offsets(
+            re.find_latin1_with(bytes, start, config, scratch)
+                .anchored(sticky),
+            search,
+            out,
+        ),
+        crate::string::CodeUnits::Utf16(units) => first_offsets(
+            re.find_utf16_with(units, start, config, scratch)
+                .anchored(sticky),
+            search,
+            out,
+        ),
+    }
+}
+
+fn first_offsets<U: otter_regex::Unit>(
+    mut matches: otter_regex::Matches<'_, '_, U>,
+    search: &super::RegexSearch<'_>,
+    out: &mut Vec<u32>,
+) -> Execution<bool> {
+    let result = matches.first_offsets(out);
+    let steps = matches.steps_executed();
+    search.scratch.set(matches.into_scratch());
+    Execution { result, steps }
 }
 
 fn first_match<U: otter_regex::Unit>(

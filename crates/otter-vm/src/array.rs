@@ -885,7 +885,7 @@ pub(crate) fn try_tagged_from_values_no_collect(
         heap.try_alloc_trailing_no_collect_or_return(
             elements::ElementSlabBody::new(values.len(), DenseElementKind::Tagged),
             elements::ElementSlabBody::trailing_bytes(values.len(), DenseElementKind::Tagged),
-            |_| {},
+            |slab| slab.init_tagged_prefix(values),
         )
         .ok()?
     };
@@ -893,9 +893,14 @@ pub(crate) fn try_tagged_from_values_no_collect(
         ..Default::default()
     };
     body.set_length(values.len());
-    body.adopt_slab(slab, 0);
-    copy_values_into(&mut body, values);
-    record_slab_contents(heap, slab, values.len());
+    body.adopt_slab(slab, values.len());
+    // A young slab needs no generational entry, only the marking half of
+    // the barrier while a cycle runs.
+    // SAFETY: a non-null handle names the live slab allocated above.
+    let young = slab.is_null() || unsafe { (*slab.as_header_ptr()).is_young() };
+    if !young || heap.marking().is_marking() {
+        record_slab_contents(heap, slab, values.len());
+    }
     heap.try_alloc_no_collect(body)
 }
 

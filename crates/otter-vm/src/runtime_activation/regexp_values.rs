@@ -53,7 +53,7 @@ impl crate::native_abi::JitCtx {
             };
             match crate::regexp_fast::exec_direct(vm, receiver, argument, test) {
                 Some(Ok(crate::regexp_fast::DirectExec::Done(value))) => return Ok(value),
-                Some(Ok(crate::regexp_fast::DirectExec::Matched(matched))) => {
+                Some(Ok(crate::regexp_fast::DirectExec::Matched(offsets))) => {
                     let has_indices = receiver
                         .as_regexp()
                         .is_some_and(|regexp| regexp.flags(&vm.gc_heap).has_indices);
@@ -62,11 +62,15 @@ impl crate::native_abi::JitCtx {
                             vm,
                             &mut receiver,
                             &mut argument,
-                            &matched,
+                            &offsets,
                         )
                     {
+                        vm.recycle_match_offsets(offsets);
                         return Ok(result);
                     }
+                    let regexp = receiver.as_regexp().expect("exec receiver is a RegExp");
+                    let matched = regexp.match_record(&vm.gc_heap, &offsets);
+                    vm.recycle_match_offsets(offsets);
                     Some(Ok((matched, has_indices)))
                 }
                 Some(Err(error)) => Some(Err(error)),

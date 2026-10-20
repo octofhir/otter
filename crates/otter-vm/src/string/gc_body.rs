@@ -757,8 +757,8 @@ pub fn slice_string_body(
     }
 }
 
-/// Allocation-buffer bytes [`try_substring_no_collect`] takes at most: a
-/// copied short substring's cell, which is at least a view's.
+/// Allocation-buffer bytes [`try_substrings_no_collect`] takes per substring
+/// at most: a copied short substring's cell, which is at least a view's.
 pub(crate) const SUBSTRING_CELL_BYTES: usize =
     GcHeap::cell_bytes::<JsStringBody>(SHORT_CONCAT_LATIN1);
 const _: () = assert!(SUBSTRING_CELL_BYTES >= GcHeap::cell_bytes::<JsStringBody>(PAIR_BYTES));
@@ -784,61 +784,75 @@ fn substring_body(content: FlatContent<'_>) -> SubstringBody<'_> {
     }
 }
 
-/// `length` units at `start` of `string`, which reads contiguously, in one
-/// cell taken from the allocation buffer without collecting, within the
-/// bytes the caller reserved ([`SUBSTRING_CELL_BYTES`]). Like [`slice_view`],
-/// short units are copied and longer ones viewed in place. `None` when the
-/// string does not read contiguously or the buffer has no room.
-pub(crate) fn try_substring_no_collect(
+/// The substring of the contiguous `string` at each range, `undefined` for a
+/// `None` range, appended to `out`, each in one cell from the allocation
+/// buffer within the bytes the caller reserved ([`SUBSTRING_CELL_BYTES`] per
+/// substring): short units copied straight from the subject, resolved once,
+/// longer ones viewed in place. `None` when the string does not read
+/// contiguously or the buffer runs out; `out` then holds a prefix.
+pub(crate) fn try_substrings_no_collect(
     heap: &mut GcHeap,
     string: JsStringHandle,
-    start: u32,
-    length: u32,
-) -> Option<JsStringHandle> {
+    ranges: impl Iterator<Item = Option<std::ops::Range<usize>>>,
+    out: &mut smallvec::SmallVec<[crate::Value; 16]>,
+) -> Option<()> {
     let (parent, base, _) = contiguous_view(heap, string)?;
-    let start = base.checked_add(start)?;
-    let mut latin1 = [0u8; SHORT_CONCAT_LATIN1];
-    let mut wide = [0u16; SHORT_CONCAT_FLAT];
-    let built = heap.read_payload(parent, |body| {
-        Some(
-            match substring_body(flat_content_range(body, start, length)?) {
-                SubstringBody::Latin1(bytes) => {
-                    latin1[..bytes.len()].copy_from_slice(bytes);
-                    (STRING_REPR_SEQ_LATIN1, bytes.len())
-                }
-                SubstringBody::Wide(units) => {
-                    wide[..units.len()].copy_from_slice(units);
-                    (STRING_REPR_SEQ_FLAT, units.len() * 2)
-                }
-                SubstringBody::View => (STRING_REPR_SLICED, PAIR_BYTES),
-            },
+    let (data, latin1) = heap.read_payload(parent, |body| {
+        (
+            body.trailing_ptr(),
+            body.repr() == JsStringBodyRepr::SeqLatin1,
         )
-    })?;
-    match built {
-        (STRING_REPR_SEQ_LATIN1, bytes) => heap
-            .try_alloc_trailing_no_collect_or_return(
+    });
+    for range in ranges {
+        let Some(range) = range else {
+            out.push(crate::Value::undefined());
+            continue;
+        };
+        let length = u32::try_from(range.len()).ok()?;
+        let start = base.checked_add(u32::try_from(range.start).ok()?)?;
+        // Nothing below collects or moves a cell, so `data` stays the
+        // parent's units for the whole loop.
+        let handle = if latin1 && range.len() <= SHORT_CONCAT_LATIN1 {
+            heap.try_alloc_trailing_no_collect_or_return(
                 JsStringBody::seq(true, length),
-                bytes,
+                range.len(),
                 |body| {
-                    body.init_seq_latin1(&latin1[..bytes]);
+                    // SAFETY: `start + length` lies inside the parent's
+                    // Latin-1 payload, which no allocation here moves.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(data.add(start as usize), range.len())
+                    };
+                    body.init_seq_latin1(bytes);
                 },
             )
-            .ok(),
-        (STRING_REPR_SEQ_FLAT, bytes) => heap
-            .try_alloc_trailing_no_collect_or_return(
+        } else if !latin1 && range.len() <= SHORT_CONCAT_FLAT {
+            heap.try_alloc_trailing_no_collect_or_return(
                 JsStringBody::seq(false, length),
-                bytes,
-                |body| body.init_seq_flat(&wide[..bytes / 2]),
+                range.len() * 2,
+                |body| {
+                    // SAFETY: as above, for the parent's WTF-16 payload.
+                    let units = unsafe {
+                        std::slice::from_raw_parts(
+                            data.cast::<u16>().add(start as usize),
+                            range.len(),
+                        )
+                    };
+                    body.init_seq_flat(units);
+                },
             )
-            .ok(),
-        _ => heap
-            .try_alloc_trailing_no_collect_or_return(
+        } else {
+            heap.try_alloc_trailing_no_collect_or_return(
                 JsStringBody::pair(STRING_REPR_SLICED, length, 0),
                 PAIR_BYTES,
                 |body| body.init_pair(parent, start),
             )
-            .ok(),
+        }
+        .ok()?;
+        out.push(crate::Value::string(crate::string::JsString::from_handle(
+            handle, heap,
+        )));
     }
+    Some(())
 }
 
 /// `length` units at `start` of the contiguous `parent`: copied into a

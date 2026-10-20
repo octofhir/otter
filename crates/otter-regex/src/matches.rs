@@ -28,7 +28,41 @@ pub(crate) enum Slots<'a> {
     Encoded(&'a [u64]),
 }
 
+/// The offset [`crate::Matches::first_offsets`] writes for both ends of a
+/// group that did not participate.
+pub const NO_OFFSET: u32 = u32::MAX;
+
 impl Slots<'_> {
+    /// Write every group's `[start, end)` as `u32` pairs, group zero first,
+    /// [`NO_OFFSET`] for both ends of a group that did not participate.
+    #[inline]
+    pub(crate) fn write_offsets(self, out: &mut Vec<u32>) {
+        out.clear();
+        match self {
+            Self::Encoded(slots) => {
+                // Every slot is an offset below `u32::MAX` or [`NONE`], whose
+                // low half is [`NO_OFFSET`]; a group the matcher closed
+                // without opening reads as absent from its start.
+                out.extend(slots.iter().map(|&slot| slot as u32));
+                for pair in out.as_chunks_mut::<2>().0 {
+                    if pair[1] == NO_OFFSET {
+                        pair[0] = NO_OFFSET;
+                    }
+                }
+            }
+            Self::Interpreted(slots) => {
+                for pair in slots.as_chunks::<2>().0 {
+                    match (pair[0], pair[1]) {
+                        (Some(start), Some(end)) => {
+                            out.extend_from_slice(&[start as u32, end as u32]);
+                        }
+                        _ => out.extend_from_slice(&[NO_OFFSET, NO_OFFSET]),
+                    }
+                }
+            }
+        }
+    }
+
     #[inline]
     pub(crate) fn len(self) -> usize {
         match self {
@@ -234,6 +268,23 @@ impl MatchRecord {
     #[inline]
     pub fn captures(&self) -> Captures<'_> {
         Captures(CaptureStorage::Ranges(&self.captures))
+    }
+
+    /// The record of the match whose offsets [`crate::Matches::first_offsets`]
+    /// wrote, under the group names of the regex that found it.
+    #[must_use]
+    pub fn from_offsets(offsets: &[u32], names: &Arc<[String]>) -> Self {
+        let range =
+            |pair: &[u32; 2]| (pair[0] != NO_OFFSET).then_some(pair[0] as usize..pair[1] as usize);
+        let pairs = offsets.as_chunks::<2>().0;
+        Self {
+            range: pairs.first().and_then(range).unwrap_or(0..0),
+            captures: pairs.iter().skip(1).map(range).collect(),
+            names: names
+                .iter()
+                .any(|name| !name.is_empty())
+                .then(|| Arc::clone(names)),
+        }
     }
 
     /// Borrow the same match view used by lending searches and batches.

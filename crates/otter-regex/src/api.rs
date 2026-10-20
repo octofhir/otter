@@ -39,6 +39,8 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp.prototype.exec> (§22.2.7.2)
 
+use std::sync::Arc;
+
 use crate::matches::{Match, MatchBatch, MatchRecord, Slots};
 
 use crate::cursor::{Input, Unit};
@@ -59,6 +61,8 @@ pub struct Regex {
     program: Program,
     flags: Flags,
     native: NativeTier,
+    /// Some capture group has a name.
+    named: bool,
 }
 
 /// Matcher buffers a host keeps between searches.
@@ -88,10 +92,12 @@ impl Regex {
     pub fn compile_utf16(pattern: &[u16], flags: Flags) -> Result<Self, RegexError> {
         let parsed = crate::parser::parse(pattern, flags)?;
         let program = crate::ir::lower(parsed, flags);
+        let named = program.names.iter().any(|name| !name.is_empty());
         Ok(Self {
             program,
             flags,
             native: NativeTier::default(),
+            named,
         })
     }
 
@@ -112,6 +118,19 @@ impl Regex {
     #[must_use]
     pub fn group_count(&self) -> u32 {
         self.program.group_count
+    }
+
+    /// Whether some capture group has a name.
+    #[must_use]
+    pub fn has_named_groups(&self) -> bool {
+        self.named
+    }
+
+    /// Capture-group names in source order, the empty string for an unnamed
+    /// group; index `i` names group `i + 1`.
+    #[must_use]
+    pub fn group_names(&self) -> &Arc<[String]> {
+        &self.program.names
     }
 
     /// Search `text` (UTF-16 code units) from code-unit offset `start`, yielding
@@ -324,6 +343,21 @@ impl<U: Unit> Matches<'_, '_, U> {
                 Ok(MatchRecord::new(self.current_slots(), &regex.program.names))
             })
             .transpose()
+    }
+
+    /// Find only the next match and write its group offsets into `out`
+    /// (see [`crate::NO_OFFSET`]), allocating nothing once `out` has room:
+    /// `Ok(false)` on a miss, which leaves `out` unspecified.
+    #[inline]
+    pub fn first_offsets(&mut self, out: &mut Vec<u32>) -> Result<bool, ExecError> {
+        match self.advance() {
+            None => Ok(false),
+            Some(found) => {
+                found?;
+                self.current_slots().write_offsets(out);
+                Ok(true)
+            }
+        }
     }
 
     /// End the search and hand its matcher buffers back for the next one.

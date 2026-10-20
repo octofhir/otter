@@ -2746,10 +2746,12 @@ impl Interpreter {
                         continue;
                     }
                     feedback::OrdinaryCallTarget::Intrinsic(kind) => {
-                        // A method intrinsic specializes `receiver.method(...)`;
-                        // the others, a plain call or construction.
+                        // A method intrinsic specializes `receiver.method(...)`,
+                        // whether the method was loaded by the call itself or
+                        // before it with the receiver kept beside it; the
+                        // others, a plain call or construction.
                         let form_site = if kind.is_method() {
-                            op == Op::CallMethodValue
+                            matches!(op, Op::CallMethodValue | Op::CallWithThis)
                         } else {
                             matches!(op, Op::Call | Op::New)
                         };

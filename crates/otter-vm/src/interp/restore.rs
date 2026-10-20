@@ -275,6 +275,7 @@ impl Interpreter {
             regexp_legacy: crate::regexp_legacy::RegExpLegacyState::default(),
             regex_compile_cache: crate::regexp::RegexCompileCache::default(),
             regex_scratch: std::cell::Cell::default(),
+            regexp_offsets: Vec::new(),
             tracer: None,
             cpu_profiler: None,
         };

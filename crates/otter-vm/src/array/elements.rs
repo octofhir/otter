@@ -355,6 +355,18 @@ impl ElementSlabBody {
         }
     }
 
+    /// Fill a fresh tagged slab's first `values.len()` slots with one copy and
+    /// publish them as its live prefix, all of it dirty.
+    pub(crate) fn init_tagged_prefix(&mut self, values: &[Value]) {
+        self.assert_private();
+        assert!(self.kind == DenseElementKind::Tagged && values.len() <= self.capacity());
+        // SAFETY: `values.len() <= capacity`; tagged data words are `Value`,
+        // and the fresh slab's storage does not overlap the caller's slice.
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), self.values_ptr(), values.len()) };
+        self.mark_dirty_range(0, values.len());
+        self.len = values.len() as u32;
+    }
+
     /// Publish a fully initialized live prefix.
     pub(crate) fn set_len(&mut self, len: usize) {
         self.assert_private();

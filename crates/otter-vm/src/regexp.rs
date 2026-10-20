@@ -595,6 +595,43 @@ impl JsRegExp {
         })
     }
 
+    /// [`Self::find_one`] writing the match's group offsets into `out`.
+    pub(crate) fn find_first_offsets(
+        &self,
+        heap: &otter_gc::GcHeap,
+        text_units: crate::string::CodeUnits<'_>,
+        start: usize,
+        search: &RegexSearch<'_>,
+        out: &mut Vec<u32>,
+    ) -> engine::Execution<bool> {
+        heap.read_payload(self.inner, |body| {
+            engine::find_first_offsets(
+                &body.pattern.regex,
+                text_units,
+                start,
+                body.flags.sticky,
+                search,
+                out,
+            )
+        })
+    }
+
+    /// Whether some capture group of the pattern has a name.
+    pub(crate) fn has_named_groups(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.pattern.regex.has_named_groups())
+    }
+
+    /// The owned record of a match [`Self::find_first_offsets`] found.
+    pub(crate) fn match_record(
+        &self,
+        heap: &otter_gc::GcHeap,
+        offsets: &engine::MatchOffsets,
+    ) -> engine::MatchRecord {
+        heap.read_payload(self.inner, |body| {
+            engine::MatchRecord::from_offsets(&offsets.0, body.pattern.regex.group_names())
+        })
+    }
+
     /// Run the compiled engine from a code-unit offset and collect owned
     /// matches, exploring at most the search's step limit of backtrack
     /// points; the returned work count is charged at the runtime boundary.

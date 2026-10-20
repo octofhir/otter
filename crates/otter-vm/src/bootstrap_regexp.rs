@@ -939,21 +939,31 @@ pub(crate) fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
             let interp = ctx.interp_mut();
             match crate::regexp_fast::exec_direct(interp, receiver, argument, false) {
                 Some(Ok(crate::regexp_fast::DirectExec::Done(value))) => return Ok(value),
-                Some(Ok(crate::regexp_fast::DirectExec::Matched(matched))) => {
-                    match crate::regexp_result::build_match_result_folded(
+                Some(Ok(crate::regexp_fast::DirectExec::Matched(offsets))) => {
+                    let folded = crate::regexp_result::build_match_result_folded(
                         interp,
                         &mut receiver,
                         &mut argument,
-                        &matched,
-                    ) {
-                        Ok(Some(result)) => return Ok(result),
-                        Ok(None) => {}
+                        &offsets,
+                    );
+                    let matched = match folded {
+                        Ok(Some(result)) => {
+                            interp.recycle_match_offsets(offsets);
+                            return Ok(result);
+                        }
+                        Ok(None) => {
+                            let regexp = receiver.as_regexp().expect("exec receiver is a RegExp");
+                            let matched = regexp.match_record(&interp.gc_heap, &offsets);
+                            interp.recycle_match_offsets(offsets);
+                            matched
+                        }
                         Err(error) => {
+                            interp.recycle_match_offsets(offsets);
                             return Err(crate::native_function::vm_to_native_error(
                                 interp, error, "RegExp",
                             ));
                         }
-                    }
+                    };
                     return ctx.scope(|mut scope| {
                         let input = scope.value(argument);
                         let result = crate::regexp_prototype::build_match_result_native(

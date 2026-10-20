@@ -1457,6 +1457,10 @@ pub struct Interpreter {
     /// takes them and puts them back when it ends. See
     /// [`crate::regexp::RegexSearch`].
     regex_scratch: std::cell::Cell<otter_regex::MatchScratch>,
+    /// Group offsets of the last direct `exec`/`test` match, lent to that
+    /// match and handed back, so a hot loop reuses one buffer. See
+    /// [`crate::regexp::engine::MatchOffsets`].
+    regexp_offsets: Vec<u32>,
     /// Optional step-trace observer. When `Some`, the dispatch loop
     /// emits one [`inspect::StepEvent`] per instruction. When `None`,
     /// the hot path pays a single `Option` discriminant check and

@@ -14,6 +14,8 @@
 //! - [`effects`] — abstract heaps each node reads and writes.
 //! - [`dominators`] — immediate dominators of the block graph.
 //! - [`licm`] — loop-invariant checks and loads run once before their loop.
+//! - [`redundancy`] — a value, load or check a dominating equivalent already
+//!   produced over unchanged memory is that node.
 //! - `branch_fold` — truthiness branches test the value under `!` and
 //!   ToBoolean.
 //! - `branch_thread` — branches on a merged boolean take the merged edges
@@ -75,6 +77,7 @@ pub(crate) mod moves;
 mod native_leaf;
 pub(crate) mod phi_repr;
 mod range;
+mod redundancy;
 pub(crate) mod regalloc;
 pub(crate) mod registers;
 pub(crate) mod truncation;
@@ -178,6 +181,7 @@ pub(crate) fn compile(
     range::narrow_checked_arithmetic(&mut built.graph, &built.layout, &zero_insensitive);
     truncation::wrap_truncated_arithmetic(&mut built.graph, &built.layout);
     licm::hoist_invariants(&mut built.graph, &mut built.layout, &built.loop_headers);
+    redundancy::eliminate(&mut built.graph, &built.layout);
     branch_fold::fold_branch_negations(&mut built.graph);
     branch_thread::thread_boolean_phis(&mut built.graph, &mut built.layout);
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);

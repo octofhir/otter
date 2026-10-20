@@ -199,6 +199,17 @@ impl HeapSet {
         self.heaps.iter().any(|&member| member.overlaps(heap))
     }
 
+    /// Whether the set holds nothing.
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.heaps.is_empty()
+    }
+
+    /// The members.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = AbstractHeap> + '_ {
+        self.heaps.iter().copied()
+    }
+
     /// Whether the set holds the whole world.
     #[must_use]
     pub(crate) fn is_world(&self) -> bool {

@@ -8,7 +8,8 @@
 //!
 //! # Contents
 //! - [`Dominators`] — immediate dominators over reverse postorder, computed
-//!   by iterating the intersect-of-predecessors equation to a fixed point.
+//!   by iterating the intersect-of-predecessors equation to a fixed point,
+//!   and each block's immediate dominator.
 //! - [`successors`] — a block's control successors.
 //!
 //! # Invariants
@@ -46,6 +47,8 @@ pub(crate) struct Dominators {
     /// Immediate dominator by reverse-postorder number; the root's is
     /// itself, an entry's is the root.
     idom: Vec<u32>,
+    /// The block of each reverse-postorder number past the root.
+    blocks: Vec<BlockId>,
 }
 
 impl Dominators {
@@ -127,7 +130,31 @@ impl Dominators {
                 }
             }
         }
-        Self { order, idom }
+        let blocks = postorder.iter().rev().copied().collect();
+        Self {
+            order,
+            idom,
+            blocks,
+        }
+    }
+
+    /// Whether an entry reaches `block`.
+    #[must_use]
+    pub(crate) fn reachable(&self, block: BlockId) -> bool {
+        self.order
+            .get(&block)
+            .is_some_and(|&number| self.idom[number as usize] != u32::MAX)
+    }
+
+    /// The immediate dominator of `block`; `None` for an entry and for an
+    /// unreachable block.
+    #[must_use]
+    pub(crate) fn immediate(&self, block: BlockId) -> Option<BlockId> {
+        let number = *self.order.get(&block)?;
+        match self.idom[number as usize] {
+            0 | u32::MAX => None,
+            parent => Some(self.blocks[parent as usize - 1]),
+        }
     }
 
     /// Whether `a` dominates `b`; false when either is unreachable.

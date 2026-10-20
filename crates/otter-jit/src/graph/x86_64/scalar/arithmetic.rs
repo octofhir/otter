@@ -173,6 +173,37 @@ impl Codegen<'_> {
                 self.emit_restore_registers(&live, saved);
                 dynasm!(self.ops ; .arch x64 ; movsd Rx(dst), xmm15);
             }
+            Kind::Float64Math(op) => {
+                let a = Self::fp(self.loc(node).inputs[0]);
+                let dst = Self::fp(self.loc(node).result.unwrap());
+                if op == crate::graph::ir::MathOp::Sqrt {
+                    // IEEE square root is the method: NaN for a negative
+                    // operand, `-0` for `-0`.
+                    dynasm!(self.ops ; .arch x64 ; sqrtsd Rx(dst), Rx(a));
+                } else {
+                    // The shared typed leaf, every live register saved
+                    // around it: it follows the platform ABI.
+                    let live = self.loc(node).live_registers.clone();
+                    let saved = self.emit_save_registers(&live);
+                    if op.arity() == 2 {
+                        let b = Self::fp(self.loc(node).inputs[1]);
+                        dynasm!(self.ops ; .arch x64
+                            ; movsd xmm15, Rx(b) ; movsd xmm0, Rx(a) ; movsd xmm1, xmm15
+                        );
+                    } else {
+                        dynasm!(self.ops ; .arch x64 ; movsd xmm0, Rx(a));
+                    }
+                    let method = op.method().as_u32() as i32;
+                    dynasm!(self.ops ; .arch x64 ; mov edi, method);
+                    self.emit_scalar_vm_leaf(
+                        abi::STUB_MATH_F64_LEAF,
+                        otter_vm::runtime_stubs::MATH_F64_LEAF.entry_addr() as u64,
+                    );
+                    dynasm!(self.ops ; .arch x64 ; movsd xmm15, xmm0);
+                    self.emit_restore_registers(&live, saved);
+                    dynasm!(self.ops ; .arch x64 ; movsd Rx(dst), xmm15);
+                }
+            }
             Kind::Float64Compare(condition) => {
                 let (a, b) = (
                     Self::fp(self.loc(node).inputs[0]),

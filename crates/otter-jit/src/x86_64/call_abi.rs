@@ -47,6 +47,8 @@ impl Platform {
 enum Arguments {
     Words(u8),
     Float64(u8),
+    /// One word and two doubles, prepared in rdi, xmm0 and xmm1.
+    WordFloat64,
 }
 
 /// Call the entry already in r11, using its authoritative fixed signature.
@@ -78,6 +80,7 @@ fn descriptor_arguments(descriptor: RuntimeStubDescriptor) -> Arguments {
         S::AllocValue3 => Arguments::Words(5),
         S::RouteThrow1 => Arguments::Words(2),
         S::Float64Leaf2 => Arguments::Float64(2),
+        S::Float64MathLeaf3 => Arguments::WordFloat64,
         S::Float64ToWordLeaf1 => Arguments::Float64(1),
         S::Variadic => panic!("a variadic C call requires its physical word count"),
         S::JsCall => panic!("a private JavaScript call cannot use the platform C boundary"),
@@ -131,6 +134,10 @@ fn emit_call(
         }
         Arguments::Float64(count) => {
             assert!((1..=2).contains(&count));
+            assert_ne!(result, RuntimeStubResultAbi::NativePair);
+            0
+        }
+        Arguments::WordFloat64 => {
             assert_ne!(result, RuntimeStubResultAbi::NativePair);
             0
         }
@@ -195,6 +202,15 @@ fn emit_call(
             }
             dynasm!(ops ; .arch x64 ; mov rcx, rdi);
         }
+    }
+    if matches!(arguments, Arguments::WordFloat64) {
+        // Microsoft parameters are positional: the word is the first, the
+        // doubles the second and third.
+        dynasm!(ops ; .arch x64
+            ; movsd xmm2, xmm1
+            ; movsd xmm1, xmm0
+            ; mov rcx, rdi
+        );
     }
     dynasm!(ops ; .arch x64 ; call r11);
     let return_offset = ops.offset();
@@ -480,6 +496,10 @@ mod tests {
         left * right
     }
 
+    extern "win64" fn method_combine(method: u32, left: f64, right: f64) -> f64 {
+        f64::from(method) * 1000.0 + left * right
+    }
+
     extern "win64" fn float_bits(value: f64) -> u64 {
         value.to_bits()
     }
@@ -532,6 +552,23 @@ mod tests {
         ] {
             assert_eq!(run(f64::from_bits(bits)), bits);
         }
+        let mut ops = Assembler::new().unwrap();
+        let start = ops.offset();
+        dynasm!(ops ; .arch x64 ; push rbp ; mov rbp, rsp ; mov r11, QWORD method_combine as *const () as usize as i64);
+        emit_call(
+            &mut ops,
+            Platform::Microsoft,
+            Arguments::WordFloat64,
+            RuntimeStubResultAbi::Float64,
+            None,
+        );
+        dynasm!(ops ; .arch x64 ; pop rbp ; ret);
+        let code = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+        // SAFETY: the word arrives in rdi and the doubles in xmm0/xmm1; the
+        // boundary moves them to their Microsoft positions.
+        let run: extern "sysv64" fn(u32, f64, f64) -> f64 =
+            unsafe { std::mem::transmute(code.entry_ptr()) };
+        assert_eq!(run(3, 1.5, -2.0).to_bits(), method_combine(3, 1.5, -2.0).to_bits());
     }
 
     #[test]

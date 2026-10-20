@@ -234,6 +234,10 @@ pub enum RuntimeStubSignature {
     /// The result is in the execution domain: success, a pure JavaScript
     /// throw, or a fatal failure with its error parked in the context.
     JsCall = 17,
+    /// `(method: u32, left: f64, right: f64) -> f64` pure `Math` leaf: the
+    /// method's arithmetic on unboxed doubles, the right operand ignored by
+    /// unary methods.
+    Float64MathLeaf3 = 18,
 }
 
 /// Safepoint requirement encoded in the descriptor.
@@ -1905,6 +1909,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_JIT_REGEXP_EXEC.id => "jit_regexp_exec",
         id if id == STUB_JIT_REGEXP_TEST.id => "jit_regexp_test",
         id if id == STUB_CONTEXT_SLOT_WRITTEN.id => "context_slot_written",
+        id if id == STUB_MATH_F64_LEAF.id => "math_f64_leaf",
         _ => "unknown_runtime_stub",
     }
 }
@@ -2135,6 +2140,18 @@ pub const STUB_CONTEXT_SLOT_WRITTEN: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Probe,
 );
 
+/// Pure unboxed `Math` method arithmetic for typed numeric machine code.
+pub const STUB_MATH_F64_LEAF: RuntimeStubDescriptor = descriptor(
+    118,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::Float64MathLeaf3,
+    3,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::Float64,
+    NativeResultDomain::None,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2254,6 +2271,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_REGEXP_EXEC,
     STUB_JIT_REGEXP_TEST,
     STUB_CONTEXT_SLOT_WRITTEN,
+    STUB_MATH_F64_LEAF,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.
@@ -2332,7 +2350,7 @@ pub const fn validate_stub_descriptor(
             (desc.result_abi, desc.result_domain),
             (RuntimeStubResultAbi::StatusWord, NativeResultDomain::None)
         ),
-        RuntimeStubSignature::Float64Leaf2 => matches!(
+        RuntimeStubSignature::Float64Leaf2 | RuntimeStubSignature::Float64MathLeaf3 => matches!(
             (desc.result_abi, desc.result_domain),
             (RuntimeStubResultAbi::Float64, NativeResultDomain::None)
         ),

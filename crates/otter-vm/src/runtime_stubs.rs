@@ -112,6 +112,41 @@ pub const CONSTRUCTOR_RECEIVER_PROBE: LeafNoAllocStub2 = LeafNoAllocStub2 {
 /// Pure two-argument unboxed binary64 runtime stub ABI.
 pub type Float64LeafStub2Fn = extern "C" fn(f64, f64) -> f64;
 
+/// Pure unboxed `Math` method ABI: the method's `MathMethod` discriminant and
+/// up to two operands.
+pub type Float64MathLeafStubFn = extern "C" fn(u32, f64, f64) -> f64;
+
+/// Callable unboxed `Math` leaf with its shared ABI descriptor.
+#[derive(Clone, Copy)]
+pub struct Float64MathLeafStub {
+    /// Passive descriptor shared with profiler/JIT metadata.
+    pub descriptor: RuntimeStubDescriptor,
+    /// Machine-callable entrypoint: the method in the first integer argument
+    /// register, the operands and result in FP registers.
+    pub entry: Float64MathLeafStubFn,
+}
+
+impl Float64MathLeafStub {
+    /// `true` when descriptor metadata matches this callable ABI shape.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        validate_stub_descriptor(self.descriptor, NO_SAFEPOINT)
+            && self.descriptor.argument_count == 3
+    }
+
+    /// Raw native entry address for generated code.
+    #[must_use]
+    pub fn entry_addr(self) -> usize {
+        self.entry as usize
+    }
+
+    /// Invoke the typed leaf without boxing or a status channel.
+    #[must_use]
+    pub fn invoke(self, method: otter_bytecode::method_id::MathMethod, left: f64, right: f64) -> f64 {
+        (self.entry)(method.as_u32(), left, right)
+    }
+}
+
 /// Callable unboxed binary64 leaf with its shared ABI descriptor.
 #[derive(Clone, Copy)]
 pub struct Float64LeafStub2 {
@@ -791,6 +826,12 @@ pub const NUMBER_POW_F64_LEAF: Float64LeafStub2 = Float64LeafStub2 {
     entry: number_pow_f64_leaf,
 };
 
+/// Callable typed ABI entry for the `Math` methods on unboxed doubles.
+pub const MATH_F64_LEAF: Float64MathLeafStub = Float64MathLeafStub {
+    descriptor: crate::native_abi::STUB_MATH_F64_LEAF,
+    entry: math_f64_leaf,
+};
+
 /// Callable typed ABI entry for ECMAScript ToInt32.
 pub const NUMBER_TO_INT32_F64_LEAF: Float64ToWordLeafStub1 = Float64ToWordLeafStub1 {
     descriptor: STUB_NUMBER_TO_INT32_F64_LEAF,
@@ -1076,6 +1117,15 @@ pub const fn float64_leaf_stub2_by_id(id: RuntimeStubId) -> Option<Float64LeafSt
     }
 }
 
+/// Resolve the pure unboxed `Math` leaf by ABI descriptor id.
+#[must_use]
+pub const fn float64_math_leaf_stub_by_id(id: RuntimeStubId) -> Option<Float64MathLeafStub> {
+    match id {
+        id if id == crate::native_abi::STUB_MATH_F64_LEAF.id => Some(MATH_F64_LEAF),
+        _ => None,
+    }
+}
+
 /// Resolve a pure binary64-to-word leaf by ABI descriptor id.
 #[must_use]
 pub const fn float64_to_word_leaf_stub1_by_id(id: RuntimeStubId) -> Option<Float64ToWordLeafStub1> {
@@ -1115,6 +1165,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
 pub(crate) fn is_vm_owned_runtime_stub(id: RuntimeStubId) -> bool {
     leaf_no_alloc_stub2_by_id(id).is_some()
         || float64_leaf_stub2_by_id(id).is_some()
+        || float64_math_leaf_stub_by_id(id).is_some()
         || float64_to_word_leaf_stub1_by_id(id).is_some()
         || mutating_leaf_stub2_by_id(id).is_some()
         || mutating_leaf_stub3_by_id(id).is_some()
@@ -1744,6 +1795,22 @@ pub extern "C" fn number_rem_f64_leaf(left: f64, right: f64) -> f64 {
 
 /// Pure unboxed ECMAScript Number exponentiation for typed machine code.
 #[must_use]
+/// `Math.<method>(left, right)` on doubles, as the native computes it; a
+/// unary method reads `left` only. A discriminant that names no method, or
+/// `Math.random` (not a pure function), answers NaN: generated code never
+/// passes either.
+pub extern "C" fn math_f64_leaf(method: u32, left: f64, right: f64) -> f64 {
+    use otter_bytecode::method_id::MathMethod;
+    match MathMethod::from_u32(method) {
+        Some(MathMethod::Random) | None => f64::NAN,
+        Some(method @ (MathMethod::Atan2 | MathMethod::Pow | MathMethod::Max
+            | MathMethod::Min | MathMethod::Hypot | MathMethod::Imul)) => {
+            crate::math::apply_f64(method, &[left, right])
+        }
+        Some(method) => crate::math::apply_f64(method, &[left]),
+    }
+}
+
 pub extern "C" fn number_pow_f64_leaf(base: f64, exponent: f64) -> f64 {
     crate::number::pow(
         crate::NumberValue::Double(base),
@@ -3327,6 +3394,17 @@ mod tests {
         );
         assert_eq!(NUMBER_POW_F64_LEAF.invoke(f64::NAN, 0.0), 1.0);
         assert!(NUMBER_POW_F64_LEAF.invoke(-1.0, f64::INFINITY).is_nan());
+        assert!(MATH_F64_LEAF.is_valid());
+        {
+            use otter_bytecode::method_id::MathMethod as M;
+            assert_eq!(MATH_F64_LEAF.invoke(M::Cos, 0.0, f64::NAN), 1.0);
+            assert_eq!(MATH_F64_LEAF.invoke(M::Atan2, 0.0, -1.0), std::f64::consts::PI);
+            assert_eq!(MATH_F64_LEAF.invoke(M::Pow, f64::NAN, 0.0), 1.0);
+            assert_eq!(MATH_F64_LEAF.invoke(M::Round, -2.5, f64::NAN), -2.0);
+            assert!(MATH_F64_LEAF.invoke(M::Round, -0.4, f64::NAN).is_sign_negative());
+            assert!(MATH_F64_LEAF.invoke(M::Max, f64::NAN, 1.0).is_nan());
+            assert!(MATH_F64_LEAF.invoke(M::Random, 0.0, 0.0).is_nan());
+        }
         assert_eq!(NUMBER_TO_INT32_F64_LEAF.invoke(f64::NAN), 0);
         assert_eq!(NUMBER_TO_INT32_F64_LEAF.invoke(f64::INFINITY), 0);
         assert_eq!(NUMBER_TO_INT32_F64_LEAF.invoke(-1.9), u64::from(u32::MAX));
@@ -4140,6 +4218,12 @@ mod tests {
                         assert!(
                             float64_to_word_leaf_stub1_by_id(descriptor.id)
                                 .is_some_and(Float64ToWordLeafStub1::is_valid)
+                        );
+                    }
+                    crate::native_abi::RuntimeStubSignature::Float64MathLeaf3 => {
+                        assert!(
+                            float64_math_leaf_stub_by_id(descriptor.id)
+                                .is_some_and(Float64MathLeafStub::is_valid)
                         );
                     }
                     crate::native_abi::RuntimeStubSignature::MutatingLeafValue2 => {

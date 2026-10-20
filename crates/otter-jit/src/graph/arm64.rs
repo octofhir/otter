@@ -76,7 +76,7 @@ use super::builder::Built;
 use super::call::{CommittedArgument, IntrinsicMethod};
 use super::emission::{Emission, ExitSite};
 use super::frame::{SlotLayout, exit_reason};
-use super::ir::{BlockId, BranchKind, Condition, DeoptReason, Graph, Kind, NodeId, Repr};
+use super::ir::{BlockId, BranchKind, Condition, DeoptReason, Graph, Kind, MathOp, NodeId, Repr};
 use super::metadata::{self, FIRST_SITE_SAFEPOINT};
 use super::regalloc::{Allocation, Location, Move};
 use crate::Unsupported;
@@ -539,6 +539,54 @@ impl<'a> Codegen<'a> {
 
     /// The int32 constant at `location`, if it is one.
     /// The value of `node`'s input `index` when it is an int32 constant.
+    /// `w16` = `W(dividend)` / `divisor` truncated toward zero
+    /// (`super::division`): shifts for a power-of-two magnitude, otherwise
+    /// its magic number, negated for a negative divisor. Clobbers `x17`. The
+    /// divisor is neither `0` nor `±1`.
+    fn emit_constant_quotient(&mut self, dividend: u8, divisor: i32) {
+        let (form, negate) = super::division::quotient_by(divisor);
+        match form {
+            super::division::Quotient::Shift(k) if k > 1 => {
+                let round = 32 - k;
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; asr w17, W(dividend), #31
+                    ; add w16, W(dividend), w17, lsr round
+                    ; asr w16, w16, k
+                );
+            }
+            super::division::Quotient::Shift(_) => {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; add w16, W(dividend), W(dividend), lsr #31
+                    ; asr w16, w16, #1
+                );
+            }
+            super::division::Quotient::Magic {
+                multiplier,
+                add,
+                shift,
+            } => {
+                self.load_immediate(17, u64::from(multiplier as u32));
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; smull x16, W(dividend), w17
+                    ; asr x16, x16, #32
+                );
+                if add {
+                    dynasm!(self.ops ; .arch aarch64 ; add w16, w16, W(dividend));
+                }
+                if shift != 0 {
+                    dynasm!(self.ops ; .arch aarch64 ; asr w16, w16, shift);
+                }
+                dynasm!(self.ops ; .arch aarch64 ; add w16, w16, W(dividend), lsr #31);
+            }
+        }
+        if negate {
+            dynasm!(self.ops ; .arch aarch64 ; neg w16, w16);
+        }
+    }
+
     fn input_int32_constant(&self, node: NodeId, index: usize) -> Option<i32> {
         match self.graph.node(self.graph.node(node).inputs[index]).kind {
             Kind::ConstInt32(value) => Some(value),
@@ -1169,6 +1217,33 @@ impl<'a> Codegen<'a> {
                     dynasm!(self.ops ; .arch aarch64 ; mov W(destination), w16);
                 }
             }
+            Kind::Int32Div
+                if self
+                    .input_int32_constant(node, 1)
+                    .is_some_and(|divisor| !matches!(divisor, -1..=1)) =>
+            {
+                // A constant divisor other than 0 and ±1: the quotient by
+                // shifts or a multiply-high, exact only when the remainder
+                // is zero; it never overflows.
+                let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::gp(result.expect("a result"));
+                let divisor = self
+                    .input_int32_constant(node, 1)
+                    .expect("a constant divisor");
+                let exit = self.eager_exit(node, DeoptReason::LostPrecision);
+                if divisor < 0 {
+                    // 0 / negative is -0.
+                    let minus_zero = self.eager_exit(node, DeoptReason::MinusZero);
+                    dynasm!(self.ops ; .arch aarch64 ; cbz W(a), =>minus_zero);
+                }
+                self.emit_constant_quotient(a, divisor);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; msub w17, w16, W(b), W(a)
+                    ; cbnz w17, =>exit
+                    ; mov W(destination), w16
+                );
+            }
             Kind::Int32Div => {
                 let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
                 let destination = Self::gp(result.expect("a result"));
@@ -1197,6 +1272,50 @@ impl<'a> Codegen<'a> {
                     ; msub w17, w16, W(b), W(a)
                     ; cmp w17, #0
                     ; b.ne =>exit
+                    ; mov W(destination), w16
+                );
+            }
+            Kind::Int32Mod
+                if self
+                    .input_int32_constant(node, 1)
+                    .is_some_and(|divisor| divisor != 0) =>
+            {
+                // A nonzero constant divisor: no divide. `n % ±2^k` keeps the
+                // low bits of `|n|` with the sign of `n`; any other divisor
+                // subtracts the multiple of the quotient by its magnitude.
+                let a = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let divisor = self
+                    .input_int32_constant(node, 1)
+                    .expect("a constant divisor");
+                let minus_zero = self.eager_exit(node, DeoptReason::MinusZero);
+                let done = self.ops.new_dynamic_label();
+                let magnitude = divisor.unsigned_abs();
+                if magnitude == 1 {
+                    dynasm!(self.ops ; .arch aarch64 ; mov w16, wzr);
+                } else if magnitude.is_power_of_two() {
+                    let mask = magnitude - 1;
+                    dynasm!(self.ops
+                        ; .arch aarch64
+                        ; and w16, W(a), mask
+                        ; neg w17, W(a)
+                        ; and w17, w17, mask
+                        ; neg w17, w17
+                        ; cmp WSP(a), #0
+                        ; csel w16, w16, w17, ge
+                    );
+                } else {
+                    self.emit_constant_quotient(a, magnitude as i32);
+                    self.load_immediate(17, u64::from(magnitude));
+                    dynasm!(self.ops ; .arch aarch64 ; msub w16, w16, w17, W(a));
+                }
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cbnz w16, =>done
+                    // A zero remainder of a negative dividend is -0.
+                    ; cmp WSP(a), #0
+                    ; b.lt =>minus_zero
+                    ; =>done
                     ; mov W(destination), w16
                 );
             }
@@ -1392,6 +1511,62 @@ impl<'a> Codegen<'a> {
                 let a = Self::fp(input(0));
                 let destination = Self::fp(result.expect("a result"));
                 dynasm!(self.ops ; .arch aarch64 ; fneg D(destination), D(a));
+            }
+            Kind::Float64Math(op) => {
+                let op = *op;
+                let a = Self::fp(input(0));
+                let destination = Self::fp(result.expect("a result"));
+                // The instructions round and select exactly as the `Math`
+                // methods do: NaN in gives NaN out, `-0` keeps its sign, and
+                // `fmin`/`fmax` order `-0` below `+0`.
+                match op {
+                    MathOp::Abs => dynasm!(self.ops ; .arch aarch64 ; fabs D(destination), D(a)),
+                    MathOp::Sqrt => dynasm!(self.ops ; .arch aarch64 ; fsqrt D(destination), D(a)),
+                    MathOp::Floor => {
+                        dynasm!(self.ops ; .arch aarch64 ; frintm D(destination), D(a))
+                    }
+                    MathOp::Ceil => dynasm!(self.ops ; .arch aarch64 ; frintp D(destination), D(a)),
+                    MathOp::Trunc => {
+                        dynasm!(self.ops ; .arch aarch64 ; frintz D(destination), D(a))
+                    }
+                    MathOp::Min => {
+                        let b = Self::fp(input(1));
+                        dynasm!(self.ops ; .arch aarch64 ; fmin D(destination), D(a), D(b));
+                    }
+                    MathOp::Max => {
+                        let b = Self::fp(input(1));
+                        dynasm!(self.ops ; .arch aarch64 ; fmax D(destination), D(a), D(b));
+                    }
+                    _ => {
+                        // The shared typed leaf, every live register saved
+                        // around it: it follows the platform ABI.
+                        let live = self.allocation.node(node).live_registers.clone();
+                        let saved = self.emit_save_registers(&live);
+                        if op.arity() == 2 {
+                            let b = Self::fp(input(1));
+                            dynasm!(self.ops
+                                ; .arch aarch64
+                                ; fmov d31, D(b)
+                                ; fmov d0, D(a)
+                                ; fmov d1, d31
+                            );
+                        } else {
+                            dynasm!(self.ops ; .arch aarch64 ; fmov d0, D(a));
+                        }
+                        let method = op.method().as_u32();
+                        dynasm!(self.ops ; .arch aarch64 ; movz w0, method);
+                        emit_load_symbol_u64(
+                            &mut self.ops,
+                            &mut self.relocations,
+                            16,
+                            otter_vm::runtime_stubs::MATH_F64_LEAF.entry_addr() as u64,
+                            RelocationTarget::runtime_stub(abi::STUB_MATH_F64_LEAF),
+                        );
+                        dynasm!(self.ops ; .arch aarch64 ; blr x16 ; fmov d31, d0);
+                        self.emit_restore_registers(&live, saved);
+                        dynasm!(self.ops ; .arch aarch64 ; fmov D(destination), d31);
+                    }
+                }
             }
             Kind::Float64Compare(condition) => {
                 let (a, b) = (Self::fp(input(0)), Self::fp(input(1)));
@@ -5267,6 +5442,16 @@ impl<'a> Codegen<'a> {
                         let a = Self::gp(allocation.inputs[0]);
                         self.load_immediate(16, u64::from(constant));
                         dynasm!(self.ops ; .arch aarch64 ; cmp X(a), x16 ; b.eq =>true_target);
+                    }
+                    // Every mismatch leaves for the false successor.
+                    BranchKind::Native(native_ref) => {
+                        let a = Self::gp(allocation.inputs[0]);
+                        let false_target = self.cond_target(false_label);
+                        self.emit_native_identity(a, native_ref, false_target);
+                        if next != Some(if_true) {
+                            dynasm!(self.ops ; .arch aarch64 ; b =>true_label);
+                        }
+                        return Ok(());
                     }
                     BranchKind::Nullish => {
                         let a = Self::gp(allocation.inputs[0]);

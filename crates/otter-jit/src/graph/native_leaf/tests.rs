@@ -156,60 +156,85 @@ fn char_code_at_reads_its_unit_inline_from_the_evaluated_operands() {
 }
 
 #[test]
-fn builder_preserves_evaluated_receiver_operands_and_exact_eager_call_pc() {
-    for (id, argc, receiver) in [
-        (abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 1, true),
-        (abi::STUB_MATH_MAX_LEAF.id, 2, false),
-        (abi::STUB_MATH_ABS_LEAF.id, 1, false),
+fn math_leaves_are_float64_arithmetic_on_the_evaluated_operands() {
+    for (id, argc, op) in [
+        (abi::STUB_MATH_MAX_LEAF.id, 2, crate::graph::ir::MathOp::Max),
+        (abi::STUB_MATH_ABS_LEAF.id, 1, crate::graph::ir::MathOp::Abs),
     ] {
         let view = call(id, argc);
         let built = build(&view);
         let graph = &built.graph;
-        let leaf = graph
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node.kind, Kind::NativeLeaf(_) | Kind::Generic { .. }))
+        );
+        let math = graph
             .nodes
             .iter()
-            .find(|node| matches!(node.kind, Kind::NativeLeaf(_)))
-            .unwrap();
-        assert_eq!(leaf.inputs.len(), 2);
-        assert_eq!(
-            graph.node(leaf.inputs[0]).kind,
-            Kind::InitialRegister(if receiver { 1 } else { 2 })
-        );
-        if receiver || argc == 2 {
-            assert_eq!(graph.node(leaf.inputs[1]).kind, Kind::InitialRegister(2));
-        } else {
-            assert!(matches!(
-                graph.node(leaf.inputs[1]).kind,
-                Kind::ConstTagged(_)
-            ));
+            .find(|node| node.kind == Kind::Float64Math(op))
+            .expect("the method as float64 arithmetic");
+        assert_eq!(math.inputs.len(), usize::from(argc));
+        for &input in &math.inputs {
+            let unboxed = graph.node(input);
+            assert_eq!(unboxed.kind, Kind::CheckedTaggedToFloat64);
+            assert_eq!(graph.node(unboxed.inputs[0]).kind, Kind::InitialRegister(2));
+            // An operand that is not a Number leaves before the call.
+            let state = graph.frame_state(unboxed.eager.unwrap());
+            assert_eq!(
+                (state.function_id, state.pc, state.byte_pc),
+                (701, 0, view.instructions[0].byte_pc)
+            );
         }
-        let state = graph.frame_state(leaf.eager.unwrap());
-        assert_eq!(
-            (state.function_id, state.pc, state.byte_pc),
-            (701, 0, view.instructions[0].byte_pc)
-        );
-        assert!(leaf.lazy.is_none());
-        let properties = leaf.kind.properties();
-        assert!(properties.call && properties.eager_deopt && properties.effectful);
-        assert!(
-            !properties.may_collect
-                && !properties.writes
-                && !properties.can_throw
-                && !properties.lazy_deopt
-        );
         assert!(
             graph
                 .nodes
                 .iter()
                 .any(|node| matches!(node.kind, Kind::CheckNative(73)))
         );
-        assert!(
-            !graph
-                .nodes
-                .iter()
-                .any(|node| matches!(node.kind, Kind::Generic { .. } | Kind::CallJs { .. }))
-        );
     }
+}
+
+#[test]
+fn builder_preserves_evaluated_receiver_operands_and_exact_eager_call_pc() {
+    let view = call(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 1);
+    let built = build(&view);
+    let graph = &built.graph;
+    let leaf = graph
+        .nodes
+        .iter()
+        .find(|node| matches!(node.kind, Kind::NativeLeaf(_)))
+        .unwrap();
+    assert_eq!(leaf.inputs.len(), 2);
+    assert_eq!(graph.node(leaf.inputs[0]).kind, Kind::InitialRegister(1));
+    assert_eq!(graph.node(leaf.inputs[1]).kind, Kind::InitialRegister(2));
+    let state = graph.frame_state(leaf.eager.unwrap());
+    assert_eq!(
+        (state.function_id, state.pc, state.byte_pc),
+        (701, 0, view.instructions[0].byte_pc)
+    );
+    assert!(leaf.lazy.is_none());
+    let properties = leaf.kind.properties();
+    assert!(properties.call && properties.eager_deopt && properties.effectful);
+    assert!(
+        !properties.may_collect
+            && !properties.writes
+            && !properties.can_throw
+            && !properties.lazy_deopt
+    );
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, Kind::CheckNative(73)))
+    );
+    assert!(
+        !graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, Kind::Generic { .. } | Kind::CallJs { .. }))
+    );
     for view in [
         call(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 0),
         call(abi::STUB_COLLECTION_MAP_SET_MUTATING.id, 2),

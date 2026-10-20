@@ -2657,6 +2657,40 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Whether `value` is always `true` or `false`: a boolean constant, a
+    /// node that produces one, or a merge of such values. A loop header's
+    /// phi may still gain inputs, so it proves nothing.
+    fn is_boolean(&self, value: NodeId) -> bool {
+        let mut pending: SmallVec<[NodeId; 8]> = SmallVec::new();
+        let mut seen: SmallVec<[NodeId; 8]> = SmallVec::new();
+        pending.push(value);
+        while let Some(value) = pending.pop() {
+            if seen.contains(&value) {
+                continue;
+            }
+            if seen.len() == seen.inline_size() {
+                return false;
+            }
+            seen.push(value);
+            let node = self.graph.node(value);
+            match node.kind {
+                Kind::ConstTagged(bits) if bits == tag::VALUE_TRUE || bits == tag::VALUE_FALSE => {}
+                Kind::Phi => {
+                    let Some(block) = node.block else {
+                        return false;
+                    };
+                    if self.graph.block(block).is_loop {
+                        return false;
+                    }
+                    pending.extend(node.inputs.iter().copied());
+                }
+                ref kind if kind.produces_boolean() => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+
     /// Whether `value` is proved to be a Number on this path.
     fn is_number(&self, value: NodeId) -> bool {
         let node = self.graph.node(value);
@@ -2750,6 +2784,12 @@ impl<'a> Builder<'a> {
                 let other = self.tagged(other);
                 let value = self.field_nullish_equal(other, instruction.op == Op::LooseNotEqual);
                 self.write(instruction.writes[0], value);
+                return;
+            }
+            // Two booleans compare loosely as they compare strictly: no
+            // operand converts, and nothing can run JavaScript.
+            if self.is_boolean(lhs) && self.is_boolean(rhs) {
+                self.visit_strict_equal(instruction, lhs, rhs, condition);
                 return;
             }
         }
@@ -4197,6 +4237,23 @@ impl<'a> Builder<'a> {
             &[callee],
             Repr::None,
         );
+        // A `Math` method of Numbers is the float64 arithmetic itself: no
+        // box, no leaf frame, one instruction where the target has it. An
+        // operand not proved a Number is checked once; after such a check
+        // failed, the recompile calls the leaf.
+        if let Some(op) = super::ir::MathOp::of_leaf(target.leaf_stub_id)
+            && arguments.len() == op.arity()
+            && (!self.exited_for(ExitReason::TypeMismatch)
+                || arguments.iter().all(|&argument| self.is_number(argument)))
+        {
+            let mut inputs: SmallVec<[NodeId; 2]> = SmallVec::new();
+            for &argument in arguments {
+                inputs.push(self.float64(argument));
+            }
+            let result = self.add(Kind::Float64Math(op), &inputs, Repr::Float64);
+            self.write(instruction.writes[0], result);
+            return;
+        }
         // `String.prototype.charCodeAt` of a flat string at an index within
         // it reads the code unit inline; anything else leaves, and the
         // recompile after such an exit calls the leaf.
@@ -4267,8 +4324,42 @@ impl<'a> Builder<'a> {
                 .property_accesses
                 .get(&byte_pc)
                 .is_some_and(|site| site.shared);
-        // A native leaf method is entered by the baseline operation without
-        // a frame.
+        // A `Math` method the site saw, read like a named load: when the
+        // method read is that native, its arithmetic runs on float64
+        // operands, so an inlined body stays inlined. Once an operand was not
+        // a Number here, the baseline operation takes the call, as it does
+        // for every other leaf method, whose misses it commits.
+        if lookup
+            && fold.is_none()
+            && method.is_none()
+            && polymorphic.is_none()
+            && !self.view.guarded_method_calls.contains_key(&byte_pc)
+            && !self.exited_for(ExitReason::TypeMismatch)
+            && let Some((target, _)) = self.admitted_native_leaf(instruction, arguments.len())
+            && let Some(op) = super::ir::MathOp::of_leaf(target.leaf_stub_id)
+            && arguments.len() == op.arity()
+        {
+            let receiver = self.read(receiver);
+            let receiver = self.tagged(receiver);
+            let arguments: SmallVec<[NodeId; 8]> = arguments
+                .iter()
+                .map(|&register| {
+                    let value = self.read(register);
+                    self.tagged(value)
+                })
+                .collect();
+            let callee = self.named_lookup(byte_pc, receiver);
+            return self.emit_math_method_call(
+                instruction,
+                op,
+                target.builtin_native_ref,
+                callee,
+                receiver,
+                &arguments,
+            );
+        }
+        // Any other native leaf method is entered by the baseline operation
+        // without a frame.
         if (fold.is_none() && method.is_none() && polymorphic.is_none() && !lookup)
             || self
                 .view
@@ -4340,6 +4431,93 @@ impl<'a> Builder<'a> {
         }
         let callee = self.named_lookup(byte_pc, receiver);
         self.emit_call_with_receiver(instruction, callee, receiver, &arguments, None);
+    }
+
+    /// A `Math` method call whose method was read like a named load. When
+    /// the method read is the site's native, its arithmetic runs on float64
+    /// operands; any other method read is called like any method, so a
+    /// replaced method neither leaves optimized code nor abandons an inlined
+    /// body. The arms meet with the call's result in its register.
+    fn emit_math_method_call(
+        &mut self,
+        instruction: &Instruction,
+        op: super::ir::MathOp,
+        native_ref: u32,
+        callee: NodeId,
+        receiver: NodeId,
+        arguments: &[NodeId],
+    ) {
+        let Some(current) = self.current else {
+            return;
+        };
+        let destination = instruction.writes[0];
+        let before = self.frame[usize::from(destination)];
+        let owner = self.current_slot;
+        let entry_known = self.known.clone();
+        let native = self.graph.new_block();
+        let other = self.graph.new_block();
+        let join = self.graph.new_block();
+        self.terminate(
+            Kind::Branch {
+                kind: BranchKind::Native(native_ref),
+                if_true: native,
+                if_false: other,
+            },
+            &[callee],
+        );
+        self.graph.block_mut(native).predecessors.push(current);
+        self.graph.block_mut(other).predecessors.push(current);
+        let mut arms: SmallVec<[(BlockId, NodeId, Known); 2]> = SmallVec::new();
+        let finish_arm =
+            |builder: &mut Self, arms: &mut SmallVec<[(BlockId, NodeId, Known); 2]>| {
+                if let Some(end) = builder.current {
+                    let value = builder.frame[usize::from(destination)];
+                    arms.push((end, value, builder.known.clone()));
+                    builder.terminate(Kind::Jump(join), &[]);
+                }
+            };
+        self.trailing[owner].push(native);
+        self.current = Some(native);
+        let mut inputs: SmallVec<[NodeId; 2]> = SmallVec::new();
+        for &argument in arguments {
+            inputs.push(self.float64(argument));
+        }
+        let result = self.add(Kind::Float64Math(op), &inputs, Repr::Float64);
+        self.write(destination, result);
+        finish_arm(self, &mut arms);
+        self.trailing[owner].push(other);
+        self.current = Some(other);
+        self.known = entry_known;
+        self.frame[usize::from(destination)] = before;
+        self.emit_receiver_call(
+            instruction,
+            callee,
+            receiver,
+            arguments,
+            None,
+            Some(destination),
+        );
+        finish_arm(self, &mut arms);
+        if arms.is_empty() {
+            // Both arms left: nothing reaches the join.
+            return;
+        }
+        self.trailing[owner].push(join);
+        self.graph.block_mut(join).predecessors = arms.iter().map(|&(block, _, _)| block).collect();
+        let mut known = arms[0].2.clone();
+        for (_, _, edge) in &arms[1..] {
+            known.intersect(edge);
+        }
+        self.current = Some(join);
+        let inputs: SmallVec<[NodeId; 4]> = arms
+            .iter_mut()
+            .map(|(block, value, edge)| self.tagged_at_end(*block, *value, edge))
+            .collect();
+        let phi = self.graph.add_node(Kind::Phi, &inputs, Repr::Tagged);
+        self.graph.node_mut(phi).block = Some(join);
+        self.graph.block_mut(join).phis.push(phi);
+        self.known = known;
+        self.write(destination, phi);
     }
 
     /// A method call whose receivers had several observed shapes: the

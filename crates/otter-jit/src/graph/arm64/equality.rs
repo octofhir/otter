@@ -164,6 +164,19 @@ impl Codegen<'_> {
             ; cmp x17, NULLISH
             ; b.eq =>b_nullish
         );
+        // Two booleans that are not the same word differ.
+        let not_both_booleans = self.ops.new_dynamic_label();
+        self.load_immediate(16, otter_vm::value::tag::VALUE_TRUE);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; orr x17, X(a), 1
+            ; cmp x17, x16
+            ; b.ne =>not_both_booleans
+            ; orr x17, X(b), 1
+            ; cmp x17, x16
+            ; b.eq =>outcomes.differ
+            ; =>not_both_booleans
+        );
         // A boolean or function-id immediate converts or compares against
         // a converted cell: the runtime decides.
         dynasm!(self.ops

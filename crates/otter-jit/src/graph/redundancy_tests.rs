@@ -7,6 +7,7 @@
 //!   that writes another field does not.
 //! - Frame states and phis read the surviving node.
 //! - A site-relative read of one inlined body never stands for another's.
+//! - A field store answers the same object's later reads of that field.
 //!
 //! # Invariants
 //! The graphs are built by hand in the pass's input form: placed blocks,
@@ -193,4 +194,38 @@ fn a_site_of_one_inlined_body_never_stands_for_another_bodys() {
     let layout = b.blocks.clone();
     assert_eq!(eliminate(&mut b.graph, &layout), 1);
     assert_eq!(b.body(0), [first, second]);
+}
+
+#[test]
+fn a_field_store_answers_the_next_reads_of_the_same_field() {
+    let mut b = Builder::new(2);
+    let object = b.node(0, Kind::InitialRegister(0), &[], Repr::Tagged);
+    let other = b.node(0, Kind::InitialRegister(1), &[], Repr::Tagged);
+    let int = b.node(0, Kind::CheckedTaggedToInt32, &[other], Repr::Int32);
+    let tagged = b.node(0, Kind::Int32ToTagged, &[int], Repr::Tagged);
+    b.node(0, field_store(7), &[object, tagged], Repr::None);
+    b.jump(0, 1);
+    let read_tagged = b.node(1, field_load(7), &[object], Repr::Tagged);
+    let read_int = b.node(1, field_load(7), &[object], Repr::Int32);
+    let elsewhere = b.node(1, field_load(7), &[other], Repr::Tagged);
+    b.control(1, Kind::Return, &[read_tagged]);
+    b.predecessors(1, &[0]);
+    let state = b.graph.add_frame_state(FrameState {
+        pc: 0,
+        byte_pc: 0,
+        function_id: 0,
+        register_count: 2,
+        registers: vec![(0, read_int), (1, elsewhere)],
+        caller: None,
+    });
+    let layout = b.blocks.clone();
+    assert_eq!(eliminate(&mut b.graph, &layout), 2);
+    assert_eq!(b.body(1), [elsewhere], "another object's field still loads");
+    let control = b.graph.block(b.blocks[1]).control.unwrap();
+    assert_eq!(b.graph.node(control).inputs.as_slice(), [tagged]);
+    assert_eq!(
+        b.graph.frame_state(state).registers,
+        vec![(0, int), (1, elsewhere)],
+        "an int32 read takes the int32 the store tagged"
+    );
 }

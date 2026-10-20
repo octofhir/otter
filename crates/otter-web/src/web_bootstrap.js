@@ -228,8 +228,12 @@
   // ---- EventTarget (DOM § EventTarget) ----
   // Node's `events` module reads listener bookkeeping off this map
   // (`getEventListeners`, `listenerCount`), so the registry keeps Node's
-  // shape: type -> root `{ size, next }` heading a chain of handlers.
+  // shape: type -> root `{ size, next }` heading a chain of handlers. The
+  // listener limit `getMaxListeners`/`setMaxListeners` read and write is a
+  // per-target slot too, starting at Node's default of ten.
   const kListeners = Symbol.for('otter.EventTarget.events');
+  const kMaxListeners = Symbol.for('otter.EventTarget.maxListeners');
+  const kMaxListenersWarned = Symbol.for('otter.EventTarget.maxListenersWarned');
 
   function normalizeOptions(options) {
     if (typeof options === 'boolean') return { capture: options, once: false, passive: false };
@@ -245,6 +249,8 @@
         writable: false,
         configurable: false,
       });
+      this[kMaxListeners] = 10;
+      this[kMaxListenersWarned] = false;
     }
 
     addEventListener(type, listener, options) {
@@ -598,6 +604,9 @@
         throw new TypeError('Illegal constructor');
       }
       super();
+      // A signal is shared by every operation it cancels: Node lets it
+      // gather any number of listeners.
+      this[kMaxListeners] = 0;
       this[kAborted] = false;
       this[kReason] = undefined;
       this[kOnabort] = null;

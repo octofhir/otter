@@ -24,17 +24,19 @@ oxc_resolver = { workspace = true }
 dirs = { workspace = true }
 json5 = { workspace = true }
 jsonc-parser = { workspace = true }
-reqwest = { workspace = true }
+otter-http-client = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 toml = { workspace = true }
 smallvec = { workspace = true }
-sysinfo = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 url = "2"
 xxhash-rust = { workspace = true }
+
+[target.'cfg(not(unix))'.dependencies]
+sysinfo = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

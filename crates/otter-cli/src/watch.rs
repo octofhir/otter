@@ -28,8 +28,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use clap::Args;
-use notify::RecursiveMode;
-use notify_debouncer_full::new_debouncer;
+use notify::{RecursiveMode, Watcher as _};
 
 use crate::OtterError;
 
@@ -63,25 +62,31 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<ExitCode, OtterError> {
     let executable =
         std::env::current_exe().map_err(|err| crate::pm_config_error(err.to_string()))?;
 
-    let (sender, receiver) = mpsc::channel();
-    let mut debouncer = new_debouncer(DEBOUNCE, None, move |result| {
-        // A watcher error is not worth stopping a development loop over; the
-        // next event still arrives, and a missed one costs one manual restart.
-        if let Ok(events) = result {
-            let _ = sender.send(events);
-        }
-    })
+    let (sender, receiver) = mpsc::channel::<notify::Event>();
+    let mut watcher = otter_node::PlatformWatcher::new(
+        move |result: notify::Result<notify::Event>| {
+            // A watcher error is not worth stopping a development loop over;
+            // the next event still arrives, and a missed one costs one manual
+            // restart.
+            if let Ok(event) = result {
+                let _ = sender.send(event);
+            }
+        },
+        notify::Config::default(),
+    )
     .map_err(|err| crate::pm_config_error(err.to_string()))?;
-    debouncer
+    watcher
         .watch(&root, RecursiveMode::Recursive)
         .map_err(|err| crate::pm_config_error(err.to_string()))?;
 
     let mut child = spawn_target(&executable, &args)?;
-    while let Ok(events) = receiver.recv() {
-        let changed = events
-            .iter()
-            .flat_map(|event| event.paths.iter())
-            .any(|path| is_watched_path(&root, path));
+    while let Ok(first) = receiver.recv() {
+        // The burst ends once no event follows the last one within the
+        // debounce window.
+        let mut changed = touches_source(&root, &first);
+        while let Ok(event) = receiver.recv_timeout(DEBOUNCE) {
+            changed |= touches_source(&root, &event);
+        }
         if !changed {
             continue;
         }
@@ -105,6 +110,10 @@ fn spawn_target(executable: &Path, args: &WatchArgs) -> Result<Child, OtterError
 fn terminate(child: &mut Child) {
     let _ = child.kill();
     let _ = child.wait();
+}
+
+fn touches_source(root: &Path, event: &notify::Event) -> bool {
+    event.paths.iter().any(|path| is_watched_path(root, path))
 }
 
 /// `true` when a changed path is one an edit of the project's own sources

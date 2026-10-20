@@ -194,27 +194,29 @@ fn start_watch(
 
     // Watching a file reports that one name; watching a directory reports
     // names relative to it, which is the path the notification carries with
-    // the watched directory cut off the front.
+    // the watched directory cut off the front. The host reports resolved
+    // paths (`/tmp` is `/private/tmp` on macOS), so the front is cut in its
+    // resolved spelling.
     let root = if metadata.is_dir() {
-        Some(path.clone())
+        Some(std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone()))
     } else {
         None
     };
     let id = next_id.fetch_add(1, Ordering::Relaxed);
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Notification>();
 
-    let mut watcher =
-        match notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
-            let Ok(event) = event else { return };
-            for notification in notifications(id, &event, root.as_deref()) {
-                // The receiver is dropped when the watch is closed; nothing
-                // is left to deliver then.
-                let _ = sender.send(notification);
-            }
-        }) {
-            Ok(watcher) => watcher,
-            Err(_) => return Ok(RuntimeValue::number_f64(UV_ENOENT)),
-        };
+    let handler = move |event: Result<notify::Event, notify::Error>| {
+        let Ok(event) = event else { return };
+        for notification in notifications(id, &event, root.as_deref()) {
+            // The receiver is dropped when the watch is closed; nothing is
+            // left to deliver then.
+            let _ = sender.send(notification);
+        }
+    };
+    let mut watcher = match crate::PlatformWatcher::new(handler, notify::Config::default()) {
+        Ok(watcher) => watcher,
+        Err(_) => return Ok(RuntimeValue::number_f64(UV_ENOENT)),
+    };
     let mode = if recursive {
         RecursiveMode::Recursive
     } else {
@@ -271,13 +273,14 @@ fn notifications(id: u32, event: &notify::Event, root: Option<&Path>) -> Vec<Not
         .paths
         .iter()
         .map(|path| {
-            let name = match root {
-                Some(root) => path
-                    .strip_prefix(root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .into_owned(),
-                None => path
+            // An event on the watched directory itself carries its own name.
+            let relative = root.and_then(|root| path.strip_prefix(root).ok());
+            let name = match (root, relative) {
+                (Some(_), Some(relative)) if !relative.as_os_str().is_empty() => {
+                    relative.to_string_lossy().into_owned()
+                }
+                (Some(_), None) => path.to_string_lossy().into_owned(),
+                _ => path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_default(),

@@ -13,6 +13,7 @@
 
 pub mod duration;
 pub mod helpers;
+pub mod host;
 pub mod instant;
 pub mod intrinsic;
 pub mod native_dispatch;

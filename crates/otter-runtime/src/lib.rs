@@ -108,6 +108,7 @@ mod process_env;
 mod process_events;
 mod process_execve;
 mod process_flags;
+mod process_info;
 mod process_ipc;
 mod process_lifecycle;
 mod realm;

@@ -83,7 +83,7 @@ pub struct LocalTimeZone {
 impl LocalTimeZone {
     fn zone(&mut self) -> Option<&temporal_rs::TimeZone> {
         self.resolved
-            .get_or_insert_with(|| temporal_rs::Temporal::local_now().time_zone().ok())
+            .get_or_insert_with(|| crate::temporal::host::now().time_zone().ok())
             .as_ref()
     }
 

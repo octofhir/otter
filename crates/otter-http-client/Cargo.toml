@@ -1,0 +1,29 @@
+[package]
+name = "otter-http-client"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Outbound HTTP/1.1 and HTTP/2 client over rustls with bundled trust roots."
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes = "1"
+flate2 = { workspace = true }
+http = { workspace = true }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1", "http2", "tls12", "aws-lc-rs"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+rustls-pki-types = { version = "1.14", features = ["std"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+url = "2"
+webpki-roots = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }

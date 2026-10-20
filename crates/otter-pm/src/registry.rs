@@ -261,7 +261,7 @@ impl RegistryMetadataClient for FileRegistryMetadataClient {
 /// Async HTTP-backed npm registry metadata client.
 #[derive(Debug, Clone)]
 pub struct HttpRegistryMetadataClient {
-    client: reqwest::Client,
+    client: otter_http_client::Client,
     registry_base: String,
 }
 
@@ -276,7 +276,7 @@ impl HttpRegistryMetadataClient {
     #[must_use]
     pub fn with_base_url(registry_base: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: otter_http_client::Client::new(),
             registry_base: registry_base.into().trim_end_matches('/').to_string(),
         }
     }
@@ -307,7 +307,7 @@ impl RegistryMetadataClient for HttpRegistryMetadataClient {
             let response = self
                 .client
                 .get(&url)
-                .header(reqwest::header::ACCEPT, "application/json")
+                .header(otter_http_client::header::ACCEPT, "application/json")
                 .send()
                 .await
                 .map_err(|err| PackageManagerError::Http {

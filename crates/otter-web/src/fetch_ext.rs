@@ -3,7 +3,7 @@
 //! `fetch.js` owns the spec contract: it normalizes `(input, init)` into a
 //! `Request`, extracts the method / absolute URL / flattened headers / buffered
 //! body, and calls the private [`native_fetch`] member with those plain values.
-//! This native gates the request on the `net` capability, drives the reqwest
+//! This native gates the request on the `net` capability, drives the HTTP
 //! transport in [`otter_runtime::web_fetch_host`] off-thread through the async
 //! completion protocol, and resolves the promise with the raw response parts
 //! (`[status, statusText, flatHeaders, bodyBytes]`) the shim turns into a
@@ -46,9 +46,10 @@ impl IntoJs for ChunkResult {
 }
 
 /// The response head plus its streaming body, marshalled to the
-/// `[status, statusText, flatHeaders, finalUrl, pull]` array the `fetch.js` shim
-/// mints a `Response` from. `pull` is a native `() => Promise<Uint8Array|null>`
-/// that reads the next body chunk on demand (natural backpressure).
+/// `[status, statusText, flatHeaders, finalUrl, pull, redirected]` array the
+/// `fetch.js` shim mints a `Response` from. `pull` is a native
+/// `() => Promise<Uint8Array|null>` that reads the next body chunk on demand
+/// (natural backpressure).
 struct StreamingHead {
     head: FetchResponseHead,
     body: Arc<ResponseBody>,
@@ -57,7 +58,7 @@ struct StreamingHead {
 impl IntoJs for StreamingHead {
     fn into_js<'s>(self, cx: &mut MarshalCx<'_, '_, 's>) -> Result<Local<'s>, JsError> {
         let StreamingHead { head, body } = self;
-        let array = cx.array(5)?;
+        let array = cx.array(6)?;
         let status = cx.number(f64::from(head.status));
         cx.set_index(array, 0, status)?;
         let status_text = cx.string(&head.status_text)?;
@@ -71,6 +72,8 @@ impl IntoJs for StreamingHead {
         cx.set_index(array, 2, flat)?;
         let final_url = cx.string(&head.final_url)?;
         cx.set_index(array, 3, final_url)?;
+        let redirected = cx.boolean(head.redirected);
+        cx.set_index(array, 5, redirected)?;
 
         // `pull()` reads the next body chunk as a fresh promise; the
         // `ReadableStream` calls it once per chunk, so the socket is drained

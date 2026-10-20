@@ -301,6 +301,25 @@ impl SourceRegistry {
         })
     }
 
+    /// Every entry: its URL, its text and its prologue length, in URL order.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&str, &SharedSource, u32)> {
+        self.inner
+            .iter()
+            .flat_map(|inner| inner.entries.iter())
+            .map(|(url, source)| (url.as_ref(), &source.text, source.prologue))
+    }
+
+    /// A registry of `entries` as [`Self::entries`] reports them.
+    ///
+    /// # Errors
+    /// See [`Self::new`].
+    pub(crate) fn from_entries(
+        entries: impl IntoIterator<Item = (String, SharedSource, u32)>,
+        account: &ResourceAccount,
+    ) -> Result<Self, ResourceError> {
+        Self::with_prologues(entries, account)
+    }
+
     /// Resolve a URL inside this exact linked chunk's immutable sources.
     #[must_use]
     pub fn get(&self, module_url: &str) -> Option<&ModuleSource> {

@@ -33,9 +33,9 @@ use hyper_util::rt::TokioIo;
 use otter_runtime::{
     CapabilitySet, HostedModule, OtterError, Runtime, RuntimeAttr as Attr, RuntimeExtensionContext,
     RuntimeExtensionInstaller, RuntimeKeepAlive, RuntimeLiveness, RuntimeLocal, RuntimeNativeCall,
-    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError, RuntimeNativeFn,
-    RuntimeNativeScope, RuntimePersistentRootId, RuntimeTask, RuntimeTaskSpawner,
-    RuntimeValue as Value, SourceInput, object, runtime_this_object, runtime_with_host_data,
+    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError, RuntimeNativeScope,
+    RuntimePersistentRootId, RuntimeTask, RuntimeTaskSpawner, RuntimeValue as Value, SourceInput,
+    object, runtime_this_object, runtime_with_host_data,
 };
 use smallvec::SmallVec;
 use std::collections::HashMap;
@@ -104,18 +104,14 @@ pub fn install_otter_module<'scope, 'rt>(
 /// Installer for the global `Otter` namespace.
 #[must_use]
 pub fn otter_global_installer() -> RuntimeExtensionInstaller {
-    RuntimeExtensionInstaller::new(install_global_otter)
+    RuntimeExtensionInstaller::new(install_global_otter).with_run_services(install_serve_host)
 }
 
 fn install_global_otter(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
-    let capabilities = runtime.capabilities().clone();
-    let task_spawner = runtime.runtime_task_spawner();
-    let serve_call: Arc<RuntimeNativeFn> =
-        Arc::new(move |ctx, args, _captures| serve(ctx, args, &capabilities, task_spawner.clone()));
     runtime.install_native_global_call(
         "__otterServe",
         1,
-        RuntimeNativeCall::Dynamic(serve_call),
+        RuntimeNativeCall::Static(serve_native),
     )?;
     runtime
         .install_script(SourceInput::from_javascript(
@@ -185,6 +181,33 @@ fn install_global_otter(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(),
             message: format!("Otter global install failed: {err}"),
         })?;
     Ok(())
+}
+
+/// `Otter.serve`'s view of this run: its grants and its task spawner.
+fn install_serve_host(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
+    let host = ServeHost {
+        capabilities: runtime.capabilities().clone(),
+        task_spawner: runtime.runtime_task_spawner(),
+    };
+    runtime.insert_host_service(host);
+    Ok(())
+}
+
+/// What `Otter.serve` reads about this run instead of capturing it.
+#[derive(Clone)]
+struct ServeHost {
+    capabilities: CapabilitySet,
+    task_spawner: Option<RuntimeTaskSpawner>,
+}
+
+fn serve_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let host = ctx
+        .host_service::<ServeHost>()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "Otter.serve",
+            reason: "the serve host is not installed".to_string(),
+        })?;
+    serve(ctx, args, &host.capabilities, host.task_spawner)
 }
 
 pub(crate) fn serve(

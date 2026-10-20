@@ -6,7 +6,8 @@
 //! - `kill` dispatches through the object's own `_kill`.
 //! - An uncaught throw reaches the capture callback, then `uncaughtException`
 //!   listeners.
-//! - A denied read capability stops the move.
+//! - A denied read capability stops the move and `loadEnvFile`; a scoped
+//!   grant loads only the env files it names.
 //! - POSIX credential reads and refused changes carry Node's shapes.
 //! - `getActiveResourcesInfo` separates pending timers from immediates.
 //! - `execve` validates its three arguments with Node's codes and messages.
@@ -144,10 +145,15 @@ fn chdir_rejects_a_non_string_directory() {
 }
 
 #[test]
-fn chdir_requires_the_read_capability() {
+fn chdir_and_load_env_file_require_the_read_capability() {
     let directory = tempfile::tempdir().expect("tempdir");
     let target = std::fs::canonicalize(directory.path()).expect("canonical target");
+    let env_file = target.join("probe.env");
+    std::fs::write(&env_file, "OTTER_LOAD_ENV_FILE_PROBE=granted\n").expect("write env file");
     let target = serde_json::to_string(&target.to_string_lossy()).expect("encode path");
+    let env_file = serde_json::to_string(&env_file.to_string_lossy()).expect("encode env file");
+    let outside = serde_json::to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .expect("encode outside path");
 
     let mut capabilities = CapabilitySet::allow_all();
     capabilities.read = Permission::Deny;
@@ -160,12 +166,53 @@ fn chdir_requires_the_read_capability() {
             thrown = error;
         }}
         if (thrown?.code !== "EACCES") throw new Error("code was " + thrown?.code);
+
+        // The refusal precedes the open: the default `.env` is refused
+        // whether or not it exists.
+        for (const path of [{env_file}, undefined]) {{
+            const reported = path ?? ".env";
+            let refused;
+            try {{
+                process.loadEnvFile(path);
+            }} catch (error) {{
+                refused = error;
+            }}
+            if (refused?.code !== "EACCES") throw new Error("loadEnvFile code was " + refused?.code);
+            if (refused.syscall !== "open") throw new Error("syscall was " + refused.syscall);
+            if (refused.path !== reported) throw new Error("path was " + refused.path);
+            if (refused.message !== `EACCES: permission denied, open '${{reported}}'`) {{
+                throw new Error("message was " + refused.message);
+            }}
+        }}
+        if (process.env.OTTER_LOAD_ENV_FILE_PROBE !== undefined) {{
+            throw new Error("a refused file reached process.env");
+        }}
         "#
     );
-
     runtime_with(capabilities)
         .run_script(SourceInput::from_javascript(source), "<test>")
-        .expect("a denied chdir throws instead of moving the process");
+        .expect("a denied read stops chdir and loadEnvFile");
+
+    let mut capabilities = CapabilitySet::allow_all();
+    capabilities.read = Permission::allow([directory.path().to_path_buf()]);
+    let source = format!(
+        r#"
+        process.loadEnvFile({env_file});
+        if (process.env.OTTER_LOAD_ENV_FILE_PROBE !== "granted") {{
+            throw new Error("the granted file was not loaded");
+        }}
+        let refused;
+        try {{
+            process.loadEnvFile({outside});
+        }} catch (error) {{
+            refused = error;
+        }}
+        if (refused?.code !== "EACCES") throw new Error("outside code was " + refused?.code);
+        "#
+    );
+    runtime_with(capabilities)
+        .run_script(SourceInput::from_javascript(source), "<test>")
+        .expect("a scoped read grant admits only the files it names");
 }
 
 #[test]

@@ -186,6 +186,23 @@ impl VerifiedBytecodeModule {
         Ok(Self::unproven(module, 0, true))
     }
 
+    /// [`Self::from_build_artifact`] for a module whose dense function ids
+    /// already start at `function_base`: a linked chunk carried in this
+    /// executable's startup image, which wrote it from a module it had
+    /// admitted at that base.
+    ///
+    /// # Errors
+    /// Returns a rejection when the bytes do not even have a measurable shape.
+    pub fn from_build_artifact_at_base(
+        module: BytecodeModule,
+        function_base: u32,
+    ) -> Result<Self, BytecodeVerifyError> {
+        if module.functions.is_empty() {
+            return Err(BytecodeVerifyError::EmptyFunctionTable);
+        }
+        Ok(Self::unproven(module, function_base, true))
+    }
+
     /// Immutable access to the admitted module DTO.
     #[must_use]
     pub const fn module(&self) -> &BytecodeModule {

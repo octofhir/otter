@@ -330,14 +330,18 @@
 
   // ---- performance (High Resolution Time, minimal) ----
   // `Performance` has no constructor (`new Performance()` throws); the
-  // singleton is built by reparenting a bare object onto the prototype,
-  // and its methods read the shared `timeOrigin` closure.
-  const timeOrigin = Date.now();
+  // singleton is built by reparenting a bare object onto the prototype.
+  // Its clock is the run's: the host answers both natives per run, so a
+  // launch restored from a startup image measures from its own start.
+  const performanceNow = globalThis.__otterPerformanceNow;
+  const performanceTimeOrigin = globalThis.__otterPerformanceTimeOrigin;
+  delete globalThis.__otterPerformanceNow;
+  delete globalThis.__otterPerformanceTimeOrigin;
   class Performance {
     constructor() { throw new TypeError('Illegal constructor'); }
-    now() { return Date.now() - timeOrigin; }
-    get timeOrigin() { return timeOrigin; }
-    toJSON() { return { timeOrigin }; }
+    now() { return performanceNow(); }
+    get timeOrigin() { return performanceTimeOrigin(); }
+    toJSON() { return { timeOrigin: performanceTimeOrigin() }; }
   }
   tagged(Performance.prototype, 'Performance');
   def('Performance', Performance);

@@ -21,6 +21,8 @@
 //! - [`HeapImage`] — the captured pages.
 //! - [`GcHeap::capture_old_space`] — build one.
 //! - [`GcHeap::restore_old_space`] — put one back, relocated.
+//! - [`HeapImage::encode`] / [`HeapImage::decode`] — the bytes of an image
+//!   carried as its executable's startup image.
 //! - [`Relocation`] — the offset mapping a restore produced, so callers
 //!   can rewrite the root handles they held outside the heap.
 //! - [`ImageError`] — why a restore refused.
@@ -32,13 +34,17 @@
 //!   survive. [`GcHeap::capture_old_space`] rejects a non-empty nursery
 //!   rather than producing an image that restores to a dangling edge.
 //! - Every pointer slot reachable by the trace table is relocated exactly
-//!   once. A slot pointing outside the image is an error, not a silently
-//!   kept stale offset.
+//!   once, a weak table's ephemeron keys and values included. A slot
+//!   pointing outside the image is an error, not a silently kept stale
+//!   offset. The collector's weak registries are not part of the image: the
+//!   VM registers each restored weak body again.
 //! - Restored pages are old-generation and unmarked. The image carries no
 //!   mark state; a restore starts a fresh collection cycle.
-//! - An image never crosses a process, executable, or type-layout boundary.
-//!   It has no byte decoder and its page records are private. Static pointers
-//!   therefore remain valid without loader relocation.
+//! - An image never crosses an executable or type-layout boundary. It
+//!   crosses a process only as the startup image of the executable that
+//!   wrote it ([`HeapImage::encode`] / [`HeapImage::decode`]); static
+//!   pointers then move with the executable as one unit, and the VM slides
+//!   them by the image anchor's displacement after the page restore.
 //! - **Bodies are self-contained or explicitly severed.** An image carries
 //!   page bytes and nothing else, so a body that owns storage outside the heap
 //!   would otherwise restore as a second owner. A registered sever hook must
@@ -94,6 +100,15 @@ pub enum ImageError {
         /// The offending body type.
         type_name: &'static str,
     },
+    /// The executable has no linker build identity, so nothing could tell
+    /// its startup image from another build's.
+    NoBuildIdentity,
+    /// The heap calls natives that close over host state; no launch can
+    /// re-create them from an image.
+    DynamicNatives {
+        /// How many such natives the heap names.
+        count: usize,
+    },
 }
 
 impl std::fmt::Display for ImageError {
@@ -120,6 +135,16 @@ impl std::fmt::Display for ImageError {
                 write!(
                     f,
                     "a live `{type_name}` holds content the image cannot capture"
+                )
+            }
+            Self::NoBuildIdentity => {
+                write!(f, "the executable carries no linker build identity")
+            }
+            Self::DynamicNatives { count } => {
+                write!(
+                    f,
+                    "the heap names {count} natives that close over host state; \
+                     a launch cannot re-create them"
                 )
             }
         }
@@ -189,6 +214,49 @@ impl HeapImage {
     #[must_use]
     pub fn byte_len(&self) -> usize {
         self.pages.iter().map(|p| p.bytes.len()).sum()
+    }
+
+    /// Append the image's pages and counts to `out`.
+    pub fn encode(&self, out: &mut crate::image_codec::ImageWriter) {
+        out.u64(self.object_count);
+        out.u64(self.live_bytes);
+        out.len(self.pages.len());
+        for page in &self.pages {
+            out.u32(page.cage_offset);
+            out.u32(page.span_pages);
+            out.bytes(&page.bytes);
+        }
+    }
+
+    /// Read back an image [`Self::encode`] wrote, or `None` for a stream
+    /// that does not hold one.
+    ///
+    /// # Safety
+    /// The bytes must be an image this same executable encoded: restoring
+    /// them trusts every page byte as a body this build laid out.
+    pub unsafe fn decode(input: &mut crate::image_codec::ImageReader<'_>) -> Option<Self> {
+        let object_count = input.u64()?;
+        let live_bytes = input.u64()?;
+        let page_count = input.len()?;
+        let mut pages = Vec::with_capacity(page_count);
+        for _ in 0..page_count {
+            let cage_offset = input.u32()?;
+            let span_pages = input.u32()?;
+            let bytes = input.bytes()?;
+            if span_pages == 0 || bytes.len() > span_pages as usize * PAGE_SIZE {
+                return None;
+            }
+            pages.push(PageImage {
+                cage_offset,
+                span_pages,
+                bytes: bytes.to_vec(),
+            });
+        }
+        Some(Self {
+            pages,
+            object_count,
+            live_bytes,
+        })
     }
 }
 
@@ -305,7 +373,9 @@ impl GcHeap {
     /// # Safety
     ///
     /// `image` must be an unmodified value returned by
-    /// [`Self::capture_old_space`] in this process, with the same executable,
+    /// [`Self::capture_old_space`] in this process, or decoded by
+    /// [`HeapImage::decode`] from this executable's own startup image, with
+    /// the same executable,
     /// Rust type layouts, and trace/sever registrations. Every captured body
     /// that owns storage outside its page must have a matching sever hook or
     /// otherwise be safe to duplicate. Violating these requirements can make
@@ -433,6 +503,9 @@ impl GcHeap {
         // leaves the heap untouched and the pages simply drop back to
         // the cage.
         let mut failure: Option<ImageError> = None;
+        // Per type tag: the restored bodies and their bytes, for the heap's
+        // statistics, which count allocations and would otherwise miss them.
+        let mut restored = vec![(0usize, 0usize); 256];
         for (_, page) in &placed {
             // SAFETY: the copied bytes are a faithful page prefix, so every
             // header up to `bump_cursor` is one this heap's trace table can
@@ -446,13 +519,19 @@ impl GcHeap {
                     if tag == FREE_TAG {
                         return;
                     }
+                    let row = &mut restored[tag as usize];
+                    row.0 += 1;
+                    row.1 += crate::page::align_up(
+                        (*header).size_bytes() as usize,
+                        crate::page::CELL_SIZE,
+                    );
                     // A restored generation starts a fresh cycle.
                     (*header).clear_mark();
                     let Some(trace) = self.trace_table().get(tag) else {
                         failure = Some(ImageError::UnregisteredTypeTag { type_tag: tag });
                         return;
                     };
-                    trace(header, &mut |slot: *mut RawGc| {
+                    let mut relocate = |slot: *mut RawGc| {
                         let old = *slot;
                         if old.is_null() {
                             return;
@@ -460,7 +539,17 @@ impl GcHeap {
                         if let Some(new) = relocation.relocate(old.0) {
                             *slot = RawGc(new);
                         }
-                    });
+                    };
+                    trace(header, &mut relocate);
+                    // A weak table's keys and values are references too:
+                    // they move with the pages like every strong slot. The
+                    // body's strong trace above already relocated the
+                    // handles this walk follows to reach its entries.
+                    self.trace_table()
+                        .trace_ephemerons(header, &mut |key, values| {
+                            relocate(key);
+                            values(&mut relocate);
+                        });
                 });
             }
         }
@@ -493,7 +582,7 @@ impl GcHeap {
         for (_, page) in placed {
             self.adopt_restored_old_page(page);
         }
-        self.account_restored_image(image.live_bytes);
+        self.account_restored_image(image.live_bytes, &restored);
         Ok(relocation)
     }
 }

@@ -326,29 +326,64 @@ impl<T: TracedHostObjectData> ErasedTracedHostObjectData for T {
     }
 }
 
+/// An untraced host payload: any type, which also names itself so a
+/// snapshot can say which payload it could not carry.
+trait HostPayload: Any {
+    fn payload_name(&self) -> &'static str;
+}
+
+impl<T: Any> HostPayload for T {
+    fn payload_name(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
+}
+
 enum HostData {
-    Untraced(Box<dyn Any>),
+    Untraced(Box<dyn HostPayload>),
     Traced(Box<dyn ErasedTracedHostObjectData>),
 }
 
 impl HostData {
+    /// The payload's concrete type.
+    fn payload_type(&self) -> std::any::TypeId {
+        match self {
+            Self::Untraced(data) => <dyn Any>::type_id(&**data as &dyn Any),
+            Self::Traced(data) => <dyn Any>::type_id(data.as_any()),
+        }
+    }
+
+    /// The payload's type name.
+    fn payload_name(&self) -> &'static str {
+        match self {
+            Self::Untraced(data) => (**data).payload_name(),
+            Self::Traced(_) => "traced host data",
+        }
+    }
+
     fn downcast_ref<T: Any>(&self) -> Option<&T> {
         match self {
-            Self::Untraced(data) => data.downcast_ref::<T>(),
+            Self::Untraced(data) => (&**data as &dyn Any).downcast_ref::<T>(),
             Self::Traced(data) => data.as_any().downcast_ref::<T>(),
         }
     }
 
     fn downcast_mut<T: Any>(&mut self) -> Option<&mut T> {
         match self {
-            Self::Untraced(data) => data.downcast_mut::<T>(),
+            Self::Untraced(data) => (&mut **data as &mut dyn Any).downcast_mut::<T>(),
             Self::Traced(data) => data.as_any_mut().downcast_mut::<T>(),
         }
     }
 
     fn into_untraced<T: Any>(self) -> Result<Box<T>, Self> {
         match self {
-            Self::Untraced(data) => data.downcast::<T>().map_err(Self::Untraced),
+            Self::Untraced(data) => {
+                if (&*data as &dyn Any).is::<T>() {
+                    let data: Box<dyn Any> = data;
+                    Ok(data.downcast::<T>().expect("checked payload type"))
+                } else {
+                    Err(Self::Untraced(data))
+                }
+            }
             traced => Err(traced),
         }
     }
@@ -1102,6 +1137,28 @@ pub struct ExoticSlots {
     /// Structural identity of a dictionary-mode object, refreshed on every
     /// key-set change; [`ShapeId::UNASSIGNED`] once it adopts a shape.
     dictionary_shape_id: ShapeId,
+}
+
+impl ExoticSlots {
+    /// The concrete type of the host payload, if the sidecar holds one; for
+    /// a declared host class, the type of the data its instance cell holds.
+    pub(crate) fn host_data_type(&self) -> Option<std::any::TypeId> {
+        let data = self.host_data.as_ref()?;
+        Some(
+            data.downcast_ref::<crate::marshal::HostInstance>()
+                .map_or_else(|| data.payload_type(), crate::marshal::HostInstance::data_type),
+        )
+    }
+
+    /// The host payload's name, if the sidecar holds one: a declared host
+    /// class's JavaScript name, any other payload's Rust type.
+    pub(crate) fn host_data_name(&self) -> Option<&'static str> {
+        let data = self.host_data.as_ref()?;
+        Some(
+            data.downcast_ref::<crate::marshal::HostInstance>()
+                .map_or_else(|| data.payload_name(), crate::marshal::HostInstance::class_name),
+        )
+    }
 }
 
 impl otter_gc::trace::SeverRestoredPayload for ExoticSlots {
@@ -2496,6 +2553,20 @@ impl ObjectBody {
     fn host_data_mut_opt(&mut self) -> Option<&mut HostData> {
         // SAFETY: a non-null handle names a live sidecar payload.
         exotic_body_of(self.exotic.get()).and_then(|body| unsafe { (*body).host_data.as_mut() })
+    }
+
+    /// Install `data` as the host payload when the sidecar holds none:
+    /// `Some(true)` installed, `Some(false)` one was present, `None` the
+    /// object has no sidecar to hold a payload.
+    fn install_missing_host_data(&mut self, data: HostData) -> Option<bool> {
+        let body = exotic_body_of(self.exotic.get())?;
+        // SAFETY: a non-null handle names a live sidecar payload.
+        let slot = unsafe { &mut (*body).host_data };
+        if slot.is_some() {
+            return Some(false);
+        }
+        *slot = Some(data);
+        Some(true)
     }
     #[inline]
     fn boolean_data(&self) -> Option<bool> {
@@ -5176,6 +5247,24 @@ where
                 expected: std::any::type_name::<T>(),
                 found: "<unknown host data>",
             })
+    })
+}
+
+/// Give a host object whose payload a snapshot restore severed a fresh
+/// payload. `Ok(false)` when the object holds host data already (a built
+/// realm), which stays as it is.
+///
+/// # Errors
+/// [`HostObjectError::Missing`] when `obj` has no sidecar: it is not a host
+/// object.
+pub fn restore_host_data<T: Any>(
+    obj: JsObject,
+    heap: &mut otter_gc::GcHeap,
+    data: T,
+) -> Result<bool, HostObjectError> {
+    heap.with_payload(obj, |body| {
+        body.install_missing_host_data(HostData::Untraced(Box::new(data)))
+            .ok_or(HostObjectError::Missing)
     })
 }
 

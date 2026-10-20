@@ -122,6 +122,9 @@ step "difftest: interpreter vs tiers vs gc-stress"
 # surface only the verdict. Any mismatch fails the gate.
 difftest_report=$(mktemp)
 cargo build --release -q -p otter-cli
+# A cargo build links the binary without its startup image; write it back so
+# difftest runs the executable as it ships, restoring instead of bootstrapping.
+target/release/otter startup-image target/release/otter
 cargo run --release -q -p otter-difftest -- "$@" >"$difftest_report"
 python3 - "$difftest_report" <<'PY'
 import json, sys

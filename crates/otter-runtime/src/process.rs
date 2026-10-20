@@ -3,15 +3,35 @@
 //! # Contents
 //! - [`default_cwd`] builds the runtime's default `process.cwd()` snapshot.
 //! - [`install_global`] materializes `process` and default argv from one host snapshot.
+//! - [`ProcessHost`] and [`process_host`]: what the `process` natives read
+//!   about the run — working directory, clock origin, CommonJS configuration
+//!   and capability grants.
+//! - [`ProcessRunState`] and [`define_run_state`]: the `process` properties
+//!   that belong to one run — arguments, executable, identity, environment,
+//!   warning switches and inherited channel.
+//! - [`reattach_after_restore`] brings the `process` of a runtime restored
+//!   from a startup image to this run.
 //! - [`crate::process_events`] owns EventEmitter and warning behavior.
 //! - [`crate::process_flags`] owns the immutable NODE_OPTIONS allowlist.
 //!
 //! # Invariants
 //! - `process.env` is capability-filtered at install time and never bypasses
 //!   the runtime's deny-by-default policy or secret denylist.
+//! - `process.loadEnvFile()` opens only a file the `read` capability grants,
+//!   checked at the Rust boundary before the open, as `fs` checks it.
+//! - Every `process` native the bootstrap installs is a static entry that
+//!   captures nothing and reads the run through its [`ProcessHost`], so a
+//!   startup image carries the natives as they are and each run inserts its
+//!   own host. Only an inherited IPC channel's members close over their
+//!   channel, and [`define_run_state`] installs those per run.
+//! - Run state is written, never carried: [`define_run_state`] defines it at
+//!   installation, and again over a restored image after that run's
+//!   [`ProcessHost`] is inserted, so nothing of the image writer's run
+//!   survives into a launch.
 //! - Default arguments are declarative absence until installation. One host
-//!   snapshot supplies the default argv, execPath and pid/ppid; uptime counts
-//!   from installation. Explicit arguments (including an empty list) remain
+//!   snapshot supplies the default argv, execPath and pid/ppid; `uptime()`
+//!   and `hrtime()` count from the start recorded in the run's
+//!   [`ProcessHost`]. Explicit arguments (including an empty list) remain
 //!   distinct inputs.
 //! - Host data is copied into JS-owned values. This module does not expose VM
 //!   internals across the public runtime boundary.
@@ -25,11 +45,10 @@
 //! - [`crate::RuntimeBuilder::process_argv`]
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Instant;
 
 use otter_vm::{
-    Attr, Interpreter, JsString, Local, NativeCall, NativeCtx, NativeError, NativeFn, NativeScope,
+    Attr, Interpreter, JsString, Local, NativeCall, NativeCtx, NativeError, NativeScope,
     NumberValue, Value,
 };
 
@@ -37,6 +56,30 @@ use crate::{CapabilitySet, DiagnosticCode, OtterError, RuntimeHooks};
 
 pub(crate) fn default_cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// What the `process` natives read about this run instead of capturing it,
+/// so each stays a static entry a startup image carries as is.
+#[derive(Clone)]
+pub(crate) struct ProcessHost {
+    /// The working directory `cwd()` reports and `chdir()` moves.
+    pub(crate) cwd: crate::process_control::WorkingDirectory,
+    /// The clock origin of `uptime()` and `hrtime()`.
+    pub(crate) start: Instant,
+    /// The module system `getBuiltinModule()` and the stdio streams load
+    /// through.
+    pub(crate) cjs: std::sync::Arc<crate::commonjs::CjsConfig>,
+    /// The grants `chdir()`, `execve()` and `loadEnvFile()` check.
+    pub(crate) capabilities: CapabilitySet,
+}
+
+/// This run's [`ProcessHost`].
+pub(crate) fn process_host(ctx: &NativeCtx<'_>) -> Result<ProcessHost, NativeError> {
+    ctx.host_service::<ProcessHost>()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "process",
+            reason: "the process host is not installed".to_string(),
+        })
 }
 
 pub(crate) fn install_global(
@@ -64,7 +107,22 @@ pub(crate) fn install_global(
         default_argv = [snapshot.exec_path.clone()];
         &default_argv
     };
-    let start = Instant::now();
+    let run = &ProcessRunState {
+        argv: process_argv,
+        exec_argv: process_exec_argv,
+        env_overlay: process_env_overlay,
+        capabilities,
+        hooks,
+        warning_options,
+        title: process_title,
+        cjs,
+    };
+    interp.insert_host_service(ProcessHost {
+        cwd: crate::process_control::WorkingDirectory::new(process_cwd.to_path_buf()),
+        start: Instant::now(),
+        cjs: cjs.clone(),
+        capabilities: capabilities.clone(),
+    });
     let function_prototype = function_prototype_object(interp);
     let global_object = *interp.global_this();
     let process_tag_symbol = interp
@@ -100,38 +158,8 @@ pub(crate) fn install_global(
                     .to_flags(),
                 )?;
 
-                let argv = scope.array(process_argv.len())?;
-                for (index, arg) in process_argv.iter().enumerate() {
-                    // Node resolves `argv[0]` to `process.execPath`; the raw
-                    // spawn-time first argument survives only as `argv0`.
-                    let arg = if index == 0 {
-                        scope.string(&snapshot.exec_path)?
-                    } else {
-                        scope.string(arg)?
-                    };
-                    scope.set_index(argv, index, arg)?;
-                }
-                scope.set(process, "argv", argv)?;
-                let exec_argv = scope.array(process_exec_argv.len())?;
-                for (index, flag) in process_exec_argv.iter().enumerate() {
-                    let flag = scope.string(flag)?;
-                    scope.set_index(exec_argv, index, flag)?;
-                }
-                scope.set(process, "execArgv", exec_argv)?;
-
+                define_run_state(&mut scope, process, run, &snapshot, channel.as_ref())?;
                 for (name, value) in [
-                    (
-                        "argv0",
-                        process_argv.first().map(String::as_str).unwrap_or("otter"),
-                    ),
-                    ("execPath", snapshot.exec_path.as_str()),
-                    // Node's default title is the spawn path (`--title`
-                    // overrides it); a plain writable property is enough
-                    // until a real setproctitle lands.
-                    (
-                        "title",
-                        process_title.unwrap_or(snapshot.exec_path.as_str()),
-                    ),
                     ("platform", node_platform()),
                     ("arch", node_arch()),
                     ("version", concat!("v", env!("CARGO_PKG_VERSION"))),
@@ -157,10 +185,6 @@ pub(crate) fn install_global(
                 scope.set(release, "name", release_name)?;
                 scope.set(process, "release", release)?;
 
-                let pid = scope.number(f64::from(pid_to_i32(snapshot.pid)));
-                scope.set(process, "pid", pid)?;
-                let ppid = scope.number(f64::from(pid_to_i32(snapshot.ppid.unwrap_or(0))));
-                scope.set(process, "ppid", ppid)?;
                 // `exitCode` is an accessor with Node's validation; the value
                 // itself lives in a hidden slot so native readers can reach
                 // it without running the getter.
@@ -188,20 +212,11 @@ pub(crate) fn install_global(
                     otter_vm::object::PropertyFlags::new(false, true, false),
                 )?;
 
-                let env = crate::process_env::build(
-                    &mut scope,
-                    process_env_overlay,
-                    capabilities,
-                    hooks,
-                )?;
-                scope.set(process, "env", env)?;
                 let allowed_flags = crate::process_flags::build(&mut scope)?;
                 scope.set(process, "allowedNodeEnvironmentFlags", allowed_flags)?;
 
-                let working_directory =
-                    crate::process_control::WorkingDirectory::new(process_cwd.to_path_buf());
                 for (name, length, call) in [
-                    ("cwd", 0, cwd_call(working_directory.clone())),
+                    ("cwd", 0, NativeCall::Static(process_working_directory)),
                     ("exit", 1, NativeCall::Static(process_exit)),
                     ("reallyExit", 1, NativeCall::Static(process_really_exit)),
                     ("_rawDebug", 0, NativeCall::Static(process_raw_debug)),
@@ -212,18 +227,14 @@ pub(crate) fn install_global(
                     ),
                     ("nextTick", 1, NativeCall::Static(process_next_tick)),
                     ("binding", 1, NativeCall::Static(process_binding)),
-                    ("uptime", 0, uptime_call(start)),
+                    ("uptime", 0, NativeCall::Static(process_uptime)),
                     ("cpuUsage", 1, NativeCall::Static(process_cpu_usage)),
                     (
                         "threadCpuUsage",
                         1,
                         NativeCall::Static(process_thread_cpu_usage),
                     ),
-                    (
-                        "loadEnvFile",
-                        1,
-                        load_env_file_call(working_directory.clone()),
-                    ),
+                    ("loadEnvFile", 1, NativeCall::Static(process_load_env_file)),
                     ("memoryUsage", 0, NativeCall::Static(process_memory_usage)),
                     (
                         "availableMemory",
@@ -238,12 +249,9 @@ pub(crate) fn install_global(
                 ] {
                     define_process_method(&mut scope, process, name, length, call)?;
                 }
-                if let Some(channel) = &channel {
-                    crate::process_ipc::install(&mut scope, process, channel, cjs)?;
-                }
-                let hrtime = hrtime_value(&mut scope, start, function_prototype)?;
+                let hrtime = hrtime_value(&mut scope, function_prototype)?;
                 scope.set(process, "hrtime", hrtime)?;
-                install_stdio_streams(&mut scope, process, cjs)?;
+                install_stdio_streams(&mut scope, process)?;
                 define_process_method(
                     &mut scope,
                     process,
@@ -270,12 +278,7 @@ pub(crate) fn install_global(
                     .to_flags(),
                 )?;
 
-                crate::process_control::install(
-                    &mut scope,
-                    process,
-                    capabilities,
-                    &working_directory,
-                )?;
+                crate::process_control::install(&mut scope, process)?;
                 crate::process_events::install(&mut scope, process)?;
 
                 let config = scope.bare_object()?;
@@ -317,64 +320,192 @@ pub(crate) fn install_global(
                 }
                 scope.set(process, "features", features)?;
 
-                // Warning-channel switches: the documented mutable process
-                // properties carry the deprecation flags, and hidden slots
-                // carry the printer configuration.
-                for (name, on) in [
-                    ("noDeprecation", warning_options.no_deprecation),
-                    ("throwDeprecation", warning_options.throw_deprecation),
-                    ("traceDeprecation", warning_options.trace_warnings),
-                ] {
-                    let value = scope.boolean(on);
-                    scope.set(process, name, value)?;
-                }
-                let no_warnings = scope.boolean(warning_options.no_warnings);
-                scope.define(
-                    process,
-                    "__otter_no_warnings__",
-                    no_warnings,
-                    Attr {
-                        writable: false,
-                        enumerable: false,
-                        configurable: false,
-                    }
-                    .to_flags(),
-                )?;
-                let trace_warnings = scope.boolean(warning_options.trace_warnings);
-                scope.define(
-                    process,
-                    "__otter_trace_warnings__",
-                    trace_warnings,
-                    Attr {
-                        writable: false,
-                        enumerable: false,
-                        configurable: false,
-                    }
-                    .to_flags(),
-                )?;
-                let disabled = scope.array(warning_options.disabled.len())?;
-                for (index, code) in warning_options.disabled.iter().enumerate() {
-                    let code = scope.string(code)?;
-                    scope.set_index(disabled, index, code)?;
-                }
-                scope.define(
-                    process,
-                    "__otter_disabled_warnings__",
-                    disabled,
-                    Attr {
-                        writable: false,
-                        enumerable: false,
-                        configurable: false,
-                    }
-                    .to_flags(),
-                )?;
-
                 scope.define(
                     global_object,
                     "process",
                     process,
                     Attr::global_binding().to_flags(),
                 )
+            })
+        },
+    );
+    result.map_err(process_bootstrap_error)
+}
+
+/// Everything `process` reports about this run: what the process was
+/// launched with and the policy it runs under.
+pub(crate) struct ProcessRunState<'a> {
+    pub(crate) argv: &'a [String],
+    pub(crate) exec_argv: &'a [String],
+    pub(crate) env_overlay: &'a std::collections::BTreeMap<String, String>,
+    pub(crate) capabilities: &'a CapabilitySet,
+    pub(crate) hooks: &'a RuntimeHooks,
+    pub(crate) warning_options: &'a crate::WarningOptions,
+    pub(crate) title: Option<&'a str>,
+    pub(crate) cjs: &'a std::sync::Arc<crate::commonjs::CjsConfig>,
+}
+
+/// Define the properties of `process` that belong to this run — its
+/// arguments, executable, identity, environment, warning switches and
+/// inherited channel — over whatever an earlier run left there.
+fn define_run_state(
+    scope: &mut NativeScope<'_, '_>,
+    process: Local<'_>,
+    run: &ProcessRunState<'_>,
+    snapshot: &RuntimeProcessSnapshot,
+    channel: Option<&std::sync::Arc<crate::ipc::IpcChannel>>,
+) -> Result<(), NativeError> {
+    let argv = scope.array(run.argv.len())?;
+    for (index, arg) in run.argv.iter().enumerate() {
+        // Node resolves `argv[0]` to `process.execPath`; the raw
+        // spawn-time first argument survives only as `argv0`.
+        let arg = if index == 0 {
+            scope.string(&snapshot.exec_path)?
+        } else {
+            scope.string(arg)?
+        };
+        scope.set_index(argv, index, arg)?;
+    }
+    scope.set(process, "argv", argv)?;
+    let exec_argv = scope.array(run.exec_argv.len())?;
+    for (index, flag) in run.exec_argv.iter().enumerate() {
+        let flag = scope.string(flag)?;
+        scope.set_index(exec_argv, index, flag)?;
+    }
+    scope.set(process, "execArgv", exec_argv)?;
+    for (name, value) in [
+        (
+            "argv0",
+            run.argv.first().map(String::as_str).unwrap_or("otter"),
+        ),
+        ("execPath", snapshot.exec_path.as_str()),
+        // Node's default title is the spawn path (`--title`
+        // overrides it); a plain writable property is enough
+        // until a real setproctitle lands.
+        ("title", run.title.unwrap_or(snapshot.exec_path.as_str())),
+    ] {
+        let value = scope.string(value)?;
+        scope.set(process, name, value)?;
+    }
+    let pid = scope.number(f64::from(pid_to_i32(snapshot.pid)));
+    scope.set(process, "pid", pid)?;
+    let ppid = scope.number(f64::from(pid_to_i32(snapshot.ppid.unwrap_or(0))));
+    scope.set(process, "ppid", ppid)?;
+    let env = crate::process_env::build(scope, run.env_overlay, run.capabilities, run.hooks)?;
+    scope.set(process, "env", env)?;
+    if let Some(channel) = channel {
+        crate::process_ipc::install(scope, process, channel, run.cjs)?;
+    }
+    // Warning-channel switches: the documented mutable process
+    // properties carry the deprecation flags, and hidden slots
+    // carry the printer configuration. The slots stay writable so a
+    // restored `process` takes this run's values over the image's.
+    for (name, on) in [
+        ("noDeprecation", run.warning_options.no_deprecation),
+        ("throwDeprecation", run.warning_options.throw_deprecation),
+        ("traceDeprecation", run.warning_options.trace_warnings),
+    ] {
+        let value = scope.boolean(on);
+        scope.set(process, name, value)?;
+    }
+    let no_warnings = scope.boolean(run.warning_options.no_warnings);
+    scope.define(
+        process,
+        "__otter_no_warnings__",
+        no_warnings,
+        Attr {
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        }
+        .to_flags(),
+    )?;
+    let trace_warnings = scope.boolean(run.warning_options.trace_warnings);
+    scope.define(
+        process,
+        "__otter_trace_warnings__",
+        trace_warnings,
+        Attr {
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        }
+        .to_flags(),
+    )?;
+    let disabled = scope.array(run.warning_options.disabled.len())?;
+    for (index, code) in run.warning_options.disabled.iter().enumerate() {
+        let code = scope.string(code)?;
+        scope.set_index(disabled, index, code)?;
+    }
+    scope.define(
+        process,
+        "__otter_disabled_warnings__",
+        disabled,
+        Attr {
+            writable: true,
+            enumerable: false,
+            configurable: false,
+        }
+        .to_flags(),
+    )?;
+    Ok(())
+}
+
+/// Bring the `process` of a runtime restored from a startup image to this
+/// run: its host service, and every property [`define_run_state`] owns.
+/// A restored realm without `process` is left as it is.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reattach_after_restore(
+    interp: &mut Interpreter,
+    process_argv: Option<&[String]>,
+    process_exec_argv: &[String],
+    process_cwd: &Path,
+    process_env_overlay: &std::collections::BTreeMap<String, String>,
+    capabilities: &CapabilitySet,
+    hooks: &RuntimeHooks,
+    warning_options: &crate::WarningOptions,
+    process_title: Option<&str>,
+    runtime_task_spawner: Option<&crate::RuntimeTaskSpawner>,
+    cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
+) -> Result<(), OtterError> {
+    let channel = inherited_channel(runtime_task_spawner);
+    let snapshot = runtime_process_snapshot();
+    let default_argv;
+    let process_argv = if let Some(argv) = process_argv {
+        argv
+    } else {
+        default_argv = [snapshot.exec_path.clone()];
+        &default_argv
+    };
+    let run = &ProcessRunState {
+        argv: process_argv,
+        exec_argv: process_exec_argv,
+        env_overlay: process_env_overlay,
+        capabilities,
+        hooks,
+        warning_options,
+        title: process_title,
+        cjs,
+    };
+    interp.insert_host_service(ProcessHost {
+        cwd: crate::process_control::WorkingDirectory::new(process_cwd.to_path_buf()),
+        start: Instant::now(),
+        cjs: cjs.clone(),
+        capabilities: capabilities.clone(),
+    });
+    let global_object = *interp.global_this();
+    let result: Result<(), NativeError> = NativeCtx::with_host_context(
+        interp,
+        otter_vm::NativeCallInfo::default_call(),
+        None,
+        |ctx| {
+            ctx.scope(|mut scope| {
+                let global_object = scope.value(Value::object(global_object));
+                let process = scope.get(global_object, "process")?;
+                if !scope.is_object(process) {
+                    return Ok(());
+                }
+                define_run_state(&mut scope, process, run, &snapshot, channel.as_ref())
             })
         },
     );
@@ -464,28 +595,11 @@ fn umask_invalid_value(ctx: &mut NativeCtx<'_>, value: Value) -> NativeError {
 fn install_stdio_streams(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
-    cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
 ) -> Result<(), NativeError> {
-    install_one_stdio(
-        scope,
-        process,
-        "stdout",
-        "__otterStdout",
-        1,
-        stdout_write,
-        cjs,
-    )?;
-    install_one_stdio(
-        scope,
-        process,
-        "stderr",
-        "__otterStderr",
-        2,
-        stderr_write,
-        cjs,
-    )?;
-    install_get_builtin_module(scope, process, cjs)?;
-    install_stdin(scope, process, cjs)
+    install_one_stdio(scope, process, &STDOUT, stdout_getter, stdout_setter)?;
+    install_one_stdio(scope, process, &STDERR, stderr_getter, stderr_setter)?;
+    install_get_builtin_module(scope, process)?;
+    install_stdin(scope, process)
 }
 
 /// Install `process.getBuiltinModule`, the way a program asks the runtime for
@@ -496,37 +610,11 @@ fn install_stdio_streams(
 fn install_get_builtin_module(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
-    cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
 ) -> Result<(), NativeError> {
-    let cfg = cjs.clone();
-    let function = scope.native_closure(
+    let function = scope.native_call(
         "getBuiltinModule",
         1,
-        &[],
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            let id = args.first().copied().unwrap_or_else(Value::undefined);
-            if !id.is_string() {
-                return Err(NativeError::Coded {
-                    kind: otter_vm::ErrorKind::TypeError,
-                    code: "ERR_INVALID_ARG_TYPE",
-                    message: format!(
-                        "The \"id\" argument must be of type string.{}",
-                        crate::process_control::received_suffix(ctx, id)
-                    ),
-                });
-            }
-            let name = id.display_string(ctx.heap());
-            ctx.scope(|mut scope| {
-                // A name the runtime does not own is not an error; it is simply
-                // not a builtin, which is what `undefined` says.
-                let Some(module) = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, &name)?
-                else {
-                    let undefined = scope.undefined();
-                    return Ok(scope.finish(undefined));
-                };
-                Ok(scope.finish(module))
-            })
-        },
+        NativeCall::Static(get_builtin_module),
     )?;
     scope.define(
         process,
@@ -541,6 +629,31 @@ fn install_get_builtin_module(
     )
 }
 
+fn get_builtin_module(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let cfg = process_host(ctx)?.cjs;
+    let id = args.first().copied().unwrap_or_else(Value::undefined);
+    if !id.is_string() {
+        return Err(NativeError::Coded {
+            kind: otter_vm::ErrorKind::TypeError,
+            code: "ERR_INVALID_ARG_TYPE",
+            message: format!(
+                "The \"id\" argument must be of type string.{}",
+                crate::process_control::received_suffix(ctx, id)
+            ),
+        });
+    }
+    let name = id.display_string(ctx.heap());
+    ctx.scope(|mut scope| {
+        // A name the runtime does not own is not an error; it is simply not
+        // a builtin, which is what `undefined` says.
+        let Some(module) = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, &name)? else {
+            let undefined = scope.undefined();
+            return Ok(scope.finish(undefined));
+        };
+        Ok(scope.finish(module))
+    })
+}
+
 /// Where the program's standard input lives once it has been opened.
 const STDIN_SLOT: &str = "__otterStdin";
 
@@ -551,11 +664,7 @@ const STDIN_SLOT: &str = "__otterStdin";
 /// that owns them. Opening one costs a handle and a hold on the run loop, so
 /// the first look is what builds it: a program that never reads its input pays
 /// nothing for having one.
-fn install_stdin(
-    scope: &mut NativeScope<'_, '_>,
-    process: Local<'_>,
-    cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
-) -> Result<(), NativeError> {
+fn install_stdin(scope: &mut NativeScope<'_, '_>, process: Local<'_>) -> Result<(), NativeError> {
     let undefined = scope.undefined();
     scope.define(
         process,
@@ -568,34 +677,7 @@ fn install_stdin(
         }
         .to_flags(),
     )?;
-    let cfg = cjs.clone();
-    let getter = scope.native_closure(
-        "stdin",
-        0,
-        &[],
-        move |ctx: &mut NativeCtx<'_>, _args: &[Value], _captures: &[Value]| {
-            let this_value = *ctx.this_value();
-            ctx.scope(|mut scope| {
-                let process = scope.value(this_value);
-                let opened = scope.get(process, STDIN_SLOT)?;
-                if !scope.is_undefined(opened) {
-                    return Ok(scope.finish(opened));
-                }
-                let stdio = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, STDIO_MODULE)?
-                    .ok_or_else(|| {
-                        crate::runtime_type_error(
-                            "import",
-                            format!("no builtin module named '{STDIO_MODULE}'"),
-                        )
-                    })?;
-                let make = scope.get(stdio, "makeStdin")?;
-                let undefined = scope.undefined();
-                let stream = scope.call(make, undefined, &[])?;
-                scope.set(process, STDIN_SLOT, stream)?;
-                Ok(scope.finish(stream))
-            })
-        },
-    )?;
+    let getter = scope.native_call("stdin", 0, NativeCall::Static(stdin_getter))?;
     let setter = scope.native_call("stdin", 1, NativeCall::Static(stdin_setter))?;
     scope.define_accessor(
         process,
@@ -604,6 +686,32 @@ fn install_stdin(
         setter,
         otter_vm::object::PropertyFlags::new(true, true, false),
     )
+}
+
+/// `process.stdin`: the stream standard input deserves, built on first look.
+fn stdin_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let cfg = process_host(ctx)?.cjs;
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
+        let opened = scope.get(process, STDIN_SLOT)?;
+        if !scope.is_undefined(opened) {
+            return Ok(scope.finish(opened));
+        }
+        let stdio = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, STDIO_MODULE)?.ok_or_else(
+            || {
+                crate::runtime_type_error(
+                    "import",
+                    format!("no builtin module named '{STDIO_MODULE}'"),
+                )
+            },
+        )?;
+        let make = scope.get(stdio, "makeStdin")?;
+        let undefined = scope.undefined();
+        let stream = scope.call(make, undefined, &[])?;
+        scope.set(process, STDIN_SLOT, stream)?;
+        Ok(scope.finish(stream))
+    })
 }
 
 /// The module that owns the streams a descriptor can become.
@@ -625,6 +733,29 @@ fn stdin_setter(
     })
 }
 
+/// One standard output stream: the property, its hidden slot, its
+/// descriptor and the native that writes to it.
+struct StdioStream {
+    name: &'static str,
+    slot: &'static str,
+    fd: i32,
+    write: fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>,
+}
+
+const STDOUT: StdioStream = StdioStream {
+    name: "stdout",
+    slot: "__otterStdout",
+    fd: 1,
+    write: stdout_write,
+};
+
+const STDERR: StdioStream = StdioStream {
+    name: "stderr",
+    slot: "__otterStderr",
+    fd: 2,
+    write: stderr_write,
+};
+
 /// One standard output stream, built the first time it is looked at.
 ///
 /// A program may put its own stream in place of this one, and is answered with
@@ -632,16 +763,14 @@ fn stdin_setter(
 fn install_one_stdio(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
-    name: &'static str,
-    slot: &'static str,
-    fd: i32,
-    write_call: fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>,
-    cjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
+    stream: &StdioStream,
+    getter: otter_vm::NativeFastFn,
+    setter: otter_vm::NativeFastFn,
 ) -> Result<(), NativeError> {
     let undefined = scope.undefined();
     scope.define(
         process,
-        slot,
+        stream.slot,
         undefined,
         Attr {
             writable: true,
@@ -650,58 +779,76 @@ fn install_one_stdio(
         }
         .to_flags(),
     )?;
-    let cfg = cjs.clone();
-    let getter = scope.native_closure(
-        name,
-        0,
-        &[],
-        move |ctx: &mut NativeCtx<'_>, _args: &[Value], _captures: &[Value]| {
-            let this_value = *ctx.this_value();
-            ctx.scope(|mut scope| {
-                let process = scope.value(this_value);
-                let opened = scope.get(process, slot)?;
-                if !scope.is_undefined(opened) {
-                    return Ok(scope.finish(opened));
-                }
-                let stdio = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, STDIO_MODULE)?
-                    .ok_or_else(|| {
-                        crate::runtime_type_error(
-                            "import",
-                            format!("no builtin module named '{STDIO_MODULE}'"),
-                        )
-                    })?;
-                let make = scope.get(stdio, "makeStdout")?;
-                let undefined = scope.undefined();
-                let fd = scope.number(f64::from(fd));
-                let write = scope.native_call(name, 1, NativeCall::Static(write_call))?;
-                let stream = scope.call(make, undefined, &[fd, write])?;
-                scope.set(process, slot, stream)?;
-                Ok(scope.finish(stream))
-            })
-        },
-    )?;
-    let setter = scope.native_closure(
-        name,
-        1,
-        &[],
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-            let stream = args.first().copied().unwrap_or_else(Value::undefined);
-            let this_value = *ctx.this_value();
-            ctx.scope(|mut scope| {
-                let process = scope.value(this_value);
-                let stream = scope.value(stream);
-                scope.set(process, slot, stream)?;
-                Ok(Value::undefined())
-            })
-        },
-    )?;
+    let getter = scope.native_call(stream.name, 0, NativeCall::Static(getter))?;
+    let setter = scope.native_call(stream.name, 1, NativeCall::Static(setter))?;
     scope.define_accessor(
         process,
-        name,
+        stream.name,
         getter,
         setter,
         otter_vm::object::PropertyFlags::new(true, true, false),
     )
+}
+
+fn stdout_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    open_stdio(ctx, &STDOUT)
+}
+
+fn stderr_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    open_stdio(ctx, &STDERR)
+}
+
+fn stdout_setter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    replace_stdio(ctx, args, &STDOUT)
+}
+
+fn stderr_setter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    replace_stdio(ctx, args, &STDERR)
+}
+
+/// The stream `process.<name>` answers, made by the stdio module on the
+/// first look.
+fn open_stdio(ctx: &mut NativeCtx<'_>, stream: &StdioStream) -> Result<Value, NativeError> {
+    let cfg = process_host(ctx)?.cjs;
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
+        let opened = scope.get(process, stream.slot)?;
+        if !scope.is_undefined(opened) {
+            return Ok(scope.finish(opened));
+        }
+        let stdio = crate::commonjs::cjs_load_builtin(&mut scope, &cfg, STDIO_MODULE)?.ok_or_else(
+            || {
+                crate::runtime_type_error(
+                    "import",
+                    format!("no builtin module named '{STDIO_MODULE}'"),
+                )
+            },
+        )?;
+        let make = scope.get(stdio, "makeStdout")?;
+        let undefined = scope.undefined();
+        let fd = scope.number(f64::from(stream.fd));
+        let write = scope.native_call(stream.name, 1, NativeCall::Static(stream.write))?;
+        let opened = scope.call(make, undefined, &[fd, write])?;
+        scope.set(process, stream.slot, opened)?;
+        Ok(scope.finish(opened))
+    })
+}
+
+/// A program's own stream in place of `process.<name>`.
+fn replace_stdio(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    stream: &StdioStream,
+) -> Result<Value, NativeError> {
+    let replacement = args.first().copied().unwrap_or_else(Value::undefined);
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
+        let replacement = scope.value(replacement);
+        scope.set(process, stream.slot, replacement)?;
+        Ok(Value::undefined())
+    })
 }
 
 fn define_method_on(
@@ -908,19 +1055,20 @@ pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
 
 /// `process.cwd()` reads the same cell `process.chdir()` writes, so a move is
 /// visible to the very next call.
-fn cwd_call(cwd: crate::process_control::WorkingDirectory) -> NativeCall {
-    let call: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
-        let current = cwd.get();
-        Ok(otter_vm::Value::string(
-            JsString::from_str(&current.to_string_lossy(), ctx.heap_mut()).map_err(|err| {
-                NativeError::TypeError {
-                    name: "process.cwd",
-                    reason: err.to_string(),
-                }
-            })?,
-        ))
-    });
-    NativeCall::Dynamic(call)
+fn process_working_directory(
+    ctx: &mut NativeCtx<'_>,
+    _args: &[Value],
+) -> Result<Value, NativeError> {
+    let cwd = process_host(ctx)?.cwd;
+    let current = cwd.get();
+    Ok(otter_vm::Value::string(
+        JsString::from_str(&current.to_string_lossy(), ctx.heap_mut()).map_err(|err| {
+            NativeError::TypeError {
+                name: "process.cwd",
+                reason: err.to_string(),
+            }
+        })?,
+    ))
 }
 
 /// `process.exit([code])` — record the code on `exitCode` and dispatch
@@ -1223,12 +1371,10 @@ fn process_next_tick(
     Ok(Value::undefined())
 }
 
-fn uptime_call(start: Instant) -> NativeCall {
-    let call: Arc<NativeFn> = Arc::new(move |_ctx, _args, _captures| {
-        let seconds = start.elapsed().as_secs_f64();
-        Ok(Value::number(NumberValue::from_f64(seconds)))
-    });
-    NativeCall::Dynamic(call)
+fn process_uptime(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let start = process_host(ctx)?.start;
+    let seconds = start.elapsed().as_secs_f64();
+    Ok(Value::number(NumberValue::from_f64(seconds)))
 }
 
 fn process_memory_usage(
@@ -1360,76 +1506,88 @@ fn process_thread_cpu_usage(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
 /// `process.loadEnvFile([path])` — read a dotenv file and fold its entries
 /// into `process.env`, skipping variables the environment already defines
 /// (Node's `--env-file` precedence). The default path is `./.env` under the
-/// process working directory.
-fn load_env_file_call(cwd: crate::process_control::WorkingDirectory) -> NativeCall {
-    let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
-        let path_value = args.first().copied().unwrap_or_else(Value::undefined);
-        // Node reports the path exactly as the caller supplied it (the bare
-        // `.env` default included), while opening resolves against cwd.
-        let (path, reported_path) = if path_value.is_undefined() || path_value.is_null() {
-            (cwd.get().join(".env"), ".env".to_string())
-        } else if let Some(string) = path_value.as_string(ctx.heap()) {
-            let text = string.to_lossy_string(ctx.heap());
-            let candidate = PathBuf::from(&text);
-            let resolved = if candidate.is_absolute() {
-                candidate
-            } else {
-                cwd.get().join(candidate)
-            };
-            (resolved, text)
+/// process working directory. Reading the file takes the `read` capability
+/// for it, checked and refused the way `fs` refuses an open.
+fn process_load_env_file(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let ProcessHost {
+        cwd, capabilities, ..
+    } = process_host(ctx)?;
+    let path_value = args.first().copied().unwrap_or_else(Value::undefined);
+    // Node reports the path exactly as the caller supplied it (the bare
+    // `.env` default included), while opening resolves against cwd.
+    let (path, reported_path) = if path_value.is_undefined() || path_value.is_null() {
+        (cwd.get().join(".env"), ".env".to_string())
+    } else if let Some(string) = path_value.as_string(ctx.heap()) {
+        let text = string.to_lossy_string(ctx.heap());
+        let candidate = PathBuf::from(&text);
+        let resolved = if candidate.is_absolute() {
+            candidate
         } else {
-            return Err(NativeError::Coded {
-                kind: otter_vm::ErrorKind::TypeError,
-                code: "ERR_INVALID_ARG_TYPE",
-                message: format!(
-                    "The \"path\" argument must be of type string.{}",
-                    crate::process_control::received_suffix(ctx, path_value)
-                ),
-            });
+            cwd.get().join(candidate)
         };
+        (resolved, text)
+    } else {
+        return Err(NativeError::Coded {
+            kind: otter_vm::ErrorKind::TypeError,
+            code: "ERR_INVALID_ARG_TYPE",
+            message: format!(
+                "The \"path\" argument must be of type string.{}",
+                crate::process_control::received_suffix(ctx, path_value)
+            ),
+        });
+    };
 
-        let content = std::fs::read_to_string(&path).map_err(|err| NativeError::Syscall {
-            code: match err.kind() {
-                std::io::ErrorKind::NotFound => "ENOENT",
-                std::io::ErrorKind::PermissionDenied => "EACCES",
-                _ => "EIO",
-            },
-            message: format!("{err}"),
+    if !capabilities.read.matches_path(&path) {
+        return Err(NativeError::Syscall {
+            code: "EACCES",
+            message: format!("EACCES: permission denied, open '{reported_path}'"),
             syscall: "open",
-            path: Some(reported_path.clone()),
+            path: Some(reported_path),
             dest: None,
-            errno: err.raw_os_error().map(|raw| -raw).unwrap_or(-5),
-        })?;
-        let parsed = parse_env_content(&content);
+            // The runtime's own gate refused the open, not the platform.
+            errno: 0,
+        });
+    }
+    let content = std::fs::read_to_string(&path).map_err(|err| NativeError::Syscall {
+        code: match err.kind() {
+            std::io::ErrorKind::NotFound => "ENOENT",
+            std::io::ErrorKind::PermissionDenied => "EACCES",
+            _ => "EIO",
+        },
+        message: format!("{err}"),
+        syscall: "open",
+        path: Some(reported_path.clone()),
+        dest: None,
+        errno: err.raw_os_error().map(|raw| -raw).unwrap_or(-5),
+    })?;
+    let parsed = parse_env_content(&content);
 
-        let this_value = *ctx.this_value();
+    let this_value = *ctx.this_value();
+    ctx.scope(|mut scope| {
+        let process = scope.value(this_value);
         // `process.env` is a Proxy; writes must run through its trap, so the
         // stores go through `Reflect.set` rather than a plain object write.
-        let reflect = ctx.global_value("Reflect").ok_or(NativeError::TypeError {
+        // `Reflect` is rooted before the first read that can run a getter.
+        let reflect = scope.global("Reflect").ok_or(NativeError::TypeError {
             name: "process.loadEnvFile",
             reason: "Reflect is not available".to_string(),
         })?;
-        ctx.scope(|mut scope| {
-            let process = scope.value(this_value);
-            let env = scope.get(process, "env")?;
-            let reflect = scope.value(reflect);
-            let reflect_get = scope.get(reflect, "get")?;
-            let reflect_set = scope.get(reflect, "set")?;
-            for (key, value) in &parsed {
-                let key = scope.string(key)?;
-                let receiver = scope.undefined();
-                let existing = scope.call(reflect_get, receiver, &[env, key])?;
-                if !scope.is_undefined(existing) {
-                    continue;
-                }
-                let value = scope.string(value)?;
-                let receiver = scope.undefined();
-                scope.call(reflect_set, receiver, &[env, key, value])?;
+        let env = scope.get(process, "env")?;
+        let reflect_get = scope.get(reflect, "get")?;
+        let reflect_set = scope.get(reflect, "set")?;
+        for (key, value) in &parsed {
+            let key = scope.string(key)?;
+            let receiver = scope.undefined();
+            let existing = scope.call(reflect_get, receiver, &[env, key])?;
+            if !scope.is_undefined(existing) {
+                continue;
             }
-            Ok(Value::undefined())
-        })
-    });
-    NativeCall::Dynamic(call)
+            let value = scope.string(value)?;
+            let receiver = scope.undefined();
+            scope.call(reflect_set, receiver, &[env, key, value])?;
+        }
+        Ok(Value::undefined())
+    })
 }
 
 /// Parse dotenv content with Node's rules: optional `export ` prefix,
@@ -1622,11 +1780,10 @@ fn function_prototype_object(interp: &mut Interpreter) -> Option<otter_vm::objec
 
 fn hrtime_value<'s>(
     scope: &mut NativeScope<'s, '_>,
-    start: Instant,
     function_prototype: Option<Local<'_>>,
 ) -> Result<Local<'s>, NativeError> {
-    let function = scope.native_call("hrtime", 1, hrtime_call(start))?;
-    let bigint = scope.native_call("bigint", 0, hrtime_bigint_call(start))?;
+    let function = scope.native_call("hrtime", 1, NativeCall::Static(process_hrtime))?;
+    let bigint = scope.native_call("bigint", 0, NativeCall::Static(process_hrtime_bigint))?;
     let object = scope.bare_object()?;
     scope.set_callable(object, function)?;
     scope.set(object, "bigint", bigint)?;
@@ -1643,63 +1800,59 @@ fn hrtime_value<'s>(
     Ok(object)
 }
 
-fn hrtime_call(start: Instant) -> NativeCall {
-    let call: Arc<NativeFn> = Arc::new(move |ctx, args, _captures| {
-        let elapsed = start.elapsed();
-        let mut seconds = elapsed.as_secs() as i64;
-        let mut nanos = elapsed.subsec_nanos() as i64;
-        if let Some(argument) = args.first() {
-            let Some(previous) = argument.as_array() else {
-                return Err(NativeError::Coded {
-                    kind: otter_vm::ErrorKind::TypeError,
-                    code: "ERR_INVALID_ARG_TYPE",
-                    message: format!(
-                        "The \"time\" argument must be an instance of Array.{}",
-                        crate::process_control::received_suffix(ctx, *argument)
-                    ),
-                });
-            };
-            let length = otter_vm::array::len(previous, ctx.heap());
-            if length != 2 {
-                return Err(NativeError::Coded {
-                    kind: otter_vm::ErrorKind::RangeError,
-                    code: "ERR_OUT_OF_RANGE",
-                    message: format!(
-                        "The value of \"time\" is out of range. It must be 2. Received {length}"
-                    ),
-                });
-            }
-            let heap = ctx.heap_mut();
-            let prev_seconds = number_to_i64(&otter_vm::array::get(previous, heap, 0));
-            let prev_nanos = number_to_i64(&otter_vm::array::get(previous, heap, 1));
-            if let (Some(prev_seconds), Some(prev_nanos)) = (prev_seconds, prev_nanos) {
-                seconds -= prev_seconds;
-                nanos -= prev_nanos;
-                if nanos < 0 {
-                    seconds -= 1;
-                    nanos += 1_000_000_000;
-                }
+fn process_hrtime(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let start = process_host(ctx)?.start;
+    let elapsed = start.elapsed();
+    let mut seconds = elapsed.as_secs() as i64;
+    let mut nanos = elapsed.subsec_nanos() as i64;
+    if let Some(argument) = args.first() {
+        let Some(previous) = argument.as_array() else {
+            return Err(NativeError::Coded {
+                kind: otter_vm::ErrorKind::TypeError,
+                code: "ERR_INVALID_ARG_TYPE",
+                message: format!(
+                    "The \"time\" argument must be an instance of Array.{}",
+                    crate::process_control::received_suffix(ctx, *argument)
+                ),
+            });
+        };
+        let length = otter_vm::array::len(previous, ctx.heap());
+        if length != 2 {
+            return Err(NativeError::Coded {
+                kind: otter_vm::ErrorKind::RangeError,
+                code: "ERR_OUT_OF_RANGE",
+                message: format!(
+                    "The value of \"time\" is out of range. It must be 2. Received {length}"
+                ),
+            });
+        }
+        let heap = ctx.heap_mut();
+        let prev_seconds = number_to_i64(&otter_vm::array::get(previous, heap, 0));
+        let prev_nanos = number_to_i64(&otter_vm::array::get(previous, heap, 1));
+        if let (Some(prev_seconds), Some(prev_nanos)) = (prev_seconds, prev_nanos) {
+            seconds -= prev_seconds;
+            nanos -= prev_nanos;
+            if nanos < 0 {
+                seconds -= 1;
+                nanos += 1_000_000_000;
             }
         }
-        let values = [
-            Value::number(NumberValue::from_f64(seconds.max(0) as f64)),
-            Value::number(NumberValue::from_f64(nanos.max(0) as f64)),
-        ];
-        let array = ctx.array_from_elements(values)?;
-        Ok(Value::array(array))
-    });
-    NativeCall::Dynamic(call)
+    }
+    let values = [
+        Value::number(NumberValue::from_f64(seconds.max(0) as f64)),
+        Value::number(NumberValue::from_f64(nanos.max(0) as f64)),
+    ];
+    let array = ctx.array_from_elements(values)?;
+    Ok(Value::array(array))
 }
 
-fn hrtime_bigint_call(start: Instant) -> NativeCall {
-    let call: Arc<NativeFn> = Arc::new(move |ctx, _args, _captures| {
-        let nanos = start.elapsed().as_nanos().min(i128::MAX as u128) as i128;
-        ctx.scope(|mut scope| {
-            let value = scope.bigint_i128(nanos)?;
-            Ok(scope.finish(value))
-        })
-    });
-    NativeCall::Dynamic(call)
+fn process_hrtime_bigint(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let start = process_host(ctx)?.start;
+    let nanos = start.elapsed().as_nanos().min(i128::MAX as u128) as i128;
+    ctx.scope(|mut scope| {
+        let value = scope.bigint_i128(nanos)?;
+        Ok(scope.finish(value))
+    })
 }
 
 fn normalize_exit_code(value: &Value, heap: &otter_gc::GcHeap) -> Option<u8> {

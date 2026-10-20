@@ -113,6 +113,39 @@ impl otter_gc::trace::SeverRestoredPayload for FinalizationRegistryBody {
     }
 }
 
+/// Register every weak collection, `WeakRef` and `FinalizationRegistry` in
+/// `heap` with the collector's weak registries, as their allocation does.
+/// A restored image places these bodies without allocating them.
+pub(crate) fn register_restored_weak_bodies(heap: &mut otter_gc::GcHeap) {
+    let mut maps = Vec::new();
+    let mut sets = Vec::new();
+    let mut refs = Vec::new();
+    let mut registries = Vec::new();
+    heap.for_each_live_body(|_space, body| match body.type_tag() {
+        WEAK_MAP_BODY_TYPE_TAG => maps.extend(body.handle::<WeakMapBody>()),
+        WEAK_SET_BODY_TYPE_TAG => sets.extend(body.handle::<WeakSetBody>()),
+        WEAK_REF_BODY_TYPE_TAG => refs.extend(body.handle::<WeakRefBody>()),
+        FINALIZATION_REGISTRY_BODY_TYPE_TAG => {
+            registries.extend(body.handle::<FinalizationRegistryBody>());
+        }
+        _ => {}
+    });
+    for map in maps {
+        heap.register_ephemeron_table(map);
+    }
+    for set in sets {
+        heap.register_ephemeron_table(set);
+    }
+    for weak_ref in refs {
+        heap.register_ephemeron_table(weak_ref);
+        heap.register_weak_ref(weak_ref);
+    }
+    for registry in registries {
+        heap.register_ephemeron_table(registry);
+        heap.register_finalization_registry(registry);
+    }
+}
+
 /// Expose every cell target and unregister token as a weak key slot.
 ///
 /// Registries are registered as ephemeron tables so a scavenge rewrites a

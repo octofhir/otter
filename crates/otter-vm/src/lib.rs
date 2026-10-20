@@ -166,6 +166,7 @@ mod array_from_async;
 mod async_from_sync_iterator;
 mod conversion_protocol;
 mod forward_arguments;
+pub mod host_services;
 pub(crate) mod iteration_protocol;
 mod jit_call_admission;
 mod jit_forward_call;
@@ -239,6 +240,7 @@ pub mod runtime_state;
 pub mod runtime_stubs;
 pub mod snapshot;
 pub mod source_registry;
+pub mod startup_image;
 mod static_call_ops;
 mod static_load_ops;
 pub mod string;
@@ -1470,6 +1472,8 @@ pub struct Interpreter {
     /// Optional VM stack sampler used by CLI/debug tooling to emit Chrome
     /// `.cpuprofile` and folded-stack artifacts.
     cpu_profiler: Option<cpu_profile::CpuProfiler>,
+    /// Host state natives read by type. See [`host_services`].
+    host_services: host_services::HostServices,
 }
 
 impl std::fmt::Debug for Interpreter {

@@ -223,7 +223,7 @@ fn snapshot_relocates_managed_bag_and_rebuilds_only_numeric_indexed_records() {
     assert!(source.gc_heap_mut().gc_stats().minor_gc_cycles >= minors_before + 2);
     assert_eq!(source.gc_heap().census().young.object_count, 0);
     let image = source.capture_isolate_snapshot().unwrap();
-    assert!(image.array_indexed_records.iter().any(|record| {
+    assert!(image.array_indexed_records.iter().any(|(_, record)| {
         !record.length_writable
             && record
                 .property_flags

@@ -192,6 +192,23 @@ fn restored_runtime_evaluates_javascript() {
             "class QM extends Map {} const m = new QM(); m.set(1, 2); m.get(1).toString()",
             "2",
         ),
+        (
+            "bootstrap host objects get their payloads back",
+            "const bytes = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]); \
+             [WebAssembly.validate(bytes), new WebAssembly.Memory({initial: 1}).buffer.byteLength, \
+              WebAssembly.JSTag instanceof WebAssembly.Tag].join()",
+            "true,65536,true",
+        ),
+        (
+            "performance measures from this run",
+            "(performance.now() < 60000 && Math.abs(performance.timeOrigin - Date.now()) < 60000).toString()",
+            "true",
+        ),
+        (
+            "registered symbols stay registered",
+            "Symbol.keyFor(Object.getOwnPropertySymbols(new EventTarget())[0])",
+            "otter.EventTarget.events",
+        ),
     ];
     for (name, source, expected) in steps {
         let got = restored
@@ -271,10 +288,12 @@ fn in_process_restored_isolate_survives_allocation_pressure() {
 }
 
 #[test]
-fn a_donor_finalization_registry_severs_on_restore() {
-    // Seed the registry inside the bootstrap, the way an extension's
-    // install script would: the donor captures under tenure-all, so
-    // registry cells land in old space and ride the image.
+fn bootstrap_weak_bodies_keep_working_after_restore() {
+    // Seed weak bodies inside the bootstrap, the way an extension's install
+    // script would: the donor captures under tenure-all, so registry cells
+    // and weak tables land in old space and ride the image. A restore severs
+    // the registry's cells, relocates the weak tables' entries and puts every
+    // weak body back in the collector's weak registries.
     let snapshot = {
         let source = otter_runtime::Runtime::builder()
             .with_node_apis()
@@ -284,7 +303,10 @@ fn a_donor_finalization_registry_severs_on_restore() {
                 ctx.install_script(otter_runtime::SourceInput::from_javascript(
                     "globalThis.__fr = new FinalizationRegistry(function(){}); \
                      globalThis.__wr = new WeakRef(globalThis); \
-                     for (var i = 0; i < 64; i++) { __fr.register({t: i}, i, {u: i}); }",
+                     for (var i = 0; i < 64; i++) { __fr.register({t: i}, i, {u: i}); } \
+                     globalThis.__wm = new WeakMap(); globalThis.__wmKeys = []; \
+                     for (var i = 0; i < 16; i++) { var k = {k: i}; __wmKeys.push(k); __wm.set(k, {v: i}); } \
+                     globalThis.__wmEmpty = new WeakMap();",
                 ))
             }))
             .build()
@@ -297,10 +319,15 @@ fn a_donor_finalization_registry_severs_on_restore() {
     restored.force_gc().expect("full GC over severed registry");
     let probe = restored
         .eval(otter_runtime::SourceInput::from_javascript(
-            "var junk; for (var i = 0; i < 200000; i++) { junk = {a: i}; }             JSON.stringify([typeof __fr, __wr.deref() === undefined || __wr.deref() === globalThis])",
+            "var fresh = []; \
+             for (var i = 0; i < 2000; i++) { var k = {i: i}; fresh.push(k); __wmEmpty.set(k, {v: i}); } \
+             var junk; for (var r = 0; r < 20; r++) { for (var i = 0; i < 100000; i++) { junk = {a: i}; } } \
+             JSON.stringify([typeof __fr, __wr.deref() === undefined || __wr.deref() === globalThis, \
+               __wmKeys.every(function (k, i) { return __wm.get(k).v === i; }), \
+               fresh.every(function (k, i) { var e = __wmEmpty.get(k); return e !== undefined && e.v === i; })])",
         ))
         .expect("eval after severed-registry GC");
-    assert_eq!(probe.completion_string(), r#"["object",true]"#);
+    assert_eq!(probe.completion_string(), r#"["object",true,true,true]"#);
 }
 
 #[test]
@@ -330,4 +357,20 @@ fn restore_is_cheaper_than_bootstrap() {
         restore < build,
         "restoring ({restore:?}) must beat rebuilding ({build:?})"
     );
+}
+
+#[test]
+fn a_startup_image_names_no_closure() {
+    // Every native the bootstrap makes is a static entry: the image carries
+    // no host closure a later process would have to re-create, and an
+    // encode that met one would refuse.
+    fn check(runtime: &otter_runtime::Runtime) {
+        let bytes = runtime.encode_startup_image().expect("encode");
+        assert!(!bytes.is_empty());
+    }
+    check(&full_surface_runtime());
+    let bare = otter_runtime::Runtime::builder()
+        .build()
+        .expect("bare runtime");
+    check(&bare);
 }

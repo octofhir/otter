@@ -43,9 +43,11 @@ build:
 gen-pow10:
     cargo run -p otter-vm-codegen --bin gen-pow10 --release
 
-# Build release
+# Build release, then write its startup image into the binary (launches
+# restore it instead of bootstrapping). Sign after this step.
 release:
     cargo build --release -p otter-cli
+    target/release/otter startup-image target/release/otter
 
 # Run CLI with arguments
 run *args:

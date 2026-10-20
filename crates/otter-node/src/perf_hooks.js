@@ -16,7 +16,7 @@ class PerformanceEntry {
   toJSON() { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }; }
 }
 class PerformanceMark extends PerformanceEntry {
-  constructor(name, options) { super(name, 'mark', Date.now() - timeOrigin, 0, options && options.detail); }
+  constructor(name, options) { super(name, 'mark', performance.now(), 0, options && options.detail); }
 }
 class PerformanceMeasure extends PerformanceEntry {
   constructor(name, start, duration, detail) { super(name, 'measure', start, duration, detail); }

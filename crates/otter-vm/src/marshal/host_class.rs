@@ -148,6 +148,12 @@ impl HostInstance {
         self.class_name
     }
 
+    /// The concrete type of the stored data.
+    #[must_use]
+    pub(crate) fn data_type(&self) -> TypeId {
+        <dyn Any>::type_id(self.data.as_ref())
+    }
+
     /// View the stored data as ancestor type `T`, walking the class's
     /// declared parent chain.
     #[must_use]

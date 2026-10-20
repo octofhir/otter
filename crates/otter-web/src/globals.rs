@@ -10,19 +10,17 @@
 //! for `crypto` (see [`crate::crypto`]) are implemented. `fetch()` is a JS
 //! shim over the private `__nativeFetch` transport (see [`crate::fetch_ext`]).
 
-use std::sync::Arc;
-
 use otter_runtime::{
     OtterError, RuntimeExtensionContext, RuntimeExtensionInstaller, RuntimeNativeCall,
-    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError, RuntimeNativeFn,
-    RuntimeValue as Value, SourceInput, runtime_arg_to_string, runtime_string_value,
-    runtime_type_error,
+    RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
+    RuntimeNumberValue as NumberValue, RuntimeValue as Value, SourceInput, runtime_arg_to_string,
+    runtime_string_value, runtime_type_error,
 };
 
 /// Installer for the Web function globals. Registered by `with_web_apis`.
 #[must_use]
 pub fn web_globals_installer() -> RuntimeExtensionInstaller {
-    RuntimeExtensionInstaller::new(install)
+    RuntimeExtensionInstaller::new(install).with_run_services(install_run_services)
 }
 
 fn install(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
@@ -32,23 +30,21 @@ fn install(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> 
     runtime.install_native_global("structuredClone", 1, structured_clone)?;
     // `fetch()` itself is the JS shim in `web_fetch.js`; it normalizes its
     // arguments and calls this private native transport member, which the shim
-    // consumes and deletes. The complete immutable capability evaluator is
-    // captured at install time and checks the initial URL plus every redirect.
-    let transport = otter_runtime::web_fetch_host::FetchTransport::new(
-        runtime.capability_evaluator(),
-        format!("Otter/{}", env!("CARGO_PKG_VERSION")),
-    );
-    let fetch_call: Arc<RuntimeNativeFn> =
-        Arc::new(move |ctx, args, _captures| crate::fetch_ext::native_fetch(ctx, args, &transport));
+    // consumes and deletes. The run's transport, with its complete immutable
+    // capability evaluator, is a host service that checks the initial URL plus
+    // every redirect.
     runtime.install_native_global_call(
         "__nativeFetch",
         5,
-        RuntimeNativeCall::Dynamic(fetch_call),
+        RuntimeNativeCall::Static(native_fetch),
     )?;
     runtime.install_native_global("__otterStreamCodec", 3, stream_codec)?;
     // The VM offers every `"use asm"` function to this hook before running
     // its body.
     runtime.install_native_global("__otterAsmLink", 5, crate::wasm::asm::link_native)?;
+    // The `performance` clock: the bootstrap consumes and deletes both.
+    runtime.install_native_global("__otterPerformanceNow", 0, performance_now)?;
+    runtime.install_native_global("__otterPerformanceTimeOrigin", 0, performance_time_origin)?;
     install_navigator(runtime)?;
     install_self(runtime)?;
     install_promise_rejection_handling(runtime)?;
@@ -329,4 +325,67 @@ fn stream_codec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         .global_value("Uint8Array")
         .ok_or_else(|| runtime_type_error("CompressionStream", "Uint8Array is unavailable"))?;
     ctx.construct(ctor, &[Value::array_buffer(buffer)])
+}
+
+/// `__nativeFetch` over this run's capability-bound transport.
+fn native_fetch(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let transport = ctx
+        .host_service::<otter_runtime::web_fetch_host::FetchTransport>()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "fetch",
+            reason: "the fetch transport is not installed".to_string(),
+        })?;
+    crate::fetch_ext::native_fetch(ctx, args, &transport)
+}
+
+/// The origin `performance` measures from: when this run began, as a
+/// monotonic instant and as milliseconds since the epoch.
+#[derive(Clone, Copy)]
+struct PerformanceClock {
+    origin: std::time::Instant,
+    origin_epoch_ms: f64,
+}
+
+impl PerformanceClock {
+    fn starting_now() -> Self {
+        let since_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        Self {
+            origin: std::time::Instant::now(),
+            origin_epoch_ms: since_epoch.as_secs_f64() * 1000.0,
+        }
+    }
+}
+
+fn performance_clock(ctx: &NativeCtx<'_>) -> Result<PerformanceClock, NativeError> {
+    ctx.host_service::<PerformanceClock>()
+        .ok_or_else(|| runtime_type_error("performance", "the clock is not installed"))
+}
+
+/// `performance.now()`: milliseconds since this run's origin.
+fn performance_now(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let clock = performance_clock(ctx)?;
+    Ok(Value::number(NumberValue::from_f64(
+        clock.origin.elapsed().as_secs_f64() * 1000.0,
+    )))
+}
+
+/// `performance.timeOrigin`: this run's origin in milliseconds since the epoch.
+fn performance_time_origin(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    let clock = performance_clock(ctx)?;
+    Ok(Value::number(NumberValue::from_f64(clock.origin_epoch_ms)))
+}
+
+/// This run's host services: the fetch transport bound to its capability
+/// policy, the `performance` clock, and the WebAssembly realm payloads a
+/// restore severed.
+fn install_run_services(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
+    let transport = otter_runtime::web_fetch_host::FetchTransport::new(
+        runtime.capability_evaluator(),
+        format!("Otter/{}", env!("CARGO_PKG_VERSION")),
+    );
+    runtime.insert_host_service(transport);
+    runtime.insert_host_service(PerformanceClock::starting_now());
+    crate::wasm::restore_run_state(runtime)
 }

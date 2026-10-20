@@ -415,10 +415,12 @@ impl std::fmt::Debug for RuntimeGlobalInstaller {
 /// [`embedding`], which deliberately does not re-export this type.
 #[derive(Clone)]
 pub struct RuntimeExtensionInstaller {
-    install: Arc<
-        dyn for<'a> Fn(&mut RuntimeExtensionContext<'a>) -> Result<(), OtterError> + Send + Sync,
-    >,
+    install: Arc<ExtensionInstallFn>,
+    run_services: Option<Arc<ExtensionInstallFn>>,
 }
+
+type ExtensionInstallFn =
+    dyn for<'a> Fn(&mut RuntimeExtensionContext<'a>) -> Result<(), OtterError> + Send + Sync;
 
 impl RuntimeExtensionInstaller {
     /// Build an advanced installer from a sendable callback.
@@ -431,11 +433,40 @@ impl RuntimeExtensionInstaller {
     ) -> Self {
         Self {
             install: Arc::new(install),
+            run_services: None,
         }
     }
 
+    /// Also install this run's host services with `services`: the
+    /// per-isolate state the extension's static natives read
+    /// ([`RuntimeExtensionContext::insert_host_service`]). It runs before the
+    /// installer on a build, and alone on a runtime restored from a startup
+    /// image, whose heap already holds everything the installer made.
+    #[must_use]
+    pub fn with_run_services(
+        mut self,
+        services: impl for<'a> Fn(&mut RuntimeExtensionContext<'a>) -> Result<(), OtterError>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.run_services = Some(Arc::new(services));
+        self
+    }
+
     fn install(&self, realm: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
+        self.install_run_services(realm)?;
         (self.install)(realm)
+    }
+
+    fn install_run_services(
+        &self,
+        realm: &mut RuntimeExtensionContext<'_>,
+    ) -> Result<(), OtterError> {
+        match &self.run_services {
+            Some(services) => services(realm),
+            None => Ok(()),
+        }
     }
 }
 
@@ -470,6 +501,24 @@ impl ConfiguredRealmInstaller {
                 let mut realm =
                     RuntimeExtensionContext::new(interp, capabilities, hooks, runtime_task_spawner);
                 installer.install(&mut realm)
+            }
+        }
+    }
+
+    /// Only this run's host services, for a realm a startup image restored.
+    fn install_run_services(
+        &self,
+        interp: &mut otter_vm::Interpreter,
+        capabilities: &CapabilitySet,
+        hooks: &RuntimeHooks,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    ) -> Result<(), OtterError> {
+        match self {
+            Self::Global(_) => Ok(()),
+            Self::Extension(installer) => {
+                let mut realm =
+                    RuntimeExtensionContext::new(interp, capabilities, hooks, runtime_task_spawner);
+                installer.install_run_services(&mut realm)
             }
         }
     }
@@ -2105,6 +2154,9 @@ pub(crate) struct RuntimeConfig {
     gc_trace: bool,
     /// Whether each run's result carries the runtime's execution statistics.
     execution_stats: bool,
+    /// Restore from the executable's startup image in place of the
+    /// bootstrap, when it carries one written for this same API surface.
+    startup_image: bool,
 }
 
 /// Which execution tiers a runtime installs at construction.
@@ -2188,6 +2240,41 @@ impl RuntimeModuleLoaderState {
         cfg.resource_account = resource_account.clone();
         module_loader::ModuleLoader::with_config(cfg)
     }
+}
+
+/// What decides the heap a bootstrap builds: this executable's build and
+/// the API surface, not the run. A startup image restores only for a
+/// configuration with the same fingerprint as the one that wrote it; an
+/// executable with no linker build identity has none.
+fn surface_fingerprint(config: &RuntimeConfig) -> Option<u64> {
+    let build = otter_vm::startup_image::build_identity()?;
+    let mut surface = String::new();
+    for byte in build {
+        surface.push_str(&format!("{byte:02x}"));
+    }
+    surface.push('|');
+    for extension in &config.extensions {
+        surface.push_str(extension.name);
+        surface.push(',');
+    }
+    surface.push_str(&format!(
+        "|{} classes|{} realm installers|{} hosted|commonjs {}|process {}|worker {}|gc {}|{}",
+        config.global_classes.len(),
+        config.realm_installers.len(),
+        config.hosted_modules.len(),
+        config.commonjs_enabled,
+        config.install_process_global,
+        config.install_worker_global,
+        config.expose_gc,
+        env!("CARGO_PKG_VERSION"),
+    ));
+    Some(
+        surface
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+            }),
+    )
 }
 
 /// The one CommonJS configuration every `require` of a runtime shares, so
@@ -2443,6 +2530,7 @@ impl Default for RuntimeConfig {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            startup_image: false,
             process_env_overlay: std::collections::BTreeMap::new(),
             tracer_factory: None,
             cpu_profile_interval: None,
@@ -2869,6 +2957,17 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Restore from the executable's startup image instead of running the
+    /// bootstrap, when it carries one written for the same API surface this
+    /// builder declares ([`Runtime::encode_startup_image`],
+    /// [`otter_vm::startup_image::write_into_executable`]); otherwise build as
+    /// usual.
+    #[must_use]
+    pub fn startup_image(mut self, restore: bool) -> Self {
+        self.config.startup_image = restore;
+        self
+    }
+
     /// Set the `process.cwd()` snapshot installed into the runtime.
     #[must_use]
     pub fn process_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
@@ -3121,7 +3220,8 @@ impl Runtime {
             resource_leases,
             kind,
         } = Self::admit_config(config, RuntimeAdmissionKind::Direct)?;
-        let runtime = Self::assemble_restored(&snapshot.isolate, config, None)?;
+        let mut runtime = Self::assemble_restored(&snapshot.isolate, config, None)?;
+        runtime.attach_run_state(None)?;
         Ok(runtime.with_admission(resource_leases, kind))
     }
 
@@ -3254,8 +3354,88 @@ impl Runtime {
             resource_leases,
             kind,
         } = admitted;
-        let runtime = Self::build_from_config(config, runtime_task_spawner)?;
+        let image = config
+            .startup_image
+            .then(otter_vm::startup_image::StartupImage::of_this_executable)
+            .flatten();
+        let restored = match image {
+            Some(image) => {
+                Self::restore_startup_image(image, &config, runtime_task_spawner.clone())?
+            }
+            None => None,
+        };
+        let runtime = match restored {
+            Some(runtime) => runtime,
+            None => Self::build_from_config(config, runtime_task_spawner)?,
+        };
         Ok(runtime.with_admission(resource_leases, kind))
+    }
+
+    /// A runtime restored from `image` for `config`, or `None` when the image
+    /// was written for another API surface or does not read as one; the
+    /// caller then bootstraps. The restored heap holds everything the
+    /// bootstrap made; this run's own state — the `process` properties and
+    /// every host service a static native reads — is installed afresh.
+    fn restore_startup_image(
+        image: otter_vm::startup_image::StartupImage,
+        config: &RuntimeConfig,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    ) -> Result<Option<Self>, OtterError> {
+        let mut input = image.reader();
+        let Some(fingerprint) = surface_fingerprint(config) else {
+            return Ok(None);
+        };
+        if input.u64() != Some(fingerprint) {
+            return Ok(None);
+        }
+        let Some(snapshot) = image.snapshot(&mut input, &config.resource_account) else {
+            return Ok(None);
+        };
+        let mut runtime =
+            Self::assemble_restored(&snapshot, config.clone(), runtime_task_spawner.clone())?;
+        runtime.enforce_direct_timeout = runtime_task_spawner.is_none();
+        runtime.attach_run_state(runtime_task_spawner)?;
+        Ok(Some(runtime))
+    }
+
+    /// Give a restored runtime this run's own state: the `process`
+    /// properties and every host service a static native reads.
+    fn attach_run_state(
+        &mut self,
+        runtime_task_spawner: Option<RuntimeTaskSpawner>,
+    ) -> Result<(), OtterError> {
+        let runtime = self;
+        let config = &runtime.config;
+        if config.install_process_global {
+            process::reattach_after_restore(
+                &mut runtime.interp,
+                config.process_argv.as_deref(),
+                &config.process_exec_argv,
+                &config.process_cwd,
+                &config.process_env_overlay,
+                &config.capabilities,
+                &config.hooks,
+                &config.warning_options,
+                config.process_title.as_deref(),
+                runtime_task_spawner.as_ref(),
+                &runtime.commonjs,
+            )?;
+        }
+        if runtime.config.install_worker_global {
+            worker::insert_main_worker_host(runtime);
+        }
+        let realm_installers = runtime.config.realm_installers.clone();
+        let capabilities = runtime.config.capabilities.clone();
+        let hooks = runtime.config.hooks.clone();
+        for installer in realm_installers {
+            installer.install_run_services(
+                &mut runtime.interp,
+                &capabilities,
+                &hooks,
+                runtime_task_spawner.clone(),
+            )?;
+        }
+        Ok(())
     }
 
     /// Build an isolate while its already-charged admission lease remains in
@@ -5514,6 +5694,29 @@ impl Runtime {
         })
     }
 
+    /// This built runtime as a startup image: its heap, code and side state
+    /// as bytes a later process of this same executable restores.
+    ///
+    /// # Errors
+    /// Propagates [`otter_gc::ImageError`] from the capture; refuses an
+    /// executable without a linker build identity, and a heap that calls
+    /// natives closing over host state, which no launch could re-create.
+    pub fn encode_startup_image(&self) -> Result<Vec<u8>, otter_gc::ImageError> {
+        let fingerprint =
+            surface_fingerprint(&self.config).ok_or(otter_gc::ImageError::NoBuildIdentity)?;
+        let snapshot = self.interp.capture_isolate_snapshot()?;
+        let natives = self.interp.startup_native_names(&snapshot);
+        if !natives.is_empty() {
+            return Err(otter_gc::ImageError::DynamicNatives {
+                count: natives.len(),
+            });
+        }
+        let mut out = otter_gc::image_codec::ImageWriter::new();
+        out.u64(fingerprint);
+        snapshot.encode(&mut out, &natives);
+        Ok(out.into_bytes())
+    }
+
     /// This realm's `globalThis` as a GC handle, for callers that need
     /// the object identity rather than a JS value.
     #[must_use]
@@ -7271,6 +7474,13 @@ impl OtterBuilder {
         self
     }
 
+    /// See [`RuntimeBuilder::startup_image`].
+    #[must_use]
+    pub fn startup_image(mut self, restore: bool) -> Self {
+        self.runtime = self.runtime.startup_image(restore);
+        self
+    }
+
     /// Allow the main thread to park in `Atomics.wait`.
     ///
     /// Node permits the block; an embedder without a cancellation path
@@ -7492,6 +7702,40 @@ impl OtterBuilder {
     pub fn jit_debug(mut self, request: JitDebugRequest) -> Self {
         self.runtime = self.runtime.jit_debug(request);
         self
+    }
+
+    /// Bootstrap the runtime this builder declares, encode it as the
+    /// executable's startup image and write it into the executable file at
+    /// `executable` ([`otter_vm::startup_image::write_into_executable`]);
+    /// answers the image's length.
+    ///
+    /// # Errors
+    /// Returns [`OtterError`] if the bootstrap, the capture or the write
+    /// fails.
+    pub fn write_startup_image(self, executable: &std::path::Path) -> Result<usize, OtterError> {
+        let image = self.encode_startup_image()?;
+        otter_vm::startup_image::write_into_executable(executable, &image).map_err(|error| {
+            OtterError::Internal {
+                code: DiagnosticCode::IsolateStart.as_str().to_string(),
+                message: format!("startup image write failed: {error}"),
+            }
+        })?;
+        Ok(image.len())
+    }
+
+    /// Bootstrap the runtime this builder declares and encode it as the
+    /// executable's startup image ([`Runtime::encode_startup_image`]).
+    ///
+    /// # Errors
+    /// Returns [`OtterError`] if the bootstrap or the capture fails.
+    pub fn encode_startup_image(self) -> Result<Vec<u8>, OtterError> {
+        let runtime = self.runtime.startup_image(false).build()?;
+        runtime
+            .encode_startup_image()
+            .map_err(|error| OtterError::Internal {
+                code: DiagnosticCode::IsolateStart.as_str().to_string(),
+                message: format!("startup image capture failed: {error}"),
+            })
     }
 
     /// Construct the public async facade.

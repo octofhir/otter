@@ -283,6 +283,55 @@ impl<'a> RuntimeExtensionContext<'a> {
         }
     }
 
+    /// Run `body` in a native handle scope of this realm, with its global
+    /// object rooted, for installers that build accessors or other surfaces
+    /// the plain global installers do not cover.
+    ///
+    /// # Errors
+    /// The body's native error, as a bootstrap failure.
+    pub fn with_global_scope(
+        &mut self,
+        body: impl for<'scope, 'rt> FnOnce(
+            &mut crate::RuntimeNativeScope<'scope, 'rt>,
+            crate::RuntimeLocal<'scope>,
+        ) -> Result<(), crate::RuntimeNativeError>,
+    ) -> Result<(), OtterError> {
+        let global = *self.realm.interp.global_this();
+        let result = otter_vm::NativeCtx::with_host_context(
+            self.realm.interp,
+            otter_vm::NativeCallInfo::default_call(),
+            None,
+            |ctx| {
+                ctx.scope(|mut scope| {
+                    let global = scope.value(otter_vm::Value::object(global));
+                    body(&mut scope, global)
+                })
+            },
+        );
+        result.map_err(|error| OtterError::Internal {
+            code: crate::DiagnosticCode::GlobalClassBootstrap
+                .as_str()
+                .to_string(),
+            message: format!("realm installer failed: {error}"),
+        })
+    }
+
+    /// Install one per-isolate host service a static native reads by type
+    /// through `ctx.host_service::<T>()`, in place of state a closure would
+    /// capture. See [`otter_vm::host_services::HostServices`].
+    pub fn insert_host_service<T: std::any::Any + Send + Sync>(&mut self, service: T) {
+        self.realm.interp.insert_host_service(service);
+    }
+
+    /// Declare that this extension's run services give its bootstrap host
+    /// objects with a payload of type `T` fresh payloads after a restore
+    /// ([`crate::RuntimeNativeScope::restore_host_data`]). A startup image
+    /// refuses a host object whose payload type nobody declared, since a
+    /// restore severs every payload.
+    pub fn declare_restorable_host_data<T: std::any::Any>(&mut self) {
+        self.realm.interp.declare_restorable_host_data::<T>();
+    }
+
     /// Install a static native function as a realm global.
     pub fn install_native_global(
         &mut self,

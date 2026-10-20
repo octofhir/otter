@@ -346,6 +346,85 @@ pub(crate) fn clone_host_refs_for_restore(
     }
 }
 
+/// A closure that captures nothing, entered through one monomorphic static
+/// function: the body is fully named by its type, so the callable needs no
+/// heap-held closure and stays a static entry a startup image carries.
+fn zero_sized_entry<F>(
+    ctx: &mut NativeCtx<'_>,
+    args: &[Value],
+    captures: &[Value],
+) -> Result<Value, NativeError>
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>,
+{
+    // SAFETY: only the closure storage constructors take this entry, and
+    // only for a zero-sized `F`: an aligned dangling pointer is then a valid
+    // reference to its one value, whose original the constructor forgot.
+    let call = unsafe { std::ptr::NonNull::<F>::dangling().as_ref() };
+    call(ctx, args, captures)
+}
+
+/// The storage of a host closure: a static capture entry when it captures
+/// nothing, a shared closure otherwise.
+fn shared_closure_storage<F>(call: F) -> NativeCallStorage
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+        + Send
+        + Sync
+        + 'static,
+{
+    if std::mem::size_of::<F>() == 0 {
+        std::mem::forget(call);
+        return NativeCallStorage::StaticWithCaptures(zero_sized_entry::<F>);
+    }
+    NativeCallStorage::Dynamic(Arc::new(call))
+}
+
+/// [`shared_closure_storage`] for an isolate-local closure.
+fn local_closure_storage<F>(call: F) -> NativeCallStorage
+where
+    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+{
+    if std::mem::size_of::<F>() == 0 {
+        std::mem::forget(call);
+        return NativeCallStorage::StaticWithCaptures(zero_sized_entry::<F>);
+    }
+    NativeCallStorage::LocalDynamic(Arc::new(call))
+}
+
+/// Every dynamic native's host-reference index and display name, in
+/// index order: how a startup image names the closures it cannot carry.
+pub(crate) fn dynamic_native_names(heap: &otter_gc::GcHeap) -> Vec<(u32, String)> {
+    let mut names: Vec<(u32, String)> = Vec::new();
+    heap.for_each_live_payload::<NativeFunctionBody, _>(|_space, body| {
+        if let Some(index) = body.call_header.host_ref() {
+            names.push((index, body.name.to_lossy_string(heap)));
+        }
+    });
+    names.sort_by_key(|entry| entry.0);
+    names.dedup_by(|a, b| a.0 == b.0);
+    names
+}
+
+/// Move every static native entry point of `heap` by `slide`, the distance
+/// the program image moved since its startup image was written.
+pub(crate) fn slide_static_entries(heap: &otter_gc::GcHeap, slide: isize) {
+    let mut bodies: Vec<*mut NativeFunctionBody> = Vec::new();
+    heap.for_each_live_payload::<NativeFunctionBody, _>(|_space, body| {
+        bodies.push(body as *const NativeFunctionBody as *mut NativeFunctionBody);
+    });
+    for body in bodies {
+        // SAFETY: single mutator, no allocation since the walk; each pointer
+        // names a live native function body.
+        unsafe { (*body).call_header.slide_entry(slide) };
+    }
+}
+
+/// The isolate-local helper closure a startup image names `name`.
+pub(crate) fn local_dynamic_native(_name: &str) -> Option<Arc<LocalNativeFn>> {
+    None
+}
+
 /// Collect the dynamic-native closures of `heap`'s host-ref table for
 /// the in-process snapshot, Arc-cloned at their indices.
 pub(crate) fn snapshot_dynamic_natives(
@@ -851,7 +930,7 @@ impl NativeFunction {
             heap,
             name,
             length,
-            NativeCallStorage::Dynamic(Arc::new(call)),
+            shared_closure_storage(call),
             captures,
             NativeFunctionMetadata::BUILTIN,
             &mut external_visit,
@@ -1484,7 +1563,7 @@ where
         heap,
         name,
         length,
-        NativeCallStorage::Dynamic(Arc::new(call)),
+        shared_closure_storage(call),
         captures,
         NativeFunctionMetadata::BUILTIN,
         external_visit,
@@ -1505,7 +1584,7 @@ where
         heap,
         name,
         0,
-        NativeCallStorage::LocalDynamic(Arc::new(call)),
+        local_closure_storage(call),
         captures,
         NativeFunctionMetadata::BUILTIN,
         external_visit,
@@ -1527,7 +1606,7 @@ where
         heap,
         name,
         length,
-        NativeCallStorage::LocalDynamic(Arc::new(call)),
+        local_closure_storage(call),
         captures,
         NativeFunctionMetadata::BUILTIN,
         external_visit,
@@ -2125,8 +2204,16 @@ mod tests {
     fn dynamic_native_host_ref_slot_is_released_when_the_body_dies() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let baseline = interp.gc_heap().host_refs().len();
-        let f = native_value(interp.gc_heap_mut(), "closure", |_, _, _| {
+        // A closure that captures nothing is a static capture entry, with
+        // no host closure to intern.
+        let _static = native_value(interp.gc_heap_mut(), "static", |_, _, _| {
             Ok(Value::undefined())
+        })
+        .expect("native");
+        assert_eq!(interp.gc_heap().host_refs().len(), baseline);
+        let state = std::sync::Arc::new(7_u32);
+        let f = native_value(interp.gc_heap_mut(), "closure", move |_, _, _| {
+            Ok(Value::number_i32(*state as i32))
         })
         .expect("native");
         assert_eq!(
@@ -2160,8 +2247,9 @@ mod tests {
     #[test]
     fn host_ref_clone_preserves_indices() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
-        let _f = native_value(interp.gc_heap_mut(), "cloned", |_, _, _| {
-            Ok(Value::undefined())
+        let state = std::sync::Arc::new(7_u32);
+        let _f = native_value(interp.gc_heap_mut(), "cloned", move |_, _, _| {
+            Ok(Value::number_i32(*state as i32))
         })
         .expect("native");
         let mut target = otter_gc::GcHeap::new().expect("target heap");

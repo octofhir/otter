@@ -16,69 +16,67 @@
 
 use std::ffi::CString;
 
-use otter_vm::{
-    ErrorKind, Local, NativeCall, NativeCtx, NativeError, NativeFn, NativeScope, Value,
-};
-
-use crate::CapabilitySet;
+use otter_vm::{ErrorKind, Local, NativeCall, NativeCtx, NativeError, NativeScope, Value};
 
 pub(crate) fn install(
     scope: &mut NativeScope<'_, '_>,
     process: Local<'_>,
-    capabilities: &CapabilitySet,
 ) -> Result<(), NativeError> {
     if !cfg!(unix) {
         return Ok(());
     }
-    crate::process::define_process_method(scope, process, "execve", 3, execve_call(capabilities))
+    crate::process::define_process_method(
+        scope,
+        process,
+        "execve",
+        3,
+        NativeCall::Static(process_execve),
+    )
 }
 
-fn execve_call(capabilities: &CapabilitySet) -> NativeCall {
-    let capabilities = capabilities.clone();
-    let call: std::sync::Arc<NativeFn> = std::sync::Arc::new(move |ctx, args, _captures| {
-        let exec_path = args.first().copied().unwrap_or_else(Value::undefined);
-        let Some(exec_path) = exec_path.as_string(ctx.heap()) else {
-            return Err(invalid_arg_type(ctx, "execPath", "string", exec_path));
-        };
-        let exec_path = exec_path.to_lossy_string(ctx.heap());
+fn process_execve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let capabilities = crate::process::process_host(ctx)?.capabilities;
+    let exec_path = args.first().copied().unwrap_or_else(Value::undefined);
+    let Some(exec_path) = exec_path.as_string(ctx.heap()) else {
+        return Err(invalid_arg_type(ctx, "execPath", "string", exec_path));
+    };
+    let exec_path = exec_path.to_lossy_string(ctx.heap());
 
-        let argv = collect_args(ctx, args.get(1).copied())?;
-        let env = collect_env(ctx, args.get(2).copied())?;
+    let argv = collect_args(ctx, args.get(1).copied())?;
+    let env = collect_env(ctx, args.get(2).copied())?;
 
-        if !capabilities.run.matches(&exec_path) {
-            return Err(NativeError::Coded {
-                kind: ErrorKind::Error,
-                code: "EACCES",
-                message: format!("EACCES: permission denied, execve '{exec_path}'"),
-            });
-        }
+    if !capabilities.run.matches(&exec_path) {
+        return Err(NativeError::Coded {
+            kind: ErrorKind::Error,
+            code: "EACCES",
+            message: format!("EACCES: permission denied, execve '{exec_path}'"),
+        });
+    }
 
-        // Capabilities belong to the process, not to the argv the caller
-        // composes: a re-exec of this engine keeps its grants the way a real
-        // execve keeps the credentials of the process. The flag is consumed
-        // by the CLI parser, so the replacement's `process.argv` still shows
-        // exactly what the caller passed.
-        let all_granted = matches!(capabilities.read, crate::Permission::AllowAll)
-            && matches!(capabilities.write, crate::Permission::AllowAll)
-            && matches!(capabilities.net, crate::Permission::AllowAll)
-            && matches!(capabilities.env, crate::Permission::AllowAll)
-            && matches!(capabilities.run, crate::Permission::AllowAll)
-            && matches!(capabilities.ffi, crate::Permission::AllowAll);
-        let argv = if all_granted
-            && std::path::Path::new(&exec_path)
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("otter"))
-        {
-            let mut argv = argv;
-            argv.insert(1.min(argv.len()), "--allow-all".to_string());
-            argv
-        } else {
-            argv
-        };
+    // Capabilities belong to the process, not to the argv the caller
+    // composes: a re-exec of this engine keeps its grants the way a real
+    // execve keeps the credentials of the process. The flag is consumed
+    // by the CLI parser, so the replacement's `process.argv` still shows
+    // exactly what the caller passed.
+    let all_granted = matches!(capabilities.read, crate::Permission::AllowAll)
+        && matches!(capabilities.write, crate::Permission::AllowAll)
+        && matches!(capabilities.net, crate::Permission::AllowAll)
+        && matches!(capabilities.env, crate::Permission::AllowAll)
+        && matches!(capabilities.run, crate::Permission::AllowAll)
+        && matches!(capabilities.ffi, crate::Permission::AllowAll);
+    let argv = if all_granted
+        && std::path::Path::new(&exec_path)
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("otter"))
+    {
+        let mut argv = argv;
+        argv.insert(1.min(argv.len()), "--allow-all".to_string());
+        argv
+    } else {
+        argv
+    };
 
-        replace_process_image(&exec_path, &argv, &env)
-    });
-    NativeCall::Dynamic(call)
+    replace_process_image(&exec_path, &argv, &env)
 }
 
 /// Read the `args` array. Node requires an array of strings without NUL and

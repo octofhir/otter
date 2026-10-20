@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn exact_shared_scope_source_and_bounded_producer() {
         let text = assemble(SOURCES, MAX_SOURCE_BYTES).expect("bounded source");
-        assert_eq!(text.len(), 122_817);
+        assert_eq!(text.len(), 123_493);
         assert!(assemble(SOURCES, text.len() - 1).is_err());
         let out = tempfile::tempdir().expect("producer directory");
         generate(out.path()).expect("actual bounded producer");

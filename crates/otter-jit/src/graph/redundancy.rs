@@ -100,6 +100,7 @@ fn origin_free(kind: &Kind) -> bool {
             | Kind::CheckShapes { .. }
             | Kind::CheckElements { .. }
             | Kind::CheckElementPresent
+            | Kind::LoadPresentElement
             | Kind::LoadOwnField { .. }
             | Kind::LoadTaggedField(_)
             | Kind::LoadContextParent

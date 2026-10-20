@@ -111,7 +111,10 @@ fn assert_refreshed_accesses(built: &Built, before_pc: u32, after_pc: u32) -> [N
             .nodes
             .iter()
             .enumerate()
-            .find(|(_, node)| node.pc == pc && matches!(node.kind, Kind::LoadElement(_)))
+            .find(|(_, node)| {
+                node.pc == pc
+                    && matches!(node.kind, Kind::LoadElement(_) | Kind::LoadPresentElement)
+            })
             .map(|(index, _)| NodeId(index as u32))
             .expect("own specialized array load")
     };
@@ -135,7 +138,7 @@ fn assert_refreshed_accesses(built: &Built, before_pc: u32, after_pc: u32) -> [N
 }
 
 #[test]
-fn boxed_load_proves_own_presence_before_native_read_and_recovers_its_exact_pc() {
+fn boxed_load_proves_own_presence_as_it_reads_and_recovers_its_exact_pc() {
     let mut view = snapshot(
         90,
         2,
@@ -146,34 +149,28 @@ fn boxed_load_proves_own_presence_before_native_read_and_recovers_its_exact_pc()
     let transitions = crate::entry::TransitionTable::resolve();
     let compiled = crate::graph::compile(&view, 7007, &transitions, None, false).unwrap();
     let graph = &compiled.built.graph;
+    assert!(
+        !graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == Kind::CheckElementPresent),
+        "the read proves its own slot"
+    );
     let (guard_id, guard) = graph
         .nodes
         .iter()
         .enumerate()
-        .find(|(_, node)| node.kind == Kind::CheckElementPresent)
+        .find(|(_, node)| node.kind == Kind::LoadPresentElement)
         .map(|(index, node)| (NodeId(index as u32), node))
-        .expect("prototype-only admission requires an own-present proof");
-    let (load_id, load) = graph
-        .nodes
-        .iter()
-        .enumerate()
-        .find(|(_, node)| node.kind == Kind::LoadElement(JitElementRepr::Boxed))
-        .map(|(index, node)| (NodeId(index as u32), node))
-        .expect("own specialized boxed read");
-    assert_eq!(guard.inputs, load.inputs);
+        .expect("prototype-only admission requires an own-present read");
     assert_eq!(guard.pc, 0);
     assert!(guard.eager.is_some() && guard.lazy.is_none());
     assert!(!guard.kind.properties().may_collect);
     let offsets = &compiled.emission.node_offsets;
     let guard_position = offsets.iter().position(|(_, id)| *id == guard_id).unwrap();
-    let load_position = offsets.iter().position(|(_, id)| *id == load_id).unwrap();
-    assert!(
-        guard_position < load_position,
-        "guard executes before the value read"
-    );
     assert!(
         offsets[guard_position + 1].0 > offsets[guard_position].0,
-        "the own-presence check emits real native instructions"
+        "the own-presence read emits real native instructions"
     );
     let exit_index = compiled
         .emission

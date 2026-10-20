@@ -110,6 +110,17 @@ impl Codegen<'_> {
                 self.load_immediate(11, tag::VALUE_HOLE);
                 dynasm!(self.ops ; .arch x64 ; mov r10d, Rd(input(1)) ; cmp [Rq(input(0)) + r10 * 8], r11 ; je =>exit);
             }
+            Kind::LoadPresentElement => {
+                let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
+                let destination = Self::gp(self.loc(node).result.expect("a result"));
+                self.load_immediate(11, tag::VALUE_HOLE);
+                // The result lands only after the check: the exit may still
+                // read either input's register.
+                dynasm!(self.ops ; .arch x64
+                    ; mov r10d, Rd(input(1)) ; mov r10, [Rq(input(0)) + r10 * 8]
+                    ; cmp r10, r11 ; je =>exit
+                    ; mov Rq(destination), r10);
+            }
             Kind::CheckHoleyElementPresent(holes) => {
                 let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
                 self.emit_hole_bit(holes, input(0), input(1));

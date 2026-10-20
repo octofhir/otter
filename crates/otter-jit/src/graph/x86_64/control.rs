@@ -128,15 +128,27 @@ impl<'a> Codegen<'a> {
                             ; je =>false_label
                             ; jmp =>true_label);
                     }
+                    // An equality whose true successor follows leaves for
+                    // the false one on inequality.
                     BranchKind::TaggedEqual => {
                         let a = Self::gp(allocation.inputs[0]);
                         let b = Self::gp(allocation.inputs[1]);
-                        dynasm!(self.ops ; .arch x64 ; cmp Rq(a), Rq(b) ; je =>true_label);
+                        dynasm!(self.ops ; .arch x64 ; cmp Rq(a), Rq(b));
+                        if next == Some(if_true) {
+                            dynasm!(self.ops ; .arch x64 ; jne =>false_label);
+                            return Ok(());
+                        }
+                        dynasm!(self.ops ; .arch x64 ; je =>true_label);
                     }
                     BranchKind::WordEqual(bits) => {
                         let a = Self::gp(allocation.inputs[0]);
                         self.load_immediate(10, u64::from(bits));
-                        dynasm!(self.ops ; .arch x64 ; cmp Rq(a), r10 ; je =>true_label);
+                        dynasm!(self.ops ; .arch x64 ; cmp Rq(a), r10);
+                        if next == Some(if_true) {
+                            dynasm!(self.ops ; .arch x64 ; jne =>false_label);
+                            return Ok(());
+                        }
+                        dynasm!(self.ops ; .arch x64 ; je =>true_label);
                     }
                     BranchKind::Nullish => {
                         let a = Self::gp(allocation.inputs[0]);
@@ -153,7 +165,12 @@ impl<'a> Codegen<'a> {
                             .produces_boolean() =>
                     {
                         let a = Self::gp(allocation.inputs[0]);
-                        dynasm!(self.ops ; .arch x64 ; cmp Rq(a), tag::VALUE_TRUE as i32 ; je =>true_label);
+                        dynasm!(self.ops ; .arch x64 ; cmp Rq(a), tag::VALUE_TRUE as i32);
+                        if next == Some(if_true) {
+                            dynasm!(self.ops ; .arch x64 ; jne =>false_label);
+                            return Ok(());
+                        }
+                        dynasm!(self.ops ; .arch x64 ; je =>true_label);
                     }
                     BranchKind::Truthy => {
                         let a = Self::gp(allocation.inputs[0]);

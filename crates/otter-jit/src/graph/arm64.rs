@@ -538,6 +538,14 @@ impl<'a> Codegen<'a> {
     }
 
     /// The int32 constant at `location`, if it is one.
+    /// The value of `node`'s input `index` when it is an int32 constant.
+    fn input_int32_constant(&self, node: NodeId, index: usize) -> Option<i32> {
+        match self.graph.node(self.graph.node(node).inputs[index]).kind {
+            Kind::ConstInt32(value) => Some(value),
+            _ => None,
+        }
+    }
+
     fn int32_constant(&self, location: Location) -> Option<i32> {
         match location {
             Location::Constant(node) => match self.graph.node(node).kind {
@@ -1101,6 +1109,23 @@ impl<'a> Codegen<'a> {
                     dynasm!(self.ops ; .arch aarch64 ; mov W(destination), w16);
                 }
             }
+            // A positive constant factor never makes `-0`: a zero product
+            // has a zero, not a negative, other factor.
+            Kind::Int32Mul
+                if self.input_int32_constant(node, 0).is_some_and(|c| c > 0)
+                    || self.input_int32_constant(node, 1).is_some_and(|c| c > 0) =>
+            {
+                let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::gp(result.expect("a result"));
+                let overflow = self.eager_exit(node, DeoptReason::Overflow);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; smull x16, W(a), W(b)
+                    ; cmp x16, w16, sxtw
+                    ; b.ne =>overflow
+                    ; mov W(destination), w16
+                );
+            }
             Kind::Int32Mul => {
                 let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
                 let destination = Self::gp(result.expect("a result"));
@@ -1178,13 +1203,15 @@ impl<'a> Codegen<'a> {
             Kind::Int32Mod => {
                 let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
                 let destination = Self::gp(result.expect("a result"));
-                let exit = self.eager_exit(node, DeoptReason::LostPrecision);
                 let minus_zero = self.eager_exit(node, DeoptReason::MinusZero);
                 let done = self.ops.new_dynamic_label();
+                // A nonzero constant divisor needs no zero test.
+                if self.input_int32_constant(node, 1).is_none_or(|c| c == 0) {
+                    let exit = self.eager_exit(node, DeoptReason::LostPrecision);
+                    dynasm!(self.ops ; .arch aarch64 ; cmp WSP(b), #0 ; b.eq =>exit);
+                }
                 dynasm!(self.ops
                     ; .arch aarch64
-                    ; cmp WSP(b), #0
-                    ; b.eq =>exit
                     ; sdiv w16, W(a), W(b)
                     ; msub w16, w16, W(b), W(a)
                     ; cbnz w16, =>done
@@ -1625,6 +1652,17 @@ impl<'a> Codegen<'a> {
                 dynasm!(self.ops ; .arch aarch64 ; ldr x16, [X(base), W(index), uxtw #3]);
                 self.load_immediate(17, VALUE_HOLE);
                 dynasm!(self.ops ; .arch aarch64 ; cmp x16, x17 ; b.eq =>exit);
+            }
+            Kind::LoadPresentElement => {
+                let (base, index) = (Self::gp(input(0)), Self::gp(input(1)));
+                let destination = Self::gp(result.expect("a result"));
+                let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
+                // The result lands only after the check: the exit may still
+                // read either input's register.
+                dynasm!(self.ops ; .arch aarch64 ; ldr x16, [X(base), W(index), uxtw #3]);
+                self.load_immediate(17, VALUE_HOLE);
+                dynasm!(self.ops ; .arch aarch64 ; cmp x16, x17 ; b.eq =>exit
+                    ; mov X(destination), x16);
             }
             Kind::LoadElementsLength { byte, width } => {
                 let receiver = Self::gp(input(0));
@@ -5166,6 +5204,37 @@ impl<'a> Codegen<'a> {
                         let operand = self.int32_operand(allocation.inputs[1]);
                         self.emit_int32_compare(a, operand);
                         self.emit_branch_condition(condition, false, true_target);
+                    }
+                    // An equality whose true successor follows leaves for
+                    // the false one on inequality.
+                    BranchKind::TaggedEqual if next == Some(if_true) => {
+                        let (a, b) = (
+                            Self::gp(allocation.inputs[0]),
+                            Self::gp(allocation.inputs[1]),
+                        );
+                        let false_target = self.cond_target(false_label);
+                        dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b) ; b.ne =>false_target);
+                        return Ok(());
+                    }
+                    BranchKind::WordEqual(constant) if next == Some(if_true) => {
+                        let a = Self::gp(allocation.inputs[0]);
+                        let false_target = self.cond_target(false_label);
+                        self.load_immediate(16, u64::from(constant));
+                        dynasm!(self.ops ; .arch aarch64 ; cmp X(a), x16 ; b.ne =>false_target);
+                        return Ok(());
+                    }
+                    BranchKind::Truthy
+                        if next == Some(if_true)
+                            && self.graph.node(data.inputs[0]).kind.produces_boolean() =>
+                    {
+                        let a = Self::gp(allocation.inputs[0]);
+                        let false_target = self.cond_target(false_label);
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; cmp XSP(a), VALUE_TRUE as u32
+                            ; b.ne =>false_target
+                        );
+                        return Ok(());
                     }
                     BranchKind::Float64(condition) => {
                         let (a, b) = (

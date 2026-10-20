@@ -24,6 +24,8 @@
 //! - A block entered from outside the graph (function or OSR entry) or with
 //!   no predecessor starts unchecked; a join is checked only when every
 //!   predecessor leaves checked.
+//! - A method load of a proved receiver whose value nothing reads, frame
+//!   states included, goes like a proof.
 //! - Each removed proof is dominated, within an effect-free stretch, by a
 //!   kept test, and keeps no frame state. A method load or layout-proved
 //!   global read reached unchecked gets a test of its own before it,
@@ -92,6 +94,26 @@ fn method_validity(
         .guard
         .prototype_validity
         .map(|validity| validity.address)
+}
+
+/// Every node some node or frame state of the graph reads.
+fn used_values(graph: &Graph) -> rustc_hash::FxHashSet<NodeId> {
+    let mut used = rustc_hash::FxHashSet::default();
+    for block in &graph.blocks {
+        for &node in block
+            .phis
+            .iter()
+            .chain(&block.body)
+            .chain(block.control.iter())
+        {
+            let data = graph.node(node);
+            used.extend(data.inputs.iter().copied());
+            for state in [data.eager, data.lazy].into_iter().flatten() {
+                used.extend(graph.state_values(state));
+            }
+        }
+    }
+    used
 }
 
 /// The slot-layout proof a global-object binding read at `byte_pc` reads
@@ -196,13 +218,28 @@ pub(crate) fn place(
             break;
         }
     }
+    // A method load of a proved receiver whose value nothing reads is, like
+    // a proof, only the generation's subscription to its chain: at most a
+    // flag test.
+    let used = used_values(graph);
+    let value_free = |graph: &Graph, node: NodeId| {
+        methods.contains(&node)
+            && !used.contains(&node)
+            && matches!(
+                graph.node(node).kind,
+                Kind::LoadGuardedMethod {
+                    receiver_proved: true,
+                    ..
+                }
+            )
+    };
     let mut tests = Vec::new();
     let mut removed = Vec::new();
     let mut guarded_loads = Vec::new();
     for block in 0..count {
         let mut checked = entry_state(graph, &checked_out, block);
         for &node in &graph.blocks[block].body {
-            if is_proof(&graph.node(node).kind) {
+            if is_proof(&graph.node(node).kind) || value_free(graph, node) {
                 if checked {
                     removed.push(node);
                 } else {
@@ -220,7 +257,10 @@ pub(crate) fn place(
         }
     }
     for node in tests {
-        graph.node_mut(node).kind = Kind::CheckDependencies;
+        let data = graph.node_mut(node);
+        data.kind = Kind::CheckDependencies;
+        data.inputs.clear();
+        data.repr = Repr::None;
     }
     for (block, load) in guarded_loads {
         let (pc, origin, eager) = {

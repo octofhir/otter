@@ -4654,12 +4654,11 @@ impl<'a> Builder<'a> {
         let receiver = self.read(instruction.reads[0]);
         let receiver = self.tagged(receiver);
         let (fact, index) = self.element_address(receiver, instruction.reads[1], access);
-        if access.element == JitElementRepr::Boxed {
-            // The descriptor admits a prototype-only sidecar. Prove an own
-            // slot before reading: a hole must use committed prototype lookup.
-            self.add(Kind::CheckElementPresent, &[fact.base, index], Repr::None);
-        }
+        // A boxed read proves an own slot as it reads: the descriptor admits
+        // a prototype-only sidecar, so a hole must use committed prototype
+        // lookup.
         let kind = match access.element {
+            JitElementRepr::Boxed => Kind::LoadPresentElement,
             JitElementRepr::Float64 if let Some(holes) = access.holes => {
                 Kind::LoadHoleyFloat64Element(holes)
             }
@@ -4682,11 +4681,9 @@ impl<'a> Builder<'a> {
                 &[fact.base, index],
                 Repr::Tagged,
             ),
-            JitElementRepr::Boxed => self.add(
-                Kind::LoadElement(access.element),
-                &[fact.base, index],
-                Repr::Tagged,
-            ),
+            JitElementRepr::Boxed => {
+                self.add(Kind::LoadPresentElement, &[fact.base, index], Repr::Tagged)
+            }
             JitElementRepr::Float32 | JitElementRepr::Float64 => self.add(
                 Kind::LoadElement(access.element),
                 &[fact.base, index],

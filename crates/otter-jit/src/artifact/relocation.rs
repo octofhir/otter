@@ -1171,20 +1171,20 @@ fn build_logical_items(
     let mut offset = 0;
     let mut relocation_index = 0;
     while offset < code.len() {
-        if data
-            .iter()
-            .any(|&(start, end)| (start..end).contains(&offset))
-        {
-            items.push(LogicalItem::DataWord { offset });
-            offset += 4;
-        } else if relocation_index < relocations.len()
-            && relocations[relocation_index].start() == offset
-        {
+        // A pool word holding a symbol's address is data that names its
+        // target: it normalizes as that target, never as its process value.
+        if relocation_index < relocations.len() && relocations[relocation_index].start() == offset {
             items.push(LogicalItem::Relocation {
                 index: relocation_index,
             });
             offset = relocations[relocation_index].end();
             relocation_index += 1;
+        } else if data
+            .iter()
+            .any(|&(start, end)| (start..end).contains(&offset))
+        {
+            items.push(LogicalItem::DataWord { offset });
+            offset += 4;
         } else {
             items.push(LogicalItem::RawInstruction { offset });
             offset += 4;
@@ -2292,15 +2292,23 @@ mod tests {
     #[test]
     fn an_emitted_literal_pool_is_data_whatever_its_constants_decode_as() {
         use dynasmrt::dynasm;
-        let mut capture = RelocationCapture::new(true).with_literal_pool();
-        let mut ops = dynasmrt::aarch64::Assembler::new().unwrap();
-        // The low word of this constant encodes `b` far outside the code.
+        // The low word of this constant encodes `b` far outside the code. A
+        // symbol's pool word normalizes as its target, so the same code
+        // with the symbol at another address normalizes the same.
         let constant = 0x1234_5678_17ff_0000;
-        assert!(capture.emit_constant_load(&mut ops, 17, constant));
-        dynasm!(ops ; .arch aarch64 ; ret);
-        capture.emit_literal_pool(&mut ops);
-        let code = ops.finalize().unwrap();
-        capture.render(&code).expect("pool words are data");
+        let render = |address: u64| {
+            let mut capture = RelocationCapture::new(true).with_literal_pool();
+            let mut ops = dynasmrt::aarch64::Assembler::new().unwrap();
+            assert!(capture.emit_constant_load(&mut ops, 17, constant));
+            assert!(capture.emit_literal_load(&mut ops, 16, address, runtime_stub()));
+            dynasm!(ops ; .arch aarch64 ; ret);
+            capture.emit_literal_pool(&mut ops);
+            let code = ops.finalize().unwrap();
+            capture.render(&code).expect("pool words are data")
+        };
+        let first = render(0x0000_0001_0203_0405);
+        let second = render(0x0000_0006_0708_090a);
+        assert_eq!(first.normalized_code, second.normalized_code);
     }
 
     #[cfg(target_arch = "aarch64")]

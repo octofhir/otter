@@ -137,12 +137,12 @@ fn structured_jit_events_are_typed() {
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(400)",
+             { s = s + i; } return s; } hot(20000)",
         )
         .output()
         .expect("run with structured JIT events");
     assert_success(&output);
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "79800");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "199990000");
 
     let report: serde_json::Value =
         serde_json::from_slice(&std::fs::read(events_path).expect("read JIT events"))
@@ -159,9 +159,20 @@ fn structured_jit_events_are_typed() {
     assert_eq!(events[0]["target"]["kind"], "osr");
     assert!(events[0]["functionId"].is_u64());
     assert!(events[0].get("function_id").is_none());
-    assert_eq!(events[1]["type"], "compileFinished");
-    assert_eq!(events[1]["outcome"]["kind"], "compiled");
-    assert!(events[1]["outcome"]["codeBytes"].is_u64());
+    // An optimizing compile runs in the background, so a baseline compile
+    // may be prepared and finish in between: a finish follows its own
+    // preparation, not the event before it.
+    let finished = events
+        .iter()
+        .position(|event| event["type"] == "compileFinished")
+        .expect("a finished compile");
+    assert_eq!(events[finished]["outcome"]["kind"], "compiled");
+    assert!(events[finished]["outcome"]["codeBytes"].is_u64());
+    assert!(events[..finished].iter().any(|event| {
+        event["type"] == "compilePrepared"
+            && event["tier"] == events[finished]["tier"]
+            && event["functionId"] == events[finished]["functionId"]
+    }));
 }
 
 #[test]
@@ -173,7 +184,7 @@ fn abrupt_failure_still_writes_partial_jit_events() {
         .arg("--eval")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(400); throw new Error('expected');",
+             { s = s + i; } return s; } hot(20000); throw new Error('expected');",
         )
         .output()
         .expect("run abrupt JIT event capture");
@@ -218,7 +229,7 @@ fn late_timeout_preserves_earlier_file_jit_events() {
     std::fs::write(
         &first,
         "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-         { s = s + i; } return s; } hot(400);",
+         { s = s + i; } return s; } hot(20000);",
     )
     .expect("write first entry");
     std::fs::write(&second, "while (true) {}").expect("write timed-out entry");
@@ -253,7 +264,7 @@ fn late_input_error_preserves_earlier_file_jit_events() {
     std::fs::write(
         &first,
         "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-         { s = s + i; } return s; } hot(400);",
+         { s = s + i; } return s; } hot(20000);",
     )
     .expect("write first entry");
     std::fs::create_dir(&invalid).expect("create invalid source directory");
@@ -288,12 +299,12 @@ fn jit_artifacts_are_complete_and_offset_consistent() {
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(400)",
+             { s = s + i; } return s; } hot(20000)",
         )
         .output()
         .expect("run with JIT artifact capture");
     assert_success(&output);
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "79800");
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "199990000");
 
     let index: serde_json::Value = serde_json::from_slice(
         &std::fs::read(artifacts_path.join("index.json")).expect("read artifact index"),
@@ -433,7 +444,7 @@ fn capture_portable_production_code(
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(400)",
+             { s = s + i; } return s; } hot(20000)",
         )
         .output()
         .expect("run portable artifact capture");
@@ -443,7 +454,15 @@ fn capture_portable_production_code(
         &std::fs::read(artifacts_path.join("index.json")).expect("read artifact index"),
     )
     .expect("valid artifact index");
-    let bundle = index["bundles"][0].as_str().expect("first bundle");
+    // The baseline compile runs on the isolate thread; an optimizing one in
+    // the background may or may not finish before the process ends.
+    let bundle = index["bundles"]
+        .as_array()
+        .expect("bundle directories")
+        .iter()
+        .filter_map(|bundle| bundle.as_str())
+        .find(|bundle| bundle.contains("-template-"))
+        .expect("a baseline bundle");
     let bundle_path = artifacts_path.join(bundle);
     let normalized =
         std::fs::read(bundle_path.join("code-normalized.bin")).expect("read normalized code");
@@ -484,7 +503,7 @@ fn abrupt_failure_still_writes_partial_jit_artifacts() {
         .arg("--eval")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(400); throw new Error('expected-artifact-error');",
+             { s = s + i; } return s; } hot(20000); throw new Error('expected-artifact-error');",
         )
         .output()
         .expect("run abrupt artifact capture");
@@ -525,7 +544,7 @@ fn existing_artifact_target_is_not_overwritten() {
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(400)",
+             { s = s + i; } return s; } hot(20000)",
         )
         .output()
         .expect("run against existing artifact target");
@@ -568,7 +587,7 @@ fn artifact_persistence_still_runs_when_event_write_fails() {
         .arg("--print")
         .arg(
             "function hot(n) { let s = 0; for (let i = 0; i < n; i = i + 1) \
-             { s = s + i; } return s; } hot(400)",
+             { s = s + i; } return s; } hot(20000)",
         )
         .output()
         .expect("run independent diagnostic writes");

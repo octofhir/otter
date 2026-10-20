@@ -391,6 +391,9 @@ pub(crate) enum Kind {
     },
     /// Eager deopt if the boxed element at `input0 + input1 * 8` is a hole.
     CheckElementPresent,
+    /// The boxed element at `input0 + input1 * 8`; eager deopt if it is a
+    /// hole, which only the committed prototype lookup may answer.
+    LoadPresentElement,
     /// Eager deopt if the hole bitmap of numeric storage with element base
     /// input0 marks index input1.
     CheckHoleyElementPresent(JitHoleBitmap),
@@ -903,6 +906,7 @@ impl Kind {
             | Self::LoadNamedProperty { .. }
             | Self::CheckElements { .. }
             | Self::CheckElementPresent
+            | Self::LoadPresentElement
             | Self::CheckHoleyElementPresent(_)
             | Self::LoadHoleyFloat64Element(_)
             | Self::LoadArrayLength { .. }
@@ -1167,6 +1171,7 @@ impl Kind {
             | Self::Float64Div
             | Self::Float64Compare(_)
             | Self::LoadElement(_)
+            | Self::LoadPresentElement
             | Self::LoadElementUint32ToFloat64 => simple(2, ResultPolicy::Register),
             Self::LoadHoleyFloat64Element(_) => Constraints {
                 inputs: registers(2),

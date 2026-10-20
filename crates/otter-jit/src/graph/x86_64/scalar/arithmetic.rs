@@ -54,8 +54,21 @@ impl Codegen<'_> {
             Kind::Int32Mul => {
                 let (a, b, dst) = self.scalar_gp_binary(node);
                 let overflow = self.eager_exit(node, DeoptReason::Overflow);
-                let minus_zero = self.eager_exit(node, DeoptReason::MinusZero);
-                emit_mul(&mut self.ops, a, b, dst, overflow, minus_zero);
+                // A positive constant factor never makes `-0`: a zero
+                // product has a zero, not a negative, other factor.
+                let positive = |index: usize| {
+                    matches!(
+                        self.graph.node(self.graph.node(node).inputs[index]).kind,
+                        Kind::ConstInt32(c) if c > 0
+                    )
+                };
+                if positive(0) || positive(1) {
+                    dynasm!(self.ops ; .arch x64
+                        ; mov r10d, Rd(a) ; imul r10d, Rd(b) ; jo =>overflow ; mov Rd(dst), r10d);
+                } else {
+                    let minus_zero = self.eager_exit(node, DeoptReason::MinusZero);
+                    emit_mul(&mut self.ops, a, b, dst, overflow, minus_zero);
+                }
             }
             Kind::Int32MulExact => {
                 let (a, b, dst) = self.scalar_gp_binary(node);

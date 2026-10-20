@@ -234,6 +234,7 @@ fn proves_inputs(kind: &Kind) -> bool {
         Kind::CheckShapes { .. }
         | Kind::CheckElements { .. }
         | Kind::CheckElementPresent
+        | Kind::LoadPresentElement
         | Kind::CheckHoleyElementPresent(_)
         | Kind::CheckBounds
         | Kind::CheckNumber
@@ -348,9 +349,9 @@ fn heap_effects(kind: &Kind) -> Effects {
         Kind::LoadContextParent | Kind::LoadClosureContext => Effects::default(),
         Kind::CheckFunctionPrototypeCall(_) => Effects::reads(&[H::Fields, H::MapWords]),
         Kind::CheckElements { .. } => Effects::reads(&[H::ElementStorage, H::MapWords]),
-        Kind::CheckElementPresent | Kind::CheckHoleyElementPresent(_) => {
-            Effects::deref(&[H::Elements])
-        }
+        Kind::CheckElementPresent
+        | Kind::LoadPresentElement
+        | Kind::CheckHoleyElementPresent(_) => Effects::deref(&[H::Elements]),
         Kind::LoadOwnField { atom, .. } => Effects::deref(&[H::Field(*atom)]),
         Kind::LoadTaggedField(offset) => Effects::reads(&[H::ContextSlot(*offset)]),
         Kind::LoadArrayLength { array_proved } => {

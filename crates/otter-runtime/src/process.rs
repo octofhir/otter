@@ -10,8 +10,9 @@
 //! - `process.env` is capability-filtered at install time and never bypasses
 //!   the runtime's deny-by-default policy or secret denylist.
 //! - Default arguments are declarative absence until installation. One host
-//!   snapshot supplies the default argv, execPath, pid/ppid and uptime base;
-//!   explicit arguments (including an empty list) remain distinct inputs.
+//!   snapshot supplies the default argv, execPath and pid/ppid; uptime counts
+//!   from installation. Explicit arguments (including an empty list) remain
+//!   distinct inputs.
 //! - Host data is copied into JS-owned values. This module does not expose VM
 //!   internals across the public runtime boundary.
 //! - `process.binding()` is present for Node shape compatibility but remains
@@ -31,7 +32,6 @@ use otter_vm::{
     Attr, Interpreter, JsString, Local, NativeCall, NativeCtx, NativeError, NativeFn, NativeScope,
     NumberValue, Value,
 };
-use sysinfo::{ProcessesToUpdate, System};
 
 use crate::{CapabilitySet, DiagnosticCode, OtterError, RuntimeHooks};
 
@@ -64,7 +64,6 @@ pub(crate) fn install_global(
         default_argv = [snapshot.exec_path.clone()];
         &default_argv
     };
-    let uptime_base_secs = snapshot.run_time_secs;
     let start = Instant::now();
     let function_prototype = function_prototype_object(interp);
     let global_object = *interp.global_this();
@@ -213,7 +212,7 @@ pub(crate) fn install_global(
                     ),
                     ("nextTick", 1, NativeCall::Static(process_next_tick)),
                     ("binding", 1, NativeCall::Static(process_binding)),
-                    ("uptime", 0, uptime_call(start, uptime_base_secs)),
+                    ("uptime", 0, uptime_call(start)),
                     ("cpuUsage", 1, NativeCall::Static(process_cpu_usage)),
                     (
                         "threadCpuUsage",
@@ -1224,9 +1223,9 @@ fn process_next_tick(
     Ok(Value::undefined())
 }
 
-fn uptime_call(start: Instant, base_secs: Option<u64>) -> NativeCall {
+fn uptime_call(start: Instant) -> NativeCall {
     let call: Arc<NativeFn> = Arc::new(move |_ctx, _args, _captures| {
-        let seconds = base_secs.map_or(0.0, |secs| secs as f64) + start.elapsed().as_secs_f64();
+        let seconds = start.elapsed().as_secs_f64();
         Ok(Value::number(NumberValue::from_f64(seconds)))
     });
     NativeCall::Dynamic(call)
@@ -1236,8 +1235,7 @@ fn process_memory_usage(
     ctx: &mut NativeCtx<'_>,
     _args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
-    let snapshot = runtime_process_snapshot();
-    let rss = snapshot.memory_bytes.unwrap_or(0) as f64;
+    let rss = crate::process_info::resident_bytes().unwrap_or(0) as f64;
     let heap_used = ctx.interp_mut().gc_heap_mut().gc_stats().live_bytes as f64;
     let heap_total = heap_used;
     ctx.scope(|mut scope| {
@@ -1566,6 +1564,7 @@ fn process_cpu_times_micros() -> (f64, f64) {
 
 #[cfg(not(unix))]
 fn process_cpu_times_micros() -> (f64, f64) {
+    use sysinfo::{ProcessesToUpdate, System};
     let mut system = System::new();
     system.refresh_processes(
         ProcessesToUpdate::Some(&[sysinfo::get_current_pid().unwrap()]),
@@ -1584,9 +1583,9 @@ fn process_available_memory(
     _ctx: &mut NativeCtx<'_>,
     _args: &[Value],
 ) -> Result<Value, NativeError> {
-    let mut system = System::new();
-    system.refresh_memory();
-    Ok(Value::number_f64(system.available_memory() as f64))
+    Ok(Value::number_f64(
+        crate::process_info::available_memory().unwrap_or(0) as f64,
+    ))
 }
 
 fn process_constrained_memory(
@@ -1760,52 +1759,21 @@ struct RuntimeProcessSnapshot {
     pid: u32,
     ppid: Option<u32>,
     exec_path: String,
-    run_time_secs: Option<u64>,
-    memory_bytes: Option<u64>,
 }
 
 fn runtime_process_snapshot() -> RuntimeProcessSnapshot {
-    let fallback_pid = std::process::id();
     // Node's `process.execPath` is the fully resolved binary path
     // (`fs.realpathSync(process.execPath)` is an identity); a relative or
     // symlinked spawn path must not leak through.
-    let fallback_exec_path = std::env::current_exe()
+    let exec_path = std::env::current_exe()
         .ok()
         .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "otter".to_string());
-    let Ok(pid) = sysinfo::get_current_pid() else {
-        return RuntimeProcessSnapshot {
-            pid: fallback_pid,
-            ppid: None,
-            exec_path: fallback_exec_path,
-            run_time_secs: None,
-            memory_bytes: None,
-        };
-    };
-
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-    let Some(process) = system.process(pid) else {
-        return RuntimeProcessSnapshot {
-            pid: fallback_pid,
-            ppid: None,
-            exec_path: fallback_exec_path,
-            run_time_secs: None,
-            memory_bytes: None,
-        };
-    };
-
     RuntimeProcessSnapshot {
-        pid: pid.as_u32(),
-        ppid: process.parent().map(|pid| pid.as_u32()),
-        exec_path: process
-            .exe()
-            .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or(fallback_exec_path),
-        run_time_secs: Some(process.run_time()),
-        memory_bytes: Some(process.memory()),
+        pid: std::process::id(),
+        ppid: crate::process_info::parent_pid(),
+        exec_path,
     }
 }
 

@@ -1,7 +1,7 @@
 //! End-to-end coverage for the Web `fetch()` global.
 //!
 //! `fetch()` normalizes its arguments through the `Request` constructor, gates
-//! the request on the `net` capability, drives the reqwest transport off-thread
+//! the request on the `net` capability, drives the HTTP transport off-thread
 //! through the async completion protocol, and resolves with a real `Response`.
 //! These tests exercise a live loopback server (buffered GET with a forwarded
 //! header, and a POST whose body round-trips) and the deny-by-default gate.
@@ -479,7 +479,7 @@ async fn fetch_follows_allowed_redirect_and_reports_final_url() -> Result<(), Ot
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fetch_aborts_in_flight_request() -> Result<(), OtterError> {
-    // A bound listener that never accepts: reqwest completes the TCP handshake
+    // A bound listener that never accepts: the client completes the TCP handshake
     // (kernel backlog) and then waits forever for a response, so the request is
     // reliably in-flight when the signal aborts. The listener is held for the
     // test's duration to keep the port bound.

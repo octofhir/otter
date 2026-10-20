@@ -14,14 +14,14 @@ use crate::{NativeCtx, NativeError, Value};
 const CLASS: &str = "Temporal.Now";
 
 pub fn instant(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let inst = temporal_rs::sys::Temporal::local_now()
+    let inst = crate::temporal::host::now()
         .instant()
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 
 pub fn time_zone_id(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    let tz = temporal_rs::sys::Temporal::local_now()
+    let tz = crate::temporal::host::now()
         .time_zone()
         .map_err(|e| temporal_err(e, CLASS))?;
     let id = tz.identifier().map_err(|e| temporal_err(e, CLASS))?;
@@ -30,7 +30,7 @@ pub fn time_zone_id(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 
 pub fn zoned_date_time_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let tz = optional_time_zone(ctx, args)?;
-    let zdt = temporal_rs::sys::Temporal::local_now()
+    let zdt = crate::temporal::host::now()
         .zoned_date_time_iso(tz)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(zdt))
@@ -55,7 +55,7 @@ fn optional_time_zone(
 
 pub fn plain_date_time_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let tz = optional_time_zone(ctx, args)?;
-    let pdt = temporal_rs::sys::Temporal::local_now()
+    let pdt = crate::temporal::host::now()
         .plain_date_time_iso(tz)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainDateTime(pdt))
@@ -63,7 +63,7 @@ pub fn plain_date_time_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 
 pub fn plain_date_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let tz = optional_time_zone(ctx, args)?;
-    let pd = temporal_rs::sys::Temporal::local_now()
+    let pd = crate::temporal::host::now()
         .plain_date_iso(tz)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainDate(pd))
@@ -71,7 +71,7 @@ pub fn plain_date_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
 pub fn plain_time_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     let tz = optional_time_zone(ctx, args)?;
-    let pt = temporal_rs::sys::Temporal::local_now()
+    let pt = crate::temporal::host::now()
         .plain_time_iso(tz)
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainTime(pt))

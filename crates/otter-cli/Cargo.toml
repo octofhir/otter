@@ -23,7 +23,6 @@ otter-modules = { workspace = true }
 otter-node = { workspace = true }
 dotenvy = { workspace = true }
 notify = { workspace = true }
-notify-debouncer-full = { workspace = true }
 otter-pm = { workspace = true }
 otter-pm-lockfile = { workspace = true }
 otter-pm-manifest = { workspace = true }

@@ -95,7 +95,7 @@ impl TarballFetchClient for FileTarballClient {
 /// Async HTTP-backed tarball fetch client.
 #[derive(Debug, Clone, Default)]
 pub struct HttpTarballClient {
-    client: reqwest::Client,
+    client: otter_http_client::Client,
 }
 
 impl HttpTarballClient {
@@ -103,7 +103,7 @@ impl HttpTarballClient {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: otter_http_client::Client::new(),
         }
     }
 }

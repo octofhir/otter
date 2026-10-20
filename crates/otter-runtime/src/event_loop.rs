@@ -34,7 +34,7 @@
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::future::Future;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
@@ -158,7 +158,7 @@ pub(crate) struct TokioEventLoop {
     // wakes the drain task, allowing runtime shutdown to join it promptly.
     timers: Arc<TimerDriverOwner>,
     owned: Option<Arc<tokio::runtime::Runtime>>,
-    http_client: Arc<OnceLock<reqwest::Client>>,
+    http_client: otter_http_client::Client,
 }
 
 impl std::fmt::Debug for TokioEventLoop {
@@ -178,7 +178,7 @@ impl TokioEventLoop {
             handle,
             timers,
             owned: None,
-            http_client: Arc::new(OnceLock::new()),
+            http_client: remote_http_client(),
         }
     }
 
@@ -195,7 +195,7 @@ impl TokioEventLoop {
             handle,
             timers,
             owned: Some(runtime),
-            http_client: Arc::new(OnceLock::new()),
+            http_client: remote_http_client(),
         })
     }
 
@@ -222,8 +222,8 @@ impl TokioEventLoop {
 
     /// Async provider used by the remote graph fetch/prefetch phase.
     ///
-    /// Creating the provider retains the shared client slot; only polling a
-    /// fetch can initialize the pooled client.
+    /// The provider shares the loop's client; only polling a fetch opens its
+    /// connection pool.
     pub(crate) fn remote_module_provider(
         &self,
     ) -> Arc<dyn crate::module_loader::RemoteModuleProvider> {
@@ -516,37 +516,36 @@ impl TimerDriverInner {
 
 #[derive(Debug)]
 struct TokioRemoteModuleProvider {
-    client: Arc<OnceLock<reqwest::Client>>,
+    client: otter_http_client::Client,
 }
 
-fn remote_http_client() -> reqwest::Client {
+fn remote_http_client() -> otter_http_client::Client {
     // Redirect authorization is request-specific, so the shared pooled client
     // must return each 3xx to `fetch_remote_module` before another connection
     // can be opened.
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+    otter_http_client::Client::builder()
+        .redirects(otter_http_client::Redirects::Stop)
         .build()
-        .expect("reqwest client construction must succeed")
 }
 
-fn is_followed_redirect(status: reqwest::StatusCode) -> bool {
+fn is_followed_redirect(status: otter_http_client::StatusCode) -> bool {
     matches!(
         status,
-        reqwest::StatusCode::MOVED_PERMANENTLY
-            | reqwest::StatusCode::FOUND
-            | reqwest::StatusCode::SEE_OTHER
-            | reqwest::StatusCode::TEMPORARY_REDIRECT
-            | reqwest::StatusCode::PERMANENT_REDIRECT
+        otter_http_client::StatusCode::MOVED_PERMANENTLY
+            | otter_http_client::StatusCode::FOUND
+            | otter_http_client::StatusCode::SEE_OTHER
+            | otter_http_client::StatusCode::TEMPORARY_REDIRECT
+            | otter_http_client::StatusCode::PERMANENT_REDIRECT
     )
 }
 
 async fn fetch_remote_module_hop(
-    client: reqwest::Client,
+    client: otter_http_client::Client,
     request: crate::module_loader::RemoteModuleRequest,
 ) -> Result<crate::module_loader::RemoteModuleResponse, crate::module_loader::RemoteModuleError> {
     let requested_url = request.url.clone();
     let request_account = request.account.clone();
-    let current = reqwest::Url::parse(&requested_url).map_err(|error| {
+    let current = otter_http_client::Url::parse(&requested_url).map_err(|error| {
         crate::module_loader::RemoteModuleError::Fetch {
             url: requested_url.clone(),
             message: format!("invalid remote module URL: {error}"),
@@ -561,7 +560,7 @@ async fn fetch_remote_module_hop(
     if is_followed_redirect(response.status()) {
         let location = response
             .headers()
-            .get(reqwest::header::LOCATION)
+            .get(otter_http_client::header::LOCATION)
             .ok_or_else(|| crate::module_loader::RemoteModuleError::Fetch {
                 url: current.to_string(),
                 message: format!(
@@ -585,7 +584,7 @@ async fn fetch_remote_module_hop(
     }
     let content_type = response
         .headers()
-        .get(reqwest::header::CONTENT_TYPE)
+        .get(otter_http_client::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     // Stream the body in chunks, charging each chunk to the request's
@@ -627,7 +626,6 @@ impl crate::module_loader::RemoteModuleProvider for TokioRemoteModuleProvider {
                     Err(crate::module_loader::RemoteModuleError::Cancelled)
                 }
                 result = async {
-                    let client = client.get_or_init(remote_http_client).clone();
                     fetch_remote_module_hop(client, request).await
                 } => result,
             }

@@ -30,6 +30,7 @@
 //! - [`frame_roots`] — active interpreter frame-stack root registry.
 //! - [`finalize`] — raw weak-reference and finalization bookkeeping.
 //! - [`oom`] — `OutOfMemory` error.
+//! - [`os_memory`] — resident set and host free memory from the OS.
 //! - [`stats`] — per-heap counters and per-type rows.
 //! - [`observation`] — bounded owned records of synchronous collection service.
 //! - [`snapshot`] — Rust-side heap snapshot + retained-size walker.
@@ -90,6 +91,7 @@ pub mod lab;
 pub mod marking;
 pub mod observation;
 pub mod oom;
+pub mod os_memory;
 pub mod page;
 pub mod pretenuring;
 pub mod root_scope;

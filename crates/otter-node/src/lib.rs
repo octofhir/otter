@@ -12,6 +12,7 @@
 //! - `nodelib` - every builtin implemented in JavaScript, compiled at product
 //!   build time from the rows of `builtin_table.rs` by `build/builtins.rs`.
 //! - [`NodeApiBuilderExt`] - convenience helper for runtime builders.
+//! - [`PlatformWatcher`] - the file watcher `fs.watch` and `otter watch` use.
 //!
 //! # Invariants
 //! - Node modules are opt-in and are not installed by `otter-runtime` itself.
@@ -36,6 +37,8 @@ pub mod error_source_ext;
 pub mod fs;
 mod fs_binding;
 mod fs_cp;
+#[cfg(target_os = "macos")]
+pub mod fs_events;
 mod fs_watch;
 pub mod globals;
 pub mod misc_modules;
@@ -50,6 +53,13 @@ pub mod util;
 pub mod zlib_stream;
 
 use otter_runtime::{HostedModule, OtterBuilder, RuntimeBuilder};
+
+/// The file watcher `fs.watch` and `otter watch` use on this platform.
+#[cfg(target_os = "macos")]
+pub type PlatformWatcher = fs_events::FsEventWatcher;
+/// The file watcher `fs.watch` and `otter watch` use on this platform.
+#[cfg(not(target_os = "macos"))]
+pub type PlatformWatcher = notify::RecommendedWatcher;
 
 /// Active Node-compatible hosted modules in deterministic install order.
 pub const HOSTED_MODULES: &[HostedModule] = &[

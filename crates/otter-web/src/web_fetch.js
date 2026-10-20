@@ -667,6 +667,7 @@
   const kStatusText = Symbol('statusText');
   const kResponseType = Symbol('responseType');
   const kResponseUrl = Symbol('responseUrl');
+  const kResponseRedirected = Symbol('responseRedirected');
 
   const REDIRECT_STATUSES = [301, 302, 303, 307, 308];
 
@@ -682,6 +683,11 @@
     });
     Object.defineProperty(response, kResponseUrl, {
       value: '',
+      writable: true,
+      enumerable: false,
+    });
+    Object.defineProperty(response, kResponseRedirected, {
+      value: false,
       writable: true,
       enumerable: false,
     });
@@ -763,7 +769,7 @@
     get status() { return this[kStatus]; }
     get statusText() { return this[kStatusText]; }
     get headers() { return this[kHeaders]; }
-    get redirected() { return false; }
+    get redirected() { return this[kResponseRedirected]; }
     get type() { return this[kResponseType]; }
     get url() { return this[kResponseUrl]; }
 
@@ -775,6 +781,7 @@
       initResponse(cloned, this[kStatus], this[kStatusText],
         cloneHeaders(this[kHeaders]), this[kResponseType]);
       cloned[kResponseUrl] = this[kResponseUrl];
+      cloned[kResponseRedirected] = this[kResponseRedirected];
       cloneBodyInto(this, cloned);
       return cloned;
     }
@@ -790,8 +797,8 @@
   //
   // The native transport member installed by `web_globals_installer`; consumed
   // and deleted here so user code never reaches the raw hook. It takes
-  // `(method, url, flatHeaders, bodyBytes)` and resolves to
-  // `[status, statusText, flatHeaders, bodyBytes, finalUrl]`.
+  // `(method, url, flatHeaders, bodyBytes, redirectMode)` and resolves to
+  // `[status, statusText, flatHeaders, finalUrl, pull, redirected]`.
   const nativeFetch = global.__nativeFetch;
   delete global.__nativeFetch;
 
@@ -805,7 +812,7 @@
   // constructor (the values are already validated by the server). The body is a
   // streaming ReadableStream whose `pull` reads the next chunk off the socket on
   // demand, so `response.body` streams and `text()`/`arrayBuffer()` drain it.
-  function makeResponse(status, statusText, flatHeaders, finalUrl, pull) {
+  function makeResponse(status, statusText, flatHeaders, finalUrl, pull, redirected) {
     const response = Object.create(Response.prototype);
     const headers = new Headers();
     const list = headers[kHeaderList];
@@ -814,6 +821,7 @@
     }
     initResponse(response, status, statusText, headers, 'basic');
     response[kResponseUrl] = finalUrl;
+    response[kResponseRedirected] = redirected;
     response[kBodyStream] = new ReadableStream({
       type: 'bytes',
       async pull(controller) {
@@ -853,7 +861,7 @@
     const body = requestBodyBytes(request);
     const call = nativeFetch(request.method, request.url, flatHeaders, body, request.redirect);
     const toResponse = (parts) =>
-      makeResponse(parts[0], parts[1], parts[2], parts[3], parts[4]);
+      makeResponse(parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]);
 
     if (signal === null || signal === undefined) {
       return toResponse(await call.promise);

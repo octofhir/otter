@@ -85,7 +85,7 @@ pub trait AdvisoryClient {
 /// Advisory client backed by the public database.
 #[derive(Debug, Clone)]
 pub struct HttpAdvisoryClient {
-    client: reqwest::Client,
+    client: otter_http_client::Client,
     endpoint: String,
 }
 
@@ -100,7 +100,7 @@ impl HttpAdvisoryClient {
     #[must_use]
     pub fn with_endpoint(endpoint: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: otter_http_client::Client::new(),
             endpoint: endpoint.into(),
         }
     }

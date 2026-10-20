@@ -60,6 +60,11 @@ unicode-segmentation = { workspace = true }
 tinystr = "0.8"
 static_assertions = "1.1"
 
+# Unix hosts name their zone in `TZ` and `/etc/localtime`; elsewhere the
+# platform is asked.
+[target.'cfg(not(unix))'.dependencies]
+iana-time-zone = "0.1"
+
 [dev-dependencies]
 criterion = { workspace = true }
 trybuild = "1.0"

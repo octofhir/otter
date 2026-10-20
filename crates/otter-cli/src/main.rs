@@ -926,8 +926,6 @@ struct TestArgs {
     paths: Vec<PathBuf>,
 }
 
-// Multi-thread: host IO (HTTP server, fetch, timers) runs on Tokio workers
-// while the VM stays pinned to the isolate thread. Current-thread would stall
 /// Spell out the switches a caller wrote together.
 ///
 /// `-pe code` is one word for two switches, and the code that follows belongs
@@ -943,6 +941,8 @@ fn clustered_switches(args: impl Iterator<Item = String>) -> Vec<String> {
     .collect()
 }
 
+// Multi-thread: host IO (HTTP server, fetch, timers) runs on Tokio workers
+// while the VM stays pinned to the isolate thread. Current-thread would stall
 // IO whenever the main thread blocks joining the isolate.
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {

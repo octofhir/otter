@@ -2,7 +2,7 @@
 //!
 //! `otter-web` owns the `fetch()` JS contract and the `Request`/`Response`
 //! classes; this module owns the network side that the plan places in
-//! `otter-runtime`: the reqwest-backed request, the `allow-net` capability
+//! `otter-runtime`: the HTTP request, the `allow-net` capability
 //! gate, and the plain-data request/response DTOs exchanged across the crate
 //! boundary. No VM handles cross this boundary — only owned, `Send` data.
 //!
@@ -25,7 +25,7 @@
 
 use std::error::Error as _;
 use std::future::Future;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 
@@ -33,7 +33,7 @@ use crate::RuntimeCapabilityEvaluator;
 
 /// Cancellation handle for an in-flight [`prepare_fetch`] request. Calling
 /// [`FetchAbort::abort`] cancels the request (closing the socket by dropping the
-/// reqwest future); dropping the handle without aborting lets it run normally.
+/// request future); dropping the handle without aborting lets it run normally.
 /// `Send + Sync` so it can be captured by the JS-visible abort callback.
 pub struct FetchAbort {
     sender: Mutex<Option<oneshot::Sender<()>>>,
@@ -56,9 +56,8 @@ impl FetchAbort {
 /// Reusable HTTP transport bound to one immutable runtime capability policy.
 ///
 /// Separate clients preserve Fetch's followed and non-followed redirect modes
-/// while sharing each mode's connection pool across requests. Construction is
-/// lazy so snapshot reattachment remains infallible; any client initialization
-/// failure becomes the rejected Fetch promise instead of a host panic.
+/// while sharing nothing mutable with the VM. A client opens its connector on
+/// its first request, so making a transport costs no TLS or socket setup.
 #[derive(Clone)]
 pub struct FetchTransport {
     inner: Arc<FetchTransportInner>,
@@ -66,23 +65,16 @@ pub struct FetchTransport {
 
 struct FetchTransportInner {
     evaluator: RuntimeCapabilityEvaluator,
-    user_agent: String,
-    follow_client: OnceLock<Result<reqwest::Client, String>>,
-    no_redirect_client: OnceLock<Result<reqwest::Client, String>>,
+    follow_client: otter_http_client::Client,
+    no_redirect_client: otter_http_client::Client,
 }
 
 impl std::fmt::Debug for FetchTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FetchTransport")
             .field("evaluator", &self.inner.evaluator)
-            .field(
-                "follow_client_initialized",
-                &self.inner.follow_client.get().is_some(),
-            )
-            .field(
-                "no_redirect_client_initialized",
-                &self.inner.no_redirect_client.get().is_some(),
-            )
+            .field("follow_client", &self.inner.follow_client)
+            .field("no_redirect_client", &self.inner.no_redirect_client)
             .finish()
     }
 }
@@ -91,65 +83,41 @@ impl FetchTransport {
     /// Bind a reusable HTTP transport to one runtime policy snapshot.
     #[must_use]
     pub fn new(evaluator: RuntimeCapabilityEvaluator, user_agent: String) -> Self {
+        let check_evaluator = evaluator.clone();
+        let check: otter_http_client::RedirectCheck = Arc::new(move |next, previous| {
+            if check_evaluator.check_network(next, Some(previous)) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "network access to \"{next}\" is not allowed; grant it with --allow-net"
+                ))
+            }
+        });
+        let follow_client = otter_http_client::Client::builder()
+            .user_agent(&user_agent)
+            .redirects(otter_http_client::Redirects::Follow(Some(check)))
+            .build();
+        let no_redirect_client = otter_http_client::Client::builder()
+            .user_agent(&user_agent)
+            .redirects(otter_http_client::Redirects::Stop)
+            .build();
         Self {
             inner: Arc::new(FetchTransportInner {
                 evaluator,
-                user_agent,
-                follow_client: OnceLock::new(),
-                no_redirect_client: OnceLock::new(),
+                follow_client,
+                no_redirect_client,
             }),
         }
     }
 
-    fn client(&self, follow_redirects: bool) -> Result<reqwest::Client, String> {
-        let slot = if follow_redirects {
+    fn client(&self, follow_redirects: bool) -> &otter_http_client::Client {
+        if follow_redirects {
             &self.inner.follow_client
         } else {
             &self.inner.no_redirect_client
-        };
-        slot.get_or_init(|| self.build_client(follow_redirects))
-            .clone()
-    }
-
-    fn build_client(&self, follow_redirects: bool) -> Result<reqwest::Client, String> {
-        let redirect_policy = if follow_redirects {
-            let evaluator = self.inner.evaluator.clone();
-            reqwest::redirect::Policy::custom(move |attempt| {
-                let initiator = attempt.previous().last();
-                if evaluator.check_network(attempt.url(), initiator) {
-                    reqwest::redirect::Policy::default().redirect(attempt)
-                } else {
-                    let target = attempt.url().to_string();
-                    attempt.error(NetworkRedirectDenied { target })
-                }
-            })
-        } else {
-            reqwest::redirect::Policy::none()
-        };
-        reqwest::Client::builder()
-            .user_agent(self.inner.user_agent.clone())
-            .redirect(redirect_policy)
-            .build()
-            .map_err(|error| format!("fetch client init failed: {error}"))
+        }
     }
 }
-
-#[derive(Debug)]
-struct NetworkRedirectDenied {
-    target: String,
-}
-
-impl std::fmt::Display for NetworkRedirectDenied {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "network access to \"{}\" is not allowed; grant it with --allow-net",
-            self.target
-        )
-    }
-}
-
-impl std::error::Error for NetworkRedirectDenied {}
 
 /// Build a cancellable outbound fetch. Returns the abort handle and the future
 /// to drive on the host executor; the future resolves with the response, or
@@ -203,6 +171,8 @@ pub struct FetchResponseHead {
     pub headers: Vec<(String, String)>,
     /// Final URL after redirects.
     pub final_url: String,
+    /// Whether a redirect was followed to reach [`Self::final_url`].
+    pub redirected: bool,
 }
 
 /// The streaming body of a fetched response. Each [`ResponseBody::pull`] reads
@@ -211,7 +181,7 @@ pub struct FetchResponseHead {
 /// The `tokio` mutex serializes pulls (the `ReadableStream` protocol pulls one
 /// chunk at a time) and is held across the `await`.
 pub struct ResponseBody {
-    response: tokio::sync::Mutex<Option<reqwest::Response>>,
+    response: tokio::sync::Mutex<Option<otter_http_client::Response>>,
 }
 
 impl ResponseBody {
@@ -246,7 +216,8 @@ pub async fn perform_fetch(
     request: FetchRequest,
     transport: FetchTransport,
 ) -> Result<(FetchResponseHead, ResponseBody), String> {
-    let parsed = reqwest::Url::parse(&request.url).map_err(|err| format!("invalid URL: {err}"))?;
+    let parsed =
+        otter_http_client::Url::parse(&request.url).map_err(|err| format!("invalid URL: {err}"))?;
     let host = parsed
         .host_str()
         .ok_or_else(|| format!("URL has no host: {}", request.url))?;
@@ -256,11 +227,11 @@ pub async fn perform_fetch(
         ));
     }
 
-    let method = reqwest::Method::from_bytes(request.method.as_bytes())
+    let method = otter_http_client::Method::from_bytes(request.method.as_bytes())
         .map_err(|_| format!("invalid HTTP method: {}", request.method))?;
     // `error` and `manual` both stop redirects: `error` rejects below when a
     // 3xx is seen, while `manual` hands the response back to the caller.
-    let client = transport.client(request.redirect == "follow")?;
+    let client = transport.client(request.redirect == "follow");
     let mut builder = client.request(method, parsed);
     for (name, value) in &request.headers {
         builder = builder.header(name.as_str(), value.as_str());
@@ -272,13 +243,13 @@ pub async fn perform_fetch(
     let response = builder
         .send()
         .await
-        .map_err(|error| format_reqwest_error("fetch failed", &error))?;
+        .map_err(|error| format_transport_error("fetch failed", &error))?;
     if request.redirect == "error" && response.status().is_redirection() {
         return Err(format!(
             "fetch failed: redirect to \"{}\" refused (redirect mode is \"error\")",
             response
                 .headers()
-                .get(reqwest::header::LOCATION)
+                .get(otter_http_client::header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .unwrap_or("")
         ));
@@ -288,6 +259,7 @@ pub async fn perform_fetch(
         status: status.as_u16(),
         status_text: status.canonical_reason().unwrap_or("").to_string(),
         final_url: response.url().to_string(),
+        redirected: response.redirected(),
         headers: response
             .headers()
             .iter()
@@ -305,7 +277,7 @@ pub async fn perform_fetch(
     Ok((head, body))
 }
 
-fn format_reqwest_error(prefix: &str, error: &reqwest::Error) -> String {
+fn format_transport_error(prefix: &str, error: &otter_http_client::Error) -> String {
     let mut message = format!("{prefix}: {error}");
     let mut source = error.source();
     while let Some(cause) = source {

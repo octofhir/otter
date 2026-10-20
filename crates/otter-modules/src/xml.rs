@@ -26,8 +26,9 @@
 //!   allocate standalone strings, so scanner offsets are never misapplied.
 //! - Writing goes the other way through one owning Rust tree, so every rule
 //!   about escaping, legal names and layout lives in `otter_xml::stringify`
-//!   and not in two places. Reading a JavaScript value is bounded by an
-//!   explicit depth, so a cyclic value fails rather than recurses forever.
+//!   and not in two places. Reading a JavaScript value keeps the objects
+//!   and arrays it is inside, as `JSON.stringify` does: one met again among
+//!   them is a cycle and fails at once, and an explicit depth bounds the rest.
 //!
 //! # See also
 //! - [Handle scopes](../../../docs/site/src/content/docs/extensions/handle-scopes.md)
@@ -50,8 +51,8 @@ use otter_xml::sink::{Piece, Sink};
 const NAME: &str = "Otter.XML.parse";
 const WRITE: &str = "Otter.XML.stringify";
 
-/// How deeply a value handed to [`stringify`] may nest. A cyclic value has no
-/// end, so the depth is what stops it.
+/// How deeply a value handed to [`stringify`] may nest. A cycle is found
+/// before this; the depth stops a replacer that builds an endless value.
 const MAX_VALUE_DEPTH: usize = 512;
 
 /// Which shape the caller asked for.
@@ -606,10 +607,10 @@ pub fn stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
         let indent = read_indent(&mut scope, space)?;
         let filter = Filter::read(&mut scope, replacer)?;
         let document = if is_node_shape(&mut scope, input)? {
-            let node = read_node(&mut scope, input, &filter, 0)?;
+            let node = read_node(&mut scope, input, &filter, None)?;
             otter_xml::stringify::node(&node, indent.as_deref())
         } else {
-            let Some(value) = read_value(&mut scope, input, &filter, 0)? else {
+            let Some(value) = read_value(&mut scope, input, &filter, None)? else {
                 return Err(NativeError::TypeError {
                     name: WRITE,
                     reason: "expected an object naming one element".to_owned(),
@@ -630,11 +631,43 @@ fn write_error(error: otter_xml::Error) -> NativeError {
     }
 }
 
-fn depth_error() -> NativeError {
-    NativeError::TypeError {
-        name: WRITE,
-        reason: "the value nests too deeply, or refers to itself".to_owned(),
+/// The objects and arrays a read is inside, innermost first.
+#[derive(Clone, Copy)]
+struct Ancestors<'a> {
+    value: Local<'a>,
+    outer: Option<&'a Ancestors<'a>>,
+    depth: usize,
+}
+
+/// Enter `value`, an object or array, below `outer`: a value already being
+/// read refers to itself and fails, as does one past [`MAX_VALUE_DEPTH`].
+fn enter<'a>(
+    scope: &NativeScope<'_, '_>,
+    value: Local<'a>,
+    outer: Option<&'a Ancestors<'a>>,
+) -> Result<Ancestors<'a>, NativeError> {
+    let mut link = outer;
+    while let Some(ancestor) = link {
+        if scope.strict_equals(ancestor.value, value) {
+            return Err(NativeError::TypeError {
+                name: WRITE,
+                reason: "the value refers to itself".to_owned(),
+            });
+        }
+        link = ancestor.outer;
     }
+    let depth = outer.map_or(0, |outer| outer.depth + 1);
+    if depth >= MAX_VALUE_DEPTH {
+        return Err(NativeError::TypeError {
+            name: WRITE,
+            reason: "the value nests too deeply".to_owned(),
+        });
+    }
+    Ok(Ancestors {
+        value,
+        outer,
+        depth,
+    })
 }
 
 /// The text one level of nesting indents by.
@@ -730,11 +763,9 @@ fn read_node(
     scope: &mut NativeScope<'_, '_>,
     value: Local<'_>,
     filter: &Filter<'_>,
-    depth: usize,
+    outer: Option<&Ancestors<'_>>,
 ) -> Result<otter_xml::Node, NativeError> {
-    if depth >= MAX_VALUE_DEPTH {
-        return Err(depth_error());
-    }
+    let here = enter(scope, value, outer)?;
     scope.scope(|mut scope| {
         let name = scope.get(value, "name")?;
         let mut node = otter_xml::Node {
@@ -761,7 +792,7 @@ fn read_node(
                 let child = scope.index(children, index)?;
                 let child = filter.apply(&mut scope, children, &index.to_string(), child)?;
                 if scope.is_object(child) {
-                    let element = read_node(&mut scope, child, filter, depth + 1)?;
+                    let element = read_node(&mut scope, child, filter, Some(&here))?;
                     node.children.push(otter_xml::Child::Element(element));
                     continue;
                 }
@@ -780,18 +811,16 @@ fn read_value(
     scope: &mut NativeScope<'_, '_>,
     value: Local<'_>,
     filter: &Filter<'_>,
-    depth: usize,
+    outer: Option<&Ancestors<'_>>,
 ) -> Result<Option<otter_xml::Value>, NativeError> {
-    if depth >= MAX_VALUE_DEPTH {
-        return Err(depth_error());
-    }
     if scope.is_array(value)? {
+        let here = enter(scope, value, outer)?;
         return scope.scope(|mut scope| {
             let mut items = Vec::with_capacity(scope.array_length(value)?);
             for index in 0..scope.array_length(value)? {
                 let item = scope.index(value, index)?;
                 let item = filter.apply(&mut scope, value, &index.to_string(), item)?;
-                if let Some(item) = read_value(&mut scope, item, filter, depth + 1)? {
+                if let Some(item) = read_value(&mut scope, item, filter, Some(&here))? {
                     items.push(item);
                 }
             }
@@ -799,6 +828,7 @@ fn read_value(
         });
     }
     if scope.is_object(value) && !scope.is_callable(value) {
+        let here = enter(scope, value, outer)?;
         return scope.scope(|mut scope| {
             let keys = scope.enumerable_own_string_keys(value)?;
             let mut entries = Vec::with_capacity(keys.len());
@@ -808,7 +838,7 @@ fn read_value(
                 }
                 let entry = scope.get(value, &key)?;
                 let entry = filter.apply(&mut scope, value, &key, entry)?;
-                if let Some(entry) = read_value(&mut scope, entry, filter, depth + 1)? {
+                if let Some(entry) = read_value(&mut scope, entry, filter, Some(&here))? {
                     entries.push((key, entry));
                 }
             }

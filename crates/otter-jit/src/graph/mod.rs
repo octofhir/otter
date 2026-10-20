@@ -16,6 +16,8 @@
 //! - [`licm`] — loop-invariant checks and loads run once before their loop.
 //! - [`redundancy`] — a value, load or check a dominating equivalent already
 //!   produced over unchanged memory is that node.
+//! - [`fold`] — constant int32 nodes and branches; the blocks only a folded
+//!   branch's dead edge reached leave the graph.
 //! - `branch_fold` — truthiness branches test the value under `!` and
 //!   ToBoolean.
 //! - `branch_thread` — branches on a merged boolean take the merged edges
@@ -67,6 +69,7 @@ pub(crate) mod effects;
 pub(crate) mod emission;
 pub(crate) mod escape;
 pub(crate) mod feedback;
+mod fold;
 pub(crate) mod frame;
 mod inline_plan;
 pub(crate) mod ir;
@@ -182,6 +185,7 @@ pub(crate) fn compile(
     truncation::wrap_truncated_arithmetic(&mut built.graph, &built.layout);
     licm::hoist_invariants(&mut built.graph, &mut built.layout, &built.loop_headers);
     redundancy::eliminate(&mut built.graph, &built.layout);
+    fold::fold(&mut built.graph, &mut built.layout, &mut built.loop_headers);
     branch_fold::fold_branch_negations(&mut built.graph);
     branch_thread::thread_boolean_phis(&mut built.graph, &mut built.layout);
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);

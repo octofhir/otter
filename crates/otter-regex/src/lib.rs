@@ -16,6 +16,7 @@
 //! - [`Match`] — a borrowed match view with capture ranges and named groups.
 //! - [`MatchBatch`] — owned flat offsets, independent of search scratch.
 //! - [`MatchRecord`] — one owned result with direct access to its overall range.
+//! - [`NO_OFFSET`] — the offset a non-participating group writes.
 //! - [`RegexError`] — pattern compile / early-error failure.
 //! - [`ExecError`] — execution aborted under an [`ExecConfig`] constraint.
 //!
@@ -50,4 +51,4 @@ pub use cursor::Unit;
 pub use error::{ExecError, RegexError};
 pub use exec::ExecConfig;
 pub use flags::Flags;
-pub use matches::{Captures, Match, MatchBatch, MatchRecord, NamedGroups};
+pub use matches::{Captures, Match, MatchBatch, MatchRecord, NO_OFFSET, NamedGroups};

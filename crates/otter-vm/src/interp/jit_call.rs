@@ -1673,6 +1673,9 @@ mod tests {
     struct SingleHeaderOptimizingHook {
         requests: AtomicUsize,
         decline_replacement: bool,
+        /// Held by a test that asserts a compile is still in flight; a
+        /// compiler thread waits on it before it compiles.
+        release: std::sync::Mutex<()>,
     }
 
     impl jit::JitCompilerHook for SingleHeaderOptimizingHook {
@@ -1691,6 +1694,7 @@ mod tests {
             &self,
             request: jit::JitCompileRequest,
         ) -> Result<jit::JitCompileStatus, jit::JitCompileError> {
+            drop(self.release.lock());
             if self.requests.fetch_add(1, Ordering::Relaxed) != 0 && self.decline_replacement {
                 return Ok(jit::JitCompileStatus::Unavailable);
             }
@@ -1720,6 +1724,7 @@ mod tests {
         let hook = Arc::new(SingleHeaderOptimizingHook {
             requests: AtomicUsize::new(0),
             decline_replacement: false,
+            release: std::sync::Mutex::new(()),
         });
         vm.jit_hook = Some(hook.clone());
         assert!(
@@ -1757,8 +1762,10 @@ mod tests {
             let hook = Arc::new(SingleHeaderOptimizingHook {
                 requests: AtomicUsize::new(0),
                 decline_replacement: false,
+                release: std::sync::Mutex::new(()),
             });
             vm.jit_hook = Some(hook.clone());
+            let in_flight = hook.release.lock().unwrap();
             fund_compile_work(
                 &mut vm,
                 &context,
@@ -1779,6 +1786,7 @@ mod tests {
             if invalidate {
                 vm.discard_invalidated_jit_state(&[0]);
             }
+            drop(in_flight);
             while !vm.jit_compile_queue.has_finished() {
                 std::thread::yield_now();
             }
@@ -1810,6 +1818,7 @@ mod tests {
             let hook = Arc::new(SingleHeaderOptimizingHook {
                 requests: AtomicUsize::new(0),
                 decline_replacement,
+                release: std::sync::Mutex::new(()),
             });
             vm.jit_hook = Some(hook.clone());
             fund_compile_work(

@@ -9,9 +9,10 @@
 //!   produced.
 //!
 //! # Invariants
-//! - Only the subject string is a GC handle; every other field is an
-//!   index into it. A match therefore records its state without
-//!   allocating, and the accessors slice on demand.
+//! - Only the subject string is a GC handle; the rest is the last match's
+//!   group offsets into it, copied as the matcher wrote them. A match
+//!   therefore records its state with one copy into a reused buffer, and
+//!   the accessors derive and slice on demand.
 //! - `input` is `None` until a legacy-enabled match runs. The accessors
 //!   report the empty string in that state, matching what the web
 //!   depends on rather than the proposal's throw-on-empty.
@@ -30,14 +31,14 @@ pub(crate) struct RegExpLegacyState {
     /// Subject of the last legacy-enabled match, or of the last
     /// `RegExp.input` assignment. Always a string value.
     input: Option<Value>,
-    /// `[start, end)` of the whole match inside `input`.
-    matched: Option<(usize, usize)>,
-    /// `[start, end)` per capture group, `None` when the group did not
-    /// participate. Only the first [`LEGACY_CAPTURE_SLOTS`] are kept.
-    captures: [Option<(usize, usize)>; LEGACY_CAPTURE_SLOTS],
-    /// Highest-numbered capture group that participated.
-    last_paren: Option<(usize, usize)>,
+    /// Every group's `[start, end)` inside `input`, group zero first, the
+    /// way the matcher reported them ([`NO_OFFSET`] for a group that did not
+    /// participate); empty before the first match. The accessors derive
+    /// `$1`…`$9`, `lastParen` and the contexts from it when read.
+    offsets: Vec<u32>,
 }
+
+use crate::regexp::engine::NO_OFFSET;
 
 impl RegExpLegacyState {
     /// Record one successful match. `captures` is the full capture list;
@@ -49,18 +50,36 @@ impl RegExpLegacyState {
         captures: impl Iterator<Item = Option<std::ops::Range<usize>>>,
     ) {
         self.input = Some(input);
-        self.matched = Some((matched.start, matched.end));
-        self.captures = [None; LEGACY_CAPTURE_SLOTS];
-        self.last_paren = None;
-        for (index, capture) in captures.enumerate() {
-            let range = capture.map(|range| (range.start, range.end));
-            if index < LEGACY_CAPTURE_SLOTS {
-                self.captures[index] = range;
-            }
-            if range.is_some() {
-                self.last_paren = range;
+        self.offsets.clear();
+        self.offsets
+            .extend_from_slice(&[matched.start as u32, matched.end as u32]);
+        for capture in captures {
+            match capture {
+                Some(range) => self
+                    .offsets
+                    .extend_from_slice(&[range.start as u32, range.end as u32]),
+                None => self.offsets.extend_from_slice(&[NO_OFFSET, NO_OFFSET]),
             }
         }
+    }
+
+    /// Record one successful match from its group offsets (see
+    /// [`crate::regexp::engine::MatchOffsets`]): one copy of the buffer.
+    pub(crate) fn record_offsets(
+        &mut self,
+        input: Value,
+        offsets: &crate::regexp::engine::MatchOffsets,
+    ) {
+        self.input = Some(input);
+        self.offsets.clear();
+        self.offsets.extend_from_slice(&offsets.0);
+    }
+
+    /// Group `index` of the recorded match, `None` when it did not
+    /// participate or does not exist.
+    fn group(&self, index: usize) -> Option<(usize, usize)> {
+        let start = *self.offsets.get(2 * index)?;
+        (start != NO_OFFSET).then(|| (start as usize, self.offsets[2 * index + 1] as usize))
     }
 
     /// Replace the subject without disturbing the recorded ranges, per
@@ -81,14 +100,20 @@ impl RegExpLegacyState {
         property: LegacyRegExpProperty,
         input_len: usize,
     ) -> Option<(usize, usize)> {
-        let (start, end) = self.matched?;
+        let (start, end) = self.group(0)?;
         match property {
             LegacyRegExpProperty::LastMatch => Some((start, end)),
             LegacyRegExpProperty::LeftContext => Some((0, start)),
             LegacyRegExpProperty::RightContext => Some((end, input_len.max(end))),
-            LegacyRegExpProperty::LastParen => self.last_paren,
+            LegacyRegExpProperty::LastParen => (1..self.offsets.len() / 2)
+                .rev()
+                .find_map(|index| self.group(index)),
             LegacyRegExpProperty::Capture(index) => {
-                self.captures.get(usize::from(index)).copied().flatten()
+                if usize::from(index) < LEGACY_CAPTURE_SLOTS {
+                    self.group(usize::from(index) + 1)
+                } else {
+                    None
+                }
             }
             LegacyRegExpProperty::Input => None,
         }

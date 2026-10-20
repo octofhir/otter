@@ -25,7 +25,7 @@
 //! - [`otter_gc::GcHeap::ensure_machine_allocation_with_roots`] makes the
 //!   reservation generated allocation groups also use.
 
-use crate::regexp::engine::MatchRecord;
+use crate::regexp::engine::MatchOffsets;
 use crate::rooting::RootScopeExt;
 use crate::{Interpreter, Value, VmError};
 
@@ -40,10 +40,12 @@ pub(crate) fn build_match_result_folded(
     interp: &mut Interpreter,
     receiver: &mut Value,
     input: &mut Value,
-    matched: &MatchRecord,
+    matched: &MatchOffsets,
 ) -> Result<Option<Value>, VmError> {
-    let found = matched.as_match();
-    if found.named_groups().next().is_some() {
+    if receiver
+        .as_regexp()
+        .is_none_or(|regexp| regexp.has_named_groups(&interp.gc_heap))
+    {
         return Ok(None);
     }
     let mut roots = otter_gc::RootScope::new(&mut interp.gc_heap);
@@ -57,8 +59,8 @@ pub(crate) fn build_match_result_folded(
     let Some(shape) = interp.shape_runtime.handle_for_id(layout.shape_id()) else {
         return Ok(None);
     };
-    let groups = 1 + found.captures.len();
-    let substrings = 1 + found.captures.iter().filter(Option::is_some).count();
+    let groups = matched.groups();
+    let substrings = 1 + matched.captures().filter(Option::is_some).count();
     let bytes = substrings * crate::string::gc_body::SUBSTRING_CELL_BYTES
         + crate::array::tagged_array_cell_bytes(groups)
         + crate::object::object_cell_bytes(crate::object::shape_body::inline_capacity_of(shape));
@@ -75,24 +77,18 @@ pub(crate) fn build_match_result_folded(
     };
     let heap = &mut interp.gc_heap;
     let text = input.as_string(heap).ok_or(VmError::TypeMismatch)?.handle();
-    let substring = |heap: &mut otter_gc::GcHeap, range: std::ops::Range<usize>| {
-        let start = u32::try_from(range.start).ok()?;
-        let length = u32::try_from(range.len()).ok()?;
-        crate::string::gc_body::try_substring_no_collect(heap, text, start, length)
-            .map(|handle| Value::string(crate::string::JsString::from_handle(handle, heap)))
-    };
-    let mut elements = smallvec::SmallVec::<[Value; 8]>::with_capacity(groups);
-    elements.push(substring(heap, found.range.clone()).ok_or(VmError::TypeMismatch)?);
-    for capture in found.captures.iter() {
-        elements.push(match capture {
-            Some(range) => substring(heap, range).ok_or(VmError::TypeMismatch)?,
-            None => Value::undefined(),
-        });
-    }
+    let mut elements = smallvec::SmallVec::<[Value; 16]>::with_capacity(groups);
+    crate::string::gc_body::try_substrings_no_collect(
+        heap,
+        text,
+        (0..groups).map(|index| matched.group(index)),
+        &mut elements,
+    )
+    .ok_or(VmError::TypeMismatch)?;
     let array = crate::array::try_tagged_from_values_no_collect(heap, &elements)
         .ok_or(VmError::TypeMismatch)?;
     let record = [
-        Value::number_f64(found.range.start as f64),
+        Value::number_f64(matched.range().start as f64),
         *input,
         Value::undefined(),
     ];

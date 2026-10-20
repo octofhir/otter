@@ -216,8 +216,16 @@ pub(crate) fn exec_without_result(
 pub(crate) enum DirectExec {
     /// The call completed with this value.
     Done(Value),
-    /// `exec` matched: the match array remains to be built from the record.
-    Matched(crate::regexp::engine::MatchRecord),
+    /// `exec` matched: the match array remains to be built from the offsets,
+    /// which go back to [`Interpreter::recycle_match_offsets`] once used.
+    Matched(crate::regexp::engine::MatchOffsets),
+}
+
+impl Interpreter {
+    /// Hand the offsets buffer of a direct match back for the next one.
+    pub(crate) fn recycle_match_offsets(&mut self, offsets: crate::regexp::engine::MatchOffsets) {
+        self.regexp_offsets = offsets.0;
+    }
 }
 
 /// `RegExpBuiltinExec(R, S)` for a RegExp `receiver` whose `lastIndex` is a
@@ -260,36 +268,42 @@ pub(crate) fn exec_direct(
         regexp.set_last_index(heap, 0);
         return Some(Ok(DirectExec::Done(missed)));
     }
+    let mut offsets = std::mem::take(&mut interp.regexp_offsets);
+    let heap = &interp.gc_heap;
     let search = interp.regex_search();
-    let execution =
-        text.with_code_units(heap, |units| regexp.find_one(heap, units, start, &search));
+    let execution = text.with_code_units(heap, |units| {
+        regexp.find_first_offsets(heap, units, start, &search, &mut offsets)
+    });
+    let offsets = crate::regexp::engine::MatchOffsets(offsets);
     if let Err(error) = interp.charge_regex_backtrack_steps(execution.steps) {
+        interp.recycle_match_offsets(offsets);
         return Some(Err(error));
     }
     let Ok(matched) = execution.result else {
+        interp.recycle_match_offsets(offsets);
         return Some(Err(interp.err_budget(
             "work budget exceeded in a regular expression search".into(),
         )));
     };
     let heap = &interp.gc_heap;
-    let Some(matched) = matched else {
+    if !matched {
         if tracks_last_index {
             regexp.set_last_index(heap, 0);
         }
+        interp.recycle_match_offsets(offsets);
         return Some(Ok(DirectExec::Done(missed)));
-    };
+    }
     if tracks_last_index {
-        regexp.set_last_index(heap, matched.range.end as u32);
+        regexp.set_last_index(heap, offsets.range().end as u32);
     }
     if regexp.legacy_features_enabled(heap) {
-        interp
-            .regexp_legacy
-            .record_match(input, matched.range.clone(), matched.captures().iter());
+        interp.regexp_legacy.record_offsets(input, &offsets);
     }
     Some(Ok(if test {
+        interp.recycle_match_offsets(offsets);
         DirectExec::Done(Value::boolean(true))
     } else {
-        DirectExec::Matched(matched)
+        DirectExec::Matched(offsets)
     }))
 }
 
@@ -478,7 +492,8 @@ mod tests {
         // An exec hit leaves the array to its caller, after the lastIndex write.
         match exec_direct(&mut vm, global, subject, false) {
             Some(Ok(DirectExec::Matched(matched))) => {
-                assert_eq!(matched.range, 4..6)
+                assert_eq!(matched.range(), 4..6);
+                vm.recycle_match_offsets(matched);
             }
             _ => panic!("a hit returns its record"),
         }

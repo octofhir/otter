@@ -14,6 +14,9 @@
 //!   `_kill`, which is what lets a test replace the syscall.
 //! - `_kill` reports a failed syscall as a negative errno rather than throwing,
 //!   matching the binding `kill` is written against.
+//! - `abort` hands back the terminal modes the run changed before it
+//!   terminates, through the same reset the exit path calls
+//!   ([`crate::process::reset_terminals`]).
 //!
 //! # See also
 //! - [`crate::process`]
@@ -341,8 +344,12 @@ fn raw_kill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 }
 
 /// `process.abort()` — terminate immediately with `SIGABRT`, the way Node's
-/// own `abort` does. There is no return path.
-fn abort(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+/// own `abort` does, handing back the terminal modes the run changed first.
+/// There is no return path.
+fn abort(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    if let Some(process) = ctx.global_value("process") {
+        crate::process::reset_terminals(ctx, process);
+    }
     std::process::abort();
 }
 

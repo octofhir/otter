@@ -28,6 +28,10 @@
 //!   installation, and again over a restored image after that run's
 //!   [`ProcessHost`] is inserted, so nothing of the image writer's run
 //!   survives into a launch.
+//! - A run leaves the terminals it switched to raw mode as it found them:
+//!   once the `'exit'` listeners have run, and before `abort()`,
+//!   [`reset_terminals`] calls the reset `node:tty` registered. The modes
+//!   live with the isolate that changed them, never in process-global state.
 //! - Default arguments are declarative absence until installation. One host
 //!   snapshot supplies the default argv, execPath and pid/ppid; `uptime()`
 //!   and `hrtime()` count from the start recorded in the run's
@@ -1284,8 +1288,49 @@ fn exit_code_setter(
 /// run completes. Emits the `'exit'` event exactly once with the final code
 /// and answers the (possibly listener-updated) exit code. A nested
 /// `process.exit(newCode)` inside a listener unwinds through here and the
-/// embedder reads the replacement code off that unwind instead.
+/// embedder reads the replacement code off that unwind instead. Afterwards
+/// the terminals the run switched to raw mode get their modes back, as
+/// Node's exit path hands them back.
 fn process_emit_exit(
+    ctx: &mut NativeCtx<'_>,
+    args: &[otter_vm::Value],
+) -> Result<otter_vm::Value, NativeError> {
+    let emitted = emit_exit_once(ctx, args);
+    // A listener's throw is still on its way out and owns the pending value;
+    // a completed emit, or an exit from inside one, leaves nothing to clobber.
+    if matches!(emitted, Ok(_) | Err(NativeError::Exit { .. })) {
+        let process = *ctx.this_value();
+        reset_terminals(ctx, process);
+    }
+    emitted
+}
+
+/// Hidden slot on `process` for the function that hands every terminal the
+/// run switched to raw mode its mode back. `node:tty` defines it the first
+/// time it switches one; the runtime calls it once the run is over.
+const RESET_TERMINALS_SLOT: &str = "__otter_reset_terminals__";
+
+/// Hand back the terminal modes the run changed, through the function
+/// `node:tty` left in [`RESET_TERMINALS_SLOT`]. The run is over by now, so
+/// whatever the call throws is dropped.
+pub(crate) fn reset_terminals(ctx: &mut NativeCtx<'_>, process: Value) {
+    let reset = ctx.scope(|mut scope| -> Result<(), NativeError> {
+        let process = scope.value(process);
+        if !scope.is_object(process) {
+            return Ok(());
+        }
+        let reset = scope.get(process, RESET_TERMINALS_SLOT)?;
+        if scope.is_callable(reset) {
+            scope.call(reset, process, &[])?;
+        }
+        Ok(())
+    });
+    if reset.is_err() {
+        ctx.clear_pending_error();
+    }
+}
+
+fn emit_exit_once(
     ctx: &mut NativeCtx<'_>,
     args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {

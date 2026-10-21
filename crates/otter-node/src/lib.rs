@@ -48,6 +48,7 @@ mod nodelib;
 pub mod os;
 pub mod stubs;
 mod transport_payload;
+mod tty;
 pub mod url;
 pub mod util;
 pub mod zlib_stream;
@@ -294,6 +295,8 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("util/types", util::util_types_cjs_value),
     HostedModule::cjs_only("node:tty", nodelib::node_tty),
     HostedModule::cjs_only("tty", nodelib::node_tty),
+    HostedModule::cjs_only("internal/tty", nodelib::internal_tty),
+    HostedModule::cjs_only("internal/otter/tty", tty::tty_binding_cjs_value),
     HostedModule::cjs_only("node:net", nodelib::node_net),
     HostedModule::cjs_only("net", nodelib::node_net),
     HostedModule::cjs_only("internal/otter/net", net::net_binding_cjs_value),
@@ -314,6 +317,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     ),
     HostedModule::cjs_only("internal/otter/tcp_wrap", nodelib::internal_tcp_wrap),
     HostedModule::cjs_only("internal/otter/pipe_wrap", nodelib::internal_pipe_wrap),
+    HostedModule::cjs_only("internal/otter/tty_wrap", nodelib::internal_tty_wrap),
     HostedModule::cjs_only("internal/otter/udp_wrap", nodelib::internal_udp_wrap),
     HostedModule::cjs_only("internal/otter/zlib_handle", nodelib::internal_zlib_handle),
     HostedModule::cjs_only("internal/otter/fs_binding", nodelib::internal_fs_binding),

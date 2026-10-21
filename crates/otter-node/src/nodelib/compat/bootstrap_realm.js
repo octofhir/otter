@@ -1035,6 +1035,7 @@ const uvErrors = [
   ['ENETUNREACH', -51, 'network is unreachable'],
   ['ENOTSOCK', -38, 'socket operation on non-socket'],
   ['ENOTSUP', -45, 'operation not supported'],
+  ['ENOTTY', -25, 'inappropriate ioctl for device'],
   ['ENFILE', -23, 'file table overflow'],
   ['ENOBUFS', -55, 'no buffer space available'],
   ['ENOENT', -2, 'no such file or directory'],
@@ -1418,6 +1419,9 @@ const bindings = {
   },
   get pipe_wrap() {
     return require('internal/otter/pipe_wrap');
+  },
+  get tty_wrap() {
+    return require('internal/otter/tty_wrap');
   },
   get udp_wrap() {
     return require('internal/otter/udp_wrap');

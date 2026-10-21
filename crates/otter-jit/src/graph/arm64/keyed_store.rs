@@ -2,10 +2,11 @@
 //!
 //! # Contents
 //! - [`Codegen::emit_store_keyed_cached`] stores into an Array's dense
-//!   storage of any kind inline, appends at its length through the VM's
-//!   push leaf, stores a Number into a typed view of any non-BigInt kind
-//!   inline, a name key through the code object's keyed table routine, and
-//!   every other store in the runtime.
+//!   storage of any kind inline, appends at its length inline into tagged
+//!   storage with room and through the VM's push leaf otherwise, stores a
+//!   Number into a typed view of any non-BigInt kind inline, a name key
+//!   through the code object's keyed table routine, and every other store in
+//!   the runtime.
 //!
 //! # Invariants
 //! - Every guard precedes the one store; a failed guard has written nothing
@@ -17,8 +18,12 @@
 //!   cleared and counted, and the last one makes the storage packed. A
 //!   tagged cell value takes the element write barrier.
 //! - An append is an ordinary own addition under the same permit as a
-//!   hole store; the push leaf completes it only within the storage's
-//!   capacity and its own dense-range guards, so it never allocates.
+//!   hole store, and never allocates: inline only into tagged storage whose
+//!   dense prefix is the whole length and below its capacity, the value
+//!   taking the element write barrier before the Array's dense length, its
+//!   slab's length and its `length` move together; the push leaf completes
+//!   any other append only within the storage's capacity and its own
+//!   dense-range guards.
 //! - A typed view is stored into inline only through its cached element
 //!   base while the detach protector holds, at an int32 index below its
 //!   length, and with a value that is already a Number: the conversion to
@@ -82,8 +87,35 @@ impl Codegen<'_> {
             ; b.hi =>in_bounds
             ; b.ne =>runtime
         );
-        // A key at the length appends.
+        // A key at the length appends: inline into tagged storage whose
+        // dense prefix is its whole length while it has room, else through
+        // the push leaf.
         self.emit_hole_store_permit(storage, receiver, runtime);
+        let leaf = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldrb w17, [X(receiver), numeric.kind_byte]
+            ; cmp w17, u32::from(storage.tagged_kind)
+            ; b.ne =>leaf
+            ; ldr w17, [X(receiver), storage.logical_length_byte]
+            ; cmp w17, W(length)
+            ; b.ne =>leaf
+            ; ldr w17, [X(receiver), storage.capacity_byte]
+            ; cmp W(length), w17
+            ; b.hs =>leaf
+            ; ldr X(base), [X(receiver), storage.base_byte]
+            ; str X(value), [X(base), W(key), uxtw #3]
+        );
+        self.emit_element_write_barrier(node, base, key, value, &[receiver, length, base]);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; add w16, WSP(length), #1
+            ; str w16, [X(receiver), storage.length_byte]
+            ; stur w16, [X(base), storage.slab_length_from_base]
+            ; str w16, [X(receiver), storage.logical_length_byte]
+            ; b =>done
+            ; =>leaf
+        );
         self.emit_array_push_leaf(node, [receiver, key, value], runtime, done);
         dynasm!(self.ops
             ; .arch aarch64

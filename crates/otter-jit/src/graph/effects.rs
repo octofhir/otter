@@ -275,6 +275,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::ConstFloat64(_)
         | Kind::VirtualObject { .. }
         | Kind::Phi
+        | Kind::Select(_)
         | Kind::LoadNewTarget
         | Kind::LoadClosure
         | Kind::LoadLiteral(_)

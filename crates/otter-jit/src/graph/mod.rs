@@ -24,6 +24,7 @@
 //!   ToBoolean.
 //! - `branch_thread` — branches on a merged boolean take the merged edges
 //!   directly.
+//! - `select` — diamonds that only pick a value become selects.
 //! - `dependency_checks` — stability and field-summary proofs become code
 //!   dependencies with one flag test per effect region.
 //! - [`regalloc`] — live intervals, canonical homes and register assignment.
@@ -87,6 +88,7 @@ mod range;
 mod redundancy;
 pub(crate) mod regalloc;
 pub(crate) mod registers;
+mod select;
 pub(crate) mod truncation;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_64;
@@ -194,6 +196,7 @@ pub(crate) fn compile(
     fold::fold(&mut built.graph, &mut built.layout, &mut built.loop_headers);
     branch_fold::fold_branch_negations(&mut built.graph);
     branch_thread::thread_boolean_phis(&mut built.graph, &mut built.layout);
+    select::convert(&mut built.graph, &mut built.layout);
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);
     let dependencies = dependency_checks::place(&mut built.graph, view, &built.inline_views);
     backedge_fuel::carry_in_registers(&mut built.graph, &mut built.layout, &built.loop_headers);

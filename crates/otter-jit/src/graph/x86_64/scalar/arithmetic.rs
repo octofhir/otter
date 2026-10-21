@@ -147,6 +147,46 @@ impl Codegen<'_> {
                 self.emit_int32_compare(a, b);
                 self.emit_cset_bool(dst, condition, false);
             }
+            // The test's flags pick one of two moves into the result.
+            Kind::Select(test) => {
+                let operands = test.operands();
+                let inputs = self.loc(node).inputs.clone();
+                let dst = self.loc(node).result.unwrap();
+                let picked = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                match test {
+                    BranchKind::Int32(condition) => {
+                        self.emit_int32_compare(Self::gp(inputs[0]), inputs[1]);
+                        self.emit_branch_condition(condition, false, picked);
+                    }
+                    BranchKind::Float64(condition) => {
+                        let (a, b) = (Self::fp(inputs[0]), Self::fp(inputs[1]));
+                        dynasm!(self.ops ; .arch x64 ; ucomisd Rx(a), Rx(b));
+                        self.emit_branch_condition(condition, true, picked);
+                    }
+                    BranchKind::TaggedEqual => {
+                        let (a, b) = (Self::gp(inputs[0]), Self::gp(inputs[1]));
+                        dynasm!(self.ops ; .arch x64 ; cmp Rq(a), Rq(b) ; je =>picked);
+                    }
+                    BranchKind::WordEqual(bits) => {
+                        let a = Self::gp(inputs[0]);
+                        self.load_immediate(10, u64::from(bits));
+                        dynasm!(self.ops ; .arch x64 ; cmp Rq(a), r10 ; je =>picked);
+                    }
+                    BranchKind::Truthy => {
+                        let a = Self::gp(inputs[0]);
+                        dynasm!(self.ops ; .arch x64
+                            ; cmp Rq(a), tag::VALUE_TRUE as i32 ; je =>picked);
+                    }
+                    BranchKind::Float64Truthy | BranchKind::Nullish | BranchKind::Native(_) => {
+                        return Err(Unsupported::OperandShape("graph x86 select test"));
+                    }
+                }
+                self.emit_move(inputs[operands + 1], dst);
+                dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>picked);
+                self.emit_move(inputs[operands], dst);
+                dynasm!(self.ops ; .arch x64 ; =>done);
+            }
             Kind::Float64Add | Kind::Float64Sub | Kind::Float64Mul | Kind::Float64Div => {
                 let (a, b, dst) = self.scalar_fp_binary(node);
                 emit_float_binary(&mut self.ops, &kind, a, b, dst);

@@ -361,6 +361,18 @@ fn branches_merge_through_phis() {
         ],
     );
     seed(&mut view, &[0, 5], ARITH_INT32);
+    // The builder's diamond, edge blocks and all, picks with one select.
+    let transitions = TransitionTable::resolve();
+    let compiled = super::compile(&view, 7002, &transitions, None, false).expect("graph compile");
+    let graph = &compiled.built.graph;
+    let selects = compiled
+        .built
+        .layout
+        .iter()
+        .flat_map(|&block| graph.block(block).body.iter())
+        .filter(|&&node| matches!(graph.node(node).kind, super::ir::Kind::Select(_)))
+        .count();
+    assert_eq!(selects, 1, "{}", graph.dump(&compiled.built.layout));
     let (result, _) = run(&view, &[int(3), int(7)]);
     assert_eq!(returned(result), int(4));
     let (result, _) = run(&view, &[int(9), int(7)]);

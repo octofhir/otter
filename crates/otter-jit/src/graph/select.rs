@@ -18,9 +18,13 @@
 //! - An arm holds at most [`ARM_NODES`] nodes, each a pure operation that
 //!   cannot trap or a field load: nothing calls, writes, collects, throws or
 //!   deopts, so running an arm on the path that did not need it changes
-//!   nothing observable. A field load runs early only when its object is no
-//!   input of the test, directly or through the test's operands, so the test
-//!   cannot be what proved the object.
+//!   nothing observable. A field load runs early only when the test cannot
+//!   be what proved its object: the test computes from the object neither
+//!   directly nor through a comparison, type test or shape word. A test of a
+//!   value loaded from the object (`this.direction == 1`) proves nothing
+//!   about the object.
+//! - Arms are matched after [`super::straighten`] merged each branch edge's
+//!   block with the block it alone enters.
 //! - Every phi of the merge becomes a select of its two inputs on the
 //!   branch's condition, placed in the testing block after both arms'
 //!   nodes; the merge keeps no phi and the testing block jumps to it.
@@ -55,17 +59,45 @@ fn condition_operands(graph: &Graph, kind: BranchKind, inputs: &[NodeId]) -> Opt
     }
 }
 
-/// Whether `node` is `object` or an input of it, at most `depth` levels down.
-fn reads_value(graph: &Graph, node: NodeId, object: NodeId, depth: u32) -> bool {
+/// Whether `kind` reads a value stored in an object: a field, an element, a
+/// length or a cell. Such a value says nothing about the object it was read
+/// from, unlike a test of the object itself, its type or its shape word.
+fn loads_stored_value(kind: &Kind) -> bool {
+    matches!(
+        kind,
+        Kind::LoadOwnField { .. }
+            | Kind::LoadTaggedField(_)
+            | Kind::LoadNamedProperty { .. }
+            | Kind::LoadPropertyCached { .. }
+            | Kind::LoadKeyedCached { .. }
+            | Kind::LoadArrayExpando(_)
+            | Kind::LoadFunctionBag
+            | Kind::LoadPresentElement
+            | Kind::LoadElement(_)
+            | Kind::LoadElementUint32ToFloat64
+            | Kind::LoadHoleyFloat64Element(_)
+            | Kind::LoadCellValue(_)
+            | Kind::LoadArrayLength { .. }
+            | Kind::LoadTypedArrayLength
+            | Kind::LoadElementsLength { .. }
+    )
+}
+
+/// Whether testing `node` may prove something about `object`: `node` is
+/// `object`, or computes from it (a comparison, a type test, a shape word)
+/// at most `depth` levels down without passing through a value stored in an
+/// object.
+fn tests_object(graph: &Graph, node: NodeId, object: NodeId, depth: u32) -> bool {
     if node == object {
         return true;
     }
+    let data = graph.node(node);
     depth > 0
-        && graph
-            .node(node)
+        && !loads_stored_value(&data.kind)
+        && data
             .inputs
             .iter()
-            .any(|&input| reads_value(graph, input, object, depth - 1))
+            .any(|&input| tests_object(graph, input, object, depth - 1))
 }
 
 /// Whether `node` may run before the test `condition` instead of below one
@@ -93,7 +125,7 @@ fn runs_early(graph: &Graph, node: NodeId, condition: &[NodeId]) -> bool {
             let object = data.inputs[0];
             !condition
                 .iter()
-                .any(|&operand| reads_value(graph, operand, object, 3))
+                .any(|&operand| tests_object(graph, operand, object, 3))
         }
         _ => false,
     }

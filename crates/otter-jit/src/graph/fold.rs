@@ -1,20 +1,28 @@
-//! Constant folding and constant branches.
+//! Constant folding, constant branches and branches a dominating branch
+//! decided.
 //!
 //! Inlined accessors and constant fields leave int32 arithmetic and compares
 //! whose operands are all constants, and branches on them: an inlined
 //! `return this.mark !== 0` over a field the builder proved to hold `0`
 //! compares two constants. Such a node is its constant; such a branch is a
-//! jump, and the blocks only its other edge reached leave the graph.
+//! jump, and the blocks only its other edge reached leave the graph. Inlined
+//! bodies also test what their caller already tested (`direction == 1`
+//! twice in one loop body): below the edge the first test took, the second
+//! takes the same edge.
 //!
 //! # Contents
-//! - [`fold`] — fold every constant node and branch of `layout`, drop the
-//!   blocks no entry reaches any more, and keep the loop headers current.
+//! - [`fold`] — fold every constant node and decided branch of `layout`,
+//!   drop the blocks no entry reaches any more, and keep the loop headers
+//!   current.
 //!
 //! # Invariants
 //! - Only operations that cannot deopt, throw or read memory fold, with the
 //!   wrapping int32 semantics their nodes compute.
-//! - A branch folds only on constants: its condition is the same on every
-//!   run, so the edge it never takes is dead.
+//! - A branch folds on constants, or below one edge of a dominating branch
+//!   on the same condition and inputs: the edge's target has that branch's
+//!   block as its only predecessor and dominates the folded branch, so every
+//!   run that reaches it took that edge. A branch condition is a pure
+//!   function of its inputs, so the edge it never takes is dead.
 //! - A block loses its last predecessor only through a folded edge; it and
 //!   every block that then has no predecessor (an entry never does) leave the
 //!   layout with their edges. A value one of them defines is read only below
@@ -33,7 +41,7 @@ use smallvec::SmallVec;
 use otter_vm::value::tag;
 
 use super::builder::LoopHeader;
-use super::dominators::successors;
+use super::dominators::{Dominators, successors};
 use super::ir::{BlockId, BranchKind, Condition, Graph, Kind, NodeId};
 
 fn int32(graph: &Graph, node: NodeId) -> Option<i32> {
@@ -102,6 +110,62 @@ fn decided(graph: &Graph, control: NodeId) -> Option<bool> {
         },
         _ => None,
     }
+}
+
+/// The edge each branch takes because a dominating branch on the same
+/// condition and inputs took one that is its target's only way in, and
+/// that target dominates the branch: `true` for its true successor.
+fn implied_by_dominating_branches(graph: &Graph, layout: &[BlockId]) -> FxHashMap<NodeId, bool> {
+    let mut implied = FxHashMap::default();
+    let branches: Vec<(BlockId, NodeId)> = layout
+        .iter()
+        .filter_map(|&block| {
+            let control = graph.block(block).control?;
+            matches!(graph.node(control).kind, Kind::Branch { .. }).then_some((block, control))
+        })
+        .collect();
+    if branches.len() < 2 {
+        return implied;
+    }
+    let dominators = Dominators::compute(graph, layout);
+    for (block, control) in branches {
+        let data = graph.node(control);
+        let Kind::Branch { kind, .. } = data.kind else {
+            continue;
+        };
+        let mut current = block;
+        while let Some(parent) = dominators.immediate(current) {
+            current = parent;
+            let Some(parent_control) = graph.block(parent).control else {
+                continue;
+            };
+            let parent_data = graph.node(parent_control);
+            let Kind::Branch {
+                kind: parent_kind,
+                if_true,
+                if_false,
+            } = parent_data.kind
+            else {
+                continue;
+            };
+            if parent_kind != kind || parent_data.inputs != data.inputs || if_true == if_false {
+                continue;
+            }
+            let sole_edge = |target: BlockId| {
+                graph.block(target).predecessors.as_slice() == [parent]
+                    && dominators.dominates(target, block)
+            };
+            if sole_edge(if_true) {
+                implied.insert(control, true);
+                break;
+            }
+            if sole_edge(if_false) {
+                implied.insert(control, false);
+                break;
+            }
+        }
+    }
+    implied
 }
 
 /// Remove the edge `from` → `target` with its phi inputs.
@@ -182,6 +246,7 @@ pub(crate) fn fold(
         }
     }
     // Branches.
+    let implied = implied_by_dominating_branches(graph, layout);
     let entries: Vec<BlockId> = layout
         .iter()
         .copied()
@@ -192,7 +257,7 @@ pub(crate) fn fold(
         let Some(control) = graph.block(block).control else {
             continue;
         };
-        let Some(taken) = decided(graph, control) else {
+        let Some(taken) = decided(graph, control).or_else(|| implied.get(&control).copied()) else {
             continue;
         };
         let Kind::Branch {

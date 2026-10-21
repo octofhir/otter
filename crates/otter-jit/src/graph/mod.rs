@@ -17,8 +17,9 @@
 //! - [`licm`] — loop-invariant checks and loads run once before their loop.
 //! - [`redundancy`] — a value, load or check a dominating equivalent already
 //!   produced over unchanged memory is that node.
-//! - [`fold`] — constant int32 nodes and branches; the blocks only a folded
-//!   branch's dead edge reached leave the graph.
+//! - [`fold`] — constant int32 nodes, branches on constants and branches
+//!   below one edge of the same test; the blocks only a folded branch's dead
+//!   edge reached leave the graph.
 //! - `branch_fold` — truthiness branches test the value under `!` and
 //!   ToBoolean.
 //! - `branch_thread` — branches on a merged boolean take the merged edges

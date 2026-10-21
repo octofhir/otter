@@ -3,10 +3,10 @@
 //!
 //! # Contents
 //! - [`Codegen::emit_keyed_store`] stores into an Array's dense storage of
-//!   any kind inline, appends at its length through the VM's push leaf,
-//!   stores a Number into a typed view of any non-BigInt kind inline, a
-//!   name key through the code object's keyed table routine, and every
-//!   other store in the runtime.
+//!   any kind inline, appends at its length inline into tagged storage with
+//!   room and through the VM's push leaf otherwise, stores a Number into a
+//!   typed view of any non-BigInt kind inline, a name key through the code
+//!   object's keyed table routine, and every other store in the runtime.
 //!
 //! # Invariants
 //! - Every guard precedes the one store; a failed guard has written nothing
@@ -17,8 +17,12 @@
 //!   cleared and counted, and the last one makes the storage packed. A
 //!   tagged cell value takes the element write barrier.
 //! - An append is an ordinary own addition under the same permit as a
-//!   hole store; the push leaf completes it only within the storage's
-//!   capacity and its own dense-range guards, so it never allocates.
+//!   hole store, and never allocates: inline only into tagged storage whose
+//!   dense prefix is the whole length and below its capacity, the value
+//!   taking the element write barrier before the Array's dense length, its
+//!   slab's length and its `length` move together; the push leaf completes
+//!   any other append only within the storage's capacity and its own
+//!   dense-range guards.
 //! - A typed view is stored into inline only through its cached element
 //!   base while the detach protector holds, at an int32 index below its
 //!   length, and with a value that is already a Number: the conversion to
@@ -76,8 +80,30 @@ impl Codegen<'_> {
             ; mov Rd(length), [Rq(receiver) + storage.length_byte as i32]
             ; cmp Rd(length), Rd(key) ; ja =>in_bounds ; jne =>runtime
         );
-        // A key at the length appends.
+        // A key at the length appends: inline into tagged storage whose
+        // dense prefix is its whole length while it has room, else through
+        // the push leaf.
         self.emit_hole_store_permit(storage, receiver, runtime);
+        let leaf = self.ops.new_dynamic_label();
+        dynasm!(self.ops ; .arch x64
+            ; cmp BYTE [Rq(receiver) + numeric.kind_byte as i32], storage.tagged_kind as i8
+            ; jne =>leaf
+            ; cmp Rd(length), DWORD [Rq(receiver) + storage.logical_length_byte as i32]
+            ; jne =>leaf
+            ; cmp Rd(length), DWORD [Rq(receiver) + storage.capacity_byte as i32]
+            ; jae =>leaf
+            ; mov Rq(base), [Rq(receiver) + storage.base_byte as i32]
+            ; mov r10d, Rd(key) ; mov [Rq(base) + r10 * 8], Rq(value)
+        );
+        self.emit_element_write_barrier(node, base, key, value, &[receiver, length, base]);
+        dynasm!(self.ops ; .arch x64
+            ; lea r10d, [Rq(length) + 1]
+            ; mov DWORD [Rq(receiver) + storage.length_byte as i32], r10d
+            ; mov DWORD [Rq(base) + storage.slab_length_from_base], r10d
+            ; mov DWORD [Rq(receiver) + storage.logical_length_byte as i32], r10d
+            ; jmp =>done
+            ; =>leaf
+        );
         self.emit_array_push_leaf(node, [receiver, key, value], runtime, done);
         dynasm!(self.ops ; .arch x64
             ; =>in_bounds

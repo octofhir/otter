@@ -1,0 +1,13 @@
+; otter graph
+  v0 = ConstTagged(10) [] Tagged
+b1 preds=[]
+  v1 = InitialRegister(0) [] Tagged
+  v2 = InitialRegister(1) [] Tagged
+  v3 = Jump(BlockId(0)) [] None
+b0 preds=[1]
+  v4 = LoadThis [] Tagged
+  v5 = StoreNamedProperty { byte_pc: 15, owners: [FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }] } [4, 1] None eager=[[(1, 2), (2, 4), (3, 1)]]
+  v6 = WriteBarrier [4, 1] None
+  v7 = StoreNamedProperty { byte_pc: 46, owners: [FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }] } [4, 2] None eager=[[(2, 4), (3, 2)]]
+  v8 = WriteBarrier [4, 2] None
+  v9 = Return [0] None

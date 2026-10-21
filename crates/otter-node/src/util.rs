@@ -2,7 +2,8 @@
 //!
 //! `node:util` itself is vendored Node (`nodelib`); this module owns the
 //! natives its compat realm forwards to through `internal/otter/natives`, and
-//! the `util/types` alias.
+//! the `util/types` alias. The same module carries the runtime's
+//! `createRequire` to `node:module`, which only a builtin can reach.
 //!
 //! # Invariants
 //! - Live call sites are captured through [`NativeCtx`]'s explicit runtime
@@ -188,8 +189,9 @@ fn float16_is_nan(bits: u16) -> bool {
 }
 
 /// Hosted `internal/otter/natives` — the native helpers the compat realm's
-/// `internalBinding('util')` forwards to. Kept as one narrow module so the
-/// realm shim stays plain JavaScript.
+/// `internalBinding('util')` forwards to, and the `createRequire` behind
+/// `node:module`'s. Kept as one narrow module so the shims stay plain
+/// JavaScript.
 ///
 /// # Errors
 /// Returns a native error when allocation fails.
@@ -210,6 +212,7 @@ pub fn otter_natives_cjs_value<'scope>(
     let typed_arrays_equal = scope.native_method("typedArraysEqual", 2, typed_arrays_equal)?;
     let proxy_details = scope.native_method("proxyDetails", 1, proxy_details)?;
     let own_non_index_keys = scope.native_method("ownNonIndexKeys", 1, own_non_index_keys)?;
+    let create_require = scope.native_method("createRequire", 1, otter_runtime::create_require)?;
     let flags = Attr {
         writable: false,
         enumerable: true,
@@ -220,6 +223,7 @@ pub fn otter_natives_cjs_value<'scope>(
     scope.define(export, "typedArraysEqual", typed_arrays_equal, flags)?;
     scope.define(export, "proxyDetails", proxy_details, flags)?;
     scope.define(export, "ownNonIndexKeys", own_non_index_keys, flags)?;
+    scope.define(export, "createRequire", create_require, flags)?;
     Ok(export)
 }
 

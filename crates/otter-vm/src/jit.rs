@@ -780,6 +780,8 @@ pub struct JitCompileSnapshot {
     pub field_layout: crate::object::FieldLayout,
     /// Header-inclusive offset of a shaped object's u32 live property count.
     pub shape_property_count_byte: u32,
+    /// Shape-owned complete own-key lookup geometry.
+    pub shape_lookup: crate::object::ShapeLookupLayout,
     /// Byte offset of the 4-byte rare-state GC handle. Conservative generated
     /// property programs require a zero handle; programs that prove ordinary
     /// named lookup separately can admit benign sidecars such as symbol keys.
@@ -2413,6 +2415,7 @@ impl JitCompileSnapshot {
             exotic_instance_root_byte: 0,
             field_layout: crate::object::FieldLayout::current(),
             shape_property_count_byte: 0,
+            shape_lookup: Default::default(),
             object_exotic_handle_byte: 0,
             gc_barrier: JitGcBarrierLayout::default(),
             shape_prototype_byte: 0,

@@ -1,0 +1,1177 @@
+{
+  "records": [
+    {
+      "id": 1,
+      "frameState": 4294967295,
+      "taggedLocations": [],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 2,
+      "frameState": 4294967295,
+      "taggedLocations": [],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 3,
+      "frameState": 4294967295,
+      "taggedLocations": [],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4,
+      "frameState": 4294967295,
+      "taggedLocations": [],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 5,
+      "frameState": 4294967295,
+      "taggedLocations": [],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 6,
+      "frameState": 4294967295,
+      "taggedLocations": [],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 7,
+      "frameState": 4294967295,
+      "taggedLocations": [],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 8,
+      "frameState": 4294967295,
+      "taggedLocations": [],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967244,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967245,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967246,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967247,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967248,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967249,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967250,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967251,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967252,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967253,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967254,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967255,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 4
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967256,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967257,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967258,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967259,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967260,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967261,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967262,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967263,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967264,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967265,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967266,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 6
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967267,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967268,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967269,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967270,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967271,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967272,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967273,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967274,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967275,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967276,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": 60
+    },
+    {
+      "id": 4294967277,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967278,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": 57
+    },
+    {
+      "id": 4294967279,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 4
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [
+        {
+          "functionId": 503,
+          "bytePc": 174,
+          "entry": null,
+          "registerCount": 0,
+          "slots": [],
+          "arguments": null
+        }
+      ],
+      "callPc": 39
+    },
+    {
+      "id": 4294967280,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967281,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": 30
+    },
+    {
+      "id": 4294967282,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": 24
+    },
+    {
+      "id": 4294967283,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967284,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967285,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [
+        {
+          "functionId": 500,
+          "bytePc": 0,
+          "entry": null,
+          "registerCount": 0,
+          "slots": [],
+          "arguments": null
+        }
+      ],
+      "callPc": 14
+    },
+    {
+      "id": 4294967286,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 4
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967287,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 6
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967288,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 4
+        },
+        {
+          "kind": "spillSlot",
+          "index": 5
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967289,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967290,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [
+        {
+          "functionId": 500,
+          "bytePc": 0,
+          "entry": null,
+          "registerCount": 0,
+          "slots": [],
+          "arguments": null
+        }
+      ],
+      "callPc": 6
+    },
+    {
+      "id": 4294967291,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967292,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967293,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967294,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 7
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    }
+  ],
+  "returnSites": [
+    {
+      "nativeReturnOffset": 7612,
+      "safepointId": 4294967282
+    },
+    {
+      "nativeReturnOffset": 7640,
+      "safepointId": 4294967282
+    },
+    {
+      "nativeReturnOffset": 7728,
+      "safepointId": 4294967282
+    },
+    {
+      "nativeReturnOffset": 7952,
+      "safepointId": 4294967281
+    },
+    {
+      "nativeReturnOffset": 7980,
+      "safepointId": 4294967281
+    },
+    {
+      "nativeReturnOffset": 8068,
+      "safepointId": 4294967281
+    },
+    {
+      "nativeReturnOffset": 10320,
+      "safepointId": 4294967278
+    },
+    {
+      "nativeReturnOffset": 10348,
+      "safepointId": 4294967278
+    },
+    {
+      "nativeReturnOffset": 10436,
+      "safepointId": 4294967278
+    }
+  ]
+}

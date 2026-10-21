@@ -1,0 +1,31 @@
+{
+  "target": "aarch64-apple-darwin",
+  "architecture": "aarch64",
+  "operatingSystem": "macos",
+  "tier": "template",
+  "functionId": 504,
+  "functionName": "initialize",
+  "module": "/Users/alexanderstreltsov/work/octofhir/otter/scripts/dev/probe/class_create_ctor.js",
+  "codeObjectId": 7,
+  "entry": {
+    "kind": "entry"
+  },
+  "bytecodeBytes": 64,
+  "codeBytes": 6736,
+  "exactCodeIsRuntimeLocal": true,
+  "filesPresent": [
+    "manifest.json",
+    "bytecode.txt",
+    "template-plan.txt",
+    "code.bin",
+    "code-normalized.bin",
+    "asm.txt",
+    "code-map.json",
+    "relocations.json",
+    "safepoints.json"
+  ],
+  "filesAbsent": [
+    "optimized-ir.txt",
+    "deopt.json"
+  ]
+}

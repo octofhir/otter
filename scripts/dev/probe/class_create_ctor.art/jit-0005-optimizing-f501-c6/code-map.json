@@ -1,0 +1,105 @@
+{
+  "entryOffset": 0,
+  "callEntryOffset": 564,
+  "runtimeAddressRange": {
+    "start": "0x109540000",
+    "endExclusive": "0x1095409e0",
+    "entry": "0x109540000"
+  },
+  "regions": [
+    {
+      "kind": "instruction",
+      "startOffset": 776,
+      "endOffset": 776,
+      "block": 1,
+      "functionId": 501,
+      "logicalPc": 0,
+      "bytePc": 0,
+      "operationIndex": 1,
+      "operation": "v1 Jump(BlockId(0))"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 776,
+      "endOffset": 784,
+      "block": 0,
+      "functionId": 501,
+      "logicalPc": 0,
+      "bytePc": 0,
+      "operationIndex": 2,
+      "operation": "v2 LoadThis"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 784,
+      "endOffset": 960,
+      "block": 0,
+      "functionId": 501,
+      "logicalPc": 1,
+      "bytePc": 5,
+      "operationIndex": 3,
+      "operation": "v3 LoadNamedProperty { byte_pc: 5, programs: [0, 1], receiver_shape: None }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 960,
+      "endOffset": 1076,
+      "block": 0,
+      "functionId": 501,
+      "logicalPc": 2,
+      "bytePc": 18,
+      "operationIndex": 4,
+      "operation": "v4 LoadNamedProperty { byte_pc: 18, programs: [0], receiver_shape: None }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1076,
+      "endOffset": 1116,
+      "block": 0,
+      "functionId": 501,
+      "logicalPc": 4,
+      "bytePc": 36,
+      "operationIndex": 5,
+      "operation": "v5 CheckNative(372)"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1116,
+      "endOffset": 1124,
+      "block": 0,
+      "functionId": 501,
+      "logicalPc": 4,
+      "bytePc": 36,
+      "operationIndex": 6,
+      "operation": "v6 CheckArgumentsElided"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1124,
+      "endOffset": 1392,
+      "block": 0,
+      "functionId": 501,
+      "logicalPc": 4,
+      "bytePc": 36,
+      "operationIndex": 7,
+      "operation": "v7 CallForward { pc: 4, plan: Generic, bindings: [] }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1392,
+      "endOffset": 1396,
+      "block": 0,
+      "functionId": 501,
+      "logicalPc": 5,
+      "bytePc": 53,
+      "operationIndex": 8,
+      "operation": "v8 Return"
+    },
+    {
+      "kind": "out-of-line",
+      "startOffset": 1396,
+      "endOffset": 2528
+    }
+  ],
+  "osrEntries": []
+}

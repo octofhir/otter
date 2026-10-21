@@ -1,0 +1,13 @@
+; otter template plan
+; registers=9 register-operands=0 safepoints=0 osr-only=false
+; register-operands=[]
+0000 pc=0000 byte=0000 LoadThis { dst: 3 }
+0001 pc=0001 byte=0005 Move { dst: 4, src: 0 }
+0002 pc=0002 byte=0015 StoreProperty { object: 3, name: 6, value: 4, site: 1638 }
+0003 pc=0003 byte=0031 LoadThis { dst: 3 }
+0004 pc=0004 byte=0036 Move { dst: 4, src: 1 }
+0005 pc=0005 byte=0046 StoreProperty { object: 3, name: 7, value: 4, site: 1639 }
+0006 pc=0006 byte=0062 LoadThis { dst: 3 }
+0007 pc=0007 byte=0067 Move { dst: 4, src: 2 }
+0008 pc=0008 byte=0077 StoreProperty { object: 3, name: 8, value: 4, site: 1640 }
+0009 pc=0009 byte=0093 ReturnUndefined

@@ -1,0 +1,147 @@
+{
+  "entryOffset": 0,
+  "callEntryOffset": 560,
+  "runtimeAddressRange": {
+    "start": "0x10953c000",
+    "endExclusive": "0x10953dd90",
+    "entry": "0x10953c000"
+  },
+  "regions": [
+    {
+      "kind": "entryPrologue",
+      "startOffset": 0,
+      "endOffset": 940
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 940,
+      "endOffset": 956,
+      "functionId": 502,
+      "logicalPc": 0,
+      "bytePc": 0,
+      "operationIndex": 0,
+      "operation": "LoadThis { dst: 3 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 956,
+      "endOffset": 964,
+      "functionId": 502,
+      "logicalPc": 1,
+      "bytePc": 5,
+      "operationIndex": 1,
+      "operation": "Move { dst: 4, src: 0 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 964,
+      "endOffset": 1768,
+      "functionId": 502,
+      "logicalPc": 2,
+      "bytePc": 15,
+      "operationIndex": 2,
+      "operation": "StoreProperty { object: 3, name: 6, value: 4, site: 1638 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1768,
+      "endOffset": 1784,
+      "functionId": 502,
+      "logicalPc": 3,
+      "bytePc": 31,
+      "operationIndex": 3,
+      "operation": "LoadThis { dst: 3 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1784,
+      "endOffset": 1792,
+      "functionId": 502,
+      "logicalPc": 4,
+      "bytePc": 36,
+      "operationIndex": 4,
+      "operation": "Move { dst: 4, src: 1 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1792,
+      "endOffset": 2596,
+      "functionId": 502,
+      "logicalPc": 5,
+      "bytePc": 46,
+      "operationIndex": 5,
+      "operation": "StoreProperty { object: 3, name: 7, value: 4, site: 1639 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 2596,
+      "endOffset": 2612,
+      "functionId": 502,
+      "logicalPc": 6,
+      "bytePc": 62,
+      "operationIndex": 6,
+      "operation": "LoadThis { dst: 3 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 2612,
+      "endOffset": 2620,
+      "functionId": 502,
+      "logicalPc": 7,
+      "bytePc": 67,
+      "operationIndex": 7,
+      "operation": "Move { dst: 4, src: 2 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 2620,
+      "endOffset": 3424,
+      "functionId": 502,
+      "logicalPc": 8,
+      "bytePc": 77,
+      "operationIndex": 8,
+      "operation": "StoreProperty { object: 3, name: 8, value: 4, site: 1640 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 3424,
+      "endOffset": 3432,
+      "functionId": 502,
+      "logicalPc": 9,
+      "bytePc": 93,
+      "operationIndex": 9,
+      "operation": "ReturnUndefined"
+    },
+    {
+      "kind": "returnEpilogue",
+      "startOffset": 3432,
+      "endOffset": 3468
+    },
+    {
+      "kind": "bailEpilogue",
+      "startOffset": 3468,
+      "endOffset": 3564
+    },
+    {
+      "kind": "committedThrowRouter",
+      "startOffset": 3564,
+      "endOffset": 3600
+    },
+    {
+      "kind": "throwEpilogue",
+      "startOffset": 3600,
+      "endOffset": 3968
+    },
+    {
+      "kind": "sharedPropertyProbes",
+      "startOffset": 3968,
+      "endOffset": 7396
+    },
+    {
+      "kind": "literalPool",
+      "startOffset": 7396,
+      "endOffset": 7568
+    }
+  ],
+  "osrEntries": []
+}

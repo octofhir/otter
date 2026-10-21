@@ -1,0 +1,12 @@
+; otter bytecode
+; function=502 registers=9 parameters=3 bytes=95
+0000 byte=0000 LoadThis [Register(3)]
+0001 byte=0005 LoadLocal [Register(4), Imm32(0)]
+0002 byte=0015 StoreProperty [Register(3), ConstIndex(6), Register(4), Register(5)]
+0003 byte=0031 LoadThis [Register(3)]
+0004 byte=0036 LoadLocal [Register(4), Imm32(1)]
+0005 byte=0046 StoreProperty [Register(3), ConstIndex(7), Register(4), Register(5)]
+0006 byte=0062 LoadThis [Register(3)]
+0007 byte=0067 LoadLocal [Register(4), Imm32(2)]
+0008 byte=0077 StoreProperty [Register(3), ConstIndex(8), Register(4), Register(5)]
+0009 byte=0093 ReturnUndefined []

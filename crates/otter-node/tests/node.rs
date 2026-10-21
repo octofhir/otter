@@ -36,6 +36,156 @@ fn hosted_node_module_specs_are_static_and_ordered() {
     }
 }
 
+/// The builtins' internal modules are theirs alone: user code reaches none of
+/// them — through `require`, `createRequire`, `require.resolve`, the `node:`
+/// scheme, `import()` or a static `import` — and fails exactly as Node's does,
+/// require stack included, while the builtins built on them keep working.
+/// `--expose-internals` opens the `internal/*` ones but the realm, as in Node.
+#[test]
+fn user_code_reaches_no_internal_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let write = |name: &str, source: &str| std::fs::write(root.join(name), source).unwrap();
+    write("dep.cjs", "module.exports = 7;\n");
+    write(
+        "nested.cjs",
+        "module.exports = () => require('internal/util');\n",
+    );
+    write(
+        "main.cjs",
+        r#"
+        const assert = require('node:assert');
+        const path = require('node:path');
+        const Module = require('node:module');
+        for (const id of ['internal/otter/tty', 'internal/util', 'internal/bootstrap/realm', '__fsnative']) {
+          const notFound = (request) => ({
+            name: 'Error',
+            code: 'MODULE_NOT_FOUND',
+            message: `Cannot find module '${request}'\nRequire stack:\n- ${__filename}`,
+            requireStack: [__filename],
+          });
+          assert.throws(() => require(id), notFound(id));
+          assert.throws(() => require.resolve(id), notFound(id));
+          assert.throws(() => Module.createRequire(__filename)(id), notFound(id));
+          assert.throws(() => require(`node:${id}`), {
+            name: 'Error',
+            code: 'ERR_UNKNOWN_BUILTIN_MODULE',
+            message: `No such built-in module: node:${id}`,
+          });
+          assert.throws(() => require.resolve(`node:${id}`), notFound(`node:${id}`));
+        }
+        const nested = path.join(__dirname, 'nested.cjs');
+        assert.throws(() => require('./nested.cjs')(), {
+          code: 'MODULE_NOT_FOUND',
+          requireStack: [nested, __filename],
+        });
+        assert.deepStrictEqual(
+          Module.builtinModules.filter((id) => id.startsWith('internal/') || id.startsWith('__')),
+          [],
+        );
+
+        // `createRequire` is a user module's `require`, from the file it names.
+        const fromHere = Module.createRequire(__filename);
+        assert.strictEqual(fromHere('./dep.cjs'), 7);
+        assert.strictEqual(fromHere('fs'), require('fs'));
+        assert.strictEqual(fromHere.resolve('fs'), 'fs');
+        assert.strictEqual(require.resolve('node:fs'), 'node:fs');
+        assert.strictEqual(require('node:_http_agent'), require('_http_agent'));
+
+        // The builtins built on the internal modules keep working.
+        assert.strictEqual(typeof require('tty').isatty(1), 'boolean');
+        assert.strictEqual(require('util').inspect({ a: 1 }), '{ a: 1 }');
+        assert.strictEqual(require('net').isIP('1.1.1.1'), 4);
+        "#,
+    );
+    write(
+        "main.mjs",
+        r#"
+        import assert from 'node:assert';
+        import { fileURLToPath } from 'node:url';
+
+        const here = fileURLToPath(import.meta.url);
+        for (const id of ['internal/otter/tty', 'internal/util']) {
+          await assert.rejects(import(id), {
+            name: 'Error',
+            code: 'ERR_MODULE_NOT_FOUND',
+            message: `Cannot find package 'internal' imported from ${here}`,
+          });
+          await assert.rejects(import(`node:${id}`), {
+            name: 'Error',
+            code: 'ERR_UNKNOWN_BUILTIN_MODULE',
+            message: `No such built-in module: node:${id}`,
+          });
+        }
+        // A literal `import()` naming nothing rejects when it runs.
+        await assert.rejects(import('node:internal/util'), { code: 'ERR_UNKNOWN_BUILTIN_MODULE' });
+        await assert.rejects(import('internal/util'), { code: 'ERR_MODULE_NOT_FOUND' });
+        "#,
+    );
+    write("static_scheme.mjs", "import 'node:internal/util';\n");
+    write("static_bare.mjs", "import 'internal/otter/tty';\n");
+
+    run_node(&root.join("main.cjs"), Entry::File, false).unwrap();
+    run_node(&root.join("main.mjs"), Entry::Module, false).unwrap();
+    let scheme = run_node(&root.join("static_scheme.mjs"), Entry::Module, false).unwrap_err();
+    assert!(
+        scheme.contains("No such built-in module: node:internal/util"),
+        "{scheme}"
+    );
+    let bare = run_node(&root.join("static_bare.mjs"), Entry::Module, false).unwrap_err();
+    assert!(
+        bare.contains("Cannot find package 'internal' imported from ")
+            && bare.contains("static_bare.mjs"),
+        "{bare}"
+    );
+
+    write(
+        "exposed.cjs",
+        r#"
+        const assert = require('node:assert');
+        assert.strictEqual(typeof require('internal/util').deprecate, 'function');
+        assert.strictEqual(require('node:internal/util'), require('internal/util'));
+        assert.strictEqual(typeof require('internal/otter/tty').isatty, 'function');
+        assert.throws(() => require('internal/bootstrap/realm'), { code: 'MODULE_NOT_FOUND' });
+        assert.throws(() => require('node:internal/bootstrap/realm'), {
+          code: 'ERR_UNKNOWN_BUILTIN_MODULE',
+        });
+        assert.throws(() => require('__fsnative'), { code: 'MODULE_NOT_FOUND' });
+        "#,
+    );
+    write(
+        "exposed.mjs",
+        "import util from 'internal/util';\n\
+         if (typeof util.deprecate !== 'function') throw new Error('internal/util');\n",
+    );
+    run_node(&root.join("exposed.cjs"), Entry::File, true).unwrap();
+    run_node(&root.join("exposed.mjs"), Entry::Module, true).unwrap();
+}
+
+/// How [`run_node`] enters its file.
+#[derive(Clone, Copy)]
+enum Entry {
+    File,
+    Module,
+}
+
+/// Run `entry` in a fresh Node runtime with every capability, answering the
+/// failure with its diagnostics in full. One runtime lives in this frame at a
+/// time.
+fn run_node(entry: &std::path::Path, how: Entry, expose_internals: bool) -> Result<(), String> {
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .expose_internals(expose_internals)
+        .with_node_apis()
+        .build()
+        .map_err(|error| format!("{error:?}"))?;
+    let result = match how {
+        Entry::File => runtime.run_file(entry),
+        Entry::Module => runtime.run_module(entry),
+    };
+    result.map(|_| ()).map_err(|error| format!("{error:?}"))
+}
+
 #[test]
 fn node_fs_requires_read_permission() {
     let dir = tempfile::tempdir().unwrap();

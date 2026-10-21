@@ -5,12 +5,17 @@
 //! - Shared trace and CPU-profiler configuration on the synchronous runtime path.
 //! - Structured JIT event capture through an explicit default-off target.
 //! - Atomic current-format JIT artifact bundle persistence.
+//! - `-p`/`-e` output to a standard stream whose reader has gone (a closed
+//!   pipe, as `| head -1` leaves it): the exit code and stderr Node gives.
 //!
 //! # Invariants
 //! - Tests invoke the built binary instead of private configuration helpers.
 //! - Enabling CPU profiling must not bypass global runtime execution settings.
+//! - A closed-pipe case writes far more than a pipe buffers, so the process is
+//!   still writing when its reader leaves, however the two are scheduled.
 
-use std::process::{Command, Output};
+use std::io::Read;
+use std::process::{Command, Output, Stdio};
 
 fn otter_command(root: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_otter"));
@@ -24,6 +29,57 @@ fn assert_success(output: &Output) {
         "otter failed with {:?}\nstdout:\n{}\nstderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The standard stream whose reader leaves after its first byte.
+#[derive(Clone, Copy)]
+enum ClosedStream {
+    Stdout,
+    Stderr,
+}
+
+/// Run `otter` with `args`, read one byte of `closed` and close that pipe
+/// while the process still has more to write to it — what `| head -c 1` does
+/// — then collect how the process ends.
+fn output_after_reader_leaves(
+    root: &std::path::Path,
+    args: &[&str],
+    closed: ClosedStream,
+) -> Output {
+    let mut child = otter_command(root)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn otter");
+    let mut first = [0_u8; 1];
+    match closed {
+        ClosedStream::Stdout => {
+            let mut stdout = child.stdout.take().expect("piped stdout");
+            stdout.read_exact(&mut first).expect("otter writes stdout");
+        }
+        ClosedStream::Stderr => {
+            let mut stderr = child.stderr.take().expect("piped stderr");
+            stderr.read_exact(&mut first).expect("otter writes stderr");
+        }
+    }
+    child.wait_with_output().expect("otter exits")
+}
+
+/// The process left with `code` and wrote nothing to standard error: no
+/// panic, no report of the broken pipe.
+fn assert_quiet_exit(output: &Output, code: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "stderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
 }
@@ -655,4 +711,122 @@ if (total !== 19900) throw new Error("bad total");
     assert!(profile["xOtterDroppedSamples"].is_u64());
     assert!(profile["xOtterTruncatedFrames"].is_u64());
     assert!(folded.is_file(), "folded stack artifact exists");
+}
+
+#[test]
+fn a_print_result_its_reader_left_is_dropped() {
+    // `node -p '"x".repeat(1 << 20)' | head -c 1` exits 0 and says nothing:
+    // Node prints the result with `console.log`, which drops what the reader
+    // no longer takes.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = output_after_reader_leaves(
+        tmp.path(),
+        &["-p", "'x'.repeat(1 << 20)"],
+        ClosedStream::Stdout,
+    );
+    assert_quiet_exit(&output, 0);
+}
+
+#[test]
+fn console_lines_their_reader_left_are_dropped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let stdout = output_after_reader_leaves(
+        tmp.path(),
+        &["-e", "for (let i = 0; i < 100000; i++) console.log(i)"],
+        ClosedStream::Stdout,
+    );
+    assert_quiet_exit(&stdout, 0);
+
+    let stderr = output_after_reader_leaves(
+        tmp.path(),
+        &["-e", "for (let i = 0; i < 100000; i++) console.error(i)"],
+        ClosedStream::Stderr,
+    );
+    assert_quiet_exit(&stderr, 0);
+}
+
+#[test]
+fn an_uncaught_error_its_reader_left_still_exits_1() {
+    // Node reports the error onto the closed stderr, which drops it, and
+    // leaves with the uncaught exception's 1.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let output = output_after_reader_leaves(
+        tmp.path(),
+        &[
+            "-e",
+            "for (let i = 0; i < 100000; i++) console.error(i); throw new Error('boom')",
+        ],
+        ClosedStream::Stderr,
+    );
+    assert_eq!(output.status.code(), Some(1));
+}
+
+#[test]
+fn writes_their_reader_left_raise_epipe() {
+    // Node's standard streams report a refused write as `Error: write EPIPE`:
+    // unhandled, it ends the run with 1; a listener receives it.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let unhandled = output_after_reader_leaves(
+        tmp.path(),
+        &[
+            "-e",
+            "for (let i = 0; i < 100000; i++) process.stdout.write(i + '\\n')",
+        ],
+        ClosedStream::Stdout,
+    );
+    let stderr = String::from_utf8_lossy(&unhandled.stderr);
+    assert_eq!(unhandled.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(stderr.contains("Error: write EPIPE"), "stderr:\n{stderr}");
+
+    let handled = output_after_reader_leaves(
+        tmp.path(),
+        &[
+            "-e",
+            "process.stdout.on('error', (e) => { process.exitCode = \
+             e.code === 'EPIPE' && e.syscall === 'write' && e.errno === -32 ? 3 : 4 }); \
+             for (let i = 0; i < 100000; i++) process.stdout.write(i + '\\n')",
+        ],
+        ClosedStream::Stdout,
+    );
+    assert_quiet_exit(&handled, 3);
+
+    let stderr_write = output_after_reader_leaves(
+        tmp.path(),
+        &[
+            "-e",
+            "for (let i = 0; i < 100000; i++) process.stderr.write(i + '\\n')",
+        ],
+        ClosedStream::Stderr,
+    );
+    assert_eq!(stderr_write.status.code(), Some(1));
+}
+
+#[test]
+fn a_later_console_write_its_reader_left_ends_the_run() {
+    // The console swallows the first refused line; the stream's next failure
+    // reaches no listener, so a program printing from timers ends with 1
+    // rather than printing into the closed pipe for ever.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let timers = output_after_reader_leaves(
+        tmp.path(),
+        &[
+            "-e",
+            "let n = 0; (function next() { console.log('x'); if (++n < 200000) setImmediate(next) })()",
+        ],
+        ClosedStream::Stdout,
+    );
+    let stderr = String::from_utf8_lossy(&timers.stderr);
+    assert_eq!(timers.status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(stderr.contains("Error: write EPIPE"), "stderr:\n{stderr}");
+
+    // A warning prints through the same console.
+    let warning = output_after_reader_leaves(
+        tmp.path(),
+        &[
+            "-e",
+            "for (let i = 0; i < 100000; i++) console.error(i); process.emitWarning('w')",
+        ],
+        ClosedStream::Stderr,
+    );
+    assert_eq!(warning.status.code(), Some(1));
 }

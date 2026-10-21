@@ -13,8 +13,9 @@
 //! - [`HeapSet`] — the union of the writes of a region, such as a loop body.
 //!
 //! # Invariants
-//! - A node that may run JavaScript, call out, or enter the runtime on a
-//!   slow path that can do either writes [`AbstractHeap::World`].
+//! - A node that may run JavaScript ([`super::ir::Properties::runs_js`]) or
+//!   call out writes [`AbstractHeap::World`]. A collecting slow path that
+//!   runs no JavaScript writes only what the node itself changes.
 //! - A node that may collect writes [`AbstractHeap::Movement`]: a collection
 //!   can move a slab, so a raw element base read before it is stale after.
 //!   Tagged values stay valid; the collector rewrites them in place.
@@ -354,6 +355,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         Kind::CheckElementPresent
         | Kind::LoadPresentElement
         | Kind::CheckHoleyElementPresent(_) => Effects::deref(&[H::Elements]),
+        Kind::LoadShapedProperty { atom } => Effects::reads(&[H::MapWords, H::Field(*atom)]),
         Kind::LoadOwnField { atom, .. } => Effects::deref(&[H::Field(*atom)]),
         Kind::LoadTaggedField(offset) => Effects::reads(&[H::ContextSlot(*offset)]),
         Kind::LoadArrayLength { array_proved } => {
@@ -431,20 +433,22 @@ fn heap_effects(kind: &Kind) -> Effects {
         // Remembered-set bookkeeping no program reads.
         Kind::WriteBarrier | Kind::ElementWriteBarrier => Effects::default(),
         // Allocation: a fresh cell no earlier load could have read, and a
-        // possible collection.
+        // possible collection, which runs no JavaScript.
         Kind::AllocationGroup(_)
         | Kind::NativeNewContext(_)
         | Kind::CopyContext
         | Kind::NewClosure
         | Kind::NewArrayWithLength
         | Kind::NewReceiver(_) => Effects::writes(&[H::Dependencies], &[H::Movement]),
-        Kind::PrimitiveAdd | Kind::BigIntBinary(_) => Effects::writes(&[], &[H::Movement]),
-        // Slow paths that may run JavaScript, and calls.
-        Kind::NewObject
+        Kind::PrimitiveAdd
+        | Kind::BigIntBinary(_)
+        | Kind::NewObject
         | Kind::NewArrayEmpty
-        | Kind::NewObjectLiteral { .. }
-        | Kind::NewArrayLiteral
-        | Kind::LoadPropertyCached { .. }
+        | Kind::NewArrayLiteral => Effects::writes(&[], &[H::Movement]),
+        // A literal's initial values seed the field types of its shape.
+        Kind::NewObjectLiteral { .. } => Effects::writes(&[], &[H::FieldTypes, H::Movement]),
+        // Slow paths that may run JavaScript, and calls.
+        Kind::LoadPropertyCached { .. }
         | Kind::StorePropertyCached { .. }
         | Kind::StoreKeyedCached { .. }
         | Kind::LoadKeyedCached { .. }
@@ -489,6 +493,28 @@ mod tests {
     }
 
     #[test]
+    fn shape_directory_reads_track_the_key_and_layout_without_runtime_effects() {
+        use AbstractHeap as H;
+        let kind = Kind::LoadShapedProperty { atom: 7 };
+        let read = clobberize(&kind);
+        let properties = kind.properties();
+        assert!(properties.eager_deopt);
+        assert!(!properties.call && !properties.may_collect && !properties.runs_js);
+        assert!(read.writes.is_empty());
+        for (heap, expected) in [
+            (H::Field(7), true),
+            (H::Field(8), false),
+            (H::MapWords, true),
+            (H::Movement, false),
+            (H::World, true),
+        ] {
+            let mut writes = HeapSet::default();
+            writes.add(heap);
+            assert_eq!(read.reads_overlap(&writes), expected, "{heap:?}");
+        }
+    }
+
+    #[test]
     fn a_cell_method_load_commutes_with_field_stores_but_not_appends() {
         let method = clobberize(&Kind::LoadGuardedMethod {
             byte_pc: 0,
@@ -526,5 +552,51 @@ mod tests {
         });
         assert!(method.reads_overlap(&append));
         assert!(clobberize(&Kind::CheckDependencies).reads_overlap(&overwrite));
+    }
+
+    #[test]
+    fn an_allocation_moves_storage_but_keeps_fields_and_shapes() {
+        let writes = |kind: &Kind| {
+            let mut set = HeapSet::default();
+            for heap in clobberize(kind).writes {
+                set.add(heap);
+            }
+            set
+        };
+        let field = clobberize(&Kind::LoadOwnField {
+            field: otter_vm::object::FieldLocation::inline(0),
+            atom: 7,
+        });
+        let shapes = clobberize(&Kind::CheckShapes {
+            shapes: Default::default(),
+            writable: false,
+            cell_proved: false,
+        });
+        let field_types = clobberize(&Kind::CheckFieldTypes(Default::default()));
+        let base = clobberize(&Kind::LoadElementsBase {
+            byte: 8,
+            off_heap: false,
+        });
+        for kind in [
+            Kind::NewObject,
+            Kind::NewArrayEmpty,
+            Kind::NewArrayLiteral,
+            Kind::NewObjectLiteral { fields: None },
+        ] {
+            let allocation = writes(&kind);
+            assert!(!allocation.is_world(), "{kind:?}");
+            assert!(!field.reads_overlap(&allocation), "{kind:?}");
+            assert!(!shapes.reads_overlap(&allocation), "{kind:?}");
+            assert!(base.reads_overlap(&allocation), "{kind:?}");
+        }
+        // A literal's values seed field types.
+        assert!(field_types.reads_overlap(&writes(&Kind::NewObjectLiteral { fields: None })));
+        assert!(!field_types.reads_overlap(&writes(&Kind::NewObject)));
+        let load = Kind::LoadPropertyCached {
+            pc: 0,
+            atom: None,
+            length: false,
+        };
+        assert!(writes(&load).is_world());
     }
 }

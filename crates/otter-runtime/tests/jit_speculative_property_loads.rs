@@ -1,6 +1,7 @@
 //! Speculative monomorphic own-data loads in the optimizing tier.
 //!
 //! # Contents
+//! - Complete shape directories serve megamorphic own reads without cache residency.
 //! - A warmed site completes in optimized code without exits or runtime
 //!   property stubs, including when its loop is entered by OSR.
 //! - A receiver of another shape exits a bounded number of times, and the
@@ -1100,3 +1101,6 @@ JSON.stringify([before, after]);
     assert!(!current.contains("ConstInt32(7)"), "{current}");
     run.assert_recompiled_after_last_exit("readCaptured");
 }
+
+#[path = "jit_speculative_property_loads/shape_directory.rs"]
+mod shape_directory;

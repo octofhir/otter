@@ -3,6 +3,7 @@
 //! # Contents
 //! - Escaped entry callbacks and failed module records keep defining sources.
 //! - Immediately queued worker messages execute after a CommonJS entry in FIFO.
+//! - A builtin main starts an internal builtin no user `require` reaches.
 //!
 //! # Invariants
 //! - Tests call the ordinary file, scoped native and worker owners. Source
@@ -328,5 +329,64 @@ async fn commonjs_worker_entry_publishes_readiness_before_fifo_messages() {
     assert_eq!(
         result.completion_string(),
         r#"[["first",1,true,true,true],["second",2,true,true,true]]"#
+    );
+}
+
+/// A builtin main is the runtime's own load: an internal builtin that no user
+/// `require` reaches still starts as the program, and a name no builtin
+/// answers to fails the run.
+#[test]
+fn a_builtin_main_starts_an_internal_builtin() {
+    fn probe_main<'scope>(
+        scope: &mut RuntimeNativeScope<'scope, '_>,
+        _caps: &CapabilitySet,
+        _runtime_task_spawner: Option<RuntimeTaskSpawner>,
+        _module: RuntimeLocal<'scope>,
+        _require: RuntimeLocal<'scope>,
+    ) -> Result<RuntimeLocal<'scope>, RuntimeNativeError> {
+        let globals = scope.global_this();
+        let ran = scope.boolean(true);
+        scope.set(globals, "builtinMainRan", ran)?;
+        scope.object()
+    }
+    let dir = tempfile::tempdir().expect("entry directory");
+    let entry = dir.path().join("user.cjs");
+    std::fs::write(
+        &entry,
+        r#"
+        try {
+            require("internal/main/probe");
+            globalThis.userReached = "loaded";
+        } catch (error) {
+            globalThis.userReached = error.code;
+        }
+        "#,
+    )
+    .expect("user source");
+    let mut runtime = Runtime::builder()
+        .capabilities(CapabilitySet::allow_all())
+        .with_nodejs_modules()
+        .hosted_module(HostedModule::cjs_only("internal/main/probe", probe_main))
+        .build()
+        .expect("CommonJS runtime");
+    runtime.run_file(&entry).expect("user entry");
+    runtime
+        .run_builtin_main("internal/main/probe")
+        .expect("builtin main");
+    let observed = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                "`${globalThis.userReached}:${globalThis.builtinMainRan}`",
+            ),
+            "observe.js",
+        )
+        .expect("observation");
+    assert_eq!(observed.completion_string(), "MODULE_NOT_FOUND:true");
+    let missing = runtime
+        .run_builtin_main("internal/main/absent")
+        .expect_err("no builtin answers");
+    assert!(
+        format!("{missing:?}").contains("no builtin module named 'internal/main/absent'"),
+        "{missing:?}"
     );
 }

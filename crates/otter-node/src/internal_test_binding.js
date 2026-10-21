@@ -1,6 +1,8 @@
 'use strict';
 // `internal/test/binding` — test-harness hooks used by selected Node
-// compatibility fixtures. This is not a public Node API.
+// compatibility fixtures, which reach it under `--expose-internals`. This is
+// not a public Node API. Like Node's, it hands out the realm's `primordials`
+// beside `internalBinding`: the realm module itself stays unreachable.
 
 const STORE_KEY = '__otterInternalTestBinding';
 const store = globalThis[STORE_KEY] || Object.defineProperty(globalThis, STORE_KEY, {
@@ -99,4 +101,4 @@ function internalBinding(name) {
   }
 }
 
-module.exports = { internalBinding };
+module.exports = { internalBinding, primordials: require('internal/bootstrap/realm').primordials };

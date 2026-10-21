@@ -23,8 +23,9 @@
 //!   cache, symbol registry, error-class registry,
 //!   function-user-prop bag.
 //! - A scavenge ([`otter_gc::RootSet::Young`]) skips only tables whose
-//!   slots name hidden classes or interned key strings, which are always
-//!   old-space cells.
+//!   slots name hidden classes, which are always old-space cells. The
+//!   canonical key strings are the heap's own roots
+//!   ([`crate::isolate_names`]).
 //!
 //! # See also
 //!
@@ -69,9 +70,9 @@ impl<'a> RuntimeState<'a> {
     /// - function-user-prop bag;
     /// - pending generator / uncaught throw side-channels.
     ///
-    /// For [`RootSet::Young`] the tables that name only hidden classes and
-    /// interned key strings are skipped: both are allocated in old space,
-    /// which a scavenge neither moves nor frees.
+    /// For [`RootSet::Young`] the tables that name only hidden classes are
+    /// skipped: they are allocated in old space, which a scavenge neither
+    /// moves nor frees.
     pub fn trace_roots(&self, roots: RootSet, visitor: &mut GcRootVisitor<'_>) {
         let interp = self.interp;
         // 1) Shared globalThis.
@@ -172,9 +173,10 @@ impl<'a> RuntimeState<'a> {
         interp.trace_iterator_prototypes(visitor);
         interp.trace_function_kind_roots(visitor);
         interp.trace_iterator_side_tables(visitor);
-        // 7) Hidden classes: the root shape and interned keys (the id and
-        //    transition tables are weak), the constructor and arguments shape
-        //    caches, and every shape a cached object layout names.
+        // 7) Hidden classes: the shapes pinned this turn (the id and
+        //    transition tables are weak; the heap roots the canonical key
+        //    strings), the constructor and arguments shape caches, and every
+        //    shape a cached object layout names.
         interp.shape_runtime_for_trace().trace_roots(roots, visitor);
         interp.trace_compiled_shapes(visitor);
         if roots == RootSet::All {

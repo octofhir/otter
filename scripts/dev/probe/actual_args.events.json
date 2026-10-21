@@ -1,0 +1,404 @@
+{
+  "events": [
+    {
+      "type": "compilePrepared",
+      "functionId": 501,
+      "functionName": "target",
+      "tier": "template",
+      "target": {
+        "kind": "entry"
+      },
+      "registerCount": 10,
+      "parameterCount": 1,
+      "bytecodeInstructionCount": 15,
+      "sourceWork": 1254,
+      "exitCount": 0,
+      "callFeedbackSites": 0,
+      "methodFeedbackSites": 0,
+      "globalLoadSites": 0,
+      "globalLexicalLoads": 0,
+      "literalCells": 0,
+      "globalObjectLoads": 0,
+      "directCallees": 0,
+      "directConstructs": 0,
+      "directMethodSites": 0,
+      "directMethodTargets": 0,
+      "nativeCalls": 0,
+      "inlineCallees": 0,
+      "inlineMethods": 0
+    },
+    {
+      "type": "compileFinished",
+      "functionId": 501,
+      "tier": "template",
+      "target": {
+        "kind": "entry"
+      },
+      "compileStartedNs": 5241125,
+      "queueDelayNs": 42,
+      "compileDurationNs": 99250,
+      "irNodeCount": 17,
+      "outcome": {
+        "kind": "compiled",
+        "codeObjectId": 1,
+        "codeBytes": 4716
+      }
+    },
+    {
+      "type": "directCallPlan",
+      "callKind": "plain",
+      "callerFunctionId": 502,
+      "instructionPc": 18,
+      "tier": "template",
+      "calleeFunctionId": 501,
+      "targetIndex": 0,
+      "targetCount": 1,
+      "outcome": {
+        "kind": "available",
+        "codeObjectId": 1,
+        "targetTier": "template",
+        "thisMode": "strictOrLexical"
+      }
+    },
+    {
+      "type": "inlineCandidate",
+      "callerFunctionId": 502,
+      "instructionPc": 18,
+      "tier": "template",
+      "calleeFunctionId": 501,
+      "bakeRejection": null
+    },
+    {
+      "type": "compilePrepared",
+      "functionId": 502,
+      "functionName": "caller",
+      "tier": "template",
+      "target": {
+        "kind": "entry"
+      },
+      "registerCount": 16,
+      "parameterCount": 4,
+      "bytecodeInstructionCount": 20,
+      "sourceWork": 1548,
+      "exitCount": 0,
+      "callFeedbackSites": 1,
+      "methodFeedbackSites": 0,
+      "globalLoadSites": 0,
+      "globalLexicalLoads": 0,
+      "literalCells": 1,
+      "globalObjectLoads": 0,
+      "directCallees": 1,
+      "directConstructs": 0,
+      "directMethodSites": 0,
+      "directMethodTargets": 0,
+      "nativeCalls": 0,
+      "inlineCallees": 1,
+      "inlineMethods": 0
+    },
+    {
+      "type": "compileFinished",
+      "functionId": 502,
+      "tier": "template",
+      "target": {
+        "kind": "entry"
+      },
+      "compileStartedNs": 5402583,
+      "queueDelayNs": 0,
+      "compileDurationNs": 46250,
+      "irNodeCount": 21,
+      "outcome": {
+        "kind": "compiled",
+        "codeObjectId": 2,
+        "codeBytes": 4848
+      }
+    },
+    {
+      "type": "directCallLowered",
+      "callKind": "plain",
+      "callerFunctionId": 502,
+      "callerCodeObjectId": 2,
+      "instructionPc": 18,
+      "bytePc": 201,
+      "tier": "template",
+      "calleeFunctionId": 501,
+      "targetIndex": 0,
+      "targetCount": 1,
+      "outcome": {
+        "kind": "generated",
+        "codeObjectId": 1,
+        "targetTier": "template",
+        "thisMode": "strictOrLexical"
+      }
+    },
+    {
+      "type": "compilePrepared",
+      "functionId": 501,
+      "functionName": "target",
+      "tier": "optimizing",
+      "target": {
+        "kind": "entry"
+      },
+      "registerCount": 10,
+      "parameterCount": 1,
+      "bytecodeInstructionCount": 15,
+      "sourceWork": 6999,
+      "exitCount": 0,
+      "callFeedbackSites": 0,
+      "methodFeedbackSites": 0,
+      "globalLoadSites": 0,
+      "globalLexicalLoads": 0,
+      "literalCells": 0,
+      "globalObjectLoads": 0,
+      "directCallees": 0,
+      "directConstructs": 0,
+      "directMethodSites": 0,
+      "directMethodTargets": 0,
+      "nativeCalls": 0,
+      "inlineCallees": 0,
+      "inlineMethods": 0
+    },
+    {
+      "type": "compileFinished",
+      "functionId": 501,
+      "tier": "optimizing",
+      "target": {
+        "kind": "entry"
+      },
+      "compileStartedNs": 5640833,
+      "queueDelayNs": 0,
+      "compileDurationNs": 122791,
+      "irNodeCount": 27,
+      "outcome": {
+        "kind": "compiled",
+        "codeObjectId": 3,
+        "codeBytes": 2140
+      }
+    },
+    {
+      "type": "directCallPlan",
+      "callKind": "plain",
+      "callerFunctionId": 502,
+      "instructionPc": 18,
+      "tier": "optimizing",
+      "calleeFunctionId": 501,
+      "targetIndex": 0,
+      "targetCount": 1,
+      "outcome": {
+        "kind": "available",
+        "codeObjectId": 3,
+        "targetTier": "optimizing",
+        "thisMode": "strictOrLexical"
+      }
+    },
+    {
+      "type": "inlineCandidate",
+      "callerFunctionId": 502,
+      "instructionPc": 18,
+      "tier": "optimizing",
+      "calleeFunctionId": 501,
+      "bakeRejection": null
+    },
+    {
+      "type": "compilePrepared",
+      "functionId": 502,
+      "functionName": "caller",
+      "tier": "optimizing",
+      "target": {
+        "kind": "entry"
+      },
+      "registerCount": 16,
+      "parameterCount": 4,
+      "bytecodeInstructionCount": 20,
+      "sourceWork": 9088,
+      "exitCount": 0,
+      "callFeedbackSites": 1,
+      "methodFeedbackSites": 0,
+      "globalLoadSites": 0,
+      "globalLexicalLoads": 0,
+      "literalCells": 1,
+      "globalObjectLoads": 0,
+      "directCallees": 1,
+      "directConstructs": 0,
+      "directMethodSites": 0,
+      "directMethodTargets": 0,
+      "nativeCalls": 0,
+      "inlineCallees": 1,
+      "inlineMethods": 0
+    },
+    {
+      "type": "compileFinished",
+      "functionId": 502,
+      "tier": "optimizing",
+      "target": {
+        "kind": "entry"
+      },
+      "compileStartedNs": 6001166,
+      "queueDelayNs": 41,
+      "compileDurationNs": 159542,
+      "irNodeCount": 59,
+      "outcome": {
+        "kind": "compiled",
+        "codeObjectId": 4,
+        "codeBytes": 4180
+      }
+    },
+    {
+      "type": "inlineLowered",
+      "functionId": 502,
+      "codeObjectId": 4,
+      "tier": "optimizing",
+      "parentFunctionId": 502,
+      "instructionPc": 18,
+      "bytePc": 201,
+      "calleeFunctionId": 501,
+      "depth": 1,
+      "cost": 154,
+      "outcome": {
+        "kind": "inlined"
+      }
+    },
+    {
+      "type": "directCallPlan",
+      "callKind": "plain",
+      "callerFunctionId": 499,
+      "instructionPc": 16,
+      "tier": "optimizing",
+      "calleeFunctionId": 501,
+      "targetIndex": 0,
+      "targetCount": 1,
+      "outcome": {
+        "kind": "available",
+        "codeObjectId": 3,
+        "targetTier": "optimizing",
+        "thisMode": "strictOrLexical"
+      }
+    },
+    {
+      "type": "inlineCandidate",
+      "callerFunctionId": 499,
+      "instructionPc": 16,
+      "tier": "optimizing",
+      "calleeFunctionId": 501,
+      "bakeRejection": null
+    },
+    {
+      "type": "inlineCandidate",
+      "callerFunctionId": 499,
+      "instructionPc": 22,
+      "tier": "optimizing",
+      "calleeFunctionId": 502,
+      "bakeRejection": {
+        "kind": "ineligible",
+        "generator": false,
+        "asyncFunction": false,
+        "asyncGenerator": false,
+        "needsArguments": true,
+        "hasRest": false,
+        "containsDirectEval": false,
+        "derivedConstructor": false,
+        "makesFunction": false
+      }
+    },
+    {
+      "type": "directCallPlan",
+      "callKind": "plain",
+      "callerFunctionId": 499,
+      "instructionPc": 22,
+      "tier": "optimizing",
+      "calleeFunctionId": 502,
+      "targetIndex": 0,
+      "targetCount": 1,
+      "outcome": {
+        "kind": "available",
+        "codeObjectId": 4,
+        "targetTier": "optimizing",
+        "thisMode": "strictOrLexical"
+      }
+    },
+    {
+      "type": "compilePrepared",
+      "functionId": 499,
+      "functionName": "<anonymous>",
+      "tier": "optimizing",
+      "target": {
+        "kind": "osr",
+        "pc": 12
+      },
+      "registerCount": 26,
+      "parameterCount": 5,
+      "bytecodeInstructionCount": 57,
+      "sourceWork": 24231,
+      "exitCount": 0,
+      "callFeedbackSites": 2,
+      "methodFeedbackSites": 0,
+      "globalLoadSites": 2,
+      "globalLexicalLoads": 0,
+      "literalCells": 3,
+      "globalObjectLoads": 1,
+      "directCallees": 2,
+      "directConstructs": 0,
+      "directMethodSites": 0,
+      "directMethodTargets": 0,
+      "nativeCalls": 0,
+      "inlineCallees": 1,
+      "inlineMethods": 0
+    },
+    {
+      "type": "compileFinished",
+      "functionId": 499,
+      "tier": "optimizing",
+      "target": {
+        "kind": "osr",
+        "pc": 12
+      },
+      "compileStartedNs": 7672125,
+      "queueDelayNs": 42,
+      "compileDurationNs": 199333,
+      "irNodeCount": 75,
+      "outcome": {
+        "kind": "compiled",
+        "codeObjectId": 5,
+        "codeBytes": 5292
+      }
+    },
+    {
+      "type": "inlineLowered",
+      "functionId": 499,
+      "codeObjectId": 5,
+      "tier": "optimizing",
+      "parentFunctionId": 499,
+      "instructionPc": 16,
+      "bytePc": 190,
+      "calleeFunctionId": 501,
+      "depth": 1,
+      "cost": 154,
+      "outcome": {
+        "kind": "inlined"
+      }
+    },
+    {
+      "type": "bail",
+      "functionId": 499,
+      "functionName": "<anonymous>",
+      "tier": "optimizing",
+      "target": {
+        "kind": "osr",
+        "pc": 12
+      },
+      "resumePc": 26,
+      "exitReason": "insufficientFeedback",
+      "exitAction": "recompile",
+      "opDebug": "LoadProperty",
+      "operandsDebug": "[Register(9), Register(8), ConstIndex(11)]"
+    },
+    {
+      "type": "inlineDeoptFrame",
+      "index": 1,
+      "total": 2,
+      "functionId": 501,
+      "resumePc": 11
+    }
+  ],
+  "droppedEvents": 0,
+  "truncated": false
+}

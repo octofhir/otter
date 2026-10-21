@@ -1,0 +1,134 @@
+{
+  "records": [
+    {
+      "id": 4294967288,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967289,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 3
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967290,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 3
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967291,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 3
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967292,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967293,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        },
+        {
+          "kind": "spillSlot",
+          "index": 1
+        },
+        {
+          "kind": "spillSlot",
+          "index": 2
+        },
+        {
+          "kind": "spillSlot",
+          "index": 3
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": 4
+    },
+    {
+      "id": 4294967294,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 3
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    }
+  ],
+  "returnSites": [
+    {
+      "nativeReturnOffset": 1248,
+      "safepointId": 4294967293
+    },
+    {
+      "nativeReturnOffset": 1352,
+      "safepointId": 4294967293
+    }
+  ]
+}

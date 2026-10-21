@@ -3,6 +3,8 @@
 //! # Contents
 //! - `Runtime::run_file_inner` selects script, module or CommonJS semantics.
 //! - `Runtime::run_commonjs_file` enters one scoped native load and checkpoint.
+//! - `Runtime::run_builtin_main` starts a builtin as the run's main program
+//!   through that same entry, the way Node starts its `internal/main/*`.
 //!
 //! # Invariants
 //! - File/source classification and capability policy retain their existing
@@ -11,6 +13,9 @@
 //! - CommonJS entry starts with no source context. Each wrapper is compiled
 //!   and linked once by the normal CommonJS loader, and calls resolve its exact
 //!   FunctionID/source owner. No empty bootstrap module is linked for dispatch.
+//! - A builtin main is the runtime's own load, so it may be an internal
+//!   builtin; no module of the program's own, and no `require` user code can
+//!   reach, stands between the host and it.
 //! - Compiler syntax errors keep their compiler diagnostic; exits keep their
 //!   actual code. Other native completions transfer their existing pending
 //!   detail/frames through the canonical projector before any uncaught handler.
@@ -88,14 +93,45 @@ impl Runtime {
         let start = std::time::Instant::now();
         let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let cfg = std::sync::Arc::clone(&self.commonjs);
+        self.run_commonjs_entry(start, |ctx| {
+            commonjs::cjs_instantiate_file(ctx, &cfg, &abs, &source.text).map(|_| ())
+        })
+    }
+
+    /// Start the builtin `builtin` as this run's main program, as Node starts
+    /// `internal/main/test_runner` for `--test`.
+    pub(crate) fn run_builtin_main(
+        &mut self,
+        builtin: &str,
+    ) -> Result<ExecutionResult, OtterError> {
+        let start = std::time::Instant::now();
+        let cfg = std::sync::Arc::clone(&self.commonjs);
+        self.run_commonjs_entry(start, |ctx| {
+            ctx.scope(|mut scope| {
+                commonjs::cjs_load_builtin(&mut scope, &cfg, builtin)?
+                    .map(|_| ())
+                    .ok_or_else(|| {
+                        runtime_type_error("main", format!("no builtin module named '{builtin}'"))
+                    })
+            })
+        })
+    }
+
+    /// Run one CommonJS entry `load` as a fresh scoped native load, then
+    /// settle its failure, its microtasks and its exit code as a program's.
+    fn run_commonjs_entry(
+        &mut self,
+        start: std::time::Instant,
+        load: impl FnOnce(&mut otter_vm::NativeCtx<'_>) -> Result<(), otter_vm::NativeError>,
+    ) -> Result<ExecutionResult, OtterError> {
         let load = otter_vm::NativeCtx::with_host_context(
             &mut self.interp,
             otter_vm::NativeCallInfo::default_call(),
             None,
             |ctx| {
-                // This is one fresh file entry, not nested require re-entry.
+                // This is one fresh entry, not nested require re-entry.
                 ctx.clear_pending_error();
-                commonjs::cjs_instantiate_file(ctx, &cfg, &abs, &source.text).map(|_| ())
+                load(ctx)
             },
         );
         if let Err(error) = load {

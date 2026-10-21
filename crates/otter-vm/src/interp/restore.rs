@@ -132,7 +132,7 @@ impl Interpreter {
         gc_heap.restore_external_refs(snapshot.external_ref_addrs.iter().copied());
 
         // Keyed side state uses the admitted directory's atom replay.
-        let shape_runtime = object::ShapeRuntime::restored_shell(names);
+        let shape_runtime = object::ShapeRuntime::restored_shell(&mut gc_heap, names);
 
         let mut interp = Self {
             local_time_zone: crate::date::LocalTimeZone::default(),

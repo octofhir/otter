@@ -1,0 +1,116 @@
+{
+  "entryOffset": 0,
+  "callEntryOffset": 848,
+  "runtimeAddressRange": {
+    "start": "0x10954c000",
+    "endExclusive": "0x10954cbc8",
+    "entry": "0x10954c000"
+  },
+  "regions": [
+    {
+      "kind": "instruction",
+      "startOffset": 1024,
+      "endOffset": 1028,
+      "block": 1,
+      "functionId": 504,
+      "logicalPc": 0,
+      "bytePc": 0,
+      "operationIndex": 1,
+      "operation": "v1 InitialRegister(0)"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1028,
+      "endOffset": 1032,
+      "block": 1,
+      "functionId": 504,
+      "logicalPc": 0,
+      "bytePc": 0,
+      "operationIndex": 2,
+      "operation": "v2 InitialRegister(1)"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1032,
+      "endOffset": 1032,
+      "block": 1,
+      "functionId": 504,
+      "logicalPc": 0,
+      "bytePc": 0,
+      "operationIndex": 3,
+      "operation": "v3 Jump(BlockId(0))"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1032,
+      "endOffset": 1036,
+      "block": 0,
+      "functionId": 504,
+      "logicalPc": 0,
+      "bytePc": 0,
+      "operationIndex": 4,
+      "operation": "v4 LoadThis"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1036,
+      "endOffset": 1240,
+      "block": 0,
+      "functionId": 504,
+      "logicalPc": 2,
+      "bytePc": 15,
+      "operationIndex": 5,
+      "operation": "v5 StoreNamedProperty { byte_pc: 15, owners: [FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }] }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1240,
+      "endOffset": 1288,
+      "block": 0,
+      "functionId": 504,
+      "logicalPc": 2,
+      "bytePc": 15,
+      "operationIndex": 6,
+      "operation": "v6 WriteBarrier"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1288,
+      "endOffset": 1492,
+      "block": 0,
+      "functionId": 504,
+      "logicalPc": 5,
+      "bytePc": 46,
+      "operationIndex": 7,
+      "operation": "v7 StoreNamedProperty { byte_pc: 46, owners: [FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }] }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1492,
+      "endOffset": 1540,
+      "block": 0,
+      "functionId": 504,
+      "logicalPc": 5,
+      "bytePc": 46,
+      "operationIndex": 8,
+      "operation": "v8 WriteBarrier"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1540,
+      "endOffset": 1544,
+      "block": 0,
+      "functionId": 504,
+      "logicalPc": 6,
+      "bytePc": 62,
+      "operationIndex": 9,
+      "operation": "v9 Return"
+    },
+    {
+      "kind": "out-of-line",
+      "startOffset": 1544,
+      "endOffset": 3016
+    }
+  ],
+  "osrEntries": []
+}

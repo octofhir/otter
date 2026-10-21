@@ -38,7 +38,9 @@
 //!   file's export list is cached by its source the same way.
 //! - Literal dynamic-import target failures are deferred into a synthetic
 //!   module init so the eventual `import()` rejects instead of failing the
-//!   entry graph.
+//!   entry graph; one whose specifier does not resolve is left to the call,
+//!   which resolves it when it runs and rejects then, with Node's error when
+//!   Node has one ([`LoaderError::node_error`]).
 //! - Linking is deterministic — modules visit in the order their
 //!   imports first appear so the merged function table reflects
 //!   source-graph topology.
@@ -735,7 +737,15 @@ impl<'a> ModuleGraphBuilder<'a> {
                 }
                 continue;
             }
-            let requested_target = self.resolve(&request.specifier, Some(url))?;
+            let requested_target = match self.resolve(&request.specifier, Some(url)) {
+                Ok(target) => target,
+                Err(
+                    LoaderError::Resolve { .. }
+                    | LoaderError::UnknownBuiltin { .. }
+                    | LoaderError::PackageNotFound { .. },
+                ) if request.dynamic => continue,
+                Err(error) => return Err(error.into()),
+            };
             let (target, loaded) = if self.nodes.contains_key(&requested_target) {
                 (requested_target, None)
             } else {
@@ -834,11 +844,26 @@ impl<'a> ModuleGraphBuilder<'a> {
 }
 
 fn dynamic_failure_fragment(url: &str, err: &GraphError) -> Result<BytecodeModule, GraphError> {
-    let ctor = dynamic_failure_constructor(err);
-    let message = format!("dynamic import: load failed for \"{url}\": {err:?}");
-    let message_literal =
-        serde_json::to_string(&message).unwrap_or_else(|_| "\"dynamic import failed\"".to_string());
-    let source = format!("throw new {ctor}({message_literal});");
+    let literal = |text: &str| {
+        serde_json::to_string(text).unwrap_or_else(|_| "\"dynamic import failed\"".to_string())
+    };
+    let node_error = match err {
+        GraphError::Loader(error) => error.node_error(),
+        _ => None,
+    };
+    let source = match node_error {
+        // What Node throws for it, code and all.
+        Some((code, message)) => format!(
+            "const error = new Error({}); error.code = {}; throw error;",
+            literal(&message),
+            literal(code),
+        ),
+        None => {
+            let ctor = dynamic_failure_constructor(err);
+            let message = format!("dynamic import: load failed for \"{url}\": {err:?}");
+            format!("throw new {ctor}({});", literal(&message))
+        }
+    };
     with_program(&source, SourceKind::JavaScript, |program| {
         let host = ModuleHostInfo {
             module_url: url.to_string(),

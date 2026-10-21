@@ -30,7 +30,7 @@ fn retained_native_capture_capacity_never_leaks_into_a_narrower_pattern() {
         let code = native::compile::<u8>(regex.program()).expect("native-eligible capture fixture");
         code.prepare();
         let mut search = regex.find_latin1_with(text, 0, ExecConfig::default(), scratch);
-        search.native = Some(&code);
+        search.execution = Execution::Native(&code);
         let batch = search.collect_batch(usize::MAX).unwrap();
         assert_eq!(batch.len(), 1);
         assert_eq!(batch.first().unwrap().captures.len(), groups);

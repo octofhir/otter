@@ -27,6 +27,7 @@
 //! - [`external_refs`] — isolate-local interner for non-GC addresses
 //!   (Rust function entries) that bodies reference by index.
 //! - [`extra_roots`] — heap-registered callbacks for runtime-owned roots.
+//! - [`isolate_data`] — the embedder's per-isolate state the heap owns.
 //! - [`frame_roots`] — active interpreter frame-stack root registry.
 //! - [`finalize`] — raw weak-reference and finalization bookkeeping.
 //! - [`image_codec`] — byte writer/reader of the startup image.
@@ -88,6 +89,7 @@ pub mod heap;
 pub mod heap_image;
 pub mod host_refs;
 pub mod image_codec;
+pub mod isolate_data;
 pub mod lab;
 #[doc(hidden)]
 pub mod marking;
@@ -122,6 +124,7 @@ pub use heap::{
     PostMarkProcessor, SitePlacement,
 };
 pub use heap_image::{HeapImage, ImageError, Relocation};
+pub use isolate_data::IsolateData;
 pub use lab::{LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, LinearAllocationArea};
 pub use observation::{
     GcPauseCapture, GcPauseCaptureError, GcPauseKind, GcPauseOutcome, GcPauseRecord,

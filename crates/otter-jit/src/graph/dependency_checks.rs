@@ -15,12 +15,14 @@
 //! - [`place`] — rewrite proofs into flag tests and return the dependencies.
 //!
 //! # Invariants
-//! - A fact can break only through a node that runs code or collects, a named
-//!   store (its transitions leave shapes and observe field summaries), an
-//!   own-field store that observes a summary, or a context-slot store whose
-//!   watch may fire, or a closure birth that can break source-context identity.
-//!   Everything else, including an interrupt poll, leaves
-//!   every fact as it was.
+//! - A fact can break only through a node that runs JavaScript or calls out,
+//!   a named store (its transitions leave shapes and observe field
+//!   summaries), an own-field store that observes a summary, an object
+//!   literal (its values seed field summaries), a context-slot store whose
+//!   watch may fire, or a closure birth that can break source-context
+//!   identity. Everything else, including an allocation that collects and an
+//!   interrupt poll, leaves every fact as it was: no collector path fires a
+//!   code dependency.
 //! - A block entered from outside the graph (function or OSR entry) or with
 //!   no predecessor starts unchecked; a join is checked only when every
 //!   predecessor leaves checked.
@@ -43,15 +45,20 @@ use otter_vm::native_abi::{CodeDependency, CodeDependencyKind};
 
 use super::ir::{Graph, Kind, NodeId, Repr};
 
-/// Whether `node` can break a subscribed shape fact.
+/// Whether `node` can break a subscribed fact. A collection fires no
+/// dependency: only JavaScript and the stores and births below do.
 fn breaks_facts(graph: &Graph, node: NodeId) -> bool {
     let kind = &graph.node(node).kind;
     let properties = kind.properties();
-    if properties.call || properties.may_collect {
+    if properties.call || properties.runs_js {
         return true;
     }
     match kind {
-        Kind::StoreNamedProperty { .. } | Kind::NoteContextWrite(_) => true,
+        // A literal's initial values seed its shape's field types.
+        Kind::StoreNamedProperty { .. }
+        | Kind::NoteContextWrite(_)
+        | Kind::NewClosure
+        | Kind::NewObjectLiteral { .. } => true,
         Kind::StoreOwnField { owners, .. } => !owners.is_empty(),
         _ => false,
     }
@@ -514,6 +521,55 @@ mod tests {
             identity: 7,
             expected: 0,
         }));
+    }
+
+    #[test]
+    fn an_allocation_between_a_proof_and_its_use_adds_no_test() {
+        let mut graph = Graph::default();
+        let entry = graph.new_block();
+        append(&mut graph, entry, Kind::CheckStableShapes(smallvec![8]));
+        for kind in [
+            Kind::NewObject,
+            Kind::NewArrayEmpty,
+            Kind::NewArrayLiteral,
+            Kind::PrimitiveAdd,
+            Kind::CopyContext,
+        ] {
+            append(&mut graph, entry, kind);
+        }
+        append(&mut graph, entry, Kind::CheckStableShapes(smallvec![8]));
+        append(
+            &mut graph,
+            entry,
+            Kind::CheckFieldTypes(smallvec![guard(16, 4)]),
+        );
+        // A literal seeds field summaries; a cached load may run a getter.
+        let literal = Kind::NewObjectLiteral { fields: None };
+        let load = Kind::LoadPropertyCached {
+            pc: 0,
+            atom: None,
+            length: false,
+        };
+        append(&mut graph, entry, literal.clone());
+        append(&mut graph, entry, Kind::CheckStableShapes(smallvec![8]));
+        append(&mut graph, entry, load.clone());
+        append(&mut graph, entry, Kind::CheckStableShapes(smallvec![8]));
+        place(&mut graph, &view(), &[]);
+        assert_eq!(
+            kinds(&graph, entry),
+            [
+                &Kind::CheckDependencies,
+                &Kind::NewObject,
+                &Kind::NewArrayEmpty,
+                &Kind::NewArrayLiteral,
+                &Kind::PrimitiveAdd,
+                &Kind::CopyContext,
+                &literal,
+                &Kind::CheckDependencies,
+                &load,
+                &Kind::CheckDependencies,
+            ]
+        );
     }
 
     #[test]

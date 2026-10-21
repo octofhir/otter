@@ -16,6 +16,11 @@
 //!
 //! # Invariants
 //! - Node modules are opt-in and are not installed by `otter-runtime` itself.
+//! - The internal rows — `internal/*` and the `__*` natives — are the
+//!   builtins' own dependencies. User code reaches none of them through
+//!   `require`, `createRequire`, `require.resolve` or `import`, except the
+//!   `internal/*` ones but the realm module under `--expose-internals`, as in
+//!   Node.
 //! - No builtin is compiled at run time: each links lazily, on first
 //!   `require`, from its embedded verified module.
 //! - Permission checks happen at the Rust boundary before host resources open.

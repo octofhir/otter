@@ -1,7 +1,8 @@
 //! SSA field-bound proofs at the graph construction boundary.
 //!
 //! # Contents
-//! - Nullable refinement and owner/target checks across effects.
+//! - Nullable refinement and owner/target checks across effects that run
+//!   JavaScript, and their survival across allocations.
 //! - Receiver-specific store authority and loop guard cache lifetime.
 //! - Demand for owner guards across SSA merges and distinct receivers.
 //! - Nullish comparisons specialize only under independently consumed bounds.
@@ -617,65 +618,88 @@ fn field_summary_proofs_remove_target_checks_after_a_nullable_guard() {
 }
 
 #[test]
-fn collecting_effects_repeat_owner_and_target_guards_without_rechecking_targets() {
-    let mut view = field_type_view(
-        vec![
-            field_load(1, 0),
-            field_load(2, 1),
-            (Op::NewObject, vec![Operand::Register(5)]),
-            field_load(3, 0),
-            field_load(4, 3),
-            (Op::ReturnValue, vec![Operand::Register(4)]),
-        ],
-        0,
-    );
-    for pc in [0, 12] {
-        view.property_programs
-            .insert(pc, vec![load_program(128, FieldLocation::inline(0), false)]);
+fn js_effects_repeat_owner_and_target_guards_without_rechecking_targets() {
+    // A cached load may run a getter, which can widen the summary: both
+    // guards repeat. An allocation only collects, which changes no summary
+    // and no field: the second loads reuse the first ones.
+    for runs_js in [true, false] {
+        let effect = if runs_js {
+            (
+                Op::LoadProperty,
+                vec![
+                    Operand::Register(5),
+                    Operand::Register(6),
+                    Operand::ConstIndex(0),
+                ],
+            )
+        } else {
+            (Op::NewObject, vec![Operand::Register(5)])
+        };
+        let mut view = field_type_view(
+            vec![
+                field_load(1, 0),
+                field_load(2, 1),
+                effect,
+                field_load(3, 0),
+                field_load(4, 3),
+                (Op::ReturnValue, vec![Operand::Register(4)]),
+            ],
+            0,
+        );
+        view.seed_property_attempted_for_test(2);
+        for pc in [0, 12] {
+            view.property_programs
+                .insert(pc, vec![load_program(128, FieldLocation::inline(0), false)]);
+        }
+        for pc in [4, 16] {
+            view.property_programs
+                .insert(pc, vec![load_program(256, FieldLocation::inline(0), false)]);
+        }
+        let built = load_graph(&view);
+        let count = |matches: &dyn Fn(&Kind) -> bool| {
+            built
+                .graph
+                .nodes
+                .iter()
+                .filter(|node| node.block.is_some() && matches(&node.kind))
+                .count()
+        };
+        assert_eq!(
+            count(&|kind| matches!(kind, Kind::LoadPropertyCached { .. })),
+            usize::from(runs_js)
+        );
+        let frames: Vec<_> = built
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| node.block.is_some() && matches!(node.kind, Kind::CheckFieldTypes(_)))
+            .map(|node| {
+                let state = built.graph.frame_state(node.eager.unwrap());
+                (state.function_id, state.pc, state.byte_pc)
+            })
+            .collect();
+        let expected: &[_] = if runs_js {
+            &[(90, 0, 0), (90, 3, 12)]
+        } else {
+            &[(90, 0, 0)]
+        };
+        assert_eq!(frames, expected, "runs_js={runs_js}");
+        assert_eq!(
+            count(&|kind| matches!(kind, Kind::CheckStableShapes(shapes) if shapes.contains(&256))),
+            1 + usize::from(runs_js),
+            "runs_js={runs_js}"
+        );
+        assert_eq!(
+            count(&|kind| matches!(kind, Kind::CheckShapes { .. })),
+            1,
+            "runs_js={runs_js}"
+        );
+        assert_eq!(
+            count(&|kind| matches!(kind, Kind::LoadOwnField { .. })),
+            if runs_js { 4 } else { 2 },
+            "runs_js={runs_js}"
+        );
     }
-    for pc in [4, 16] {
-        view.property_programs
-            .insert(pc, vec![load_program(256, FieldLocation::inline(0), false)]);
-    }
-    let built = load_graph(&view);
-    assert_eq!(
-        built
-            .graph
-            .nodes
-            .iter()
-            .filter(|n| matches!(n.kind, Kind::CheckFieldTypes(_)))
-            .count(),
-        2
-    );
-    let frames: Vec<_> = built
-        .graph
-        .nodes
-        .iter()
-        .filter(|node| node.block.is_some() && matches!(node.kind, Kind::CheckFieldTypes(_)))
-        .map(|node| {
-            let state = built.graph.frame_state(node.eager.unwrap());
-            (state.function_id, state.pc, state.byte_pc)
-        })
-        .collect();
-    assert_eq!(frames, [(90, 0, 0), (90, 3, 12)]);
-    assert_eq!(
-        built
-            .graph
-            .nodes
-            .iter()
-            .filter(|n| matches!(&n.kind, Kind::CheckStableShapes(shapes) if shapes.contains(&256)))
-            .count(),
-        2
-    );
-    assert_eq!(
-        built
-            .graph
-            .nodes
-            .iter()
-            .filter(|n| matches!(n.kind, Kind::CheckShapes { .. }))
-            .count(),
-        1
-    );
 }
 
 #[test]

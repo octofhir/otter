@@ -24,6 +24,10 @@
 //!   empty run state (sandbox grants, no environment, no arguments). It
 //!   replaces the executable only by renaming a fully patched copy over it,
 //!   and a failed step leaves no copy behind.
+//! - Everything the binary prints goes through [`output`], whose writes
+//!   report failure instead of panicking: a closed pipe on either standard
+//!   stream drops the text and leaves the exit code to the command.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 
 /// The process allocator. The engine's Rust-side allocation is dominated by
 /// many small, short-lived buffers (compiler IR and allocation tables,
@@ -58,11 +62,13 @@ mod dlx;
 mod error_render;
 mod execution_config;
 mod gc_trace;
+mod output;
 mod watch;
 
 use dlx::DlxArgs;
 use error_render::emit_error;
 use execution_config::CliExecutionConfig;
+use output::{stderr, stderrln, stdout, stdoutln};
 use watch::WatchArgs;
 
 /// Otter — JS/TS engine (foundation phase).
@@ -1012,13 +1018,13 @@ async fn main() -> ExitCode {
     let inline_print = cli.print_source.clone();
 
     if inline_eval.is_some() && inline_print.is_some() {
-        eprintln!("error: --eval and --print cannot be used together");
+        stderrln!("error: --eval and --print cannot be used together");
         return ExitCode::from(2);
     }
 
     if inline_eval.is_some() || inline_print.is_some() {
         if cli.command.is_some() || dump_mode.is_some() {
-            eprintln!("error: inline eval/print cannot be combined with a subcommand or file path");
+            stderrln!("error: inline eval/print cannot be combined with a subcommand or file path");
             return ExitCode::from(2);
         }
         let (source, print) = match (inline_eval.as_deref(), inline_print.as_deref()) {
@@ -1121,7 +1127,7 @@ async fn main() -> ExitCode {
             .await
         }
         (None, None) => {
-            eprintln!("usage: otter <file> | otter <subcommand> [args...]");
+            stderrln!("usage: otter <file> | otter <subcommand> [args...]");
             return ExitCode::from(2);
         }
     };
@@ -1145,7 +1151,7 @@ impl CliStartupTimer {
 
     fn mark(&self, label: &str) {
         if self.enabled {
-            eprintln!(
+            stderrln!(
                 "otter_cli_startup phase={label} elapsed_us={}",
                 self.start.elapsed().as_micros()
             );
@@ -1289,7 +1295,7 @@ async fn run_file_with_cwd(
                 "truncatedFrames": truncated_frames,
             });
         }
-        println!("{payload}");
+        stdoutln!("{payload}");
     }
     let code = result.exit_code();
     // The process is exiting; freeing the multi-MB GC heap and unwinding every
@@ -1318,7 +1324,7 @@ fn report_cpu_profile(
     };
     let profile = result.cpu_profile().unwrap_or(&empty);
     let artifacts = write_cpu_profile_artifacts(path, profile, options)?;
-    eprintln!(
+    stderrln!(
         "cpu profile written: {} ({} samples, {} dropped, {} truncated frames), {}",
         artifacts.cpuprofile.display(),
         profile.sample_count(),
@@ -1510,7 +1516,7 @@ fn folded_frame_name(function_name: &str, module: &str) -> String {
 /// Print the run's collection pauses, when `--trace-gc` asked for them.
 fn emit_gc_trace(result: &otter_runtime::ExecutionResult) {
     if let Some(pauses) = result.gc_pauses() {
-        eprint!("{}", gc_trace::render(pauses));
+        stderr!("{}", gc_trace::render(pauses));
     }
 }
 
@@ -1523,7 +1529,7 @@ fn emit_otter_stats_if_requested(result: &otter_runtime::ExecutionResult) {
         "exitCode": result.exit_code(),
         "stats": result.stats(),
     });
-    eprintln!("{payload}");
+    stderrln!("{payload}");
 }
 
 fn finish_jit_debug_attempt(
@@ -1800,7 +1806,7 @@ async fn verify_project_dependencies(project_root: &Path) -> Result<(), OtterErr
     };
 
     if policy == otter_pm_manifest::VerifyDependencies::Install {
-        eprintln!(
+        stderrln!(
             "installing {} dependenc{} missing from node_modules",
             stale.len(),
             if stale.len() == 1 { "y" } else { "ies" }
@@ -1808,7 +1814,7 @@ async fn verify_project_dependencies(project_root: &Path) -> Result<(), OtterErr
         let _installed = run_pm_install(project_root, false).await?;
         return Ok(());
     }
-    eprintln!(
+    stderrln!(
         "warning: node_modules does not match package.json ({} dependenc{}):",
         stale.len(),
         if stale.len() == 1 { "y" } else { "ies" }
@@ -1816,20 +1822,22 @@ async fn verify_project_dependencies(project_root: &Path) -> Result<(), OtterErr
     for dependency in &stale {
         match &dependency.reason {
             otter_pm::StaleReason::Missing => {
-                eprintln!(
+                stderrln!(
                     "  {} ({}) is not installed",
-                    dependency.name, dependency.range
+                    dependency.name,
+                    dependency.range
                 );
             }
             otter_pm::StaleReason::OutOfRange { installed } => {
-                eprintln!(
+                stderrln!(
                     "  {} is installed at {installed}, outside {}",
-                    dependency.name, dependency.range
+                    dependency.name,
+                    dependency.range
                 );
             }
         }
     }
-    eprintln!("run: otter install");
+    stderrln!("run: otter install");
     Ok(())
 }
 
@@ -1952,7 +1960,7 @@ async fn run_script_file_sequence(
     event_write?;
     artifact_write?;
     if json {
-        println!(
+        stdoutln!(
             "{}",
             serde_json::json!({
                 "completion": result.completion_string(),
@@ -2324,7 +2332,7 @@ async fn run_eval(
             .await?;
         startup_timer.mark("runtime_eval");
         if print {
-            println!("{}", result.completion_string());
+            print_completion(&result);
         }
         return Ok(ExitCode::from(result.exit_code()));
     }
@@ -2347,10 +2355,10 @@ async fn run_eval(
     };
     startup_timer.mark("runtime_eval");
     if print {
-        println!("{}", result.completion_string());
+        print_completion(&result);
     }
     if json {
-        println!(
+        stdoutln!(
             "{}",
             serde_json::json!({
                 "completion": result.completion_string(),
@@ -2359,6 +2367,13 @@ async fn run_eval(
         );
     }
     Ok(ExitCode::from(result.exit_code()))
+}
+
+/// Print a `-p` result once the run is over. Text the descriptor refuses is
+/// dropped, so a closed pipe leaves the exit code to the run:
+/// `otter -p '"x".repeat(1e6)' | head -c 1` exits 0.
+fn print_completion(result: &otter_runtime::ExecutionResult) {
+    stdoutln!("{}", result.completion_string());
 }
 
 /// Run a package binary, fetching the package only when the project does not
@@ -2568,7 +2583,7 @@ async fn run_check(
         .build()?;
     otter.check_file(path).await?;
     if json {
-        println!("{{\"ok\":true}}");
+        stdoutln!("{{\"ok\":true}}");
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -2578,24 +2593,44 @@ async fn run_check(
 /// The runner is `internal/main/test_runner`, the module Node's `--test`
 /// starts: it reads its configuration back out of `process.execArgv`, takes
 /// the files to run from `process.argv`, discovering them when none are
-/// named, and reports through the reporters the command line asked for.
+/// named, and reports through the reporters the command line asked for. It
+/// is an internal module no script may load, so the runtime starts it as the
+/// main program itself.
 async fn run_test_runner(
     globs: &[String],
     caps: &CapabilitySet,
     execution: &CliExecutionConfig,
     startup_timer: &CliStartupTimer,
 ) -> Result<ExitCode, OtterError> {
-    run_eval(
-        "require('internal/main/test_runner');",
-        false,
-        globs,
-        false,
-        false,
-        caps,
-        execution,
-        startup_timer,
-    )
-    .await
+    let mut argv = Vec::with_capacity(globs.len() + 1);
+    argv.push(
+        std::env::current_exe()
+            .ok()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "otter".to_string()),
+    );
+    argv.extend(globs.iter().cloned());
+    let otter = cli_otter_builder(caps, execution)
+        .process_argv(argv)
+        .build()?;
+    startup_timer.mark("runtime_build");
+    let attempt = otter
+        .run_builtin_main_with_diagnostics("internal/main/test_runner")
+        .await;
+    // See `run_file`: a failed run's 'exit' listener may replace the code.
+    let exit_override = attempt.exit_code_override();
+    let result = match finish_jit_debug_attempt(execution, attempt) {
+        Ok(result) => result,
+        Err(error) => {
+            let Some(code) = exit_override else {
+                return Err(error);
+            };
+            emit_error(&error, false);
+            return Ok(ExitCode::from(code));
+        }
+    };
+    startup_timer.mark("runtime_main");
+    Ok(ExitCode::from(result.exit_code()))
 }
 
 async fn run_dump(
@@ -2621,7 +2656,7 @@ async fn run_dump(
         })?,
         _ => disassemble(&compiled.bytecode),
     };
-    print!("{text}");
+    stdout!("{text}");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -2670,7 +2705,7 @@ async fn run_pm_init(args: InitArgs, json: bool) -> Result<ExitCode, OtterError>
         .await
         .map_err(|err| pm_config_error(err.to_string()))?;
     if json {
-        println!(
+        stdoutln!(
             "{}",
             serde_json::json!({
                 "ok": true,
@@ -2679,7 +2714,7 @@ async fn run_pm_init(args: InitArgs, json: bool) -> Result<ExitCode, OtterError>
             })
         );
     } else {
-        println!("created {}", manifest_path.display());
+        stdoutln!("created {}", manifest_path.display());
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -2702,7 +2737,7 @@ async fn run_pm_install(root: &Path, json: bool) -> Result<ExitCode, OtterError>
 
 fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: bool) {
     if json {
-        println!(
+        stdoutln!(
             "{}",
             serde_json::json!({
                 "ok": true,
@@ -2721,30 +2756,30 @@ fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: boo
     }
     if report.lockfile_changed {
         if let Some(format) = report.imported_lockfile {
-            println!("imported {}", root.join(format.filename()).display());
+            stdoutln!("imported {}", root.join(format.filename()).display());
         }
-        println!(
+        stdoutln!(
             "wrote {}",
             root.join(otter_pm_lockfile::LOCKFILE_NAME).display()
         );
     } else {
-        println!(
+        stdoutln!(
             "{} is up to date",
             root.join(otter_pm_lockfile::LOCKFILE_NAME).display()
         );
     }
-    println!(
+    stdoutln!(
         "installed {} package{}, reused {}",
         report.added_packages,
         if report.added_packages == 1 { "" } else { "s" },
         report.reused_packages
     );
-    println!(
+    stdoutln!(
         "linked {} bin{}",
         report.linked_bins,
         if report.linked_bins == 1 { "" } else { "s" }
     );
-    println!(
+    stdoutln!(
         "ran {} lifecycle script{}",
         report.lifecycle_scripts,
         if report.lifecycle_scripts == 1 {
@@ -2754,7 +2789,7 @@ fn print_install_report(root: &Path, report: &otter_pm::InstallReport, json: boo
         }
     );
     for warning in &report.warnings {
-        println!("warning {}: {}", warning.code, warning.message);
+        stdoutln!("warning {}: {}", warning.code, warning.message);
     }
     print_pending_builds(&report.pending_builds);
 }
@@ -2784,23 +2819,23 @@ fn print_pending_builds(pending: &[otter_pm::PendingBuild]) {
     if pending.is_empty() {
         return;
     }
-    println!(
+    stdoutln!(
         "skipped install scripts for {} package{} awaiting approval:",
         pending.len(),
         if pending.len() == 1 { "" } else { "s" }
     );
     for build in pending {
-        println!(
+        stdoutln!(
             "  {}@{} ({})",
             build.name,
             build.version,
             build.hooks.join(", ")
         );
         for finding in &build.findings {
-            println!("    {}: {}", finding.code, finding.message);
+            stdoutln!("    {}: {}", finding.code, finding.message);
         }
     }
-    println!("approve with: otter approve-builds <package>...");
+    stdoutln!("approve with: otter approve-builds <package>...");
 }
 
 async fn run_pm_add(args: AddArgs, json: bool) -> Result<ExitCode, OtterError> {
@@ -2841,7 +2876,7 @@ async fn run_pm_add(args: AddArgs, json: bool) -> Result<ExitCode, OtterError> {
     .await
     .map_err(map_pm_error)?;
     if json {
-        println!(
+        stdoutln!(
             "{}",
             serde_json::json!({
                 "ok": true,
@@ -2854,7 +2889,7 @@ async fn run_pm_add(args: AddArgs, json: bool) -> Result<ExitCode, OtterError> {
         );
     } else {
         for item in added {
-            println!(
+            stdoutln!(
                 "added {}@{}",
                 item["name"].as_str().unwrap(),
                 item["range"].as_str().unwrap()
@@ -2903,7 +2938,7 @@ async fn run_pm_remove(args: RemoveArgs, json: bool) -> Result<ExitCode, OtterEr
         }
     };
     if json {
-        println!(
+        stdoutln!(
             "{}",
             serde_json::json!({
                 "ok": true,
@@ -2914,11 +2949,11 @@ async fn run_pm_remove(args: RemoveArgs, json: bool) -> Result<ExitCode, OtterEr
             })
         );
     } else {
-        println!(
+        stdoutln!(
             "removed {removed} dependency entr{}",
             if removed == 1 { "y" } else { "ies" }
         );
-        println!(
+        stdoutln!(
             "pruned {} package{}, {} bin{}",
             prune.removed_packages,
             if prune.removed_packages == 1 { "" } else { "s" },
@@ -2974,7 +3009,7 @@ async fn run_pm_doctor(args: DoctorArgs, json: bool) -> Result<ExitCode, OtterEr
     let healthy = stale.is_empty() && scan.undeclared.is_empty();
 
     if json {
-        println!(
+        stdoutln!(
             "{}",
             serde_json::json!({
                 "ok": healthy,
@@ -3002,7 +3037,7 @@ async fn run_pm_doctor(args: DoctorArgs, json: bool) -> Result<ExitCode, OtterEr
     }
 
     if healthy {
-        println!(
+        stdoutln!(
             "no dependency problems found ({} file{} scanned)",
             scan.scanned_files,
             if scan.scanned_files == 1 { "" } else { "s" }
@@ -3010,39 +3045,41 @@ async fn run_pm_doctor(args: DoctorArgs, json: bool) -> Result<ExitCode, OtterEr
         return Ok(ExitCode::SUCCESS);
     }
     if !stale.is_empty() {
-        println!("node_modules does not match package.json:");
+        stdoutln!("node_modules does not match package.json:");
         for dependency in stale {
             match &dependency.reason {
                 otter_pm::StaleReason::Missing => {
-                    println!(
+                    stdoutln!(
                         "  {} ({}) is not installed",
-                        dependency.name, dependency.range
+                        dependency.name,
+                        dependency.range
                     );
                 }
                 otter_pm::StaleReason::OutOfRange { installed } => {
-                    println!(
+                    stdoutln!(
                         "  {} is installed at {installed}, outside {}",
-                        dependency.name, dependency.range
+                        dependency.name,
+                        dependency.range
                     );
                 }
             }
         }
-        println!("run: otter install");
+        stdoutln!("run: otter install");
     }
     if !scan.undeclared.is_empty() {
-        println!("imported but not declared in package.json:");
+        stdoutln!("imported but not declared in package.json:");
         for dependency in &scan.undeclared {
             let state = match (dependency.installed, dependency.guarded) {
                 (true, _) => "resolves today through another dependency",
                 (false, true) => "not installed, every import is guarded",
                 (false, false) => "not installed",
             };
-            println!("  {} — {state}", dependency.package);
+            stdoutln!("  {} — {state}", dependency.package);
             for file in &dependency.files {
-                println!("    {}", file.display());
+                stdoutln!("    {}", file.display());
             }
         }
-        println!("declare them with: otter add <package>...");
+        stdoutln!("declare them with: otter add <package>...");
     }
     Ok(exit_code_for_findings(false))
 }
@@ -3075,7 +3112,7 @@ async fn run_pm_approve_builds(
     };
     if decided.is_empty() {
         if json {
-            println!(
+            stdoutln!(
                 "{}",
                 serde_json::json!({
                     "ok": true,
@@ -3083,7 +3120,7 @@ async fn run_pm_approve_builds(
                 })
             );
         } else if pending.is_empty() {
-            println!("no dependency install scripts are awaiting review");
+            stdoutln!("no dependency install scripts are awaiting review");
         } else {
             print_pending_builds(&pending);
         }
@@ -3123,7 +3160,7 @@ async fn run_pm_approve_builds(
     };
 
     if json {
-        println!(
+        stdoutln!(
             "{}",
             serde_json::json!({
                 "ok": true,
@@ -3138,7 +3175,7 @@ async fn run_pm_approve_builds(
         );
     } else {
         for name in &decided {
-            println!(
+            stdoutln!(
                 "{} install scripts for {name}",
                 if approved { "approved" } else { "refused" }
             );
@@ -3309,7 +3346,7 @@ fn classify_bump(current: &str, latest: &str) -> VersionBump {
 
 fn print_outdated_report(rows: &[OutdatedPackage], json: bool) {
     if json {
-        println!(
+        stdoutln!(
             "{}",
             serde_json::json!({
                 "ok": rows.is_empty(),
@@ -3327,10 +3364,10 @@ fn print_outdated_report(rows: &[OutdatedPackage], json: bool) {
         return;
     }
     if rows.is_empty() {
-        println!("all dependencies are up to date");
+        stdoutln!("all dependencies are up to date");
         return;
     }
-    print!("{}", render_outdated_table(rows));
+    stdout!("{}", render_outdated_table(rows));
 }
 
 fn render_outdated_table(rows: &[OutdatedPackage]) -> String {
@@ -3438,7 +3475,7 @@ fn build_init_manifest(args: &InitArgs) -> Result<PackageManifest, OtterError> {
         match value.as_str() {
             "module" => break PackageType::Module,
             "commonjs" => break PackageType::CommonJs,
-            other => eprintln!("invalid package type `{other}`; expected `module` or `commonjs`"),
+            other => stderrln!("invalid package type `{other}`; expected `module` or `commonjs`"),
         }
     };
     let main = prompt_with_default("entry point", "index.ts")?;
@@ -3460,9 +3497,7 @@ fn build_init_manifest(args: &InitArgs) -> Result<PackageManifest, OtterError> {
 }
 
 fn prompt_with_default(label: &str, default: &str) -> Result<String, OtterError> {
-    print!("{label} ({default}): ");
-    io::stdout()
-        .flush()
+    output::write_stdout(format_args!("{label} ({default}): "))
         .map_err(|err| pm_config_error(err.to_string()))?;
     let mut input = String::new();
     io::stdin()
@@ -3477,9 +3512,7 @@ fn prompt_with_default(label: &str, default: &str) -> Result<String, OtterError>
 }
 
 fn prompt_optional(label: &str) -> Result<Option<String>, OtterError> {
-    print!("{label}: ");
-    io::stdout()
-        .flush()
+    output::write_stdout(format_args!("{label}: "))
         .map_err(|err| pm_config_error(err.to_string()))?;
     let mut input = String::new();
     io::stdin()
@@ -3573,7 +3606,7 @@ fn write_startup_image(target: &Path) -> Result<ExitCode, OtterError> {
         }
     }
     staged.place(target)?;
-    eprintln!(
+    stderrln!(
         "startup image: {len} bytes written into {}",
         target.display()
     );
@@ -3633,9 +3666,9 @@ fn run_info(json: bool, execution: &CliExecutionConfig) -> Result<ExitCode, Otte
         "execution_mode": execution.execution_mode_name(),
             "rust_edition": "2024",
         });
-        println!("{}", serde_json::to_string(&info).unwrap());
+        stdoutln!("{}", serde_json::to_string(&info).unwrap());
     } else {
-        println!(
+        stdoutln!(
             "otter v{} (foundation, {})",
             env!("CARGO_PKG_VERSION"),
             execution.execution_mode_name(),

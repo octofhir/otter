@@ -1,0 +1,775 @@
+{
+  "status": "implemented",
+  "comparison": {
+    "status": "passed",
+    "binarySha256": {
+      "before": "c1421a4479281218d313e4726afee39e8aa0b36e82ba897d6bbca82b8f0414ca",
+      "after": "61473dfec269d3b610fdb2e5c76db2e4a9452823b86ea400551b32b1900f8d63",
+      "node": "1ee75375e33b94fc34b3b19aede049e11dae90efb63b374dc96d6bdace70c4b8"
+    },
+    "sourceSha256": {
+      "ts": "09a383b31c016cf303bfd0ec220c75efb35f8183a97cf1540ed0eda5913e2203"
+    },
+    "versions": {
+      "before": "otter 0.1.0",
+      "after": "otter 0.1.0",
+      "node": "v24.16.0"
+    },
+    "runs": [
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/before-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.242771791999985,
+        "watchdogElapsedSeconds": 3.243424500004039,
+        "stdoutFile": "ts-0-before.stdout",
+        "stderrAndCountersFile": "ts-0-before.time",
+        "real_seconds": 3.23,
+        "user_seconds": 4.18,
+        "sys_seconds": 0.15,
+        "instructions": 35323672546,
+        "rss_bytes": 602914816,
+        "fixture": "ts",
+        "engine": "before",
+        "warmup": true,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/after-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.0357972499987227,
+        "watchdogElapsedSeconds": 3.036272249999456,
+        "stdoutFile": "ts-0-after.stdout",
+        "stderrAndCountersFile": "ts-0-after.time",
+        "real_seconds": 3.03,
+        "user_seconds": 3.97,
+        "sys_seconds": 0.13,
+        "instructions": 34038655424,
+        "rss_bytes": 631144448,
+        "fixture": "ts",
+        "engine": "after",
+        "warmup": true,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/.local/state/fnm_multishells/10497_1792602237439/bin/node",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 1.1640545000045677,
+        "watchdogElapsedSeconds": 1.164546625004732,
+        "stdoutFile": "ts-0-node.stdout",
+        "stderrAndCountersFile": "ts-0-node.time",
+        "real_seconds": 1.16,
+        "user_seconds": 2.27,
+        "sys_seconds": 0.09,
+        "instructions": 20912089815,
+        "rss_bytes": 528465920,
+        "fixture": "ts",
+        "engine": "node",
+        "warmup": true,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/after-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.04110404200037,
+        "watchdogElapsedSeconds": 3.041602334000345,
+        "stdoutFile": "ts-1-after.stdout",
+        "stderrAndCountersFile": "ts-1-after.time",
+        "real_seconds": 3.03,
+        "user_seconds": 3.97,
+        "sys_seconds": 0.13,
+        "instructions": 34011872737,
+        "rss_bytes": 648609792,
+        "fixture": "ts",
+        "engine": "after",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/.local/state/fnm_multishells/10497_1792602237439/bin/node",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 1.1703751250024652,
+        "watchdogElapsedSeconds": 1.1708555000004708,
+        "stdoutFile": "ts-1-node.stdout",
+        "stderrAndCountersFile": "ts-1-node.time",
+        "real_seconds": 1.16,
+        "user_seconds": 2.31,
+        "sys_seconds": 0.09,
+        "instructions": 20858270545,
+        "rss_bytes": 529186816,
+        "fixture": "ts",
+        "engine": "node",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/before-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.176901791994169,
+        "watchdogElapsedSeconds": 3.1773947499968926,
+        "stdoutFile": "ts-1-before.stdout",
+        "stderrAndCountersFile": "ts-1-before.time",
+        "real_seconds": 3.17,
+        "user_seconds": 4.12,
+        "sys_seconds": 0.13,
+        "instructions": 35349616005,
+        "rss_bytes": 605978624,
+        "fixture": "ts",
+        "engine": "before",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/.local/state/fnm_multishells/10497_1792602237439/bin/node",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 1.2218724169943016,
+        "watchdogElapsedSeconds": 1.2221829169939156,
+        "stdoutFile": "ts-2-node.stdout",
+        "stderrAndCountersFile": "ts-2-node.time",
+        "real_seconds": 1.21,
+        "user_seconds": 2.35,
+        "sys_seconds": 0.09,
+        "instructions": 20873010938,
+        "rss_bytes": 529678336,
+        "fixture": "ts",
+        "engine": "node",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/before-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.7559195409994572,
+        "watchdogElapsedSeconds": 3.7564299579971703,
+        "stdoutFile": "ts-2-before.stdout",
+        "stderrAndCountersFile": "ts-2-before.time",
+        "real_seconds": 3.75,
+        "user_seconds": 4.85,
+        "sys_seconds": 0.19,
+        "instructions": 35302150322,
+        "rss_bytes": 525729792,
+        "fixture": "ts",
+        "engine": "before",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/after-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.047599750003428,
+        "watchdogElapsedSeconds": 3.0494982080053887,
+        "stdoutFile": "ts-2-after.stdout",
+        "stderrAndCountersFile": "ts-2-after.time",
+        "real_seconds": 3.04,
+        "user_seconds": 4.05,
+        "sys_seconds": 0.13,
+        "instructions": 34643785991,
+        "rss_bytes": 593592320,
+        "fixture": "ts",
+        "engine": "after",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/before-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.2087057089956943,
+        "watchdogElapsedSeconds": 3.2091941670005326,
+        "stdoutFile": "ts-3-before.stdout",
+        "stderrAndCountersFile": "ts-3-before.time",
+        "real_seconds": 3.2,
+        "user_seconds": 4.06,
+        "sys_seconds": 0.13,
+        "instructions": 34736989202,
+        "rss_bytes": 644415488,
+        "fixture": "ts",
+        "engine": "before",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/after-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.0993150409994996,
+        "watchdogElapsedSeconds": 3.0998130000007222,
+        "stdoutFile": "ts-3-after.stdout",
+        "stderrAndCountersFile": "ts-3-after.time",
+        "real_seconds": 3.09,
+        "user_seconds": 4.08,
+        "sys_seconds": 0.13,
+        "instructions": 34286998922,
+        "rss_bytes": 554287104,
+        "fixture": "ts",
+        "engine": "after",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/.local/state/fnm_multishells/10497_1792602237439/bin/node",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 1.2254167499995674,
+        "watchdogElapsedSeconds": 1.225791750002827,
+        "stdoutFile": "ts-3-node.stdout",
+        "stderrAndCountersFile": "ts-3-node.time",
+        "real_seconds": 1.22,
+        "user_seconds": 2.42,
+        "sys_seconds": 0.09,
+        "instructions": 20896233582,
+        "rss_bytes": 529416192,
+        "fixture": "ts",
+        "engine": "node",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/after-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.159464166004909,
+        "watchdogElapsedSeconds": 3.1612698329990963,
+        "stdoutFile": "ts-4-after.stdout",
+        "stderrAndCountersFile": "ts-4-after.time",
+        "real_seconds": 3.15,
+        "user_seconds": 4.18,
+        "sys_seconds": 0.14,
+        "instructions": 34791313997,
+        "rss_bytes": 610320384,
+        "fixture": "ts",
+        "engine": "after",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/.local/state/fnm_multishells/10497_1792602237439/bin/node",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 1.2472908749987255,
+        "watchdogElapsedSeconds": 1.2476152919989545,
+        "stdoutFile": "ts-4-node.stdout",
+        "stderrAndCountersFile": "ts-4-node.time",
+        "real_seconds": 1.24,
+        "user_seconds": 2.38,
+        "sys_seconds": 0.09,
+        "instructions": 21024235493,
+        "rss_bytes": 528957440,
+        "fixture": "ts",
+        "engine": "node",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/before-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.3659969169966644,
+        "watchdogElapsedSeconds": 3.3663432089961134,
+        "stdoutFile": "ts-4-before.stdout",
+        "stderrAndCountersFile": "ts-4-before.time",
+        "real_seconds": 3.36,
+        "user_seconds": 4.24,
+        "sys_seconds": 0.14,
+        "instructions": 35030242895,
+        "rss_bytes": 508510208,
+        "fixture": "ts",
+        "engine": "before",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/.local/state/fnm_multishells/10497_1792602237439/bin/node",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 1.1654573750056443,
+        "watchdogElapsedSeconds": 1.1659464170006686,
+        "stdoutFile": "ts-5-node.stdout",
+        "stderrAndCountersFile": "ts-5-node.time",
+        "real_seconds": 1.16,
+        "user_seconds": 2.29,
+        "sys_seconds": 0.08,
+        "instructions": 20889927255,
+        "rss_bytes": 528646144,
+        "fixture": "ts",
+        "engine": "node",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/before-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.243091791999177,
+        "watchdogElapsedSeconds": 3.2435702919974574,
+        "stdoutFile": "ts-5-before.stdout",
+        "stderrAndCountersFile": "ts-5-before.time",
+        "real_seconds": 3.24,
+        "user_seconds": 4.17,
+        "sys_seconds": 0.14,
+        "instructions": 35196692444,
+        "rss_bytes": 519307264,
+        "fixture": "ts",
+        "engine": "before",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      },
+      {
+        "command": [
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/after-otter",
+          "--timeout",
+          "0",
+          "run",
+          "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/fixtures/fixed-work/ts.js"
+        ],
+        "exit": 0,
+        "timedOut": false,
+        "launchToExitSeconds": 3.0260184169965214,
+        "watchdogElapsedSeconds": 3.0264784999963013,
+        "stdoutFile": "ts-5-after.stdout",
+        "stderrAndCountersFile": "ts-5-after.time",
+        "real_seconds": 3.02,
+        "user_seconds": 3.96,
+        "sys_seconds": 0.13,
+        "instructions": 33960028586,
+        "rss_bytes": 644349952,
+        "fixture": "ts",
+        "engine": "after",
+        "warmup": false,
+        "stdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "normalizedStdoutSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "matchesExpectedStdout": true,
+        "status": "ok",
+        "failures": []
+      }
+    ],
+    "summary": {
+      "ts": {
+        "before": {
+          "real_seconds": {
+            "median": 3.24,
+            "min": 3.17,
+            "max": 3.75,
+            "stdev": 0.23818060374430153,
+            "n": 5
+          },
+          "user_seconds": {
+            "median": 4.17,
+            "min": 4.06,
+            "max": 4.85,
+            "stdev": 0.32104516816174006,
+            "n": 5
+          },
+          "sys_seconds": {
+            "median": 0.14,
+            "min": 0.13,
+            "max": 0.19,
+            "stdev": 0.025099800796022264,
+            "n": 5
+          },
+          "instructions": {
+            "median": 35196692444,
+            "min": 34736989202,
+            "max": 35349616005,
+            "stdev": 248237965.0347706,
+            "n": 5
+          },
+          "rss_bytes": {
+            "median": 525729792,
+            "min": 508510208,
+            "max": 644415488,
+            "stdev": 60659801.74297693,
+            "n": 5
+          },
+          "launchToExitSeconds": {
+            "median": 3.243091791999177,
+            "min": 3.176901791994169,
+            "max": 3.7559195409994572,
+            "stdev": 0.23789857634711672,
+            "n": 5
+          }
+        },
+        "after": {
+          "real_seconds": {
+            "median": 3.04,
+            "min": 3.02,
+            "max": 3.15,
+            "stdev": 0.05412947441089741,
+            "n": 5
+          },
+          "user_seconds": {
+            "median": 4.05,
+            "min": 3.96,
+            "max": 4.18,
+            "stdev": 0.0898331787259027,
+            "n": 5
+          },
+          "sys_seconds": {
+            "median": 0.13,
+            "min": 0.13,
+            "max": 0.14,
+            "stdev": 0.004472135954999583,
+            "n": 5
+          },
+          "instructions": {
+            "median": 34286998922,
+            "min": 33960028586,
+            "max": 34791313997,
+            "stdev": 371085550.5221639,
+            "n": 5
+          },
+          "rss_bytes": {
+            "median": 610320384,
+            "min": 554287104,
+            "max": 648609792,
+            "stdev": 38870321.96327328,
+            "n": 5
+          },
+          "launchToExitSeconds": {
+            "median": 3.047599750003428,
+            "min": 3.0260184169965214,
+            "max": 3.159464166004909,
+            "stdev": 0.05482671007143325,
+            "n": 5
+          }
+        },
+        "node": {
+          "real_seconds": {
+            "median": 1.21,
+            "min": 1.16,
+            "max": 1.24,
+            "stdev": 0.03633180424916993,
+            "n": 5
+          },
+          "user_seconds": {
+            "median": 2.35,
+            "min": 2.29,
+            "max": 2.42,
+            "stdev": 0.052440442408507516,
+            "n": 5
+          },
+          "sys_seconds": {
+            "median": 0.09,
+            "min": 0.08,
+            "max": 0.09,
+            "stdev": 0.004472135954999577,
+            "n": 5
+          },
+          "instructions": {
+            "median": 20889927255,
+            "min": 20858270545,
+            "max": 21024235493,
+            "stdev": 66468888.73804622,
+            "n": 5
+          },
+          "rss_bytes": {
+            "median": 529186816,
+            "min": 528646144,
+            "max": 529678336,
+            "stdev": 399581.54265281075,
+            "n": 5
+          },
+          "launchToExitSeconds": {
+            "median": 1.2218724169943016,
+            "min": 1.1654573750056443,
+            "max": 1.2472908749987255,
+            "stdev": 0.03621699284103229,
+            "n": 5
+          }
+        }
+      }
+    }
+  },
+  "pairedWallPercent": [
+    -4.274534086511917,
+    -18.85875837498755,
+    -3.4091835748449872,
+    -6.135856808093443,
+    -6.693408294460967
+  ],
+  "conformance": [
+    {
+      "filter": "language/expressions/property-accessors/",
+      "totals": {
+        "total": 21,
+        "passed": 21,
+        "failed": 0,
+        "skipped": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "oom": 0
+      }
+    },
+    {
+      "filter": "built-ins/Object/defineProperty/",
+      "totals": {
+        "total": 1131,
+        "passed": 1131,
+        "failed": 0,
+        "skipped": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "oom": 0
+      }
+    },
+    {
+      "filter": "built-ins/Reflect/get/",
+      "totals": {
+        "total": 11,
+        "passed": 11,
+        "failed": 0,
+        "skipped": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "oom": 0
+      }
+    },
+    {
+      "filter": "built-ins/Reflect/set/",
+      "totals": {
+        "total": 18,
+        "passed": 18,
+        "failed": 0,
+        "skipped": 0,
+        "crashed": 0,
+        "timed_out": 0,
+        "oom": 0
+      }
+    }
+  ],
+  "sourceFiles": [
+    "crates/otter-jit/src/arm64.rs",
+    "crates/otter-jit/src/arm64/property_actions.rs",
+    "crates/otter-jit/src/arm64/property_actions/tests.rs",
+    "crates/otter-jit/src/graph/arm64.rs",
+    "crates/otter-jit/src/graph/builder.rs",
+    "crates/otter-jit/src/graph/builder_field_tests.rs",
+    "crates/otter-jit/src/graph/effects.rs",
+    "crates/otter-jit/src/graph/frame.rs",
+    "crates/otter-jit/src/graph/ir.rs",
+    "crates/otter-jit/src/graph/licm.rs",
+    "crates/otter-jit/src/graph/redundancy.rs",
+    "crates/otter-jit/src/graph/select.rs",
+    "crates/otter-jit/src/graph/tests.rs",
+    "crates/otter-jit/src/graph/x86_64/properties.rs",
+    "crates/otter-jit/src/x86_64.rs",
+    "crates/otter-jit/src/x86_64/property_actions.rs",
+    "crates/otter-jit/src/x86_64/property_actions/tests.rs",
+    "crates/otter-runtime/tests/jit_speculative_property_loads.rs",
+    "crates/otter-vm/src/executable.rs",
+    "crates/otter-vm/src/jit.rs",
+    "crates/otter-vm/src/native_abi/dispatch.rs",
+    "crates/otter-vm/src/object.rs",
+    "crates/otter-vm/src/object/shape_body.rs",
+    "crates/otter-vm/src/object/shape_keys.rs",
+    "crates/otter-jit/src/arm64/shape_lookup.rs",
+    "crates/otter-jit/src/x86_64/shape_lookup.rs",
+    "crates/otter-runtime/tests/jit_speculative_property_loads/shape_directory.rs",
+    "crates/otter-difftest/corpus/shape_directory_loads.js",
+    "docs/site/src/content/docs/engine/jit-debugging.md"
+  ],
+  "baselineHead": "0c56affaa54f481a3dcd3b50a29fc309f4e8b305",
+  "unrelatedIntegratedDifferences": [
+    "crates/otter-jit/src/graph/builder_field_type_tests.rs",
+    "crates/otter-vm/src/runtime_stubs.rs"
+  ],
+  "checksReducedAtUserRequest": true,
+  "fullCheckedGcMatrix": "cancelled",
+  "newRegression": [
+    {
+      "name": "interpreter",
+      "command": [
+        "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/after-otter",
+        "--interpreter",
+        "--timeout",
+        "0",
+        "run",
+        "/Users/alexanderstreltsov/work/octofhir/otter/crates/otter-difftest/corpus/shape_directory_loads.js"
+      ],
+      "overrides": {},
+      "exit": 0,
+      "matchesNode": true,
+      "sourceSha256": "c0710fe3c5c539ee1d5ee2b7a80fc1aae4800ce2eab24197aea61294216361ee",
+      "binarySha256": "61473dfec269d3b610fdb2e5c76db2e4a9452823b86ea400551b32b1900f8d63"
+    },
+    {
+      "name": "gc-stride-1",
+      "command": [
+        "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/ts-slice-2026-10-21/after-otter",
+        "--timeout",
+        "0",
+        "run",
+        "/Users/alexanderstreltsov/work/octofhir/otter/crates/otter-difftest/corpus/shape_directory_loads.js"
+      ],
+      "overrides": {
+        "OTTER_GC_STRESS": "1",
+        "OTTER_GC_VERIFY": "1"
+      },
+      "exit": 0,
+      "matchesNode": true,
+      "sourceSha256": "c0710fe3c5c539ee1d5ee2b7a80fc1aae4800ce2eab24197aea61294216361ee",
+      "binarySha256": "61473dfec269d3b610fdb2e5c76db2e4a9452823b86ea400551b32b1900f8d63"
+    }
+  ],
+  "unrelatedIntegratedDifferencesAreTestOnly": true
+}

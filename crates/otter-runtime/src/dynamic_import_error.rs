@@ -1,12 +1,16 @@
 //! Rooted error materialization for dynamic module loading.
 //!
 //! # Contents
-//! - One realm-prototype and message builder for direct and extra-realm imports.
+//! - One realm-prototype, message and Node `code` builder for direct and
+//!   extra-realm imports.
 //! - Moving-collection and actual heap-cap regression proofs.
 //!
 //! # Invariants
 //! - The native scope retains the prototype, receiver and message across every
 //!   allocation and descriptor publication.
+//! - A failure Node gives a code (`ERR_UNKNOWN_BUILTIN_MODULE`,
+//!   `ERR_MODULE_NOT_FOUND`) carries it as an own enumerable `code`, as Node's
+//!   own errors do.
 //! - Allocation refusal preserves the allocator request and limit through the
 //!   canonical runtime error projection.
 //! - The completed value is returned directly to the synchronous settlement
@@ -22,6 +26,7 @@ use otter_vm::{ErrorKind, Interpreter, NativeCallInfo, NativeCtx, Value};
 pub(super) fn allocate(
     interp: &mut Interpreter,
     kind: ErrorKind,
+    code: Option<&str>,
     message: &str,
 ) -> Result<Value, OtterError> {
     let prototype = Value::object(interp.error_classes_for_trace().prototype(kind));
@@ -36,6 +41,15 @@ pub(super) fn allocate(
                 message,
                 otter_vm::object::PropertyFlags::new(true, false, true),
             )?;
+            if let Some(code) = code {
+                let code = scope.string(code)?;
+                scope.define(
+                    object,
+                    "code",
+                    code,
+                    otter_vm::object::PropertyFlags::new(true, true, true),
+                )?;
+            }
             Ok(scope.finish(object))
         })
     })
@@ -52,7 +66,7 @@ mod tests {
         interp.gc_heap_mut().set_gc_stress(1, false);
         let before = interp.gc_heap().gc_cycle_counts();
         let message = "missing module 🙂".repeat(16);
-        let value = allocate(&mut interp, ErrorKind::TypeError, &message).unwrap();
+        let value = allocate(&mut interp, ErrorKind::TypeError, None, &message).unwrap();
         let root = NativeCtx::with_host_context(
             &mut interp,
             NativeCallInfo::default_call(),
@@ -95,8 +109,13 @@ mod tests {
         let cap = 2 * 1024 * 1024;
         let mut interp = Interpreter::with_string_heap_cap(cap).expect("capped fixture bootstrap");
         interp.gc_heap_mut().set_gc_stress(0, false);
-        let error =
-            allocate(&mut interp, ErrorKind::TypeError, &"m".repeat(cap as usize)).unwrap_err();
+        let error = allocate(
+            &mut interp,
+            ErrorKind::TypeError,
+            None,
+            &"m".repeat(cap as usize),
+        )
+        .unwrap_err();
         assert!(
             matches!(error, OtterError::OutOfMemory { requested_bytes, heap_limit_bytes }
             if requested_bytes > cap && heap_limit_bytes == cap),

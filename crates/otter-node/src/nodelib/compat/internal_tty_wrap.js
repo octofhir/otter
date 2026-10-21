@@ -7,18 +7,21 @@
 // process's own, a pipe or a socket is carried as it is, and what a poller
 // cannot wait on — a regular file, a device that is not a terminal, a
 // descriptor that is not open — is refused with EINVAL through `ctx`, which
-// is how `tty.ReadStream` and `tty.WriteStream` learn of it. Beyond the
-// stream it carries what only a terminal has: raw mode, the window size, and
-// writes that complete before they return.
+// is how `tty.ReadStream` and `tty.WriteStream` learn of it. A descriptor the
+// run may not use — any but its standard streams — is refused the same way,
+// as one the process does not have, whether the handle is being made or is
+// asked to `open` one later; the natives refuse it on their own as well,
+// whatever `fd` a handle is later given. Beyond the stream it carries
+// what only a terminal has: raw mode, the window size, and writes that
+// complete before they return.
 //
-// A terminal switched to raw mode is the run's to hand back. The first
-// switch on a descriptor records the mode it replaced, here, in this
-// isolate's own module state; the runtime calls the reset this module leaves
-// on `process` once the run is over, and before `abort()`, so a program that
-// exits while raw does not leave its shell raw.
+// A terminal switched to raw mode is the run's to hand back, and the runtime
+// does that itself: the native that changes a terminal's mode keeps the mode
+// it replaced in the run's own record, out of reach of JavaScript, and the
+// run hands it back once the 'exit' listeners have run, and before
+// `abort()`, so a program that exits while raw does not leave its shell raw.
 
-const { internalBinding, primordials } = require('internal/bootstrap/realm');
-const { ObjectDefineProperty } = primordials;
+const { internalBinding } = require('internal/bootstrap/realm');
 const {
   streamBaseState,
   kBytesWritten,
@@ -31,32 +34,6 @@ const native = require('internal/otter/tty');
 
 function isTTY(fd) {
   return native.isatty(fd);
-}
-
-// The terminals this run switched to raw mode, each with the mode it had
-// before its first switch, in the order they were switched.
-const switchedTerminals = [];
-
-function rememberNormalMode(fd, mode) {
-  for (let i = 0; i < switchedTerminals.length; i++) {
-    if (switchedTerminals[i].fd === fd) return;
-  }
-  switchedTerminals[switchedTerminals.length] = { __proto__: null, fd, mode };
-  if (switchedTerminals.length === 1) {
-    ObjectDefineProperty(process, '__otter_reset_terminals__', {
-      __proto__: null,
-      value: resetTerminals,
-      configurable: true,
-    });
-  }
-}
-
-// Hand every switched terminal its mode back, unless it already has it.
-function resetTerminals() {
-  for (let i = 0; i < switchedTerminals.length; i++) {
-    const { fd, mode } = switchedTerminals[i];
-    native.resetMode(fd, mode);
-  }
 }
 
 // What `CollectUVExceptionInfo` puts on the context object a failed
@@ -77,7 +54,7 @@ class TTY extends StreamHandle {
     this._normalMode = null;
     this._blocking = false;
     this._terminal = false;
-    const kind = guessHandleType(fd);
+    const kind = native.mayUse(fd) ? guessHandleType(fd) : 'UNKNOWN';
     if (kind === 'FILE' || kind === 'UNKNOWN') {
       reportInitFailure(ctx, uv.UV_EINVAL);
       return;
@@ -87,8 +64,19 @@ class TTY extends StreamHandle {
     if (err !== 0) reportInitFailure(ctx, err);
   }
 
+  // Taking a descriptor over is where the stream table would own it, so the
+  // run's rule stands here too: `open` is reachable on any handle, and on
+  // the class itself, without going through the constructor.
+  open(fd) {
+    if (!native.mayUse(fd)) return uv.UV_EINVAL;
+    return super.open(fd);
+  }
+
   // A terminal's mode belongs to the device, so the descriptor the program
   // named reaches it as well as the description this handle reads through.
+  // Each switch to raw bases itself on the mode the terminal has then, and a
+  // switch back applies that mode, as libuv's handle does; what the run's end
+  // hands back is the native's to keep.
   setRawMode(flag) {
     const raw = Boolean(flag);
     if (raw === this._raw) return 0;
@@ -99,7 +87,6 @@ class TTY extends StreamHandle {
     }
     const err = native.setMode(this.fd, this._normalMode, raw);
     if (err !== 0) return err;
-    if (raw) rememberNormalMode(this.fd, this._normalMode);
     this._raw = raw;
     return 0;
   }

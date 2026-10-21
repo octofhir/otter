@@ -1,0 +1,8 @@
+10457c000 438 JS:<arrow> [template c1]
+1045a4000 e30 JS:cb [template c3]
+1045a8000 618 JS:<arrow> [optimizing c2]
+1045ac000 8d8 JS:cb [optimizing c4]
+1045bc000 22e8 JS:<anonymous> [template c6]
+1045b8000 1a28 JS:<anonymous> [optimizing c5]
+1045b0000 918 JS:cb [optimizing c7]
+1045c0000 1b48 JS:<anonymous> [optimizing c8]

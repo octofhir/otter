@@ -1,0 +1,94 @@
+{
+  "frameStates": [
+    {
+      "id": 0,
+      "frames": [
+        {
+          "functionId": 504,
+          "bytePc": 15,
+          "entry": null,
+          "registerCount": 7,
+          "slots": [
+            [
+              1,
+              {
+                "locationKind": "register",
+                "locationValue": "1",
+                "representation": "tagged"
+              }
+            ],
+            [
+              2,
+              {
+                "locationKind": "register",
+                "locationValue": "2",
+                "representation": "tagged"
+              }
+            ],
+            [
+              3,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 1,
+      "frames": [
+        {
+          "functionId": 504,
+          "bytePc": 46,
+          "entry": null,
+          "registerCount": 7,
+          "slots": [
+            [
+              2,
+              {
+                "locationKind": "register",
+                "locationValue": "2",
+                "representation": "tagged"
+              }
+            ],
+            [
+              3,
+              {
+                "locationKind": "register",
+                "locationValue": "1",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    }
+  ],
+  "exits": [
+    {
+      "id": 0,
+      "frameStateId": 0,
+      "reason": "shapeGuard",
+      "action": "recompile",
+      "resumePcs": [
+        2
+      ]
+    },
+    {
+      "id": 1,
+      "frameStateId": 1,
+      "reason": "shapeGuard",
+      "action": "recompile",
+      "resumePcs": [
+        5
+      ]
+    }
+  ]
+}

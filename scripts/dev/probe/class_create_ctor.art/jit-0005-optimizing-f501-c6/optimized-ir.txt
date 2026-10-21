@@ -1,0 +1,12 @@
+; otter graph
+  v0 = ConstTagged(10) [] Tagged
+b1 preds=[]
+  v1 = Jump(BlockId(0)) [] None
+b0 preds=[1]
+  v2 = LoadThis [] Tagged
+  v3 = LoadNamedProperty { byte_pc: 5, programs: [0, 1], receiver_shape: None } [2] Tagged eager=[[(0, 2), (3, 0)]]
+  v4 = LoadNamedProperty { byte_pc: 18, programs: [0], receiver_shape: None } [3] Tagged eager=[[(0, 3), (3, 0)]]
+  v5 = CheckNative(372) [4] None eager=[[(0, 3), (1, 4), (2, 2), (3, 0)]]
+  v6 = CheckArgumentsElided [] None eager=[[(0, 3), (1, 4), (2, 2), (3, 0)]]
+  v7 = CallForward { pc: 4, plan: Generic, bindings: [] } [3, 2] Tagged eager=[[(0, 3), (1, 4), (2, 2), (3, 0)]]
+  v8 = Return [0] None

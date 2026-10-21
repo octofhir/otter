@@ -170,7 +170,7 @@ impl Interpreter {
                 function_id,
             )
             .map_err(|_| VmError::InvalidOperand)?;
-        body_context.resolve_atoms(self.shape_runtime.names_mut());
+        body_context.resolve_atoms(crate::isolate_names::names_mut(&mut self.gc_heap));
         let body_base = body_context.function_base();
         let linked = body_context.linked_functions();
         for function in linked.iter().skip(1) {

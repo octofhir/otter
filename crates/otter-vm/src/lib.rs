@@ -146,6 +146,7 @@ pub mod inspect;
 pub mod intl;
 pub mod intrinsic_install;
 pub mod intrinsics;
+mod isolate_names;
 mod iterator_ops;
 mod iterator_record;
 pub mod iterator_state;
@@ -1369,8 +1370,8 @@ pub struct Interpreter {
     /// once created.
     typeof_strings: [Option<crate::JsString>; 8],
     /// Embedder-overridable sink behind the `console` namespace.
-    /// Defaults to `println!` / `eprintln!` via
-    /// [`console::StdConsoleSink`].
+    /// Defaults to the process's standard output and standard error
+    /// via [`console::StdConsoleSink`].
     console_sink: console::ConsoleSinkHandle,
     /// Host-side timer scheduler. Wired by the runtime layer so
     /// `setTimeout` / `clearTimeout` / `setInterval` /

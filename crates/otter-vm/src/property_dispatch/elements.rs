@@ -90,11 +90,10 @@ impl Interpreter {
         obj: object::JsObject,
         key: crate::string::JsString,
     ) -> Option<Value> {
-        let atom = self.string_key_atom(key)?;
-        let name = self.shape_runtime.names().spelling(atom)?;
+        let (atom, name) = self.interned_string_key(key)?;
         let key = crate::property_atom::AtomizedPropertyKey::new(
             crate::property_atom::PropertyAtom::new(atom),
-            name,
+            &name,
         );
         let mut current = obj;
         for _ in 0..object::PROTO_CHAIN_HARD_CAP {

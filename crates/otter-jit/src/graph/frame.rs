@@ -278,6 +278,7 @@ pub(crate) fn exit_reason(reason: DeoptReason) -> (ExitReason, ExitAction) {
     match reason {
         DeoptReason::WrongType => (ExitReason::TypeMismatch, ExitAction::Recompile),
         DeoptReason::WrongShape => (ExitReason::ShapeGuard, ExitAction::Recompile),
+        DeoptReason::OwnDataMiss => (ExitReason::OwnDataMiss, ExitAction::Recompile),
         DeoptReason::WrongValue => (ExitReason::IdentityGuard, ExitAction::Recompile),
         DeoptReason::Overflow => (ExitReason::Int32Overflow, ExitAction::Recompile),
         DeoptReason::MinusZero => (ExitReason::NegativeZero, ExitAction::Recompile),

@@ -1,0 +1,115 @@
+{
+  "entryOffset": 0,
+  "callEntryOffset": 560,
+  "runtimeAddressRange": {
+    "start": "0x109534000",
+    "endExclusive": "0x109534e08",
+    "entry": "0x109534000"
+  },
+  "regions": [
+    {
+      "kind": "entryPrologue",
+      "startOffset": 0,
+      "endOffset": 840
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 840,
+      "endOffset": 856,
+      "functionId": 501,
+      "logicalPc": 0,
+      "bytePc": 0,
+      "operationIndex": 0,
+      "operation": "LoadThis { dst: 0 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 856,
+      "endOffset": 988,
+      "functionId": 501,
+      "logicalPc": 1,
+      "bytePc": 5,
+      "operationIndex": 1,
+      "operation": "LoadProperty { dst: 0, object: 0, name: 0, site: 1636, array_length: false }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 988,
+      "endOffset": 1256,
+      "functionId": 501,
+      "logicalPc": 2,
+      "bytePc": 18,
+      "operationIndex": 2,
+      "operation": "LoadProperty { dst: 1, object: 0, name: 1, site: 1637, array_length: false }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1256,
+      "endOffset": 1272,
+      "functionId": 501,
+      "logicalPc": 3,
+      "bytePc": 31,
+      "operationIndex": 3,
+      "operation": "LoadThis { dst: 2 }"
+    },
+    {
+      "kind": "callTrampoline",
+      "startOffset": 1272,
+      "endOffset": 1900,
+      "functionId": 501,
+      "logicalPc": 4,
+      "bytePc": 36
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1272,
+      "endOffset": 1900,
+      "functionId": 501,
+      "logicalPc": 4,
+      "bytePc": 36,
+      "operationIndex": 4,
+      "operation": "CallForwardArguments { dst: 3, method: 1, receiver: 0, this_value: 2 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1900,
+      "endOffset": 1908,
+      "functionId": 501,
+      "logicalPc": 5,
+      "bytePc": 53,
+      "operationIndex": 5,
+      "operation": "ReturnUndefined"
+    },
+    {
+      "kind": "returnEpilogue",
+      "startOffset": 2028,
+      "endOffset": 2064
+    },
+    {
+      "kind": "bailEpilogue",
+      "startOffset": 2064,
+      "endOffset": 2160
+    },
+    {
+      "kind": "committedThrowRouter",
+      "startOffset": 2160,
+      "endOffset": 2196
+    },
+    {
+      "kind": "throwEpilogue",
+      "startOffset": 2196,
+      "endOffset": 2564
+    },
+    {
+      "kind": "sharedPropertyProbes",
+      "startOffset": 2564,
+      "endOffset": 3412
+    },
+    {
+      "kind": "literalPool",
+      "startOffset": 3412,
+      "endOffset": 3592
+    }
+  ],
+  "osrEntries": []
+}

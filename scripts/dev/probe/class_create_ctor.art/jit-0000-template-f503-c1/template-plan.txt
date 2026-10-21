@@ -1,0 +1,22 @@
+; otter template plan
+; registers=13 register-operands=0 safepoints=1 osr-only=false
+; register-operands=[]
+0000 pc=0000 byte=0000 LoadClosureContext { dst: 11 }
+0001 pc=0001 byte=0005 LoadContextSlot { dst: 1, context: 11, depth: 0, slot: 0 }
+0002 pc=0002 byte=0018 LoadThis { dst: 2 }
+0003 pc=0003 byte=0023 LoadProperty { dst: 2, object: 2, name: 6, site: 1641, array_length: false }
+0004 pc=0004 byte=0036 Move { dst: 3, src: 0 }
+0005 pc=0005 byte=0046 LoadProperty { dst: 3, object: 3, name: 6, site: 1642, array_length: false }
+0006 pc=0006 byte=0059 BinaryArith { dst: 4, lhs: 2, rhs: 3, kind: Sub }
+0007 pc=0007 byte=0070 LoadThis { dst: 5 }
+0008 pc=0008 byte=0075 LoadProperty { dst: 5, object: 5, name: 7, site: 1643, array_length: false }
+0009 pc=0009 byte=0088 Move { dst: 6, src: 0 }
+0010 pc=0010 byte=0098 LoadProperty { dst: 6, object: 6, name: 7, site: 1644, array_length: false }
+0011 pc=0011 byte=0111 BinaryArith { dst: 7, lhs: 5, rhs: 6, kind: Sub }
+0012 pc=0012 byte=0122 LoadThis { dst: 8 }
+0013 pc=0013 byte=0127 LoadProperty { dst: 8, object: 8, name: 8, site: 1645, array_length: false }
+0014 pc=0014 byte=0140 Move { dst: 9, src: 0 }
+0015 pc=0015 byte=0150 LoadProperty { dst: 9, object: 9, name: 8, site: 1646, array_length: false }
+0016 pc=0016 byte=0163 BinaryArith { dst: 10, lhs: 8, rhs: 9, kind: Sub }
+0017 pc=0017 byte=0174 Construct { dst: 1, callee: 1, argc: 3, packed_args: 42950131716, super_construct: false, byte_pc: 174 }
+0018 pc=0018 byte=0196 Return { src: 1 }

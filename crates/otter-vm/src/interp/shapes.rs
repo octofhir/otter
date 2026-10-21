@@ -466,7 +466,7 @@ impl Interpreter {
     /// nothing has interned names no shape key.
     #[must_use]
     pub(crate) fn shape_offset_of(&self, shape: object::ShapeHandle, key: &str) -> Option<u32> {
-        let atom = self.shape_runtime.names().lookup(key);
+        let atom = crate::isolate_names::names(&self.gc_heap).lookup(key);
         if atom == crate::property_atom::AtomId::NONE {
             return None;
         }

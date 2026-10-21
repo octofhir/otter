@@ -11,13 +11,21 @@
 //!   rather than whichever one a `PATH` lookup happens to find first.
 //! - The child's exit status is this process's exit status: a wrapper that
 //!   swallowed a tool's failure would break every script using it.
+//! - Its own messages never panic: a message standard error refuses (its
+//!   reader is gone) is dropped, and the exit status still says what went
+//!   wrong.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
     let Some(executable) = sibling_otter() else {
-        eprintln!("otterx: cannot locate the otter executable");
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "otterx: cannot locate the otter executable"
+        );
         return ExitCode::from(2);
     };
     let status = Command::new(&executable)
@@ -27,7 +35,11 @@ fn main() -> ExitCode {
     match status {
         Ok(status) => ExitCode::from(exit_code(status.code())),
         Err(err) => {
-            eprintln!("otterx: cannot run {}: {err}", executable.display());
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "otterx: cannot run {}: {err}",
+                executable.display()
+            );
             ExitCode::from(2)
         }
     }

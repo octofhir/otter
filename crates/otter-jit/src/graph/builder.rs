@@ -450,9 +450,12 @@ impl Known {
         }
     }
 
-    /// Forget the storage words read on this path. A loop back edge polls
-    /// for interrupts, and a collection there may move element storage.
-    fn forget_storage(&mut self) {
+    /// Forget what a collection invalidates: the storage words read on this
+    /// path, which a scavenge may move, and the cells still known young.
+    /// Layouts, field values and shape facts name nodes, which the collector
+    /// keeps current, so they stay. A loop back edge polls for interrupts,
+    /// and a collection there may run too.
+    fn collect(&mut self) {
         self.storage.clear();
         self.elements_read.clear();
         self.fresh.clear();
@@ -1585,7 +1588,7 @@ impl<'a> Builder<'a> {
             }
         }
         if is_loop {
-            known.forget_storage();
+            known.collect();
             known.checked_field_types.clear();
             known.stable_checked.clear();
             // The body reaches only the values its registers and `this`
@@ -1885,8 +1888,12 @@ impl<'a> Builder<'a> {
         }
         // Only a call, or a slow path that runs JavaScript, can change an
         // object's shape or prototype state; a slot store keeps every shape.
-        if properties.call || properties.may_collect {
+        // A collection only moves cells: it forgets raw storage words and
+        // which cells are still young, never a shape or a field value.
+        if properties.call || properties.runs_js {
             self.clobber_heap();
+        } else if properties.may_collect {
+            self.known.collect();
         }
         node
     }
@@ -2175,6 +2182,8 @@ impl<'a> Builder<'a> {
                 let object = matches!(kind, Kind::NewObjectLiteral { .. });
                 let value = self.add(kind, &inputs, Repr::Tagged);
                 if object {
+                    // Its values seed the field types of its shape's owners.
+                    self.known.checked_field_types.clear();
                     self.prove_ordinary_object(value);
                 } else {
                     self.prove_array_body(value);
@@ -3154,9 +3163,10 @@ impl<'a> Builder<'a> {
     }
 
     /// `[[Get]]` of the named site at `byte_pc` on `object`: the site's
-    /// feedback programs inline, or, for a megamorphic site or one whose
-    /// receivers no program describes, a probe of the shared property action table
-    /// that completes in the runtime on a miss.
+    /// feedback programs inline. Megamorphic sites first use the complete
+    /// shape-owned data directory. A typed own-data miss permanently selects
+    /// the committed shared lookup for that site; cache residency never deopts
+    /// a directory read.
     fn named_lookup(&mut self, byte_pc: u32, object: NodeId) -> NodeId {
         let receivers = (!self.exited_for(ExitReason::ShapeGuard))
             .then(|| self.known_shapes(object))
@@ -3199,6 +3209,9 @@ impl<'a> Builder<'a> {
             .get(&byte_pc)
             .filter(|site| site.shared)
             .map(|site| site.atom);
+        if let Some(atom) = atom.filter(|_| !self.exited_for(ExitReason::OwnDataMiss)) {
+            return self.add(Kind::LoadShapedProperty { atom }, &[object], Repr::Tagged);
+        }
         self.add(
             Kind::LoadPropertyCached {
                 pc: self.pc,

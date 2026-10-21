@@ -20,7 +20,7 @@ use crate::{Interpreter, Value};
 
 fn key<'a>(vm: &mut Interpreter, name: &'a str) -> AtomizedPropertyKey<'a> {
     AtomizedPropertyKey::new(
-        PropertyAtom::new(vm.shape_runtime.names_mut().intern(name)),
+        PropertyAtom::new(crate::isolate_names::names_mut(&mut vm.gc_heap).intern(name)),
         name,
     )
 }

@@ -82,7 +82,9 @@ mod completion_admission;
 mod entry_file;
 mod timer_delivery;
 mod uncaught;
-pub use commonjs::{SCHEME_ONLY_BUILTINS, require_commonjs_dependency, run_builtin_cjs_shim};
+pub use commonjs::{
+    SCHEME_ONLY_BUILTINS, create_require, require_commonjs_dependency, run_builtin_cjs_shim,
+};
 mod compile_cache;
 pub mod compiled_program;
 pub mod data_modules;
@@ -119,6 +121,8 @@ mod static_bootstrap;
 pub use static_bootstrap::ExtensionJs;
 pub mod structured_clone;
 pub mod surface;
+#[cfg(unix)]
+pub mod terminal;
 pub mod web_fetch_host;
 pub mod web_modules;
 pub mod web_structured_clone;
@@ -2144,6 +2148,8 @@ pub(crate) struct RuntimeConfig {
     warning_options: WarningOptions,
     process_title: Option<String>,
     expose_gc: bool,
+    /// `--expose-internals`: user code may load the `internal/*` builtins.
+    expose_internals: bool,
     tracer_factory: Option<TracerFactory>,
     /// Dispatch-tick interval for VM stack sampling; `None` leaves the
     /// profiler uninstalled.
@@ -2179,11 +2185,16 @@ pub enum JitSelection {
 #[derive(Debug, Clone)]
 struct RuntimeModuleLoaderState {
     configured: Option<module_loader::LoaderConfig>,
+    /// `--expose-internals`, which decides the builtins an `import` reaches.
+    expose_internals: bool,
 }
 
 impl RuntimeModuleLoaderState {
-    fn new(configured: Option<module_loader::LoaderConfig>) -> Self {
-        Self { configured }
+    fn new(configured: Option<module_loader::LoaderConfig>, expose_internals: bool) -> Self {
+        Self {
+            configured,
+            expose_internals,
+        }
     }
 
     fn for_entry(
@@ -2224,11 +2235,16 @@ impl RuntimeModuleLoaderState {
             Some(cfg) => cfg.clone(),
             None => module_loader::LoaderConfig::new(base_dir),
         };
+        // An `import` is always user code: the builtins' internal ids name no
+        // module for it, unless `--expose-internals` opened them.
         cfg.hosted_specifiers.extend(
             hosted_modules
                 .iter()
                 .copied()
-                .filter(|module| module.supports_esm())
+                .filter(|module| {
+                    module.supports_esm()
+                        && commonjs::user_may_load(module.specifier(), self.expose_internals)
+                })
                 .map(|module| module.specifier().to_string()),
         );
         package_manager.apply_to_loader_config(&mut cfg);
@@ -2291,6 +2307,7 @@ fn commonjs_config(
         runtime_task_spawner,
         addon_loader: config.commonjs_addon_loader,
         report_watch_dependencies: commonjs::watch_reporting_requested(),
+        expose_internals: config.expose_internals,
         resolver: module_loader.for_base_dir(
             config.process_cwd.clone(),
             &config.hosted_modules,
@@ -2530,6 +2547,7 @@ impl Default for RuntimeConfig {
             warning_options: WarningOptions::default(),
             process_title: None,
             expose_gc: false,
+            expose_internals: false,
             startup_image: false,
             process_env_overlay: std::collections::BTreeMap::new(),
             tracer_factory: None,
@@ -2848,10 +2866,11 @@ impl RuntimeBuilder {
 
     /// Override the implementation behind `console.*`.
     ///
-    /// The default sink writes `log` / `info` / `debug` through
-    /// `println!` and `warn` / `error` / `trace` / failed `assert`
-    /// through `eprintln!`. Embedders can replace it with a sink
-    /// backed by `tracing`, structured logs, or test capture.
+    /// The default sink writes `log` / `info` / `debug` to standard
+    /// output and `warn` / `error` / `trace` / failed `assert` to
+    /// standard error, dropping a line the stream refuses. Embedders
+    /// can replace it with a sink backed by `tracing`, structured
+    /// logs, or test capture.
     #[must_use]
     pub fn console_sink(mut self, sink: ConsoleSinkHandle) -> Self {
         self.config.console_sink = sink;
@@ -2954,6 +2973,15 @@ impl RuntimeBuilder {
     #[must_use]
     pub fn expose_gc(mut self, expose: bool) -> Self {
         self.config.expose_gc = expose;
+        self
+    }
+
+    /// Let user code load the `internal/*` builtins — all but the realm
+    /// module that supplies the others' primordials — through `require`,
+    /// `import` and every other route (the CLI's `--expose-internals`).
+    #[must_use]
+    pub fn expose_internals(mut self, expose: bool) -> Self {
+        self.config.expose_internals = expose;
         self
     }
 
@@ -3244,7 +3272,8 @@ impl Runtime {
         config: RuntimeConfig,
         runtime_task_spawner: Option<RuntimeTaskSpawner>,
     ) -> Result<Self, OtterError> {
-        let module_loader = RuntimeModuleLoaderState::new(config.loader.clone());
+        let module_loader =
+            RuntimeModuleLoaderState::new(config.loader.clone(), config.expose_internals);
         let completion_pool = completion_admission::CompletionAdmissionPool::new(
             config.resource_account.clone(),
             config.completion_capacities,
@@ -3271,6 +3300,9 @@ impl Runtime {
             },
         })?;
         interp.set_max_stack_depth(config.max_stack_depth);
+        // Host services are host machinery, not heap state: a restored
+        // isolate wires its run's own.
+        interp.insert_host_service(commonjs::CommonJsHost(Arc::clone(&commonjs)));
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
         interp.set_console_sink(config.console_sink.clone());
         // A restored isolate runs no bootstrap, so its configured per-turn
@@ -3444,7 +3476,8 @@ impl Runtime {
         config: RuntimeConfig,
         runtime_task_spawner: Option<RuntimeTaskSpawner>,
     ) -> Result<Self, OtterError> {
-        let module_loader = RuntimeModuleLoaderState::new(config.loader.clone());
+        let module_loader =
+            RuntimeModuleLoaderState::new(config.loader.clone(), config.expose_internals);
         let completion_pool = completion_admission::CompletionAdmissionPool::new(
             config.resource_account.clone(),
             config.completion_capacities,
@@ -3468,6 +3501,7 @@ impl Runtime {
         // die, so the build runs tenured and the nursery starts empty.
         interp.gc_heap_mut().set_tenure_all(true);
         interp.set_max_stack_depth(config.max_stack_depth);
+        interp.insert_host_service(commonjs::CommonJsHost(Arc::clone(&commonjs)));
         interp.set_allow_blocking_atomics_wait(config.allow_blocking_atomics_wait);
         interp.set_resource_account(config.resource_account.clone())?;
         interp.set_console_sink(config.console_sink.clone());
@@ -4217,8 +4251,12 @@ impl Runtime {
                 Ok(DynamicImportBegin::FetchHttps { target_url })
             }
             Err(DynLoadError::Fatal(error)) => Err(error),
-            Err(DynLoadError::Diagnostic { kind, message }) => self
-                .alloc_dynamic_import_error(kind, message)
+            Err(DynLoadError::Diagnostic {
+                kind,
+                code,
+                message,
+            }) => self
+                .alloc_dynamic_import_error(kind, code, message)
                 .and_then(|value| self.settle_dynamic_import_result(token, Err(value)))
                 .map(|_| DynamicImportBegin::Settled),
             Err(DynLoadError::Thrown(value)) => self
@@ -4307,8 +4345,12 @@ impl Runtime {
                 message: "prepared dynamic module requested a second entry fetch".to_string(),
             }),
             Err(DynLoadError::Fatal(error)) => Err(error),
-            Err(DynLoadError::Diagnostic { kind, message }) => {
-                let value = self.alloc_dynamic_import_error(kind, message)?;
+            Err(DynLoadError::Diagnostic {
+                kind,
+                code,
+                message,
+            }) => {
+                let value = self.alloc_dynamic_import_error(kind, code, message)?;
                 self.settle_dynamic_import_result(token, Err(value))
             }
             Err(DynLoadError::Thrown(value)) => {
@@ -4335,13 +4377,9 @@ impl Runtime {
         let target_url = match loader.resolve(specifier, referrer_opt) {
             Ok(url) => url,
             Err(error) => {
-                let message = format!("dynamic import: cannot resolve \"{specifier}\": {error:?}");
+                let (kind, code, message) = unresolved_import(specifier, &error);
                 return self
-                    .settle_extra_realm_dynamic_error(
-                        token,
-                        otter_vm::ErrorKind::TypeError,
-                        message,
-                    )
+                    .settle_extra_realm_dynamic_error(token, kind, code, message)
                     .map(|_| DynamicImportBegin::Settled);
             }
         };
@@ -4404,9 +4442,11 @@ impl Runtime {
             Err(error) => {
                 return match DynLoadError::from_graph_error(&error, error.to_string()) {
                     DynLoadError::Fatal(error) => Err(error),
-                    DynLoadError::Diagnostic { kind, message } => {
-                        self.settle_extra_realm_dynamic_error(token, kind, message)
-                    }
+                    DynLoadError::Diagnostic {
+                        kind,
+                        code,
+                        message,
+                    } => self.settle_extra_realm_dynamic_error(token, kind, code, message),
                     DynLoadError::Thrown(value) => {
                         self.settle_extra_realm_dynamic_import(token, Err(value))
                     }
@@ -4453,11 +4493,12 @@ impl Runtime {
         &mut self,
         token: u64,
         kind: otter_vm::ErrorKind,
+        code: Option<&'static str>,
         message: String,
     ) -> Result<bool, OtterError> {
         self.interp
             .with_dynamic_import_realm(token, move |interp| {
-                Ok(alloc_dynamic_import_error_on(interp, kind, message)
+                Ok(alloc_dynamic_import_error_on(interp, kind, code, message)
                     .and_then(|value| settle_dynamic_import_result_on(interp, token, Err(value))))
             })
             .map_err(realm::map_realm_vm_error)?
@@ -4487,9 +4528,10 @@ impl Runtime {
     fn alloc_dynamic_import_error(
         &mut self,
         kind: otter_vm::ErrorKind,
+        code: Option<&'static str>,
         message: String,
     ) -> Result<otter_vm::Value, OtterError> {
-        dynamic_import_error::allocate(&mut self.interp, kind, &message)
+        dynamic_import_error::allocate(&mut self.interp, kind, code, &message)
     }
 
     fn load_dynamic_module(
@@ -4503,11 +4545,9 @@ impl Runtime {
             DynLoadError::type_error(format!("dynamic import: cwd lookup failed: {e}"))
         })?;
         let loader = self.module_loader_for_entry(&entry_for_loader);
-        let target_url = loader.resolve(specifier, referrer_opt).map_err(|e| {
-            DynLoadError::type_error(format!(
-                "dynamic import: cannot resolve \"{specifier}\": {e:?}"
-            ))
-        })?;
+        let target_url = loader
+            .resolve(specifier, referrer_opt)
+            .map_err(|error| DynLoadError::unresolved(specifier, &error))?;
         // A `type` attribute selects the data-module pipeline. Route through
         // a synthetic wrapper whose one static edge carries the attribute, so
         // the graph machinery that serves static attributed imports serves
@@ -6112,11 +6152,13 @@ impl Runtime {
                                 self.settle_extra_realm_dynamic_error(
                                     token,
                                     otter_vm::ErrorKind::TypeError,
+                                    None,
                                     message,
                                 )?;
                             } else {
                                 let reason = self.alloc_dynamic_import_error(
                                     otter_vm::ErrorKind::TypeError,
+                                    None,
                                     message,
                                 )?;
                                 self.settle_dynamic_import_result(token, Err(reason))?;
@@ -7284,6 +7326,13 @@ impl Otter {
             .await
     }
 
+    /// Start the builtin `builtin` as the run's main program, the way Node
+    /// starts `internal/main/test_runner` for `--test`: the runtime loads it
+    /// itself, so it may be an internal builtin user code cannot reach.
+    pub async fn run_builtin_main_with_diagnostics(&self, builtin: &str) -> ExecutionAttempt {
+        self.handle.run_builtin_main(builtin).await
+    }
+
     /// Blocking file execution wrapper for sync embedders.
     ///
     /// # Errors
@@ -7471,6 +7520,13 @@ impl OtterBuilder {
     #[must_use]
     pub fn expose_gc(mut self, expose: bool) -> Self {
         self.runtime = self.runtime.expose_gc(expose);
+        self
+    }
+
+    /// See [`RuntimeBuilder::expose_internals`].
+    #[must_use]
+    pub fn expose_internals(mut self, expose: bool) -> Self {
+        self.runtime = self.runtime.expose_internals(expose);
         self
     }
 
@@ -8152,8 +8208,12 @@ fn evaluate_and_settle_dynamic_linked_module_on(
             message: "prepared dynamic module requested a second entry fetch".to_string(),
         }),
         Err(DynLoadError::Fatal(error)) => Err(error),
-        Err(DynLoadError::Diagnostic { kind, message }) => {
-            let value = alloc_dynamic_import_error_on(interp, kind, message)?;
+        Err(DynLoadError::Diagnostic {
+            kind,
+            code,
+            message,
+        }) => {
+            let value = alloc_dynamic_import_error_on(interp, kind, code, message)?;
             settle_dynamic_import_result_on(interp, token, Err(value))
         }
         Err(DynLoadError::Thrown(value)) => {
@@ -8273,14 +8333,34 @@ fn settle_dynamic_import_result_on(
 fn alloc_dynamic_import_error_on(
     interp: &mut Interpreter,
     kind: otter_vm::ErrorKind,
+    code: Option<&'static str>,
     message: String,
 ) -> Result<otter_vm::Value, OtterError> {
-    dynamic_import_error::allocate(interp, kind, &message)
+    dynamic_import_error::allocate(interp, kind, code, &message)
+}
+
+/// What `import()` of a specifier the loader could not resolve rejects with:
+/// the error Node throws for it when the loader's reason has one — an unknown
+/// builtin, a missing package — and the engine's own description otherwise.
+fn unresolved_import(
+    specifier: &str,
+    error: &module_loader::LoaderError,
+) -> (otter_vm::ErrorKind, Option<&'static str>, String) {
+    match error.node_error() {
+        Some((code, message)) => (otter_vm::ErrorKind::Error, Some(code), message),
+        None => (
+            otter_vm::ErrorKind::TypeError,
+            None,
+            format!("dynamic import: cannot resolve \"{specifier}\": {error:?}"),
+        ),
+    }
 }
 
 enum DynLoadError {
     Diagnostic {
         kind: otter_vm::ErrorKind,
+        /// Node's `code` for the failure, when Node gives it one.
+        code: Option<&'static str>,
         message: String,
     },
     Thrown(otter_vm::Value),
@@ -8291,12 +8371,23 @@ impl DynLoadError {
     fn diagnostic(kind: otter_vm::ErrorKind, message: impl Into<String>) -> Self {
         Self::Diagnostic {
             kind,
+            code: None,
             message: message.into(),
         }
     }
 
     fn type_error(message: impl Into<String>) -> Self {
         Self::diagnostic(otter_vm::ErrorKind::TypeError, message)
+    }
+
+    /// `import()` of a specifier the loader could not resolve.
+    fn unresolved(specifier: &str, error: &module_loader::LoaderError) -> Self {
+        let (kind, code, message) = unresolved_import(specifier, error);
+        Self::Diagnostic {
+            kind,
+            code,
+            message,
+        }
     }
 
     fn from_graph_error(err: &module_graph::GraphError, message: impl Into<String>) -> Self {
@@ -8307,6 +8398,15 @@ impl DynLoadError {
                 });
             }
             module_graph::GraphError::Interrupted => return Self::Fatal(OtterError::Interrupted),
+            module_graph::GraphError::Loader(error) => {
+                if let Some((code, message)) = error.node_error() {
+                    return Self::Diagnostic {
+                        kind: otter_vm::ErrorKind::Error,
+                        code: Some(code),
+                        message,
+                    };
+                }
+            }
             _ => {}
         }
         let kind = match err {

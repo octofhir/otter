@@ -35,6 +35,9 @@
 //! - A search owns its matcher buffers; a host that passes a
 //!   [`MatchScratch`] in gets it back from [`Matches::into_scratch`], so
 //!   sharing a [`Regex`] never serializes matching.
+//! - A complete literal scan writes its two result slots directly, without
+//!   matcher buffers or native compilation. Sticky failures charge the same
+//!   candidate attempt as the backtracker; unanchored scans charge only hits.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp.prototype.exec> (§22.2.7.2)
@@ -49,7 +52,12 @@ use crate::exec::ExecConfig;
 use crate::exec::backtrack;
 use crate::exec::native::{self, NativeCode, NativeTier, Outcome, Window};
 use crate::flags::Flags;
-use crate::program::Program;
+use crate::program::{Program, RequiredLiteral};
+
+mod literal;
+
+#[cfg(test)]
+mod literal_tests;
 
 /// A compiled regular expression.
 ///
@@ -83,6 +91,7 @@ pub struct MatchScratch(Option<Box<Buffers>>);
 struct Buffers {
     interpreter: backtrack::Scratch,
     native: native::Scratch,
+    literal: [u64; 2],
 }
 
 impl Regex {
@@ -191,10 +200,19 @@ impl Regex {
         config: ExecConfig,
         scratch: MatchScratch,
     ) -> Matches<'r, 't, U> {
-        let native = self.native.code::<U>(&self.program);
-        if let Some(code) = native {
+        let literal = self
+            .program
+            .required_literal
+            .as_ref()
+            .filter(|lit| lit.is_complete());
+        let execution = if let Some(literal) = literal {
+            Execution::Literal(literal)
+        } else if let Some(code) = self.native.code::<U>(&self.program) {
             code.prepare();
-        }
+            Execution::Native(code)
+        } else {
+            Execution::Interpreted
+        };
         Matches {
             regex: self,
             text,
@@ -204,7 +222,7 @@ impl Regex {
             done: false,
             steps_executed: 0,
             scratch: scratch.0.unwrap_or_default(),
-            native,
+            execution,
         }
     }
 
@@ -230,7 +248,7 @@ impl Regex {
             done: false,
             steps_executed: 0,
             scratch: Box::default(),
-            native: code,
+            execution: code.map_or(Execution::Interpreted, Execution::Native),
         }
     }
 
@@ -269,6 +287,15 @@ enum Scan<'p> {
     FirstSet(&'p crate::program::Prefilter),
 }
 
+/// One authoritative execution plan, selected before acquiring search scratch.
+/// Explicit test-tier searches exclude literal completion to keep an oracle.
+#[derive(Debug, Clone, Copy)]
+enum Execution<'r> {
+    Literal(&'r RequiredLiteral),
+    Native(&'r NativeCode),
+    Interpreted,
+}
+
 /// Lending search over successive matches of a [`Regex`] in a subject of UTF-16
 /// units or Latin-1 bytes.
 ///
@@ -285,8 +312,8 @@ pub struct Matches<'r, 't, U: Unit = u16> {
     done: bool,
     steps_executed: u64,
     scratch: Box<Buffers>,
-    /// The program's machine code for this width, once it has compiled.
-    native: Option<&'r NativeCode>,
+    /// The complete scan, compiled matcher or interpreted matcher for this search.
+    execution: Execution<'r>,
 }
 
 impl<U: Unit> Matches<'_, '_, U> {
@@ -519,10 +546,12 @@ impl<U: Unit> Matches<'_, '_, U> {
     #[inline]
     fn current_slots(&self) -> Slots<'_> {
         let count = self.regex.program.capture_slot_count();
-        if self.native.is_some() {
-            Slots::Encoded(&self.scratch.native.captures()[..count])
-        } else {
-            Slots::Interpreted(&self.scratch.interpreter.captures()[..count])
+        match self.execution {
+            Execution::Literal(_) => Slots::Encoded(&self.scratch.literal),
+            Execution::Native(_) => Slots::Encoded(&self.scratch.native.captures()[..count]),
+            Execution::Interpreted => {
+                Slots::Interpreted(&self.scratch.interpreter.captures()[..count])
+            }
         }
     }
 
@@ -530,9 +559,10 @@ impl<U: Unit> Matches<'_, '_, U> {
         if self.done {
             return None;
         }
-        match self.native {
-            Some(code) => self.advance_native(code),
-            None => self.advance_interpreted(),
+        match self.execution {
+            Execution::Literal(literal) => self.advance_literal(literal),
+            Execution::Native(code) => self.advance_native(code),
+            Execution::Interpreted => self.advance_interpreted(),
         }
     }
 }

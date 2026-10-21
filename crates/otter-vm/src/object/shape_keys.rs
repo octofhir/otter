@@ -16,7 +16,8 @@
 //!
 //! # Contents
 //! - [`ShapeKeysBody`] — the table: length and capacity, then the entries and
-//!   the atom index in trailing storage.
+//!   the atom/data-slot index in trailing storage.
+//! - [`ShapeLookupLayout`] — the owned scalar contract consumed by both JITs.
 //! - [`ShapeKeysHandle`] — the handle a shape stores.
 //! - [`keys_for_child`] — the table a new child shape names.
 //! - [`ShapeKeysBody::slot_of_atom`] / [`ShapeKeysBody::slot_of_str`] /
@@ -70,12 +71,12 @@ pub(crate) struct KeyEntry {
     pub(crate) is_accessor: bool,
 }
 
-/// Index bucket of no entry.
-const EMPTY: u16 = 0;
+/// Empty atom/data-slot bucket.
+const EMPTY: u64 = 0;
 
 /// Length and capacity of a lineage's key table. `capacity` entries follow
-/// in the same cell, then `2 * capacity` atom index buckets, each the
-/// entry's index plus one.
+/// in the same cell, then `2 * capacity` atom index buckets, each holding the atom, accessor bit and entry index plus one. A probe
+/// resolves a data slot without a dependent read of the key entries.
 #[repr(C, align(8))]
 pub struct ShapeKeysBody {
     len: u32,
@@ -90,7 +91,7 @@ impl ShapeKeysBody {
 
     fn trailing_bytes(capacity: u32) -> usize {
         let capacity = capacity as usize;
-        capacity * std::mem::size_of::<KeyEntry>() + 2 * capacity * std::mem::size_of::<u16>()
+        capacity * std::mem::size_of::<KeyEntry>() + 2 * capacity * std::mem::size_of::<u64>()
     }
 
     fn entries_ptr(&self) -> *mut KeyEntry {
@@ -99,7 +100,7 @@ impl ShapeKeysBody {
         unsafe { (self as *const Self as *mut Self).add(1).cast() }
     }
 
-    fn index_ptr(&self) -> *mut u16 {
+    fn index_ptr(&self) -> *mut u64 {
         // SAFETY: the index follows the `capacity` entries in the same tail.
         unsafe { self.entries_ptr().add(self.capacity as usize).cast() }
     }
@@ -109,7 +110,7 @@ impl ShapeKeysBody {
     }
 
     fn bucket_of(&self, atom: AtomId) -> u32 {
-        atom.raw().wrapping_mul(0x9e37_79b1).rotate_right(16) & self.mask()
+        ShapeLookupLayout::atom_hash(atom.raw()) & self.mask()
     }
 
     /// Entry `slot`, which must be below the reading shape's key count.
@@ -123,6 +124,15 @@ impl ShapeKeysBody {
     /// The slot of `atom` among the first `count` entries.
     #[must_use]
     pub(crate) fn slot_of_atom(&self, atom: AtomId, count: u32) -> Option<u32> {
+        self.lookup_atom(atom, count).map(|(slot, _, _)| slot)
+    }
+
+    /// Slot and descriptor facts from the authoritative atom bucket.
+    pub(crate) fn lookup_atom(
+        &self,
+        atom: AtomId,
+        count: u32,
+    ) -> Option<(u32, PropertyFlags, bool)> {
         let mut bucket = self.bucket_of(atom);
         loop {
             // SAFETY: `bucket <= mask`, within the `2 * capacity` buckets.
@@ -130,9 +140,13 @@ impl ShapeKeysBody {
             if found == EMPTY {
                 return None;
             }
-            let slot = u32::from(found) - 1;
-            if self.entry(slot).atom == atom {
-                return (slot < count).then_some(slot);
+            let slot = (found as u32 & 0xffff) - 1;
+            if (found >> 32) as u32 == atom.raw() {
+                return (slot < count).then_some((
+                    slot,
+                    PropertyFlags::from_bits(((found >> 17) & 7) as u8),
+                    found & (1 << 16) != 0,
+                ));
             }
             bucket = (bucket + 1) & self.mask();
         }
@@ -169,8 +183,10 @@ impl ShapeKeysBody {
             while *self.index_ptr().add(bucket as usize) != EMPTY {
                 bucket = (bucket + 1) & self.mask();
             }
-            *self.index_ptr().add(bucket as usize) =
-                u16::try_from(slot + 1).expect("key table index exceeds u16");
+            *self.index_ptr().add(bucket as usize) = u64::from(entry.atom.raw()) << 32
+                | u64::from(u16::try_from(slot + 1).expect("key table index exceeds u16"))
+                | u64::from(entry.is_accessor) << 16
+                | u64::from(entry.flags.bits()) << 17;
         }
     }
 
@@ -268,6 +284,46 @@ pub(crate) fn keys_for_child(
     )
 }
 
+/// Physical layout of the shape-owned lookup directory for native probes.
+/// All offsets include the GC header. Buckets contain an atom in bits 32..64,
+/// an accessor bit at 16, flags at 17..20, and logical slot plus one in bits 0..16.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShapeLookupLayout {
+    /// Compressed directory handle in a shape.
+    pub keys_byte: u32,
+    /// Compressed parent shape handle.
+    pub parent_byte: u32,
+    /// Atom introduced by one shape transition.
+    pub atom_byte: u32,
+    /// Accessor discriminator of a shape transition.
+    pub accessor_byte: u32,
+    /// Directory entry capacity.
+    pub capacity_byte: u32,
+    /// Beginning of the key entry tail.
+    pub entries_byte: u32,
+    /// Size of one key entry preceding the buckets.
+    pub entry_bytes: u32,
+}
+impl ShapeLookupLayout {
+    /// Hash shared by Rust and generated probes before the directory mask.
+    pub const fn atom_hash(atom: u32) -> u32 {
+        atom.wrapping_mul(0x9e37_79b1).rotate_right(16)
+    }
+
+    pub(crate) fn current() -> Self {
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        Self {
+            keys_byte: header + super::shape_body::SHAPE_BODY_KEYS_OFFSET as u32,
+            parent_byte: header + super::shape_body::SHAPE_BODY_PARENT_OFFSET as u32,
+            atom_byte: header + super::shape_body::SHAPE_BODY_ATOM_OFFSET as u32,
+            accessor_byte: header + super::shape_body::SHAPE_BODY_ACCESSOR_OFFSET as u32,
+            capacity_byte: header + std::mem::offset_of!(ShapeKeysBody, capacity) as u32,
+            entries_byte: header + std::mem::size_of::<ShapeKeysBody>() as u32,
+            entry_bytes: std::mem::size_of::<KeyEntry>() as u32,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +400,45 @@ mod tests {
                 keys.slot_of_atom(AtomId::from_global(100), parent_count + 1),
                 None
             );
+        });
+    }
+
+    #[test]
+    fn atom_buckets_keep_collision_slots_and_descriptor_kinds() {
+        let mut heap = GcHeap::new().expect("heap");
+        let mut entries: Vec<_> = (0..SHAPE_KEYS_MIN).map(entry).collect();
+        entries[3].is_accessor = true;
+        // The packed directory must describe each entry, including accessors,
+        // and cannot conflate the low sixteen bits of distinct atom ids.
+        entries[4].atom = AtomId::from_global(0x1_0003);
+        let table = keys_for_child(
+            &mut heap,
+            ShapeKeysHandle::null(),
+            SHAPE_KEYS_MIN - 1,
+            |_| entries[..entries.len() - 1].to_vec(),
+            entries[entries.len() - 1],
+            &mut |_| {},
+        )
+        .expect("directory");
+        heap.read_payload(table, |keys| {
+            for (slot, entry) in entries.iter().enumerate() {
+                assert_eq!(
+                    keys.slot_of_atom(entry.atom, SHAPE_KEYS_MIN),
+                    Some(slot as u32)
+                );
+                let mut bucket = keys.bucket_of(entry.atom);
+                loop {
+                    // SAFETY: the mask bounds every bucket in the allocated tail.
+                    let word = unsafe { *keys.index_ptr().add(bucket as usize) };
+                    assert_ne!(word, EMPTY);
+                    if (word >> 32) as u32 == entry.atom.raw() {
+                        assert_eq!((word as u32 & 0xffff) - 1, slot as u32);
+                        assert_eq!((word >> 16) & 1, u64::from(entry.is_accessor));
+                        break;
+                    }
+                    bucket = (bucket + 1) & keys.mask();
+                }
+            }
         });
     }
 

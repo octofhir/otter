@@ -200,7 +200,7 @@ fn bank(
 }
 
 /// [`bank`] of `holder` whose current shape's address is already in `shape`.
-fn bank_of_shape(
+pub(super) fn bank_of_shape(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     holder: u8,

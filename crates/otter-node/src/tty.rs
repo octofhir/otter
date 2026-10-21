@@ -9,21 +9,31 @@
 //!
 //! # Contents
 //! - [`tty_binding_cjs_value`] — the hosted module.
-//! - [`is_terminal`], [`window_size`], [`terminal_mode`],
-//!   [`set_terminal_mode`], [`reset_terminal_mode`], [`set_blocking`],
+//! - [`usable_fd`] — the only descriptors its natives operate on.
+//! - [`is_terminal`], [`window_size`], [`terminal_mode`], [`wanted_mode`],
+//!   [`apply_mode`], [`reset_terminal_mode`], [`set_blocking`],
 //!   [`write_all`] — the descriptor operations behind it.
 //!
 //! # Invariants
 //! - Every native is a static entry that captures nothing: the descriptor a
-//!   call names is everything it operates on.
+//!   call names and the run's host services are everything it operates on.
+//! - A native operates only on a descriptor the run may use: one of its
+//!   standard streams, 0, 1 and 2. The file system numbers the files a
+//!   program opens on its own, apart from the process's descriptors, and the
+//!   host carries a connection under an id, so no other descriptor of the
+//!   process is one the program opened: it is the runtime's own — its startup
+//!   image, its event loop, its channels — or one the process inherited
+//!   without asking. Any other answers as a descriptor the process does not
+//!   have, `EBADF`, and `isatty` answers `false`, the way `fs` answers
+//!   `fstat` on a descriptor the run does not own.
 //! - A failure answers as a negative errno, the way the platform layer
 //!   reports one, and is never thrown: the handle turns it into the error
 //!   Node's own handle raises.
-//! - A terminal's normal mode is kept by whoever left it: switching to raw
-//!   mode hands back the mode it replaced, as bytes, and switching back
-//!   applies them. Nothing about a terminal is remembered here; the handle
-//!   module keeps the modes its isolate replaced and hands them back through
-//!   `resetMode` when the run ends.
+//! - Before the run first changes a terminal's mode, `setMode` keeps the mode
+//!   the terminal has in the run's [`TerminalModes`], with
+//!   [`reset_terminal_mode`] to put it back; the runtime hands it back when
+//!   the run ends. Nothing here or in JavaScript remembers a mode, and no
+//!   JavaScript hands one back.
 //! - Raw mode is the platform layer's: input is no longer translated, echoed
 //!   or turned into signals, and output still maps a newline to CR-LF.
 //!
@@ -31,13 +41,20 @@
 //! - `nodelib/compat/internal_tty_wrap.js` — the handle these natives back.
 //! - `nodelib/compat/internal_otter_stdio.js` — the standard streams, which
 //!   read a terminal's size here.
+//! - [`otter_runtime::terminal`] — the run's record of the modes it changed.
 
+use std::mem::MaybeUninit;
+use std::ops::RangeInclusive;
 use std::os::fd::RawFd;
 
+use otter_runtime::terminal::TerminalModes;
 use otter_runtime::{
     CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
 };
 use otter_vm::{NativeCtx, NativeError, NativeFastFn, NumberValue, Value};
+
+/// The descriptors a program starts with: the only ones it names here.
+const STANDARD_STREAMS: RangeInclusive<RawFd> = 0..=2;
 
 /// The hosted `internal/otter/tty`: the terminal natives the compat
 /// `tty_wrap` handle and the standard streams call.
@@ -54,10 +71,10 @@ pub fn tty_binding_cjs_value<'scope>(
     let binding = scope.object()?;
     let natives: [(&'static str, u8, NativeFastFn); 7] = [
         ("isatty", 1, tty_isatty),
+        ("mayUse", 1, tty_may_use),
         ("getWindowSize", 2, tty_get_window_size),
         ("getMode", 1, tty_get_mode),
         ("setMode", 3, tty_set_mode),
-        ("resetMode", 2, tty_reset_mode),
         ("setBlocking", 2, tty_set_blocking),
         ("writeSync", 2, tty_write_sync),
     ];
@@ -68,16 +85,24 @@ pub fn tty_binding_cjs_value<'scope>(
     Ok(binding)
 }
 
-/// `isatty(fd)` — whether `fd` is an open descriptor of a terminal.
+/// `isatty(fd)` — whether `fd` is a descriptor the run may use, open on a
+/// terminal.
 fn tty_isatty(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    Ok(Value::boolean(fd_arg(args, 0).is_some_and(is_terminal)))
+    Ok(Value::boolean(usable_fd(args, 0).is_some_and(is_terminal)))
+}
+
+/// `mayUse(fd)` — whether the run may use `fd` at all. A handle refuses any
+/// other descriptor the way the platform layer refuses one the process does
+/// not have.
+fn tty_may_use(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    Ok(Value::boolean(usable_fd(args, 0).is_some()))
 }
 
 /// `getWindowSize(fd, size)` — store the terminal's columns and rows in
 /// `size[0]` and `size[1]`; answers 0, or a negative errno with `size`
 /// untouched.
 fn tty_get_window_size(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let Some(fd) = fd_arg(args, 0) else {
+    let Some(fd) = usable_fd(args, 0) else {
         return Ok(errno_value(libc::EBADF));
     };
     let Some(size) = args
@@ -104,7 +129,7 @@ fn tty_get_window_size(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 /// `getMode(fd)` — the terminal's current mode as an `ArrayBuffer` to hand
 /// back to `setMode`, or a negative errno.
 fn tty_get_mode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let Some(fd) = fd_arg(args, 0) else {
+    let Some(fd) = usable_fd(args, 0) else {
         return Ok(errno_value(libc::EBADF));
     };
     let mode = match terminal_mode(fd) {
@@ -119,9 +144,14 @@ fn tty_get_mode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 
 /// `setMode(fd, mode, raw)` — apply a mode `getMode` answered, made raw
 /// first when `raw` is true, once pending output has drained; answers 0 or a
-/// negative errno.
+/// negative errno. The run's first change of a terminal keeps the mode it
+/// has, for the run's end to hand back.
+///
+/// # Errors
+/// A type error when the run keeps no record of terminal modes: a run without
+/// `process` has no end to hand a mode back at.
 fn tty_set_mode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let Some(fd) = fd_arg(args, 0) else {
+    let Some(fd) = usable_fd(args, 0) else {
         return Ok(errno_value(libc::EBADF));
     };
     let raw = args
@@ -131,23 +161,20 @@ fn tty_set_mode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     let Some(mode) = bytes_arg(ctx, args, 1) else {
         return Ok(errno_value(libc::EINVAL));
     };
-    Ok(match set_terminal_mode(fd, &mode, raw) {
-        Ok(()) => Value::number_i32(0),
-        Err(errno) => errno_value(errno),
-    })
-}
-
-/// `resetMode(fd, mode)` — hand a terminal back a mode `getMode` answered,
-/// once its run is over; answers 0 or a negative errno. See
-/// [`reset_terminal_mode`].
-fn tty_reset_mode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let Some(fd) = fd_arg(args, 0) else {
-        return Ok(errno_value(libc::EBADF));
+    let wanted = match wanted_mode(&mode, raw) {
+        Ok(wanted) => wanted,
+        Err(errno) => return Ok(errno_value(errno)),
     };
-    let Some(mode) = bytes_arg(ctx, args, 1) else {
-        return Ok(errno_value(libc::EINVAL));
-    };
-    Ok(match reset_terminal_mode(fd, &mode) {
+    let modes = ctx
+        .host_service::<TerminalModes>()
+        .ok_or_else(|| NativeError::TypeError {
+            name: "setMode",
+            reason: "the run keeps no record of terminal modes".to_string(),
+        })?;
+    let changed = modes
+        .keep(fd, terminal_mode, reset_terminal_mode)
+        .and_then(|()| apply_mode(fd, libc::TCSADRAIN, &wanted));
+    Ok(match changed {
         Ok(()) => Value::number_i32(0),
         Err(errno) => errno_value(errno),
     })
@@ -156,7 +183,7 @@ fn tty_reset_mode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
 /// `setBlocking(fd, blocking)` — clear or set `O_NONBLOCK` on the open file
 /// description behind `fd`; answers 0 or a negative errno.
 fn tty_set_blocking(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let Some(fd) = fd_arg(args, 0) else {
+    let Some(fd) = usable_fd(args, 0) else {
         return Ok(errno_value(libc::EBADF));
     };
     let blocking = args
@@ -172,7 +199,7 @@ fn tty_set_blocking(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
 /// `writeSync(fd, bytes)` — write every byte of a buffer source before
 /// returning; answers the count written or a negative errno.
 fn tty_write_sync(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let Some(fd) = fd_arg(args, 0) else {
+    let Some(fd) = usable_fd(args, 0) else {
         return Ok(errno_value(libc::EBADF));
     };
     let Some(bytes) = bytes_arg(ctx, args, 1) else {
@@ -182,6 +209,13 @@ fn tty_write_sync(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
         Ok(written) => Value::number(NumberValue::from_f64(written as f64)),
         Err(errno) => errno_value(errno),
     })
+}
+
+/// The descriptor a JavaScript number names, when the run may use it: one
+/// of its standard streams. Anything else is a descriptor the program never
+/// opened (see the module's invariants), so it answers as none.
+fn usable_fd(args: &[Value], index: usize) -> Option<RawFd> {
+    fd_arg(args, index).filter(|fd| STANDARD_STREAMS.contains(fd))
 }
 
 /// The descriptor a JavaScript number names: an integer the platform can
@@ -214,7 +248,7 @@ fn last_errno() -> i32 {
 }
 
 /// Whether `fd` is an open descriptor of a terminal.
-pub(crate) fn is_terminal(fd: RawFd) -> bool {
+fn is_terminal(fd: RawFd) -> bool {
     // SAFETY: `isatty` only asks about the descriptor; one that is not open
     // answers 0.
     unsafe { libc::isatty(fd) == 1 }
@@ -222,7 +256,7 @@ pub(crate) fn is_terminal(fd: RawFd) -> bool {
 
 /// The terminal's window as `(columns, rows)`, or the errno that says it has
 /// none.
-pub(crate) fn window_size(fd: RawFd) -> Result<(u16, u16), i32> {
+fn window_size(fd: RawFd) -> Result<(u16, u16), i32> {
     let mut size = libc::winsize {
         ws_row: 0,
         ws_col: 0,
@@ -243,19 +277,9 @@ pub(crate) fn window_size(fd: RawFd) -> Result<(u16, u16), i32> {
 }
 
 /// The terminal's current mode as the bytes of its `termios`.
-pub(crate) fn terminal_mode(fd: RawFd) -> Result<Vec<u8>, i32> {
-    let mut mode = std::mem::MaybeUninit::<libc::termios>::zeroed();
-    loop {
-        // SAFETY: `mode` is storage for one `termios`, which `tcgetattr`
-        // fills.
-        if unsafe { libc::tcgetattr(fd, mode.as_mut_ptr()) } == 0 {
-            break;
-        }
-        let errno = last_errno();
-        if errno != libc::EINTR {
-            return Err(errno);
-        }
-    }
+fn terminal_mode(fd: RawFd) -> Result<Vec<u8>, i32> {
+    let mut mode = MaybeUninit::<libc::termios>::zeroed();
+    fill_mode(fd, &mut mode)?;
     // SAFETY: the storage was zeroed and then written by `tcgetattr`, so all
     // of its bytes are initialized, and the slice covers exactly that storage.
     let bytes = unsafe {
@@ -267,14 +291,38 @@ pub(crate) fn terminal_mode(fd: RawFd) -> Result<Vec<u8>, i32> {
     Ok(bytes.to_vec())
 }
 
-/// Apply a mode [`terminal_mode`] answered, made raw first when `raw` is
-/// set, once output already written has drained.
-pub(crate) fn set_terminal_mode(fd: RawFd, saved: &[u8], raw: bool) -> Result<(), i32> {
+/// The terminal's current mode.
+fn read_mode(fd: RawFd) -> Result<libc::termios, i32> {
+    let mut mode = MaybeUninit::<libc::termios>::zeroed();
+    fill_mode(fd, &mut mode)?;
+    // SAFETY: the storage was zeroed and then written by `tcgetattr`, and a
+    // `termios` is plain integers, valid for any bit pattern.
+    Ok(unsafe { mode.assume_init() })
+}
+
+/// Fill `mode` with the terminal's current mode.
+fn fill_mode(fd: RawFd, mode: &mut MaybeUninit<libc::termios>) -> Result<(), i32> {
+    loop {
+        // SAFETY: `mode` is storage for one `termios`, which `tcgetattr`
+        // fills.
+        if unsafe { libc::tcgetattr(fd, mode.as_mut_ptr()) } == 0 {
+            return Ok(());
+        }
+        let errno = last_errno();
+        if errno != libc::EINTR {
+            return Err(errno);
+        }
+    }
+}
+
+/// The mode the bytes [`terminal_mode`] answered set, made raw first when
+/// `raw` is set.
+fn wanted_mode(saved: &[u8], raw: bool) -> Result<libc::termios, i32> {
     let mut mode = termios_from(saved)?;
     if raw {
         make_raw(&mut mode);
     }
-    apply_mode(fd, libc::TCSADRAIN, &mode)
+    Ok(mode)
 }
 
 /// Hand a terminal back a mode [`terminal_mode`] answered, once the run that
@@ -285,10 +333,9 @@ pub(crate) fn set_terminal_mode(fd: RawFd, saved: &[u8], raw: bool) -> Result<()
 /// now. A terminal that is not this process's controlling terminal has no
 /// foreground to defer to. SIGTTOU, which stops a background process that
 /// touches its terminal, is held off for the call.
-pub(crate) fn reset_terminal_mode(fd: RawFd, saved: &[u8]) -> Result<(), i32> {
+fn reset_terminal_mode(fd: RawFd, saved: &[u8]) -> Result<(), i32> {
     let mode = termios_from(saved)?;
-    let current = termios_from(&terminal_mode(fd)?)?;
-    if same_mode(&current, &mode) {
+    if same_mode(&read_mode(fd)?, &mode) {
         return Ok(());
     }
     // SAFETY: both calls only ask which process groups are involved.
@@ -304,7 +351,7 @@ fn termios_from(bytes: &[u8]) -> Result<libc::termios, i32> {
     if bytes.len() != std::mem::size_of::<libc::termios>() {
         return Err(libc::EINVAL);
     }
-    let mut mode = std::mem::MaybeUninit::<libc::termios>::zeroed();
+    let mut mode = MaybeUninit::<libc::termios>::zeroed();
     // SAFETY: `bytes` holds exactly one `termios` worth of bytes, `mode` has
     // room for them, and the two do not overlap.
     unsafe {
@@ -344,8 +391,8 @@ fn same_mode(left: &libc::termios, right: &libc::termios) -> bool {
 /// Run `f` with SIGTTOU blocked on this thread, then put the thread's signal
 /// mask back as it was.
 fn with_sigttou_held<R>(f: impl FnOnce() -> R) -> R {
-    let mut held = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
-    let mut previous = std::mem::MaybeUninit::<libc::sigset_t>::zeroed();
+    let mut held = MaybeUninit::<libc::sigset_t>::zeroed();
+    let mut previous = MaybeUninit::<libc::sigset_t>::zeroed();
     // SAFETY: `held` is initialized by `sigemptyset` before it is read and
     // `pthread_sigmask` fills `previous`; only this thread's mask changes.
     let blocked = unsafe {
@@ -377,7 +424,7 @@ fn make_raw(mode: &mut libc::termios) {
 }
 
 /// Clear or set `O_NONBLOCK` on the open file description behind `fd`.
-pub(crate) fn set_blocking(fd: RawFd, blocking: bool) -> Result<(), i32> {
+fn set_blocking(fd: RawFd, blocking: bool) -> Result<(), i32> {
     let flags = loop {
         // SAFETY: `F_GETFL` only reads the description's status flags.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -411,7 +458,7 @@ pub(crate) fn set_blocking(fd: RawFd, blocking: bool) -> Result<(), i32> {
 
 /// Write every byte to `fd` before returning, waiting out a description that
 /// is not blocking; answers the count written.
-pub(crate) fn write_all(fd: RawFd, bytes: &[u8]) -> Result<usize, i32> {
+fn write_all(fd: RawFd, bytes: &[u8]) -> Result<usize, i32> {
     let mut written = 0;
     while written < bytes.len() {
         let rest = &bytes[written..];
@@ -487,8 +534,12 @@ mod tests {
         }
     }
 
-    fn termios_of(fd: RawFd) -> libc::termios {
-        termios_from(&terminal_mode(fd).expect("terminal mode")).expect("one termios")
+    fn mode_of(fd: RawFd) -> libc::termios {
+        read_mode(fd).expect("terminal mode")
+    }
+
+    fn switch(fd: RawFd, saved: &[u8], raw: bool) -> Result<(), i32> {
+        apply_mode(fd, libc::TCSADRAIN, &wanted_mode(saved, raw)?)
     }
 
     #[test]
@@ -499,8 +550,9 @@ mod tests {
         assert_eq!(window_size(fd), Ok((100, 30)));
 
         let normal = terminal_mode(fd).expect("normal mode");
-        set_terminal_mode(fd, &normal, true).expect("raw mode");
-        let raw = termios_of(fd);
+        let original = mode_of(fd);
+        switch(fd, &normal, true).expect("raw mode");
+        let raw = mode_of(fd);
         assert_eq!(
             raw.c_lflag & (libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG),
             0
@@ -510,21 +562,37 @@ mod tests {
         assert_eq!(raw.c_cflag & libc::CS8, libc::CS8);
         assert_eq!((raw.c_cc[libc::VMIN], raw.c_cc[libc::VTIME]), (1, 0));
 
-        let saved = termios_from(&normal).expect("saved mode");
-        set_terminal_mode(fd, &normal, false).expect("normal mode again");
-        assert!(same_mode(&termios_of(fd), &saved));
-        assert_eq!(
-            set_terminal_mode(fd, &normal[1..], false),
-            Err(libc::EINVAL)
-        );
+        switch(fd, &normal, false).expect("normal mode again");
+        assert!(same_mode(&mode_of(fd), &original));
+        assert_eq!(switch(fd, &normal[1..], false), Err(libc::EINVAL));
 
         // The end of a run hands the mode back at once, and a terminal that
         // already has it is left as it is.
-        set_terminal_mode(fd, &normal, true).expect("raw mode again");
-        assert!(!same_mode(&termios_of(fd), &saved));
+        switch(fd, &normal, true).expect("raw mode again");
+        assert!(!same_mode(&mode_of(fd), &original));
         reset_terminal_mode(fd, &normal).expect("reset");
-        assert!(same_mode(&termios_of(fd), &saved));
+        assert!(same_mode(&mode_of(fd), &original));
         reset_terminal_mode(fd, &normal).expect("reset of an unchanged terminal");
+    }
+
+    #[test]
+    fn only_the_standard_streams_are_usable() {
+        for fd in STANDARD_STREAMS {
+            assert_eq!(usable_fd(&[Value::number_i32(fd)], 0), Some(fd));
+        }
+        // An open descriptor the program never opened answers as none, the
+        // same as one that is not open or a number that names no descriptor.
+        let (_controller, terminal) = pseudo_terminal(80, 24);
+        for value in [
+            Value::number_i32(terminal.as_raw_fd()),
+            Value::number_i32(3),
+            Value::number_i32(-1),
+            Value::number(NumberValue::from_f64(1.5)),
+            Value::undefined(),
+        ] {
+            assert_eq!(usable_fd(&[value], 0), None);
+        }
+        assert_eq!(usable_fd(&[], 0), None);
     }
 
     #[test]
@@ -540,6 +608,12 @@ mod tests {
         assert!(!is_terminal(-1));
         assert_eq!(window_size(fd), Err(libc::ENOTTY));
         assert_eq!(terminal_mode(fd), Err(libc::ENOTTY));
+        // A descriptor with no mode has none to keep.
+        let modes = TerminalModes::default();
+        assert_eq!(
+            modes.keep(fd, terminal_mode, reset_terminal_mode),
+            Err(libc::ENOTTY)
+        );
 
         set_blocking(fd, false).expect("non-blocking");
         // SAFETY: `F_GETFL` only reads the status flags.

@@ -473,6 +473,7 @@ impl CodeBlock {
             exotic_instance_root_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::EXOTIC_SLOTS_INSTANCE_ROOT_OFFSET as u32,
             field_layout: crate::object::FieldLayout::current(),
+            shape_lookup: crate::object::ShapeLookupLayout::current(),
             shape_property_count_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::SHAPE_BODY_PROPERTY_COUNT_OFFSET as u32,
             object_exotic_handle_byte: otter_gc::header::HEADER_SIZE as u32

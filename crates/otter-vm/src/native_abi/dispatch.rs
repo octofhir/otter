@@ -68,6 +68,8 @@ pub enum ExitReason {
     /// placement. The exit recompiles with the decision; it is not a failed
     /// speculation.
     AllocationSiteDecided = 15,
+    /// A complete shape directory could not authorize an ordinary own data read.
+    OwnDataMiss = 16,
 }
 
 impl ExitReason {
@@ -88,6 +90,7 @@ impl ExitReason {
             13 => Some(Self::DependencyChanged),
             14 => Some(Self::ReceiverAllocationMiss),
             15 => Some(Self::AllocationSiteDecided),
+            16 => Some(Self::OwnDataMiss),
             _ => None,
         }
     }
@@ -505,6 +508,7 @@ mod tests {
             ExitReason::DependencyChanged,
             ExitReason::ReceiverAllocationMiss,
             ExitReason::AllocationSiteDecided,
+            ExitReason::OwnDataMiss,
         ];
         let actions = [
             ExitAction::Resume,

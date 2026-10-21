@@ -1,0 +1,16 @@
+{
+  "bundles": [
+    "jit-0000-template-f503-c1",
+    "jit-0001-template-f502-c2",
+    "jit-0002-template-f501-c3",
+    "jit-0003-optimizing-f503-c4",
+    "jit-0004-optimizing-f499-c5",
+    "jit-0005-optimizing-f501-c6",
+    "jit-0006-template-f504-c7",
+    "jit-0007-optimizing-f504-c8"
+  ],
+  "retainedBytes": 1013561,
+  "droppedBundles": 0,
+  "droppedBytes": 0,
+  "truncated": false
+}

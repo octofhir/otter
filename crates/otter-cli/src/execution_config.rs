@@ -27,6 +27,8 @@ use otter_runtime::{
     TracerFactory, WarningOptions,
 };
 
+use crate::output::stderrln;
+
 /// Owned execution settings shared by every runtime-backed CLI command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliExecutionConfig {
@@ -141,8 +143,8 @@ impl CliExecutionConfig {
         Some(u32::try_from(frames.max(1)).unwrap_or(u32::MAX))
     }
 
-    /// Record `--expose-internals`. The engine's `internal/*` modules are
-    /// always requirable; the flag is what a flag-checking harness reads
+    /// Record `--expose-internals`: the script may load the engine's
+    /// `internal/*` modules, and a flag-checking harness reads the switch
     /// back out of `process.execArgv`.
     pub(crate) fn set_expose_internals(&mut self, expose: bool) {
         self.expose_internals = expose;
@@ -221,6 +223,7 @@ impl CliExecutionConfig {
             // watchdog and an interrupt handle, so the park is cancellable.
             .allow_blocking_atomics_wait(true)
             .expose_gc(self.expose_gc)
+            .expose_internals(self.expose_internals)
             .gc_trace(self.gc_trace);
         if let Some(depth) = self.stack_depth() {
             builder = builder.max_stack_depth(depth);
@@ -411,7 +414,7 @@ fn trace_factory_for_target(target: &str) -> TracerFactory {
             match std::fs::File::create(&target) {
                 Ok(file) => Box::new(BufWriter::new(file)),
                 Err(err) => {
-                    eprintln!(
+                    stderrln!(
                         "warning: --trace cannot open {target}: {err}; falling back to stderr"
                     );
                     Box::new(BufWriter::new(io::stderr()))

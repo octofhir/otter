@@ -1,0 +1,9 @@
+; otter template plan
+; registers=4 register-operands=0 safepoints=1 osr-only=false
+; register-operands=[]
+0000 pc=0000 byte=0000 LoadThis { dst: 0 }
+0001 pc=0001 byte=0005 LoadProperty { dst: 0, object: 0, name: 0, site: 1636, array_length: false }
+0002 pc=0002 byte=0018 LoadProperty { dst: 1, object: 0, name: 1, site: 1637, array_length: false }
+0003 pc=0003 byte=0031 LoadThis { dst: 2 }
+0004 pc=0004 byte=0036 CallForwardArguments { dst: 3, method: 1, receiver: 0, this_value: 2 }
+0005 pc=0005 byte=0053 ReturnUndefined

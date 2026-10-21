@@ -268,7 +268,9 @@ mod tests {
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let key = |interpreter: &mut Interpreter, name: &'static str| {
             AtomizedPropertyKey::new(
-                PropertyAtom::new(interpreter.shape_runtime.names_mut().intern(name)),
+                PropertyAtom::new(
+                    crate::isolate_names::names_mut(&mut interpreter.gc_heap).intern(name),
+                ),
                 name,
             )
         };
@@ -336,7 +338,9 @@ mod tests {
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let key = |interpreter: &mut Interpreter, name: &'static str| {
             AtomizedPropertyKey::new(
-                PropertyAtom::new(interpreter.shape_runtime.names_mut().intern(name)),
+                PropertyAtom::new(
+                    crate::isolate_names::names_mut(&mut interpreter.gc_heap).intern(name),
+                ),
                 name,
             )
         };
@@ -426,7 +430,9 @@ mod tests {
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let key = |interpreter: &mut Interpreter, name: &'static str| {
             AtomizedPropertyKey::new(
-                PropertyAtom::new(interpreter.shape_runtime.names_mut().intern(name)),
+                PropertyAtom::new(
+                    crate::isolate_names::names_mut(&mut interpreter.gc_heap).intern(name),
+                ),
                 name,
             )
         };

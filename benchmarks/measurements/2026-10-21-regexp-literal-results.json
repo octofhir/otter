@@ -1,0 +1,1777 @@
+{
+  "environment": {
+    "head": "0c56affaa54f481a3dcd3b50a29fc309f4e8b305",
+    "snapshot": "/tmp/otter-search-20261021/source",
+    "buildCommand": [
+      "cargo",
+      "build",
+      "--release",
+      "-p",
+      "otter-cli",
+      "--target-dir",
+      "/Users/alexanderstreltsov/work/octofhir/otter/target"
+    ],
+    "platform": "macOS-26.5-arm64-arm-64bit-Mach-O",
+    "versions": {
+      "node": "v24.16.0",
+      "rustc": "rustc 1.100.0-beta.7 (fd8e211ae 2026-10-17)",
+      "cargo": "cargo 1.100.0-beta.7 (72b77b8d9 2026-10-17)"
+    },
+    "manifestSha256": "1c497f9e7da726fba4ef4039783ecb0d089f5cdaff8fc479e33aaa479e58fe62",
+    "beforeBinarySha256": "ed115dca3355a2f65df465ae997c4725860bb6a9046af9e6875e7812ff9dfceb",
+    "snapshotVerifiedAfterBuild": true,
+    "afterBinarySha256": "c1421a4479281218d313e4726afee39e8aa0b36e82ba897d6bbca82b8f0414ca",
+    "candidateSnapshotVerifiedAfterBuild": true,
+    "initialAb": "invalid; preserved timestamps caused Cargo to reuse old regex code",
+    "profiles": {
+      "release": "opt-level=3, thin LTO, one codegen unit, debug=1, assertions off; embedded startup image"
+    },
+    "finalBinary": {
+      "path": "/Users/alexanderstreltsov/work/octofhir/otter/benchmarks/results/regexp-search-2026-10-21/after-verified-otter",
+      "sha256": "c1421a4479281218d313e4726afee39e8aa0b36e82ba897d6bbca82b8f0414ca"
+    },
+    "finalBenchmarkSourceVerified": true,
+    "cpu": "Apple M1",
+    "canonicalResults": "verified-ab/results.json",
+    "environmentOverrides": {
+      "NODE_OPTIONS": null,
+      "RUSTFLAGS": null,
+      "CARGO_BUILD_TARGET": null,
+      "RUSTC_WRAPPER": null,
+      "MIMALLOC_SHOW_STATS": null
+    }
+  },
+  "primary": {
+    "startup": {
+      "before": {
+        "real_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 52632048,
+          "min": 52290929,
+          "max": 54542766,
+          "stdev": 921573.2216772034,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 22396928,
+          "min": 22347776,
+          "max": 22446080,
+          "stdev": 37718.80057477968,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.011509291995025706,
+          "min": 0.011282749997917563,
+          "max": 0.012340957997366786,
+          "stdev": 0.00041085485507825424,
+          "n": 5
+        }
+      },
+      "after": {
+        "real_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 52668432,
+          "min": 52275811,
+          "max": 52924262,
+          "stdev": 278629.0056209152,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 22462464,
+          "min": 22462464,
+          "max": 22528000,
+          "stdev": 29308.590194685243,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.011058167001465335,
+          "min": 0.010795916998176835,
+          "max": 0.012903041999379639,
+          "stdev": 0.0008724062418802527,
+          "n": 5
+        }
+      },
+      "node": {
+        "real_seconds": {
+          "median": 0.02,
+          "min": 0.02,
+          "max": 0.02,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.02,
+          "min": 0.02,
+          "max": 0.02,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 235679791,
+          "min": 233978427,
+          "max": 237053863,
+          "stdev": 1215618.0535431348,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 45580288,
+          "min": 45449216,
+          "max": 45596672,
+          "stdev": 59526.02808183996,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.02888645799976075,
+          "min": 0.028443457995308563,
+          "max": 0.029779500000586268,
+          "stdev": 0.0005215745407715201,
+          "n": 5
+        }
+      }
+    },
+    "literal": {
+      "before": {
+        "real_seconds": {
+          "median": 0.23,
+          "min": 0.22,
+          "max": 0.23,
+          "stdev": 0.005477225575051666,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.22,
+          "min": 0.22,
+          "max": 0.23,
+          "stdev": 0.004472135954999583,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 4058045004,
+          "min": 4057523182,
+          "max": 4059852833,
+          "stdev": 1025951.3953305488,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 29704192,
+          "min": 29687808,
+          "max": 29720576,
+          "stdev": 11585.237502960395,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.23323533299844712,
+          "min": 0.23115087499900255,
+          "max": 0.23949283300316893,
+          "stdev": 0.0033230890082444078,
+          "n": 5
+        },
+        "firstMs": {
+          "median": 14.406,
+          "min": 14.082416,
+          "max": 14.805916999999999,
+          "stdev": 0.2613850150722106,
+          "n": 5
+        },
+        "steadyMs": {
+          "median": 13.576020500000013,
+          "min": 13.479,
+          "max": 13.852478999999988,
+          "stdev": 0.1447140324893335,
+          "n": 5
+        }
+      },
+      "after": {
+        "real_seconds": {
+          "median": 0.21,
+          "min": 0.21,
+          "max": 0.21,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.21,
+          "min": 0.21,
+          "max": 0.21,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 3675633742,
+          "min": 3675136342,
+          "max": 3675898858,
+          "stdev": 298901.59216738876,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 29704192,
+          "min": 29687808,
+          "max": 29720576,
+          "stdev": 13707.837874734294,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.22163383400038583,
+          "min": 0.22081591599999228,
+          "max": 0.22209766599553404,
+          "stdev": 0.0005079435502471796,
+          "n": 5
+        },
+        "firstMs": {
+          "median": 13.633125,
+          "min": 13.433625,
+          "max": 13.692459,
+          "stdev": 0.11572000876814731,
+          "n": 5
+        },
+        "steadyMs": {
+          "median": 12.882312500000005,
+          "min": 12.807229499999998,
+          "max": 12.906292000000015,
+          "stdev": 0.038005855430451506,
+          "n": 5
+        }
+      },
+      "node": {
+        "real_seconds": {
+          "median": 0.13,
+          "min": 0.13,
+          "max": 0.13,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.12,
+          "min": 0.12,
+          "max": 0.12,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 2234153773,
+          "min": 2230408097,
+          "max": 2235457789,
+          "stdev": 1922067.9451559978,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 52101120,
+          "min": 51970048,
+          "max": 52166656,
+          "stdev": 78232.52774134299,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.13346720799745526,
+          "min": 0.13320974999805912,
+          "max": 0.1374396249957499,
+          "stdev": 0.0017898118899635743,
+          "n": 5
+        },
+        "firstMs": {
+          "median": 7.130417000000001,
+          "min": 6.958916000000002,
+          "max": 7.159334000000001,
+          "stdev": 0.08210320488080788,
+          "n": 5
+        },
+        "steadyMs": {
+          "median": 6.405083000000008,
+          "min": 6.340478999999995,
+          "max": 6.537146000000007,
+          "stdev": 0.07513325155149743,
+          "n": 5
+        }
+      }
+    },
+    "literal-wide": {
+      "before": {
+        "real_seconds": {
+          "median": 0.2,
+          "min": 0.2,
+          "max": 0.21,
+          "stdev": 0.004472135954999571,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.2,
+          "min": 0.2,
+          "max": 0.2,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 3432342258,
+          "min": 3432172325,
+          "max": 3432748914,
+          "stdev": 215103.90798565236,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 29638656,
+          "min": 29589504,
+          "max": 29687808,
+          "stdev": 37718.80057477968,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.21228104200417874,
+          "min": 0.21121762500115437,
+          "max": 0.21279741599573754,
+          "stdev": 0.0006380787653869198,
+          "n": 5
+        },
+        "firstMs": {
+          "median": 12.882333,
+          "min": 12.765374999999999,
+          "max": 13.006792,
+          "stdev": 0.10106940161690967,
+          "n": 5
+        },
+        "steadyMs": {
+          "median": 12.354708499999994,
+          "min": 12.186,
+          "max": 12.368687499999993,
+          "stdev": 0.07758086034825044,
+          "n": 5
+        }
+      },
+      "after": {
+        "real_seconds": {
+          "median": 0.19,
+          "min": 0.19,
+          "max": 0.2,
+          "stdev": 0.004472135954999583,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.19,
+          "min": 0.19,
+          "max": 0.19,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 3088538116,
+          "min": 3088103085,
+          "max": 3088930973,
+          "stdev": 411853.17432830355,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 29720576,
+          "min": 29687808,
+          "max": 29753344,
+          "stdev": 24301.39920251507,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.2009675419976702,
+          "min": 0.20003508400259307,
+          "max": 0.20494029200199293,
+          "stdev": 0.0019197254299058364,
+          "n": 5
+        },
+        "firstMs": {
+          "median": 12.188792000000001,
+          "min": 12.015459,
+          "max": 12.365375,
+          "stdev": 0.12424994640119588,
+          "n": 5
+        },
+        "steadyMs": {
+          "median": 11.593353999999998,
+          "min": 11.441145999999982,
+          "max": 11.868229500000005,
+          "stdev": 0.1576438288940529,
+          "n": 5
+        }
+      },
+      "node": {
+        "real_seconds": {
+          "median": 3.97,
+          "min": 3.95,
+          "max": 3.99,
+          "stdev": 0.017888543819998295,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 3.95,
+          "min": 3.93,
+          "max": 3.96,
+          "stdev": 0.015165750888103012,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.01,
+          "min": 0.01,
+          "max": 0.01,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 20007885732,
+          "min": 20003691014,
+          "max": 20015404158,
+          "stdev": 4388699.860595653,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 51838976,
+          "min": 51822592,
+          "max": 51871744,
+          "stdev": 18680.634164824278,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 3.9789852920002886,
+          "min": 3.955190416003461,
+          "max": 3.9953227500009234,
+          "stdev": 0.0174062010073607,
+          "n": 5
+        },
+        "firstMs": {
+          "median": 245.410125,
+          "min": 244.77808299999998,
+          "max": 249.49,
+          "stdev": 1.8885091585214882,
+          "n": 5
+        },
+        "steadyMs": {
+          "median": 245.87779149999983,
+          "min": 245.4276249999998,
+          "max": 246.2757919999999,
+          "stdev": 0.33562094883974264,
+          "n": 5
+        }
+      }
+    },
+    "regexp": {
+      "before": {
+        "real_seconds": {
+          "median": 1.28,
+          "min": 1.28,
+          "max": 1.34,
+          "stdev": 0.026076809620810618,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 1.28,
+          "min": 1.28,
+          "max": 1.31,
+          "stdev": 0.014142135623730963,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.02,
+          "min": 0.01,
+          "max": 0.02,
+          "stdev": 0.00447213595499958,
+          "n": 5
+        },
+        "instructions": {
+          "median": 18777132040,
+          "min": 18773229245,
+          "max": 18792875211,
+          "stdev": 9766044.058083687,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 150061056,
+          "min": 149733376,
+          "max": 150814720,
+          "stdev": 408024.10444874456,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 1.2863292499969248,
+          "min": 1.283904292002262,
+          "max": 1.3426675829978194,
+          "stdev": 0.024972983083680098,
+          "n": 5
+        }
+      },
+      "after": {
+        "real_seconds": {
+          "median": 1.27,
+          "min": 1.26,
+          "max": 1.28,
+          "stdev": 0.007071067811865481,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 1.27,
+          "min": 1.26,
+          "max": 1.28,
+          "stdev": 0.008366600265340763,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.02,
+          "min": 0.02,
+          "max": 0.02,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 18486347809,
+          "min": 18484322206,
+          "max": 18489582943,
+          "stdev": 2153189.9023082475,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 149635072,
+          "min": 149028864,
+          "max": 149782528,
+          "stdev": 323433.60555638,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 1.2787687500022002,
+          "min": 1.2676107500010403,
+          "max": 1.2847442909987876,
+          "stdev": 0.006543089028891215,
+          "n": 5
+        }
+      },
+      "node": {
+        "real_seconds": {
+          "median": 0.4,
+          "min": 0.4,
+          "max": 0.41,
+          "stdev": 0.004472135954999559,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.45,
+          "min": 0.45,
+          "max": 0.46,
+          "stdev": 0.004472135954999583,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 7293815965,
+          "min": 7292072794,
+          "max": 7302027109,
+          "stdev": 4021571.4030019036,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 79249408,
+          "min": 79183872,
+          "max": 79380480,
+          "stdev": 78915.79423157319,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.40856162500131177,
+          "min": 0.4071156659992994,
+          "max": 0.41637962499953574,
+          "stdev": 0.003787186633946034,
+          "n": 5
+        }
+      }
+    },
+    "ts": {
+      "before": {
+        "real_seconds": {
+          "median": 3.19,
+          "min": 3.14,
+          "max": 3.26,
+          "stdev": 0.045825756949558275,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 4.1,
+          "min": 3.98,
+          "max": 4.15,
+          "stdev": 0.06442049363362577,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.13,
+          "min": 0.12,
+          "max": 0.13,
+          "stdev": 0.005477225575051666,
+          "n": 5
+        },
+        "instructions": {
+          "median": 35119003792,
+          "min": 34643281254,
+          "max": 35490898290,
+          "stdev": 348601833.1278136,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 595525632,
+          "min": 510132224,
+          "max": 629374976,
+          "stdev": 44969438.522459105,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 3.1968696669937344,
+          "min": 3.1430297499973676,
+          "max": 3.2715582079981687,
+          "stdev": 0.048610091707369074,
+          "n": 5
+        }
+      },
+      "after": {
+        "real_seconds": {
+          "median": 3.19,
+          "min": 3.16,
+          "max": 3.21,
+          "stdev": 0.02302172886644262,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 4.09,
+          "min": 4.03,
+          "max": 4.12,
+          "stdev": 0.03507135583350034,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.13,
+          "min": 0.12,
+          "max": 0.13,
+          "stdev": 0.005477225575051666,
+          "n": 5
+        },
+        "instructions": {
+          "median": 35168480361,
+          "min": 34929467743,
+          "max": 35454112441,
+          "stdev": 202796747.79274923,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 576569344,
+          "min": 509001728,
+          "max": 636960768,
+          "stdev": 57839701.24987698,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 3.195377957999881,
+          "min": 3.1635180410012254,
+          "max": 3.2135573330015177,
+          "stdev": 0.0217178199964161,
+          "n": 5
+        }
+      },
+      "node": {
+        "real_seconds": {
+          "median": 1.16,
+          "min": 1.14,
+          "max": 1.3,
+          "stdev": 0.0669328021227261,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 2.21,
+          "min": 2.18,
+          "max": 2.38,
+          "stdev": 0.08203657720797466,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.08,
+          "min": 0.07,
+          "max": 0.09,
+          "stdev": 0.008366600265340751,
+          "n": 5
+        },
+        "instructions": {
+          "median": 20847536870,
+          "min": 20807938323,
+          "max": 22363198254,
+          "stdev": 664776041.0212089,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 527810560,
+          "min": 525762560,
+          "max": 528793600,
+          "stdev": 1162710.042748062,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 1.1672619999953895,
+          "min": 1.1491506669990486,
+          "max": 1.309728250002081,
+          "stdev": 0.06732262535028377,
+          "n": 5
+        }
+      }
+    },
+    "crypto": {
+      "before": {
+        "real_seconds": {
+          "median": 0.19,
+          "min": 0.19,
+          "max": 0.2,
+          "stdev": 0.004472135954999583,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.2,
+          "min": 0.2,
+          "max": 0.21,
+          "stdev": 0.004472135954999571,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 3831547076,
+          "min": 3804466877,
+          "max": 3886383118,
+          "stdev": 32829871.055835612,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 46153728,
+          "min": 45121536,
+          "max": 48300032,
+          "stdev": 1250969.632480661,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.20017145900055766,
+          "min": 0.19899404100578977,
+          "max": 0.2060758329971577,
+          "stdev": 0.002830060097674624,
+          "n": 5
+        }
+      },
+      "after": {
+        "real_seconds": {
+          "median": 0.19,
+          "min": 0.19,
+          "max": 0.19,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.2,
+          "min": 0.2,
+          "max": 0.21,
+          "stdev": 0.005477225575051651,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 3826270926,
+          "min": 3803368457,
+          "max": 3931961966,
+          "stdev": 50339916.91448168,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 47890432,
+          "min": 45826048,
+          "max": 48300032,
+          "stdev": 1125295.77293652,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.2003715830069268,
+          "min": 0.19972716600022977,
+          "max": 0.20077791700168746,
+          "stdev": 0.00041308463212461717,
+          "n": 5
+        }
+      },
+      "node": {
+        "real_seconds": {
+          "median": 0.15,
+          "min": 0.15,
+          "max": 0.15,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.17,
+          "min": 0.17,
+          "max": 0.17,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 2918703077,
+          "min": 2914632100,
+          "max": 2919324509,
+          "stdev": 2029870.1956651562,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 56852480,
+          "min": 56655872,
+          "max": 57032704,
+          "stdev": 136882.41241591267,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.15894629200192867,
+          "min": 0.1566569159986102,
+          "max": 0.15930462499818532,
+          "stdev": 0.001141439438419394,
+          "n": 5
+        }
+      }
+    },
+    "zlib": {
+      "before": {
+        "real_seconds": {
+          "median": 1.74,
+          "min": 1.74,
+          "max": 1.74,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 1.72,
+          "min": 1.72,
+          "max": 1.73,
+          "stdev": 0.005477225575051666,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.01,
+          "min": 0.01,
+          "max": 0.01,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 23836834852,
+          "min": 23835787766,
+          "max": 23839609198,
+          "stdev": 1426847.7247926635,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 121962496,
+          "min": 121913344,
+          "max": 121978880,
+          "stdev": 24847.56625506812,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 1.7496045000007143,
+          "min": 1.7453334579986404,
+          "max": 1.7516328749989043,
+          "stdev": 0.002452771715645617,
+          "n": 5
+        }
+      },
+      "after": {
+        "real_seconds": {
+          "median": 1.74,
+          "min": 1.74,
+          "max": 1.75,
+          "stdev": 0.005477225575051666,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 1.73,
+          "min": 1.72,
+          "max": 1.73,
+          "stdev": 0.004472135954999583,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.01,
+          "min": 0.01,
+          "max": 0.01,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 23839573434,
+          "min": 23836195333,
+          "max": 23840760552,
+          "stdev": 2006216.2636532234,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 122077184,
+          "min": 122060800,
+          "max": 122126336,
+          "stdev": 26921.659146493927,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 1.753132417004963,
+          "min": 1.7477397499969811,
+          "max": 1.7599454170049285,
+          "stdev": 0.005614362676441894,
+          "n": 5
+        }
+      },
+      "node": {
+        "real_seconds": {
+          "median": 1.61,
+          "min": 1.6,
+          "max": 1.7,
+          "stdev": 0.04062019202317974,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 1.6,
+          "min": 1.6,
+          "max": 1.62,
+          "stdev": 0.008944271909999166,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.01,
+          "min": 0.0,
+          "max": 0.01,
+          "stdev": 0.00447213595499958,
+          "n": 5
+        },
+        "instructions": {
+          "median": 24739984576,
+          "min": 24738761064,
+          "max": 24750196146,
+          "stdev": 4702291.396176422,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 87130112,
+          "min": 86884352,
+          "max": 87326720,
+          "stdev": 178502.90929617925,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 1.6146426249979413,
+          "min": 1.6101074580001296,
+          "max": 1.7036702499972307,
+          "stdev": 0.0395053262742712,
+          "n": 5
+        }
+      }
+    },
+    "earley-boyer": {
+      "before": {
+        "real_seconds": {
+          "median": 1.46,
+          "min": 1.45,
+          "max": 1.47,
+          "stdev": 0.008366600265340763,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 1.49,
+          "min": 1.49,
+          "max": 1.51,
+          "stdev": 0.008944271909999166,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.02,
+          "min": 0.02,
+          "max": 0.03,
+          "stdev": 0.00547722557505166,
+          "n": 5
+        },
+        "instructions": {
+          "median": 25154256523,
+          "min": 25115455670,
+          "max": 25172277336,
+          "stdev": 22950026.15149205,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 128335872,
+          "min": 127942656,
+          "max": 130088960,
+          "stdev": 840596.6041025862,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 1.4643756250006845,
+          "min": 1.4560665000026347,
+          "max": 1.4742752500023926,
+          "stdev": 0.007442650514853391,
+          "n": 5
+        }
+      },
+      "after": {
+        "real_seconds": {
+          "median": 1.45,
+          "min": 1.45,
+          "max": 1.46,
+          "stdev": 0.005477225575051666,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 1.49,
+          "min": 1.49,
+          "max": 1.51,
+          "stdev": 0.008944271909999166,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.02,
+          "min": 0.02,
+          "max": 0.03,
+          "stdev": 0.00547722557505166,
+          "n": 5
+        },
+        "instructions": {
+          "median": 25226825431,
+          "min": 25106581342,
+          "max": 25272686253,
+          "stdev": 66304591.79614869,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 128286720,
+          "min": 127418368,
+          "max": 129433600,
+          "stdev": 842542.3214248647,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 1.4624755420009024,
+          "min": 1.4565242089956882,
+          "max": 1.4692710419985815,
+          "stdev": 0.005184231893497955,
+          "n": 5
+        }
+      },
+      "node": {
+        "real_seconds": {
+          "median": 1.03,
+          "min": 1.03,
+          "max": 1.04,
+          "stdev": 0.004472135954999583,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 1.15,
+          "min": 1.14,
+          "max": 1.16,
+          "stdev": 0.008366600265340763,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.02,
+          "min": 0.02,
+          "max": 0.03,
+          "stdev": 0.004472135954999579,
+          "n": 5
+        },
+        "instructions": {
+          "median": 18651392075,
+          "min": 18620200495,
+          "max": 18695650348,
+          "stdev": 29161055.509148557,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 197361664,
+          "min": 197328896,
+          "max": 197967872,
+          "stdev": 278142.22696167516,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 1.0374415830010548,
+          "min": 1.0367887500033248,
+          "max": 1.049400167001295,
+          "stdev": 0.005388756965239251,
+          "n": 5
+        }
+      }
+    },
+    "richards": {
+      "before": {
+        "real_seconds": {
+          "median": 1.03,
+          "min": 0.96,
+          "max": 1.04,
+          "stdev": 0.03391164991562637,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 1.03,
+          "min": 0.96,
+          "max": 1.04,
+          "stdev": 0.03271085446759228,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 18794483970,
+          "min": 16235213001,
+          "max": 18795274823,
+          "stdev": 1143688119.8335307,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 43925504,
+          "min": 43286528,
+          "max": 44466176,
+          "stdev": 440147.5532082395,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 1.0415556669977377,
+          "min": 0.9690012089995435,
+          "max": 1.047665167003288,
+          "stdev": 0.03288697645005897,
+          "n": 5
+        }
+      },
+      "after": {
+        "real_seconds": {
+          "median": 1.03,
+          "min": 0.97,
+          "max": 1.03,
+          "stdev": 0.0268328157299975,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 1.03,
+          "min": 0.97,
+          "max": 1.03,
+          "stdev": 0.0268328157299975,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 18794334240,
+          "min": 16228603779,
+          "max": 18794460909,
+          "stdev": 1147360269.3649755,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 43941888,
+          "min": 43794432,
+          "max": 44384256,
+          "stdev": 234869.08312504648,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 1.0368371670047054,
+          "min": 0.9743643339970731,
+          "max": 1.0425860830000602,
+          "stdev": 0.028712499333484437,
+          "n": 5
+        }
+      },
+      "node": {
+        "real_seconds": {
+          "median": 0.63,
+          "min": 0.63,
+          "max": 0.63,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "user_seconds": {
+          "median": 0.64,
+          "min": 0.64,
+          "max": 0.64,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 5
+        },
+        "instructions": {
+          "median": 11550259192,
+          "min": 11549244376,
+          "max": 11551029967,
+          "stdev": 650996.2872841135,
+          "n": 5
+        },
+        "rss_bytes": {
+          "median": 55771136,
+          "min": 55705600,
+          "max": 55984128,
+          "stdev": 112918.9273771231,
+          "n": 5
+        },
+        "launchToExitSeconds": {
+          "median": 0.6347732499998529,
+          "min": 0.6334791250046692,
+          "max": 0.6409835830054362,
+          "stdev": 0.0029725828815275013,
+          "n": 5
+        }
+      }
+    }
+  },
+  "confirmation": {
+    "regexp": {
+      "before": {
+        "real_seconds": {
+          "median": 1.27,
+          "min": 1.26,
+          "max": 1.37,
+          "stdev": 0.029490625115398475,
+          "n": 12
+        },
+        "user_seconds": {
+          "median": 1.28,
+          "min": 1.27,
+          "max": 1.31,
+          "stdev": 0.011934162828797112,
+          "n": 12
+        },
+        "sys_seconds": {
+          "median": 0.02,
+          "min": 0.02,
+          "max": 0.02,
+          "stdev": 0.0,
+          "n": 12
+        },
+        "instructions": {
+          "median": 18774766577.0,
+          "min": 18772722813,
+          "max": 18790620414,
+          "stdev": 4821744.894020456,
+          "n": 12
+        },
+        "rss_bytes": {
+          "median": 150044672.0,
+          "min": 149716992,
+          "max": 150601728,
+          "stdev": 277617.5064744493,
+          "n": 12
+        },
+        "launchToExitSeconds": {
+          "median": 1.2811547919955046,
+          "min": 1.272432875004597,
+          "max": 1.3813461249956163,
+          "stdev": 0.029687119640928447,
+          "n": 12
+        }
+      },
+      "after": {
+        "real_seconds": {
+          "median": 1.26,
+          "min": 1.25,
+          "max": 1.28,
+          "stdev": 0.009045340337332917,
+          "n": 12
+        },
+        "user_seconds": {
+          "median": 1.27,
+          "min": 1.26,
+          "max": 1.29,
+          "stdev": 0.009003366373785208,
+          "n": 12
+        },
+        "sys_seconds": {
+          "median": 0.02,
+          "min": 0.02,
+          "max": 0.02,
+          "stdev": 0.0,
+          "n": 12
+        },
+        "instructions": {
+          "median": 18485425455.0,
+          "min": 18484141937,
+          "max": 18505395887,
+          "stdev": 6993138.045815087,
+          "n": 12
+        },
+        "rss_bytes": {
+          "median": 149413888.0,
+          "min": 148373504,
+          "max": 149766144,
+          "stdev": 398017.07385335607,
+          "n": 12
+        },
+        "launchToExitSeconds": {
+          "median": 1.2720054380006331,
+          "min": 1.2624837089970242,
+          "max": 1.2923404169996502,
+          "stdev": 0.00865279331264917,
+          "n": 12
+        }
+      },
+      "node": {
+        "real_seconds": {
+          "median": 0.4,
+          "min": 0.4,
+          "max": 0.41,
+          "stdev": 0.0038924947208075966,
+          "n": 12
+        },
+        "user_seconds": {
+          "median": 0.45,
+          "min": 0.45,
+          "max": 0.46,
+          "stdev": 0.0038924947208076183,
+          "n": 12
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 12
+        },
+        "instructions": {
+          "median": 7295043083.0,
+          "min": 7290262893,
+          "max": 7299638164,
+          "stdev": 2830639.3624104476,
+          "n": 12
+        },
+        "rss_bytes": {
+          "median": 79364096.0,
+          "min": 79200256,
+          "max": 79511552,
+          "stdev": 98086.54737155716,
+          "n": 12
+        },
+        "launchToExitSeconds": {
+          "median": 0.4079625414960901,
+          "min": 0.40380479199666297,
+          "max": 0.4151202089997241,
+          "stdev": 0.003369975369026381,
+          "n": 12
+        }
+      }
+    },
+    "crypto": {
+      "before": {
+        "real_seconds": {
+          "median": 0.19,
+          "min": 0.19,
+          "max": 0.19,
+          "stdev": 0.0,
+          "n": 12
+        },
+        "user_seconds": {
+          "median": 0.2,
+          "min": 0.2,
+          "max": 0.21,
+          "stdev": 0.0028867513459481233,
+          "n": 12
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 12
+        },
+        "instructions": {
+          "median": 3830292901.5,
+          "min": 3808222340,
+          "max": 3850094785,
+          "stdev": 13894149.171959253,
+          "n": 12
+        },
+        "rss_bytes": {
+          "median": 46882816.0,
+          "min": 45400064,
+          "max": 47972352,
+          "stdev": 874094.1124649097,
+          "n": 12
+        },
+        "launchToExitSeconds": {
+          "median": 0.20019345799664734,
+          "min": 0.1991725839980063,
+          "max": 0.2017215829982888,
+          "stdev": 0.0007588482073212797,
+          "n": 12
+        }
+      },
+      "after": {
+        "real_seconds": {
+          "median": 0.19,
+          "min": 0.19,
+          "max": 0.2,
+          "stdev": 0.004522670168666459,
+          "n": 12
+        },
+        "user_seconds": {
+          "median": 0.2,
+          "min": 0.2,
+          "max": 0.21,
+          "stdev": 0.0049236596391733,
+          "n": 12
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 12
+        },
+        "instructions": {
+          "median": 3831472282.0,
+          "min": 3798090313,
+          "max": 3865068319,
+          "stdev": 19488757.865116082,
+          "n": 12
+        },
+        "rss_bytes": {
+          "median": 46178304.0,
+          "min": 44941312,
+          "max": 48545792,
+          "stdev": 1339003.068357405,
+          "n": 12
+        },
+        "launchToExitSeconds": {
+          "median": 0.20030449999831035,
+          "min": 0.19842695799889043,
+          "max": 0.20777354200254194,
+          "stdev": 0.0027532955575814764,
+          "n": 12
+        }
+      },
+      "node": {
+        "real_seconds": {
+          "median": 0.15,
+          "min": 0.15,
+          "max": 0.15,
+          "stdev": 0.0,
+          "n": 12
+        },
+        "user_seconds": {
+          "median": 0.17,
+          "min": 0.17,
+          "max": 0.17,
+          "stdev": 0.0,
+          "n": 12
+        },
+        "sys_seconds": {
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.0,
+          "stdev": 0.0,
+          "n": 12
+        },
+        "instructions": {
+          "median": 2916729869.5,
+          "min": 2912576717,
+          "max": 2921410008,
+          "stdev": 2999968.5931508085,
+          "n": 12
+        },
+        "rss_bytes": {
+          "median": 56926208.0,
+          "min": 56754176,
+          "max": 57065472,
+          "stdev": 100836.54941026938,
+          "n": 12
+        },
+        "launchToExitSeconds": {
+          "median": 0.15764516650233418,
+          "min": 0.1558266660067602,
+          "max": 0.1589689169995836,
+          "stdev": 0.001025765414397186,
+          "n": 12
+        }
+      }
+    }
+  },
+  "regexpPaired": {
+    "n": 17,
+    "medianPercent": -0.537274625184736,
+    "medianIntervalPercent": [
+      -1.614619992544153,
+      -0.17310429932828608
+    ],
+    "coverage": 0.950958251953125,
+    "fasterPairs": 13,
+    "sortedPercent": [
+      -8.247193801329955,
+      -4.772374473608332,
+      -2.9403055992990756,
+      -2.45507340095954,
+      -1.614619992544153,
+      -1.1777286961240918,
+      -0.8210044853833698,
+      -0.5877577606777318,
+      -0.537274625184736,
+      -0.39978199239588674,
+      -0.20685205054998823,
+      -0.18733467576420582,
+      -0.17310429932828608,
+      0.06542535933231619,
+      0.12011672234075732,
+      0.19184164586458774,
+      0.33413338899417333
+    ]
+  },
+  "resources": [
+    {
+      "engine": "before",
+      "run": 0,
+      "truncated": false,
+      "compiles": 28,
+      "codeBytes": 2644988,
+      "compileMs": 33.736665,
+      "minorCount": 98,
+      "minorMs": 8.308,
+      "oldMaxMb": 76.8
+    },
+    {
+      "engine": "before",
+      "run": 1,
+      "truncated": false,
+      "compiles": 28,
+      "codeBytes": 2644988,
+      "compileMs": 32.818623,
+      "minorCount": 98,
+      "minorMs": 7.802,
+      "oldMaxMb": 76.8
+    },
+    {
+      "engine": "before",
+      "run": 2,
+      "truncated": false,
+      "compiles": 28,
+      "codeBytes": 2644988,
+      "compileMs": 32.584335,
+      "minorCount": 98,
+      "minorMs": 7.69,
+      "oldMaxMb": 76.8
+    },
+    {
+      "engine": "after",
+      "run": 0,
+      "truncated": false,
+      "compiles": 28,
+      "codeBytes": 2644988,
+      "compileMs": 34.115328,
+      "minorCount": 98,
+      "minorMs": 8.15,
+      "oldMaxMb": 76.8
+    },
+    {
+      "engine": "after",
+      "run": 1,
+      "truncated": false,
+      "compiles": 28,
+      "codeBytes": 2644988,
+      "compileMs": 33.307333,
+      "minorCount": 98,
+      "minorMs": 7.468,
+      "oldMaxMb": 76.8
+    },
+    {
+      "engine": "after",
+      "run": 2,
+      "truncated": false,
+      "compiles": 30,
+      "codeBytes": 2716700,
+      "compileMs": 35.059836,
+      "minorCount": 98,
+      "minorMs": 8.555,
+      "oldMaxMb": 76.8
+    }
+  ],
+  "validation": {
+    "regexPerArch": 96,
+    "vmRelease": 1283,
+    "difftestPassed": 188,
+    "stressStatus": "passed",
+    "stressRuns": 144,
+    "test262": [
+      {
+        "section": "verified-built-ins-RegExp.json",
+        "totals": {
+          "total": 1945,
+          "passed": 1926,
+          "failed": 0,
+          "skipped": 19,
+          "crashed": 0,
+          "timed_out": 0,
+          "oom": 0
+        },
+        "samePathOutcomes": true
+      },
+      {
+        "section": "verified-built-ins-String-prototype-match.json",
+        "totals": {
+          "total": 78,
+          "passed": 78,
+          "failed": 0,
+          "skipped": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "oom": 0
+        },
+        "samePathOutcomes": true
+      },
+      {
+        "section": "verified-built-ins-String-prototype-replace.json",
+        "totals": {
+          "total": 102,
+          "passed": 102,
+          "failed": 0,
+          "skipped": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "oom": 0
+        },
+        "samePathOutcomes": true
+      },
+      {
+        "section": "verified-built-ins-String-prototype-search.json",
+        "totals": {
+          "total": 44,
+          "passed": 44,
+          "failed": 0,
+          "skipped": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "oom": 0
+        },
+        "samePathOutcomes": true
+      },
+      {
+        "section": "verified-built-ins-String-prototype-split.json",
+        "totals": {
+          "total": 121,
+          "passed": 121,
+          "failed": 0,
+          "skipped": 0,
+          "crashed": 0,
+          "timed_out": 0,
+          "oom": 0
+        },
+        "samePathOutcomes": true
+      }
+    ]
+  }
+}

@@ -198,6 +198,12 @@ pub(crate) const SHAPE_BODY_STATE_OFFSET: usize = std::mem::offset_of!(ShapeBody
 /// Compressed ordinary-object prototype generated chain walks read.
 pub(crate) const SHAPE_BODY_PROTOTYPE_OFFSET: usize = std::mem::offset_of!(ShapeBody, prototype);
 
+pub(crate) const SHAPE_BODY_KEYS_OFFSET: usize = std::mem::offset_of!(ShapeBody, keys);
+pub(crate) const SHAPE_BODY_PARENT_OFFSET: usize = std::mem::offset_of!(ShapeBody, parent);
+pub(crate) const SHAPE_BODY_ATOM_OFFSET: usize = std::mem::offset_of!(ShapeBody, transition_atom);
+pub(crate) const SHAPE_BODY_ACCESSOR_OFFSET: usize =
+    std::mem::offset_of!(ShapeBody, own_is_accessor);
+
 impl ShapeBody {
     /// An empty node of `prototype`'s lineage: a root when `dictionary` names
     /// the lineage's dictionary shape, or that dictionary shape itself.
@@ -1140,12 +1146,11 @@ pub(crate) fn shape_slot_of_atom(
     debug_assert_ne!(atom, AtomId::NONE, "the root atom names no property");
     if let Some((keys, count)) = keys_of(shape) {
         return heap.read_payload(keys, |table| {
-            let offset = table.slot_of_atom(atom, count)?;
-            let entry = table.entry(offset);
+            let (offset, flags, is_accessor) = table.lookup_atom(atom, count)?;
             Some(ShapeSlot {
                 offset,
-                flags: entry.flags,
-                is_accessor: entry.is_accessor,
+                flags,
+                is_accessor,
             })
         });
     }

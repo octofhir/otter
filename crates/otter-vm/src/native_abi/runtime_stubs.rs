@@ -2028,8 +2028,8 @@ pub const STUB_INSTANCEOF_LEAF: RuntimeStubDescriptor = descriptor(
 );
 
 /// Leaf `TryInternalizeString` for a keyed access: the interned atom of a
-/// flat string key's content, read through the isolate's name interner
-/// (the first word is the `VmThread`). Never allocates; a rope, a lone
+/// flat string key's content, read through the name interner the heap owns
+/// (the second argument is ignored). Never allocates; a rope, a lone
 /// surrogate or content no property key ever named misses.
 pub const STUB_STRING_KEY_ATOM_LEAF: RuntimeStubDescriptor = descriptor(
     99,

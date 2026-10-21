@@ -164,7 +164,7 @@ impl Interpreter {
         .ok()?;
         let prototype = self.realm_intrinsics.object_prototype()?;
         let validity = chain_validity(prototype, &self.gc_heap)?;
-        let names = self.shape_runtime.names_mut();
+        let names = crate::isolate_names::names_mut(&mut self.gc_heap);
         let value_of = names.intern(VALUE_OF);
         let to_string = names.intern(TO_STRING);
         let heap = &self.gc_heap;

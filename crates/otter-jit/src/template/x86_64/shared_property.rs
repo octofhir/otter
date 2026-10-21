@@ -185,9 +185,9 @@ fn emit_key_atom(
         dynasm!(ops ; .arch x64 ; sub rsp, 8);
     }
     dynasm!(ops ; .arch x64
-        ; mov rdx, Rq(key)
-        ; mov rsi, [r15 + crate::entry::THREAD_OFFSET as i32]
-        ; mov rdi, [rsi + crate::entry::VM_THREAD_GC_HEAP_OFFSET as i32]
+        ; mov r11, [r15 + crate::entry::THREAD_OFFSET as i32]
+        ; mov rdi, [r11 + crate::entry::VM_THREAD_GC_HEAP_OFFSET as i32]
+        ; mov rsi, Rq(key)
     );
     emit_load_runtime_stub(
         ops,

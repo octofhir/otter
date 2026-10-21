@@ -1,0 +1,473 @@
+{
+  "offsetBasis": "code.bin",
+  "addressEncoding": "symbolicOnly",
+  "relocations": [
+    {
+      "startOffset": 208,
+      "endOffset": 212,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 95,
+        "name": "constructor_receiver_probe",
+        "signature": "leafValue2"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 264,
+      "endOffset": 268,
+      "register": 12,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "gcCageBase"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 392,
+      "endOffset": 396,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 96,
+        "name": "constructor_receiver_commit",
+        "signature": "contextWords"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 484,
+      "endOffset": 488,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 71,
+        "name": "jit_prepare_activation",
+        "signature": "executionEntry0"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 516,
+      "endOffset": 520,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 71,
+        "name": "jit_prepare_activation",
+        "signature": "executionEntry0"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 536,
+      "endOffset": 540,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 88,
+        "name": "jit_call_overflow",
+        "signature": "executionEntry0"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 824,
+      "endOffset": 828,
+      "register": 2,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "prototypeValidityCell",
+        "identity": 3260
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 908,
+      "endOffset": 912,
+      "register": 2,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "prototypeValidityCell",
+        "identity": 3271
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1024,
+      "endOffset": 1028,
+      "register": 1,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "guardedHeapReference",
+        "component": "prototype",
+        "bytePc": 18,
+        "runtimeStubId": 17
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1240,
+      "endOffset": 1244,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 87,
+        "name": "jit_call_generic",
+        "signature": "jsCall"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1344,
+      "endOffset": 1348,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 83,
+        "name": "jit_call",
+        "signature": "executionEntry0"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1572,
+      "endOffset": 1576,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 91,
+        "name": "jit_constructor_terminal",
+        "signature": "contextWords"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1652,
+      "endOffset": 1656,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 51,
+        "name": "jit_deopt_call",
+        "signature": "contextWords"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1884,
+      "endOffset": 1888,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 49,
+        "name": "jit_finish_error",
+        "signature": "variadic"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1916,
+      "endOffset": 1920,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 77,
+        "name": "jit_route_throw",
+        "signature": "routeThrow1"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2060,
+      "endOffset": 2064,
+      "register": 2,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "deoptRuntimeData"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2076,
+      "endOffset": 2080,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 50,
+        "name": "jit_deopt_rebuild_frames",
+        "signature": "variadic"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2256,
+      "endOffset": 2260,
+      "register": 2,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "deoptRuntimeData"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2272,
+      "endOffset": 2276,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 50,
+        "name": "jit_deopt_rebuild_frames",
+        "signature": "variadic"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2352,
+      "endOffset": 2360,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 95,
+        "name": "constructor_receiver_probe",
+        "signature": "leafValue2"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2360,
+      "endOffset": 2368,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "gcCageBase"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2368,
+      "endOffset": 2376,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 96,
+        "name": "constructor_receiver_commit",
+        "signature": "contextWords"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2376,
+      "endOffset": 2384,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 71,
+        "name": "jit_prepare_activation",
+        "signature": "executionEntry0"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2384,
+      "endOffset": 2392,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 88,
+        "name": "jit_call_overflow",
+        "signature": "executionEntry0"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2408,
+      "endOffset": 2416,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "prototypeValidityCell",
+        "identity": 3260
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2432,
+      "endOffset": 2440,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "prototypeValidityCell",
+        "identity": 3271
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2448,
+      "endOffset": 2456,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "guardedHeapReference",
+        "component": "prototype",
+        "bytePc": 18,
+        "runtimeStubId": 17
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2464,
+      "endOffset": 2472,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 87,
+        "name": "jit_call_generic",
+        "signature": "jsCall"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2472,
+      "endOffset": 2480,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 83,
+        "name": "jit_call",
+        "signature": "executionEntry0"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2480,
+      "endOffset": 2488,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 91,
+        "name": "jit_constructor_terminal",
+        "signature": "contextWords"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2488,
+      "endOffset": 2496,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 51,
+        "name": "jit_deopt_call",
+        "signature": "contextWords"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2496,
+      "endOffset": 2504,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 49,
+        "name": "jit_finish_error",
+        "signature": "variadic"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2504,
+      "endOffset": 2512,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 77,
+        "name": "jit_route_throw",
+        "signature": "routeThrow1"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2512,
+      "endOffset": 2520,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "deoptRuntimeData"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 2520,
+      "endOffset": 2528,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 50,
+        "name": "jit_deopt_rebuild_frames",
+        "signature": "variadic"
+      },
+      "form": "literalWord"
+    }
+  ]
+}

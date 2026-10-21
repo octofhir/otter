@@ -7,6 +7,9 @@
 //!   retaining or serializing the process-local address itself.
 //! - [`RelocationCapture::render`] validates the finalized instruction bytes,
 //!   renders `relocations.json`, and builds portable `code-normalized.bin`.
+//! - Debug builds: `RelocationCapture::begin_stub_audit` /
+//!   `end_stub_audit` collect the runtime stubs a stretch of emission names,
+//!   for the graph tier's slow-path declarations.
 //!
 //! # Invariants
 //! - Relocation ranges use exact `code.bin` byte offsets and contain one
@@ -275,6 +278,10 @@ pub(crate) struct RelocationCapture {
     data: Vec<(usize, usize)>,
     #[cfg(not(target_arch = "x86_64"))]
     pool: LiteralPool,
+    /// Debug builds: the runtime stubs symbol loads named since the open
+    /// [`Self::begin_stub_audit`], captured or not.
+    #[cfg(debug_assertions)]
+    stub_audit: Option<Vec<u32>>,
 }
 
 impl RelocationCapture {
@@ -286,7 +293,37 @@ impl RelocationCapture {
             data: Vec::new(),
             #[cfg(not(target_arch = "x86_64"))]
             pool: LiteralPool::default(),
+            #[cfg(debug_assertions)]
+            stub_audit: None,
         }
+    }
+
+    /// Debug builds: collect the ids of the runtime stubs symbol loads name
+    /// from here on; returns the enclosing collection, which
+    /// [`Self::end_stub_audit`] resumes.
+    #[cfg(debug_assertions)]
+    pub(crate) fn begin_stub_audit(&mut self) -> Option<Vec<u32>> {
+        self.stub_audit.replace(Vec::new())
+    }
+
+    /// Debug builds: the runtime stubs named since the matching
+    /// [`Self::begin_stub_audit`]; `outer` collects again.
+    #[cfg(debug_assertions)]
+    pub(crate) fn end_stub_audit(&mut self, outer: Option<Vec<u32>>) -> Vec<u32> {
+        std::mem::replace(&mut self.stub_audit, outer).unwrap_or_default()
+    }
+
+    /// Note a materialized symbol for the open stub audit.
+    #[inline]
+    fn audit(&mut self, target: &RelocationTarget) {
+        #[cfg(debug_assertions)]
+        if let (Some(named), RelocationTarget::RuntimeStub { id, .. }) =
+            (self.stub_audit.as_mut(), target)
+        {
+            named.push(*id);
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = target;
     }
 
     /// Load every symbolic address through one PC-relative `LDR (literal)`
@@ -318,6 +355,7 @@ impl RelocationCapture {
         if !self.pool.enabled {
             return false;
         }
+        self.audit(&target);
         let label = self.pool_label(ops, value, Some(target.clone()));
         let start = ops.offset().0;
         dynasm!(ops ; .arch aarch64 ; ldr X(register), =>label);
@@ -437,6 +475,7 @@ impl RelocationCapture {
         register: u8,
         target: RelocationTarget,
     ) {
+        self.audit(&target);
         if !self.enabled {
             return;
         }
@@ -458,6 +497,7 @@ impl RelocationCapture {
         register: u8,
         target: RelocationTarget,
     ) {
+        self.audit(&target);
         if !self.enabled {
             return;
         }

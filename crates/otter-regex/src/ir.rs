@@ -115,12 +115,19 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     let lead_possessive_run = lead_possessive_run(&e.insns);
     let start_anchored = start_anchored(&e.insns);
     let unicode = flags.is_unicode_mode();
-    let required_literal = (!start_anchored)
-        .then(|| compute_required_literal(&e.insns, &e.classes, unicode))
-        .flatten()
-        .map(|(units, min_offset, max_offset)| {
-            crate::program::RequiredLiteral::new(units, min_offset, max_offset)
-        });
+    let required_literal = crate::program::RequiredLiteral::for_complete_program(
+        &e.insns,
+        unicode,
+        parsed.group_count,
+    )
+    .or_else(|| {
+        (!start_anchored)
+            .then(|| compute_required_literal(&e.insns, &e.classes, unicode))
+            .flatten()
+            .map(|(units, min_offset, max_offset)| {
+                crate::program::RequiredLiteral::new(units, min_offset, max_offset)
+            })
+    });
 
     let loop_marks = e.next_mark - mark_base;
     let prefilter =

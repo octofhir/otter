@@ -274,7 +274,7 @@ impl Interpreter {
         {
             return Some(atom);
         }
-        let names = self.shape_runtime.names();
+        let names = crate::isolate_names::names(&self.gc_heap);
         let atom = match crate::string::gc_body::lookup_atom_in_place(&self.gc_heap, handle, names)
         {
             Some(atom) => atom,
@@ -296,7 +296,12 @@ impl Interpreter {
         key: crate::string::JsString,
     ) -> Option<(crate::property_atom::AtomId, std::sync::Arc<str>)> {
         let atom = self.string_key_atom(key)?;
-        Some((atom, self.shape_runtime.names().spelling(atom)?.clone()))
+        Some((
+            atom,
+            crate::isolate_names::names(&self.gc_heap)
+                .spelling(atom)?
+                .clone(),
+        ))
     }
 
     /// A runtime spelling as an atomized key: shape walks compare its interned
@@ -308,7 +313,9 @@ impl Interpreter {
         name: &'a str,
     ) -> crate::property_atom::AtomizedPropertyKey<'a> {
         crate::property_atom::AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(self.shape_runtime.names().lookup(name)),
+            crate::property_atom::PropertyAtom::new(
+                crate::isolate_names::names(&self.gc_heap).lookup(name),
+            ),
             name,
         )
     }

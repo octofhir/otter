@@ -395,13 +395,13 @@ impl<'a> Codegen<'a> {
                 }
                 if let Some(&control) = self.fused.get(&node) {
                     self.sink = Some(self.branch_sink(control));
-                    let emitted = self.emit_node(node);
+                    let emitted = self.audited(node, |codegen| codegen.emit_node(node));
                     self.sink = None;
                     emitted?;
                     fused_control = Some(control);
                     continue;
                 }
-                self.emit_node(node)?;
+                self.audited(node, |codegen| codegen.emit_node(node))?;
                 self.spill_definition(node);
             }
             let control = data.control.expect("terminated block");
@@ -413,10 +413,36 @@ impl<'a> Codegen<'a> {
             for mov in self.allocation.node(control).moves.clone() {
                 self.emit_move(mov.from, mov.to);
             }
-            self.emit_control(block, control, order.get(position + 1).copied())?;
+            let next = order.get(position + 1).copied();
+            self.audited(control, |codegen| codegen.emit_control(block, control, next))?;
         }
         debug_assert!(forwarders.is_empty());
         Ok(())
+    }
+
+    /// Run `emit` for `node`. Debug builds check that every runtime stub it
+    /// calls, and every stub of the deferred code it queues, is one of the
+    /// node's [`Kind::slow_path_stubs`]. Deferred code runs after the body,
+    /// so the entries `emit` queues are the ones past the queue's length
+    /// before it.
+    fn audited<T>(&mut self, node: NodeId, emit: impl FnOnce(&mut Self) -> T) -> T {
+        #[cfg(debug_assertions)]
+        {
+            let outer = self.relocations.begin_stub_audit();
+            let queued = self.deferred.len();
+            let result = emit(self);
+            for index in queued..self.deferred.len() {
+                let deferred: Deferred<'a> =
+                    std::mem::replace(&mut self.deferred[index], Box::new(|_: &mut Self| {}));
+                self.deferred[index] =
+                    Box::new(move |codegen: &mut Codegen<'a>| codegen.audited(node, deferred));
+            }
+            let called = self.relocations.end_stub_audit(outer);
+            self.graph.node(node).kind.audit_stub_calls(&called);
+            result
+        }
+        #[cfg(not(debug_assertions))]
+        emit(self)
     }
     fn spill_definition(&mut self, node: NodeId) {
         if let (Some(result), Some(&home)) = (

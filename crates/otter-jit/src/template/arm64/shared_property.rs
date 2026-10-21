@@ -180,9 +180,9 @@ fn emit_key_atom(
         ; =>unrecorded
         ; stp x30, x9, [sp, #-32]!
         ; stp x10, x12, [sp, #16]
-        ; ldr x1, [x20, crate::entry::THREAD_OFFSET]
-        ; ldr x0, [x1, crate::entry::VM_THREAD_GC_HEAP_OFFSET]
-        ; mov x2, X(key)
+        ; ldr x16, [x20, crate::entry::THREAD_OFFSET]
+        ; ldr x0, [x16, crate::entry::VM_THREAD_GC_HEAP_OFFSET]
+        ; mov x1, X(key)
     );
     emit_load_runtime_stub(
         ops,

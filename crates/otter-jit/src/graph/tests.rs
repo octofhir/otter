@@ -5,6 +5,8 @@
 //!   fake published interpreter frame.
 //! - Straight-line, branch and loop programs over int32 and float64
 //!   feedback, and exact deopt exits.
+//! - Every node kind's declared slow-path stubs agree with what its
+//!   properties say it may do.
 //!
 //! # See also
 //! - [`super::compile`] — the pipeline under test.
@@ -510,3 +512,457 @@ fn nested_loops_carry_values_through_both_headers() {
 
 #[path = "osr_tests.rs"]
 mod osr_tests;
+
+/// One node of every kind, with each payload that selects other slow paths.
+fn every_kind() -> Vec<super::ir::Kind> {
+    use super::ir::{BlockId, BranchKind, Condition, DeoptReason, Kind, MathOp};
+    use otter_vm::jit::{
+        JitArrayLayout, JitBodySlot, JitElementRepr, JitHoleBitmap, JitReceiverAllocationPlan,
+    };
+    use otter_vm::object::FieldLocation;
+    let plan = JitReceiverAllocationPlan {
+        new_target_function_id: 1,
+        new_target_is_class: false,
+        family_id: 1,
+        family_cell: 8,
+        receiver_shape: 0,
+        initial_field_count: 0,
+        inline_capacity: 4,
+        prototype_validity: None,
+        prototype_root: 16,
+    };
+    let holes = JitHoleBitmap {
+        capacity_byte: 0,
+        hole_count_byte: 4,
+        storage_kind_byte: 8,
+        kind_byte: 12,
+        packed_kind: 1,
+        holey_kind: 2,
+    };
+    let field = FieldLocation::inline(0);
+    let condition = Condition::Less;
+    let mut kinds = vec![
+        Kind::ConstTagged(0),
+        Kind::ConstInt32(0),
+        Kind::ConstFloat64(0),
+        Kind::InitialRegister(0),
+        Kind::LoadThis,
+        Kind::LoadNewTarget,
+        Kind::LoadClosure,
+        Kind::LoadLiteral(0),
+        Kind::LoadGlobalBinding(0),
+        Kind::LoadGlobalThis,
+        Kind::LoadWindow(0),
+        Kind::Phi,
+        Kind::Select(BranchKind::Truthy),
+        Kind::AllocationGroup(0),
+        Kind::AllocationProjection(0),
+        Kind::NewObject,
+        Kind::NewArrayEmpty,
+        Kind::NewObjectLiteral { fields: None },
+        Kind::NewArrayLiteral,
+        Kind::NativeNewContext(0),
+        Kind::CopyContext,
+        Kind::NewClosure,
+        Kind::NewReceiver(plan),
+        Kind::CheckReceiverPlan(plan),
+        Kind::VirtualObject { shape: 0 },
+        Kind::NewArrayWithLength,
+        Kind::PrimitiveAdd,
+        Kind::BigIntBinary(otter_vm::bigint::ops::Operator::Add),
+        Kind::PrimitiveCompare(condition),
+        Kind::Int32Add,
+        Kind::Int32Sub,
+        Kind::Int32AddWrapping,
+        Kind::Int32SubWrapping,
+        Kind::Int32Mul,
+        Kind::Int32MulExact,
+        Kind::Int32MulIdentifyZeros,
+        Kind::Int32Div,
+        Kind::Int32Mod,
+        Kind::Int32Negate,
+        Kind::Int32BitAnd,
+        Kind::Int32BitOr,
+        Kind::Int32BitXor,
+        Kind::Int32BitNot,
+        Kind::Int32ShiftLeft,
+        Kind::Int32ShiftRight,
+        Kind::Int32ShiftRightLogical,
+        Kind::Uint32ShiftRightToFloat64,
+        Kind::Int32Compare(condition),
+        Kind::Float64Add,
+        Kind::Float64Sub,
+        Kind::Float64Mul,
+        Kind::Float64Div,
+        Kind::Float64Negate,
+        Kind::Float64Mod,
+        Kind::Float64Math(MathOp::Sqrt),
+        Kind::Float64Math(MathOp::Pow),
+        Kind::Float64Compare(condition),
+        Kind::CheckedTaggedToInt32,
+        Kind::CheckedTaggedToFloat64,
+        Kind::Int32ToTagged,
+        Kind::Float64ToTagged,
+        Kind::Int32ToFloat64,
+        Kind::TruncateFloat64ToInt32,
+        Kind::CheckedFloat64ToInt32,
+        Kind::CheckedTaggedToIndex,
+        Kind::CheckedFloat64ToIndex,
+        Kind::StrictEqual { negate: false },
+        Kind::LooseEqual { negate: false },
+        Kind::NullishEqual {
+            negate: false,
+            object_or_nullish: false,
+        },
+        Kind::ToBoolean,
+        Kind::LogicalNot,
+        Kind::TestTypeOf { test: 0 },
+        Kind::CheckNumber,
+        Kind::CheckNotNullish { mask: 1 },
+        Kind::CheckFieldTypes(Default::default()),
+        Kind::CheckShapes {
+            shapes: Default::default(),
+            writable: true,
+            cell_proved: false,
+        },
+        Kind::CheckBounds,
+        Kind::CheckElements {
+            type_tag: 0,
+            guards: [None, None],
+            holes: Some(holes),
+            cached_base: None,
+        },
+        Kind::CheckElementPresent,
+        Kind::LoadPresentElement,
+        Kind::CheckHoleyElementPresent(holes),
+        Kind::LoadOwnField { field, atom: 0 },
+        Kind::LoadArrayExpando(JitArrayLayout::default()),
+        Kind::StringCharCodeAt,
+        Kind::LoadFunctionBag,
+        Kind::StoreOwnField {
+            field,
+            atom: 0,
+            owners: Default::default(),
+        },
+        Kind::LoadShapedProperty { atom: 0 },
+        Kind::LoadNamedProperty {
+            byte_pc: 0,
+            programs: Default::default(),
+            receiver_shape: None,
+        },
+        Kind::StoreNamedProperty {
+            byte_pc: 0,
+            owners: Default::default(),
+            receiver_shape: None,
+            fresh: false,
+        },
+        Kind::StoreBodySlot(JitBodySlot {
+            type_tag: 0,
+            guard: None,
+            byte: 8,
+        }),
+        Kind::LoadPropertyCached {
+            pc: 0,
+            atom: None,
+            length: true,
+        },
+        Kind::StorePropertyCached {
+            pc: 0,
+            atom: None,
+            barrier: true,
+        },
+        Kind::StoreKeyedCached { pc: 0 },
+        Kind::LoadKeyedCached { pc: 0 },
+        Kind::RegExpMethod { test: true },
+        Kind::RegExpMethod { test: false },
+        Kind::LoadTaggedField(8),
+        Kind::StoreTaggedField(8),
+        Kind::WriteBarrier,
+        Kind::ElementWriteBarrier,
+        Kind::LoadContextParent,
+        Kind::LoadClosureContext,
+        Kind::LoadArrayLength {
+            array_proved: false,
+        },
+        Kind::LoadTypedArrayLength,
+        Kind::LoadElementsLength {
+            byte: 8,
+            width: Default::default(),
+        },
+        Kind::LoadElementsBase {
+            byte: 8,
+            off_heap: false,
+        },
+        Kind::LoadElement(JitElementRepr::default()),
+        Kind::LoadElementUint32ToFloat64,
+        Kind::LoadHoleyFloat64Element(holes),
+        Kind::StoreElement(JitElementRepr::default()),
+        Kind::CallJs {
+            pc: 0,
+            plan: crate::call_linkage::CallPlan::Generic,
+            construct: true,
+            receiver: false,
+            receiver_object: false,
+            allocation: Some(plan),
+        },
+        Kind::CallForward {
+            pc: 0,
+            plan: crate::call_linkage::CallPlan::Generic,
+            bindings: Box::new([]),
+        },
+        Kind::CheckFunctionPrototypeCall(0),
+        Kind::CheckNative(0),
+        Kind::CheckArgumentsElided,
+        Kind::LoadArgumentCount,
+        Kind::LoadActualArgument,
+        Kind::SelectArgument { count: 1 },
+        Kind::CheckFunction {
+            function_id: 1,
+            cell: 0,
+        },
+        Kind::CheckCellValue(0),
+        Kind::LoadCellValue(0),
+        Kind::CheckClosureContext(0),
+        Kind::CheckContextSlot { watch: 0, slot: 0 },
+        Kind::NoteContextWrite(0),
+        Kind::CheckNotHole,
+        Kind::Instanceof,
+        Kind::ArrayPush(0),
+        Kind::ArrayPop(0),
+        Kind::LoadGuardedMethod {
+            byte_pc: 0,
+            target: 0,
+            receiver_proved: false,
+            cell_read: false,
+        },
+        Kind::LoadReceiverShape,
+        Kind::BooleanToInt32,
+        Kind::Generic {
+            pc: 0,
+            registers: Box::new([]),
+        },
+        Kind::LoadBackedgeFuel,
+        Kind::DecrementBackedgeFuel,
+        Kind::StoreBackedgeFuel,
+        Kind::Jump(BlockId(0)),
+        Kind::JumpLoop(BlockId(0)),
+        Kind::Branch {
+            kind: BranchKind::Int32(condition),
+            if_true: BlockId(0),
+            if_false: BlockId(1),
+        },
+        Kind::Return,
+        Kind::Deopt(DeoptReason::WrongType),
+        Kind::CheckStableShapes(Default::default()),
+        Kind::CheckDependencies,
+    ];
+    for kind in [
+        BranchKind::Truthy,
+        BranchKind::Float64(condition),
+        BranchKind::Float64Truthy,
+        BranchKind::TaggedEqual,
+        BranchKind::Nullish,
+        BranchKind::WordEqual(0),
+        BranchKind::Native(0),
+    ] {
+        kinds.push(Kind::Branch {
+            kind,
+            if_true: BlockId(0),
+            if_false: BlockId(1),
+        });
+    }
+    for stub in [
+        otter_vm::native_abi::STUB_MATH_ABS_LEAF,
+        otter_vm::native_abi::STUB_STRING_CHAR_CODE_AT_LEAF,
+        otter_vm::native_abi::STUB_COLLECTION_MAP_SET_MUTATING,
+    ] {
+        kinds.push(Kind::NativeLeaf(stub.id));
+    }
+    for kind in &kinds {
+        listed(kind);
+    }
+    kinds
+}
+
+/// Fails to compile once a kind exists that [`every_kind`] does not list.
+fn listed(kind: &super::ir::Kind) {
+    use super::ir::Kind as K;
+    match kind {
+        K::ConstTagged(_)
+        | K::ConstInt32(_)
+        | K::ConstFloat64(_)
+        | K::InitialRegister(_)
+        | K::LoadThis
+        | K::LoadNewTarget
+        | K::LoadClosure
+        | K::LoadLiteral(_)
+        | K::LoadGlobalBinding(_)
+        | K::LoadGlobalThis
+        | K::LoadWindow(_)
+        | K::Phi
+        | K::Select(_)
+        | K::AllocationGroup(_)
+        | K::AllocationProjection(_)
+        | K::NewObject
+        | K::NewArrayEmpty
+        | K::NewObjectLiteral { .. }
+        | K::NewArrayLiteral
+        | K::NativeNewContext(_)
+        | K::CopyContext
+        | K::NewClosure
+        | K::NewReceiver(_)
+        | K::CheckReceiverPlan(_)
+        | K::VirtualObject { .. }
+        | K::NewArrayWithLength
+        | K::PrimitiveAdd
+        | K::BigIntBinary(_)
+        | K::PrimitiveCompare(_)
+        | K::Int32Add
+        | K::Int32Sub
+        | K::Int32AddWrapping
+        | K::Int32SubWrapping
+        | K::Int32Mul
+        | K::Int32MulExact
+        | K::Int32MulIdentifyZeros
+        | K::Int32Div
+        | K::Int32Mod
+        | K::Int32Negate
+        | K::Int32BitAnd
+        | K::Int32BitOr
+        | K::Int32BitXor
+        | K::Int32BitNot
+        | K::Int32ShiftLeft
+        | K::Int32ShiftRight
+        | K::Int32ShiftRightLogical
+        | K::Uint32ShiftRightToFloat64
+        | K::Int32Compare(_)
+        | K::Float64Add
+        | K::Float64Sub
+        | K::Float64Mul
+        | K::Float64Div
+        | K::Float64Negate
+        | K::Float64Mod
+        | K::Float64Math(_)
+        | K::Float64Compare(_)
+        | K::CheckedTaggedToInt32
+        | K::CheckedTaggedToFloat64
+        | K::Int32ToTagged
+        | K::Float64ToTagged
+        | K::Int32ToFloat64
+        | K::TruncateFloat64ToInt32
+        | K::CheckedFloat64ToInt32
+        | K::CheckedTaggedToIndex
+        | K::CheckedFloat64ToIndex
+        | K::StrictEqual { .. }
+        | K::LooseEqual { .. }
+        | K::NullishEqual { .. }
+        | K::ToBoolean
+        | K::LogicalNot
+        | K::TestTypeOf { .. }
+        | K::CheckNumber
+        | K::CheckNotNullish { .. }
+        | K::CheckFieldTypes(_)
+        | K::CheckShapes { .. }
+        | K::CheckBounds
+        | K::CheckElements { .. }
+        | K::CheckElementPresent
+        | K::LoadPresentElement
+        | K::CheckHoleyElementPresent(_)
+        | K::LoadOwnField { .. }
+        | K::LoadArrayExpando(_)
+        | K::StringCharCodeAt
+        | K::LoadFunctionBag
+        | K::StoreOwnField { .. }
+        | K::LoadShapedProperty { .. }
+        | K::LoadNamedProperty { .. }
+        | K::StoreNamedProperty { .. }
+        | K::StoreBodySlot(_)
+        | K::LoadPropertyCached { .. }
+        | K::StorePropertyCached { .. }
+        | K::StoreKeyedCached { .. }
+        | K::LoadKeyedCached { .. }
+        | K::RegExpMethod { .. }
+        | K::LoadTaggedField(_)
+        | K::StoreTaggedField(_)
+        | K::WriteBarrier
+        | K::ElementWriteBarrier
+        | K::LoadContextParent
+        | K::LoadClosureContext
+        | K::LoadArrayLength { .. }
+        | K::LoadTypedArrayLength
+        | K::LoadElementsLength { .. }
+        | K::LoadElementsBase { .. }
+        | K::LoadElement(_)
+        | K::LoadElementUint32ToFloat64
+        | K::LoadHoleyFloat64Element(_)
+        | K::StoreElement(_)
+        | K::NativeLeaf(_)
+        | K::CallJs { .. }
+        | K::CallForward { .. }
+        | K::CheckFunctionPrototypeCall(_)
+        | K::CheckNative(_)
+        | K::CheckArgumentsElided
+        | K::LoadArgumentCount
+        | K::LoadActualArgument
+        | K::SelectArgument { .. }
+        | K::CheckFunction { .. }
+        | K::CheckCellValue(_)
+        | K::LoadCellValue(_)
+        | K::CheckClosureContext(_)
+        | K::CheckContextSlot { .. }
+        | K::NoteContextWrite(_)
+        | K::CheckNotHole
+        | K::Instanceof
+        | K::ArrayPush(_)
+        | K::ArrayPop(_)
+        | K::LoadGuardedMethod { .. }
+        | K::LoadReceiverShape
+        | K::BooleanToInt32
+        | K::Generic { .. }
+        | K::LoadBackedgeFuel
+        | K::DecrementBackedgeFuel
+        | K::StoreBackedgeFuel
+        | K::Jump(_)
+        | K::JumpLoop(_)
+        | K::Branch { .. }
+        | K::Return
+        | K::Deopt(_)
+        | K::CheckStableShapes(_)
+        | K::CheckDependencies => {}
+    }
+}
+
+#[test]
+fn slow_path_stubs_bound_what_a_node_may_do() {
+    use otter_vm::native_abi::{RUNTIME_STUB_DESCRIPTORS, RuntimeStubEffects as E};
+    for kind in every_kind() {
+        let properties = kind.properties();
+        let stubs = kind.slow_path_stubs();
+        for stub in stubs {
+            assert_eq!(
+                RUNTIME_STUB_DESCRIPTORS.get(stub.id as usize - 1),
+                Some(stub),
+                "{kind:?} names a declared stub"
+            );
+        }
+        let any = |mask: u16| stubs.iter().any(|stub| stub.effects.bits() & mask != 0);
+        let reenters = any(E::MAY_REENTER_JS);
+        if !properties.call {
+            // Only a call or a JavaScript-running node reenters, and only a
+            // call or a collecting node allocates.
+            assert!(!reenters || properties.runs_js, "{kind:?} reenters JS");
+            assert!(
+                !any(E::MAY_ALLOCATE | E::MAY_TRIGGER_GC) || properties.may_collect,
+                "{kind:?} allocates"
+            );
+            assert!(
+                !properties.runs_js || properties.may_collect,
+                "{kind:?} runs JS without collecting"
+            );
+        }
+        assert!(
+            !properties.runs_js || properties.call || reenters,
+            "{kind:?} runs JS through no reentrant stub"
+        );
+    }
+}

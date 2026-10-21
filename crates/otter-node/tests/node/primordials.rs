@@ -2,7 +2,9 @@
 //!
 //! # Contents
 //! - One grouped program covering live holders, descriptors and callable ABI.
-//! - Real ESM hosted imports in default and additional realms with distinct caches.
+//! - Real ESM hosted imports in default and additional realms with distinct
+//!   caches, of `internal/test/binding` under `--expose-internals`: the realm's
+//!   primordials as Node's own tests reach them.
 //! - The actual vendored typed-array inspection reconstruction.
 //!
 //! # Invariants
@@ -237,13 +239,14 @@ fn primordial_members_are_live_until_cached_and_remain_owned_by_the_source_realm
     // No console/timer/rejection getter is entered before this first bootstrap
     // load. The Node installer only installs their lazy functions/descriptors.
     let mut node = Runtime::builder()
+        .expose_internals(true)
         .with_node_apis()
         .build()
         .expect("Node runtime for the actual vendored inspection loader");
     let default = node
         .run_script(
             SourceInput::from_javascript(format!(
-                "{PROGRAM}(process.getBuiltinModule('internal/bootstrap/realm').primordials, 'collision', true)"
+                "{PROGRAM}(process.getBuiltinModule('internal/test/binding').primordials, 'collision', true)"
             )),
             "primordials:node-default",
         )
@@ -254,6 +257,7 @@ fn primordial_members_are_live_until_cached_and_remain_owned_by_the_source_realm
     // the actual public hosted catalog for the realm pair, without replaying
     // that installer or copying its process/require into the additional realm.
     let mut realms = Runtime::builder()
+        .expose_internals(true)
         .with_nodejs_modules()
         .hosted_modules(otter_node::hosted_modules().iter().copied())
         .build()
@@ -261,7 +265,7 @@ fn primordial_members_are_live_until_cached_and_remain_owned_by_the_source_realm
     realms
         .run_module_source(
             SourceInput::from_javascript(format!(
-                "import {{ primordials }} from 'internal/bootstrap/realm';\n\
+                "import {{ primordials }} from 'internal/test/binding';\n\
                  globalThis.__primordialProofResult = {PROGRAM}(primordials, 'collision', false);"
             )),
             "file:///primordials-default.mjs",
@@ -282,7 +286,7 @@ fn primordial_members_are_live_until_cached_and_remain_owned_by_the_source_realm
         .run_module_source_in_realm(
             realm,
             SourceInput::from_javascript(format!(
-                "import {{ primordials }} from 'internal/bootstrap/realm';\n\
+                "import {{ primordials }} from 'internal/test/binding';\n\
                  if (typeof process !== 'undefined') throw new Error('copied process singleton');\n\
                  globalThis.__primordialProofResult = {PROGRAM}(primordials, 'undefined', false);"
             )),
@@ -301,7 +305,7 @@ fn primordial_members_are_live_until_cached_and_remain_owned_by_the_source_realm
     realms
         .run_module_source(
             SourceInput::from_javascript(
-                "import { primordials } from 'internal/bootstrap/realm';\n\
+                "import { primordials } from 'internal/test/binding';\n\
                  globalThis.__primordialRetainedRealm = primordials.SafeMap.prototype.__primordialProbeRealm;",
             ),
             "file:///primordials-default-retained.mjs",

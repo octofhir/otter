@@ -11,7 +11,9 @@
 //! - [`InlineCaller`] / [`InlinedBody`] — how an inlined body's frames and
 //!   nodes name the call they run for.
 //! - [`Properties`] / [`Kind::properties`] — what a node may do (call,
-//!   deopt eagerly or lazily, throw, read or write the heap).
+//!   deopt eagerly or lazily, throw, read or write the heap, collect, run
+//!   JavaScript).
+//! - [`Kind::slow_path_stubs`] — the runtime stubs a node's code may call.
 //! - [`Constraints`] / [`Kind::constraints`] — where the register allocator
 //!   must put inputs, the result, and how many temporaries a node needs.
 //! - Named-load plans retain ordered indices into their source body's programs.
@@ -31,6 +33,11 @@
 //!   it, with the node itself bound to the instruction's result register.
 //! - A call ([`Properties::call`]) clobbers every allocatable register; the
 //!   allocator spills every live value before it.
+//! - A node whose slow-path stubs may reenter JavaScript is a call or
+//!   [`Properties::runs_js`]; one whose stubs may allocate or collect is a
+//!   call or [`Properties::may_collect`]. Only those nodes change
+//!   JavaScript-visible state through the runtime; a collecting node that
+//!   runs no JavaScript only moves cells.
 //! - A frame state of an inlined body links to its caller's state after the
 //!   call; the values of the whole chain stay live wherever it is read.
 //! - A named load's receiver shape is a live exact proof. Only a matching
@@ -115,6 +122,8 @@ pub(crate) enum DeoptReason {
     WrongType,
     /// An object did not have one of the speculated shapes.
     WrongShape,
+    /// Complete shape lookup found no ordinary own data property.
+    OwnDataMiss,
     /// A value was not the speculated constant.
     WrongValue,
     /// Int32 arithmetic overflowed.
@@ -526,6 +535,11 @@ pub(crate) enum Kind {
         atom: u32,
         owners: SmallVec<[(u32, FieldStoreOwner); 4]>,
     },
+    /// Read an ordinary own data slot from the live shape directory. No cache,
+    /// allocation or JavaScript. Other receivers/descriptors deopt before the get.
+    LoadShapedProperty {
+        atom: u32,
+    },
     /// Read a named property of input0 through the selected feedback programs
     /// at `byte_pc`. Indices refer to the original source programs in their
     /// order. A live exact `receiver_shape` proves only a matching receiver
@@ -843,10 +857,17 @@ pub(crate) struct Properties {
     pub(crate) writes: bool,
     /// Must stay even when its value is unused.
     pub(crate) effectful: bool,
-    /// Not a call, but its slow path enters the runtime, which may collect
-    /// or run JavaScript: exact-live registers are preserved through canonical
-    /// homes and the safepoint roots the initialized tagged region.
+    /// Not a call, but its slow path enters the runtime, which may collect:
+    /// exact-live registers are preserved through canonical homes and the
+    /// safepoint roots the initialized tagged region.
     pub(crate) may_collect: bool,
+    /// It may run JavaScript (a call, or a slow path that reenters through a
+    /// stub declaring [`otter_vm::native_abi::RuntimeStubEffects::MAY_REENTER_JS`]):
+    /// accessors, proxies and coercions can change any object's shape,
+    /// prototype state or fields. A collecting node without it only
+    /// allocates and collects, which moves cells but changes no
+    /// JavaScript-visible state.
+    pub(crate) runs_js: bool,
 }
 
 /// Where the allocator must put one input.
@@ -1006,6 +1027,7 @@ impl Kind {
             | Self::CheckCellValue(_)
             | Self::CheckNotHole
             | Self::LoadGuardedMethod { .. }
+            | Self::LoadShapedProperty { .. }
             | Self::LoadNamedProperty { .. }
             | Self::CheckElements { .. }
             | Self::CheckElementPresent
@@ -1058,16 +1080,9 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
-            Self::LoadPropertyCached { .. }
-            | Self::StorePropertyCached { .. }
-            | Self::StoreKeyedCached { .. }
-            | Self::LoadKeyedCached { .. }
-            | Self::RegExpMethod { .. }
-            | Self::Instanceof
-            | Self::ArrayPush(_)
-            | Self::ArrayPop(_)
-            | Self::LooseEqual { .. }
-            | Self::NewObject
+            // An allocation whose collecting miss can throw only the
+            // out-of-memory RangeError.
+            Self::NewObject
             | Self::NewArrayEmpty
             | Self::NewObjectLiteral { .. }
             | Self::NewArrayLiteral => Properties {
@@ -1076,6 +1091,23 @@ impl Kind {
                 writes: true,
                 effectful: true,
                 may_collect: true,
+                ..Properties::default()
+            },
+            Self::LoadPropertyCached { .. }
+            | Self::StorePropertyCached { .. }
+            | Self::StoreKeyedCached { .. }
+            | Self::LoadKeyedCached { .. }
+            | Self::RegExpMethod { .. }
+            | Self::Instanceof
+            | Self::ArrayPush(_)
+            | Self::ArrayPop(_)
+            | Self::LooseEqual { .. } => Properties {
+                eager_deopt: true,
+                can_throw: true,
+                writes: true,
+                effectful: true,
+                may_collect: true,
+                runs_js: true,
                 ..Properties::default()
             },
             Self::StoreOwnField { .. }
@@ -1102,6 +1134,7 @@ impl Kind {
                 writes: true,
                 effectful: true,
                 may_collect: false,
+                runs_js: true,
             },
             Self::Jump(_) | Self::JumpLoop(_) | Self::Branch { .. } | Self::Return => Properties {
                 effectful: true,
@@ -1121,6 +1154,118 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
+        }
+    }
+
+    /// Every runtime stub this node's code may call, on either target: its
+    /// inline slow paths, the deferred code it queues and the shared routines
+    /// it branches to. Deopt and exception exits are not slow paths: they
+    /// leave the node and never return to the code after it. A
+    /// [`Self::Generic`] node runs the baseline sequence of its instruction,
+    /// which may call any stub.
+    ///
+    /// [`Properties`] follow from these: a node whose stubs may reenter
+    /// JavaScript runs JavaScript, and one whose stubs may allocate or collect
+    /// collects; both emitters check in debug builds that every stub they
+    /// call for a node is listed here.
+    pub(crate) fn slow_path_stubs(&self) -> &'static [otter_vm::native_abi::RuntimeStubDescriptor] {
+        use otter_vm::native_abi as abi;
+        match self {
+            Self::NoteContextWrite(_) => &[abi::STUB_CONTEXT_SLOT_WRITTEN],
+            Self::TestTypeOf { .. } | Self::NullishEqual { .. } => &[abi::STUB_TYPEOF_TEST_LEAF],
+            Self::ToBoolean | Self::LogicalNot => &[abi::STUB_TO_BOOLEAN_LEAF],
+            Self::Branch {
+                kind: BranchKind::Truthy,
+                ..
+            } => &[abi::STUB_TO_BOOLEAN_LEAF],
+            Self::Float64Mod => &[abi::STUB_NUMBER_REM_F64_LEAF],
+            Self::Float64Math(_) => &[abi::STUB_MATH_F64_LEAF],
+            Self::TruncateFloat64ToInt32 => &[abi::STUB_NUMBER_TO_INT32_F64_LEAF],
+            Self::StrictEqual { .. } => &[abi::STUB_STRICT_EQ_LEAF],
+            Self::LooseEqual { .. } => &[
+                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
+                abi::STUB_STRICT_EQ_LEAF,
+            ],
+            Self::PrimitiveCompare(_) => &[abi::STUB_PRIMITIVE_STRING_ORDER],
+            Self::StoreOwnField { .. } => &[abi::STUB_FIELD_TYPE_OBSERVE],
+            Self::StoreNamedProperty { .. } => &[
+                abi::STUB_FIELD_TYPE_OBSERVE,
+                abi::STUB_SHAPE_LEFT,
+                abi::STUB_WRITE_BARRIER,
+            ],
+            Self::WriteBarrier => &[abi::STUB_WRITE_BARRIER],
+            Self::ElementWriteBarrier => &[abi::STUB_ELEMENT_WRITE_BARRIER],
+            Self::LoadPropertyCached { .. } => &[abi::STUB_JIT_LOAD_PROPERTY],
+            Self::StorePropertyCached { .. } => &[
+                abi::STUB_JIT_STORE_PROPERTY,
+                abi::STUB_FIELD_TYPE_OBSERVE,
+                abi::STUB_WRITE_BARRIER,
+            ],
+            Self::LoadKeyedCached { .. } => &[
+                abi::STUB_JIT_LOAD_ELEMENT,
+                abi::STUB_STRING_KEY_ATOM_LEAF,
+                abi::STUB_KEYED_NAMED_LOAD_LEAF,
+            ],
+            Self::StoreKeyedCached { .. } => &[
+                abi::STUB_JIT_STORE_ELEMENT,
+                abi::STUB_ARRAY_PUSH_LEAF,
+                abi::STUB_ELEMENT_WRITE_BARRIER,
+                abi::STUB_STRING_KEY_ATOM_LEAF,
+                abi::STUB_FIELD_TYPE_OBSERVE,
+                abi::STUB_WRITE_BARRIER,
+            ],
+            Self::RegExpMethod { test: true } => &[abi::STUB_JIT_REGEXP_TEST],
+            Self::RegExpMethod { test: false } => &[abi::STUB_JIT_REGEXP_EXEC],
+            Self::Instanceof => &[
+                abi::STUB_INSTANCEOF_LEAF,
+                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
+            ],
+            Self::ArrayPush(_) => &[
+                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
+                abi::STUB_ELEMENT_WRITE_BARRIER,
+                abi::STUB_WRITE_BARRIER,
+            ],
+            Self::ArrayPop(_) => &[abi::STUB_JIT_OBJECT_PROTOCOL_VALUE],
+            Self::NewObject => &[abi::STUB_JIT_NEW_OBJECT],
+            Self::NewArrayEmpty | Self::NewArrayLiteral => &[abi::STUB_JIT_NEW_ARRAY],
+            Self::NewObjectLiteral { .. } => &[
+                abi::STUB_JIT_NEW_OBJECT_LITERAL,
+                abi::STUB_FIELD_TYPE_OBSERVE,
+            ],
+            Self::AllocationGroup(_) | Self::NewReceiver(_) => &[abi::STUB_ALLOC_GROUP_ENSURE],
+            Self::NativeNewContext(_) => &[abi::STUB_CREATE_CONTEXT_ALLOC],
+            Self::CopyContext => &[abi::STUB_COPY_CONTEXT_ALLOC],
+            Self::NewClosure => &[abi::STUB_JIT_MAKE_FN, abi::STUB_JIT_MAKE_CLOSURE],
+            Self::NewArrayWithLength => &[abi::STUB_ARRAY_CONSTRUCT_ALLOC],
+            Self::PrimitiveAdd => &[abi::STUB_STRING_CONCAT_ALLOC],
+            Self::BigIntBinary(_) => &[abi::STUB_BIGINT_BINARY_ALLOC],
+            Self::CallJs { .. } | Self::CallForward { .. } => &[
+                abi::STUB_JIT_CALL,
+                abi::STUB_JIT_CALL_GENERIC,
+                abi::STUB_JIT_CALL_NATIVE,
+            ],
+            Self::NativeLeaf(stub) => stub
+                .checked_sub(1)
+                .and_then(|index| abi::RUNTIME_STUB_DESCRIPTORS.get(index as usize))
+                .map_or(&[], std::slice::from_ref),
+            Self::JumpLoop(_) => &[abi::STUB_JIT_BACKEDGE_POLL],
+            Self::Generic { .. } => abi::RUNTIME_STUB_DESCRIPTORS,
+            _ => &[],
+        }
+    }
+
+    /// Debug builds: panic unless every runtime stub id in `called`, the
+    /// stubs this node's code was just emitted to call, is one of its
+    /// [`Self::slow_path_stubs`].
+    #[cfg(debug_assertions)]
+    pub(crate) fn audit_stub_calls(&self, called: &[u32]) {
+        let declared = self.slow_path_stubs();
+        for &id in called {
+            assert!(
+                declared.iter().any(|stub| stub.id == id),
+                "{self:?} calls runtime stub {} missing from its slow_path_stubs",
+                otter_vm::native_abi::runtime_stub_name(id),
+            );
         }
     }
 
@@ -1354,7 +1499,7 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::LoadPropertyCached { .. } => Constraints {
+            Self::LoadShapedProperty { .. } | Self::LoadPropertyCached { .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,
                 gp_temps: 4,

@@ -1,0 +1,251 @@
+{
+  "entryOffset": 0,
+  "callEntryOffset": 560,
+  "runtimeAddressRange": {
+    "start": "0x109538000",
+    "endExclusive": "0x109539320",
+    "entry": "0x109538000"
+  },
+  "regions": [
+    {
+      "kind": "entryPrologue",
+      "startOffset": 0,
+      "endOffset": 944
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 944,
+      "endOffset": 984,
+      "functionId": 503,
+      "logicalPc": 0,
+      "bytePc": 0,
+      "operationIndex": 0,
+      "operation": "LoadClosureContext { dst: 11 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 984,
+      "endOffset": 996,
+      "functionId": 503,
+      "logicalPc": 1,
+      "bytePc": 5,
+      "operationIndex": 1,
+      "operation": "LoadContextSlot { dst: 1, context: 11, depth: 0, slot: 0 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 996,
+      "endOffset": 1012,
+      "functionId": 503,
+      "logicalPc": 2,
+      "bytePc": 18,
+      "operationIndex": 2,
+      "operation": "LoadThis { dst: 2 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1012,
+      "endOffset": 1144,
+      "functionId": 503,
+      "logicalPc": 3,
+      "bytePc": 23,
+      "operationIndex": 3,
+      "operation": "LoadProperty { dst: 2, object: 2, name: 6, site: 1641, array_length: false }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1144,
+      "endOffset": 1152,
+      "functionId": 503,
+      "logicalPc": 4,
+      "bytePc": 36,
+      "operationIndex": 4,
+      "operation": "Move { dst: 3, src: 0 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1152,
+      "endOffset": 1284,
+      "functionId": 503,
+      "logicalPc": 5,
+      "bytePc": 46,
+      "operationIndex": 5,
+      "operation": "LoadProperty { dst: 3, object: 3, name: 6, site: 1642, array_length: false }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1284,
+      "endOffset": 1488,
+      "functionId": 503,
+      "logicalPc": 6,
+      "bytePc": 59,
+      "operationIndex": 6,
+      "operation": "BinaryArith { dst: 4, lhs: 2, rhs: 3, kind: Sub }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1488,
+      "endOffset": 1504,
+      "functionId": 503,
+      "logicalPc": 7,
+      "bytePc": 70,
+      "operationIndex": 7,
+      "operation": "LoadThis { dst: 5 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1504,
+      "endOffset": 1636,
+      "functionId": 503,
+      "logicalPc": 8,
+      "bytePc": 75,
+      "operationIndex": 8,
+      "operation": "LoadProperty { dst: 5, object: 5, name: 7, site: 1643, array_length: false }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1636,
+      "endOffset": 1644,
+      "functionId": 503,
+      "logicalPc": 9,
+      "bytePc": 88,
+      "operationIndex": 9,
+      "operation": "Move { dst: 6, src: 0 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1644,
+      "endOffset": 1776,
+      "functionId": 503,
+      "logicalPc": 10,
+      "bytePc": 98,
+      "operationIndex": 10,
+      "operation": "LoadProperty { dst: 6, object: 6, name: 7, site: 1644, array_length: false }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1776,
+      "endOffset": 1980,
+      "functionId": 503,
+      "logicalPc": 11,
+      "bytePc": 111,
+      "operationIndex": 11,
+      "operation": "BinaryArith { dst: 7, lhs: 5, rhs: 6, kind: Sub }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1980,
+      "endOffset": 1996,
+      "functionId": 503,
+      "logicalPc": 12,
+      "bytePc": 122,
+      "operationIndex": 12,
+      "operation": "LoadThis { dst: 8 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 1996,
+      "endOffset": 2128,
+      "functionId": 503,
+      "logicalPc": 13,
+      "bytePc": 127,
+      "operationIndex": 13,
+      "operation": "LoadProperty { dst: 8, object: 8, name: 8, site: 1645, array_length: false }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 2128,
+      "endOffset": 2136,
+      "functionId": 503,
+      "logicalPc": 14,
+      "bytePc": 140,
+      "operationIndex": 14,
+      "operation": "Move { dst: 9, src: 0 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 2136,
+      "endOffset": 2268,
+      "functionId": 503,
+      "logicalPc": 15,
+      "bytePc": 150,
+      "operationIndex": 15,
+      "operation": "LoadProperty { dst: 9, object: 9, name: 8, site: 1646, array_length: false }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 2268,
+      "endOffset": 2472,
+      "functionId": 503,
+      "logicalPc": 16,
+      "bytePc": 163,
+      "operationIndex": 16,
+      "operation": "BinaryArith { dst: 10, lhs: 8, rhs: 9, kind: Sub }"
+    },
+    {
+      "kind": "callTrampoline",
+      "startOffset": 2472,
+      "endOffset": 2984,
+      "functionId": 503,
+      "callTargetFunctionId": 501,
+      "logicalPc": 17,
+      "bytePc": 174
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 2472,
+      "endOffset": 2984,
+      "functionId": 503,
+      "logicalPc": 17,
+      "bytePc": 174,
+      "operationIndex": 17,
+      "operation": "Construct { dst: 1, callee: 1, argc: 3, packed_args: 42950131716, super_construct: false, byte_pc: 174 }"
+    },
+    {
+      "kind": "instruction",
+      "startOffset": 2984,
+      "endOffset": 2992,
+      "functionId": 503,
+      "logicalPc": 18,
+      "bytePc": 196,
+      "operationIndex": 18,
+      "operation": "Return { src: 1 }"
+    },
+    {
+      "kind": "outlinedSlowPaths",
+      "startOffset": 3112,
+      "endOffset": 3272
+    },
+    {
+      "kind": "returnEpilogue",
+      "startOffset": 3272,
+      "endOffset": 3308
+    },
+    {
+      "kind": "bailEpilogue",
+      "startOffset": 3308,
+      "endOffset": 3404
+    },
+    {
+      "kind": "committedThrowRouter",
+      "startOffset": 3404,
+      "endOffset": 3440
+    },
+    {
+      "kind": "throwEpilogue",
+      "startOffset": 3440,
+      "endOffset": 3808
+    },
+    {
+      "kind": "sharedPropertyProbes",
+      "startOffset": 3808,
+      "endOffset": 4656
+    },
+    {
+      "kind": "literalPool",
+      "startOffset": 4656,
+      "endOffset": 4896
+    }
+  ],
+  "osrEntries": []
+}

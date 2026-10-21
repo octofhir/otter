@@ -15,8 +15,9 @@
 //! - `_kill` reports a failed syscall as a negative errno rather than throwing,
 //!   matching the binding `kill` is written against.
 //! - `abort` hands back the terminal modes the run changed before it
-//!   terminates, through the same reset the exit path calls
-//!   ([`crate::process::reset_terminals`]).
+//!   terminates, from the run's own record and without running JavaScript,
+//!   through the same hand-back the exit path runs
+//!   ([`crate::terminal::restore_run_terminals`]).
 //!
 //! # See also
 //! - [`crate::process`]
@@ -347,9 +348,10 @@ fn raw_kill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 /// own `abort` does, handing back the terminal modes the run changed first.
 /// There is no return path.
 fn abort(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    if let Some(process) = ctx.global_value("process") {
-        crate::process::reset_terminals(ctx, process);
-    }
+    #[cfg(unix)]
+    crate::terminal::restore_run_terminals(ctx);
+    #[cfg(not(unix))]
+    let _ = ctx;
     std::process::abort();
 }
 
@@ -554,6 +556,11 @@ pub(crate) fn errno_code_from_raw(errno: i32) -> &'static str {
         libc::EINVAL => "EINVAL",
         libc::ENAMETOOLONG => "ENAMETOOLONG",
         libc::ELOOP => "ELOOP",
+        libc::EPIPE => "EPIPE",
+        libc::EAGAIN => "EAGAIN",
+        libc::EBADF => "EBADF",
+        libc::EIO => "EIO",
+        libc::ENOSPC => "ENOSPC",
         _ => "UNKNOWN",
     }
 }

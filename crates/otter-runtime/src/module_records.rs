@@ -269,14 +269,15 @@ impl RuntimeModuleRecords {
 /// The value is produced by the CommonJS loader itself, so the builtin's own
 /// `require` graph runs exactly as it does for `require()`. `default` is that
 /// value and every own enumerable string key becomes a named export, which is
-/// how Node presents a CommonJS-backed builtin to an `import`.
+/// how Node presents a CommonJS-backed builtin to an `import`. An `import` is
+/// user code, so it reaches the builtins a user `require` reaches.
 fn synthesize_commonjs_namespace<'scope>(
     scope: &mut otter_vm::NativeScope<'scope, '_>,
     specifier: &str,
     commonjs: &std::sync::Arc<crate::commonjs::CjsConfig>,
 ) -> Result<otter_vm::Local<'scope>, NativeError> {
     let exports =
-        crate::commonjs::cjs_load_builtin(scope, commonjs, specifier)?.ok_or_else(|| {
+        crate::commonjs::cjs_load_user_builtin(scope, commonjs, specifier)?.ok_or_else(|| {
             crate::runtime_type_error("import", format!("no builtin module named '{specifier}'"))
         })?;
     let namespace = scope.bare_object()?;

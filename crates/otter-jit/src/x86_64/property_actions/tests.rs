@@ -579,3 +579,83 @@ fn every_miss_finishes_before_any_slot_or_shape_effect() {
     );
     f.assert_stability(0);
 }
+
+#[test]
+#[cfg(not(target_os = "windows"))]
+fn shape_directory_reads_banks_and_refuses_shared_suffix_and_accessors() {
+    let mut f = Fixture::new(2);
+    f.view.shape_property_count_byte = 40;
+    f.view.shape_lookup = otter_vm::object::ShapeLookupLayout {
+        keys_byte: 24,
+        parent_byte: 28,
+        atom_byte: 32,
+        accessor_byte: 36,
+        capacity_byte: 4,
+        entries_byte: 8,
+        entry_bytes: 16,
+    };
+    let atom = 0x1_0431;
+    let capacity = 4u32;
+    let bucket = otter_vm::object::ShapeLookupLayout::atom_hash(atom) & (capacity * 2 - 1);
+    let directory = ROOT;
+    let bucket_byte = directory + 8 + capacity as usize * 16 + bucket as usize * 8;
+    for byte in (directory..directory + 8 + capacity as usize * 32).step_by(8) {
+        f.cells[byte / 8] = 0;
+    }
+    f.cell_u32(SHAPE + 40, 4);
+    f.cell_u32(SHAPE + 24, f.address(directory) as u32);
+    f.cell_u32(directory + 4, capacity);
+    let inline = otter_vm::Value::number_i32(41).to_bits();
+    let suffix = otter_vm::Value::number_i32(73).to_bits();
+    let inline_byte = f.bank_byte(0, SLAB, 1);
+    let suffix_byte = f.bank_byte(0, SLAB, 3);
+    f.cells[inline_byte / 8] = inline;
+    f.cells[suffix_byte / 8] = suffix;
+    let poison = 0xbadc_0ffe_2468_1357;
+    for alias in [false, true] {
+        let mut ops = Assembler::new().unwrap();
+        let entry = ops.offset();
+        let miss = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        crate::x86_64::shape_lookup::emit_load(
+            &mut ops,
+            &f.view,
+            atom,
+            7,
+            [1, 2, 8, 9],
+            if alias { 7 } else { 0 },
+            miss,
+        );
+        if alias {
+            dynasm!(ops ; .arch x64 ; mov rax, rdi);
+        }
+        dynasm!(ops ; .arch x64 ; jmp =>done ; =>miss);
+        crate::x86_64::values::emit_load_u64(&mut ops, 0, poison);
+        dynasm!(ops ; .arch x64 ; =>done ; ret);
+        let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+        // SAFETY: the allocation-free emitted leaf follows the platform C ABI.
+        let call: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.entry_ptr()) };
+        let receiver = f.address(0);
+        let packed = u64::from(atom) << 32;
+        f.cells[bucket_byte / 8] = packed | 2;
+        assert_eq!(call(receiver), inline);
+        f.cells[bucket_byte / 8] = packed | 4;
+        assert_eq!(call(receiver), suffix);
+        f.cells[bucket_byte / 8] = packed | 5;
+        assert_eq!(call(receiver), poison);
+        f.cells[bucket_byte / 8] = packed | 2 | (1 << 16);
+        assert_eq!(call(receiver), poison);
+        f.cells[bucket_byte / 8] = 0;
+        assert_eq!(call(receiver), poison);
+        f.cell_u32(SHAPE + 24, 0);
+        f.cell_u32(SHAPE + 32, atom);
+        f.cell_u8(SHAPE + 36, 0);
+        f.cell_u32(SHAPE + 40, 2);
+        assert_eq!(call(receiver), inline);
+        f.cell_u8(SHAPE + 36, 1);
+        assert_eq!(call(receiver), poison);
+        f.cell_u8(SHAPE + 36, 0);
+        f.cell_u32(SHAPE + 40, 4);
+        f.cell_u32(SHAPE + 24, f.address(directory) as u32);
+    }
+}

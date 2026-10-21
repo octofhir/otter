@@ -98,8 +98,11 @@ fn native_zlib_parameter_change_delivers_pre_admitted_carry() {
     )
     .expect("write params fixture");
 
+    // The native handle is an internal module, which a script reaches only
+    // the way Node's tests reach theirs: under `--expose-internals`.
     let mut runtime = Runtime::builder()
         .capabilities(CapabilitySet::allow_all())
+        .expose_internals(true)
         .with_node_apis()
         .build()
         .expect("runtime with Node APIs");

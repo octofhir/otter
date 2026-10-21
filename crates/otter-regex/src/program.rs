@@ -19,9 +19,9 @@
 //!   [`Program::insns`] vector.
 //! - Every scan aid ([`Program::prefilter`], [`Program::required_literal`],
 //!   [`Program::start_anchored`]) is a *necessary* condition on a match's start
-//!   position, never a sufficient one: skipping a position it rejects can never
-//!   discard a match, and every position it accepts is still run through the
-//!   matcher.
+//!   position: skipping a position it rejects can never discard a match.
+//!   A complete literal proves the entire capture-free program, so its scan
+//!   produces the result directly; other accepted positions enter the matcher.
 //! - Capture slots number `2 * (group_count + 1)`: slots `2*g` / `2*g+1` hold
 //!   the start / end of group `g`, with group `0` the overall match.
 //! - Scratch appends unbounded-loop progress marks after the capture prefix;
@@ -197,7 +197,7 @@ pub(crate) struct Program {
     /// exactly the maximal span of [`Prefilter`] members, so the skip reuses the
     /// prefilter membership test.
     pub(crate) lead_possessive_run: bool,
-    /// A literal run of at least two code units every match must contain, a
+    /// A literal run every match must contain, a
     /// bounded number of units after its start. The leftmost search prefers it
     /// over [`Self::prefilter`] (which characterizes only the first code
     /// point): a subject without the literal is rejected by one scan, and only
@@ -372,16 +372,29 @@ impl Prefilter {
 /// `q - max_offset ..= q - min_offset`.
 #[derive(Debug, Clone)]
 pub(crate) struct RequiredLiteral {
-    /// The required units, in subject order.
-    units: Box<[u16]>,
+    /// A unit compares at unit boundaries; a sequence uses substring finders.
+    needle: LiteralNeedle,
     /// Fewest code units any match consumes before the literal begins.
     pub(crate) min_offset: usize,
     /// Most code units any match consumes before the literal begins.
     pub(crate) max_offset: usize,
-    /// The searcher a one-byte subject uses, when every unit of the literal
-    /// fits one byte; otherwise the literal never occurs in such a subject.
+    /// The untruncated literal is the entire capture-free, code-unit program.
+    /// Its occurrence proves a match without running the backtracker.
+    complete: bool,
+}
+
+/// Width-aware scanners prepared once, without substring finders for one unit.
+#[derive(Debug, Clone)]
+enum LiteralNeedle {
+    Unit(u16),
+    Sequence(Box<LiteralSequence>),
+}
+
+/// Out-of-line sequence preparation keeps unit plans and other programs small.
+#[derive(Debug, Clone)]
+struct LiteralSequence {
+    units: Box<[u16]>,
     narrow: Option<memchr::memmem::Finder<'static>>,
-    /// The searcher over a two-byte subject's bytes.
     wide: memchr::memmem::Finder<'static>,
 }
 
@@ -390,7 +403,7 @@ impl RequiredLiteral {
     /// truncated, which only weakens the filter, never its soundness.
     const MAX_UNITS: usize = 4096;
 
-    /// Build the scan for a required literal of two or more units that every
+    /// Build the scan for a sequence of at least two units that every
     /// match holds between `min_offset` and `max_offset` units after its start.
     pub(crate) fn new(mut units: Vec<u16>, min_offset: usize, max_offset: usize) -> Self {
         units.truncate(Self::MAX_UNITS);
@@ -403,31 +416,85 @@ impl RequiredLiteral {
             .map(|bytes| memchr::memmem::Finder::new(&bytes).into_owned());
         let wide_bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
         let wide = memchr::memmem::Finder::new(&wide_bytes).into_owned();
-        Self {
+        let needle = LiteralNeedle::Sequence(Box::new(LiteralSequence {
             units: units.into_boxed_slice(),
-            min_offset,
-            max_offset,
             narrow,
             wide,
+        }));
+        Self {
+            needle,
+            min_offset,
+            max_offset,
+            complete: false,
         }
+    }
+
+    /// Prove the whole program is a case-sensitive code-unit literal.
+    /// A long scan needle is truncated, so it cannot prove completion.
+    pub(crate) fn for_complete_program(
+        insns: &[Insn],
+        unicode: bool,
+        group_count: u32,
+    ) -> Option<Self> {
+        // A {0} body emits no Save, but its declared groups still contribute
+        // undefined capture slots and named-group metadata to every result.
+        if unicode || group_count != 0 {
+            return None;
+        }
+        let mut literal = match insns {
+            [
+                Insn::Char {
+                    cp,
+                    ignore_case: false,
+                },
+                Insn::Match,
+            ] if *cp <= 0xFFFF && !(0xD800..=0xDFFF).contains(cp) => Self {
+                needle: LiteralNeedle::Unit(*cp as u16),
+                min_offset: 0,
+                max_offset: 0,
+                complete: false,
+            },
+            [Insn::CharSeq(units), Insn::Match] if units.len() <= Self::MAX_UNITS => {
+                Self::new(units.to_vec(), 0, 0)
+            }
+            _ => return None,
+        };
+        literal.complete = true;
+        Some(literal)
+    }
+
+    /// Whether this scan proves the whole program, including its result width.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.complete
     }
 
     /// The literal's code units.
     pub(crate) fn units(&self) -> &[u16] {
-        &self.units
+        match &self.needle {
+            LiteralNeedle::Unit(unit) => core::slice::from_ref(unit),
+            LiteralNeedle::Sequence(sequence) => &sequence.units,
+        }
     }
 
     /// The first offset at or after `from` where the literal occurs, or `None`
     /// when the subject holds no further occurrence.
     #[must_use]
     pub(crate) fn find<U: crate::cursor::Unit>(&self, text: &[U], from: usize) -> Option<usize> {
-        let bytes = U::as_bytes(text.get(from..)?);
+        let rest = text.get(from..)?;
+        let sequence = match &self.needle {
+            LiteralNeedle::Unit(unit) => {
+                let unit = U::narrow(*unit)?;
+                return U::position(rest, unit).map(|at| from + at);
+            }
+            LiteralNeedle::Sequence(sequence) => sequence,
+        };
+        let bytes = U::as_bytes(rest);
         if !U::WIDE {
-            return self.narrow.as_ref()?.find(bytes).map(|at| from + at);
+            return sequence.narrow.as_ref()?.find(bytes).map(|at| from + at);
         }
         let mut at = 0;
         loop {
-            let hit = at + self.wide.find(&bytes[at..])?;
+            let hit = at + sequence.wide.find(&bytes[at..])?;
             if hit % 2 == 0 {
                 return Some(from + hit / 2);
             }
@@ -482,7 +549,8 @@ impl Program {
             "anchored".to_string()
         } else if let Some(lit) = &self.required_literal {
             format!(
-                "literal {:?} at {}..={}",
+                "{}literal {:?} at {}..={}",
+                if lit.is_complete() { "complete " } else { "" },
                 String::from_utf16_lossy(lit.units()),
                 lit.min_offset,
                 lit.max_offset

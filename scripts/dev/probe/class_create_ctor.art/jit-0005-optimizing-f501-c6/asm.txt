@@ -1,0 +1,721 @@
+; otter jit aarch64 assembly
+; offset-basis=code.bin
+; target=aarch64-apple-darwin
+; architecture=aarch64
+; operating-system=macos
+; tier=optimizing
+; function-id=501
+; function-name="<anonymous>"
+; module="/Users/alexanderstreltsov/work/octofhir/otter/scripts/dev/probe/class_create_ctor.js"
+; code-object-id=6
+; compile-target=entry
+; entry-offset=+0x00000000
+; code-bytes=2528
+; deopt-exits=4
+; frame-state=0 frames=1 innermost-function=501 innermost-byte-pc=5 slots=1
+; frame-state=1 frames=1 innermost-function=501 innermost-byte-pc=18 slots=1
+; frame-state=2 frames=1 innermost-function=501 innermost-byte-pc=36 slots=3
+; frame-state=3 frames=1 innermost-function=501 innermost-byte-pc=36 slots=3
+; safepoints=7
+; safepoint id=4294967288 frame-state=4294967295 tagged=spillSlot:0,spillSlot:1,spillSlot:2,spillSlot:3
+; safepoint id=4294967289 frame-state=4294967295 tagged=spillSlot:3
+; safepoint id=4294967290 frame-state=4294967295 tagged=spillSlot:3
+; safepoint id=4294967291 frame-state=4294967295 tagged=spillSlot:3
+; safepoint id=4294967292 frame-state=4294967295 tagged=spillSlot:0,spillSlot:1,spillSlot:2,spillSlot:3
+; safepoint id=4294967293 frame-state=4294967295 tagged=spillSlot:0,spillSlot:1,spillSlot:2,spillSlot:3
+; safepoint id=4294967294 frame-state=4294967295 tagged=spillSlot:3
+; js-return-sites=2
+; js-return +0x000004e0 safepoint=4294967293
+; js-return +0x00000548 safepoint=4294967293
+
+L00000000:
++0x00000000: a9bd7bfd  stp x29, x30, [sp, #-0x30]!
++0x00000004: a90153f3  stp x19, x20, [sp, #0x10]
++0x00000008: f90013f5  str x21, [sp, #0x20]
++0x0000000c: 910003fd  mov x29, sp
++0x00000010: aa0003f4  mov x20, x0
++0x00000014: f9400695  ldr x21, [x20, #0x8]
++0x00000018: f9400ab3  ldr x19, [x21, #0x10]
++0x0000001c: f90017b5  str x21, [x29, #0x28]
++0x00000020: d10303ff  sub sp, sp, #0xc0
++0x00000024: f9000fff  str xzr, [sp, #0x18]
++0x00000028: b27f7bf1  mov x17, #0xfffffffe
++0x0000002c: f9402ab0  ldr x16, [x21, #0x50]
++0x00000030: f81603b0  stur x16, [x29, #-0xa0]
++0x00000034: f9402eb0  ldr x16, [x21, #0x58]
++0x00000038: f81683b0  stur x16, [x29, #-0x98]
++0x0000003c: b90056b1  str w17, [x21, #0x54]
++0x00000040: 910003f0  mov x16, sp
++0x00000044: f9002eb0  str x16, [x21, #0x58]
++0x00000048: 140000b0  b L00000308
+L0000004c:
++0x0000004c: 927ff908  and x8, x8, #0xfffffffffffffffe
++0x00000050: f9406690  ldr x16, [x20, #0xc8]
++0x00000054: f100021f  cmp x16, #0x0
++0x00000058: 9a9f1610  csinc x16, x16, xzr, ne
++0x0000005c: a90c7e9f  stp xzr, xzr, [x20, #0xc0]
++0x00000060: f90036b0  str x16, [x21, #0x68]
++0x00000064: 14000097  b L000002c0
+L00000068:
++0x00000068: d280014f  mov x15, #0xa
++0x0000006c: b940aa90  ldr w16, [x20, #0xa8]
++0x00000070: f9405a91  ldr x17, [x20, #0xb0]
++0x00000074: a90746b0  stp x16, x17, [x21, #0x70]
++0x00000078: f9405e90  ldr x16, [x20, #0xb8]
++0x0000007c: f90042b0  str x16, [x21, #0x80]
++0x00000080: f9005e9f  str xzr, [x20, #0xb8]
++0x00000084: b900aa9f  str wzr, [x20, #0xa8]
++0x00000088: f9005a8f  str x15, [x20, #0xb0]
++0x0000008c: 39402ea9  ldrb w9, [x21, #0xb]
++0x00000090: 321b0129  orr w9, w9, #0x20
++0x00000094: 39002ea9  strb w9, [x21, #0xb]
++0x00000098: f94017a9  ldr x9, [x29, #0x28]
++0x0000009c: b2400129  orr x9, x9, #0x1
++0x000000a0: f90017a9  str x9, [x29, #0x28]
++0x000000a4: f100285f  cmp x2, #0xa
++0x000000a8: 54000aa1  b.ne L000001fc
++0x000000ac: d10043ff  sub sp, sp, #0x10
++0x000000b0: f90003e6  str x6, [sp]
++0x000000b4: f9400280  ldr x0, [x20]
++0x000000b8: f9401000  ldr x0, [x0, #0x20]
++0x000000bc: f94016a1  ldr x1, [x21, #0x28]
++0x000000c0: b94002a2  ldr w2, [x21]
++0x000000c4: d370bc42  lsl x2, x2, #0x10
++0x000000c8: d2800450  mov x16, #0x22
++0x000000cc: aa100042  orr x2, x2, x16
++0x000000d0: relocation x16, runtimeStub(id=95,name="constructor_receiver_probe",signature="leafValue2") ; encoded-bytes=4 redacted
++0x000000d4: d63f0200  blr x16
++0x000000d8: b40000a1  cbz x1, L000000ec
++0x000000dc: f100043f  cmp x1, #0x1
++0x000000e0: 540007a1  b.ne L000001d4
++0x000000e4: b5000780  cbnz x0, L000001d4
++0x000000e8: 14000031  b L000001ac
+L000000ec:
++0x000000ec: b2607fef  mov x15, #0xffffffff00000000
++0x000000f0: 8a0f000e  and x14, x0, x15
++0x000000f4: d2ffffcf  mov x15, #0xfffe000000000000
++0x000000f8: eb0f01df  cmp x14, x15
++0x000000fc: 540006c1  b.ne L000001d4
++0x00000100: 2a0003e9  mov w9, w0
++0x00000104: 34000689  cbz w9, L000001d4
++0x00000108: relocation x12, gcCageBase ; encoded-bytes=4 redacted
++0x0000010c: 8b09018f  add x15, x12, x9
++0x00000110: b9401dea  ldr w10, [x15, #0x1c]
++0x00000114: 8b0a018f  add x15, x12, x10
++0x00000118: 3940b9ee  ldrb w14, [x15, #0x2e]
++0x0000011c: d37df1d1  lsl x17, x14, #0x3
++0x00000120: 91006231  add x17, x17, #0x18
++0x00000124: f9401e8b  ldr x11, [x20, #0x38]
++0x00000128: f9400160  ldr x0, [x11]
++0x0000012c: f940056f  ldr x15, [x11, #0x8]
++0x00000130: 8b11000d  add x13, x0, x17
++0x00000134: eb0f01bf  cmp x13, x15
++0x00000138: 54000448  b.hi L000001c0
++0x0000013c: d2808230  mov x16, #0x411
++0x00000140: aa118210  orr x16, x16, x17, lsl #32
++0x00000144: f9000010  str x16, [x0]
++0x00000148: f900041f  str xzr, [x0, #0x8]
++0x0000014c: f900081f  str xzr, [x0, #0x10]
++0x00000150: b900080a  str w10, [x0, #0x8]
++0x00000154: 9100600c  add x12, x0, #0x18
++0x00000158: d2800150  mov x16, #0xa
++0x0000015c: eb0d019f  cmp x12, x13
++0x00000160: 54000080  b.eq L00000170
+L00000164:
++0x00000164: f8008590  str x16, [x12], #0x8
++0x00000168: eb0d019f  cmp x12, x13
++0x0000016c: 54ffffc1  b.ne L00000164
+L00000170:
++0x00000170: f900016d  str x13, [x11]
++0x00000174: b90072a9  str w9, [x21, #0x70]
++0x00000178: f9003ea0  str x0, [x21, #0x78]
++0x0000017c: f90012a0  str x0, [x21, #0x20]
++0x00000180: aa0003e1  mov x1, x0
++0x00000184: aa1403e0  mov x0, x20
++0x00000188: relocation x16, runtimeStub(id=96,name="constructor_receiver_commit",signature="contextWords") ; encoded-bytes=4 redacted
++0x0000018c: d63f0200  blr x16
++0x00000190: b40002e1  cbz x1, L000001ec
++0x00000194: f100183f  cmp x1, #0x6
++0x00000198: 540001e1  b.ne L000001d4
++0x0000019c: d280014f  mov x15, #0xa
++0x000001a0: eb0f001f  cmp x0, x15
++0x000001a4: 54000181  b.ne L000001d4
++0x000001a8: 14000011  b L000001ec
+L000001ac:
++0x000001ac: f940268f  ldr x15, [x20, #0x48]
++0x000001b0: f9407dee  ldr x14, [x15, #0xf8]
++0x000001b4: 910005ce  add x14, x14, #0x1
++0x000001b8: f9007dee  str x14, [x15, #0xf8]
++0x000001bc: 14000009  b L000001e0
+L000001c0:
++0x000001c0: f940268f  ldr x15, [x20, #0x48]
++0x000001c4: f94081ee  ldr x14, [x15, #0x100]
++0x000001c8: 910005ce  add x14, x14, #0x1
++0x000001cc: f90081ee  str x14, [x15, #0x100]
++0x000001d0: 14000004  b L000001e0
+L000001d4:
++0x000001d4: d2800140  mov x0, #0xa
++0x000001d8: d28000c1  mov x1, #0x6
++0x000001dc: 14000004  b L000001ec
+L000001e0:
++0x000001e0: aa1403e0  mov x0, x20
++0x000001e4: relocation x16, runtimeStub(id=71,name="jit_prepare_activation",signature="executionEntry0") ; encoded-bytes=4 redacted
++0x000001e8: d63f0200  blr x16
+L000001ec:
++0x000001ec: f94003e6  ldr x6, [sp]
++0x000001f0: 910043ff  add sp, sp, #0x10
++0x000001f4: b4000041  cbz x1, L000001fc
++0x000001f8: 140000ee  b L000005b0
+L000001fc:
++0x000001fc: 14000043  b L00000308
+L00000200:
++0x00000200: aa1403e0  mov x0, x20
++0x00000204: relocation x16, runtimeStub(id=71,name="jit_prepare_activation",signature="executionEntry0") ; encoded-bytes=4 redacted
++0x00000208: d63f0200  blr x16
++0x0000020c: b40007e1  cbz x1, L00000308
++0x00000210: 140000e8  b L000005b0
+L00000214:
++0x00000214: aa1403e0  mov x0, x20
++0x00000218: relocation x16, runtimeStub(id=88,name="jit_call_overflow",signature="executionEntry0") ; encoded-bytes=4 redacted
++0x0000021c: d63f0200  blr x16
++0x00000220: 910003bf  mov sp, x29
++0x00000224: f94013f5  ldr x21, [sp, #0x20]
++0x00000228: a94153f3  ldp x19, x20, [sp, #0x10]
++0x0000022c: a8c37bfd  ldp x29, x30, [sp], #0x30
++0x00000230: d65f03c0  ret
++0x00000234: d371fc49  lsr x9, x2, #0x31
++0x00000238: b5000209  cbnz x9, L00000278
++0x0000023c: 37080162  tbnz w2, #1, L00000268
++0x00000240: 39400049  ldrb w9, [x2]
++0x00000244: 7100453f  cmp w9, #0x11
++0x00000248: 540001c0  b.eq L00000280
++0x0000024c: 7100813f  cmp w9, #0x20
++0x00000250: 54000140  b.eq L00000278
++0x00000254: 7100993f  cmp w9, #0x26
++0x00000258: 54000100  b.eq L00000278
++0x0000025c: 7100953f  cmp w9, #0x25
++0x00000260: 540000c0  b.eq L00000278
++0x00000264: 14000007  b L00000280
+L00000268:
++0x00000268: 92403c49  and x9, x2, #0xffff
++0x0000026c: f100893f  cmp x9, #0x22
++0x00000270: 54000080  b.eq L00000280
++0x00000274: 14000001  b L00000278
+L00000278:
++0x00000278: d2800025  mov x5, #0x1
++0x0000027c: 14000002  b L00000284
+L00000280:
++0x00000280: aa1f03e5  mov x5, xzr
+L00000284:
++0x00000284: a9bd7bfd  stp x29, x30, [sp, #-0x30]!
++0x00000288: a90153f3  stp x19, x20, [sp, #0x10]
++0x0000028c: f90013f5  str x21, [sp, #0x20]
++0x00000290: 910003fd  mov x29, sp
++0x00000294: aa0003f4  mov x20, x0
++0x00000298: d10383e9  sub x9, sp, #0xe0
++0x0000029c: f940168b  ldr x11, [x20, #0x28]
++0x000002a0: eb0b013f  cmp x9, x11
++0x000002a4: 54fffb83  b.cc L00000214
++0x000002a8: 9100013f  mov sp, x9
++0x000002ac: d10243b5  sub x21, x29, #0x90
++0x000002b0: f9000fff  str xzr, [sp, #0x18]
++0x000002b4: 12800010  mov w16, #0xffffffff
++0x000002b8: a9067eb0  stp x16, xzr, [x21, #0x60]
++0x000002bc: 3707ec88  tbnz w8, #0, L0000004c
+L000002c0:
++0x000002c0: f940068a  ldr x10, [x20, #0x8]
++0x000002c4: f90017aa  str x10, [x29, #0x28]
++0x000002c8: d2803ead  mov x13, #0x1f5
++0x000002cc: 5800346e  ldr x14, L00000958
++0x000002d0: a9003aad  stp x13, x14, [x21]
++0x000002d4: a9017ebf  stp xzr, xzr, [x21, #0x10]
++0x000002d8: a9020ea2  stp x2, x3, [x21, #0x20]
++0x000002dc: a90312a1  stp x1, x4, [x21, #0x30]
++0x000002e0: 9100c3af  add x15, x29, #0x30
++0x000002e4: a9042aaf  stp x15, x10, [x21, #0x40]
++0x000002e8: b25f7bf0  mov x16, #0xfffffffe00000000
++0x000002ec: 910003f1  mov x17, sp
++0x000002f0: a90546b0  stp x16, x17, [x21, #0x50]
++0x000002f4: 9100c3b3  add x19, x29, #0x30
++0x000002f8: f9000695  str x21, [x20, #0x8]
++0x000002fc: f100287f  cmp x3, #0xa
++0x00000300: 54ffeb41  b.ne L00000068
++0x00000304: b5fff7e5  cbnz x5, L00000200
+L00000308:
+  ; region kind=instruction range=+0x00000308..+0x00000308 block=1 function=501 pc=0 byte-pc=0 operation-index=1 tier-op="v1 Jump(BlockId(0))"
+  ; region kind=instruction range=+0x00000308..+0x00000310 block=0 function=501 pc=0 byte-pc=0 operation-index=2 tier-op="v2 LoadThis"
++0x00000308: f94012a0  ldr x0, [x21, #0x20]
++0x0000030c: f90003e0  str x0, [sp]
+  ; region kind=instruction range=+0x00000310..+0x000003c0 block=0 function=501 pc=1 byte-pc=5 operation-index=3 tier-op="v3 LoadNamedProperty { byte_pc: 5, programs: [0, 1], receiver_shape: None }"
++0x00000310: f24f441f  tst x0, #0xfffe000000000007
++0x00000314: 54000281  b.ne L00000364
++0x00000318: 39400010  ldrb w16, [x0]
++0x0000031c: 7100461f  cmp w16, #0x11
++0x00000320: 54000221  b.ne L00000364
++0x00000324: b9400810  ldr w16, [x0, #0x8]
++0x00000328: 340001f0  cbz w16, L00000364
++0x0000032c: 580031b1  ldr x17, L00000960
++0x00000330: 6b11021f  cmp w16, w17
++0x00000334: 54000181  b.ne L00000364
++0x00000338: relocation x2, prototypeValidityCell identity=3260 ; encoded-bytes=4 redacted
++0x0000033c: 88dffc42  ldar w2, [x2]
++0x00000340: 34000122  cbz w2, L00000364
++0x00000344: 58003171  ldr x17, L00000970
++0x00000348: 92607c10  and x16, x0, #0xffffffff00000000
++0x0000034c: 8b110211  add x17, x16, x17
++0x00000350: b9403a21  ldr w1, [x17, #0x38]
++0x00000354: 8b010201  add x1, x16, x1
++0x00000358: 91006030  add x16, x1, #0x18
++0x0000035c: f9400203  ldr x3, [x16]
++0x00000360: 14000017  b L000003bc
+L00000364:
++0x00000364: f24f441f  tst x0, #0xfffe000000000007
++0x00000368: 54000281  b.ne L000003b8
++0x0000036c: 39400010  ldrb w16, [x0]
++0x00000370: 7100461f  cmp w16, #0x11
++0x00000374: 54000221  b.ne L000003b8
++0x00000378: b9400810  ldr w16, [x0, #0x8]
++0x0000037c: 340001f0  cbz w16, L000003b8
++0x00000380: 58002fd1  ldr x17, L00000978
++0x00000384: 6b11021f  cmp w16, w17
++0x00000388: 54000181  b.ne L000003b8
++0x0000038c: relocation x2, prototypeValidityCell identity=3271 ; encoded-bytes=4 redacted
++0x00000390: 88dffc42  ldar w2, [x2]
++0x00000394: 34000122  cbz w2, L000003b8
++0x00000398: 58002f91  ldr x17, L00000988
++0x0000039c: 92607c10  and x16, x0, #0xffffffff00000000
++0x000003a0: 8b110211  add x17, x16, x17
++0x000003a4: b9403a21  ldr w1, [x17, #0x38]
++0x000003a8: 8b010201  add x1, x16, x1
++0x000003ac: 91006030  add x16, x1, #0x18
++0x000003b0: f9400203  ldr x3, [x16]
++0x000003b4: 14000002  b L000003bc
+L000003b8:
++0x000003b8: 140000cc  b L000006e8
+L000003bc:
++0x000003bc: f90007e3  str x3, [sp, #0x8]
+  ; region kind=instruction range=+0x000003c0..+0x00000434 block=0 function=501 pc=2 byte-pc=18 operation-index=4 tier-op="v4 LoadNamedProperty { byte_pc: 18, programs: [0], receiver_shape: None }"
++0x000003c0: f24f447f  tst x3, #0xfffe000000000007
++0x000003c4: 54000341  b.ne L0000042c
++0x000003c8: b4000323  cbz x3, L0000042c
++0x000003cc: 39400070  ldrb w16, [x3]
++0x000003d0: 71008e1f  cmp w16, #0x23
++0x000003d4: 540002c1  b.ne L0000042c
++0x000003d8: 39403c71  ldrb w17, [x3, #0xf]
++0x000003dc: f100063f  cmp x17, #0x1
++0x000003e0: 54000261  b.ne L0000042c
++0x000003e4: f9400290  ldr x16, [x20]
++0x000003e8: f9402610  ldr x16, [x16, #0x48]
++0x000003ec: b4000210  cbz x16, L0000042c
++0x000003f0: b9400210  ldr w16, [x16]
++0x000003f4: d2e00011  mov x17, #0x0
++0x000003f8: 6b11021f  cmp w16, w17
++0x000003fc: 54000181  b.ne L0000042c
++0x00000400: relocation x1, guardedHeapReference(component=prototype,bytePc=18,runtimeStubId=17) ; encoded-bytes=4 redacted
++0x00000404: 92607c70  and x16, x3, #0xffffffff00000000
++0x00000408: 8b100021  add x1, x1, x16
++0x0000040c: b9400830  ldr w16, [x1, #0x8]
++0x00000410: 340000f0  cbz w16, L0000042c
++0x00000414: 58002c31  ldr x17, L00000998
++0x00000418: 6b11021f  cmp w16, w17
++0x0000041c: 54000081  b.ne L0000042c
++0x00000420: 91006030  add x16, x1, #0x18
++0x00000424: f9400604  ldr x4, [x16, #0x8]
++0x00000428: 14000002  b L00000430
+L0000042c:
++0x0000042c: 140000b1  b L000006f0
+L00000430:
++0x00000430: f9000be4  str x4, [sp, #0x10]
+  ; region kind=instruction range=+0x00000434..+0x0000045c block=0 function=501 pc=4 byte-pc=36 operation-index=5 tier-op="v5 CheckNative(372)"
++0x00000434: f24f449f  tst x4, #0xfffe000000000007
++0x00000438: 54001601  b.ne L000006f8
++0x0000043c: b40015e4  cbz x4, L000006f8
++0x00000440: 39400090  ldrb w16, [x4]
++0x00000444: 7100761f  cmp w16, #0x1d
++0x00000448: 54001581  b.ne L000006f8
++0x0000044c: b9400890  ldr w16, [x4, #0x8]
++0x00000450: d2802e91  mov x17, #0x174
++0x00000454: 6b11021f  cmp w16, w17
++0x00000458: 54001501  b.ne L000006f8
+  ; region kind=instruction range=+0x0000045c..+0x00000464 block=0 function=501 pc=4 byte-pc=36 operation-index=6 tier-op="v6 CheckArgumentsElided"
++0x0000045c: b9403eb0  ldr w16, [x21, #0x3c]
++0x00000460: 35001510  cbnz w16, L00000700
+  ; region kind=instruction range=+0x00000464..+0x00000570 block=0 function=501 pc=4 byte-pc=36 operation-index=7 tier-op="v7 CallForward { pc: 4, plan: Generic, bindings: [] }"
++0x00000464: aa0303e1  mov x1, x3
++0x00000468: aa0003e2  mov x2, x0
++0x0000046c: b9403ab0  ldr w16, [x21, #0x38]
++0x00000470: 11000610  add w16, w16, #0x1
++0x00000474: 121f7a10  and w16, w16, #0xfffffffe
++0x00000478: d37df210  lsl x16, x16, #0x3
++0x0000047c: 910003f1  mov x17, sp
++0x00000480: aa1103e0  mov x0, x17
++0x00000484: cb100010  sub x16, x0, x16
++0x00000488: f9401691  ldr x17, [x20, #0x28]
++0x0000048c: eb11021f  cmp x16, x17
++0x00000490: 540013c3  b.cc L00000708
++0x00000494: aa0003f1  mov x17, x0
+L00000498:
++0x00000498: d1400631  sub x17, x17, #0x1, lsl #12
++0x0000049c: eb10023f  cmp x17, x16
++0x000004a0: 54000069  b.ls L000004ac
++0x000004a4: f900023f  str xzr, [x17]
++0x000004a8: 17fffffc  b L00000498
+L000004ac:
++0x000004ac: 9100021f  mov sp, x16
++0x000004b0: f94022a3  ldr x3, [x21, #0x40]
++0x000004b4: b9403ab1  ldr w17, [x21, #0x38]
+L000004b8:
++0x000004b8: 340000b1  cbz w17, L000004cc
++0x000004bc: 51000631  sub w17, w17, #0x1
++0x000004c0: f8717870  ldr x16, [x3, x17, lsl #3]
++0x000004c4: f8317bf0  str x16, [sp, x17, lsl #3]
++0x000004c8: 17fffffc  b L000004b8
+L000004cc:
++0x000004cc: b9403aa4  ldr w4, [x21, #0x38]
++0x000004d0: aa1403e0  mov x0, x20
++0x000004d4: d2800143  mov x3, #0xa
++0x000004d8: relocation x16, runtimeStub(id=87,name="jit_call_generic",signature="jsCall") ; encoded-bytes=4 redacted
++0x000004dc: d63f0200  blr x16
++0x000004e0: b9403ab0  ldr w16, [x21, #0x38]
++0x000004e4: 11000610  add w16, w16, #0x1
++0x000004e8: 121f7a10  and w16, w16, #0xfffffffe
++0x000004ec: d37df210  lsl x16, x16, #0x3
++0x000004f0: 8b3063ff  add sp, sp, x16
+L000004f4:
++0x000004f4: b40003e1  cbz x1, L00000570
++0x000004f8: f1000c3f  cmp x1, #0x3
++0x000004fc: 54000281  b.ne L0000054c
++0x00000500: aa1403e0  mov x0, x20
++0x00000504: 91014010  add x16, x0, #0x50
++0x00000508: f9403e11  ldr x17, [x16, #0x78]
++0x0000050c: b50001b1  cbnz x17, L00000540
++0x00000510: 39404e11  ldrb w17, [x16, #0x13]
++0x00000514: 721a063f  tst w17, #0xc0
++0x00000518: 54000141  b.ne L00000540
++0x0000051c: f9400411  ldr x17, [x0, #0x8]
++0x00000520: f9003a11  str x17, [x16, #0x70]
++0x00000524: b40000d1  cbz x17, L0000053c
++0x00000528: b9400e31  ldr w17, [x17, #0xc]
++0x0000052c: 34000091  cbz w17, L0000053c
++0x00000530: 100000d1  adr x17, L00000548
++0x00000534: f9003e11  str x17, [x16, #0x78]
++0x00000538: 14000002  b L00000540
+L0000053c:
++0x0000053c: f9003e1f  str xzr, [x16, #0x78]
+L00000540:
++0x00000540: relocation x16, runtimeStub(id=83,name="jit_call",signature="executionEntry0") ; encoded-bytes=4 redacted
++0x00000544: d63f0200  blr x16
+L00000548:
++0x00000548: 17ffffeb  b L000004f4
+L0000054c:
++0x0000054c: 12800070  mov w16, #0xfffffffc
++0x00000550: b90056b0  str w16, [x21, #0x54]
++0x00000554: 52800090  mov w16, #0x4
++0x00000558: b90006b0  str w16, [x21, #0x4]
++0x0000055c: f100083f  cmp x1, #0x2
++0x00000560: 54001040  b.eq L00000768
++0x00000564: f100183f  cmp x1, #0x6
++0x00000568: 54000d40  b.eq L00000710
++0x0000056c: 14000079  b L00000750
+L00000570:
+  ; region kind=instruction range=+0x00000570..+0x00000574 block=0 function=501 pc=5 byte-pc=53 operation-index=8 tier-op="v8 Return"
++0x00000570: d2800140  mov x0, #0xa
+  ; region kind=out-of-line range=+0x00000574..+0x000009e0
++0x00000574: d2800001  mov x1, #0x0
++0x00000578: f94017a9  ldr x9, [x29, #0x28]
++0x0000057c: 370001a9  tbnz w9, #0, L000005b0
++0x00000580: eb15013f  cmp x9, x21
++0x00000584: 540000a1  b.ne L00000598
++0x00000588: f85603b0  ldur x16, [x29, #-0xa0]
++0x0000058c: f9002ab0  str x16, [x21, #0x50]
++0x00000590: f85683b0  ldur x16, [x29, #-0x98]
++0x00000594: f9002eb0  str x16, [x21, #0x58]
+L00000598:
++0x00000598: f9000689  str x9, [x20, #0x8]
++0x0000059c: 910003bf  mov sp, x29
++0x000005a0: f94013f5  ldr x21, [sp, #0x20]
++0x000005a4: a94153f3  ldp x19, x20, [sp, #0x10]
++0x000005a8: a8c37bfd  ldp x29, x30, [sp], #0x30
++0x000005ac: d65f03c0  ret
+L000005b0:
++0x000005b0: b5000261  cbnz x1, L000005fc
++0x000005b4: d371fc09  lsr x9, x0, #0x31
++0x000005b8: b5000209  cbnz x9, L000005f8
++0x000005bc: 37080160  tbnz w0, #1, L000005e8
++0x000005c0: 39400009  ldrb w9, [x0]
++0x000005c4: 7100453f  cmp w9, #0x11
++0x000005c8: 540001a0  b.eq L000005fc
++0x000005cc: 7100813f  cmp w9, #0x20
++0x000005d0: 54000140  b.eq L000005f8
++0x000005d4: 7100993f  cmp w9, #0x26
++0x000005d8: 54000100  b.eq L000005f8
++0x000005dc: 7100953f  cmp w9, #0x25
++0x000005e0: 540000c0  b.eq L000005f8
++0x000005e4: 14000006  b L000005fc
+L000005e8:
++0x000005e8: 92403c09  and x9, x0, #0xffff
++0x000005ec: f100893f  cmp x9, #0x22
++0x000005f0: 54000060  b.eq L000005fc
++0x000005f4: 14000001  b L000005f8
+L000005f8:
++0x000005f8: f94012a0  ldr x0, [x21, #0x20]
+L000005fc:
++0x000005fc: 39402ea9  ldrb w9, [x21, #0xb]
++0x00000600: 36280189  tbz w9, #5, L00000630
++0x00000604: b94072a9  ldr w9, [x21, #0x70]
++0x00000608: f94042aa  ldr x10, [x21, #0x80]
++0x0000060c: aa0a0129  orr x9, x9, x10
++0x00000610: b4000109  cbz x9, L00000630
++0x00000614: d10043ff  sub sp, sp, #0x10
++0x00000618: a90007e0  stp x0, x1, [sp]
++0x0000061c: 910003e1  mov x1, sp
++0x00000620: aa1403e0  mov x0, x20
++0x00000624: relocation x16, runtimeStub(id=91,name="jit_constructor_terminal",signature="contextWords") ; encoded-bytes=4 redacted
++0x00000628: d63f0200  blr x16
++0x0000062c: 910043ff  add sp, sp, #0x10
+L00000630:
++0x00000630: f94017a9  ldr x9, [x29, #0x28]
++0x00000634: 927ff929  and x9, x9, #0xfffffffffffffffe
++0x00000638: f9000689  str x9, [x20, #0x8]
++0x0000063c: 910003bf  mov sp, x29
++0x00000640: f94013f5  ldr x21, [sp, #0x20]
++0x00000644: a94153f3  ldp x19, x20, [sp, #0x10]
++0x00000648: a8c37bfd  ldp x29, x30, [sp], #0x30
++0x0000064c: d65f03c0  ret
+L00000650:
++0x00000650: f94017a9  ldr x9, [x29, #0x28]
++0x00000654: 927ff929  and x9, x9, #0xfffffffffffffffe
++0x00000658: eb15013f  cmp x9, x21
++0x0000065c: 540002c0  b.eq L000006b4
++0x00000660: 12800010  mov w16, #0xffffffff
++0x00000664: b90056b0  str w16, [x21, #0x54]
++0x00000668: f9002ebf  str xzr, [x21, #0x58]
++0x0000066c: aa0003e1  mov x1, x0
++0x00000670: aa1403e0  mov x0, x20
++0x00000674: relocation x16, runtimeStub(id=51,name="jit_deopt_call",signature="contextWords") ; encoded-bytes=4 redacted
++0x00000678: d63f0200  blr x16
++0x0000067c: f94017a9  ldr x9, [x29, #0x28]
++0x00000680: 3707f989  tbnz w9, #0, L000005b0
++0x00000684: eb15013f  cmp x9, x21
++0x00000688: 540000a1  b.ne L0000069c
++0x0000068c: f85603b0  ldur x16, [x29, #-0xa0]
++0x00000690: f9002ab0  str x16, [x21, #0x50]
++0x00000694: f85683b0  ldur x16, [x29, #-0x98]
++0x00000698: f9002eb0  str x16, [x21, #0x58]
+L0000069c:
++0x0000069c: f9000689  str x9, [x20, #0x8]
++0x000006a0: 910003bf  mov sp, x29
++0x000006a4: f94013f5  ldr x21, [sp, #0x20]
++0x000006a8: a94153f3  ldp x19, x20, [sp, #0x10]
++0x000006ac: a8c37bfd  ldp x29, x30, [sp], #0x30
++0x000006b0: d65f03c0  ret
+L000006b4:
++0x000006b4: eb15013f  cmp x9, x21
++0x000006b8: 540000a1  b.ne L000006cc
++0x000006bc: f85603b0  ldur x16, [x29, #-0xa0]
++0x000006c0: f9002ab0  str x16, [x21, #0x50]
++0x000006c4: f85683b0  ldur x16, [x29, #-0x98]
++0x000006c8: f9002eb0  str x16, [x21, #0x58]
+L000006cc:
++0x000006cc: d2800021  mov x1, #0x1
++0x000006d0: f9000689  str x9, [x20, #0x8]
++0x000006d4: 910003bf  mov sp, x29
++0x000006d8: f94013f5  ldr x21, [sp, #0x20]
++0x000006dc: a94153f3  ldp x19, x20, [sp, #0x10]
++0x000006e0: a8c37bfd  ldp x29, x30, [sp], #0x30
++0x000006e4: d65f03c0  ret
+L000006e8:
++0x000006e8: 52800011  mov w17, #0x0
++0x000006ec: 14000052  b L00000834
+L000006f0:
++0x000006f0: 52800031  mov w17, #0x1
++0x000006f4: 14000050  b L00000834
+L000006f8:
++0x000006f8: 52800051  mov w17, #0x2
++0x000006fc: 1400004e  b L00000834
+L00000700:
++0x00000700: 52800071  mov w17, #0x3
++0x00000704: 1400004c  b L00000834
+L00000708:
++0x00000708: 52800091  mov w17, #0x4
++0x0000070c: 1400004a  b L00000834
+L00000710:
++0x00000710: d2800140  mov x0, #0xa
++0x00000714: d28000c1  mov x1, #0x6
++0x00000718: f94017a9  ldr x9, [x29, #0x28]
++0x0000071c: 3707f4a9  tbnz w9, #0, L000005b0
++0x00000720: eb15013f  cmp x9, x21
++0x00000724: 540000a1  b.ne L00000738
++0x00000728: f85603b0  ldur x16, [x29, #-0xa0]
++0x0000072c: f9002ab0  str x16, [x21, #0x50]
++0x00000730: f85683b0  ldur x16, [x29, #-0x98]
++0x00000734: f9002eb0  str x16, [x21, #0x58]
+L00000738:
++0x00000738: f9000689  str x9, [x20, #0x8]
++0x0000073c: 910003bf  mov sp, x29
++0x00000740: f94013f5  ldr x21, [sp, #0x20]
++0x00000744: a94153f3  ldp x19, x20, [sp, #0x10]
++0x00000748: a8c37bfd  ldp x29, x30, [sp], #0x30
++0x0000074c: d65f03c0  ret
+L00000750:
++0x00000750: 12800030  mov w16, #0xfffffffe
++0x00000754: b90056b0  str w16, [x21, #0x54]
++0x00000758: aa1403e0  mov x0, x20
++0x0000075c: relocation x16, runtimeStub(id=49,name="jit_finish_error",signature="variadic") ; encoded-bytes=4 redacted
++0x00000760: d63f0200  blr x16
++0x00000764: 14000008  b L00000784
+L00000768:
++0x00000768: f9000fe0  str x0, [sp, #0x18]
++0x0000076c: 12800030  mov w16, #0xfffffffe
++0x00000770: b90056b0  str w16, [x21, #0x54]
++0x00000774: aa0003e1  mov x1, x0
++0x00000778: aa1403e0  mov x0, x20
++0x0000077c: relocation x16, runtimeStub(id=77,name="jit_route_throw",signature="routeThrow1") ; encoded-bytes=4 redacted
++0x00000780: d63f0200  blr x16
+L00000784:
++0x00000784: f100043f  cmp x1, #0x1
++0x00000788: 54fff640  b.eq L00000650
++0x0000078c: f100083f  cmp x1, #0x2
++0x00000790: 54fffc01  b.ne L00000710
++0x00000794: d2800041  mov x1, #0x2
++0x00000798: f94017a9  ldr x9, [x29, #0x28]
++0x0000079c: 3707f0a9  tbnz w9, #0, L000005b0
++0x000007a0: eb15013f  cmp x9, x21
++0x000007a4: 540000a1  b.ne L000007b8
++0x000007a8: f85603b0  ldur x16, [x29, #-0xa0]
++0x000007ac: f9002ab0  str x16, [x21, #0x50]
++0x000007b0: f85683b0  ldur x16, [x29, #-0x98]
++0x000007b4: f9002eb0  str x16, [x21, #0x58]
+L000007b8:
++0x000007b8: f9000689  str x9, [x20, #0x8]
++0x000007bc: 910003bf  mov sp, x29
++0x000007c0: f94013f5  ldr x21, [sp, #0x20]
++0x000007c4: a94153f3  ldp x19, x20, [sp, #0x10]
++0x000007c8: a8c37bfd  ldp x29, x30, [sp], #0x30
++0x000007cc: d65f03c0  ret
++0x000007d0: f81f0ffe  str x30, [sp, #-0x10]!
++0x000007d4: 2a1103e1  mov w1, w17
++0x000007d8: f9400ab0  ldr x16, [x21, #0x10]
++0x000007dc: b5000170  cbnz x16, L00000808
++0x000007e0: d2801610  mov x16, #0xb0
++0x000007e4: cb1003b3  sub x19, x29, x16
++0x000007e8: d2800150  mov x16, #0xa
++0x000007ec: f9000270  str x16, [x19]
++0x000007f0: f9000670  str x16, [x19, #0x8]
++0x000007f4: f9000a70  str x16, [x19, #0x10]
++0x000007f8: f9000e70  str x16, [x19, #0x18]
++0x000007fc: d2800090  mov x16, #0x4
++0x00000800: a90142b3  stp x19, x16, [x21, #0x10]
++0x00000804: 790012b0  strh w16, [x21, #0x8]
+L00000808:
++0x00000808: aa1403e0  mov x0, x20
++0x0000080c: relocation x2, deoptRuntimeData ; encoded-bytes=4 redacted
++0x00000810: 910043e3  add x3, sp, #0x10
++0x00000814: aa1303e4  mov x4, x19
++0x00000818: aa1f03e5  mov x5, xzr
++0x0000081c: relocation x16, runtimeStub(id=50,name="jit_deopt_rebuild_frames",signature="variadic") ; encoded-bytes=4 redacted
++0x00000820: d63f0200  blr x16
++0x00000824: f84107fe  ldr x30, [sp], #0x10
++0x00000828: f100043f  cmp x1, #0x1
++0x0000082c: 54fff721  b.ne L00000710
++0x00000830: d65f03c0  ret
+L00000834:
++0x00000834: d10803ff  sub sp, sp, #0x200
++0x00000838: a90007e0  stp x0, x1, [sp]
++0x0000083c: a9010fe2  stp x2, x3, [sp, #0x10]
++0x00000840: a90217e4  stp x4, x5, [sp, #0x20]
++0x00000844: a9031fe6  stp x6, x7, [sp, #0x30]
++0x00000848: a90427e8  stp x8, x9, [sp, #0x40]
++0x0000084c: a9052fea  stp x10, x11, [sp, #0x50]
++0x00000850: a90637ec  stp x12, x13, [sp, #0x60]
++0x00000854: a9073fee  stp x14, x15, [sp, #0x70]
++0x00000858: a90b5ff6  stp x22, x23, [sp, #0xb0]
++0x0000085c: a90c67f8  stp x24, x25, [sp, #0xc0]
++0x00000860: a90d6ffa  stp x26, x27, [sp, #0xd0]
++0x00000864: f90073fc  str x28, [sp, #0xe0]
++0x00000868: 6d1007e0  stp d0, d1, [sp, #0x100]
++0x0000086c: 6d110fe2  stp d2, d3, [sp, #0x110]
++0x00000870: 6d1217e4  stp d4, d5, [sp, #0x120]
++0x00000874: 6d131fe6  stp d6, d7, [sp, #0x130]
++0x00000878: 6d1847f0  stp d16, d17, [sp, #0x180]
++0x0000087c: 6d194ff2  stp d18, d19, [sp, #0x190]
++0x00000880: 6d1a57f4  stp d20, d21, [sp, #0x1a0]
++0x00000884: 6d1b5ff6  stp d22, d23, [sp, #0x1b0]
++0x00000888: 6d1c67f8  stp d24, d25, [sp, #0x1c0]
++0x0000088c: 6d1d6ffa  stp d26, d27, [sp, #0x1d0]
++0x00000890: 6d1e77fc  stp d28, d29, [sp, #0x1e0]
++0x00000894: fd00fbfe  str d30, [sp, #0x1f0]
++0x00000898: 2a1103e1  mov w1, w17
++0x0000089c: f9400ab0  ldr x16, [x21, #0x10]
++0x000008a0: b5000170  cbnz x16, L000008cc
++0x000008a4: d2801610  mov x16, #0xb0
++0x000008a8: cb1003b3  sub x19, x29, x16
++0x000008ac: d2800150  mov x16, #0xa
++0x000008b0: f9000270  str x16, [x19]
++0x000008b4: f9000670  str x16, [x19, #0x8]
++0x000008b8: f9000a70  str x16, [x19, #0x10]
++0x000008bc: f9000e70  str x16, [x19, #0x18]
++0x000008c0: d2800090  mov x16, #0x4
++0x000008c4: a90142b3  stp x19, x16, [x21, #0x10]
++0x000008c8: 790012b0  strh w16, [x21, #0x8]
+L000008cc:
++0x000008cc: aa1403e0  mov x0, x20
++0x000008d0: relocation x2, deoptRuntimeData ; encoded-bytes=4 redacted
++0x000008d4: 910803e3  add x3, sp, #0x200
++0x000008d8: aa1303e4  mov x4, x19
++0x000008dc: 910003e5  mov x5, sp
++0x000008e0: relocation x16, runtimeStub(id=50,name="jit_deopt_rebuild_frames",signature="variadic") ; encoded-bytes=4 redacted
++0x000008e4: d63f0200  blr x16
++0x000008e8: 910803ff  add sp, sp, #0x200
++0x000008ec: f100043f  cmp x1, #0x1
++0x000008f0: 54ffeb00  b.eq L00000650
++0x000008f4: f94017a9  ldr x9, [x29, #0x28]
++0x000008f8: 3707e5c9  tbnz w9, #0, L000005b0
++0x000008fc: eb15013f  cmp x9, x21
++0x00000900: 540000a1  b.ne L00000914
++0x00000904: f85603b0  ldur x16, [x29, #-0xa0]
++0x00000908: f9002ab0  str x16, [x21, #0x50]
++0x0000090c: f85683b0  ldur x16, [x29, #-0x98]
++0x00000910: f9002eb0  str x16, [x21, #0x58]
+L00000914:
++0x00000914: f9000689  str x9, [x20, #0x8]
++0x00000918: 910003bf  mov sp, x29
++0x0000091c: f94013f5  ldr x21, [sp, #0x20]
++0x00000920: a94153f3  ldp x19, x20, [sp, #0x10]
++0x00000924: a8c37bfd  ldp x29, x30, [sp], #0x30
++0x00000928: d65f03c0  ret
++0x0000092c: 00000000  udf #0x0
++0x00000930: literal runtimeStub(id=95,name="constructor_receiver_probe",signature="leafValue2") ; encoded-bytes=8 redacted
++0x00000938: literal gcCageBase ; encoded-bytes=8 redacted
++0x00000940: literal runtimeStub(id=96,name="constructor_receiver_commit",signature="contextWords") ; encoded-bytes=8 redacted
++0x00000948: literal runtimeStub(id=71,name="jit_prepare_activation",signature="executionEntry0") ; encoded-bytes=8 redacted
++0x00000950: literal runtimeStub(id=88,name="jit_call_overflow",signature="executionEntry0") ; encoded-bytes=8 redacted
+L00000958:
++0x00000958: 01020000  .word 0x01020000
++0x0000095c: 00000006  udf #0x6
+L00000960:
++0x00000960: 00934490  .word 0x00934490
++0x00000964: 00000000  udf #0x0
++0x00000968: literal prototypeValidityCell identity=3260 ; encoded-bytes=8 redacted
+L00000970:
++0x00000970: 00934160  .word 0x00934160
++0x00000974: 00000000  udf #0x0
+L00000978:
++0x00000978: 00934980  .word 0x00934980
++0x0000097c: 00000000  udf #0x0
++0x00000980: literal prototypeValidityCell identity=3271 ; encoded-bytes=8 redacted
+L00000988:
++0x00000988: 009346b0  .word 0x009346b0
++0x0000098c: 00000000  udf #0x0
++0x00000990: literal guardedHeapReference(component=prototype,bytePc=18,runtimeStubId=17) ; encoded-bytes=8 redacted
+L00000998:
++0x00000998: 008a9170  .word 0x008a9170
++0x0000099c: 00000000  udf #0x0
++0x000009a0: literal runtimeStub(id=87,name="jit_call_generic",signature="jsCall") ; encoded-bytes=8 redacted
++0x000009a8: literal runtimeStub(id=83,name="jit_call",signature="executionEntry0") ; encoded-bytes=8 redacted
++0x000009b0: literal runtimeStub(id=91,name="jit_constructor_terminal",signature="contextWords") ; encoded-bytes=8 redacted
++0x000009b8: literal runtimeStub(id=51,name="jit_deopt_call",signature="contextWords") ; encoded-bytes=8 redacted
++0x000009c0: literal runtimeStub(id=49,name="jit_finish_error",signature="variadic") ; encoded-bytes=8 redacted
++0x000009c8: literal runtimeStub(id=77,name="jit_route_throw",signature="routeThrow1") ; encoded-bytes=8 redacted
++0x000009d0: literal deoptRuntimeData ; encoded-bytes=8 redacted
++0x000009d8: literal runtimeStub(id=50,name="jit_deopt_rebuild_frames",signature="variadic") ; encoded-bytes=8 redacted

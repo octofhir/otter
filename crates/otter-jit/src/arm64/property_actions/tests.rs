@@ -436,3 +436,114 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
     assert_eq!(arena, before);
     assert_stability(&arena, &view, 1);
 }
+
+#[test]
+fn shape_directory_reads_live_banks_and_rejects_accessor_and_shared_suffix() {
+    let mut arena = vec![0u64; 640];
+    let mut view = snapshot();
+    view.shape_property_count_byte = 40;
+    view.shape_lookup = otter_vm::object::ShapeLookupLayout {
+        keys_byte: 24,
+        parent_byte: 28,
+        atom_byte: 32,
+        accessor_byte: 36,
+        capacity_byte: 4,
+        entries_byte: 8,
+        entry_bytes: 16,
+    };
+    let atom = 0x1_0431;
+    let capacity = 8u32;
+    let bucket = otter_vm::object::ShapeLookupLayout::atom_hash(atom) & (capacity * 2 - 1);
+    let directory = ROOT;
+    let bucket_byte = directory + 8 + capacity as usize * 16 + bucket as usize * 8;
+    put(&mut arena, RECEIVER, u64::from(OBJECT_BODY_TYPE_TAG));
+    put_offset(
+        &mut arena,
+        RECEIVER + view.object_shape_byte as usize,
+        RECEIVER_SHAPE,
+    );
+    put(
+        &mut arena,
+        RECEIVER_SHAPE + view.shape_inline_capacity_byte as usize,
+        2u8,
+    );
+    put(&mut arena, RECEIVER_SHAPE + 40, 4u32);
+    put_offset(&mut arena, RECEIVER_SHAPE + 24, directory);
+    put(&mut arena, directory + 4, capacity);
+    put_offset(
+        &mut arena,
+        RECEIVER + view.field_layout.slab_handle_byte as usize,
+        SLAB,
+    );
+    put(
+        &mut arena,
+        SLAB + view.field_layout.slab_capacity_byte as usize,
+        2u32,
+    );
+    let inline_value = Value::number_i32(41).to_bits();
+    let suffix_value = Value::number_i32(73).to_bits();
+    put(
+        &mut arena,
+        RECEIVER + view.field_layout.inline_values_byte as usize + 8,
+        inline_value,
+    );
+    put(
+        &mut arena,
+        SLAB + view.field_layout.slab_words_byte as usize + 8,
+        suffix_value,
+    );
+    for alias in [false, true] {
+        let mut ops = Assembler::new().unwrap();
+        let entry = ops.offset();
+        let miss = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        dynasm!(ops ; .arch aarch64 ; mov x12, x0 ; mov x3, x2);
+        for register in [4, 5, 6, 7] {
+            emit_load_u64(&mut ops, register, CANARY);
+        }
+        dynasm!(ops ; .arch aarch64 ; fmov d0, x7);
+        crate::arm64::shape_lookup::emit_load(
+            &mut ops,
+            &view,
+            atom,
+            12,
+            [9, 10, 11, 15],
+            if alias { 12 } else { 0 },
+            miss,
+        );
+        if alias {
+            dynasm!(ops ; .arch aarch64 ; mov x0, x12);
+        }
+        dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+        emit_load_u64(&mut ops, 0, POISON);
+        dynasm!(ops ; .arch aarch64 ; =>done ; ret);
+        let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+        // SAFETY: emitted allocation-free leaf follows the platform C ABI.
+        let call: extern "C" fn(u64, u64, *mut u64) -> u64 =
+            unsafe { std::mem::transmute(code.entry_ptr()) };
+        let receiver = address(&arena, RECEIVER);
+        let probe = || call(receiver, 0, std::ptr::null_mut());
+        let packed = u64::from(atom) << 32;
+        put(&mut arena, bucket_byte, packed | 2);
+        assert_eq!(probe(), inline_value);
+        put(&mut arena, bucket_byte, packed | 4);
+        assert_eq!(probe(), suffix_value);
+        put(&mut arena, bucket_byte, packed | 5);
+        assert_eq!(probe(), POISON);
+        put(&mut arena, bucket_byte, packed | 2 | (1 << 16));
+        assert_eq!(probe(), POISON);
+        put(&mut arena, bucket_byte, 0u64);
+        assert_eq!(probe(), POISON);
+        // A short chain has no directory. The matching transition's count
+        // selects its logical slot rather than the receiver's last slot.
+        put(&mut arena, RECEIVER_SHAPE + 24, 0u32);
+        put(&mut arena, RECEIVER_SHAPE + 32, atom);
+        put(&mut arena, RECEIVER_SHAPE + 40, 2u32);
+        assert_eq!(probe(), inline_value);
+        put(&mut arena, RECEIVER_SHAPE + 36, 1u8);
+        assert_eq!(probe(), POISON);
+        put(&mut arena, RECEIVER_SHAPE + 36, 0u8);
+        put(&mut arena, RECEIVER_SHAPE + 40, 4u32);
+        put_offset(&mut arena, RECEIVER_SHAPE + 24, directory);
+    }
+}

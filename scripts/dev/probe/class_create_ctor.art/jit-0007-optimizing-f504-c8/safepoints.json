@@ -1,0 +1,41 @@
+{
+  "records": [
+    {
+      "id": 4294967292,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967293,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    },
+    {
+      "id": 4294967294,
+      "frameState": 4294967295,
+      "taggedLocations": [
+        {
+          "kind": "spillSlot",
+          "index": 0
+        }
+      ],
+      "inlineFrames": [],
+      "callPc": null
+    }
+  ],
+  "returnSites": []
+}

@@ -4,6 +4,8 @@
 //! - Empty kinds and canonical-home initialized nonempty literals.
 //! - Different caller/callee realms without forbidding the body splice.
 //! - Moving element storage never keeps an interior pointer across collection.
+//! - A collecting allocation keeps every layout proof, a constructed
+//!   receiver's included, but not its youth.
 //!
 //! # Invariants
 //! These tests inspect the production builder before emitting or executing
@@ -278,4 +280,156 @@ fn tenured_object_literals_barrier_each_possible_cell_input() {
             assert!(barriers.is_empty(), "{mode:?} cells are born young");
         }
     }
+}
+
+#[test]
+fn an_allocation_keeps_the_layout_of_a_constructed_receiver() {
+    use otter_vm::jit::{JitCacheIrOp, JitCacheIrProgram, JitFieldType, JitFieldTypeGuard};
+    use otter_vm::object::{FieldLocation, field_type};
+    // `function C() { this.items = []; }` inlined into `new C()`: the array
+    // allocation may collect, which changes no shape, so the store still
+    // runs only the program of the receiver's proved shape.
+    let mut constructor = snapshot(
+        801,
+        0,
+        3,
+        vec![
+            (Op::LoadThis, vec![Operand::Register(0)]),
+            (
+                Op::NewArray,
+                vec![Operand::Register(1), Operand::ConstIndex(0)],
+            ),
+            (
+                Op::StoreProperty,
+                vec![
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                    Operand::Register(1),
+                    Operand::Register(2),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(0)]),
+        ],
+    );
+    let field = FieldLocation::inline(0);
+    constructor.seed_property_attempted_for_test(2);
+    constructor.property_programs.insert(
+        8,
+        vec![JitCacheIrProgram {
+            ops: vec![
+                JitCacheIrOp::GuardShape {
+                    object: 0,
+                    shape: 864,
+                },
+                JitCacheIrOp::GuardExtensible { object: 0, field },
+                JitCacheIrOp::StoreField { object: 0, field },
+                JitCacheIrOp::PublishShape {
+                    object: 0,
+                    shape: 872,
+                },
+            ]
+            .into_boxed_slice(),
+        }],
+    );
+    constructor.field_types.insert(
+        (872, field),
+        JitFieldType {
+            guard: JitFieldTypeGuard {
+                owner_shape: 872,
+                expected: field_type::TOP,
+            },
+            shapes: Default::default(),
+            stored_shapes: Default::default(),
+            nullish_mask: 0,
+        },
+    );
+    let mut caller = snapshot(
+        800,
+        1,
+        2,
+        vec![
+            (
+                Op::New,
+                vec![
+                    Operand::Register(1),
+                    Operand::Register(0),
+                    Operand::ConstIndex(0),
+                ],
+            ),
+            (Op::ReturnValue, vec![Operand::Register(1)]),
+        ],
+    );
+    caller.instructions[0].call_attempted = true;
+    caller.literal_allocations.group_allowed = true;
+    caller.direct_constructs.insert(
+        0,
+        JitDirectCallee {
+            plan: JitDirectCallPlan {
+                function_id: 801,
+                code_object_id: 1,
+                entry_cell: 0,
+                tier: NativeFrameKind::Baseline,
+                this_mode: JitDirectCallThisMode::StrictOrLexical,
+                is_derived_constructor: false,
+                call_flags: otter_vm::native_abi::FUNCTION_CALL_CONSTRUCTIBLE,
+                callee_cell: 0,
+            },
+            receiver_allocation: Some(otter_vm::jit::JitReceiverAllocationPlan {
+                new_target_function_id: 801,
+                new_target_is_class: false,
+                family_id: 1,
+                family_cell: 432,
+                receiver_shape: 0,
+                initial_field_count: 0,
+                inline_capacity: 4,
+                prototype_validity: None,
+                prototype_root: 864,
+            }),
+        },
+    );
+    caller.inline_callees.insert(
+        0,
+        JitInlineCallee {
+            body: Arc::new(constructor),
+        },
+    );
+    let built = graph(&caller);
+    let kinds: Vec<_> = built.graph.nodes.iter().map(|node| &node.kind).collect();
+    let receiver = kinds
+        .iter()
+        .position(|kind| matches!(kind, Kind::NewReceiver(_)))
+        .expect("an inlined receiver allocation");
+    let array = kinds
+        .iter()
+        .position(|kind| **kind == Kind::NewArrayEmpty)
+        .expect("a native array allocation");
+    assert!(receiver < array);
+    let store = built
+        .graph
+        .nodes
+        .iter()
+        .find(|node| matches!(node.kind, Kind::StoreNamedProperty { .. }))
+        .expect("a store through the receiver's program");
+    assert!(
+        matches!(
+            store.kind,
+            Kind::StoreNamedProperty {
+                receiver_shape: Some(864),
+                fresh: false,
+                ..
+            }
+        ),
+        "{:?}",
+        store.kind
+    );
+    assert_eq!(built.graph.node(store.inputs[0]).kind, kinds[receiver].clone());
+    // The array may have collected: the receiver is no longer known young,
+    // so the stored array is barriered.
+    assert!(
+        built
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == Kind::WriteBarrier && node.inputs == store.inputs)
+    );
 }

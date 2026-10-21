@@ -7,13 +7,18 @@
 //! - `node:tty` over pipes and files: stream shapes, color negotiation from
 //!   an explicit environment, and the refusals Node raises.
 //! - `node:tty` in a pseudo-terminal: standard streams that are terminal
-//!   streams, a window size, and raw mode switched on and off.
+//!   streams, a window size, and raw mode switched on and off and handed
+//!   back when the run ends.
+//! - `node:tty` and descriptors the run did not open: refused.
 //!
 //! # Invariants
 //! - Hosted aliases share one cached util export per runtime.
 //! - A terminal stream over a pipe is a `net.Socket` that answers `isTTY`
 //!   from its prototype, has no window size, and colors nothing under
 //!   `NO_COLOR`; a regular file is refused with Node's `uv_tty_init` error.
+//! - The terminal natives reach the standard streams alone: any other
+//!   descriptor, open or not, answers EBADF and receives nothing, and no
+//!   terminal stream is made over it. Raw mode leaves nothing on `process`.
 
 use std::process::{Command, Stdio};
 
@@ -146,9 +151,9 @@ input.destroy();
 
 /// Standard streams in a pseudo-terminal are terminal streams: input is a
 /// `tty.ReadStream` that switches raw mode on and off, and output knows the
-/// terminal's size. A program that exits while raw leaves the terminal as it
-/// found it. `script` provides the terminal; where it is missing the test has
-/// nothing to run in.
+/// terminal's size. Switching leaves nothing on `process`, and a program that
+/// exits while raw leaves the terminal as it found it. `script` provides the
+/// terminal; where it is missing the test has nothing to run in.
 #[cfg(unix)]
 #[test]
 fn node_tty_in_a_pseudo_terminal_is_a_terminal() {
@@ -164,10 +169,14 @@ checks.push(process.stdin instanceof tty.ReadStream && process.stdin.isTTY === t
 checks.push(tty.isatty(0) && tty.isatty(1));
 checks.push(process.stdout.isTTY === true && Number.isInteger(process.stdout.columns));
 checks.push(new tty.WriteStream(1).columns === process.stdout.columns);
+const keys = Reflect.ownKeys(process).length;
 process.stdin.setRawMode(true);
 checks.push(process.stdin.isRaw === true);
 process.stdin.setRawMode(false);
 checks.push(process.stdin.isRaw === false);
+// The mode to hand back is the run's to keep: raw mode leaves nothing on
+// `process` for a program to read, replace or delete.
+checks.push(Reflect.ownKeys(process).length === keys);
 console.log(`checks:${checks.join(',')}`);
 // Left raw on purpose: the run hands the mode back as it ends.
 process.stdin.setRawMode(true);
@@ -198,12 +207,112 @@ process.stdin.setRawMode(true);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stdout.contains("checks:true,true,true,true,true,true,true"),
+        stdout.contains("checks:true,true,true,true,true,true,true,true"),
         "terminal checks failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
         stdout.split_whitespace().any(|flag| flag == "icanon"),
         "the terminal was left raw\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// The terminal natives operate on the run's standard streams alone. The
+/// shell that launches the run leaves two descriptors open that the run never
+/// opened: 8 on its standard error, a pipe, and 9 on a file. No terminal
+/// stream is made over either, and a handle pointed at 9 after it was made
+/// neither writes to it nor changes its mode or blocking flag: each native
+/// answers EBADF, as for a descriptor the process does not have, where the
+/// descriptor itself would have taken the write and the flag, and answered
+/// ENOTTY or EINVAL for a mode.
+#[cfg(unix)]
+#[test]
+fn node_tty_refuses_descriptors_the_run_did_not_open() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        tmp.path().join("main.js"),
+        r#"
+const fs = require('node:fs');
+const tty = require('node:tty');
+const util = require('node:util');
+
+function refusal(make) {
+  try { make(); } catch (error) { return error; }
+  throw new Error('expected a refusal');
+}
+
+// Both are open in this process: whatever refuses them is the run's rule.
+const open = fs.readdirSync('/dev/fd');
+if (!open.includes('8') || !open.includes('9')) {
+  throw new Error(`descriptors 8 and 9 are not open: ${open.join(' ')}`);
+}
+
+for (const fd of [8, 9]) {
+  if (tty.isatty(fd) !== false) throw new Error(`isatty(${fd})`);
+  const failed = refusal(() => new tty.WriteStream(fd));
+  if (failed.code !== 'ERR_TTY_INIT_FAILED' || failed.info.code !== 'EINVAL') {
+    throw new Error(`a stream over ${fd}: ${failed.message}`);
+  }
+}
+
+// Taking a descriptor over without the constructor: on a live handle, and on
+// a bare instance of the class, the way `process.binding('tty_wrap')` and a
+// stream's `_handle.constructor` reach it.
+const live = new tty.WriteStream(1)._handle;
+const bare = Object.create(live.constructor.prototype);
+for (const [call, answer] of [
+  ['open on a live handle', live.open(9)],
+  ['open on a bare handle', live.open.call(bare, 9)],
+]) {
+  const name = answer < 0 ? util.getSystemErrorName(answer) : String(answer);
+  if (name !== 'EINVAL') throw new Error(`${call} answered ${name}`);
+}
+const { TTY } = process.binding('tty_wrap');
+const ctx = {};
+new TTY(9, ctx);
+if (ctx.code !== 'EINVAL') throw new Error(`the binding's TTY over 9: ${ctx.code}`);
+
+// A handle made over standard output, then pointed elsewhere. It writes
+// before it is asked to stop blocking, since a handle that does not block
+// writes through the stream table instead.
+const handle = new tty.WriteStream(1)._handle;
+handle.fd = 9;
+const answers = [
+  ['write', handle.writeUtf8String({}, 'leaked\n')],
+  ['setBlocking', handle.setBlocking(false)],
+  ['getWindowSize', handle.getWindowSize([0, 0])],
+  ['setRawMode(true)', handle.setRawMode(true)],
+];
+// Switching back applies the mode a switch to raw read; the descriptor is
+// refused before that mode is looked at.
+handle._raw = true;
+handle._normalMode = new ArrayBuffer(0);
+answers.push(['setRawMode(false)', handle.setRawMode(false)]);
+for (const [call, answer] of answers) {
+  const name = answer < 0 ? util.getSystemErrorName(answer) : String(answer);
+  if (name !== 'EBADF') throw new Error(`${call} answered ${name}`);
+}
+console.log('refused');
+"#,
+    )
+    .expect("write refusal fixture");
+    let untouched = tmp.path().join("untouched.txt");
+    std::fs::write(&untouched, b"").expect("write untouched file");
+
+    let output = Command::new("sh")
+        .current_dir(tmp.path())
+        .arg("-c")
+        .arg(r#"exec 8>&2 9>>"$1"; exec "$0" --allow-read run main.js"#)
+        .arg(env!("CARGO_BIN_EXE_otter"))
+        .arg(&untouched)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run refusal fixture");
+    assert_success(&output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "refused");
+    assert_eq!(
+        std::fs::read(&untouched).expect("read untouched file"),
+        b"",
+        "a descriptor the run did not open was written to"
     );
 }
 

@@ -301,7 +301,7 @@ fn emit_slot_storage(
 
 /// [`emit_slot_storage`] of `holder` whose current shape's address is already
 /// in `shape`.
-fn emit_slot_storage_of_shape(
+pub(super) fn emit_slot_storage_of_shape(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     holder: u8,

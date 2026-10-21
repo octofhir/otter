@@ -1,0 +1,175 @@
+{
+  "frameStates": [
+    {
+      "id": 0,
+      "frames": [
+        {
+          "functionId": 501,
+          "bytePc": 5,
+          "entry": null,
+          "registerCount": 4,
+          "slots": [
+            [
+              0,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 1,
+      "frames": [
+        {
+          "functionId": 501,
+          "bytePc": 18,
+          "entry": null,
+          "registerCount": 4,
+          "slots": [
+            [
+              0,
+              {
+                "locationKind": "register",
+                "locationValue": "3",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 2,
+      "frames": [
+        {
+          "functionId": 501,
+          "bytePc": 36,
+          "entry": null,
+          "registerCount": 4,
+          "slots": [
+            [
+              0,
+              {
+                "locationKind": "register",
+                "locationValue": "3",
+                "representation": "tagged"
+              }
+            ],
+            [
+              1,
+              {
+                "locationKind": "register",
+                "locationValue": "4",
+                "representation": "tagged"
+              }
+            ],
+            [
+              2,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 3,
+      "frames": [
+        {
+          "functionId": 501,
+          "bytePc": 36,
+          "entry": null,
+          "registerCount": 4,
+          "slots": [
+            [
+              0,
+              {
+                "locationKind": "stackSlot",
+                "locationValue": "8",
+                "representation": "tagged"
+              }
+            ],
+            [
+              1,
+              {
+                "locationKind": "stackSlot",
+                "locationValue": "16",
+                "representation": "tagged"
+              }
+            ],
+            [
+              2,
+              {
+                "locationKind": "stackSlot",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    }
+  ],
+  "exits": [
+    {
+      "id": 0,
+      "frameStateId": 0,
+      "reason": "shapeGuard",
+      "action": "recompile",
+      "resumePcs": [
+        1
+      ]
+    },
+    {
+      "id": 1,
+      "frameStateId": 1,
+      "reason": "shapeGuard",
+      "action": "recompile",
+      "resumePcs": [
+        2
+      ]
+    },
+    {
+      "id": 2,
+      "frameStateId": 2,
+      "reason": "identityGuard",
+      "action": "recompile",
+      "resumePcs": [
+        4
+      ]
+    },
+    {
+      "id": 3,
+      "frameStateId": 2,
+      "reason": "identityGuard",
+      "action": "recompile",
+      "resumePcs": [
+        4
+      ]
+    },
+    {
+      "id": 4,
+      "frameStateId": 3,
+      "reason": "identityGuard",
+      "action": "recompile",
+      "resumePcs": [
+        4
+      ]
+    }
+  ]
+}

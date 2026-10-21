@@ -21,7 +21,6 @@
 //! - Interrupting the watcher terminates the child; a run never outlives the
 //!   watcher that started it.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode};
 use std::sync::mpsc;
@@ -31,6 +30,7 @@ use clap::Args;
 use notify::{RecursiveMode, Watcher as _};
 
 use crate::OtterError;
+use crate::output::stderrln;
 
 /// How long a burst of filesystem events is allowed to settle before a
 /// restart. Long enough to absorb one editor save, short enough to feel
@@ -90,7 +90,7 @@ pub(crate) fn run_watch(args: WatchArgs) -> Result<ExitCode, OtterError> {
         if !changed {
             continue;
         }
-        let _ = writeln!(std::io::stderr(), "restarting: file change detected");
+        stderrln!("restarting: file change detected");
         terminate(&mut child);
         child = spawn_target(&executable, &args)?;
     }

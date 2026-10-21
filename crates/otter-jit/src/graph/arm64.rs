@@ -211,6 +211,10 @@ struct Codegen<'a> {
     fused: FxHashMap<NodeId, NodeId>,
     /// The successors of the producer being emitted, while it is fused.
     sink: Option<BooleanSink>,
+    /// Debug builds: how many entries at the front of `deferred` already
+    /// audit their stubs against the node that queued them.
+    #[cfg(debug_assertions)]
+    deferred_audited: usize,
 }
 
 /// Where a boolean producer fused with its block's branch delivers its
@@ -371,6 +375,8 @@ pub(crate) fn emit(
         veneers: Vec::new(),
         fused: FxHashMap::default(),
         sink: None,
+        #[cfg(debug_assertions)]
+        deferred_audited: 0,
     };
     codegen.fused = super::emission::fused_branches(&built.graph, allocation);
     let tier_entry = codegen.ops.offset().0;
@@ -902,6 +908,10 @@ impl<'a> Codegen<'a> {
         while let Some(deferred) = self.deferred.pop() {
             deferred(self);
         }
+        #[cfg(debug_assertions)]
+        {
+            self.deferred_audited = 0;
+        }
         self.flush_veneers();
         let deopt = self.deopt;
         for index in self.exits_flushed..self.exits.len() {
@@ -979,13 +989,13 @@ impl<'a> Codegen<'a> {
                 }
                 if let Some(&control) = self.fused.get(&node) {
                     self.sink = Some(self.branch_sink(control));
-                    let emitted = self.emit_node(node);
+                    let emitted = self.audited(node, |codegen| codegen.emit_node(node));
                     self.sink = None;
                     emitted?;
                     fused_control = Some(control);
                     continue;
                 }
-                self.emit_node(node)?;
+                self.audited(node, |codegen| codegen.emit_node(node))?;
                 if let (Some(result), Some(&slot)) =
                     (allocation.result, self.allocation.spill.get(&node))
                     && result != slot
@@ -1004,10 +1014,37 @@ impl<'a> Codegen<'a> {
                 self.emit_move(m.from, m.to);
             }
             let next = order.get(position + 1).copied();
-            self.emit_control(block, control, next)?;
+            self.audited(control, |codegen| {
+                codegen.emit_control(block, control, next)
+            })?;
         }
         debug_assert!(forwarders.is_empty(), "every forwarding target is emitted");
         Ok(())
+    }
+
+    /// Run `emit` for `node`. Debug builds check that every runtime stub it
+    /// calls, and every stub of the deferred code it queues, is one of the
+    /// node's [`Kind::slow_path_stubs`].
+    fn audited<T>(&mut self, node: NodeId, emit: impl FnOnce(&mut Self) -> T) -> T {
+        #[cfg(debug_assertions)]
+        {
+            let outer = self.relocations.begin_stub_audit();
+            let queued = self.deferred.len();
+            let result = emit(self);
+            // A flush during `emit` ran everything queued before it.
+            for index in queued.min(self.deferred_audited)..self.deferred.len() {
+                let deferred: Deferred<'a> =
+                    std::mem::replace(&mut self.deferred[index], Box::new(|_: &mut Self| {}));
+                self.deferred[index] =
+                    Box::new(move |codegen: &mut Codegen<'a>| codegen.audited(node, deferred));
+            }
+            self.deferred_audited = self.deferred.len();
+            let called = self.relocations.end_stub_audit(outer);
+            self.graph.node(node).kind.audit_stub_calls(&called);
+            result
+        }
+        #[cfg(not(debug_assertions))]
+        emit(self)
     }
 
     fn emit_node(&mut self, node: NodeId) -> Result<(), Unsupported> {
@@ -2067,6 +2104,20 @@ impl<'a> Codegen<'a> {
                 self.emit_function_bag(
                     Self::gp(input(0)),
                     Self::gp(result.expect("function bag result")),
+                    exit,
+                );
+            }
+            Kind::LoadShapedProperty { atom } => {
+                let atom = *atom;
+                let exit = self.eager_exit(node, DeoptReason::OwnDataMiss);
+                let view = self.view_of(node);
+                crate::arm64::shape_lookup::emit_load(
+                    &mut self.ops,
+                    view,
+                    atom,
+                    Self::gp(input(0)),
+                    allocation.gp_temps[..4].try_into().unwrap(),
+                    Self::gp(result.expect("shape lookup result")),
                     exit,
                 );
             }

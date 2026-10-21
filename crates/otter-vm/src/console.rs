@@ -21,6 +21,9 @@
 //! - Error-shaped objects render through the same
 //!   `Error.prototype.toString` helper used by uncaught exception
 //!   diagnostics.
+//! - The default sink never panics on a failed write: a line its
+//!   stream refuses (a closed pipe, a full disk) is dropped, as
+//!   Node's console drops it, and the program goes on.
 //!
 //! # See also
 //! - <https://console.spec.whatwg.org/>
@@ -78,8 +81,8 @@ pub enum ConsoleLevel {
 /// Embedder-overridable console sink.
 ///
 /// The default sink writes `log` / `info` / `debug` to stdout and
-/// `warn` / `error` / `trace` / failed `assert` to stderr using
-/// `println!` / `eprintln!`.
+/// `warn` / `error` / `trace` / failed `assert` to stderr, dropping a
+/// line the stream refuses.
 pub trait ConsoleSink: Send + Sync + std::fmt::Debug + 'static {
     /// Write one console event. `fields` are already rendered in
     /// JavaScript argument order.
@@ -89,22 +92,26 @@ pub trait ConsoleSink: Send + Sync + std::fmt::Debug + 'static {
 /// Shared console sink handle.
 pub type ConsoleSinkHandle = Arc<dyn ConsoleSink>;
 
-/// Default console sink backed by `println!` / `eprintln!`.
+/// Default console sink over the process's standard output and
+/// standard error.
 #[derive(Debug, Default)]
 pub struct StdConsoleSink;
 
 impl ConsoleSink for StdConsoleSink {
     fn write(&self, level: ConsoleLevel, fields: &[String]) {
+        use std::io::Write as _;
         let line = fields.join(" ");
-        match level {
-            ConsoleLevel::Log | ConsoleLevel::Info | ConsoleLevel::Debug => println!("{line}"),
+        // A line the stream refuses (its reader is gone) is dropped: a
+        // console reports what the program does and never stops it.
+        let _ = match level {
+            ConsoleLevel::Log | ConsoleLevel::Info | ConsoleLevel::Debug => {
+                writeln!(std::io::stdout().lock(), "{line}")
+            }
             ConsoleLevel::Warn
             | ConsoleLevel::Error
             | ConsoleLevel::Trace
-            | ConsoleLevel::Assert => {
-                eprintln!("{line}")
-            }
-        }
+            | ConsoleLevel::Assert => writeln!(std::io::stderr().lock(), "{line}"),
+        };
     }
 }
 

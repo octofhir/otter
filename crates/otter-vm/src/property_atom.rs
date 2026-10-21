@@ -25,7 +25,8 @@
 //!   isolate's life, which is what lets shapes and caches store bare ids.
 //! - The interner is keyed by a hash of UTF-16 code units, so a runtime
 //!   string's atom is found from its Latin-1 or wide units in place. Its one
-//!   owner is the isolate's shape runtime; no lock guards it.
+//!   owner is the isolate's heap ([`crate::isolate_names`]); no lock guards
+//!   it.
 //! - Each interned spelling has one backing allocation shared by the name-to-id
 //!   map and the id-to-name table.
 //! - A chunk's atom table starts unresolved and is resolved by the interpreter
@@ -83,8 +84,8 @@ impl AtomId {
 ///
 /// The table is keyed by a hash of the UTF-16 code units, so a runtime
 /// string looks its atom up from its own Latin-1 or wide units with no
-/// decoded copy. The isolate's single mutator owns it through its shape
-/// runtime: no lock guards any read or mint.
+/// decoded copy. The isolate's single mutator owns it through its heap
+/// ([`crate::isolate_names::IsolateNames`]): no lock guards any read or mint.
 #[derive(Debug, Default)]
 pub(crate) struct NameInterner {
     /// Atom ids by content hash; equality reads the id's spelling.

@@ -550,10 +550,20 @@ leaves through an eager deopt. An overflow addition may allocate its suffix;
 ordinary stores use `StorePropertyCached` even when that transition is known,
 with a resident-suffix hit and a rooted committed miss. Strict overflow stores
 retain their baseline operation. One unknown program keeps the whole site
-generic. Megamorphic sites, and sites whose earlier generation exited with
-`shapeGuard`, lower to
-`LoadPropertyCached` / `StorePropertyCached`: the current terminal shared
-feedback selects a probe of the isolate's one property action table
+generic. Megamorphic named reads use `LoadShapedProperty`: the receiver's
+current ordinary shape owns the complete atom-to-slot directory. A bucket
+contains the atom, logical slot and descriptor facts; shared directories are
+bounded by that shape's own key count. Short shapes use their transition chain.
+Both native backends read the current inline or suffix bank without a runtime
+call, safepoint or action-cache lookup. The operation reads only map words and
+the named field, so repeated data reads can be commoned across unrelated writes.
+An absent key, accessor, dictionary or exotic receiver leaves before the source
+get with `ownDataMiss`; that exact source site then uses its committed lookup.
+Earlier `shapeGuard` exits do not suppress this complete directory operation.
+
+Fallback reads and megamorphic stores use `LoadPropertyCached` /
+`StorePropertyCached`: terminal shared feedback selects a probe of the
+isolate's one property action table
 (`propertyActionCacheTable` relocation). One receiver shape and atom key
 holds independent load and store facts. An inherited holder read and a
 different own addition slot can coexist. Native hits prove the live

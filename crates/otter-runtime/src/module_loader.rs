@@ -25,6 +25,11 @@
 //! - Remote source caching and concurrent fetch scheduling are owned by the
 //!   higher-level async graph driver. This loader only reads its completed
 //!   cache while CPU-bound graph construction runs on a blocking worker.
+//! - A `node:` specifier names one of the hosted builtins an `import` may
+//!   reach, or nothing: it never falls back to a package or a file.
+//! - A failure Node reports with a code of its own carries what Node says
+//!   ([`LoaderError::node_error`]): an unknown builtin, and a bare specifier
+//!   whose package is installed in no `node_modules` above the importer.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-hostloadimportedmodule>
@@ -352,6 +357,37 @@ impl LoaderError {
     pub(crate) fn into_otter_error(self) -> crate::OtterError {
         crate::map_graph_error(crate::module_graph::GraphError::Loader(self))
     }
+
+    /// The `code` and message Node gives this failure, for the failures it
+    /// reports with a code of its own.
+    #[must_use]
+    pub fn node_error(&self) -> Option<(&'static str, String)> {
+        match self {
+            Self::UnknownBuiltin { specifier, .. } => Some((
+                "ERR_UNKNOWN_BUILTIN_MODULE",
+                format!("No such built-in module: {specifier}"),
+            )),
+            Self::PackageNotFound {
+                package, importer, ..
+            } => Some((
+                "ERR_MODULE_NOT_FOUND",
+                format!("Cannot find package '{package}' imported from {importer}"),
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// The package a bare specifier names: its first path segment, or the first
+/// two for a scoped `@scope/name`.
+fn package_name(specifier: &str) -> &str {
+    let mut segments = specifier.match_indices('/').map(|(index, _)| index);
+    let end = if specifier.starts_with('@') {
+        segments.nth(1)
+    } else {
+        segments.next()
+    };
+    end.map_or(specifier, |end| &specifier[..end])
 }
 
 /// Charge one retained source to the loader's ledger.
@@ -706,6 +742,30 @@ pub enum LoaderError {
         /// Underlying reason.
         message: String,
     },
+    /// A `node:` specifier naming no builtin this loader serves an `import`.
+    #[error("cannot resolve `{specifier}` from `{referrer}`: No such built-in module: {specifier}")]
+    UnknownBuiltin {
+        /// Raw specifier, scheme included.
+        specifier: String,
+        /// Importer's URL (or working directory for entry).
+        referrer: String,
+    },
+    /// A bare specifier whose package is installed in no `node_modules`
+    /// directory above the importer.
+    #[error(
+        "cannot resolve `{specifier}` from `{referrer}`: Cannot find package '{package}' imported from {importer}"
+    )]
+    PackageNotFound {
+        /// Raw specifier.
+        specifier: String,
+        /// The package name the specifier starts with.
+        package: String,
+        /// Importer's URL (or working directory for entry).
+        referrer: String,
+        /// The importer as Node names it: its file path, or the directory a
+        /// referrer-less request resolves from.
+        importer: String,
+    },
     /// File extension is not a foundation source extension.
     #[error("unsupported source extension for `{url}`: {extension}")]
     Extension {
@@ -1019,6 +1079,12 @@ impl ModuleLoader {
                 specifier: specifier.to_string(),
             });
         }
+        if specifier.starts_with("node:") {
+            return Err(LoaderError::UnknownBuiltin {
+                specifier: specifier.to_string(),
+                referrer: referrer.unwrap_or("<entry>").to_string(),
+            });
+        }
         // A `data:` module carries its own source, so it is already
         // canonical and needs no filesystem or network reach.
         if is_data_url(specifier) {
@@ -1182,7 +1248,28 @@ impl ModuleLoader {
                 specifier: specifier.to_string(),
             });
         }
-        oxc(bare)
+        oxc(bare).map_err(|error| {
+            // Node's ESM resolver reports a package installed nowhere above
+            // the importer as such, before it looks at any file inside one.
+            let package = package_name(bare);
+            let installed = dir
+                .ancestors()
+                .any(|ancestor| ancestor.join("node_modules").join(package).is_dir());
+            if kind == ImportKind::Cjs || bare.starts_with('#') || installed {
+                return error;
+            }
+            LoaderError::PackageNotFound {
+                specifier: specifier.to_string(),
+                package: package.to_string(),
+                referrer: referrer.unwrap_or("<entry>").to_string(),
+                // A CommonJS importer's referrer is its path, an ES module's
+                // its `file://` URL; a referrer-less request has its directory.
+                importer: match referrer.map(|url| url.strip_prefix("file://").unwrap_or(url)) {
+                    Some(path) if Path::new(path).is_absolute() => path.to_string(),
+                    _ => dir.to_string_lossy().into_owned(),
+                },
+            }
+        })
     }
 
     fn check_network_capability(
@@ -1566,12 +1653,48 @@ mod tests {
     fn bare_specifier_unknown_resolves_with_error_message() {
         let dir = temp_dir();
         let loader = ModuleLoader::new(dir.path().to_path_buf());
-        // `oxc_resolver` returns a resolution failure for an
-        // unknown bare name (no node_modules tree).
+        // A package installed in no `node_modules` above the importer is
+        // Node's "Cannot find package", scoped names included.
+        for (specifier, package) in [
+            (
+                "definitely-not-installed-pkg",
+                "definitely-not-installed-pkg",
+            ),
+            ("@scope/missing/sub/path.js", "@scope/missing"),
+        ] {
+            let err = loader
+                .resolve(specifier, None)
+                .expect_err("bare specifier with no install must fail");
+            assert!(
+                matches!(&err, LoaderError::PackageNotFound { package: name, .. } if name == package),
+                "{err:?}"
+            );
+            let (code, message) = err.node_error().expect("a missing package has a Node code");
+            assert_eq!(code, "ERR_MODULE_NOT_FOUND");
+            assert!(
+                message.starts_with(&format!("Cannot find package '{package}' imported from ")),
+                "{message}"
+            );
+        }
+        // An installed package missing the file asked for is a plain
+        // resolution failure.
+        std::fs::create_dir_all(dir.path().join("node_modules/present")).unwrap();
         let err = loader
-            .resolve("definitely-not-installed-pkg", None)
-            .expect_err("bare specifier with no install must fail");
-        assert!(matches!(err, LoaderError::Resolve { .. }));
+            .resolve("present/absent.js", None)
+            .expect_err("a missing file inside an installed package must fail");
+        assert!(matches!(err, LoaderError::Resolve { .. }), "{err:?}");
+        assert_eq!(err.node_error(), None);
+        // A `node:` specifier names a builtin the loader serves, or nothing.
+        let err = loader
+            .resolve("node:internal/util", None)
+            .expect_err("an unknown builtin must fail");
+        assert_eq!(
+            err.node_error(),
+            Some((
+                "ERR_UNKNOWN_BUILTIN_MODULE",
+                "No such built-in module: node:internal/util".to_string()
+            ))
+        );
     }
 
     #[test]

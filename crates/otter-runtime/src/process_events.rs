@@ -9,7 +9,8 @@
 //! # Contents
 //! - [`install`] creates hidden listener state and installs EventEmitter methods.
 //! - Listener add/remove/query operations over stable JS-owned records.
-//! - Deferred `process.emitWarning` construction and delivery.
+//! - Deferred `process.emitWarning` construction and delivery, printed by
+//!   default through the global console's `error`, as Node's `writeOut`.
 //!
 //! # Invariants
 //! - Incoming `Value`s enter a handle scope before the first allocation.
@@ -703,7 +704,7 @@ fn process_emit_warning(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
                 Ok::<Value, NativeError>(scope.finish(event))
             })?;
             emit_values(ctx, process, event, &[warning])?;
-            print_warning_default(ctx, process, warning);
+            print_warning_default(ctx, process, warning)?;
             Ok(Value::undefined())
         },
     )?;
@@ -718,7 +719,11 @@ fn process_emit_warning(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
 /// Node's default warning printer: `(node:pid) [CODE] Name: message` on
 /// stderr, or the warning's stack under `--trace-warnings`. Printing — not
 /// emission — is what `--no-warnings` and `--disable-warning` switch off.
-fn print_warning_default(ctx: &mut NativeCtx<'_>, process: Value, warning: Value) {
+fn print_warning_default(
+    ctx: &mut NativeCtx<'_>,
+    process: Value,
+    warning: Value,
+) -> Result<(), NativeError> {
     use std::io::Write;
 
     let read_process = |ctx: &NativeCtx<'_>, key: &str| -> Option<Value> {
@@ -730,7 +735,7 @@ fn print_warning_default(ctx: &mut NativeCtx<'_>, process: Value, warning: Value
         .and_then(|value| value.as_boolean())
         .unwrap_or(false);
     if silenced {
-        return;
+        return Ok(());
     }
     let read_warning = |ctx: &NativeCtx<'_>, key: &str| -> Option<String> {
         warning
@@ -752,7 +757,7 @@ fn print_warning_default(ctx: &mut NativeCtx<'_>, process: Value, warning: Value
             };
             let entry = entry.to_lossy_string(ctx.heap());
             if Some(entry.as_str()) == code.as_deref() || entry == name {
-                return;
+                return Ok(());
             }
         }
     }
@@ -777,23 +782,57 @@ fn print_warning_default(ctx: &mut NativeCtx<'_>, process: Value, warning: Value
             .open(&path)
     {
         let _ = writeln!(file, "{head}");
-        return;
+        return Ok(());
     }
-    let mut err = std::io::stderr();
+    let mut text = head;
     if trace {
         // First line gets the pid/code prefix; the stack's frame lines
         // follow untouched.
-        let _ = writeln!(err, "{head}");
         if let Some(stack) = read_warning(ctx, "stack") {
             for line in stack.lines().skip(1) {
-                let _ = writeln!(err, "{line}");
+                text.push('\n');
+                text.push_str(line);
             }
         }
-    } else {
-        let _ = writeln!(err, "{head}");
-        if let Some(detail) = detail {
-            let _ = writeln!(err, "{detail}");
+    } else if let Some(detail) = detail {
+        text.push('\n');
+        text.push_str(&detail);
+    }
+    write_warning(ctx, &text)
+}
+
+/// Write a warning the way Node's `writeOut` does: through the global
+/// console's `error`, so it reaches stderr by the same stream as the
+/// program's own `console.error` lines — a stream whose reader has gone
+/// reports the failure as that console would. A runtime without the Node
+/// console writes the warning to stderr directly, dropping it if refused.
+///
+/// # Errors
+/// Returns the console's throw, or a native error when its module fails to
+/// load.
+fn write_warning(ctx: &mut NativeCtx<'_>, text: &str) -> Result<(), NativeError> {
+    use std::io::Write;
+
+    if let Ok(host) = crate::process::process_host(ctx) {
+        let written = ctx.scope(|mut scope| {
+            let Some(console) = crate::commonjs::cjs_load_builtin(
+                &mut scope,
+                &host.cjs,
+                "internal/console/global",
+            )?
+            else {
+                return Ok::<bool, NativeError>(false);
+            };
+            let error = scope.get(console, "error")?;
+            let message = scope.string(text)?;
+            let undefined = scope.undefined();
+            scope.call(error, undefined, &[message])?;
+            Ok(true)
+        })?;
+        if written {
+            return Ok(());
         }
     }
-    let _ = err.flush();
+    let _ = writeln!(std::io::stderr().lock(), "{text}");
+    Ok(())
 }

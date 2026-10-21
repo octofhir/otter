@@ -1,0 +1,1076 @@
+{
+  "frameStates": [
+    {
+      "id": 0,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 23,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [
+            [
+              0,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ],
+            [
+              1,
+              {
+                "locationKind": "register",
+                "locationValue": "1",
+                "representation": "tagged"
+              }
+            ],
+            [
+              2,
+              {
+                "locationKind": "register",
+                "locationValue": "2",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 1,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 46,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [
+            [
+              0,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ],
+            [
+              1,
+              {
+                "locationKind": "register",
+                "locationValue": "1",
+                "representation": "tagged"
+              }
+            ],
+            [
+              2,
+              {
+                "locationKind": "register",
+                "locationValue": "3",
+                "representation": "tagged"
+              }
+            ],
+            [
+              3,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 2,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 59,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [
+            [
+              0,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ],
+            [
+              1,
+              {
+                "locationKind": "register",
+                "locationValue": "1",
+                "representation": "tagged"
+              }
+            ],
+            [
+              2,
+              {
+                "locationKind": "register",
+                "locationValue": "3",
+                "representation": "tagged"
+              }
+            ],
+            [
+              3,
+              {
+                "locationKind": "register",
+                "locationValue": "4",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 3,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 111,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [
+            [
+              0,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ],
+            [
+              1,
+              {
+                "locationKind": "register",
+                "locationValue": "1",
+                "representation": "tagged"
+              }
+            ],
+            [
+              4,
+              {
+                "locationKind": "register",
+                "locationValue": "32",
+                "representation": "float64"
+              }
+            ],
+            [
+              5,
+              {
+                "locationKind": "register",
+                "locationValue": "3",
+                "representation": "tagged"
+              }
+            ],
+            [
+              6,
+              {
+                "locationKind": "register",
+                "locationValue": "4",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 4,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 163,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [
+            [
+              1,
+              {
+                "locationKind": "register",
+                "locationValue": "1",
+                "representation": "tagged"
+              }
+            ],
+            [
+              4,
+              {
+                "locationKind": "register",
+                "locationValue": "32",
+                "representation": "float64"
+              }
+            ],
+            [
+              7,
+              {
+                "locationKind": "register",
+                "locationValue": "33",
+                "representation": "float64"
+              }
+            ],
+            [
+              8,
+              {
+                "locationKind": "register",
+                "locationValue": "2",
+                "representation": "tagged"
+              }
+            ],
+            [
+              9,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 5,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 174,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [
+            [
+              1,
+              {
+                "locationKind": "register",
+                "locationValue": "1",
+                "representation": "tagged"
+              }
+            ],
+            [
+              4,
+              {
+                "locationKind": "register",
+                "locationValue": "32",
+                "representation": "float64"
+              }
+            ],
+            [
+              7,
+              {
+                "locationKind": "register",
+                "locationValue": "33",
+                "representation": "float64"
+              }
+            ],
+            [
+              10,
+              {
+                "locationKind": "register",
+                "locationValue": "34",
+                "representation": "float64"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 6,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 174,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [
+            [
+              1,
+              {
+                "locationKind": "stackSlot",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ],
+            [
+              4,
+              {
+                "locationKind": "stackSlot",
+                "locationValue": "16",
+                "representation": "float64"
+              }
+            ],
+            [
+              7,
+              {
+                "locationKind": "stackSlot",
+                "locationValue": "24",
+                "representation": "float64"
+              }
+            ],
+            [
+              10,
+              {
+                "locationKind": "stackSlot",
+                "locationValue": "32",
+                "representation": "float64"
+              }
+            ]
+          ],
+          "arguments": null
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 7,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 196,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [],
+          "arguments": null
+        },
+        {
+          "functionId": 501,
+          "bytePc": 5,
+          "entry": {
+            "returnRegister": 1,
+            "this": {
+              "locationKind": "register",
+              "locationValue": "0",
+              "representation": "tagged"
+            },
+            "closure": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            },
+            "newTarget": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            }
+          },
+          "registerCount": 4,
+          "slots": [
+            [
+              0,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": [
+            {
+              "locationKind": "register",
+              "locationValue": "32",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "33",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "34",
+              "representation": "float64"
+            }
+          ]
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 8,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 196,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [],
+          "arguments": null
+        },
+        {
+          "functionId": 501,
+          "bytePc": 18,
+          "entry": {
+            "returnRegister": 1,
+            "this": {
+              "locationKind": "register",
+              "locationValue": "0",
+              "representation": "tagged"
+            },
+            "closure": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            },
+            "newTarget": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            }
+          },
+          "registerCount": 4,
+          "slots": [
+            [
+              0,
+              {
+                "locationKind": "register",
+                "locationValue": "3",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": [
+            {
+              "locationKind": "register",
+              "locationValue": "32",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "33",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "34",
+              "representation": "float64"
+            }
+          ]
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 9,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 196,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [],
+          "arguments": null
+        },
+        {
+          "functionId": 501,
+          "bytePc": 36,
+          "entry": {
+            "returnRegister": 1,
+            "this": {
+              "locationKind": "register",
+              "locationValue": "0",
+              "representation": "tagged"
+            },
+            "closure": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            },
+            "newTarget": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            }
+          },
+          "registerCount": 4,
+          "slots": [
+            [
+              0,
+              {
+                "locationKind": "register",
+                "locationValue": "3",
+                "representation": "tagged"
+              }
+            ],
+            [
+              1,
+              {
+                "locationKind": "register",
+                "locationValue": "5",
+                "representation": "tagged"
+              }
+            ],
+            [
+              2,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": [
+            {
+              "locationKind": "register",
+              "locationValue": "32",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "33",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "34",
+              "representation": "float64"
+            }
+          ]
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 10,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 196,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [],
+          "arguments": null
+        },
+        {
+          "functionId": 501,
+          "bytePc": 53,
+          "entry": {
+            "returnRegister": 1,
+            "this": {
+              "locationKind": "register",
+              "locationValue": "0",
+              "representation": "tagged"
+            },
+            "closure": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            },
+            "newTarget": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            }
+          },
+          "registerCount": 4,
+          "slots": [],
+          "arguments": [
+            {
+              "locationKind": "register",
+              "locationValue": "32",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "33",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "34",
+              "representation": "float64"
+            }
+          ]
+        },
+        {
+          "functionId": 502,
+          "bytePc": 15,
+          "entry": {
+            "returnRegister": 3,
+            "this": {
+              "locationKind": "register",
+              "locationValue": "0",
+              "representation": "tagged"
+            },
+            "closure": {
+              "locationKind": "register",
+              "locationValue": "3",
+              "representation": "tagged"
+            },
+            "newTarget": {
+              "locationKind": "literal",
+              "locationValue": "0x000000000000000a",
+              "representation": "tagged"
+            }
+          },
+          "registerCount": 9,
+          "slots": [
+            [
+              1,
+              {
+                "locationKind": "register",
+                "locationValue": "4",
+                "representation": "tagged"
+              }
+            ],
+            [
+              2,
+              {
+                "locationKind": "register",
+                "locationValue": "5",
+                "representation": "tagged"
+              }
+            ],
+            [
+              3,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ],
+            [
+              4,
+              {
+                "locationKind": "register",
+                "locationValue": "1",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": [
+            {
+              "locationKind": "register",
+              "locationValue": "1",
+              "representation": "tagged"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "4",
+              "representation": "tagged"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "5",
+              "representation": "tagged"
+            }
+          ]
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 11,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 196,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [],
+          "arguments": null
+        },
+        {
+          "functionId": 501,
+          "bytePc": 53,
+          "entry": {
+            "returnRegister": 1,
+            "this": {
+              "locationKind": "register",
+              "locationValue": "0",
+              "representation": "tagged"
+            },
+            "closure": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            },
+            "newTarget": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            }
+          },
+          "registerCount": 4,
+          "slots": [],
+          "arguments": [
+            {
+              "locationKind": "register",
+              "locationValue": "32",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "33",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "34",
+              "representation": "float64"
+            }
+          ]
+        },
+        {
+          "functionId": 502,
+          "bytePc": 46,
+          "entry": {
+            "returnRegister": 3,
+            "this": {
+              "locationKind": "register",
+              "locationValue": "0",
+              "representation": "tagged"
+            },
+            "closure": {
+              "locationKind": "register",
+              "locationValue": "3",
+              "representation": "tagged"
+            },
+            "newTarget": {
+              "locationKind": "literal",
+              "locationValue": "0x000000000000000a",
+              "representation": "tagged"
+            }
+          },
+          "registerCount": 9,
+          "slots": [
+            [
+              2,
+              {
+                "locationKind": "register",
+                "locationValue": "5",
+                "representation": "tagged"
+              }
+            ],
+            [
+              3,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ],
+            [
+              4,
+              {
+                "locationKind": "register",
+                "locationValue": "4",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": [
+            {
+              "locationKind": "register",
+              "locationValue": "1",
+              "representation": "tagged"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "4",
+              "representation": "tagged"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "5",
+              "representation": "tagged"
+            }
+          ]
+        }
+      ],
+      "virtualObjects": []
+    },
+    {
+      "id": 12,
+      "frames": [
+        {
+          "functionId": 503,
+          "bytePc": 196,
+          "entry": null,
+          "registerCount": 13,
+          "slots": [],
+          "arguments": null
+        },
+        {
+          "functionId": 501,
+          "bytePc": 53,
+          "entry": {
+            "returnRegister": 1,
+            "this": {
+              "locationKind": "register",
+              "locationValue": "0",
+              "representation": "tagged"
+            },
+            "closure": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            },
+            "newTarget": {
+              "locationKind": "register",
+              "locationValue": "2",
+              "representation": "tagged"
+            }
+          },
+          "registerCount": 4,
+          "slots": [],
+          "arguments": [
+            {
+              "locationKind": "register",
+              "locationValue": "32",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "33",
+              "representation": "float64"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "34",
+              "representation": "float64"
+            }
+          ]
+        },
+        {
+          "functionId": 502,
+          "bytePc": 77,
+          "entry": {
+            "returnRegister": 3,
+            "this": {
+              "locationKind": "register",
+              "locationValue": "0",
+              "representation": "tagged"
+            },
+            "closure": {
+              "locationKind": "register",
+              "locationValue": "3",
+              "representation": "tagged"
+            },
+            "newTarget": {
+              "locationKind": "literal",
+              "locationValue": "0x000000000000000a",
+              "representation": "tagged"
+            }
+          },
+          "registerCount": 9,
+          "slots": [
+            [
+              3,
+              {
+                "locationKind": "register",
+                "locationValue": "0",
+                "representation": "tagged"
+              }
+            ],
+            [
+              4,
+              {
+                "locationKind": "register",
+                "locationValue": "5",
+                "representation": "tagged"
+              }
+            ]
+          ],
+          "arguments": [
+            {
+              "locationKind": "register",
+              "locationValue": "1",
+              "representation": "tagged"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "4",
+              "representation": "tagged"
+            },
+            {
+              "locationKind": "register",
+              "locationValue": "5",
+              "representation": "tagged"
+            }
+          ]
+        }
+      ],
+      "virtualObjects": []
+    }
+  ],
+  "exits": [
+    {
+      "id": 0,
+      "frameStateId": 0,
+      "reason": "shapeGuard",
+      "action": "recompile",
+      "resumePcs": [
+        3
+      ]
+    },
+    {
+      "id": 1,
+      "frameStateId": 1,
+      "reason": "shapeGuard",
+      "action": "recompile",
+      "resumePcs": [
+        5
+      ]
+    },
+    {
+      "id": 2,
+      "frameStateId": 2,
+      "reason": "typeMismatch",
+      "action": "recompile",
+      "resumePcs": [
+        6
+      ]
+    },
+    {
+      "id": 3,
+      "frameStateId": 2,
+      "reason": "typeMismatch",
+      "action": "recompile",
+      "resumePcs": [
+        6
+      ]
+    },
+    {
+      "id": 4,
+      "frameStateId": 3,
+      "reason": "typeMismatch",
+      "action": "recompile",
+      "resumePcs": [
+        11
+      ]
+    },
+    {
+      "id": 5,
+      "frameStateId": 3,
+      "reason": "typeMismatch",
+      "action": "recompile",
+      "resumePcs": [
+        11
+      ]
+    },
+    {
+      "id": 6,
+      "frameStateId": 4,
+      "reason": "typeMismatch",
+      "action": "recompile",
+      "resumePcs": [
+        16
+      ]
+    },
+    {
+      "id": 7,
+      "frameStateId": 4,
+      "reason": "typeMismatch",
+      "action": "recompile",
+      "resumePcs": [
+        16
+      ]
+    },
+    {
+      "id": 8,
+      "frameStateId": 5,
+      "reason": "identityGuard",
+      "action": "recompile",
+      "resumePcs": [
+        17
+      ]
+    },
+    {
+      "id": 9,
+      "frameStateId": 6,
+      "reason": "identityGuard",
+      "action": "recompile",
+      "resumePcs": [
+        17
+      ]
+    },
+    {
+      "id": 10,
+      "frameStateId": 6,
+      "reason": "receiverAllocationMiss",
+      "action": "resume",
+      "resumePcs": [
+        17
+      ]
+    },
+    {
+      "id": 11,
+      "frameStateId": 7,
+      "reason": "shapeGuard",
+      "action": "recompile",
+      "resumePcs": [
+        18,
+        1
+      ]
+    },
+    {
+      "id": 12,
+      "frameStateId": 8,
+      "reason": "shapeGuard",
+      "action": "recompile",
+      "resumePcs": [
+        18,
+        2
+      ]
+    },
+    {
+      "id": 13,
+      "frameStateId": 9,
+      "reason": "identityGuard",
+      "action": "recompile",
+      "resumePcs": [
+        18,
+        4
+      ]
+    },
+    {
+      "id": 14,
+      "frameStateId": 10,
+      "reason": "shapeGuard",
+      "action": "recompile",
+      "resumePcs": [
+        18,
+        5,
+        2
+      ]
+    },
+    {
+      "id": 15,
+      "frameStateId": 11,
+      "reason": "shapeGuard",
+      "action": "recompile",
+      "resumePcs": [
+        18,
+        5,
+        5
+      ]
+    },
+    {
+      "id": 16,
+      "frameStateId": 12,
+      "reason": "shapeGuard",
+      "action": "recompile",
+      "resumePcs": [
+        18,
+        5,
+        8
+      ]
+    }
+  ]
+}

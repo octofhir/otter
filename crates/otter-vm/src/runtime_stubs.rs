@@ -1638,44 +1638,29 @@ pub extern "C" fn to_boolean_leaf(
 }
 
 /// String internalization lookup for a keyed access: the atom the isolate's
-/// name interner holds for the content of the flat string `key_bits`, as a
-/// raw atom id. The caller records it in the string's atom word. Flat content
-/// the interner never saw answers [`UNINTERNED_KEY`]: no shaped object has
-/// that property, and the caller records nothing. A rope (its units are not
-/// contiguous), a lone surrogate or a thread without a published runtime
-/// context misses; nothing allocates.
+/// name interner, read from the heap, holds for the content of the flat
+/// string `key_bits` (the second argument is ignored), as a raw atom id. The
+/// caller records it in the string's atom word. Flat content the interner
+/// never saw answers [`UNINTERNED_KEY`]: no shaped object has that property,
+/// and the caller records nothing. A rope (its units are not contiguous), a
+/// lone surrogate or a heap no isolate owns misses; nothing allocates.
 #[must_use]
 pub extern "C" fn string_key_atom_leaf(
     heap: *const otter_gc::GcHeap,
-    thread_bits: u64,
     key_bits: u64,
+    _ignored: u64,
 ) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
     let Some(heap) = heap_ref(heap) else {
         return NativeResultPair::miss();
     };
-    let thread = thread_bits as *const crate::native_abi::VmThread;
-    if thread.is_null() {
+    let Some(isolate) = crate::isolate_names::IsolateNames::get(heap) else {
         return NativeResultPair::miss();
-    }
-    // SAFETY: generated code passes its live `VmThread`, which outlives the
-    // compiled entry making this synchronous call.
-    let runtime_context = unsafe { (*thread).runtime_context };
-    if runtime_context == 0 {
-        return NativeResultPair::miss();
-    }
-    // SAFETY: `runtime_context` is published from a live VmRuntimeActivation
-    // whose interpreter is the mutator running this call; the reference is
-    // shared, read-only and not retained.
-    let vm = unsafe {
-        let activation = &*(runtime_context as *const crate::jit::VmRuntimeActivation);
-        &*activation.vm_ptr()
     };
     let Some(key) = Value::from_abi_bits(key_bits).as_string(heap) else {
         return NativeResultPair::miss();
     };
-    match crate::string::gc_body::lookup_atom_in_place(heap, key.handle(), vm.shape_runtime.names())
-    {
+    match crate::string::gc_body::lookup_atom_in_place(heap, key.handle(), isolate.names()) {
         Some(atom) if atom != crate::property_atom::AtomId::NONE => {
             NativeResultPair::success_bits(u64::from(atom.raw()))
         }
@@ -4187,6 +4172,35 @@ mod tests {
         );
         assert_eq!(probe_status(pair), NativeResultStatus::Success);
         assert_eq!(probe_value(pair), Some(Value::boolean(true)));
+    }
+
+    #[test]
+    fn string_key_atom_leaf_reads_the_names_the_heap_owns() {
+        let mut heap = otter_gc::GcHeap::new().expect("gc heap");
+        let key = crate::string::JsString::from_str("x", &mut heap).expect("key");
+        let atom_of = |heap: &otter_gc::GcHeap, key: crate::string::JsString| {
+            invoke_leaf_no_alloc_stub2(
+                heap,
+                STUB_STRING_KEY_ATOM_LEAF.id,
+                Value::string(key),
+                Value::undefined(),
+            )
+        };
+        // A heap no isolate owns has no interner to ask.
+        assert_eq!(
+            probe_status(atom_of(&heap, key)),
+            NativeResultStatus::SideExit
+        );
+
+        let _shapes = crate::object::ShapeRuntime::new(&mut heap).expect("shape runtime");
+        let unseen = atom_of(&heap, key);
+        assert_eq!(probe_status(unseen), NativeResultStatus::Success);
+        assert_eq!(unseen.payload_bits(), UNINTERNED_KEY);
+
+        let atom = crate::isolate_names::names_mut(&mut heap).intern("x");
+        let interned = atom_of(&heap, key);
+        assert_eq!(probe_status(interned), NativeResultStatus::Success);
+        assert_eq!(interned.payload_bits(), u64::from(atom.raw()));
     }
 
     #[test]

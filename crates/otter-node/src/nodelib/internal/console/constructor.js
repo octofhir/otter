@@ -425,10 +425,17 @@ ObjectDefineProperties(Console.prototype, {
 
       // Otter: with no stream built and nothing to tell, the line goes to
       // the descriptor (`unbuiltOutput`); otherwise the stream is read here.
+      // A line the descriptor refuses goes to the stream instead, which
+      // writes it again and meets the failure through its own error path.
       const unbuilt = unbuiltOutput(this, useStdout);
       if (unbuilt !== undefined) {
-        otterStdio.write(unbuilt.fd, string);
-        return;
+        try {
+          otterStdio.write(unbuilt.fd, string);
+          return;
+        } catch (e) {
+          if (lazyErrors().isStackOverflowError(e))
+            throw e;
+        }
       }
       const stream = useStdout ? this._stdout : this._stderr;
 

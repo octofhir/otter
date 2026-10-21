@@ -16,6 +16,11 @@
 //!   cache keys.
 //! - `cjs_load` - load hosted modules, files, and native addons through the
 //!   shared module-record cache.
+//! - [`create_require`] - `module.createRequire`: the `require` of a user
+//!   module at any path.
+//! - [`user_may_load`] - which builtin ids code outside the builtins reaches.
+//! - `module_not_found` / `unknown_builtin` - Node's errors for a request that
+//!   names nothing, with the require stack that led to it.
 //! - [`SCHEME_ONLY_BUILTINS`] - builtins a user module reaches only as
 //!   `node:<name>`.
 //!
@@ -44,6 +49,18 @@
 //! - A bare specifier names a builtin only when the requester is allowed to
 //!   spell it that way: builtins require each other bare, while a user module
 //!   naming a [`SCHEME_ONLY_BUILTINS`] entry gets `node_modules` resolution.
+//! - An internal id (`internal/*`, and the engine's `__*` natives) names a
+//!   builtin only for a builtin's own `require` and for the runtime's own
+//!   loads ([`cjs_load_builtin`]). User code's `require`, `createRequire`,
+//!   `require.resolve` and `import` resolve it as a package and fail the way
+//!   Node's do; under `--expose-internals` the `internal/*` ids except the
+//!   realm module open to them, as in Node.
+//! - A user `require` of a `node:` id that names no builtin it may load throws
+//!   `ERR_UNKNOWN_BUILTIN_MODULE`; `require.resolve` of one reports
+//!   `MODULE_NOT_FOUND`, and answers a builtin with the request as written.
+//! - `MODULE_NOT_FOUND` names the files whose first `require`s led to the
+//!   failing request, newest first, in its message and as `requireStack`.
+//!   Builtins are never part of that stack.
 //! - Re-entry uses [`otter_vm::Interpreter::run_callable_sync`] and the
 //!   code-space-linked wrapper from `create_commonjs_wrapper`; the unsafe
 //!   `Interpreter::run` (which swaps `code_space`) is never called nested.
@@ -79,7 +96,15 @@ pub(crate) struct CjsConfig {
     /// parent. Set once per run, from the environment the parent spawned
     /// it with; see [`watch_reporting_requested`].
     pub(crate) report_watch_dependencies: bool,
+    /// `--expose-internals`: user code may load the `internal/*` builtins
+    /// (all but the realm module), as Node lets it under that switch.
+    pub(crate) expose_internals: bool,
 }
+
+/// The run's CommonJS configuration as a host service, so a static native
+/// such as [`create_require`] can build a `require` without capturing it.
+#[derive(Debug, Clone)]
+pub(crate) struct CommonJsHost(pub(crate) Arc<CjsConfig>);
 
 /// Whether the parent that spawned this process asked to be told what it
 /// requires.
@@ -219,22 +244,63 @@ pub const SCHEME_ONLY_BUILTINS: &[&str] = &[
     "vfs",
 ];
 
-/// Resolve a builtin (hosted) module by specifier. Matches the bare specifier
-/// directly (`fs`) or the `node:`-prefixed form (`node:fs`).
-fn resolve_builtin(cfg: &CjsConfig, spec: &str, from_builtin: bool) -> Option<HostedModule> {
-    if !spec.starts_with("node:") && !spec.starts_with('.') && !Path::new(spec).is_absolute() {
-        if !from_builtin && SCHEME_ONLY_BUILTINS.contains(&spec) {
-            return None;
-        }
-        let prefixed = format!("node:{spec}");
-        if let Some(hm) = cfg.hosted.iter().find(|h| h.specifier() == prefixed) {
-            return Some(*hm);
-        }
+/// The builtin that supplies `primordials` and `internalBinding` to the
+/// others. Like Node's loader, it stays out of user code's reach even under
+/// `--expose-internals`.
+const REALM_MODULE: &str = "internal/bootstrap/realm";
+
+/// Whether code outside the builtins may load the builtin `specifier`, bare
+/// or `node:`-prefixed.
+///
+/// The internal ids — Node's `internal/*` and the engine's `__*` natives —
+/// are the builtins' own dependencies. `expose_internals`
+/// (`--expose-internals`) opens the `internal/*` ones except the realm
+/// module, exactly the set Node opens.
+#[must_use]
+pub(crate) fn user_may_load(specifier: &str, expose_internals: bool) -> bool {
+    let id = specifier.strip_prefix("node:").unwrap_or(specifier);
+    if id.starts_with("__") {
+        return false;
     }
+    if id.starts_with("internal/") {
+        return expose_internals && id != REALM_MODULE;
+    }
+    true
+}
+
+/// The hosted row registered under exactly `name`.
+fn hosted_row(cfg: &CjsConfig, name: &str) -> Option<HostedModule> {
     cfg.hosted
         .iter()
-        .find(|hosted| hosted.specifier() == spec)
         .copied()
+        .find(|hosted| hosted.specifier() == name)
+}
+
+/// Resolve a builtin (hosted) module by specifier for one requester.
+///
+/// `<id>` and `node:<id>` reach the same row — the `node:<id>` one when it is
+/// registered, `<id>` otherwise — so every spelling shares one module record.
+/// A requester outside the builtins reaches only what [`user_may_load`]
+/// admits, and a [`SCHEME_ONLY_BUILTINS`] entry only through the scheme.
+fn resolve_builtin(cfg: &CjsConfig, spec: &str, from_builtin: bool) -> Option<HostedModule> {
+    let (id, scheme) = match spec.strip_prefix("node:") {
+        Some(id) => (id, true),
+        None => (spec, false),
+    };
+    if !from_builtin
+        && (!user_may_load(id, cfg.expose_internals)
+            || (!scheme && SCHEME_ONLY_BUILTINS.contains(&id)))
+    {
+        return None;
+    }
+    let prefixed;
+    let canonical = if scheme {
+        spec
+    } else {
+        prefixed = format!("node:{id}");
+        &prefixed
+    };
+    hosted_row(cfg, canonical).or_else(|| hosted_row(cfg, id))
 }
 
 #[derive(Debug)]
@@ -249,10 +315,12 @@ struct CjsResolution {
     filename: String,
     dir: PathBuf,
     target: CjsTarget,
+    /// The require chain of the module that asked for this one.
+    parent: Option<Arc<RequireChain>>,
 }
 
 impl CjsResolution {
-    fn file(path: PathBuf) -> Self {
+    fn file(path: PathBuf, parent: Option<Arc<RequireChain>>) -> Self {
         let filename = path.to_string_lossy().into_owned();
         let dir = path
             .parent()
@@ -262,32 +330,55 @@ impl CjsResolution {
             filename,
             dir,
             target: CjsTarget::File(path),
+            parent,
         }
     }
 
     /// The referrer this module's own `require` resolves from.
+    ///
+    /// A file heads its own require chain; a builtin adds nothing to the
+    /// chain it was loaded through, as Node's builtins appear in no require
+    /// stack.
     fn referrer(&self) -> CjsReferrer {
+        let (file, chain) = match &self.target {
+            CjsTarget::File(path) => (
+                Some(path.clone()),
+                Some(Arc::new(RequireChain {
+                    filename: self.filename.clone(),
+                    parent: self.parent.clone(),
+                })),
+            ),
+            CjsTarget::Hosted(_) => (None, self.parent.clone()),
+        };
         CjsReferrer {
             dir: self.dir.clone(),
-            file: match &self.target {
-                CjsTarget::File(path) => Some(path.clone()),
-                CjsTarget::Hosted(_) => None,
-            },
+            file,
+            chain,
         }
     }
+}
+
+/// Why `resolve_module` found nothing.
+#[derive(Debug, Clone, Copy)]
+enum Unresolved {
+    /// No builtin, package or file answers to the specifier.
+    NotFound,
+    /// A `node:` specifier naming no builtin the requester may load.
+    UnknownBuiltin,
 }
 
 /// Resolve one specifier and derive its sole cache key.
 ///
 /// The selected hosted row is authoritative for aliases, so both
 /// `fs/promises` and `node:fs/promises` use `node:fs/promises` when that is the
-/// registered specifier. Files use their canonical absolute path.
+/// registered specifier. Files use their canonical absolute path. A `node:`
+/// specifier names a builtin or nothing: no file answers to it.
 fn resolve_module(
     cfg: &CjsConfig,
     referrer: &CjsReferrer,
     spec: &str,
     from_builtin: bool,
-) -> Result<CjsResolution, NativeError> {
+) -> Result<CjsResolution, Unresolved> {
     if let Some(hosted) = resolve_builtin(cfg, spec, from_builtin) {
         let key = hosted.specifier().to_string();
         return Ok(CjsResolution {
@@ -295,29 +386,82 @@ fn resolve_module(
             key,
             dir: referrer.dir.clone(),
             target: CjsTarget::Hosted(hosted),
+            parent: referrer.chain.clone(),
         });
+    }
+    if spec.starts_with("node:") {
+        return Err(Unresolved::UnknownBuiltin);
     }
     let path = cfg
         .resolver
         .resolve_require(spec, referrer.file.as_deref(), &referrer.dir)
-        .map_err(|_| {
-            // Node reports an unresolvable specifier as a plain `Error`
-            // carrying `MODULE_NOT_FOUND`; callers branch on the code.
-            NativeError::Coded {
-                kind: otter_vm::error_classes::ErrorKind::Error,
-                code: "MODULE_NOT_FOUND",
-                message: format!("Cannot find module '{spec}'"),
-            }
-        })?;
-    Ok(CjsResolution::file(path))
+        .map_err(|_| Unresolved::NotFound)?;
+    Ok(CjsResolution::file(path, referrer.chain.clone()))
 }
 
-/// The module a `require` resolves from: its directory, and its file when it
-/// has one (a hosted builtin has none).
+/// One file in the chain of first `require`s that led to a module, newest
+/// first: what Node prints as the `Require stack` of a failed request.
+#[derive(Debug)]
+struct RequireChain {
+    filename: String,
+    parent: Option<Arc<RequireChain>>,
+}
+
+/// The module a `require` resolves from: its directory, its file when it has
+/// one (a hosted builtin has none), and the require chain that loaded it.
 #[derive(Debug, Clone)]
 struct CjsReferrer {
     dir: PathBuf,
     file: Option<PathBuf>,
+    chain: Option<Arc<RequireChain>>,
+}
+
+/// Node's `ERR_UNKNOWN_BUILTIN_MODULE`, for a `node:` request that names no
+/// builtin the requester may load.
+fn unknown_builtin(spec: &str) -> NativeError {
+    NativeError::Coded {
+        kind: otter_vm::error_classes::ErrorKind::Error,
+        code: "ERR_UNKNOWN_BUILTIN_MODULE",
+        message: format!("No such built-in module: {spec}"),
+    }
+}
+
+/// Node's `MODULE_NOT_FOUND`: `Cannot find module '<request>'`, then the
+/// require stack of the module that asked — its own file and the files whose
+/// first `require`s led to it — which the error also carries as
+/// `requireStack`.
+fn module_not_found(
+    ctx: &mut NativeCtx<'_>,
+    request: &str,
+    chain: Option<&Arc<RequireChain>>,
+) -> NativeError {
+    let stack: Vec<&str> = std::iter::successors(chain, |link| link.parent.as_ref())
+        .map(|link| link.filename.as_str())
+        .collect();
+    let mut message = format!("Cannot find module '{request}'");
+    if !stack.is_empty() {
+        message.push_str("\nRequire stack:\n- ");
+        message.push_str(&stack.join("\n- "));
+    }
+    let built = ctx.scope(|mut scope| -> Result<Value, NativeError> {
+        let constructor = scope.error_constructor(otter_vm::error_classes::ErrorKind::Error);
+        let text = scope.string(&message)?;
+        let error = scope.construct(constructor, &[text])?;
+        let flags = Attr::data().to_flags();
+        let code = scope.string("MODULE_NOT_FOUND")?;
+        scope.define(error, "code", code, flags)?;
+        let frames = scope.array(stack.len())?;
+        for (index, filename) in stack.iter().enumerate() {
+            let filename = scope.string(filename)?;
+            scope.set_index(frames, index, filename)?;
+        }
+        scope.define(error, "requireStack", frames, flags)?;
+        Ok(scope.finish(error))
+    });
+    match built {
+        Ok(error) => ctx.throw_value("require", error),
+        Err(error) => error,
+    }
 }
 
 /// Build a per-module `require` native function bound to its referrer. The
@@ -359,9 +503,9 @@ fn make_require<'scope>(
 /// Build `require.resolve` for one referrer.
 ///
 /// It answers with the same resolution `require` itself would take — a
-/// builtin reports its registered specifier, a file its canonical path —
-/// and reports an unresolvable specifier the way `require` does, with a
-/// `MODULE_NOT_FOUND` error.
+/// builtin with the request as written, as Node does, a file with its
+/// canonical path — and reports anything unresolvable, a `node:` id naming
+/// no builtin included, with `MODULE_NOT_FOUND`.
 fn make_require_resolve<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     cfg: Arc<CjsConfig>,
@@ -377,9 +521,15 @@ fn make_require_resolve<'scope>(
                 "module specifier is required",
             ));
         }
-        let resolution = resolve_module(&cfg, &referrer, &spec, from_builtin)?;
+        let Ok(resolution) = resolve_module(&cfg, &referrer, &spec, from_builtin) else {
+            return Err(module_not_found(ctx, &spec, referrer.chain.as_ref()));
+        };
+        let answer = match resolution.target {
+            CjsTarget::Hosted(_) => spec.as_str(),
+            CjsTarget::File(_) => resolution.filename.as_str(),
+        };
         ctx.scope(|mut scope| {
-            let filename = scope.string(&resolution.filename)?;
+            let filename = scope.string(answer)?;
             Ok(scope.finish(filename))
         })
     })?;
@@ -639,7 +789,13 @@ fn cjs_load(
     spec: &str,
     from_builtin: bool,
 ) -> Result<Value, NativeError> {
-    let resolution = resolve_module(cfg, referrer, spec, from_builtin)?;
+    let resolution = match resolve_module(cfg, referrer, spec, from_builtin) {
+        Ok(resolution) => resolution,
+        Err(Unresolved::UnknownBuiltin) => return Err(unknown_builtin(spec)),
+        Err(Unresolved::NotFound) => {
+            return Err(module_not_found(ctx, spec, referrer.chain.as_ref()));
+        }
+    };
     if cfg.report_watch_dependencies
         && let CjsTarget::File(path) = &resolution.target
     {
@@ -653,14 +809,15 @@ fn cjs_load(
     })
 }
 
-/// Load one hosted builtin by specifier through the CommonJS pipeline, so its
-/// own `require` graph, aliases, and cycles behave exactly as they do for a
-/// `require()` from JavaScript.
+/// Load a builtin the runtime itself asks for, by the name it is registered
+/// under, through the CommonJS pipeline, so its own `require` graph, aliases,
+/// and cycles behave exactly as they do for a `require()` from JavaScript.
 ///
-/// The ESM side calls this for a builtin that publishes only a CommonJS value:
-/// the namespace it synthesizes has to hold the same object `require` would
-/// return, and that object can only be produced by running the installer with
-/// a working `require` in hand.
+/// The runtime's own requests reach the internal builtins — the standard
+/// streams, the IPC channel, a builtin started as the main program, and
+/// `process.getBuiltinModule`, through which the realm installers reach
+/// theirs. A bare [`SCHEME_ONLY_BUILTINS`] name is a builtin only inside the
+/// builtin graph.
 ///
 /// Returns `None` when discovery finds no hosted builtin, before cache
 /// preparation or installation.
@@ -672,18 +829,92 @@ pub(crate) fn cjs_load_builtin<'scope>(
     cfg: &Arc<CjsConfig>,
     specifier: &str,
 ) -> Result<Option<Local<'scope>>, NativeError> {
+    let hosted = if specifier.starts_with("node:") {
+        hosted_row(cfg, specifier)
+    } else if SCHEME_ONLY_BUILTINS.contains(&specifier) {
+        None
+    } else {
+        hosted_row(cfg, &format!("node:{specifier}")).or_else(|| hosted_row(cfg, specifier))
+    };
+    let Some(hosted) = hosted else {
+        return Ok(None);
+    };
+    load_builtin(scope, cfg, hosted).map(Some)
+}
+
+/// Load a builtin user code asked for by name, as `require` from a user
+/// module would find it ([`user_may_load`]).
+///
+/// The ESM side calls this for a builtin that publishes only a CommonJS value:
+/// the namespace it synthesizes has to hold the same object `require` would
+/// return, and that object can only be produced by running the installer with
+/// a working `require` in hand.
+///
+/// Returns `None` when the name is no builtin user code may load, before
+/// cache preparation or installation.
+///
+/// # Errors
+/// Returns the original native error from cache preparation or installation.
+pub(crate) fn cjs_load_user_builtin<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    cfg: &Arc<CjsConfig>,
+    specifier: &str,
+) -> Result<Option<Local<'scope>>, NativeError> {
     let Some(hosted) = resolve_builtin(cfg, specifier, false) else {
         return Ok(None);
     };
+    load_builtin(scope, cfg, hosted).map(Some)
+}
+
+fn load_builtin<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    cfg: &Arc<CjsConfig>,
+    hosted: HostedModule,
+) -> Result<Local<'scope>, NativeError> {
     let key = hosted.specifier().to_string();
     let resolution = CjsResolution {
         filename: key.clone(),
         key,
         dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         target: CjsTarget::Hosted(hosted),
+        parent: None,
     };
     let cache = canonical_cache(scope)?;
-    load_resolved_scoped(scope, cfg, cache, &resolution, None).map(Some)
+    load_resolved_scoped(scope, cfg, cache, &resolution, None)
+}
+
+/// `module.createRequire(filename)`: the `require` a user module at
+/// `filename` has — Node's resolution from that file's directory, the realm's
+/// one module cache, and `filename` at the head of the require stack of
+/// anything it cannot find.
+///
+/// `filename` is an absolute path; `node:module` checks the argument and turns
+/// a URL into one before it calls this.
+///
+/// # Errors
+/// Returns a native error when the run has no CommonJS configuration or an
+/// allocation fails.
+pub fn create_require(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    let CommonJsHost(cfg) = ctx
+        .host_service::<CommonJsHost>()
+        .ok_or_else(|| runtime_type_error("createRequire", "CommonJS is not enabled"))?;
+    let filename = crate::runtime_arg_to_string(args, 0, ctx.heap());
+    let path = PathBuf::from(&filename);
+    let referrer = CjsReferrer {
+        dir: path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
+        file: Some(path),
+        chain: Some(Arc::new(RequireChain {
+            filename,
+            parent: None,
+        })),
+    };
+    ctx.scope(|mut scope| {
+        let cache = canonical_cache(&mut scope)?;
+        let require = make_require(&mut scope, cfg, cache, referrer, false)?;
+        Ok(scope.finish(require))
+    })
 }
 
 /// The realm's one require cache. Every load path — the CommonJS entry
@@ -722,7 +953,7 @@ pub(crate) fn cjs_instantiate_file(
     abs: &Path,
     source: &str,
 ) -> Result<Value, NativeError> {
-    let resolution = CjsResolution::file(abs.to_path_buf());
+    let resolution = CjsResolution::file(abs.to_path_buf(), None);
     // The entry counts too: a watching parent maps a file to the tests that
     // depend on it, and a test file is its own first dependency.
     if cfg.report_watch_dependencies {

@@ -253,7 +253,7 @@ impl ModulePreparation {
             .clone()
             .unwrap_or_else(|| event_loop.remote_module_provider());
         Self {
-            loader: RuntimeModuleLoaderState::new(config.loader.clone()),
+            loader: RuntimeModuleLoaderState::new(config.loader.clone(), config.expose_internals),
             hosted_modules: config.hosted_modules.clone(),
             package_manager: RuntimePackageManagerHandle::from_loader_config(
                 config.loader.as_ref(),
@@ -1470,6 +1470,12 @@ enum RuntimeCommand {
         commonjs_scope: Option<std::path::PathBuf>,
         reply: RunReply,
     },
+    RunBuiltinMain {
+        id: CommandId,
+        /// The builtin the runtime loads as the main program.
+        builtin: String,
+        reply: RunReply,
+    },
 }
 
 #[cfg(test)]
@@ -1843,6 +1849,22 @@ impl RuntimeHandle {
             id,
             source,
             commonjs_scope,
+            reply,
+        }) {
+            return ExecutionAttempt::from_result(Err(error), None, None);
+        }
+        self.await_run_reply(rx).await
+    }
+
+    /// Start the builtin `builtin` as the run's main program, the way Node
+    /// starts its `internal/main/*` entries, and drive the event loop until
+    /// it is idle.
+    pub async fn run_builtin_main(&self, builtin: impl Into<String>) -> ExecutionAttempt {
+        let (reply, rx) = oneshot::channel();
+        let id = self.next_command_id();
+        if let Err(error) = self.submit(RuntimeCommand::RunBuiltinMain {
+            id,
+            builtin: builtin.into(),
             reply,
         }) {
             return ExecutionAttempt::from_result(Err(error), None, None);
@@ -3487,6 +3509,16 @@ impl IsolateRunner {
                     .with_exit_code_override(exit_override);
                 send_run_reply(reply, attempt, &self.counters);
             }
+            RuntimeCommand::RunBuiltinMain { builtin, reply, .. } => {
+                let result = self.runtime.run_builtin_main(&builtin);
+                let result = self.drive_event_loop_to_idle(result);
+                let (result, exit_override) = self.finalize_process_exit(result);
+                let attempt = self
+                    .runtime
+                    .finish_jit_debug_attempt(result)
+                    .with_exit_code_override(exit_override);
+                send_run_reply(reply, attempt, &self.counters);
+            }
         }
         self.counters
             .running_command
@@ -3752,7 +3784,8 @@ impl RuntimeCommand {
             | RuntimeCommand::RunModule { id, .. }
             | RuntimeCommand::RunModuleSource { id, .. }
             | RuntimeCommand::RunModuleInRealm { id, .. }
-            | RuntimeCommand::Eval { id, .. } => *id,
+            | RuntimeCommand::Eval { id, .. }
+            | RuntimeCommand::RunBuiltinMain { id, .. } => *id,
         }
     }
 }

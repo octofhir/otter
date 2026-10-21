@@ -121,8 +121,24 @@ function buildStdout(fd, write) {
   // would take the program's own output away from anything else writing to
   // the same descriptor.
   stream.end = function endStdout() { return this; };
-  stream.destroy = function destroyStdout() { return this; };
+  // Destroying it — as a refused write does — reports the error and leaves
+  // the descriptor open: the stream comes back writable, so a reader that has
+  // gone surfaces as `'error'` on every write that fails.
+  stream.destroySoon = stream.destroy;
+  stream._destroy = keepDescriptor;
   return stream;
+}
+
+// Node's `_destroy` for the standard outputs: the descriptor is never closed.
+function keepDescriptor(err, cb) {
+  cb(err);
+  this._undestroy();
+  // 'close' is still observable, so `finished` and `pipeline` settle.
+  if (!this._writableState.emitClose) {
+    process.nextTick(() => {
+      this.emit('close');
+    });
+  }
 }
 
 // What an output stream says about its descriptor: which one it is, whether

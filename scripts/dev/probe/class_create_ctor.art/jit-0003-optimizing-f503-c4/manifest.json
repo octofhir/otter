@@ -1,0 +1,31 @@
+{
+  "target": "aarch64-apple-darwin",
+  "architecture": "aarch64",
+  "operatingSystem": "macos",
+  "tier": "optimizing",
+  "functionId": 503,
+  "functionName": "subtract",
+  "module": "/Users/alexanderstreltsov/work/octofhir/otter/scripts/dev/probe/class_create_ctor.js",
+  "codeObjectId": 4,
+  "entry": {
+    "kind": "entry"
+  },
+  "bytecodeBytes": 201,
+  "codeBytes": 4344,
+  "exactCodeIsRuntimeLocal": true,
+  "filesPresent": [
+    "manifest.json",
+    "bytecode.txt",
+    "optimized-ir.txt",
+    "code.bin",
+    "code-normalized.bin",
+    "asm.txt",
+    "code-map.json",
+    "relocations.json",
+    "deopt.json",
+    "safepoints.json"
+  ],
+  "filesAbsent": [
+    "template-plan.txt"
+  ]
+}

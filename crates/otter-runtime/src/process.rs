@@ -5,7 +5,8 @@
 //! - [`install_global`] materializes `process` and default argv from one host snapshot.
 //! - [`ProcessHost`] and [`process_host`]: what the `process` natives read
 //!   about the run — working directory, clock origin, CommonJS configuration
-//!   and capability grants.
+//!   and capability grants — inserted beside the run's own record of the
+//!   terminal modes it changes ([`crate::terminal::TerminalModes`]).
 //! - [`ProcessRunState`] and [`define_run_state`]: the `process` properties
 //!   that belong to one run — arguments, executable, identity, environment,
 //!   warning switches and inherited channel.
@@ -28,10 +29,13 @@
 //!   installation, and again over a restored image after that run's
 //!   [`ProcessHost`] is inserted, so nothing of the image writer's run
 //!   survives into a launch.
-//! - A run leaves the terminals it switched to raw mode as it found them:
-//!   once the `'exit'` listeners have run, and before `abort()`,
-//!   [`reset_terminals`] calls the reset `node:tty` registered. The modes
-//!   live with the isolate that changed them, never in process-global state.
+//! - A run leaves the terminals it changed as it found them: once the
+//!   `'exit'` listeners have run — whether they completed, threw or exited —
+//!   the exit path hands back every mode the run's terminal record kept, from
+//!   Rust, as `abort()` does first ([`crate::terminal`]). The record is a
+//!   host service each run inserts afresh, so no program can see or change
+//!   it, and for a run that changed no terminal the hand-back allocates
+//!   nothing, calls no JavaScript and makes no system call.
 //! - Default arguments are declarative absence until installation. One host
 //!   snapshot supplies the default argv, execPath and pid/ppid; `uptime()`
 //!   and `hrtime()` count from the start recorded in the run's
@@ -127,6 +131,8 @@ pub(crate) fn install_global(
         cjs: cjs.clone(),
         capabilities: capabilities.clone(),
     });
+    #[cfg(unix)]
+    interp.insert_host_service(crate::terminal::TerminalModes::default());
     let function_prototype = function_prototype_object(interp);
     let global_object = *interp.global_this();
     let process_tag_symbol = interp
@@ -456,7 +462,7 @@ fn define_run_state(
 }
 
 /// Bring the `process` of a runtime restored from a startup image to this
-/// run: its host service, and every property [`define_run_state`] owns.
+/// run: its host services, and every property [`define_run_state`] owns.
 /// A restored realm without `process` is left as it is.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reattach_after_restore(
@@ -497,6 +503,8 @@ pub(crate) fn reattach_after_restore(
         cjs: cjs.clone(),
         capabilities: capabilities.clone(),
     });
+    #[cfg(unix)]
+    interp.insert_host_service(crate::terminal::TerminalModes::default());
     let global_object = *interp.global_this();
     let result: Result<(), NativeError> = NativeCtx::with_host_context(
         interp,
@@ -902,11 +910,8 @@ fn stdout_write(
     ctx: &mut NativeCtx<'_>,
     args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
-    use std::io::Write;
     let bytes = write_chunk_bytes(ctx, args);
-    let mut out = std::io::stdout();
-    let _ = out.write_all(&bytes);
-    let _ = out.flush();
+    write_standard(&mut std::io::stdout().lock(), &bytes).map_err(write_failure)?;
     Ok(Value::boolean(true))
 }
 
@@ -914,12 +919,58 @@ fn stderr_write(
     ctx: &mut NativeCtx<'_>,
     args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
-    use std::io::Write;
     let bytes = write_chunk_bytes(ctx, args);
-    let mut err = std::io::stderr();
-    let _ = err.write_all(&bytes);
-    let _ = err.flush();
+    write_standard(&mut std::io::stderr().lock(), &bytes).map_err(write_failure)?;
     Ok(Value::boolean(true))
+}
+
+/// Write all of `bytes` to a locked standard stream and flush them,
+/// returning only once they are gone or the descriptor refused them.
+///
+/// A descriptor another process left non-blocking is retried until it takes
+/// the rest, so a full pipe or terminal delays a write rather than failing
+/// it, as Node's blocking standard streams do.
+fn write_standard(stream: &mut impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        match stream.write(rest) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(written) => rest = &rest[written..],
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => wait_writable(),
+            Err(error) => return Err(error),
+        }
+    }
+    loop {
+        match stream.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => wait_writable(),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Give a descriptor that would block a moment to drain before writing to
+/// it again.
+fn wait_writable() {
+    std::thread::sleep(std::time::Duration::from_millis(1));
+}
+
+/// A standard stream's refused write as the error Node's stream raises for
+/// it: `Error: write EPIPE`, carrying `code`, `errno` and `syscall`.
+fn write_failure(error: std::io::Error) -> NativeError {
+    let errno = error.raw_os_error().unwrap_or(0);
+    let code = crate::process_control::errno_code_from_raw(errno);
+    NativeError::Syscall {
+        code,
+        message: format!("write {code}"),
+        syscall: "write",
+        path: None,
+        dest: None,
+        errno: -errno,
+    }
 }
 
 /// Define the natives Node's console writes through before any standard
@@ -933,7 +984,8 @@ fn stderr_write(
 /// - `isatty(fd)`: whether the descriptor is a terminal, the same decision
 ///   the stream makes when it is built.
 /// - `write(fd, chunk)`: exactly the host write a stream built for `fd`
-///   performs for `chunk`: synchronous, with the same ignored errors.
+///   performs for `chunk`: synchronous, throwing the same `write` error when
+///   the descriptor refuses the bytes.
 ///
 /// `process.stdout`/`process.stderr` are non-configurable accessors whose
 /// current stream lives in their slot, so an empty slot is the whole answer.
@@ -1289,45 +1341,19 @@ fn exit_code_setter(
 /// and answers the (possibly listener-updated) exit code. A nested
 /// `process.exit(newCode)` inside a listener unwinds through here and the
 /// embedder reads the replacement code off that unwind instead. Afterwards
-/// the terminals the run switched to raw mode get their modes back, as
-/// Node's exit path hands them back.
+/// the terminals the run changed get their modes back, as Node's exit path
+/// hands them back: from the run's own record, in Rust, however the
+/// listeners ended — the run is over either way, and the hand-back touches
+/// no JavaScript state, so a listener's throw on its way out is left as it
+/// is.
 fn process_emit_exit(
     ctx: &mut NativeCtx<'_>,
     args: &[otter_vm::Value],
 ) -> Result<otter_vm::Value, NativeError> {
     let emitted = emit_exit_once(ctx, args);
-    // A listener's throw is still on its way out and owns the pending value;
-    // a completed emit, or an exit from inside one, leaves nothing to clobber.
-    if matches!(emitted, Ok(_) | Err(NativeError::Exit { .. })) {
-        let process = *ctx.this_value();
-        reset_terminals(ctx, process);
-    }
+    #[cfg(unix)]
+    crate::terminal::restore_run_terminals(ctx);
     emitted
-}
-
-/// Hidden slot on `process` for the function that hands every terminal the
-/// run switched to raw mode its mode back. `node:tty` defines it the first
-/// time it switches one; the runtime calls it once the run is over.
-const RESET_TERMINALS_SLOT: &str = "__otter_reset_terminals__";
-
-/// Hand back the terminal modes the run changed, through the function
-/// `node:tty` left in [`RESET_TERMINALS_SLOT`]. The run is over by now, so
-/// whatever the call throws is dropped.
-pub(crate) fn reset_terminals(ctx: &mut NativeCtx<'_>, process: Value) {
-    let reset = ctx.scope(|mut scope| -> Result<(), NativeError> {
-        let process = scope.value(process);
-        if !scope.is_object(process) {
-            return Ok(());
-        }
-        let reset = scope.get(process, RESET_TERMINALS_SLOT)?;
-        if scope.is_callable(reset) {
-            scope.call(reset, process, &[])?;
-        }
-        Ok(())
-    });
-    if reset.is_err() {
-        ctx.clear_pending_error();
-    }
 }
 
 fn emit_exit_once(

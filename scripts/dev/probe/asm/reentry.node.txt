@@ -1,0 +1,5 @@
+145,15,RangeError:boom 3,1,object,5,6,42,1,f,true,f/g
+(node:35459) V8: /Users/alexanderstreltsov/work/octofhir/otter/scripts/dev/probe/asm/reentry.js:21 Invalid asm.js: Bad variable declaration
+(Use `node --trace-warnings ...` to show where the warning was created)
+(node:35459) V8: /Users/alexanderstreltsov/work/octofhir/otter/scripts/dev/probe/asm/reentry.js:2 Linking failure in asm.js: Invalid heap size
+(node:35459) V8: /Users/alexanderstreltsov/work/octofhir/otter/scripts/dev/probe/asm/reentry.js:31 Linking failure in asm.js: Unexpected stdlib member

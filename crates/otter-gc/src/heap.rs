@@ -9,6 +9,8 @@
 //! - Bounded default-off collection-service captures with exact trigger metadata.
 //! - [`GcHeap::embedder_root`] — strong handles the embedder keeps at fixed
 //!   indices for code that holds only the heap.
+//! - [`GcHeap::isolate_data`] — the embedder's per-isolate state, owned and
+//!   rooted by the heap (see [`crate::isolate_data`]).
 //! - [`MachineAllocationWindow`] — the audited nursery/accounting view exposed
 //!   to generated-code allocators: the heap's linear allocation buffer, the
 //!   old-space buffer of tenured allocation sites, and the per-type counters.
@@ -362,6 +364,9 @@ pub struct GcHeap {
     /// only the heap. Traced as roots and rewritten in place when their
     /// targets move.
     embedder_roots: [Cell<RawGc>; EMBEDDER_ROOT_SLOTS],
+    /// The embedder's per-isolate state; its old-space handles are marking
+    /// roots.
+    isolate_data: Option<crate::isolate_data::IsolateDataSlot>,
     /// LIFO stack of runtime-owned root sources. A stack — not a
     /// single slot — because VM scopes nest (native call → re-entrant
     /// dispatch → nested native): replacing a single registration
@@ -607,6 +612,7 @@ impl GcHeap {
             handle_stack: Box::new(HandleStack::new()),
             global_handles: Box::new(GlobalHandleTable::new()),
             embedder_roots: Default::default(),
+            isolate_data: None,
             extra_roots: Vec::new(),
             frame_root_providers: FrameRootProviders::new(),
             ephemerons: EphemeronRegistry::default(),
@@ -1306,6 +1312,32 @@ impl GcHeap {
         for slot in &self.embedder_roots {
             visitor(slot.as_ptr());
         }
+    }
+
+    /// Take ownership of the embedder's per-isolate state for the heap's
+    /// life. Its old-space handles are roots of every marking from here on.
+    ///
+    /// # Panics
+    /// When the heap already holds a value.
+    pub fn install_isolate_data<T: crate::isolate_data::IsolateData>(&mut self, data: T) {
+        assert!(
+            self.isolate_data.is_none(),
+            "a heap owns one isolate data value"
+        );
+        self.isolate_data = Some(crate::isolate_data::IsolateDataSlot::new(data));
+    }
+
+    /// The per-isolate state, when it was installed as `T`.
+    #[inline]
+    #[must_use]
+    pub fn isolate_data<T: crate::isolate_data::IsolateData>(&self) -> Option<&T> {
+        self.isolate_data.as_ref()?.get()
+    }
+
+    /// [`Self::isolate_data`] for mutation.
+    #[inline]
+    pub fn isolate_data_mut<T: crate::isolate_data::IsolateData>(&mut self) -> Option<&mut T> {
+        self.isolate_data.as_mut()?.get_mut()
     }
 
     /// Visit the filled embedder root slots.
@@ -3278,6 +3310,9 @@ impl GcHeap {
             (*global_handles).visit_slots(&mut shade);
         }
         self.trace_embedder_roots(&mut shade);
+        if let Some(data) = &self.isolate_data {
+            data.visit_old_roots(&mut shade);
+        }
         external_visit(&mut shade);
         visit_extra_roots_deduped(&self.extra_roots, RootSet::All, &mut shade);
         self.frame_root_providers.trace(&mut shade);

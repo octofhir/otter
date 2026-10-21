@@ -1,0 +1,19 @@
+[package]
+name = "oxc-parse-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Parse speed of two oxc releases over the same files.
+[workspace]
+
+[dependencies]
+old_parser = { package = "oxc_parser", version = "=0.139.0" }
+old_alloc = { package = "oxc_allocator", version = "=0.139.0" }
+old_span = { package = "oxc_span", version = "=0.139.0" }
+new_parser = { package = "oxc_parser", version = "=0.154.0" }
+new_alloc = { package = "oxc_allocator", version = "=0.154.0" }
+new_span = { package = "oxc_span", version = "=0.154.0" }
+
+[profile.release]
+debug = 1

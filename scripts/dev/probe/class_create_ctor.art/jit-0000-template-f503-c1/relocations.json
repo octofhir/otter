@@ -1,0 +1,791 @@
+{
+  "offsetBasis": "code.bin",
+  "addressEncoding": "symbolicOnly",
+  "relocations": [
+    {
+      "startOffset": 188,
+      "endOffset": 192,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 95,
+        "name": "constructor_receiver_probe",
+        "signature": "leafValue2"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 244,
+      "endOffset": 248,
+      "register": 12,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "gcCageBase"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 372,
+      "endOffset": 376,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 96,
+        "name": "constructor_receiver_commit",
+        "signature": "contextWords"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 464,
+      "endOffset": 468,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 71,
+        "name": "jit_prepare_activation",
+        "signature": "executionEntry0"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 496,
+      "endOffset": 500,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 71,
+        "name": "jit_prepare_activation",
+        "signature": "executionEntry0"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 516,
+      "endOffset": 520,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 74,
+        "name": "jit_promote_entered",
+        "signature": "executionEntry0"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 532,
+      "endOffset": 536,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 88,
+        "name": "jit_call_overflow",
+        "signature": "executionEntry0"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 720,
+      "endOffset": 724,
+      "register": 9,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "sourceWorkCell",
+        "functionId": 503
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1020,
+      "endOffset": 1024,
+      "register": 10,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 23
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1160,
+      "endOffset": 1164,
+      "register": 10,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 46
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1352,
+      "endOffset": 1356,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "arithFeedbackCell",
+        "functionId": 503,
+        "pc": 6
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1512,
+      "endOffset": 1516,
+      "register": 10,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 75
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1652,
+      "endOffset": 1656,
+      "register": 10,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 98
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 1844,
+      "endOffset": 1848,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "arithFeedbackCell",
+        "functionId": 503,
+        "pc": 11
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2004,
+      "endOffset": 2008,
+      "register": 10,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 127
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2144,
+      "endOffset": 2148,
+      "register": 10,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 150
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2336,
+      "endOffset": 2340,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "arithFeedbackCell",
+        "functionId": 503,
+        "pc": 16
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2476,
+      "endOffset": 2480,
+      "register": 10,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "calleeIdentityCell",
+        "functionId": 501,
+        "callPc": 17
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2564,
+      "endOffset": 2568,
+      "register": 10,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "calleeIdentityCell",
+        "functionId": 501,
+        "callPc": 17
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2628,
+      "endOffset": 2632,
+      "register": 8,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "functionEntryCell",
+        "functionId": 501
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2732,
+      "endOffset": 2736,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 83,
+        "name": "jit_call",
+        "signature": "executionEntry0"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2840,
+      "endOffset": 2844,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 87,
+        "name": "jit_call_generic",
+        "signature": "jsCall"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 2936,
+      "endOffset": 2940,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 83,
+        "name": "jit_call",
+        "signature": "executionEntry0"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 3136,
+      "endOffset": 3140,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 33,
+        "name": "jit_numeric_op",
+        "signature": "variadic"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 3188,
+      "endOffset": 3192,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 33,
+        "name": "jit_numeric_op",
+        "signature": "variadic"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 3240,
+      "endOffset": 3244,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 33,
+        "name": "jit_numeric_op",
+        "signature": "variadic"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 3412,
+      "endOffset": 3416,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 77,
+        "name": "jit_route_throw",
+        "signature": "routeThrow1"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 3444,
+      "endOffset": 3448,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 49,
+        "name": "jit_finish_error",
+        "signature": "variadic"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 3672,
+      "endOffset": 3676,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 91,
+        "name": "jit_constructor_terminal",
+        "signature": "contextWords"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 3740,
+      "endOffset": 3744,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 51,
+        "name": "jit_deopt_call",
+        "signature": "contextWords"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 4276,
+      "endOffset": 4280,
+      "register": 17,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyActionCacheTable"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 4640,
+      "endOffset": 4644,
+      "register": 16,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 17,
+        "name": "jit_load_property_value",
+        "signature": "reentrantNamedLoad"
+      },
+      "form": "literalLoad"
+    },
+    {
+      "startOffset": 4656,
+      "endOffset": 4664,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 95,
+        "name": "constructor_receiver_probe",
+        "signature": "leafValue2"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4664,
+      "endOffset": 4672,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "gcCageBase"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4672,
+      "endOffset": 4680,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 96,
+        "name": "constructor_receiver_commit",
+        "signature": "contextWords"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4680,
+      "endOffset": 4688,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 71,
+        "name": "jit_prepare_activation",
+        "signature": "executionEntry0"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4688,
+      "endOffset": 4696,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 74,
+        "name": "jit_promote_entered",
+        "signature": "executionEntry0"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4696,
+      "endOffset": 4704,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 88,
+        "name": "jit_call_overflow",
+        "signature": "executionEntry0"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4704,
+      "endOffset": 4712,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "sourceWorkCell",
+        "functionId": 503
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4720,
+      "endOffset": 4728,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 23
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4728,
+      "endOffset": 4736,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 46
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4736,
+      "endOffset": 4744,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "arithFeedbackCell",
+        "functionId": 503,
+        "pc": 6
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4744,
+      "endOffset": 4752,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 75
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4752,
+      "endOffset": 4760,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 98
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4760,
+      "endOffset": 4768,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "arithFeedbackCell",
+        "functionId": 503,
+        "pc": 11
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4768,
+      "endOffset": 4776,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 127
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4776,
+      "endOffset": 4784,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyIcSlot",
+        "functionId": 503,
+        "bytePc": 150
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4784,
+      "endOffset": 4792,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "arithFeedbackCell",
+        "functionId": 503,
+        "pc": 16
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4792,
+      "endOffset": 4800,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "calleeIdentityCell",
+        "functionId": 501,
+        "callPc": 17
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4800,
+      "endOffset": 4808,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "functionEntryCell",
+        "functionId": 501
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4808,
+      "endOffset": 4816,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 83,
+        "name": "jit_call",
+        "signature": "executionEntry0"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4816,
+      "endOffset": 4824,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 87,
+        "name": "jit_call_generic",
+        "signature": "jsCall"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4824,
+      "endOffset": 4832,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 33,
+        "name": "jit_numeric_op",
+        "signature": "variadic"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4832,
+      "endOffset": 4840,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 77,
+        "name": "jit_route_throw",
+        "signature": "routeThrow1"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4840,
+      "endOffset": 4848,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 49,
+        "name": "jit_finish_error",
+        "signature": "variadic"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4848,
+      "endOffset": 4856,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 91,
+        "name": "jit_constructor_terminal",
+        "signature": "contextWords"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4856,
+      "endOffset": 4864,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 51,
+        "name": "jit_deopt_call",
+        "signature": "contextWords"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4880,
+      "endOffset": 4888,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "propertyActionCacheTable"
+      },
+      "form": "literalWord"
+    },
+    {
+      "startOffset": 4888,
+      "endOffset": 4896,
+      "register": 0,
+      "widthBits": 64,
+      "chunks": [],
+      "target": {
+        "kind": "runtimeStub",
+        "id": 17,
+        "name": "jit_load_property_value",
+        "signature": "reentrantNamedLoad"
+      },
+      "form": "literalWord"
+    }
+  ]
+}

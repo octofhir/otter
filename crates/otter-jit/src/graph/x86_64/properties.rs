@@ -162,6 +162,19 @@ impl Codegen<'_> {
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
                 self.emit_function_bag(input(0), result(), exit);
             }
+            Kind::LoadShapedProperty { atom } => {
+                let exit = self.eager_exit(node, DeoptReason::OwnDataMiss);
+                let view = self.view_of(node);
+                crate::x86_64::shape_lookup::emit_load(
+                    &mut self.ops,
+                    view,
+                    atom,
+                    input(0),
+                    assigned.gp_temps[..4].try_into().unwrap(),
+                    result(),
+                    exit,
+                );
+            }
             Kind::LoadNamedProperty { byte_pc, .. } => self.emit_named_program(
                 node,
                 byte_pc,

@@ -1,0 +1,150 @@
+; otter graph
+  v0 = ConstTagged(10) [] Tagged
+  v39 = ConstInt32(1) [] Int32
+  v40 = ConstInt32(2) [] Int32
+  v41 = ConstInt32(3) [] Int32
+  v42 = ConstTagged(18446181123756130305) [] Tagged
+  v43 = ConstTagged(18446181123756130306) [] Tagged
+  v44 = ConstTagged(18446181123756130307) [] Tagged
+  v47 = ConstFloat64(4602678819172646912) [] Float64
+  v48 = ConstFloat64(4598175219545276416) [] Float64
+  v49 = ConstFloat64(4593671619917905920) [] Float64
+  v50 = ConstTagged(4603241769126068224) [] Tagged
+  v51 = ConstTagged(4598738169498697728) [] Tagged
+  v52 = ConstTagged(4594234569871327232) [] Tagged
+  v54 = ConstInt32(0) [] Int32
+  v55 = ConstTagged(18446181123756130304) [] Tagged
+  v62 = ConstInt32(3000000) [] Int32
+  v108 = ConstInt32(1000) [] Int32
+  v128 = ConstFloat64(0) [] Float64
+b6 preds=[]
+  v1 = InitialRegister(0) [] Tagged
+  v2 = InitialRegister(1) [] Tagged
+  v3 = InitialRegister(2) [] Tagged
+  v4 = InitialRegister(3) [] Tagged
+  v5 = InitialRegister(4) [] Tagged
+  v6 = Jump(BlockId(0)) [] None
+b7 preds=[]
+  v7 = InitialRegister(8) [] Tagged
+  v8 = InitialRegister(9) [] Tagged
+  v9 = InitialRegister(10) [] Tagged
+  v10 = InitialRegister(11) [] Tagged
+  v11 = InitialRegister(12) [] Tagged
+  v125 = CheckedTaggedToInt32 [11] Int32 eager=[[(8, 7), (9, 8), (10, 9), (11, 10), (12, 11)]]
+  v127 = CheckedTaggedToFloat64 [10] Float64 eager=[[(8, 7), (9, 8), (10, 9), (11, 10), (12, 125)]]
+  v12 = Jump(BlockId(1)) [] None
+b0 preds=[6]
+  v13 = NativeNewContext(0) [0] Tagged eager=[[(7, 0)]]
+  v14 = NewClosure [0, 0, 0] Tagged eager=[[(6, 13)]]
+  v15 = NewObjectLiteral { fields: Some([FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }]) } [14] Tagged eager=[[(6, 13), (14, 14)]]
+  v16 = LoadGuardedMethod { byte_pc: 66, target: 0, receiver_proved: false } [15] Tagged eager=[[(5, 15), (6, 13), (14, 15)]]
+  v17 = CheckFunction { function_id: 500, cell: 2199047454576 } [16] None eager=[[(5, 15), (6, 13), (14, 15)]]
+  v18 = Jump(BlockId(9)) [] None
+b9 preds=[0]
+  v19 = NewClosure [0, 0, 0] Tagged eager=[[(5, 15), (6, 13), (14, 0)], []]
+  v20 = Jump(BlockId(8)) [] None
+b8 preds=[9]
+  v21 = StoreTaggedField(24) [13, 19] None
+  v22 = WriteBarrier [13, 19] None
+  v23 = NewClosure [0, 0, 0] Tagged eager=[[(5, 15), (6, 13), (14, 19)]]
+  v24 = LoadThis [] Tagged
+  v25 = LoadNewTarget [] Tagged
+  v26 = NewClosure [13, 24, 25] Tagged eager=[[(5, 15), (6, 13), (14, 19), (15, 23)]]
+  v27 = NewObjectLiteral { fields: Some([FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }, FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }]) } [23, 26] Tagged eager=[[(5, 15), (6, 13), (14, 19), (15, 23), (16, 26)]]
+  v28 = StorePropertyCached { pc: 12, atom: None, barrier: true } [19, 27] None eager=[[(5, 15), (6, 13), (14, 19), (17, 27)]]
+  v29 = CheckStableShapes([9650144]) [] None eager=[[(6, 13), (14, 15)]]
+  v30 = LoadGuardedMethod { byte_pc: 180, target: 0, receiver_proved: true } [15] Tagged eager=[[(6, 13), (14, 15)]]
+  v31 = CheckFunction { function_id: 500, cell: 2199047454544 } [30] None eager=[[(6, 13), (14, 15)]]
+  v32 = Jump(BlockId(11)) [] None
+b11 preds=[8]
+  v33 = NewClosure [0, 0, 0] Tagged eager=[[(6, 13), (14, 0)], []]
+  v34 = Jump(BlockId(10)) [] None
+b10 preds=[11]
+  v35 = NewClosure [0, 0, 0] Tagged eager=[[(6, 13), (8, 33), (14, 33)]]
+  v36 = NewObjectLiteral { fields: Some([FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }]) } [35] Tagged eager=[[(6, 13), (8, 33), (14, 33), (15, 35)]]
+  v37 = StorePropertyCached { pc: 19, atom: None, barrier: true } [33, 36] None eager=[[(6, 13), (8, 33), (14, 33), (16, 36)]]
+  v38 = LoadTaggedField(24) [13] Tagged
+  v45 = CallJs { pc: 24, plan: Bytecode(JitDirectCallPlan { function_id: 501, code_object_id: 3, entry_cell: 2199047704064, tier: Baseline, this_mode: SloppyGlobal, is_derived_constructor: false, call_flags: 4, callee_cell: 2199047446832 }), construct: true, receiver: false, receiver_object: false, allocation: None } [38, 42, 43, 44] Tagged eager=[[(6, 13), (8, 33), (14, 38), (15, 39), (16, 40), (17, 41)]]
+  v46 = LoadTaggedField(24) [13] Tagged
+  v53 = CallJs { pc: 30, plan: Bytecode(JitDirectCallPlan { function_id: 501, code_object_id: 3, entry_cell: 2199047704064, tier: Baseline, this_mode: SloppyGlobal, is_derived_constructor: false, call_flags: 4, callee_cell: 2199047446672 }), construct: true, receiver: false, receiver_object: false, allocation: None } [46, 50, 51, 52] Tagged eager=[[(8, 33), (9, 45), (15, 46), (16, 47), (17, 48), (18, 49)]]
+  v56 = Jump(BlockId(1)) [] None
+b1 loop preds=[7, 10, 4]
+  v57 = Phi [7, 33, 57] Tagged
+  v58 = Phi [8, 45, 58] Tagged
+  v59 = Phi [9, 53, 59] Tagged
+  v60 = Phi [127, 128, 107] Float64
+  v61 = Phi [125, 54, 118] Int32
+  v64 = Int32Compare(Less) [61, 62] Tagged
+  v65 = Branch { kind: Int32(Less), if_true: BlockId(12), if_false: BlockId(13) } [61, 62] None
+b12 preds=[1]
+  v66 = Jump(BlockId(2)) [] None
+b13 preds=[1]
+  v67 = Jump(BlockId(5)) [] None
+b2 preds=[12]
+  v68 = LoadGuardedMethod { byte_pc: 485, target: 0, receiver_proved: false } [58] Tagged eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 58), (17, 59)]]
+  v69 = Jump(BlockId(15)) [] None
+b15 preds=[2]
+  v70 = LoadClosureContext [68] Tagged
+  v71 = LoadTaggedField(24) [70] Tagged
+  v72 = LoadOwnField(FieldLocation(2147483648)) [58] Tagged
+  v73 = CheckShapes { shapes: [9651792], writable: false, object_proved: false } [59] None eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(0, 59), (1, 71), (2, 72), (3, 59)]]
+  v74 = LoadOwnField(FieldLocation(2147483648)) [59] Tagged
+  v75 = CheckedTaggedToFloat64 [72] Float64 eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(0, 59), (1, 71), (2, 72), (3, 74)]]
+  v76 = CheckedTaggedToFloat64 [74] Float64 eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(0, 59), (1, 71), (2, 72), (3, 74)]]
+  v77 = Float64Sub [75, 76] Float64
+  v78 = LoadOwnField(FieldLocation(2147483649)) [58] Tagged
+  v79 = LoadOwnField(FieldLocation(2147483649)) [59] Tagged
+  v80 = CheckedTaggedToFloat64 [78] Float64 eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(0, 59), (1, 71), (4, 77), (5, 78), (6, 79)]]
+  v81 = CheckedTaggedToFloat64 [79] Float64 eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(0, 59), (1, 71), (4, 77), (5, 78), (6, 79)]]
+  v82 = Float64Sub [80, 81] Float64
+  v83 = LoadOwnField(FieldLocation(2147483650)) [58] Tagged
+  v84 = LoadOwnField(FieldLocation(2147483650)) [59] Tagged
+  v85 = CheckedTaggedToFloat64 [83] Float64 eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(1, 71), (4, 77), (7, 82), (8, 83), (9, 84)]]
+  v86 = CheckedTaggedToFloat64 [84] Float64 eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(1, 71), (4, 77), (7, 82), (8, 83), (9, 84)]]
+  v87 = Float64Sub [85, 86] Float64
+  v88 = CheckFunction { function_id: 501, cell: 2199047451216 } [71] None eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(1, 71), (4, 77), (7, 82), (10, 87)]]
+  v89 = NewReceiver(JitReceiverAllocationPlan { new_target_function_id: 501, new_target_is_class: false, family_id: 1, family_cell: 9651536, receiver_shape: 0, initial_field_count: 0, inline_capacity: 3, prototype_validity: Some(JitPrototypeValidity { address: 2199047453456, identity: 3260 }), prototype_root: 9651344 }) [71] Tagged eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(1, 71), (4, 77), (7, 82), (10, 87)]]
+  v90 = Jump(BlockId(17)) [] None
+b17 preds=[15]
+  v91 = LoadGuardedMethod { byte_pc: 5, target: 0, receiver_proved: true } [89] Tagged eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(1, 0)], [(0, 89), (3, 0)]]
+  v92 = LoadNamedProperty { byte_pc: 18, programs: [0], receiver_shape: None } [91] Tagged eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(1, 0)], [(0, 91), (3, 0)]]
+  v93 = CheckNative(372) [92] None eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(1, 0)], [(0, 91), (1, 92), (2, 89), (3, 0)]]
+  v94 = Float64ToTagged [77] Tagged
+  v95 = Float64ToTagged [82] Tagged
+  v96 = Float64ToTagged [87] Tagged
+  v97 = Jump(BlockId(19)) [] None
+b19 preds=[17]
+  v98 = StoreNamedProperty { byte_pc: 15, owners: [FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }] } [89, 94] None eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(1, 0)], [], [(1, 95), (2, 96), (3, 89), (4, 94)]]
+  v99 = StoreNamedProperty { byte_pc: 46, owners: [FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }] } [89, 95] None eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(1, 0)], [], [(2, 96), (3, 89), (4, 95)]]
+  v100 = StoreNamedProperty { byte_pc: 77, owners: [FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }] } [89, 96] None eager=[[(8, 57), (9, 58), (10, 59), (11, 60), (12, 61), (16, 0)], [(1, 0)], [], [(3, 89), (4, 96)]]
+  v101 = Jump(BlockId(18)) [] None
+b18 preds=[19]
+  v102 = Jump(BlockId(16)) [] None
+b16 preds=[18]
+  v103 = Jump(BlockId(14)) [] None
+b14 preds=[16]
+  v104 = Float64Add [77, 82] Float64
+  v105 = Float64Add [104, 87] Float64
+  v107 = Float64Add [60, 105] Float64
+  v109 = Int32Mod [61, 108] Int32 eager=[[(8, 57), (9, 58), (10, 59), (11, 107), (12, 61), (16, 108)]]
+  v110 = Int32Compare(Equal) [109, 54] Tagged
+  v111 = Branch { kind: Int32(Equal), if_true: BlockId(20), if_false: BlockId(21) } [109, 54] None
+b20 preds=[14]
+  v112 = Float64ToTagged [107] Tagged
+  v113 = Jump(BlockId(3)) [] None
+b21 preds=[14]
+  v114 = Float64ToTagged [107] Tagged
+  v115 = Jump(BlockId(4)) [] None
+b3 preds=[20]
+  v126 = Int32ToTagged [61] Tagged
+  v116 = CallJs { pc: 57, plan: Bytecode(JitDirectCallPlan { function_id: 501, code_object_id: 3, entry_cell: 2199047704064, tier: Baseline, this_mode: SloppyGlobal, is_derived_constructor: false, call_flags: 4, callee_cell: 2199047453232 }), construct: true, receiver: false, receiver_object: false, allocation: None } [57, 126, 126] Tagged eager=[[(8, 57), (9, 58), (10, 59), (11, 107), (12, 61), (17, 57), (18, 61), (19, 61)]]
+  v117 = Jump(BlockId(4)) [] None
+b4 preds=[21, 3]
+  v118 = Int32Add [61, 39] Int32 eager=[[(8, 57), (9, 58), (10, 59), (11, 107), (12, 61)]]
+  v119 = Float64ToTagged [107] Tagged
+  v120 = Int32ToTagged [118] Tagged
+  v121 = JumpLoop(BlockId(1)) [] None eager=[[(8, 57), (9, 58), (10, 59), (11, 107), (12, 118)]]
+b5 preds=[13]
+  v122 = Generic { pc: 60, registers: [] } [] None eager=[[(11, 60)]]
+  v123 = LoadWindow(14) [] Tagged
+  v124 = Deopt(InsufficientFeedback) [] None eager=[[(14, 123), (15, 60)]]

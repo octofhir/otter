@@ -1,5 +1,6 @@
 'use strict';
 // `node:module` — builtin-module metadata + a minimal Module class.
+const { createRequire: requireAt } = require('internal/otter/natives');
 const builtinModules = [
   'assert', 'buffer', 'child_process', 'cluster', 'console', 'constants', 'crypto',
   'dgram', 'diagnostics_channel', 'dns', 'domain', 'events', 'fs', 'http', 'http2',
@@ -12,9 +13,11 @@ function isBuiltin(name) {
   return builtinModules.includes(String(name).replace(/^node:/, ''));
 }
 
-// `require` here is this shim's own resolver. Bare specifiers reach it
-// unchanged; a relative one is resolved against `filename` first, which is the
-// whole point of createRequire.
+// The `require` of a user module at `filename`, made by the loader itself:
+// Node's resolution from that file's directory, the one module cache, and
+// `filename` heading the require stack of whatever it cannot find. It is not
+// this shim's own `require`, which, being a builtin's, reaches the internal
+// modules no user module may load.
 function createRequire(filename) {
   // `URL` is a web global; an embedder can run node modules without it.
   const isURL = typeof URL !== 'undefined' && filename instanceof URL;
@@ -26,29 +29,12 @@ function createRequire(filename) {
     throw err;
   }
   const path = require('path');
-  let from = isURL ? filename.pathname : String(filename);
-  if (from.startsWith('file://')) from = from.slice('file://'.length);
-  // A directory argument names the base directly; anything else is a file whose
-  // directory is the base.
-  const base = from.endsWith('/') ? from : path.dirname(from);
-
-  // Named `requireFrom`, not `require`: a named function expression binds its
-  // own name in scope, which would shadow this shim's resolver and recurse.
-  const fn = function requireFrom(id) {
-    const spec = String(id);
-    if (spec.startsWith('./') || spec.startsWith('../') || spec === '.' || spec === '..') {
-      return require(path.resolve(base, spec));
-    }
-    return require(spec);
-  };
-  fn.resolve = (id) => {
-    const spec = String(id);
-    if (spec.startsWith('./') || spec.startsWith('../')) return path.resolve(base, spec);
-    return spec;
-  };
-  fn.resolve.paths = () => [];
-  fn.cache = {};
-  fn.extensions = {};
+  let from = String(filename);
+  if (isURL || from.startsWith('file:')) from = require('url').fileURLToPath(filename);
+  // A directory argument stands for a file inside it, as Node's does.
+  const proxy = from.endsWith('/') ? path.join(from, 'noop.js') : path.resolve(from);
+  const fn = requireAt(proxy);
+  fn.extensions = Module._extensions;
   fn.main = undefined;
   return fn;
 }

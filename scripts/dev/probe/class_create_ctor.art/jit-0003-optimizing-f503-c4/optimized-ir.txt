@@ -1,0 +1,47 @@
+; otter graph
+  v0 = ConstTagged(10) [] Tagged
+b1 preds=[]
+  v1 = InitialRegister(0) [] Tagged
+  v2 = Jump(BlockId(0)) [] None
+b0 preds=[1]
+  v3 = LoadClosure [] Tagged
+  v4 = LoadClosureContext [3] Tagged
+  v5 = LoadTaggedField(24) [4] Tagged
+  v6 = LoadThis [] Tagged
+  v7 = CheckShapes { shapes: [9651792], writable: false, object_proved: false } [6] None eager=[[(0, 1), (1, 5), (2, 6)]]
+  v8 = LoadOwnField(FieldLocation(2147483648)) [6] Tagged
+  v9 = CheckShapes { shapes: [9651792], writable: false, object_proved: false } [1] None eager=[[(0, 1), (1, 5), (2, 8), (3, 1)]]
+  v10 = LoadOwnField(FieldLocation(2147483648)) [1] Tagged
+  v11 = CheckedTaggedToFloat64 [8] Float64 eager=[[(0, 1), (1, 5), (2, 8), (3, 10)]]
+  v12 = CheckedTaggedToFloat64 [10] Float64 eager=[[(0, 1), (1, 5), (2, 8), (3, 10)]]
+  v13 = Float64Sub [11, 12] Float64
+  v14 = LoadOwnField(FieldLocation(2147483649)) [6] Tagged
+  v15 = LoadOwnField(FieldLocation(2147483649)) [1] Tagged
+  v16 = CheckedTaggedToFloat64 [14] Float64 eager=[[(0, 1), (1, 5), (4, 13), (5, 14), (6, 15)]]
+  v17 = CheckedTaggedToFloat64 [15] Float64 eager=[[(0, 1), (1, 5), (4, 13), (5, 14), (6, 15)]]
+  v18 = Float64Sub [16, 17] Float64
+  v19 = LoadOwnField(FieldLocation(2147483650)) [6] Tagged
+  v20 = LoadOwnField(FieldLocation(2147483650)) [1] Tagged
+  v21 = CheckedTaggedToFloat64 [19] Float64 eager=[[(1, 5), (4, 13), (7, 18), (8, 19), (9, 20)]]
+  v22 = CheckedTaggedToFloat64 [20] Float64 eager=[[(1, 5), (4, 13), (7, 18), (8, 19), (9, 20)]]
+  v23 = Float64Sub [21, 22] Float64
+  v24 = CheckFunction { function_id: 501, cell: 2199047446736 } [5] None eager=[[(1, 5), (4, 13), (7, 18), (10, 23)]]
+  v25 = NewReceiver(JitReceiverAllocationPlan { new_target_function_id: 501, new_target_is_class: false, family_id: 1, family_cell: 9651536, receiver_shape: 0, initial_field_count: 0, inline_capacity: 3, prototype_validity: Some(JitPrototypeValidity { address: 2199047453456, identity: 3260 }), prototype_root: 9651344 }) [5] Tagged eager=[[(1, 5), (4, 13), (7, 18), (10, 23)]]
+  v26 = Jump(BlockId(3)) [] None
+b3 preds=[0]
+  v27 = LoadGuardedMethod { byte_pc: 5, target: 0, receiver_proved: true } [25] Tagged eager=[[(1, 0)], [(0, 25), (3, 0)]]
+  v28 = LoadNamedProperty { byte_pc: 18, programs: [0], receiver_shape: None } [27] Tagged eager=[[(1, 0)], [(0, 27), (3, 0)]]
+  v29 = CheckNative(372) [28] None eager=[[(1, 0)], [(0, 27), (1, 28), (2, 25), (3, 0)]]
+  v30 = Float64ToTagged [13] Tagged
+  v31 = Float64ToTagged [18] Tagged
+  v32 = Float64ToTagged [23] Tagged
+  v33 = Jump(BlockId(5)) [] None
+b5 preds=[3]
+  v34 = StoreNamedProperty { byte_pc: 15, owners: [FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }] } [25, 30] None eager=[[(1, 0)], [], [(1, 31), (2, 32), (3, 25), (4, 30)]]
+  v35 = StoreNamedProperty { byte_pc: 46, owners: [FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }] } [25, 31] None eager=[[(1, 0)], [], [(2, 32), (3, 25), (4, 31)]]
+  v36 = StoreNamedProperty { byte_pc: 77, owners: [FieldStoreOwner { owner_shape: 0, stored_shapes: [], nullish_mask: 0 }] } [25, 32] None eager=[[(1, 0)], [], [(3, 25), (4, 32)]]
+  v37 = Jump(BlockId(4)) [] None
+b4 preds=[5]
+  v38 = Jump(BlockId(2)) [] None
+b2 preds=[4]
+  v39 = Return [25] None

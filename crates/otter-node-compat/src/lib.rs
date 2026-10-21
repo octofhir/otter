@@ -428,7 +428,9 @@ fn ensure_node_tests_present(workspace_root: &Path) -> Result<()> {
 /// The subset of a test's `// Flags:` line the engine understands.
 /// Engine-specific flags are skipped (the harness's own flag re-exec stays
 /// disabled), but the Node-level switches Otter implements are honored, so
-/// tests that assert on them run the way `node` runs them.
+/// tests that assert on them run the way `node` runs them. The line is looked
+/// for where Node's own harness looks: in the file's first 1500 bytes, which
+/// reach past the copyright header some tests open with.
 fn supported_test_flags(file_path: &Path) -> Vec<String> {
     const SUPPORTED_PREFIXES: &[&str] = &[
         "--title=",
@@ -455,8 +457,13 @@ fn supported_test_flags(file_path: &Path) -> Vec<String> {
     let Ok(source) = std::fs::read_to_string(file_path) else {
         return Vec::new();
     };
+    const FLAGS_WINDOW: usize = 1500;
+    let mut window = source.len().min(FLAGS_WINDOW);
+    while !source.is_char_boundary(window) {
+        window -= 1;
+    }
     let mut flags = Vec::new();
-    for line in source.lines().take(10) {
+    for line in source[..window].lines() {
         let Some(rest) = line.trim().strip_prefix("// Flags:") else {
             continue;
         };
@@ -1135,6 +1142,28 @@ mod tests {
     #[test]
     fn cli_timeout_diagnostic_is_classified_as_timeout() {
         assert!(super::is_timeout_error("error: timeout after 10000 ms"));
+    }
+
+    /// `// Flags:` count where Node's harness reads them: below the copyright
+    /// header some tests open with, but not past the first 1500 bytes.
+    #[test]
+    fn flags_below_a_copyright_header_are_honored() {
+        let root = temp_test_root("flags");
+        let file = root.join("test-flags.js");
+        let header = "// Copyright notice, one line of many.\n".repeat(20);
+        std::fs::write(
+            &file,
+            format!("{header}\n// Flags: --expose-internals --stack-size=100\n'use strict';\n"),
+        )
+        .expect("write flagged test");
+        assert_eq!(super::supported_test_flags(&file), ["--expose-internals"]);
+        std::fs::write(
+            &file,
+            format!("{}\n// Flags: --expose-gc\n", "/".repeat(1500)),
+        )
+        .expect("write late-flagged test");
+        assert!(super::supported_test_flags(&file).is_empty());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     fn temp_test_root(name: &str) -> std::path::PathBuf {

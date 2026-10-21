@@ -425,7 +425,7 @@ impl Interpreter {
         context: ExecutionContext,
         function_count: u32,
     ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
-        context.resolve_atoms(self.shape_runtime.names_mut());
+        context.resolve_atoms(crate::isolate_names::names_mut(&mut self.gc_heap));
         for function in context.linked_functions() {
             self.jit_code_registry
                 .link_function(function, self.active_realm_id);
@@ -466,7 +466,7 @@ impl Interpreter {
             self.owner_cache.borrow_mut().clear();
             self.code_space = std::sync::Arc::clone(context.space());
             self.code_space
-                .resolve_atoms(self.shape_runtime.names_mut());
+                .resolve_atoms(crate::isolate_names::names_mut(&mut self.gc_heap));
             for function in context.linked_functions() {
                 let realm_id = self.function_realm_id(function.id);
                 self.jit_code_registry.link_function(function, realm_id);

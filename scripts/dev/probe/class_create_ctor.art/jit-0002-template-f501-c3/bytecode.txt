@@ -1,0 +1,8 @@
+; otter bytecode
+; function=501 registers=4 parameters=0 bytes=55
+0000 byte=0000 LoadThis [Register(0)]
+0001 byte=0005 LoadProperty [Register(0), Register(0), ConstIndex(0)]
+0002 byte=0018 LoadProperty [Register(1), Register(0), ConstIndex(1)]
+0003 byte=0031 LoadThis [Register(2)]
+0004 byte=0036 CallForwardArguments [Register(3), Register(1), Register(0), Register(2), Register(3)]
+0005 byte=0053 ReturnUndefined []

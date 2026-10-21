@@ -1,0 +1,29 @@
+{
+  "records": [
+    {
+      "id": 1,
+      "frameState": 4294967295,
+      "taggedLocations": [],
+      "inlineFrames": [],
+      "callPc": 17
+    }
+  ],
+  "returnSites": [
+    {
+      "nativeReturnOffset": 2644,
+      "safepointId": 1
+    },
+    {
+      "nativeReturnOffset": 2740,
+      "safepointId": 1
+    },
+    {
+      "nativeReturnOffset": 2848,
+      "safepointId": 1
+    },
+    {
+      "nativeReturnOffset": 2944,
+      "safepointId": 1
+    }
+  ]
+}

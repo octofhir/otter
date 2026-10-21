@@ -160,6 +160,7 @@ pub(crate) use shape_body::{
     SHAPE_BODY_ID_OFFSET, SHAPE_BODY_INLINE_CAPACITY_OFFSET, SHAPE_BODY_PROPERTY_COUNT_OFFSET,
     SHAPE_BODY_PROTOTYPE_OFFSET, SHAPE_BODY_STATE_OFFSET,
 };
+pub use shape_keys::ShapeLookupLayout;
 pub(crate) use shape_runtime::ShapeRuntime;
 #[cfg(test)]
 pub(crate) use shape_transition::capture_store_property_transition;
@@ -1146,7 +1147,10 @@ impl ExoticSlots {
         let data = self.host_data.as_ref()?;
         Some(
             data.downcast_ref::<crate::marshal::HostInstance>()
-                .map_or_else(|| data.payload_type(), crate::marshal::HostInstance::data_type),
+                .map_or_else(
+                    || data.payload_type(),
+                    crate::marshal::HostInstance::data_type,
+                ),
         )
     }
 
@@ -1156,7 +1160,10 @@ impl ExoticSlots {
         let data = self.host_data.as_ref()?;
         Some(
             data.downcast_ref::<crate::marshal::HostInstance>()
-                .map_or_else(|| data.payload_name(), crate::marshal::HostInstance::class_name),
+                .map_or_else(
+                    || data.payload_name(),
+                    crate::marshal::HostInstance::class_name,
+                ),
         )
     }
 }

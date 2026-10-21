@@ -8,27 +8,33 @@
 //! - JSON output stays the stable `OtterError` wire shape.
 //! - Human output uses OXC's miette fork so parser/compiler/runtime diagnostics
 //!   render through the same report handler.
+//! - Rendering never fails the process: text standard error refuses (its
+//!   reader is gone) is dropped, and the run still leaves with the error's
+//!   own exit code, as Node's does.
 //!
 //! # See also
 //! - <https://github.com/oxc-project/oxc-miette>
+//! - [`crate::output`] — the writers every line here goes through.
 
 use std::path::PathBuf;
 
 use otter_runtime::{Diagnostic, OtterError};
 use oxc_diagnostics::{GraphicalReportHandler, LabeledSpan, NamedSource, OxcDiagnostic};
 
+use crate::output::{stderr, stderrln};
+
 /// Emit a CLI error to stderr.
 pub(crate) fn emit_error(err: &OtterError, json: bool) {
     if json {
         match err.to_json() {
-            Ok(s) => eprintln!("{s}"),
-            Err(_) => eprintln!("error: {err}"),
+            Ok(s) => stderrln!("{s}"),
+            Err(_) => stderrln!("error: {err}"),
         }
         return;
     }
 
     if !emit_human_diagnostics(err) {
-        eprintln!("error: {err}");
+        stderrln!("error: {err}");
     }
 }
 
@@ -53,7 +59,7 @@ fn emit_human_diagnostics(err: &OtterError) -> bool {
             let message = message
                 .strip_prefix("native function NativeScope::call threw: ")
                 .unwrap_or(message);
-            eprintln!("{message}");
+            stderrln!("{message}");
             true
         }
         _ => false,
@@ -86,21 +92,21 @@ fn emit_human_diagnostic(diagnostic: &Diagnostic) {
                 .take(position.start_column as usize)
                 .map(|c| if c == '\t' { '\t' } else { ' ' })
                 .collect();
-            eprintln!("{script}:{}", position.line_number);
-            eprintln!("{source_line}");
-            eprintln!("{caret_indent}^");
+            stderrln!("{script}:{}", position.line_number);
+            stderrln!("{source_line}");
+            stderrln!("{caret_indent}^");
             // An error's stack follows after a blank line; a thrown
             // primitive follows the caret directly.
             if message.contains("\n    at ") {
-                eprintln!();
+                stderrln!();
             }
         }
-        eprintln!("{message}");
+        stderrln!("{message}");
         return;
     }
     match render_human_diagnostic(diagnostic) {
-        Some(rendered) => eprint!("{rendered}"),
-        None => eprintln!("error[{}]: {}", diagnostic.code, diagnostic.message),
+        Some(rendered) => stderr!("{rendered}"),
+        None => stderrln!("error[{}]: {}", diagnostic.code, diagnostic.message),
     }
 }
 

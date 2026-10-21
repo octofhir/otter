@@ -645,12 +645,11 @@ impl Interpreter {
             && let Some(string) = key_value.as_string(&self.gc_heap)
             && object::supports_fast_property_ic(obj, &self.gc_heap)
             && !object::state(obj, &self.gc_heap).is_prototype()
-            && let Some(atom) = self.string_key_atom(string)
-            && let Some(name) = self.shape_runtime.names().spelling(atom)
+            && let Some((atom, name)) = self.interned_string_key(string)
         {
             let key = crate::property_atom::AtomizedPropertyKey::new(
                 crate::property_atom::PropertyAtom::new(atom),
-                name,
+                &name,
             );
             if self
                 .property_cache
@@ -678,11 +677,6 @@ impl Interpreter {
                     object::SetOutcome::AssignData
                 )
             {
-                let name = name.clone();
-                let key = crate::property_atom::AtomizedPropertyKey::new(
-                    crate::property_atom::PropertyAtom::new(atom),
-                    &name,
-                );
                 // Interning the child shape may collect; a refused add leaves
                 // the full path below with current receiver and key words.
                 let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);

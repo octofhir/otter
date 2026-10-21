@@ -145,6 +145,7 @@ builtin_table! {
     installer internal_otter_stream_handle "internal/otter/stream_handle" plain "nodelib/compat/internal_otter_stream_handle.js";
     installer internal_tcp_wrap "internal/otter/tcp_wrap" plain "nodelib/compat/internal_tcp_wrap.js";
     installer internal_pipe_wrap "internal/otter/pipe_wrap" plain "nodelib/compat/internal_pipe_wrap.js";
+    installer internal_tty_wrap "internal/otter/tty_wrap" plain "nodelib/compat/internal_tty_wrap.js";
     installer internal_udp_wrap "internal/otter/udp_wrap" plain "nodelib/compat/internal_udp_wrap.js";
     installer internal_zlib_handle "internal/otter/zlib_handle" plain "nodelib/compat/internal_zlib_handle.js";
     installer internal_fs_binding "internal/otter/fs_binding" plain "nodelib/compat/internal_fs_binding.js";
@@ -210,7 +211,8 @@ builtin_table! {
     installer internal_cluster_primary "internal/cluster/primary" vendored "nodelib/internal/cluster/primary.js";
     installer internal_otter_cluster "internal/otter/cluster" vendored "nodelib/cluster.js";
     installer node_cluster "node:cluster" plain "nodelib/compat/node_cluster.js";
-    installer node_tty "node:tty" plain "tty.js";
+    installer node_tty "node:tty" vendored "nodelib/tty.js";
+    installer internal_tty "internal/tty" vendored "nodelib/internal/tty.js";
     installer node_readline "node:readline" plain "readline.js";
     installer node_child_process "node:child_process" plain "child_process.js";
     embedded node_dns "node:dns" plain "dns.js";

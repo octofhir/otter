@@ -126,20 +126,73 @@ function buildStdout(fd, write) {
 }
 
 // What an output stream says about its descriptor: which one it is, whether
-// it is a terminal, and for a terminal its color support and size. The stream
-// carries exactly these, and the console decides colors from them alone while
-// no stream has been built yet.
+// it is a terminal, and for a terminal its color support, its size and the
+// cursor and size members a `tty.WriteStream` has, so the program's own
+// output answers every call a terminal stream it made itself would. The
+// stream carries exactly these, and the console decides colors from them
+// alone while no stream has been built yet.
+//
+// None of this loads `tty`: that module stands on the whole `net` stack, and
+// the first line a program prints to a terminal must not pay for it.
 function describeOutput(fd, isTTY) {
   const traits = { __proto__: null, fd, isTTY };
   if (isTTY) {
-    const { WriteStream } = require('tty');
-    traits.getColorDepth = WriteStream.prototype.getColorDepth;
-    traits.hasColors = WriteStream.prototype.hasColors;
-    traits.columns = 80;
-    traits.rows = 24;
+    const { getColorDepth, hasColors } = require('internal/tty');
+    traits.getColorDepth = getColorDepth;
+    traits.hasColors = hasColors;
+    // A terminal that will not say its size is left without one, as Node
+    // leaves it.
+    const size = [0, 0];
+    if (require('internal/otter/tty').getWindowSize(fd, size) === 0) {
+      traits.columns = size[0];
+      traits.rows = size[1];
+    }
+    for (const key in terminalMembers) traits[key] = terminalMembers[key];
   }
   return traits;
 }
+
+let readline;
+function lazyReadline() {
+  readline ??= require('readline');
+  return readline;
+}
+
+// `tty.WriteStream`'s own members, over the descriptor rather than a handle.
+const terminalMembers = {
+  __proto__: null,
+  getWindowSize() {
+    return [this.columns, this.rows];
+  },
+  // Node's stream reads its size again on SIGWINCH; a program may ask for
+  // the same at any time.
+  _refreshSize() {
+    const size = [0, 0];
+    const err = require('internal/otter/tty').getWindowSize(this.fd, size);
+    if (err !== 0) {
+      const { ErrnoException } = require('internal/errors');
+      this.emit('error', new ErrnoException(err, 'getWindowSize'));
+      return;
+    }
+    if (this.columns !== size[0] || this.rows !== size[1]) {
+      this.columns = size[0];
+      this.rows = size[1];
+      this.emit('resize');
+    }
+  },
+  cursorTo(x, y, callback) {
+    return lazyReadline().cursorTo(this, x, y, callback);
+  },
+  moveCursor(dx, dy, callback) {
+    return lazyReadline().moveCursor(this, dx, dy, callback);
+  },
+  clearLine(dir, callback) {
+    return lazyReadline().clearLine(this, dir, callback);
+  },
+  clearScreenDown(callback) {
+    return lazyReadline().clearScreenDown(this, callback);
+  },
+};
 
 // The runtime defines `holdsAccessor`, `streamUnset`, `isatty` and `write`
 // beside these: the console's way to the descriptors before any stream exists.

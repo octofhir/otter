@@ -161,6 +161,20 @@ pub(crate) enum BranchKind {
     Native(u32),
 }
 
+impl BranchKind {
+    /// How many inputs the condition reads.
+    pub(crate) fn operands(self) -> usize {
+        match self {
+            Self::Int32(_) | Self::Float64(_) | Self::TaggedEqual => 2,
+            Self::Truthy
+            | Self::Float64Truthy
+            | Self::Nullish
+            | Self::WordEqual(_)
+            | Self::Native(_) => 1,
+        }
+    }
+}
+
 /// A `Math` method on float64 operands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum MathOp {
@@ -272,6 +286,9 @@ pub(crate) enum Kind {
     LoadWindow(u16),
     /// A merge of one value per predecessor.
     Phi,
+    /// Input `n` when this branch kind's condition holds over the first `n`
+    /// inputs, its operands, else input `n + 1`, picked without a branch.
+    Select(BranchKind),
 
     // ---- Allocation ----
     /// One post-LICM fixed-shell group, preserving the first original source id.
@@ -917,6 +934,7 @@ impl Kind {
             | Self::LoadCellValue(_)
             | Self::LoadWindow(_)
             | Self::Phi
+            | Self::Select(_)
             | Self::AllocationProjection(_)
             | Self::DecrementBackedgeFuel
             | Self::Int32AddWrapping
@@ -1512,6 +1530,7 @@ impl Kind {
             | Self::CheckContextSlot { .. }
             | Self::CheckClosureContext(_)
             | Self::CheckDependencies => simple(0, ResultPolicy::None),
+            Self::Select(_) => simple(input_count, ResultPolicy::Register),
             Self::Branch {
                 kind: BranchKind::Int32(_),
                 ..

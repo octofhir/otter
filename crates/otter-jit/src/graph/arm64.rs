@@ -119,6 +119,36 @@ const ARRAY_INDEX_PROTECTOR: u32 = crate::entry::VM_THREAD_ARRAY_INDEX_PROTECTOR
 /// A slow path emitted after the body.
 type Deferred<'a> = Box<dyn FnOnce(&mut Codegen<'a>) + 'a>;
 
+/// The flag condition a select picks its first value under.
+#[derive(Debug, Clone, Copy)]
+enum SelectCondition {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Mi,
+    Ls,
+}
+
+impl SelectCondition {
+    /// Where `condition` holds after an int32 compare, or after a float64
+    /// one, whose unordered result satisfies only `!=`.
+    fn of(condition: Condition, float: bool) -> Self {
+        match (condition, float) {
+            (Condition::Equal, _) => Self::Eq,
+            (Condition::NotEqual, _) => Self::Ne,
+            (Condition::Less, false) => Self::Lt,
+            (Condition::Less, true) => Self::Mi,
+            (Condition::LessEqual, false) => Self::Le,
+            (Condition::LessEqual, true) => Self::Ls,
+            (Condition::Greater, _) => Self::Gt,
+            (Condition::GreaterEqual, _) => Self::Ge,
+        }
+    }
+}
+
 struct Codegen<'a> {
     ops: Assembler,
     /// Literal-pool label of each float64 constant a move loads, emitted
@@ -1466,6 +1496,14 @@ impl<'a> Codegen<'a> {
                 let condition = *condition;
                 self.emit_int32_compare(a, operand);
                 self.emit_cset_bool(destination, condition, false);
+            }
+            Kind::Select(kind) => {
+                let kind = *kind;
+                let operands = kind.operands();
+                let condition = self.emit_select_test(kind, &allocation.inputs[..operands])?;
+                let (picked, other) = (input(operands), input(operands + 1));
+                let float = data.repr == Repr::Float64;
+                self.emit_select(condition, float, result.expect("a result"), picked, other);
             }
             Kind::Float64Add | Kind::Float64Sub | Kind::Float64Mul | Kind::Float64Div => {
                 let (a, b) = (Self::fp(input(0)), Self::fp(input(1)));
@@ -5496,6 +5534,85 @@ impl<'a> Codegen<'a> {
             ref other => return Err(Unsupported::OperandShape(node_name(other))),
         }
         Ok(())
+    }
+
+    /// Set the flags for `kind`'s condition over `operands`; answers the flag
+    /// condition under which it holds.
+    fn emit_select_test(
+        &mut self,
+        kind: BranchKind,
+        operands: &[Location],
+    ) -> Result<SelectCondition, Unsupported> {
+        Ok(match kind {
+            BranchKind::Int32(condition) => {
+                let a = Self::gp(operands[0]);
+                let operand = self.int32_operand(operands[1]);
+                self.emit_int32_compare(a, operand);
+                SelectCondition::of(condition, false)
+            }
+            BranchKind::Float64(condition) => {
+                let (a, b) = (Self::fp(operands[0]), Self::fp(operands[1]));
+                dynasm!(self.ops ; .arch aarch64 ; fcmp D(a), D(b));
+                SelectCondition::of(condition, true)
+            }
+            BranchKind::TaggedEqual => {
+                let (a, b) = (Self::gp(operands[0]), Self::gp(operands[1]));
+                dynasm!(self.ops ; .arch aarch64 ; cmp X(a), X(b));
+                SelectCondition::Eq
+            }
+            BranchKind::WordEqual(constant) => {
+                let a = Self::gp(operands[0]);
+                self.load_immediate(16, u64::from(constant));
+                dynasm!(self.ops ; .arch aarch64 ; cmp X(a), x16);
+                SelectCondition::Eq
+            }
+            // A select tests only a boolean's truth.
+            BranchKind::Truthy => {
+                let a = Self::gp(operands[0]);
+                dynasm!(self.ops ; .arch aarch64 ; cmp XSP(a), VALUE_TRUE as u32);
+                SelectCondition::Eq
+            }
+            BranchKind::Float64Truthy | BranchKind::Nullish | BranchKind::Native(_) => {
+                return Err(Unsupported::OperandShape("graph select test"));
+            }
+        })
+    }
+
+    /// `destination = condition ? picked : other` on the flags just set.
+    fn emit_select(
+        &mut self,
+        condition: SelectCondition,
+        float: bool,
+        destination: Location,
+        picked: Location,
+        other: Location,
+    ) {
+        use SelectCondition as C;
+        if float {
+            let (d, a, b) = (Self::fp(destination), Self::fp(picked), Self::fp(other));
+            match condition {
+                C::Eq => dynasm!(self.ops ; .arch aarch64 ; fcsel D(d), D(a), D(b), eq),
+                C::Ne => dynasm!(self.ops ; .arch aarch64 ; fcsel D(d), D(a), D(b), ne),
+                C::Lt => dynasm!(self.ops ; .arch aarch64 ; fcsel D(d), D(a), D(b), lt),
+                C::Le => dynasm!(self.ops ; .arch aarch64 ; fcsel D(d), D(a), D(b), le),
+                C::Gt => dynasm!(self.ops ; .arch aarch64 ; fcsel D(d), D(a), D(b), gt),
+                C::Ge => dynasm!(self.ops ; .arch aarch64 ; fcsel D(d), D(a), D(b), ge),
+                C::Mi => dynasm!(self.ops ; .arch aarch64 ; fcsel D(d), D(a), D(b), mi),
+                C::Ls => dynasm!(self.ops ; .arch aarch64 ; fcsel D(d), D(a), D(b), ls),
+            }
+        } else {
+            let (d, a, b) = (Self::gp(destination), Self::gp(picked), Self::gp(other));
+            match condition {
+                C::Eq => dynasm!(self.ops ; .arch aarch64 ; csel X(d), X(a), X(b), eq),
+                C::Ne => dynasm!(self.ops ; .arch aarch64 ; csel X(d), X(a), X(b), ne),
+                C::Lt => dynasm!(self.ops ; .arch aarch64 ; csel X(d), X(a), X(b), lt),
+                C::Le => dynasm!(self.ops ; .arch aarch64 ; csel X(d), X(a), X(b), le),
+                C::Gt => dynasm!(self.ops ; .arch aarch64 ; csel X(d), X(a), X(b), gt),
+                C::Ge => dynasm!(self.ops ; .arch aarch64 ; csel X(d), X(a), X(b), ge),
+                C::Mi => dynasm!(self.ops ; .arch aarch64 ; csel X(d), X(a), X(b), mi),
+                C::Ls => dynasm!(self.ops ; .arch aarch64 ; csel X(d), X(a), X(b), ls),
+            }
+        }
     }
 
     fn emit_branch_condition(&mut self, condition: Condition, float: bool, target: DynamicLabel) {

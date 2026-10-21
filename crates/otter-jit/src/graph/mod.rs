@@ -24,6 +24,8 @@
 //!   ToBoolean.
 //! - `branch_thread` — branches on a merged boolean take the merged edges
 //!   directly.
+//! - `straighten` — a block entered only by its predecessor's jump joins
+//!   that predecessor.
 //! - `select` — diamonds that only pick a value become selects.
 //! - `dependency_checks` — stability and field-summary proofs become code
 //!   dependencies with one flag test per effect region.
@@ -89,6 +91,7 @@ mod redundancy;
 pub(crate) mod regalloc;
 pub(crate) mod registers;
 mod select;
+mod straighten;
 pub(crate) mod truncation;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_64;
@@ -196,7 +199,10 @@ pub(crate) fn compile(
     fold::fold(&mut built.graph, &mut built.layout, &mut built.loop_headers);
     branch_fold::fold_branch_negations(&mut built.graph);
     branch_thread::thread_boolean_phis(&mut built.graph, &mut built.layout);
+    let osr_entry = built.osr_entry;
+    straighten::merge(&mut built.graph, &mut built.layout, osr_entry.as_slice());
     select::convert(&mut built.graph, &mut built.layout);
+    straighten::merge(&mut built.graph, &mut built.layout, osr_entry.as_slice());
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);
     let dependencies = dependency_checks::place(&mut built.graph, view, &built.inline_views);
     backedge_fuel::carry_in_registers(&mut built.graph, &mut built.layout, &built.loop_headers);

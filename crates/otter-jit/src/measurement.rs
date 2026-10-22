@@ -256,6 +256,7 @@ impl OtterJitCompiler {
         }
         .map_err(|error| error.to_string())?;
         match status {
+            JitCompileStatus::Cancelled => Err(format!("{} compilation cancelled", tier.name())),
             JitCompileStatus::Compiled {
                 code,
                 artifact,
@@ -289,6 +290,9 @@ impl ExactMeasuredCompiler {
         &self,
         request: JitCompileRequest,
     ) -> Result<JitCompileStatus, JitCompileError> {
+        if request.cancellation.is_cancelled() {
+            return Ok(JitCompileStatus::Cancelled);
+        }
         if request.snapshot.code_block.id != self.function_id {
             return Ok(JitCompileStatus::Unsupported {
                 reason: "validation hook exposes only the measured function".into(),

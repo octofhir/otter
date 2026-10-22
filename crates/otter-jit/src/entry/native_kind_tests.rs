@@ -261,7 +261,8 @@ fn same_source_whole_compilation_exposes_both_hit_and_miss_code_cost() {
         // Compile-only source selection: no address is called, no policy or
         // execution feedback is simulated. Runtime owns actual admission.
         let template = crate::template::compile(&view, 31, &table).unwrap();
-        let graph = crate::graph::compile(&view, 32, &table, None, false).unwrap();
+        let graph =
+            crate::graph::compile(&view, 32, &table, None, false, &Default::default()).unwrap();
         let plans: Vec<_> = graph
             .built
             .graph

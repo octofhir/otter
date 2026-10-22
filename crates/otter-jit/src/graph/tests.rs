@@ -7,6 +7,7 @@
 //!   feedback, and exact deopt exits.
 //! - Every node kind's declared slow-path stubs agree with what its
 //!   properties say it may do.
+//! - A cancelled request stops before bytecode analysis can reject its body.
 //!
 //! # See also
 //! - [`super::compile`] — the pipeline under test.
@@ -42,11 +43,30 @@ fn seed(view: &mut JitCompileSnapshot, pcs: &[u32], bits: u8) {
     }
 }
 
+#[test]
+fn cancellation_precedes_bytecode_analysis() {
+    // An empty body fails analysis unless cancellation stops the request first.
+    let view = JitCompileSnapshot::without_feedback(90, 0, 0, Vec::new());
+    let cancellation = otter_vm::JitCompileCancellation::default();
+    cancellation.cancel();
+    let result = super::compile_optimized(
+        &view,
+        7000,
+        &TransitionTable::resolve(),
+        None,
+        None,
+        false,
+        &cancellation,
+    );
+    assert!(matches!(result, Err(crate::CompileFailure::Cancelled)));
+}
+
 /// Run the tier entry over a frame holding `args`; returns the result pair
 /// and the frame window afterwards.
 fn run(view: &JitCompileSnapshot, args: &[u64]) -> (NativeResultPair, Vec<u64>) {
     let transitions = TransitionTable::resolve();
-    let compiled = super::compile(view, 7001, &transitions, None, false).expect("graph compile");
+    let compiled = super::compile(view, 7001, &transitions, None, false, &Default::default())
+        .expect("graph compile");
     let entry: JitEntry = unsafe {
         std::mem::transmute(
             compiled
@@ -185,13 +205,29 @@ fn captured_splices_report_exact_nested_source_owners_and_budget_bytes() {
     );
     offer(&mut root, middle.clone());
     let transitions = TransitionTable::resolve();
-    let disabled = super::compile_optimized(&root, 7002, &transitions, None, None, false)
-        .expect("nested graph without events");
+    let disabled = super::compile_optimized(
+        &root,
+        7002,
+        &transitions,
+        None,
+        None,
+        false,
+        &Default::default(),
+    )
+    .expect("nested graph without events");
     assert!(disabled.diagnostics.is_empty());
     assert_eq!(disabled.code.spliced_functions(), &[91, 92]);
 
-    let captured = super::compile_optimized(&root, 7003, &transitions, None, None, true)
-        .expect("nested graph with events");
+    let captured = super::compile_optimized(
+        &root,
+        7003,
+        &transitions,
+        None,
+        None,
+        true,
+        &Default::default(),
+    )
+    .expect("nested graph with events");
     assert_eq!(captured.code.spliced_functions(), &[91, 92]);
     assert_eq!(
         captured.diagnostics.as_ref(),
@@ -365,7 +401,8 @@ fn branches_merge_through_phis() {
     seed(&mut view, &[0, 5], ARITH_INT32);
     // The builder's diamond, edge blocks and all, picks with one select.
     let transitions = TransitionTable::resolve();
-    let compiled = super::compile(&view, 7002, &transitions, None, false).expect("graph compile");
+    let compiled = super::compile(&view, 7002, &transitions, None, false, &Default::default())
+        .expect("graph compile");
     let graph = &compiled.built.graph;
     let selects = compiled
         .built
@@ -499,7 +536,8 @@ fn nested_loops() -> JitCompileSnapshot {
 fn nested_loops_carry_values_through_both_headers() {
     let view = nested_loops();
     let transitions = TransitionTable::resolve();
-    let compiled = super::compile(&view, 7001, &transitions, None, false).expect("graph compile");
+    let compiled = super::compile(&view, 7001, &transitions, None, false, &Default::default())
+        .expect("graph compile");
     let dump = compiled.built.graph.dump(&compiled.built.layout);
     let (result, _) = run(&view, &[int(10), int(1)]);
     assert_eq!(

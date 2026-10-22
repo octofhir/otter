@@ -139,7 +139,15 @@ fn emitted_receiver_refill_and_retry_misses_keep_their_semantic_owner() {
         .inline_callees
         .insert(0, JitInlineCallee { body: constructor });
     let transitions = crate::entry::TransitionTable::resolve();
-    let compiled = super::compile(&receiver, 8001, &transitions, None, false).unwrap();
+    let compiled = super::compile(
+        &receiver,
+        8001,
+        &transitions,
+        None,
+        false,
+        &Default::default(),
+    )
+    .unwrap();
     assert_eq!(compiled.built.inline_views.len(), 1);
     assert!(
         compiled
@@ -190,7 +198,8 @@ fn emitted_receiver_refill_and_retry_misses_keep_their_semantic_owner() {
             realm_id: array.literal_allocations.realm_id,
         }),
     );
-    let compiled = super::compile(&array, 8002, &transitions, None, false).unwrap();
+    let compiled =
+        super::compile(&array, 8002, &transitions, None, false, &Default::default()).unwrap();
     assert!(
         compiled
             .built
@@ -269,7 +278,8 @@ fn nested_native_regions_use_their_own_function_and_byte_pc() {
     );
     offer(&mut root, Arc::new(middle));
     let transitions = crate::entry::TransitionTable::resolve();
-    let compiled = super::compile(&root, 7001, &transitions, None, false).unwrap();
+    let compiled =
+        super::compile(&root, 7001, &transitions, None, false, &Default::default()).unwrap();
     assert_eq!(
         compiled.built.inline_views.len(),
         2,
@@ -294,9 +304,26 @@ fn nested_native_regions_use_their_own_function_and_byte_pc() {
         tier: JitDebugTier::Optimizing,
         entry: JitDebugTarget::Entry,
     };
-    let captured =
-        super::compile_optimized(&root, 7002, &transitions, None, Some(request), false).unwrap();
-    let disabled = super::compile_optimized(&root, 7003, &transitions, None, None, false).unwrap();
+    let captured = super::compile_optimized(
+        &root,
+        7002,
+        &transitions,
+        None,
+        Some(request),
+        false,
+        &Default::default(),
+    )
+    .unwrap();
+    let disabled = super::compile_optimized(
+        &root,
+        7003,
+        &transitions,
+        None,
+        None,
+        false,
+        &Default::default(),
+    )
+    .unwrap();
     assert!(disabled.artifact.is_none());
     assert_eq!(disabled.ir_node_count, captured.ir_node_count);
     assert_eq!(disabled.code.code_len(), captured.code.code_len());
@@ -426,7 +453,8 @@ fn generic_window_owner_survives_nested_splices_and_abandoned_inline_source() {
     offer_at(&mut root, 1, Arc::new(middle));
     offer_at(&mut root, 2, Arc::new(needs_window));
     let transitions = crate::entry::TransitionTable::resolve();
-    let mut compiled = super::compile(&root, 7101, &transitions, None, false).unwrap();
+    let mut compiled =
+        super::compile(&root, 7101, &transitions, None, false, &Default::default()).unwrap();
     assert_eq!(
         compiled.built.inline_views.len(),
         2,
@@ -486,8 +514,16 @@ fn generic_window_owner_survives_nested_splices_and_abandoned_inline_source() {
         tier: JitDebugTier::Optimizing,
         entry: JitDebugTarget::Entry,
     };
-    let captured =
-        super::compile_optimized(&root, 7102, &transitions, None, Some(request), false).unwrap();
+    let captured = super::compile_optimized(
+        &root,
+        7102,
+        &transitions,
+        None,
+        Some(request),
+        false,
+        &Default::default(),
+    )
+    .unwrap();
     let artifact = captured.artifact.unwrap();
     let map: serde_json::Value = serde_json::from_slice(
         artifact
@@ -602,7 +638,8 @@ fn an_abandoned_callee_drops_the_loops_of_bodies_spliced_into_it() {
     );
     offer(&mut root, Arc::new(middle));
     let transitions = crate::entry::TransitionTable::resolve();
-    let compiled = super::compile(&root, 7102, &transitions, None, false).unwrap();
+    let compiled =
+        super::compile(&root, 7102, &transitions, None, false, &Default::default()).unwrap();
     let graph = &compiled.built.graph;
     assert!(graph.inlined.is_empty(), "the middle body was abandoned");
     assert!(
@@ -669,7 +706,8 @@ fn object_protocol_words_follow_rewritten_nodes_and_retain_inline_roots() {
         );
         offer(&mut root, Arc::new(leaf));
         let transitions = crate::entry::TransitionTable::resolve();
-        let mut compiled = super::compile(&root, 7201, &transitions, None, false).unwrap();
+        let mut compiled =
+            super::compile(&root, 7201, &transitions, None, false, &Default::default()).unwrap();
         assert_eq!(
             compiled.built.inline_views.len(),
             1,

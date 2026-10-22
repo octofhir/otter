@@ -17,6 +17,9 @@
 //! no moving-GC handle is stored in function metadata.
 //! Source-context optimization roots of candidates are released before the
 //! collection, so they cannot turn a dead chunk into a live census result.
+//! Pending compiler jobs are cancelled before candidate selection. Their source
+//! leases survive until terminal acknowledgement, so an active worker can
+//! postpone reclamation but cannot read a detached chunk or publish orphan code.
 //! Dynamic-code reclamation runs only with no active native/materialized
 //! activation, completes a full collection, retires generated code, and only
 //! then tombstones a payload proven free of ids and retained contexts.
@@ -98,6 +101,11 @@ impl Interpreter {
         debug_assert_eq!(self.sync_reentry_depth, 0);
         debug_assert!(!self.jit_has_native_frames());
 
+        self.jit_compile_queue.cancel_all();
+        // Queued ACKs release their source leases before candidate selection;
+        // active workers retain theirs until a later acknowledgement/poll.
+        self.install_finished_optimized_compiles();
+
         self.code_eviction_stats.census_passes =
             self.code_eviction_stats.census_passes.saturating_add(1);
         let mut released_contexts = false;
@@ -158,10 +166,15 @@ impl Interpreter {
             self.purge_chunk_side_tables(&evicted);
         }
         self.code_eviction_stats.retained_bytes = self.code_space.evictable_retained_bytes();
+        if self.code_eviction_stats.retained_bytes > target_bytes {
+            self.jit_compile_queue
+                .mark_cancelled_for_reclamation_retry();
+        }
         Ok(())
     }
 
     fn retire_jit_for_code_eviction(&mut self) {
+        self.jit_compile_queue.cancel_all();
         let invalidated = self.jit_code_registry.invalidate_all().len() as u64;
         self.jit_runtime_stats.caller_invalidations = self
             .jit_runtime_stats
@@ -463,6 +476,7 @@ impl Interpreter {
         // whole space so every atom id this run compares — against shape
         // nodes, IC guards, transition records — comes from this isolate.
         if !std::sync::Arc::ptr_eq(&self.code_space, context.space()) {
+            self.jit_compile_queue.cancel_all();
             self.owner_cache.borrow_mut().clear();
             self.code_space = std::sync::Arc::clone(context.space());
             self.code_space

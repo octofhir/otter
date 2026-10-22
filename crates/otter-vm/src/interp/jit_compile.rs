@@ -28,8 +28,8 @@
 //! source-aware committed operations instead of baking the caller's cells.
 //! Compiled code is published only after the registry accepts its metadata and
 //! exact isolate-epoch dependency snapshot. An optimizing snapshot owns its
-//! roots until its result is installed or dropped; a result whose function was
-//! invalidated or entered retraining after the snapshot is dropped.
+//! roots and defining source chunks until terminal compiler acknowledgement;
+//! cancelled, replaced-source or retraining results cannot be published.
 //! Caller compilation never recursively compiles its generated-call targets.
 //! Property shape preparation precedes nested body and method snapshots, so
 //! metadata migration cannot immediately stale a freshly captured method guard.
@@ -366,7 +366,7 @@ impl Interpreter {
         tier: jit_debug::JitDebugTier,
         target: jit_debug::JitDebugTarget,
         code_object_id: u64,
-        compile_started_ns: u64,
+        compile_started_ns: Option<u64>,
         queue_delay_ns: u64,
         compile_duration_ns: u64,
         status: &Result<jit::JitCompileStatus, jit::JitCompileError>,
@@ -375,6 +375,9 @@ impl Interpreter {
             return;
         }
         let (outcome, ir_node_count) = match status {
+            Ok(jit::JitCompileStatus::Cancelled) => {
+                (jit_debug::JitDebugCompileOutcome::Cancelled, 0)
+            }
             Ok(jit::JitCompileStatus::Compiled {
                 code,
                 ir_node_count,
@@ -635,6 +638,7 @@ impl Interpreter {
                 }
             }
         }
+        let sources = crate::jit_compile_lifetime::CompilationSources::retain(context, &snapshot)?;
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
@@ -666,26 +670,26 @@ impl Interpreter {
         } else {
             0
         };
-        self.jit_runtime_stats.compile_attempts =
-            self.jit_runtime_stats.compile_attempts.saturating_add(1);
-        self.optimizing_tier_policy
-            .record_compile_attempt(fid, crate::tier_policy::CostedTier::Optimizing);
         let perf_name = self.jit_debug.request().perf_map_enabled().then(|| {
             context
                 .function(fid)
                 .map_or_else(|| "<unknown>".to_string(), |function| function.name.clone())
         });
+        let cancellation = crate::JitCompileCancellation::default();
         let pending = crate::jit_compile_queue::PendingCompile {
             function_id: fid,
             osr_pc,
             function,
             roots: self.finalized_compile_roots(roots_start),
+            sources,
+            cancellation: cancellation.clone(),
+            retry_code_reclamation: false,
             feedback_epoch: self.code_space.feedback_epoch(fid),
             queued_ns,
             perf_name,
-            stale: false,
         };
         let request = jit::JitCompileRequest {
+            cancellation,
             snapshot,
             debug: self.jit_debug.request(),
             artifact_identity,
@@ -743,18 +747,50 @@ impl Interpreter {
     fn finish_optimized_compile(
         &mut self,
         pending: crate::jit_compile_queue::PendingCompile,
-        finished: crate::jit_compile_queue::FinishedCompile,
+        mut finished: crate::jit_compile_queue::FinishedCompile,
     ) -> Option<std::sync::Arc<dyn jit::JitFunctionCode>> {
         let crate::jit_compile_queue::PendingCompile {
             function_id: fid,
             osr_pc,
             function,
             roots,
+            sources,
+            cancellation,
+            retry_code_reclamation,
             feedback_epoch,
             queued_ns,
             perf_name,
-            stale,
         } = pending;
+        if retry_code_reclamation {
+            // Release the leases below before the next top-level pressure
+            // check. ACK itself never collects or recursively evicts source.
+            self.code_eviction_trigger_bytes = self.code_eviction_high_water_bytes;
+        }
+        let spliced = match &finished.status {
+            Ok(jit::JitCompileStatus::Compiled { code, .. }) => code.spliced_functions(),
+            _ => &[],
+        };
+        let root_current = sources.is_current(&self.code_space, &function, &[]);
+        let sources_current = root_current
+            && (spliced.is_empty() || sources.is_current(&self.code_space, &function, spliced));
+        if !root_current {
+            cancellation.cancel();
+        }
+        if cancellation.is_cancelled() {
+            finished.status = Ok(jit::JitCompileStatus::Cancelled);
+        }
+        if finished.entered_hook {
+            self.jit_runtime_stats.compile_attempts =
+                self.jit_runtime_stats.compile_attempts.saturating_add(1);
+            // Actual compiler work belongs to a still-current root even when
+            // a returned artifact cannot publish one of its spliced sources.
+            // Dropping that attempt would leave its unchanged source-work
+            // budget immediately ready to compile the same snapshot again.
+            if root_current {
+                self.optimizing_tier_policy
+                    .record_compile_attempt(fid, crate::tier_policy::CostedTier::Optimizing);
+            }
+        }
         let nanos =
             |duration: std::time::Duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64;
         let queue_delay_ns = nanos(finished.queue_delay);
@@ -767,12 +803,16 @@ impl Interpreter {
             jit_debug::JitDebugTier::Optimizing,
             target,
             code_object_id,
-            queued_ns.saturating_add(queue_delay_ns),
+            finished
+                .entered_hook
+                .then(|| queued_ns.saturating_add(queue_delay_ns)),
             queue_delay_ns,
             nanos(finished.duration),
             &finished.status,
         );
-        if self.jit_retraining_blocks(fid) {
+        if self.jit_retraining_blocks(fid)
+            || matches!(finished.status, Ok(jit::JitCompileStatus::Cancelled))
+        {
             return None;
         }
         let rearm = |vm: &mut Self| {
@@ -784,11 +824,21 @@ impl Interpreter {
             vm.jit_code_registry
                 .defer_generated_tiering(fid, decision.work_target);
         };
-        if stale {
-            rearm(self);
-            return None;
-        }
         let declined = match finished.status {
+            Ok(jit::JitCompileStatus::Compiled { .. }) if !sources_current => {
+                // Every actual splice must have arrived in the prepared source
+                // closure. With a current root and retained chunk leases this
+                // is an invalid artifact, not a transient cancellation. Keep
+                // truthful compile diagnostics and cache the ordinary decline
+                // for this feedback rather than repeatedly compiling it.
+                self.record_jit_install_declined(
+                    fid,
+                    code_object_id,
+                    jit_debug::JitDebugTier::Optimizing,
+                    crate::jit_registry::JitInstallError::InvalidCode,
+                );
+                true
+            }
             Ok(jit::JitCompileStatus::Compiled {
                 code,
                 artifact,
@@ -1063,13 +1113,18 @@ impl Interpreter {
             self.jit_runtime_stats.compile_attempts.saturating_add(1);
         self.optimizing_tier_policy
             .record_compile_attempt(fid, crate::tier_policy::CostedTier::Template);
-        let status = hook.compile_function(jit::JitCompileRequest {
+        let cancellation = crate::JitCompileCancellation::default();
+        let mut status = hook.compile_function(jit::JitCompileRequest {
+            cancellation: cancellation.clone(),
             snapshot: view,
             debug: self.jit_debug.request(),
             artifact_identity,
             osr_pc,
             code_object_id,
         });
+        if cancellation.is_cancelled() {
+            status = Ok(jit::JitCompileStatus::Cancelled);
+        }
         let compile_duration_ns = compile_started.map_or(0, |started| {
             started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
         });
@@ -1078,7 +1133,7 @@ impl Interpreter {
             jit_debug::JitDebugTier::Template,
             target,
             code_object_id,
-            compile_started_ns,
+            Some(compile_started_ns),
             compile_started_ns.saturating_sub(queued_ns),
             compile_duration_ns,
             &status,
@@ -1163,7 +1218,9 @@ impl Interpreter {
                 }
             }
             Ok(jit::JitCompileStatus::Unsupported { .. }) => TemplateCompileOutcome::Unsupported,
-            Ok(jit::JitCompileStatus::Unavailable) | Err(_) => TemplateCompileOutcome::Deferred,
+            Ok(jit::JitCompileStatus::Cancelled | jit::JitCompileStatus::Unavailable) | Err(_) => {
+                TemplateCompileOutcome::Deferred
+            }
         }
     }
 

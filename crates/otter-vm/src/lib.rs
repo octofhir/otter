@@ -152,7 +152,9 @@ mod iterator_record;
 pub mod iterator_state;
 pub mod jit;
 pub mod jit_artifact;
+mod jit_cancellation;
 mod jit_class_value_ops;
+mod jit_compile_lifetime;
 mod jit_compile_queue;
 mod jit_construct_ops;
 pub mod jit_debug;
@@ -329,6 +331,7 @@ pub use jit_artifact::{
     JitArtifactBundle, JitArtifactFile, JitArtifactFileName, JitArtifactIdentity,
     JitArtifactManifest, JitArtifactMetadata,
 };
+pub use jit_cancellation::JitCompileCancellation;
 pub use jit_debug::{
     JIT_DEBUG_EVENT_LIMIT, JitCompilerDiagnostic, JitDebugCompileOutcome, JitDebugEvent,
     JitDebugReport, JitDebugRequest, JitDebugTarget, JitDebugTier, JitDirectCallLoweringOutcome,
@@ -633,7 +636,8 @@ pub struct JitRuntimeStats {
     pub generated_optimizing_returns: u64,
     /// Generated optimizing-tier callees that cold-deoptimized.
     pub generated_optimizing_deopts: u64,
-    /// Function-entry compile attempts across native tiers.
+    /// Acknowledged compiler-hook invocations across native tiers. Cancelled
+    /// queued requests that never entered the hook do not count.
     pub compile_attempts: u64,
     /// Successfully installed native code generations across tiers.
     pub code_generations: u64,
@@ -1489,6 +1493,10 @@ impl std::fmt::Debug for Interpreter {
 
 impl Drop for Interpreter {
     fn drop(&mut self) {
+        // Field order would otherwise destroy heap-owned facts before the
+        // optimizing queue. Cancel and join all readers while the isolate's
+        // heap, registry, roots and defining source chunks still exist.
+        drop(std::mem::take(&mut self.jit_compile_queue));
         // Shape side tables store raw compressed GC handles outside the heap.
         // Clear them before `gc_heap` drops so stale offsets cannot outlive the
         // collector they came from.

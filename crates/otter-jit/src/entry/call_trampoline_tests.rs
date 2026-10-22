@@ -128,7 +128,8 @@ fn native_call_trampoline_enters_available_compiled_tiers_on_child_and_current_f
         1,
     );
     #[cfg(target_arch = "aarch64")]
-    let optimized = crate::optimizing::compile_optimized(&snapshot, 2, None).unwrap();
+    let optimized =
+        crate::optimizing::compile_optimized(&snapshot, 2, None, &Default::default()).unwrap();
     #[cfg(target_arch = "aarch64")]
     let compiled = vec![
         template_entry,

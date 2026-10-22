@@ -252,7 +252,15 @@ fn emitted_inline_factory_uses_own_plans_receiver_and_undefined_new_target() {
         .inline_callees
         .insert(call_byte_pc, JitInlineCallee { body: factory });
     let transitions = crate::entry::TransitionTable::resolve();
-    let compiled = crate::graph::compile(&caller, 9001, &transitions, None, false).unwrap();
+    let compiled = crate::graph::compile(
+        &caller,
+        9001,
+        &transitions,
+        None,
+        false,
+        &Default::default(),
+    )
+    .unwrap();
     assert_eq!(
         compiled.built.inline_views.len(),
         1,
@@ -312,6 +320,7 @@ fn emitted_inline_factory_uses_own_plans_receiver_and_undefined_new_target() {
             entry: JitDebugTarget::Entry,
         }),
         false,
+        &Default::default(),
     )
     .unwrap();
     let artifact = captured.artifact.unwrap();

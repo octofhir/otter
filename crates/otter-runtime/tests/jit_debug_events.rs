@@ -192,6 +192,7 @@ fn template_osr_emits_ordered_compile_events() {
                     _ => None,
                 })
                 .expect("template compile telemetry");
+        let compile_started_ns = compile_started_ns.expect("compiled hook entered");
         assert!(compile_started_ns > 0);
         assert!(queue_delay_ns <= compile_started_ns);
         assert!(compile_duration_ns > 0);

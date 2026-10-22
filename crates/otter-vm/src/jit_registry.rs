@@ -909,10 +909,24 @@ impl JitCodeRegistry {
     /// Visit every hidden class a registered (not yet retired) code object
     /// embeds, as strong roots.
     pub(crate) fn trace_retained_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
-        self.closure_contexts.trace(visitor);
         for registered in self.codes.values() {
             for shape in &*registered.roots {
                 shape.trace(visitor);
+            }
+        }
+    }
+
+    /// Resolve speculative observations without retaining their JavaScript
+    /// graphs. An actual generation assumption holds its context strongly;
+    /// an unowned source observation expires before its offset can be reused.
+    pub(crate) fn process_weak(
+        &self,
+        resolve: &mut dyn FnMut(otter_gc::raw::RawGc) -> Option<otter_gc::raw::RawGc>,
+    ) {
+        self.closure_contexts.process_weak(resolve);
+        for registered in self.codes.values() {
+            for root in &*registered.roots {
+                root.process_weak(resolve);
             }
         }
     }

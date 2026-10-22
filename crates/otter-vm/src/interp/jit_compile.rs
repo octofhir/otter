@@ -3335,17 +3335,25 @@ impl Interpreter {
     }
 
     fn bake_unique_closure_context(&mut self, view: &mut jit::JitCompileSnapshot) {
-        let Some((cell, context)) = self
+        let Some((_, context)) = self
             .jit_code_registry
             .closure_contexts
             .single(view.code_block.id)
         else {
             return;
         };
+        // The source fact observes a context weakly. Once a compilation
+        // actually uses it, the generation must own the value its unguarded
+        // LoadCellValue reads. Publish that strong root before preparing any
+        // further assumptions; an unused context is removed from this session.
+        let root_index = self.jit_compile_roots.borrow().len();
+        let cell = self.bake_held_identity_cell(context);
         let constants = self.bake_closure_constants(context, &view.code_block);
         if !constants.is_empty() {
             view.unique_closure_context = Some(cell);
             view.closure_constants = constants;
+        } else {
+            self.jit_compile_roots.borrow_mut().remove(root_index);
         }
     }
 

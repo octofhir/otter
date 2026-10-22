@@ -3,7 +3,7 @@
 //! # Contents
 //!
 //! - [`ExtraRootSource`] — root owners, pre-collection observation hooks, and
-//!   the post-mark weak pass over owner-held tables.
+//!   weak-reference resolution, and the post-mark table sweep.
 //! - [`RootSet`] — which roots a collection needs: every root, or only those
 //!   that may name a young cell.
 //! - [`ExtraRoots`] — raw-pointer trampoline stored by [`crate::heap::GcHeap`].
@@ -22,6 +22,9 @@
 //! - A scavenge asks for [`RootSet::Young`]. A source may then skip a slot
 //!   only when the slot can never hold a young cell: a scavenge neither
 //!   moves nor frees old-space cells, so such a slot is never rewritten.
+//! - Weak observations never enter the strong root walk. After strong and
+//!   ephemeron reachability is complete, the collector resolves them before
+//!   recycling from-space or sweeping old cells.
 //!
 //! # See also
 //!
@@ -59,6 +62,16 @@ pub trait ExtraRootSource {
     /// JavaScript or retain the heap reference; it may only forget entries.
     fn sweep_weak(&self, _heap: &GcHeap) {}
 
+    /// Rewrite or forget non-owning observations after strong and ephemeron
+    /// tracing. The resolver returns a survivor's current handle, or `None`
+    /// for a dead target. It never marks or evacuates an object.
+    ///
+    /// The source must not allocate in the GC heap, reenter JavaScript,
+    /// change registrations or retain the resolver. It may update its own
+    /// scalar observations and invalidate dependent code. Repeated visits
+    /// are allowed, including through composite registrations.
+    fn process_weak(&self, _resolve: &mut dyn FnMut(RawGc) -> Option<RawGc>) {}
+
     /// Visit the mutable raw root slots of `roots` owned by this source.
     fn visit_extra_roots(&self, roots: RootSet, visitor: &mut dyn FnMut(*mut RawGc));
 }
@@ -70,6 +83,7 @@ pub struct ExtraRoots {
     thunk: unsafe fn(*const (), RootSet, &mut dyn FnMut(*mut RawGc)),
     prepare: unsafe fn(*const (), &GcHeap),
     sweep: unsafe fn(*const (), &GcHeap),
+    weak: unsafe fn(*const (), &mut dyn FnMut(RawGc) -> Option<RawGc>),
 }
 
 impl ExtraRoots {
@@ -97,11 +111,20 @@ impl ExtraRoots {
             unsafe { (&*(data as *const S)).sweep_weak(heap) };
         }
 
+        unsafe fn weak<S: ExtraRootSource>(
+            data: *const (),
+            resolve: &mut dyn FnMut(RawGc) -> Option<RawGc>,
+        ) {
+            // SAFETY: the same source lifetime and concrete type as the root thunk.
+            unsafe { (&*(data as *const S)).process_weak(resolve) };
+        }
+
         Self {
             data: source as *const S as *const (),
             thunk: thunk::<S>,
             prepare: prepare::<S>,
             sweep: sweep::<S>,
+            weak: weak::<S>,
         }
     }
 
@@ -117,6 +140,13 @@ impl ExtraRoots {
     pub fn sweep_weak(self, heap: &GcHeap) {
         // SAFETY: the registered source is live throughout this GC pause.
         unsafe { (self.sweep)(self.data, heap) };
+    }
+
+    /// Resolve non-owning observations. Composite sources must forward this
+    /// hook as well as [`Self::visit`].
+    pub fn process_weak(self, resolve: &mut dyn FnMut(RawGc) -> Option<RawGc>) {
+        // SAFETY: the registered source is live throughout this GC pause.
+        unsafe { (self.weak)(self.data, resolve) };
     }
 
     /// Visit the source's roots. Public so a composite
@@ -178,6 +208,59 @@ mod tests {
 
     impl ExtraRootSource for EmptySource {
         fn visit_extra_roots(&self, _roots: RootSet, _visitor: &mut dyn FnMut(*mut RawGc)) {}
+    }
+
+    #[test]
+    fn weak_owner_resolves_survivors_before_recycling_and_drops_dead_targets() {
+        use crate::test_support::OpaqueLeaf;
+        use std::cell::Cell;
+
+        struct Observations {
+            live: Cell<RawGc>,
+            dead: Cell<RawGc>,
+        }
+        impl ExtraRootSource for Observations {
+            fn visit_extra_roots(&self, _: RootSet, _: &mut dyn FnMut(*mut RawGc)) {}
+            fn process_weak(&self, resolve: &mut dyn FnMut(RawGc) -> Option<RawGc>) {
+                for slot in [&self.live, &self.dead] {
+                    slot.set(resolve(slot.get()).unwrap_or(RawGc::NULL));
+                }
+            }
+        }
+        struct Composite(ExtraRoots);
+        impl ExtraRootSource for Composite {
+            fn visit_extra_roots(&self, _: RootSet, _: &mut dyn FnMut(*mut RawGc)) {}
+            fn process_weak(&self, resolve: &mut dyn FnMut(RawGc) -> Option<RawGc>) {
+                self.0.process_weak(resolve);
+            }
+        }
+
+        let mut heap = GcHeap::new().expect("heap");
+        let mut live = heap.alloc(OpaqueLeaf { payload: 11 }).expect("live").raw();
+        let original = live;
+        let observations = Observations {
+            live: Cell::new(live),
+            dead: Cell::new(heap.alloc(OpaqueLeaf { payload: 22 }).expect("dead").raw()),
+        };
+        let composite = Composite(ExtraRoots::new(&observations));
+        let _registration = heap.register_extra_roots(ExtraRoots::new(&composite));
+        let _duplicate = heap.register_extra_roots(ExtraRoots::new(&composite));
+        for _ in 0..2 {
+            heap.collect_minor_with_roots(&mut |visitor| visitor(&mut live))
+                .expect("scavenge");
+            assert_eq!(observations.live.get(), live);
+            assert_eq!(observations.dead.get(), RawGc::NULL);
+        }
+        assert_ne!(live, original);
+        heap.collect_full(&mut |visitor| visitor(&mut live))
+            .expect("live full collection");
+        assert_eq!(observations.live.get(), live);
+        heap.start_incremental_mark_phase(&mut |_| {})
+            .expect("split mark");
+        heap.finish_incremental_mark_phase(&mut |_| {})
+            .expect("finish split mark");
+        heap.sweep_phase();
+        assert_eq!(observations.live.get(), RawGc::NULL);
     }
 
     #[test]

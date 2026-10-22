@@ -758,8 +758,9 @@ pub struct JitCompileSnapshot {
     pub context_layout: JitContextLayout,
     /// Watched slots of a proven method closure or a source with one context.
     pub closure_constants: Vec<JitContextConstant>,
-    /// Address of the permanent traced context word when this source has
-    /// exactly one observed context. Uses a ClosureContext dependency.
+    /// Address of this generation's strongly traced context constant when
+    /// the source has one weakly observed context. Uses a ClosureContext
+    /// dependency; the source observation itself never owns the context.
     pub unique_closure_context: Option<u64>,
     /// Byte offset from a decompressed object pointer to its shape handle
     /// (`HEADER_SIZE + OBJECT_BODY_SHAPE_OFFSET`). A `#[repr(C)]` constant; the

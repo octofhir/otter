@@ -58,6 +58,12 @@ struct ArrayFastDispatchRoots<'a> {
 }
 
 impl otter_gc::ExtraRootSource for ArrayFastDispatchRoots<'_> {
+    fn process_weak(
+        &self,
+        resolve: &mut dyn FnMut(otter_gc::raw::RawGc) -> Option<otter_gc::raw::RawGc>,
+    ) {
+        self.interp_roots.process_weak(resolve);
+    }
     fn prepare_collection(&self, heap: &otter_gc::GcHeap) {
         self.interp_roots.prepare_collection(heap);
     }
@@ -91,6 +97,12 @@ struct CollectionFastDispatchRoots<'a> {
 }
 
 impl otter_gc::ExtraRootSource for CollectionFastDispatchRoots<'_> {
+    fn process_weak(
+        &self,
+        resolve: &mut dyn FnMut(otter_gc::raw::RawGc) -> Option<otter_gc::raw::RawGc>,
+    ) {
+        self.interp_roots.process_weak(resolve);
+    }
     fn prepare_collection(&self, heap: &otter_gc::GcHeap) {
         self.interp_roots.prepare_collection(heap);
     }

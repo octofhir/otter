@@ -192,6 +192,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                 |code| artifact::NativeCompileOutput {
                     code,
                     artifact: None,
+                    required_cells: Box::default(),
                     diagnostics: Box::default(),
                     ir_node_count: u64::try_from(request.snapshot.instructions.len())
                         .unwrap_or(u64::MAX),
@@ -201,6 +202,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
         match compiled {
             Ok(output) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(output.code),
+                required_cells: output.required_cells,
                 artifact: output.artifact,
                 diagnostics: output.diagnostics,
                 ir_node_count: output.ir_node_count,
@@ -258,6 +260,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
         match compiled {
             Ok(output) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(output.code),
+                required_cells: output.required_cells,
                 artifact: output.artifact,
                 diagnostics: output.diagnostics,
                 ir_node_count: output.ir_node_count,

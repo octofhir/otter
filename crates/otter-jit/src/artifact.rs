@@ -1,9 +1,10 @@
-//! Default-off capture helpers for owned JIT artifact bundles.
+//! Finalized compile output and opt-in owned JIT artifact bundles.
 //!
 //! # Contents
 //! - [`ArtifactRequest`] — compiler-local capture identity derived from the
 //!   VM-owned diagnostics request.
-//! - [`NativeCompileOutput`] — finalized code plus an optional sidecar.
+//! - [`NativeCompileOutput`] — finalized code, required cell owners, and an
+//!   optional diagnostics sidecar.
 //! - [`CodeMapCapture`] and [`CodeRegion`] — emission-order native offset
 //!   correlation, including template inline subregions, generated direct-call
 //!   targets, compact scratch layouts and actual callable-entry offsets.
@@ -12,9 +13,10 @@
 //! - Deterministic bytecode, safepoint, deopt, and bundle renderers.
 //!
 //! # Invariants
-//! - Callers construct these values only when artifact capture is requested.
-//!   The ordinary compile path does not allocate maps, clone executable bytes,
-//!   or format text.
+//! - Required cell identities are installation input on every compile path;
+//!   the VM consumes them to transfer only used cell owners to the generation.
+//! - Artifact-only maps, executable-byte copies, and formatted text are built
+//!   only when capture is requested.
 //! - Code regions are recorded during the existing emission pass. This module
 //!   never re-emits code or runs a second lowering/analysis traversal.
 //! - Relocation normalization scans finalized bytes only when capture is
@@ -67,6 +69,9 @@ pub(crate) struct ArtifactRequest {
 /// Native code returned independently from its optional diagnostics sidecar.
 pub(crate) struct NativeCompileOutput<T> {
     pub(crate) code: T,
+    /// Address-stable cell owners used by code or its validity metadata.
+    /// Installation consumes this sorted set; the code object retains no copy.
+    pub(crate) required_cells: Box<[u64]>,
     pub(crate) artifact: Option<Box<JitArtifactBundle>>,
     pub(crate) diagnostics: Box<[otter_vm::JitCompilerDiagnostic]>,
     pub(crate) ir_node_count: u64,

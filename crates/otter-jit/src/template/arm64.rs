@@ -719,6 +719,7 @@ fn compile_with_reach(
     safepoint_records.sort_by_key(|record| record.id);
     return_sites.sort_by_key(|site| site.native_return_offset);
     let compiled_code = CompiledCode::new(buf, entry);
+    let required_cells = relocations.take_required_cells();
     let artifact = artifact_request.map(|request| {
         build_bundle(
             request,
@@ -758,6 +759,7 @@ fn compile_with_reach(
     );
     Ok(NativeCompileOutput {
         code,
+        required_cells,
         artifact,
         ir_node_count: u64::try_from(plan.instructions.len()).unwrap_or(u64::MAX),
         diagnostics: direct_call_events

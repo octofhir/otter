@@ -26,6 +26,8 @@
 //!   and `r12`–`r15`.
 //! - A fully staged request enters the C trampoline through the platform C
 //!   boundary. Known, generic and tail JavaScript targets use the private ABI.
+//! - Identity-cache addresses use the shared symbol emitter, which records
+//!   required cell ownership independently of optional artifact capture.
 //!
 //! # See also
 //! - [`crate::call_linkage`] — the architecture-neutral call contract.
@@ -94,14 +96,10 @@ pub(crate) fn emit_cached_identity(
         call_pc,
     };
     let proven = ops.new_dynamic_label();
-    let start = ops.offset().0;
-    dynasm!(ops ; .arch x64 ; mov r10, QWORD plan.callee_cell as i64);
-    relocations.record_x86_imm64(start, ops.offset().0, 10, cell.clone());
+    super::values::emit_load_symbol_u64(ops, relocations, 10, plan.callee_cell, cell.clone());
     dynasm!(ops ; .arch x64 ; cmp r9, [r10] ; je =>proven);
     proof(ops, bail);
-    let start = ops.offset().0;
-    dynasm!(ops ; .arch x64 ; mov r10, QWORD plan.callee_cell as i64);
-    relocations.record_x86_imm64(start, ops.offset().0, 10, cell);
+    super::values::emit_load_symbol_u64(ops, relocations, 10, plan.callee_cell, cell);
     dynasm!(ops ; .arch x64 ; mov [r10], r9 ; =>proven);
 }
 

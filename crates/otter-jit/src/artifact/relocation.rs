@@ -1,8 +1,10 @@
-//! Address-free native relocation artifacts and semantic code normalization.
+//! Native symbol uses, address-free artifacts, and semantic code normalization.
 //!
 //! # Contents
 //! - [`RelocationCapture`] records typed address materializations while the
 //!   existing emission pass is active.
+//! - Required physical cell uses are collected even when artifact capture is
+//!   disabled, for the code generation's retained-root set.
 //! - [`RelocationTarget`] describes the runtime meaning of an address without
 //!   retaining or serializing the process-local address itself.
 //! - [`RelocationCapture::render`] validates the finalized instruction bytes,
@@ -19,8 +21,10 @@
 //! - A literal pool follows every instruction of its code object, which the
 //!   tier keeps within the `LDR (literal)` range; each distinct address has
 //!   one word.
-//! - Captured targets contain semantic identities only. Raw target addresses
-//!   never enter this module's state or either rendered artifact.
+//! - Artifact records and rendered targets contain semantic identities only.
+//!   Required physical cell facts are private, transient, and never serialized.
+//!   Pending literal-pool words hold addresses for exact machine code; portable
+//!   normalization replaces those words with symbolic targets.
 //! - Exact relocation JSON may name an isolate-local target code generation.
 //!   Portable normalized code excludes that generation id while retaining the
 //!   target function, tier, and complete stack-layout contract.
@@ -152,7 +156,7 @@ pub(crate) enum RelocationTarget {
     FunctionEntryCell {
         function_id: u32,
     },
-    /// Permanent source-context fact word, rewritten by moving collection.
+    /// Address-stable source-context word, rewritten by moving collection.
     ClosureContextCell {
         function_id: u32,
     },
@@ -268,12 +272,15 @@ struct LiteralPool {
     index: rustc_hash::FxHashMap<u64, usize>,
 }
 
-/// Optional emission-side typed relocation storage, and the literal pool
-/// address loads may use.
+/// Mandatory physical cell-use facts, optional typed artifact records, and
+/// the literal pool address loads may use.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RelocationCapture {
     enabled: bool,
     records: Vec<RelocationRecord>,
+    /// Compile-local cells read by generated code, independent of artifact
+    /// capture. These physical addresses never enter serialized records.
+    required_cells: Vec<u64>,
     /// Byte ranges of in-code data (literal pools), never instructions.
     data: Vec<(usize, usize)>,
     #[cfg(not(target_arch = "x86_64"))]
@@ -290,12 +297,40 @@ impl RelocationCapture {
         Self {
             enabled,
             records: Vec::new(),
+            required_cells: Vec::new(),
             data: Vec::new(),
             #[cfg(not(target_arch = "x86_64"))]
             pool: LiteralPool::default(),
             #[cfg(debug_assertions)]
             stub_audit: None,
         }
+    }
+
+    /// Require one physical cell that emitted code or its metadata reads.
+    #[inline]
+    pub(crate) fn require_cell(&mut self, address: u64) {
+        self.required_cells.push(address);
+    }
+
+    /// Record a symbol load that requires a retained identity or context
+    /// cell, including loads emitted without optional artifact capture.
+    #[inline]
+    pub(crate) fn record_symbol_cell_use(&mut self, address: u64, target: &RelocationTarget) {
+        if matches!(
+            target,
+            RelocationTarget::CalleeIdentityCell { .. }
+                | RelocationTarget::ClosureContextCell { .. }
+        ) {
+            self.require_cell(address);
+        }
+    }
+
+    /// Drain the physical required-cell set in deterministic address order.
+    pub(crate) fn take_required_cells(&mut self) -> Box<[u64]> {
+        let mut cells = std::mem::take(&mut self.required_cells);
+        cells.sort_unstable();
+        cells.dedup();
+        cells.into_boxed_slice()
     }
 
     /// Debug builds: collect the ids of the runtime stubs symbol loads name
@@ -1699,6 +1734,88 @@ mod tests {
 
     fn function_entry_cell(function_id: u32) -> RelocationTarget {
         RelocationTarget::FunctionEntryCell { function_id }
+    }
+
+    #[test]
+    fn required_cells_are_sorted_unique_and_drained_without_artifact_capture() {
+        let mut capture = RelocationCapture::default();
+        capture.require_cell(0x3000);
+        capture.require_cell(0x1000);
+        capture.require_cell(0x3000);
+        assert_eq!(&*capture.take_required_cells(), &[0x1000, 0x3000]);
+        assert!(capture.take_required_cells().is_empty());
+        assert!(!capture.enabled);
+        assert!(capture.records.is_empty());
+        assert!(capture.data.is_empty());
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn emitted_cell_uses_are_required_with_artifact_capture_disabled() {
+        use dynasmrt::dynasm;
+
+        #[cfg(target_arch = "aarch64")]
+        use crate::template::arm64::values::emit_load_symbol_u64;
+        #[cfg(target_arch = "x86_64")]
+        use crate::x86_64::values::emit_load_symbol_u64;
+
+        let captures = vec![RelocationCapture::new(false)];
+        #[cfg(target_arch = "aarch64")]
+        let captures = {
+            let mut captures = captures;
+            captures.push(RelocationCapture::new(false).with_literal_pool());
+            captures
+        };
+        for mut capture in captures {
+            #[cfg(target_arch = "aarch64")]
+            let mut ops = dynasmrt::aarch64::Assembler::new().unwrap();
+            #[cfg(target_arch = "x86_64")]
+            let mut ops = dynasmrt::x64::Assembler::new().unwrap();
+
+            // The unused prepared candidate is never materialized. Only the
+            // two cell symbols below may become retained physical uses.
+            let unused_candidate = 0x4000;
+            for (address, target) in [
+                (
+                    0x3000,
+                    RelocationTarget::ClosureContextCell { function_id: 2 },
+                ),
+                (
+                    0x1000,
+                    RelocationTarget::CalleeIdentityCell {
+                        function_id: 1,
+                        call_pc: 4,
+                    },
+                ),
+                (0x2000, RelocationTarget::GcCageBase),
+                (
+                    0x1000,
+                    RelocationTarget::CalleeIdentityCell {
+                        function_id: 1,
+                        call_pc: 4,
+                    },
+                ),
+            ] {
+                emit_load_symbol_u64(&mut ops, &mut capture, 0, address, target);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                dynasm!(ops ; .arch aarch64 ; ret);
+                capture.emit_literal_pool(&mut ops);
+            }
+            #[cfg(target_arch = "x86_64")]
+            dynasm!(ops ; .arch x64 ; ret);
+
+            let code = ops.finalize().unwrap();
+            assert!(!code.is_empty());
+            assert!(!capture.enabled);
+            assert!(capture.records.is_empty());
+            assert!(capture.data.is_empty());
+            let required = capture.take_required_cells();
+            assert_eq!(&*required, &[0x1000, 0x3000]);
+            assert!(!required.contains(&unused_candidate));
+            assert!(capture.take_required_cells().is_empty());
+        }
     }
 
     #[cfg(target_arch = "aarch64")]

@@ -162,6 +162,7 @@ pub struct MeasuredCompilation {
     compiler: Arc<OtterJitCompiler>,
     code: Arc<dyn JitFunctionCode>,
     artifact: Option<Box<JitArtifactBundle>>,
+    required_cells: Box<[u64]>,
 }
 
 impl MeasuredCompilation {
@@ -196,6 +197,7 @@ impl MeasuredCompilation {
             function_id,
             tier: self.tier,
             code: observed,
+            required_cells: self.required_cells,
             runtime_stub_bindings: self.compiler.runtime_stub_bindings(),
         });
         MeasuredValidation {
@@ -254,11 +256,17 @@ impl OtterJitCompiler {
         }
         .map_err(|error| error.to_string())?;
         match status {
-            JitCompileStatus::Compiled { code, artifact, .. } => Ok(MeasuredCompilation {
+            JitCompileStatus::Compiled {
+                code,
+                artifact,
+                required_cells,
+                ..
+            } => Ok(MeasuredCompilation {
                 tier,
                 compiler: Arc::clone(self),
                 code,
                 artifact,
+                required_cells,
             }),
             JitCompileStatus::Unavailable => Err(format!("{} compiler unavailable", tier.name())),
             JitCompileStatus::Unsupported { reason } => {
@@ -272,6 +280,7 @@ struct ExactMeasuredCompiler {
     function_id: u32,
     tier: JitMeasurementTier,
     code: Arc<dyn JitFunctionCode>,
+    required_cells: Box<[u64]>,
     runtime_stub_bindings: Vec<JitRuntimeStubBinding>,
 }
 
@@ -302,6 +311,7 @@ impl ExactMeasuredCompiler {
         }
         Ok(JitCompileStatus::Compiled {
             code: Arc::clone(&self.code),
+            required_cells: self.required_cells.clone(),
             artifact: None,
             diagnostics: Box::default(),
             ir_node_count: 0,

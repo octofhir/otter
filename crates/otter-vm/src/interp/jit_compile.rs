@@ -789,10 +789,19 @@ impl Interpreter {
             return None;
         }
         let declined = match finished.status {
-            Ok(jit::JitCompileStatus::Compiled { code, artifact, .. }) => {
+            Ok(jit::JitCompileStatus::Compiled {
+                code,
+                artifact,
+                required_cells,
+                ..
+            }) => {
                 if let Some(artifact) = artifact {
                     self.record_jit_artifact(*artifact);
                 }
+                let roots = crate::jit_roots::CompilationRoot::retain_required_cells(
+                    roots,
+                    &required_cells,
+                );
                 code.prepare_for_execution();
                 // Generated callers take no per-call executable lease; the
                 // published frame chain names every executing generation.
@@ -1075,7 +1084,12 @@ impl Interpreter {
             &status,
         );
         match status {
-            Ok(jit::JitCompileStatus::Compiled { code, artifact, .. }) => {
+            Ok(jit::JitCompileStatus::Compiled {
+                code,
+                artifact,
+                required_cells,
+                ..
+            }) => {
                 if let Some(artifact) = artifact {
                     self.record_jit_artifact(*artifact);
                 }
@@ -1083,7 +1097,10 @@ impl Interpreter {
                 // Sweep before registering: cached/installed users hold an
                 // `Arc`; executing generations are named by published frames.
                 self.retire_unreferenced_jit_code();
-                let roots = self.finalized_compile_roots(roots_start);
+                let roots = crate::jit_roots::CompilationRoot::retain_required_cells(
+                    self.finalized_compile_roots(roots_start),
+                    &required_cells,
+                );
                 let required_bytes = crate::jit_registry::JitCodeRegistry::retained_admission_bytes(
                     code.as_ref(),
                     &roots,

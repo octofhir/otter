@@ -6,10 +6,14 @@
 //! - [`InstanceofCell`] caches the target an `instanceof` site proved, with
 //!   the prototype OrdinaryHasInstance searches for.
 //! - Weak processing relocates live cache entries and forgets dead ones.
+//! - Installation retains only identity cells used by finalized native code.
 //!
 //! # Invariants
 //! - Compile sessions retain every embedded allocation until installation;
 //!   an observation's payload remains weak even while its cell is retained.
+//! - Prepared inline candidates do not become installed-code owners merely
+//!   by existing. Emitted references and finalized validity dependencies select
+//!   identity cells; other proof-root classes retain their existing ownership.
 //! - Installed generations retain roots through invalidation until physical
 //!   retirement, including while an active frame can return into their code.
 //! - Shapes are pinned GC cells; validity cells are address-stable Rust
@@ -169,6 +173,21 @@ pub(crate) enum CompilationRoot {
 }
 
 impl CompilationRoot {
+    /// Transfer prepared owners to a generation, discarding unused identity
+    /// cells. The compiler supplies one sorted current-format use proof.
+    pub(crate) fn retain_required_cells(roots: Box<[Self]>, required: &[u64]) -> Box<[Self]> {
+        assert!(
+            required.windows(2).all(|pair| pair[0] < pair[1]),
+            "compiled identity-cell uses must be sorted and unique"
+        );
+        let mut roots = roots.into_vec();
+        roots.retain(|root| match root {
+            Self::CalleeIdentity(cell) => required.binary_search(&cell.address()).is_ok(),
+            Self::Shape(_) | Self::Family(_) | Self::Prototype(_) | Self::Instanceof(_) => true,
+        });
+        roots.into_boxed_slice()
+    }
+
     pub(crate) fn key(&self) -> (u8, usize) {
         match self {
             Self::Shape(shape) => (0, shape.offset() as usize),

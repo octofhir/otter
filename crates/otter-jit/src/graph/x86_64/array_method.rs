@@ -21,7 +21,8 @@
 //! - The Array's dense length, its slab's length and its `length` move
 //!   together, as the VM's own append and truncation do.
 //! - Storage shared with a literal boilerplate reports no capacity, so an
-//!   append grows it into private storage and clears the shared mark; a
+//!   append reserves at least `length + 1` words before copying the full
+//!   prefix into private storage and clearing the shared mark; a
 //!   removal from it completes in the builtin, which copies it out.
 //!
 //! # See also
@@ -93,7 +94,9 @@ impl Codegen<'_> {
                 ; mov r10, [r10 + crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
                 ; cmp BYTE [r10], 0 ; jne =>runtime
                 // Double the capacity, and at least four words.
-                ; lea Rd(base), [r11 + r11] ; mov r10d, 4 ; cmp Rd(base), r10d ; cmovb Rd(base), r10d);
+                ; lea Rd(base), [r11 + r11] ; mov r10d, 4 ; cmp Rd(base), r10d ; cmovb Rd(base), r10d
+                // Shared storage reports capacity zero but retains its prefix.
+                ; lea r10d, [Rq(length) + 1] ; cmp Rd(base), r10d ; cmovb Rd(base), r10d);
             let regs = LabRegisters {
                 buffer: assigned.gp_temps[3],
                 candidate: temp,

@@ -42,6 +42,8 @@
 //! - [`compile`] — the pipeline from snapshot to code bytes.
 //! - Captured inline diagnostics describe the canonical bodies actually
 //!   spliced into the completed graph, including nested source attribution.
+//! - Finalized cell requirements include emitted references and the context
+//!   owners needed by the accepted graph's validity dependencies.
 //!
 //! # Invariants
 //! - An instruction without a specialized form runs through its baseline
@@ -52,6 +54,8 @@
 //!   rebuilds the interpreter frame before the failed instruction.
 //! - Backend contracts exclude pinned and emitter scratch registers from
 //!   allocation. Nodes declare every other register they need.
+//! - A closure-context dependency retains its context even when slot folding
+//!   removes the context load; collection cannot invalidate an active proof.
 //!
 //! # See also
 //! - `otter_vm::deopt` — the frame-state recipe the exits produce.
@@ -367,13 +371,20 @@ pub(crate) fn compile_optimized(
         artifact_request.is_some(),
     )?;
     let Compiled {
-        emission,
+        mut emission,
         built,
         allocation,
         deopt,
         plan,
         dependencies,
     } = compiled;
+    require_dependency_contexts(
+        &mut emission.relocations,
+        view,
+        &built.inline_views,
+        &dependencies,
+    )?;
+    let required_cells = emission.relocations.take_required_cells();
     let mut safepoints = plan.safepoint_records.clone();
     safepoints.extend(emission.site_records.iter().cloned());
     safepoints.sort_by_key(|record| record.id);
@@ -481,10 +492,130 @@ pub(crate) fn compile_optimized(
             plan.register_operands,
             metadata,
         ),
+        required_cells,
         artifact,
         diagnostics,
         ir_node_count: node_count,
     })
+}
+
+/// A source-identity proof owns its context even if the load was optimized out.
+/// Only the root and accepted inline views can contribute such a requirement;
+/// candidates left in their snapshot maps are not installed assumptions.
+fn require_dependency_contexts(
+    references: &mut crate::artifact::relocation::RelocationCapture,
+    root: &JitCompileSnapshot,
+    inline_views: &[std::sync::Arc<JitCompileSnapshot>],
+    dependencies: &[otter_vm::native_abi::CodeDependency],
+) -> Result<(), Unsupported> {
+    use otter_vm::native_abi::CodeDependencyKind;
+
+    for dependency in dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == CodeDependencyKind::ClosureContext)
+    {
+        let mut retained = false;
+        for source in std::iter::once(root).chain(inline_views.iter().map(AsRef::as_ref)) {
+            if source.code_block.id == dependency.identity
+                && let Some(cell) = source.unique_closure_context
+            {
+                references.require_cell(cell);
+                retained = true;
+            }
+        }
+        if !retained {
+            return Err(Unsupported::OperandShape(
+                "closure-context dependency has no context owner",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod required_cell_tests {
+    //! Context ownership required by final dependency metadata.
+    //!
+    //! # Contents
+    //! Metadata-only context owners and rejected candidate exclusion.
+    //!
+    //! # Invariants
+    //! Synthetic cell addresses are never dereferenced or emitted.
+
+    use super::*;
+    use crate::artifact::relocation::RelocationCapture;
+    use otter_vm::jit::{JitInlineCallee, JitTestInstruction};
+    use otter_vm::native_abi::{CodeDependency, CodeDependencyKind};
+    use std::sync::Arc;
+
+    fn source(function_id: u32, cell: u64) -> JitCompileSnapshot {
+        let mut source = JitCompileSnapshot::without_feedback(
+            function_id,
+            0,
+            1,
+            vec![JitTestInstruction::new(
+                otter_bytecode::Op::ReturnUndefined,
+                0,
+                0,
+                vec![],
+            )],
+        );
+        source.unique_closure_context = Some(cell);
+        source
+    }
+
+    fn dependency(function_id: u32) -> CodeDependency {
+        CodeDependency {
+            kind: CodeDependencyKind::ClosureContext,
+            identity: function_id,
+            expected: 0,
+        }
+    }
+
+    #[test]
+    fn metadata_keeps_accepted_contexts_without_emitted_loads_or_rejected_candidates() {
+        let mut root = source(1, 0x1000);
+        root.inline_callees.insert(
+            0,
+            JitInlineCallee {
+                body: Arc::new(source(3, 0x3000)),
+            },
+        );
+        let accepted = [Arc::new(source(2, 0x2000))];
+        let mut references = RelocationCapture::new(false);
+        references.require_cell(0x4000);
+        require_dependency_contexts(
+            &mut references,
+            &root,
+            &accepted,
+            &[dependency(1), dependency(2)],
+        )
+        .expect("every finalized context proof has its owner");
+        assert_eq!(
+            references.take_required_cells().as_ref(),
+            &[0x1000, 0x2000, 0x4000]
+        );
+    }
+
+    #[test]
+    fn a_prepared_candidate_cannot_supply_an_unowned_final_dependency() {
+        let mut root = source(1, 0x1000);
+        root.inline_callees.insert(
+            0,
+            JitInlineCallee {
+                body: Arc::new(source(3, 0x3000)),
+            },
+        );
+        assert!(
+            require_dependency_contexts(
+                &mut RelocationCapture::new(false),
+                &root,
+                &[],
+                &[dependency(3)],
+            )
+            .is_err()
+        );
+    }
 }
 
 /// Accepted splices come from the finished graph, after speculative builder

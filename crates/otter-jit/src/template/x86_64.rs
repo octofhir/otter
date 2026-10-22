@@ -463,6 +463,7 @@ pub(super) fn compile(
             compiled_code.len(),
         ));
     }
+    let required_cells = relocations.take_required_cells();
     let artifact = artifact_request.map(|request| {
         build_bundle(
             request,
@@ -497,6 +498,7 @@ pub(super) fn compile(
     );
     Ok(NativeCompileOutput {
         code,
+        required_cells,
         artifact,
         diagnostics: direct_call_events
             .map(|events| events.into_values().collect::<Vec<_>>().into_boxed_slice())

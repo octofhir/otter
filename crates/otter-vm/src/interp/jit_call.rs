@@ -1432,6 +1432,7 @@ mod tests {
                 osr_entries: Arc::from(request.snapshot.code_block.loop_headers()),
             }),
             artifact: None,
+            required_cells: Box::default(),
             diagnostics: Box::default(),
             ir_node_count: u64::try_from(request.snapshot.instructions.len()).unwrap_or(u64::MAX),
         }
@@ -1711,6 +1712,7 @@ mod tests {
             Ok(jit::JitCompileStatus::Compiled {
                 code: Arc::new(code),
                 artifact: None,
+                required_cells: Box::default(),
                 diagnostics: Box::default(),
                 ir_node_count: 1,
             })

@@ -3003,6 +3003,11 @@ pub enum JitCompileStatus {
     Compiled {
         /// Type-erased native-code handle.
         code: Arc<dyn JitFunctionCode>,
+        /// Sorted unique stable identity-cell addresses required by emitted
+        /// code or its finalized validity dependencies. This transient proof
+        /// selects the prepared cell owners at installation; it is independent
+        /// of optional artifacts and is not retained on the installed code.
+        required_cells: Box<[u64]>,
         /// Optional owned debug sidecar returned independently of installed
         /// executable code.
         artifact: Option<Box<crate::jit_artifact::JitArtifactBundle>>,

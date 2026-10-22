@@ -1,12 +1,88 @@
 # Архитектурный аудит Otter и план крупных рефакторов
 
+## Текущий план по конкретным механизмам V8 и JavaScriptCore
+
+Исходники доступны локально и проверены на точных ревизиях: V8 `926c0e5fb9cd60257e49cbdf7855ba42dd13963c`, WebKit/JSC `e9c03b26665d2a3f4c9002075d90f9d9d5c1cb5e`. Ниже указаны действительные механизмы и границы переноса. Полный перенос чужого коллектора или оптимизатора не требуется.
+
+| Граница | Что действительно делает другой движок | Разница Otter и действие |
+|---|---|---|
+| Ссылки установленного native code | V8 сохраняет обязательные relocations фактически выпущенного кода; deopt literals формируются отдельно из translation operands | Otter сохранял весь prepared root set, включая отвергнутых inline-кандидатов. Реализован mandatory cell-use proof из emission плюс владельцы finalized dependency metadata; один `CompilationRoot` owner после установки |
+| Фоновая компиляция | V8 удаляет queued jobs и передаёт активным atomic cancellation flag; compiler проверяет его между фазами; source handles живут до завершения job | В Otter `pending.stale` проверяется после полной компиляции; worker его не видит. Следующий execution срез: один worker-visible token, terminal cancellation и целостная source lifetime до publication |
+| Жизнь неактивного optimizing code | JSC делает связь Executable → optimizing CodeBlock условной; speculative references слабы, активный/marked CodeBlock удерживает их сильно | Используемые константы Otter пока сильны весь срок generation. Это отдельный будущий code-GC срез; обнулить ссылки без retirement/active-frame протокола нельзя |
+
+### 1. Установленный код получает свои реальные ссылки
+
+В V8 `MacroAssembler::Cmp` регистрирует embedded object при выпуске инструкции; `CodeBuilder` принимает `CodeDesc`, переносит relocations в `InstructionStream`, а GC обходит этот обязательный список. Это runtime metadata, существующее без diagnostic capture. Отдельный deopt literal table строится из translation operands и дедуплицируется: перечень machine references не заменяет recovery metadata. [Эмиссия](https://github.com/v8/v8/blob/926c0e5fb9cd60257e49cbdf7855ba42dd13963c/src/codegen/x64/macro-assembler-x64.cc#L3235), [перенос relocations](https://github.com/v8/v8/blob/926c0e5fb9cd60257e49cbdf7855ba42dd13963c/src/objects/instruction-stream-inl.h#L134), [GC обход](https://github.com/v8/v8/blob/926c0e5fb9cd60257e49cbdf7855ba42dd13963c/src/objects/objects-body-descriptors-inl.h#L1757), [deopt literals](https://github.com/v8/v8/blob/926c0e5fb9cd60257e49cbdf7855ba42dd13963c/src/compiler/backend/code-generator.cc#L1259).
+
+Otter воспроизводит конкретный дефект владения: `cold` вызывается один раз и захватывает массив из 1 048 576 элементов; `hot` получает настоящий Graph OSR. Sloppy `cold` наблюдает `this`, поэтому plain-call с `undefined` не допускает splice. Events подтверждают prepared candidate, artifacts — отсутствие actual inline и отсутствие отдельного native body `cold`. После возврата и двух GC payload case удерживает **9 656 416 Б**, контроль с восемью элементами **1 136 808 Б**. Разница **8 519 608 Б** принадлежит подготовленным, но не использованным владельцам. Сырые source/events/artifacts: `benchmarks/results/root-use-2026-10-22/before-v2-*`. Первый строгий вариант repro действительно inlined callee и потому не доказывал дефект; его данные сохранены отдельно и не используются как доказательство unused owner.
+
+Исправление завершает одну границу producer → consumer: оба native emitter регистрируют фактические stable-cell references независимо от `--jit-artifacts`; Graph добавляет strong context owners, необходимые finalized `ClosureContext` dependencies даже после устранения context load; `JitCompileStatus::Compiled` переносит sorted unique `required_cells`; VM при публикации фильтрует только `CalleeIdentity` roots. Pending compilation сохраняет весь подготовленный набор до terminal result. Shape/family/prototype/instanceof ownership этим срезом не меняется. В установленном code object второй reference registry не появляется. Проверки должны доказать освобождение unused payload и сохранность действительно используемых native constants через moving GC на обеих ISA.
+
+### Измеренный результат pruning установленных roots
+
+Baseline `857a9cdb7`, SHA256 `0a4e85804f81e7e33169b66fc14cfde725424aad810a05b9d11d084e6a73f4c7`; after SHA256 `1a33806f2e343a534078f4040823e8ff7c4915397b38595834c48a60b7a44d21`. After включает также отдельный COW bounds fix `26dbe8ae2`. Оба executable собраны отдельно с одинаковой default production конфигурацией. Rust builds/profiler не работали во время измерений; host snapshots сохранены. Три чередующиеся AB/BA-пары после одной исключённой warmup-пары на каждом классе; все 64 процесса завершились с одинаковыми результатами. CPU — median суммы user+sys каждого процесса, включая worker threads.
+
+| Класс | Wall median, с до → после | Δ wall | CPU median, с до → после | Peak RSS median, МиБ до → после |
+|---|---:|---:|---:|---:|
+| crypto | 0.2042 → 0.2049 | +0.34% | 0.21 → 0.21 | 43.80 → 43.41 |
+| deltablue | 0.6555 → 0.6588 | +0.50% | 0.68 → 0.67 | 60.38 → 61.33 |
+| box2d | 0.6119 → 0.6314 | +3.17% | 0.70 → 0.74 | 132.66 → 135.03 |
+| raytrace | 0.8139 → 0.8523 | +4.72% | 0.82 → 0.84 | 46.77 → 47.20 |
+| splay | 0.6371 → 0.6584 | +3.34% | 1.18 → 1.20 | 381.12 → 381.02 |
+| regexp | 1.3544 → 1.3840 | +2.18% | 1.34 → 1.35 | 140.52 → 141.05 |
+| mandreel | 0.9995 → 1.0098 | +1.03% | 1.06 → 1.06 | 224.12 → 223.61 |
+| ts | 3.0864 → 3.0626 | -0.77% | 4.13 → 4.11 | 495.64 → 501.52 |
+
+| Класс | Wall min…max до / после, с | Peak RSS min…max до / после, МиБ |
+|---|---:|---:|
+| crypto | 0.204…0.206 / 0.205…0.205 | 43.391…44.766 / 42.719…45.688 |
+| deltablue | 0.649…0.665 / 0.639…0.659 | 57.797…60.906 / 60.172…62.422 |
+| box2d | 0.611…0.629 / 0.616…0.651 | 132.656…136.859 / 130.797…136.828 |
+| raytrace | 0.807…0.903 / 0.832…0.853 | 46.406…47.422 / 45.781…47.359 |
+| splay | 0.637…0.643 / 0.634…0.669 | 380.828…385.547 / 376.688…383.375 |
+| regexp | 1.334…1.358 / 1.322…2.087 | 139.359…140.969 / 139.516…141.078 |
+| mandreel | 0.996…1.018 / 1.004…1.012 | 219.500…226.625 / 218.641…225.078 |
+| ts | 3.065…3.095 / 3.040…3.089 | 488.906…500.656 / 500.516…501.766 |
+
+Общего ускорения нет: TS wall −0,77%/CPU 4,13 → 4,11 с, но остальные medians wall выше на 0,34…4,72%; Box2D CPU 0,70 → 0,74 с. Это результат владения памятью, не достигнутая цель speed+resources. В двух зафиксированных hot-code артефактах до/после codeBytes совпадают (Template 5400, Graph 2536); инструкциям не приписывается speedup.
+
+Три адресные post-GC пары: payload heap **9 656 416 → 1 136 584 Б (−88,23%)**, control **1 136 808 → 1 136 584 Б**; все три значения внутри каждого набора совпали. Payload RSS median **34,50 → 26,30 МиБ**. Actual `hot` получил Graph OSR, `cold` не имеет собственного native body и не был spliced; наличие prepared candidate и отсутствие `inlineLowered` сохранены в `native-use-proof.json`. Старый production executable падает на новой retention assertion; interpreter и новый executable проходят.
+
+На прежнем неизменённом require-wrapper полного TS три новые пары дали heap до **7,885…48,800 МиБ**, после **7,885…7,885 МиБ**; post-GC RSS median **301,53 → 300,89 МиБ**. Эти три прогона не доказывают отсутствие остаточного скачка во всех расписаниях background compiler. Wrapper retention не смешивается с plain-fixture peak RSS в таблице выше.
+
+Адресные gates: mandatory sorted use proof и metadata-only accepted contexts, actual cell emission с выключенным artifact capture — по 4 JIT unit tests на ISA; existing VM owner filter 2; actual native context/closure — по 2 на ISA; shared Tagged growth moving-GC fixture — по 2 на ISA. CLI driver: 32 успешных процесса и один ожидаемый baseline failure, включая interpreter oracle / production / jitless / interpreter для двух новых corpus и existing unique-context, затронутые GC strides 1/4/16, retention и actual artifacts; ещё шесть TS retention процессов. Release ENOSPC исправлен удалением только пересоздаваемых debug incremental caches; failed build log сохранён, тесты не перезапускались.
+
+Все команды, точный compiled-source patch, source/binary hashes, build failure/retry, диапазоны и сырые stdout/time: `benchmarks/results/root-use-2026-10-22/`.
+
+### 2. Worker должен прекращать ненужную работу
+
+Это готовая модель V8, а не предложение убивать потоки. Dispatcher `FlushJobsForIsolate` удаляет queued jobs; `CancelCompilationJobsForIsolate` вызывает `job->Cancel` у активных jobs; atomic flag проверяется до graph и после каждой compiler phase. Teardown сначала flush/cancel, затем ждёт jobs и их LocalHeap destruction, затем освобождает output без установки. [Queued/active lifecycle](https://github.com/v8/v8/blob/926c0e5fb9cd60257e49cbdf7855ba42dd13963c/src/compiler-dispatcher/optimizing-compile-dispatcher.cc#L247), [проверка между фазами](https://github.com/v8/v8/blob/926c0e5fb9cd60257e49cbdf7855ba42dd13963c/src/compiler/pipeline.cc#L839), [удержание source](https://github.com/v8/v8/blob/926c0e5fb9cd60257e49cbdf7855ba42dd13963c/src/codegen/optimized-compilation-info.h#L312).
+
+Перед publication V8 дополнительно проверяет detached context, disabled optimization, deprecated maps и dependency validity; commit повторяет validation непосредственно перед installation. Otter уже проверяет dependencies при install — это существующее совпадение. Реальные недостающие границы: worker-visible cancellation и source lifetime при eviction (`Arc<CodeBlock>` не является lease на независимо evictable `ChunkPayload`). [Dependency commit](https://github.com/v8/v8/blob/926c0e5fb9cd60257e49cbdf7855ba42dd13963c/src/compiler/compilation-dependencies.cc#L1461).
+
+План реализации: один token Pending/Job/Request; queued cancellation не входит в compiler hook; active cancellation проверяется между крупными фазами; roots живут до terminal ACK; eviction отменяет pending и final admission проверяет source liveness; отмена получает собственный terminal outcome, не `Unsupported`. Адресные проверки: queued hook не вызывается; active job не публикуется и сохраняет roots до ACK; evicted source и внешний inline caller не порождают orphan generation. Затем измеряются реально завершённые после execution jobs, process CPU вокруг teardown и полный production A/B. Текущая доля wasted compilation в workload CPU **ещё не измерена**. Подготовлен default-worker driver `benchmarks/results/compile-waste-2026-10-22/drop_tail.rs`; сумма compiler wall durations не будет названа CPU хвоста.
+
+### 3. JSC: weak code dependencies и активный стек
+
+JSC — более широкий механизм, чем текущий Otter cell pruning. `Graph::freeze` по умолчанию создаёт `WeakValue`; `handleGetScope` специализирует function scope через `weakJSConstant`. При linking `registerFrozenValues` обходит **все** frozen values, а не только emitted uses: weak values переходят в `DesiredWeakReferences`, strong — в CodeBlock constants. Поэтому приписывать JSC наш точный emitted-use алгоритм было бы неправильно. [Scope constant](https://github.com/WebKit/WebKit/blob/e9c03b26665d2a3f4c9002075d90f9d9d5c1cb5e/Source/JavaScriptCore/dfg/DFGByteCodeParser.cpp#L7707), [registerFrozenValues](https://github.com/WebKit/WebKit/blob/e9c03b26665d2a3f4c9002075d90f9d9d5c1cb5e/Source/JavaScriptCore/dfg/DFGGraph.cpp#L1664).
+
+Пока compilation жива, эти references трассируются сильно. Finalize формирует фиксированные vectors; `reallyAdd` переносит их в CommonData. Неактивный optimizing CodeBlock становится live только после доказательства независимой достижимости всех weak dependencies. Уже marked/active CodeBlock, наоборот, strongly visits weak references. [Pending roots](https://github.com/WebKit/WebKit/blob/e9c03b26665d2a3f4c9002075d90f9d9d5c1cb5e/Source/JavaScriptCore/dfg/DFGPlan.cpp#L656), [публикация](https://github.com/WebKit/WebKit/blob/e9c03b26665d2a3f4c9002075d90f9d9d5c1cb5e/Source/JavaScriptCore/dfg/DFGDesiredWeakReferences.cpp#L71), [условная code edge](https://github.com/WebKit/WebKit/blob/e9c03b26665d2a3f4c9002075d90f9d9d5c1cb5e/Source/JavaScriptCore/runtime/ScriptExecutable.cpp#L558), [liveness](https://github.com/WebKit/WebKit/blob/e9c03b26665d2a3f4c9002075d90f9d9d5c1cb5e/Source/JavaScriptCore/bytecode/CodeBlock.cpp#L1484), [active references](https://github.com/WebKit/WebKit/blob/e9c03b26665d2a3f4c9002075d90f9d9d5c1cb5e/Source/JavaScriptCore/bytecode/CodeBlock.cpp#L2028).
+
+Для Otter это означает будущую единую фазу code liveness + entry retirement + active-frame roots при GC, а не превращение всех `LoadCellValue` в слабые ссылки. Остаточный TS шаг 41 МиБ пока не приписан этому владельцу: нужны observations конкретных generations/roots.
+
+### Отвергнутый Array execution срез
+
+Полная попытка заменить arbitrary-JS miss у Graph ArrayPush/Pop на no-JS probes, включая actual `CallWithThis`, обе ISA, COW copy-out и раздельные semantic/OOM exits, удалена из активного кода. Семантические/native/GC проверки проходили; artifacts показывали сохранение чужих field facts (4 loads → 1). Однако финальные три AB/BA-пары на восьми неизменённых классах не дали общего ускорения: DeltaBlue **+21,37% wall** (CPU 0,72 → 0,77 с), Box2D **+11,20%** (0,73 → 0,79 с), TS **+1,49%** (4,24 → 4,26 с). Это не принятый performance result. Все 64 процесса дали одинаковые результаты. Полные диапазоны/CPU/RSS, binary/source SHA, неудачные проверки и rejected patch: `benchmarks/results/array-cow-probes-2026-10-22/`.
+
+Отдельно сохраняется найденное исправление корректности: shared tagged slab сообщает writable capacity=0, но хранит полный prefix. Прежний inline grow выделял `max(2*capacity,4)` и мог копировать восемь элементов в четыре слота. Обе ISA теперь резервируют `max(2*capacity,4,length+1)` до копирования. Этот fix не объявляется ускорением и не сохраняет отвергнутый no-JS refactor.
+
 ## Цель и критерий
 
 Цель — конкурентная скорость полного исполнения, прогретого исполнения, startup и компиляции при минимальных peak RSS и удерживаемой памяти. Лидерство над другими движками должно подтверждаться на опубликованной матрице, а не одним TS-прогоном или снижением числа инструкций. Превосходство над всеми движками на любых программах не является проверяемым обещанием.
 
 Работа идёт в текущем checkout. Все исходные изменения сохранены одним checkpoint-коммитом `fa4cc6668`. Последующий field-observer эксперимент не принят как достижение цели: сокращение emitted code около 17% дало только 2,7% медианного выигрыша полного ts, без убедительного уменьшения RSS. Его executable, patch и пять пар сохранены в `benchmarks/results/metadata-ownership-2026-10-21/compact-experiment/`. Observer-прототип полностью удалён из активного кода; его последний patch сохранён в `benchmarks/results/architecture-census-2026-10-22/rejected-observer.patch`.
 
-## Следующий срез: наблюдения JIT перестают владеть JS graph
+## Законченный срез: наблюдения JIT перестают владеть JS graph
 
 Baseline этого среза — `4c8dff094`, executable `shared-wordcode-2026-10-22/final/after-otter`, SHA256 `eb833505405f36ea230810818d26e09a01f3d07c23231700b72fd2ff7b108dcc`. Аудит выполнялся параллельно по трём направлениям: реальные GC owners, горячий Graph и source/compiler metadata.
 
@@ -66,7 +142,7 @@ GC получает один `ExtraRootSource::process_weak` протокол. N
 
 Проверки: GC extra-root filter 4; VM identity owners 2 и source-context 2; настоящие native context/closure cases по 2 на ARM64 и x86_64/Rosetta; x86 owner tests 2; один hot-eval eviction regression; новый JS case и existing unique-context case во всех трёх tier policies против baseline interpreter; новый case GC strides 1/4/16; семь реальных Graph bodies в artifacts. Всего diagnostic driver записал 30 успешных процессов. Форматирование проверено на изменённых Rust files; incidental baseline-only formatting из `cargo fmt --all` удалено. Полные suites/Clippy/Test262 не запускались. `compiled-source.patch`, `build-manifest.json`, `build-commands.json`, `diagnostics.json`, `whole-ab/results.json`, host/process snapshots и исходные stdout/stderr сохранены.
 
-Следующий execution срез: Graph ArrayPush/ArrayPop сейчас имеют World effects из-за committed arbitrary-JS protocol miss. Уже существующий ARRAY_PUSH_ALLOC — no-JS collecting Probe с отказом до append/length mutation; ARRAY_POP_LEAF тоже отказывает до mutation. Перевести оба native backend на эти окончательные границы, сохранить native fits и точное eager recovery, сузить effects до array storage/length/elements + Movement. Проверять не только стоимость самого push, но сохранение чужих field/shape/context facts через массивную операцию. Требуются безопасная staging трёх ABI operands, GC внутри growth, прототип/accessor/readonly/COW/widening случаи и full A/B.
+Проверенный затем ArrayPush/ArrayPop execution срез отвергнут по полному A/B; результаты и удалённый patch приведены выше. Текущий следующий execution срез — отмена ненужной фоновой компиляции с source lifetime до terminal ACK.
 
 
 Остаточные сильные владельцы: реальные generation constants, shape → prototype graph, активные frames и pending compilation. Их удержание не объявляется исправленным этим срезом. `process.memoryUsage().external/arrayBuffers == 0` остаётся неполным API coverage, а не доказательством отсутствия внешней памяти.

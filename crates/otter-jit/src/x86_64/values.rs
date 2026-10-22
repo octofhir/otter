@@ -7,6 +7,8 @@
 //!
 //! # Invariants
 //! - Address-bearing immediates carry their one relocation identity.
+//! - Identity and context cell uses are recorded even when artifact capture
+//!   is disabled.
 //! - Runtime entry loads use `r11`; the call ABI owner emits the call itself.
 //! - Numeric boxing preserves the floating source, canonicalizes NaN, and
 //!   writes only its destination/scratch GPs and flags; it never calls or allocates.
@@ -104,6 +106,7 @@ pub(crate) fn emit_load_symbol_u64(
     value: u64,
     target: RelocationTarget,
 ) {
+    relocations.record_symbol_cell_use(value, &target);
     let start = ops.offset().0;
     // Relocations validate and normalize the full ten-byte address move,
     // including an address that happens to fit in the low 32 bits.

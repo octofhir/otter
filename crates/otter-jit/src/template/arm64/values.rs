@@ -15,6 +15,8 @@
 //!   supplied pre-effect continuation, normally an outlined VM transition.
 //! - Symbolic loads wrap the ordinary variable-width materializer, so capture
 //!   never changes installed machine code.
+//! - Identity and context cell uses are recorded before either materialization
+//!   form, independently of optional artifact capture.
 //!
 //! # See also
 //! - `otter_vm::value::tag` — the frozen boxed-value contract these bake.
@@ -122,6 +124,7 @@ pub(crate) fn emit_load_symbol_u64(
     value: u64,
     target: RelocationTarget,
 ) {
+    relocations.record_symbol_cell_use(value, &target);
     if relocations.emit_literal_load(ops, t, value, target.clone()) {
         return;
     }

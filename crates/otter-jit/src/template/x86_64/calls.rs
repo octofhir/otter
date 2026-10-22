@@ -460,13 +460,16 @@ pub(super) fn emit_method_call(
     fatal: DynamicLabel,
 ) -> Result<(), Unsupported> {
     let done = ops.new_dynamic_label();
-    if let Some(targets) = view.direct_methods.get(&byte_pc) {
+    if let Some(targets) = view.method_targets.get(&byte_pc) {
         for target in targets {
+            let Some(callee) = target.callee.as_ref() else {
+                continue;
+            };
             let start = ops.offset().0;
             let next = ops.new_dynamic_label();
             emit_load_reg(ops, 8, receiver);
             crate::x86_64::method_guard::emit(ops, relocations, view, &target.guard, next)?;
-            let plan = target.callee.plan;
+            let plan = callee.plan;
             emit_target_call(
                 ops,
                 relocations,
@@ -490,7 +493,7 @@ pub(super) fn emit_method_call(
                 otter_vm::JitDirectCallKind::Method,
                 logical_pc,
                 byte_pc,
-                &target.callee,
+                callee,
                 target.target_index,
                 target.target_count,
             );

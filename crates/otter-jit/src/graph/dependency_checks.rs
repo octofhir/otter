@@ -95,7 +95,7 @@ fn method_validity(
         return None;
     };
     super::metadata::source_view(view, inline_views, graph, node)
-        .direct_methods
+        .method_targets
         .get(&byte_pc)?
         .get(usize::from(target))?
         .guard

@@ -27,8 +27,9 @@
 //!   only for live entry values.
 //! - A raw receiver pointer retained in `x17` is live only between the entry
 //!   identity guard and the end of a call-free, safepoint-free inline body.
-//! - A method target without one current native generation is omitted; a site
-//!   matching no generated target completes through the VM's canonical
+//! - A method target may own a leaf body without generated linkage. Each
+//!   target's optional call plan selects native linkage; a site matching no
+//!   generated target completes through the VM's canonical
 //!   `GetMethod + Call` transition without replaying the caller.
 //!
 //! # See also
@@ -41,7 +42,7 @@ use super::value_packet::{PacketWord, emit_value_packet_transition};
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::native_abi as abi;
-use otter_vm::{JitCompileSnapshot, JitInlineCallee, JitInlineMethod};
+use otter_vm::{JitCompileSnapshot, JitInlineCallee, JitMethodInlineFields, JitMethodTarget};
 
 use super::ic_probe::{
     emit_guarded_method_call, emit_native_entry_call, emit_native_leaf_call,
@@ -111,29 +112,11 @@ fn inline_scratch_artifact(
     }
 }
 
-/// Build the current template plan for one baked leaf body.
-///
-/// PORT NOTE: the deleted legacy baseline emitter decoded the method body a
-/// second time. This port deliberately reuses the current typed TemplatePlan,
-/// keeping operand validation and opcode shapes in one backend-neutral path.
+/// Plan the baked body without cloning its snapshot. Planning reads the
+/// instruction metadata; only the emitter chooses splices, and the leaf
+/// validator rejects every nested call before any inline code is emitted.
 fn inline_leaf_template_plan(body: &JitCompileSnapshot) -> Result<TemplatePlan, Unsupported> {
-    // The spliced body is planned from its own baked inputs. Its call sites
-    // stay calls: a leaf body owns no further splice.
-    let mut leaf_view = body.clone();
-    leaf_view.inline_callees.clear();
-    leaf_view.direct_callees.clear();
-    leaf_view.direct_methods.clear();
-    leaf_view.inline_methods.clear();
-    leaf_view.inline_poly_methods.clear();
-    TemplatePlan::build(&leaf_view)
-}
-
-fn inline_method_template_plan(method: &JitInlineMethod) -> Result<TemplatePlan, Unsupported> {
-    inline_leaf_template_plan(&method.body)
-}
-
-fn inline_callee_template_plan(callee: &JitInlineCallee) -> Result<TemplatePlan, Unsupported> {
-    inline_leaf_template_plan(&callee.body)
+    TemplatePlan::build(body)
 }
 
 /// Load one compact inline slot without changing the caller register base.
@@ -326,7 +309,8 @@ struct InlineBodySpec<'a> {
     register_count: u16,
     arguments: [Option<u16>; 2],
     receiver: Option<u16>,
-    method: Option<&'a JitInlineMethod>,
+    body: &'a JitCompileSnapshot,
+    method: Option<&'a JitMethodInlineFields>,
     inline_site: InlineSiteArtifact,
     body_region: &'static str,
     hit_epilogue_region: &'static str,
@@ -457,7 +441,7 @@ fn emit_inline_leaf_body(
                     .prop_fields
                     .get(&instruction.byte_pc)
                     .ok_or(Unsupported::OperandShape("inline method property offset"))?;
-                emit_inline_receiver_property(ops, dst, field, &method.body, relocations)?;
+                emit_inline_receiver_property(ops, dst, field, spec.body, relocations)?;
             }
             TemplateOp::ToPrimitive { dst, src, .. } | TemplateOp::ToNumeric { dst, src } => {
                 let dst = plan
@@ -602,7 +586,7 @@ fn try_emit_inline_numeric_method(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
-    method: &JitInlineMethod,
+    method: &JitMethodTarget,
     dst: u16,
     receiver: u16,
     argc: u16,
@@ -615,9 +599,12 @@ fn try_emit_inline_numeric_method(
     guard_miss: DynamicLabel,
     bail: DynamicLabel,
 ) -> Result<bool, Unsupported> {
-    let template_plan = inline_method_template_plan(method)?;
+    let (Some(body), Some(fields)) = (&method.body, &method.inline_fields) else {
+        return Ok(false);
+    };
+    let template_plan = inline_leaf_template_plan(body)?;
     let Some(plan) = (view.cage_base != 0)
-        .then(|| InlineLeafPlan::build_method(method, &template_plan, usize::from(argc)))
+        .then(|| InlineLeafPlan::build_method(body, fields, &template_plan, usize::from(argc)))
         .flatten()
     else {
         if std::env::var_os("OTTER_JIT_TRACE").is_some() {
@@ -625,8 +612,8 @@ fn try_emit_inline_numeric_method(
                 "[otter-jit] template inline method skip fid={} argc={} params={} regs={} ops={:?}",
                 method.guard.method_fid,
                 argc,
-                method.param_count(),
-                method.register_count(),
+                body.code_block.param_count,
+                body.code_block.register_count,
                 template_plan
                     .instructions
                     .iter()
@@ -641,7 +628,7 @@ fn try_emit_inline_numeric_method(
             "[otter-jit] template inline method emit fid={} argc={} regs={} scratch_slots={} scratch_bytes={}",
             method.guard.method_fid,
             argc,
-            method.register_count(),
+            body.code_block.register_count,
             plan.slot_count(),
             plan.aligned_scratch_bytes(),
         );
@@ -694,11 +681,12 @@ fn try_emit_inline_numeric_method(
         &plan,
         InlineBodySpec {
             function_id: method.guard.method_fid,
-            parameter_count: method.param_count(),
-            register_count: method.register_count(),
+            parameter_count: body.code_block.param_count,
+            register_count: body.code_block.register_count,
             arguments,
             receiver: Some(receiver),
-            method: Some(method),
+            body,
+            method: Some(fields),
             inline_site,
             body_region: "inlineMethodBody",
             hit_epilogue_region: "inlineMethodHitEpilogue",
@@ -747,7 +735,7 @@ fn try_emit_inline_numeric_callee(
     done: DynamicLabel,
     bail: DynamicLabel,
 ) -> Result<bool, Unsupported> {
-    let template_plan = inline_callee_template_plan(callee)?;
+    let template_plan = inline_leaf_template_plan(&callee.body)?;
     let Some(plan) = InlineLeafPlan::build_callee(callee, &template_plan, usize::from(argc)) else {
         if std::env::var_os("OTTER_JIT_TRACE").is_some() {
             eprintln!(
@@ -810,6 +798,7 @@ fn try_emit_inline_numeric_callee(
             register_count: callee.register_count(),
             arguments,
             receiver: None,
+            body: &callee.body,
             method: None,
             inline_site,
             body_region: "inlineCallBody",
@@ -1850,60 +1839,15 @@ pub(super) fn emit_method_call(
             ; =>leaf_miss
         );
     }
-    let planned_methods = view.direct_methods.get(&byte_pc);
-    // A monomorphic inlinable body keeps its receiver guard as a fall-through
-    // to the layers below, exactly as the polymorphic chain does: an unseen
-    // shape reaches the direct call or the generic packet instead of pinning
-    // the site back to the interpreter. Only a bail raised inside the
-    // accepted body is a real deopt.
-    if planned_methods.is_none_or(|methods| methods.len() == 1 && methods[0].target_count == 1)
-        && let Some(method) = view.inline_methods.get(&byte_pc)
+    let planned_methods = view.method_targets.get(&byte_pc);
+    // Each target owns one body and its receiver-field proof. An identity
+    // miss falls through to the next candidate or ordinary call dispatch;
+    // a guard raised inside an accepted body still deoptimizes the call.
+    for method in planned_methods
+        .into_iter()
+        .flatten()
+        .filter(|method| method.body.is_some() && method.inline_fields.is_some())
     {
-        let inline_miss = ops.new_dynamic_label();
-        if try_emit_inline_numeric_method(
-            ops,
-            relocations,
-            view,
-            method,
-            dst,
-            receiver,
-            argc,
-            arg0,
-            arg1,
-            logical_pc,
-            byte_pc,
-            code_map.as_deref_mut(),
-            done,
-            inline_miss,
-            bail,
-        )? {
-            spliced_functions.insert(method.guard.method_fid);
-            if let (Some(events), Some(target)) = (
-                direct_call_events.as_deref_mut(),
-                planned_methods.and_then(|methods| methods.first()),
-            ) {
-                events.insert(
-                    (byte_pc, target.target_index),
-                    direct_call_lowering_event(
-                        otter_vm::JitDirectCallKind::Method,
-                        logical_pc,
-                        byte_pc,
-                        &target.callee,
-                        target.target_index,
-                        target.target_count,
-                        otter_vm::JitDirectCallLoweringOutcome::Inlined,
-                    ),
-                );
-            }
-            dynasm!(ops ; .arch aarch64 ; =>inline_miss);
-        }
-    }
-    // A site that observed several inlinable shapes emits one guarded body per
-    // shape. Each guard miss falls through to the next candidate rather than
-    // deoptimizing, so an unobserved shape reaches the ordinary dispatch below
-    // instead of pinning the whole site back to the interpreter. Only a bail
-    // raised inside an accepted body is a real deopt.
-    for method in view.inline_poly_methods.get(&byte_pc).into_iter().flatten() {
         let next_candidate = ops.new_dynamic_label();
         if try_emit_inline_numeric_method(
             ops,
@@ -1923,22 +1867,18 @@ pub(super) fn emit_method_call(
             bail,
         )? {
             spliced_functions.insert(method.guard.method_fid);
-            if let (Some(events), Some(target)) = (
-                direct_call_events.as_deref_mut(),
-                planned_methods
-                    .into_iter()
-                    .flatten()
-                    .find(|target| target.guard == method.guard),
-            ) {
+            if let (Some(events), Some(callee)) =
+                (direct_call_events.as_deref_mut(), method.callee.as_ref())
+            {
                 events.insert(
-                    (byte_pc, target.target_index),
+                    (byte_pc, method.target_index),
                     direct_call_lowering_event(
                         otter_vm::JitDirectCallKind::Method,
                         logical_pc,
                         byte_pc,
-                        &target.callee,
-                        target.target_index,
-                        target.target_count,
+                        callee,
+                        method.target_index,
+                        method.target_count,
                         otter_vm::JitDirectCallLoweringOutcome::Inlined,
                     ),
                 );
@@ -1949,6 +1889,9 @@ pub(super) fn emit_method_call(
     // A planned method chain proves the callable from exact receiver and
     // holder identities; the trampoline then enters it like any callee.
     for method in planned_methods.into_iter().flatten() {
+        let Some(callee) = method.callee.as_ref() else {
+            continue;
+        };
         let next_target = ops.new_dynamic_label();
         let guard_start = ops.offset().0;
         emit_method_guard(
@@ -1989,7 +1932,7 @@ pub(super) fn emit_method_call(
             Some(receiver),
             CallNewTarget::None,
             CallActuals::Fixed(argument_registers),
-            Some(method.callee.plan),
+            Some(callee.plan),
             dst,
             throw_value,
             threw,
@@ -2000,7 +1943,7 @@ pub(super) fn emit_method_call(
             otter_vm::JitDirectCallKind::Method,
             logical_pc,
             byte_pc,
-            &method.callee,
+            callee,
             method.target_index,
             method.target_count,
         );

@@ -471,7 +471,7 @@ fn walk(
                         continue;
                     };
                     let cell = source
-                        .direct_methods
+                        .method_targets
                         .get(byte_pc)
                         .and_then(|methods| methods.get(usize::from(*target)))
                         .filter(|method| {

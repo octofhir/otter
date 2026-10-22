@@ -656,12 +656,10 @@ impl CodeBlock {
             // carries none.
             direct_callees: rustc_hash::FxHashMap::default(),
             direct_constructs: rustc_hash::FxHashMap::default(),
-            direct_methods: rustc_hash::FxHashMap::default(),
+            method_targets: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
             call_frequencies: rustc_hash::FxHashMap::default(),
             optimized_inlined_instructions: 0,
-            inline_methods: rustc_hash::FxHashMap::default(),
-            inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             function_prototype_calls: rustc_hash::FxHashMap::default(),
             instanceof_cells: rustc_hash::FxHashMap::default(),

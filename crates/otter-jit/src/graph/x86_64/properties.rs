@@ -230,7 +230,7 @@ impl Codegen<'_> {
             } => {
                 let guard = self
                     .view_of(node)
-                    .direct_methods
+                    .method_targets
                     .get(&byte_pc)
                     .and_then(|methods| methods.get(usize::from(target)))
                     .ok_or(Unsupported::OperandShape("x86 graph guarded method"))?

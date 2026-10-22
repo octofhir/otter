@@ -1,7 +1,8 @@
 //! Descriptor-checked receiver fields for Template method inlining.
 //!
 //! # Contents
-//! - `bake_one_inline_method` prepares one identity-guarded method body.
+//! - `bake_method_inline_fields` proves Template field access for the one
+//!   prepared body owned by a canonical method target.
 //! - Own receiver fields and independently guarded non-receiver fields.
 //!
 //! # Invariants
@@ -9,32 +10,26 @@
 //! - Receiver loads require an own data descriptor; stores also require writable.
 //! - Accessors keep their committed invocation, including getter/setter effects.
 //! - Every retained bank location belongs to its exact guarded storage shape.
+//! - This pass neither prepares another body nor duplicates its identity guard.
 //!
 //! # See also
 //! - `super` owns source snapshots, method guards and compile roots.
 //! - `crate::object::shape_body` owns immutable ordinary descriptors.
 //! - `otter_jit::template::inline_leaf` validates scratch and receiver use.
 
-use super::{
-    ExecutionContext, InlineSnapshotBudget, Interpreter, Op, PolyMethodTarget, jit, jit_debug,
-};
+use super::{ExecutionContext, Interpreter, Op, PolyMethodTarget, jit};
 
 impl Interpreter {
-    /// Bake one inline-method candidate body for a `(method, receiver shape)`
-    /// target, resolving its sealed property loads/stores to banked field
-    /// locations against the receiver shape. Returns `None` when the method shape
-    /// is ineligible (generator/async/derived-constructor/etc.), its view is
-    /// missing, or any body property fails to resolve to a sealed receiver slot.
-    /// Shared by the monomorphic and polymorphic method-inline bake paths.
-    pub(super) fn bake_one_inline_method(
+    /// Prove the prepared body's property access for this exact guarded
+    /// receiver. Mono and poly targets use the same descriptor checks; refusal
+    /// removes only Template's field proof, leaving the target's call plan and
+    /// Graph body intact.
+    pub(super) fn bake_method_inline_fields(
         &mut self,
         context: &ExecutionContext,
         target: &PolyMethodTarget,
-        body: Option<std::sync::Arc<jit::JitCompileSnapshot>>,
-        tier: jit_debug::JitDebugTier,
-        budget: &mut InlineSnapshotBudget,
-        call_byte_pc: u32,
-    ) -> Option<jit::JitInlineMethod> {
+        method_view: &jit::JitCompileSnapshot,
+    ) -> Option<jit::JitMethodInlineFields> {
         let method_context = context.for_function(target.method_fid).ok()?;
         let context = &*method_context;
         let method = context.exec_function(target.method_fid)?;
@@ -49,18 +44,6 @@ impl Interpreter {
         {
             return None;
         }
-        let method_view = match body {
-            Some(body) => body,
-            None => self.bake_inline_body(
-                context,
-                target.method_fid,
-                tier,
-                budget,
-                Some(call_byte_pc),
-                None,
-                None,
-            )?,
-        };
         // Resolve every body `LoadProperty`/`StoreProperty` to a logical own
         // field; bail out if a property is absent or an accessor. The shape
         // fixes its bank and relative index. A receiver property resolves against
@@ -106,10 +89,7 @@ impl Interpreter {
             prop_fields.insert(instr.byte_pc, field);
             prop_shapes.insert(instr.byte_pc, shape_off);
         }
-        let guard = self.bake_method_guard(target)?;
-        Some(jit::JitInlineMethod {
-            body: method_view,
-            guard,
+        Some(jit::JitMethodInlineFields {
             prop_fields,
             prop_shapes,
         })

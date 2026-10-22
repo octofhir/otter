@@ -34,7 +34,7 @@
 
 use std::cmp::Reverse;
 
-use otter_vm::{JitInlineCallee, JitInlineMethod};
+use otter_vm::{JitCompileSnapshot, JitInlineCallee, JitMethodInlineFields};
 
 use super::plan::TemplateInstr;
 use super::{ArithKind, FusedChainStep, TemplateOp, TemplatePlan, TemplateTail};
@@ -148,14 +148,15 @@ impl<'a> InlineLeafPlan<'a> {
     /// operands and instruction order.
     #[must_use]
     pub(crate) fn build_method(
-        method: &JitInlineMethod,
+        body: &JitCompileSnapshot,
+        fields: &JitMethodInlineFields,
         template: &'a TemplatePlan,
         argc: usize,
     ) -> Option<Self> {
         Self::build_leaf(
-            method.param_count(),
-            method.register_count(),
-            Some(method),
+            body.code_block.param_count,
+            body.code_block.register_count,
+            Some(fields),
             template,
             argc,
         )
@@ -183,7 +184,7 @@ impl<'a> InlineLeafPlan<'a> {
     fn build_leaf(
         param_count: u16,
         register_count: u16,
-        method: Option<&JitInlineMethod>,
+        method: Option<&JitMethodInlineFields>,
         template: &'a TemplatePlan,
         argc: usize,
     ) -> Option<Self> {

@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - [`ClosureContexts`] owns permanent cells and generation subscriptions.
-//! - Birth observation and a collector-rewritten first-context word.
+//! - Birth observation and a weak collector-rewritten first-context word.
 //!
 //! # Invariants
 //! - Every eligible source is observed from its first closure birth. A lazy
@@ -14,7 +14,12 @@
 //!   Code reclamation also releases candidate sources before its full census.
 //! - Native allocation accepts an identical context or a many cell; every
 //!   other birth misses before effects into the common VM construction owner.
-//! - Cells survive generated code and are traced at every moving collection.
+//! - Cells survive generated code, but their observed contexts are weak.
+//!   Compilation and installed generations retain their own strong context
+//!   constants before using a fact, so collection cannot break an active
+//!   generation's dependency.
+//! - Losing an unowned context permanently disables its fact before the
+//!   collector reuses the dead context's offset.
 //!
 //! # See also
 //! - [`crate::function_ops`] observes the initialized, rewritten context.
@@ -59,6 +64,28 @@ impl ContextFact {
             .store(Value::undefined().to_bits(), Ordering::Relaxed);
         for flag in self.subscribers.drain(..) {
             flag.set();
+        }
+    }
+
+    fn process_weak(
+        &self,
+        visitor: &mut dyn FnMut(otter_gc::raw::RawGc) -> Option<otter_gc::raw::RawGc>,
+    ) {
+        let Some(value) = self.single() else {
+            return;
+        };
+        let raw = value.as_raw_gc().expect("single context is a GC value");
+        if let Some(moved) = visitor(raw) {
+            self.context.store(
+                (value.to_bits() & !u64::from(u32::MAX)) | u64::from(moved.0),
+                Ordering::Relaxed,
+            );
+        } else {
+            self.context
+                .store(Value::undefined().to_bits(), Ordering::Relaxed);
+            for flag in &self.subscribers {
+                flag.set();
+            }
         }
     }
 }
@@ -165,11 +192,13 @@ impl ClosureContexts {
         released
     }
 
-    pub(crate) fn trace(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+    /// Keep a fact only while a non-speculative owner keeps its context alive.
+    pub(crate) fn process_weak(
+        &self,
+        visitor: &mut dyn FnMut(otter_gc::raw::RawGc) -> Option<otter_gc::raw::RawGc>,
+    ) {
         for fact in self.facts.values().flatten() {
-            if fact.single().is_some() {
-                visitor(fact.context.as_ptr().cast());
-            }
+            fact.process_weak(visitor);
         }
     }
 }

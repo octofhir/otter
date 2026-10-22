@@ -43,6 +43,8 @@
 //!   trace table by tag.
 //! - Registered observation prologues run before nursery movement, each
 //!   incremental marking step or sweep; observations cannot become strong roots.
+//! - Owner-held weak references resolve after strong/ephemeron tracing and
+//!   before nursery recycling or old-space sweep; resolution never marks.
 //! - An initializer passed to an `_initialized` allocator runs at the body's
 //!   final address with no intervening safepoint, before the old-placement
 //!   barrier scan; the body is never traced with an unfilled tail.
@@ -2672,6 +2674,19 @@ impl GcHeap {
         };
         let ephemeron_registry_slots = self.ephemerons.handle_slots();
         let weak_registry_slots = self.weak_finalization.handle_slots();
+        let mut process_weak = |resolve: &mut dyn FnMut(RawGc) -> Option<RawGc>| {
+            // SAFETY: the registration stack is unchanged during this pause;
+            // no weak owner may allocate or change registrations.
+            let sources = unsafe { &*extra_roots };
+            for (index, source) in sources.iter().enumerate() {
+                if !sources[..index]
+                    .iter()
+                    .any(|prior| prior.same_source(source))
+                {
+                    source.process_weak(resolve);
+                }
+            }
+        };
         // SAFETY: STW pause for the duration of the call;
         // every type tag in from-space is registered.
         let scavenge_start = Instant::now();
@@ -2685,6 +2700,7 @@ impl GcHeap {
                 &mut combined,
                 &ephemeron_registry_slots,
                 &weak_registry_slots,
+                &mut process_weak,
                 &mut self.remembered_parents,
                 &mut self.host_refs,
                 &mut self.allocation_sites,
@@ -3409,6 +3425,18 @@ impl GcHeap {
     fn sweep_phase_with_pause_start(&mut self, pause_start: Instant) {
         self.retire_machine_labs();
         self.prepare_collection_observations();
+        // This is also the split mark/sweep entry. Resolve observations here
+        // so even a caller without an embedder post-mark pass cannot leave a
+        // freed old offset in an owner cache. Full collections have already
+        // completed the ephemeron fixpoint before reaching this boundary.
+        for (index, source) in self.extra_roots.iter().enumerate() {
+            if !self.extra_roots[..index]
+                .iter()
+                .any(|prior| prior.same_source(source))
+            {
+                source.process_weak(&mut |raw| raw_is_marked(raw).then_some(raw));
+            }
+        }
         self.prune_ephemeron_registry_to_marked();
         self.prune_weak_finalization_registry_to_marked();
         self.weak_cleanup_due |= self.weak_finalization.has_finalization_registries();

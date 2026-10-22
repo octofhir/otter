@@ -330,18 +330,31 @@ site followed by a recompile. Repeated identical `negativeZero` or
 
 Sources whose closures all share one lexical context can fold watched context
 slots in their own Graph bodies and inlines. `closureContextCell` relocations
-name the permanent collector-rewritten context word by source function id;
+name a generation-owned strongly traced context constant by source function id;
 `CheckDependencies` protects its use without comparing context identity at
 calls. Creating a closure over a second context fires those generations,
 releases the first context from the source fact, and permanently disables that
 specialization. Both native allocation encoders prove the birth context before
 carving: a first or different context takes the existing pre-effect allocating
 path, which observes the rewritten context before publishing the callable.
+The source's first-context observation is weak: an unused closure cannot keep
+its lexical graph alive merely by having been born. If the context dies, that
+source fact becomes permanently unavailable before its cage offset is reused.
+Only a compilation that actually uses the context retains a strong constant,
+first in its pending roots and then until its installed generation retires.
 Before a dynamic-code reclamation census, candidate sources also release their
 optimization-owned context roots and retire their dependent code, so an unused
 eval capture cannot pin its source chunk.
 Context-slot writes keep their independent watched-slot invalidation. Lexical
 `this` and `new.target` remain the actual bindings of each closure.
+
+Writable callee identity caches and generated `instanceof` target/prototype
+pairs are also weak observations. Nursery collection rewrites surviving entries
+after strong and ephemeron tracing; full collection clears dead entries before
+sweep, including split incremental collections. A dead entry makes the next
+call or test re-prove its target. Immutable method and context-slot constants
+read by native code remain strong roots. Both native architectures use this
+same carrier lifetime and miss protocol.
 
 Every `LoadString` site exposes a `stringConstantCell` relocation keyed by
 function id and byte PC. The process address is redacted. The cell is rooted,

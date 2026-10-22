@@ -19,7 +19,7 @@
 //!    half to idle workers; the phase ends when every worker is idle and no
 //!    work is shared.
 //! 3. The collecting thread runs the ephemeron fixpoint and rewrites weak
-//!    registry slots.
+//!    registry slots and owner-held weak observations.
 //! 4. Finalize and drop the unforwarded bodies the new space tracks for
 //!    reclamation; untracked dead cells are never visited.
 //! 5. Set every to-space page's `age_mark` to its bump top: everything
@@ -269,6 +269,8 @@ unsafe fn store_slot(slot: *mut RawGc, offset: u32) {
 /// pruning. `threads` are the heap's helper threads. While an old-generation
 /// marking cycle runs, `promoted_gray` receives every promoted copy, born
 /// gray for the marker to visit.
+/// `process_weak` resolves owner-held observations after the same ephemeron
+/// fixpoint, before the source nursery can be recycled.
 ///
 /// # Safety
 ///
@@ -286,6 +288,7 @@ pub unsafe fn scavenge(
     external_visit: &mut RootSlotVisitor<'_>,
     ephemeron_registry_slots: &[*mut RawGc],
     weak_registry_slots: &[*mut RawGc],
+    process_weak: &mut dyn FnMut(&mut dyn FnMut(RawGc) -> Option<RawGc>),
     remembered_parents: &mut Vec<RawGc>,
     host_refs: &mut crate::host_refs::HostRefTable,
     sites: &mut crate::pretenuring::AllocationSites,
@@ -411,6 +414,12 @@ pub unsafe fn scavenge(
             main.process_weak_registry_slot(slot);
         }
     }
+    process_weak(&mut |mut raw| {
+        // SAFETY: owner observations name heap-issued handles. The mutator
+        // and helpers are paused, and from-space still holds forwarding words.
+        unsafe { main.process_weak_registry_slot(&mut raw) };
+        (!raw.is_null()).then_some(raw)
+    });
 
     let mut stats = ScavengeStats {
         workers,
@@ -1442,6 +1451,7 @@ mod tests {
                 &mut |_| {},
                 &[],
                 &[],
+                &mut |_| {},
                 &mut remembered,
                 &mut crate::host_refs::HostRefTable::default(),
                 &mut crate::pretenuring::AllocationSites::default(),

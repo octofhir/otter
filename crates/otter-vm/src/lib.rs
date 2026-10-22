@@ -1638,6 +1638,13 @@ impl Interpreter {
 }
 
 impl otter_gc::ExtraRootSource for Interpreter {
+    fn process_weak(&self, resolve: &mut dyn FnMut(RawGc) -> Option<RawGc>) {
+        self.jit_code_registry.process_weak(resolve);
+        for root in self.jit_compile_roots.borrow().iter() {
+            root.process_weak(resolve);
+        }
+        self.jit_compile_queue.process_weak(resolve);
+    }
     /// Hidden classes are collectable: forget the shapes the marking left
     /// unreached in the shape tables and in every table generated code
     /// probes by shape handle. Rust-side hits that outlive their shape are

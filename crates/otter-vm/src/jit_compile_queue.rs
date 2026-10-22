@@ -302,4 +302,17 @@ impl OptimizingCompileQueue {
             }
         }
     }
+
+    /// Weak lookup caches belong to the same pending session as its strong
+    /// constants, but do not retain the JavaScript values they observed.
+    pub(crate) fn process_weak(
+        &self,
+        resolve: &mut dyn FnMut(otter_gc::raw::RawGc) -> Option<otter_gc::raw::RawGc>,
+    ) {
+        for pending in self.pending.values() {
+            for root in pending.roots.iter() {
+                root.process_weak(resolve);
+            }
+        }
+    }
 }

@@ -402,7 +402,7 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
     // The inlined body reaches its operands straight from locals: the arithmetic
     // opcodes own their ToPrimitive / ToNumeric steps, so no coercion temporaries
     // are materialized.
-    assert_eq!(layout["virtualRegisterCount"], 5);
+    assert_eq!(layout["virtualRegisterCount"], 4);
     assert_eq!(layout["scratchSlotCount"], 2);
     assert_eq!(layout["slotBytes"], 8);
     assert_eq!(layout["stackAlignmentBytes"], 16);
@@ -435,13 +435,12 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
     for slot in register_slots.iter().filter_map(serde_json::Value::as_u64) {
         assert!(slot < scratch_slot_count, "register slot out of range");
     }
-    assert!(register_slots[4].is_null(), "unused r4 stays unmapped");
-    // The parameter, the local read of it, and the sum are one live chain and
-    // compact onto one slot; the receiver's property load keeps its own.
-    assert_eq!(register_slots[0], register_slots[1]);
-    assert_eq!(register_slots[1], register_slots[3]);
-    assert_ne!(register_slots[0], register_slots[2]);
-    assert_eq!(layout["receiverSlot"], register_slots[2]);
+    assert!(register_slots[3].is_null(), "unused r3 stays unmapped");
+    // The parameter and sum compact onto one slot; the receiver and its
+    // property read reuse the other. The frontend reads the parameter directly.
+    assert_eq!(register_slots[0], register_slots[2]);
+    assert_ne!(register_slots[0], register_slots[1]);
+    assert_eq!(layout["receiverSlot"], register_slots[1]);
     assert!(
         layout["receiverSlot"]
             .as_u64()
@@ -486,9 +485,9 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
         .iter()
         .filter(|region| region["kind"] == "inlineInstruction")
         .collect::<Vec<_>>();
-    // `apply` is five bytecodes now that `+` owns its own coercion; the inline
-    // region stream covers the callee body plus its return.
-    assert_eq!(inline_instructions.len(), 5);
+    // LoadThis, LoadProperty, Add and Return cover the complete callee; the
+    // arithmetic opcode reads the parameter directly and owns its coercion.
+    assert_eq!(inline_instructions.len(), 4);
     assert!(inline_instructions.iter().all(|region| {
         region["functionId"].is_u64()
             && region["logicalPc"].is_u64()
@@ -501,7 +500,7 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
             .iter()
             .map(|region| region["operationIndex"].as_u64().unwrap())
             .collect::<Vec<_>>(),
-        (0..5).collect::<Vec<_>>()
+        (0..4).collect::<Vec<_>>()
     );
 
     let find_region = |kind: &str| {
@@ -567,7 +566,7 @@ fn template_method_inline_artifact_exposes_compact_scratch_and_deopt_ranges() {
     assert!(assembly.contains("inline-site=caller:"));
     assert!(assembly.contains("receiver-property=true"));
     assert!(assembly.contains(
-        "parameters=1 virtual-registers=5 scratch-slots=2 slot-bytes=8 stack-alignment=16 scratch-bytes=16 offset-basis=postAllocationSp"
+        "parameters=1 virtual-registers=4 scratch-slots=2 slot-bytes=8 stack-alignment=16 scratch-bytes=16 offset-basis=postAllocationSp"
     ));
     assert!(assembly.contains("register-slots=["));
     assert!(assembly.contains("entry-values=[arg0->r0:s"));

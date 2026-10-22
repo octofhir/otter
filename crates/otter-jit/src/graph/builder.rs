@@ -59,6 +59,8 @@
 //!   Calls forget owner-word checks while retaining the loaded value bounds.
 //!   Owner guards keep their original load's eager frame and remain only
 //!   when a consumer relies on the bound, including through a non-loop phi.
+//! - Guarded method nodes retain positions in the canonical target vector.
+//!   Targets without call linkage do not admit Graph calls or body inlining.
 //! - A held method or a source with one closure context may fold watched
 //!   context slots. Source and slot dependencies guard the respective facts;
 //!   each slot store notifies its context's watch.
@@ -1133,7 +1135,7 @@ impl<'a> Builder<'a> {
             return false;
         };
         self.view
-            .direct_methods
+            .method_targets
             .get(&byte_pc)
             .and_then(|methods| methods.get(usize::from(target)))
             .is_some_and(|method| {
@@ -1155,7 +1157,7 @@ impl<'a> Builder<'a> {
             return false;
         };
         self.view
-            .direct_methods
+            .method_targets
             .get(&byte_pc)
             .and_then(|methods| methods.get(usize::from(target)))
             .is_some_and(|method| {
@@ -3890,7 +3892,11 @@ impl<'a> Builder<'a> {
             return false;
         }
         let view: &'a JitCompileSnapshot = self.view;
-        let Some([method]) = view.direct_methods.get(&byte_pc).map(Vec::as_slice) else {
+        let Some((target, method, target_callee)) = view
+            .method_targets
+            .get(&byte_pc)
+            .and_then(|methods| single_method_target(methods))
+        else {
             return false;
         };
         if method.guard.accessor_byte.is_none() {
@@ -3908,7 +3914,7 @@ impl<'a> Builder<'a> {
         let callee = self.add(
             Kind::LoadGuardedMethod {
                 byte_pc,
-                target: 0,
+                target,
                 receiver_proved: false,
                 cell_read: reads_method_cell(method),
             },
@@ -3922,7 +3928,7 @@ impl<'a> Builder<'a> {
             callee,
             receiver,
             &arguments,
-            Some(method.callee.plan),
+            Some(target_callee.plan),
             destination,
         );
         true
@@ -3938,7 +3944,11 @@ impl<'a> Builder<'a> {
             return false;
         }
         let view: &'a JitCompileSnapshot = self.view;
-        let Some([method]) = view.direct_methods.get(&byte_pc).map(Vec::as_slice) else {
+        let Some((target, method, _)) = view
+            .method_targets
+            .get(&byte_pc)
+            .and_then(|methods| single_method_target(methods))
+        else {
             return false;
         };
         if method.guard.accessor_byte.is_some() {
@@ -3952,7 +3962,7 @@ impl<'a> Builder<'a> {
         let value = self.add(
             Kind::LoadGuardedMethod {
                 byte_pc,
-                target: 0,
+                target,
                 receiver_proved: true,
                 cell_read: reads_method_cell(method),
             },
@@ -3964,7 +3974,13 @@ impl<'a> Builder<'a> {
     }
 
     /// The direct method a read of this body's guarded method `node` names.
-    fn loaded_method(&self, node: NodeId) -> Option<&'a otter_vm::jit::JitDirectMethod> {
+    fn loaded_method(
+        &self,
+        node: NodeId,
+    ) -> Option<(
+        &'a otter_vm::jit::JitMethodTarget,
+        &'a otter_vm::jit::JitDirectCallee,
+    )> {
         let data = self.graph.node(node);
         let Kind::LoadGuardedMethod {
             byte_pc, target, ..
@@ -3976,7 +3992,11 @@ impl<'a> Builder<'a> {
             return None;
         }
         let view: &'a JitCompileSnapshot = self.view;
-        view.direct_methods.get(&byte_pc)?.get(usize::from(target))
+        let method = view
+            .method_targets
+            .get(&byte_pc)?
+            .get(usize::from(target))?;
+        Some((method, method.callee.as_ref()?))
     }
 
     /// `dst = callee.apply(this, arguments)` over the activation's own
@@ -4104,8 +4124,8 @@ impl<'a> Builder<'a> {
             *argument = self.tagged(*argument);
         }
         // A method read through its holder slot names its target.
-        if let Some(method) = self.loaded_method(callee) {
-            let plan = method.callee.plan;
+        if let Some((method, target)) = self.loaded_method(callee) {
+            let plan = target.plan;
             if let Some(body) = method.body.as_ref()
                 && self.binds_this_as_is(body, plan, this)
                 && self.inline_call(instruction, body, plan, callee, this, &arguments)
@@ -4317,18 +4337,20 @@ impl<'a> Builder<'a> {
                     .is_some_and(|lookup| lookup.receiver.is_generated_receiver())
             })
             .map(|site| site.callee.plan);
-        let method = (!self.exited_for(ExitReason::ShapeGuard)
-            && !self.exited_for(ExitReason::IdentityGuard))
-        .then(|| self.view.direct_methods.get(&byte_pc))
-        .flatten()
-        .filter(|methods| methods.len() == 1)
-        .map(|methods| methods[0].callee.plan);
         let view: &'a JitCompileSnapshot = self.view;
-        let polymorphic = (!self.exited_for(ExitReason::ShapeGuard)
+        let methods = (!self.exited_for(ExitReason::ShapeGuard)
             && !self.exited_for(ExitReason::IdentityGuard))
-        .then(|| view.direct_methods.get(&byte_pc))
-        .flatten()
-        .filter(|methods| methods.len() >= 2);
+        .then(|| view.method_targets.get(&byte_pc))
+        .flatten();
+        let monomorphic = methods.and_then(|methods| single_method_target(methods));
+        let method = monomorphic.map(|(_, _, callee)| callee.plan);
+        let polymorphic = methods.filter(|methods| {
+            methods
+                .iter()
+                .filter(|method| method.callee.is_some())
+                .count()
+                >= 2
+        });
         // Any other method is read like a named load when the site's lookup
         // feedback describes it, then called through the generic entry.
         let lookup = self.view.property_programs.contains_key(&byte_pc)
@@ -4400,29 +4422,25 @@ impl<'a> Builder<'a> {
             );
             return self.emit_function_prototype_call(instruction, receiver, &arguments, plan);
         }
-        if let Some(plan) = method {
-            let view: &'a JitCompileSnapshot = self.view;
-            let method = view.direct_methods.get(&byte_pc).map(|methods| &methods[0]);
+        if let Some((target, method, callee_plan)) = monomorphic {
+            let plan = callee_plan.plan;
             // A receiver this path already proved to have the guard's shape
             // needs no second proof.
-            let receiver_proved = method.is_some_and(|method| {
-                self.known_shapes(receiver)
-                    .is_some_and(|shapes| shapes.as_slice() == [method.guard.recv_shape])
-            });
+            let receiver_proved = self
+                .known_shapes(receiver)
+                .is_some_and(|shapes| shapes.as_slice() == [method.guard.recv_shape]);
             let callee = self.add(
                 Kind::LoadGuardedMethod {
                     byte_pc,
-                    target: 0,
+                    target,
                     receiver_proved,
-                    cell_read: method.is_some_and(reads_method_cell),
+                    cell_read: reads_method_cell(method),
                 },
                 &[receiver],
                 Repr::Tagged,
             );
-            if let Some(method) = method {
-                self.prove_receiver_shape(receiver, method.guard.recv_shape);
-            }
-            let body = method.and_then(|method| method.body.as_ref());
+            self.prove_receiver_shape(receiver, method.guard.recv_shape);
+            let body = method.body.as_ref();
             // The guard proved an object receiver, which a non-arrow method
             // binds as `this`.
             if let Some(body) = body
@@ -4543,7 +4561,7 @@ impl<'a> Builder<'a> {
         instruction: &Instruction,
         receiver: NodeId,
         arguments: &[NodeId],
-        methods: &'a [otter_vm::jit::JitDirectMethod],
+        methods: &'a [otter_vm::jit::JitMethodTarget],
     ) {
         let byte_pc = instruction.byte_pc;
         let destination = instruction.writes[0];
@@ -4560,7 +4578,12 @@ impl<'a> Builder<'a> {
                 builder.terminate(Kind::Jump(join), &[]);
             }
         };
+        // Enumerate the canonical vector before skipping Template-only
+        // targets: LoadGuardedMethod names that original vector position.
         for (index, method) in methods.iter().enumerate() {
+            let Some(target) = method.callee.as_ref() else {
+                continue;
+            };
             let Some(current) = self.current else {
                 break;
             };
@@ -4591,7 +4614,7 @@ impl<'a> Builder<'a> {
                 Repr::Tagged,
             );
             self.prove_receiver_shape(receiver, method.guard.recv_shape);
-            let plan = method.callee.plan;
+            let plan = target.plan;
             let inlined = method.body.as_ref().is_some_and(|body| {
                 (!body.code_block.observes_this() || !body.code_block.is_arrow())
                     && self.inline_call(instruction, body, plan, callee, receiver, arguments)
@@ -4602,7 +4625,7 @@ impl<'a> Builder<'a> {
                     callee,
                     receiver,
                     arguments,
-                    Some(method.callee.plan),
+                    Some(target.plan),
                 );
             }
             finish_arm(self, &mut arms);
@@ -5254,8 +5277,28 @@ impl<'a> Builder<'a> {
     }
 }
 
+/// The only target Graph can call, retaining its canonical vector index.
+/// Template-only bodies do not create Graph call or inline admission.
+fn single_method_target(
+    methods: &[otter_vm::jit::JitMethodTarget],
+) -> Option<(
+    u8,
+    &otter_vm::jit::JitMethodTarget,
+    &otter_vm::jit::JitDirectCallee,
+)> {
+    let mut targets = methods
+        .iter()
+        .enumerate()
+        .filter_map(|(index, method)| Some((index, method, method.callee.as_ref()?)));
+    let (index, method, callee) = targets.next()?;
+    if targets.next().is_some() {
+        return None;
+    }
+    Some((u8::try_from(index).ok()?, method, callee))
+}
+
 /// Whether the guarded load of `method` reads its code-retained method cell
 /// rather than the holder's slot.
-fn reads_method_cell(method: &otter_vm::jit::JitDirectMethod) -> bool {
+fn reads_method_cell(method: &otter_vm::jit::JitMethodTarget) -> bool {
     method.guard.method_cell != 0 && method.guard.accessor_byte.is_none()
 }

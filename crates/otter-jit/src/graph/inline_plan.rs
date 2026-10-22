@@ -14,6 +14,8 @@
 //! - A candidate's site frequency is its caller snapshot's baked frequency
 //!   at the site's byte PC; its size counts what its function's optimized
 //!   code inlined, unless its function already runs on its inline path.
+//! - Method candidates require a generated call plan; Template-only leaf
+//!   bodies do not enter the Graph inline budget.
 //! - Sites are offered in byte PC order, then by function: map order never
 //!   decides a tie.
 //!
@@ -57,10 +59,11 @@ impl InlineTree for SnapshotTree<'_> {
             .inline_callees
             .iter()
             .map(|(&byte_pc, callee)| (byte_pc, &callee.body));
-        let methods = view.direct_methods.iter().flat_map(|(&byte_pc, methods)| {
-            methods
-                .iter()
-                .filter_map(move |method| Some((byte_pc, method.body.as_ref()?)))
+        let methods = view.method_targets.iter().flat_map(|(&byte_pc, methods)| {
+            methods.iter().filter_map(move |method| {
+                method.callee.as_ref()?;
+                Some((byte_pc, method.body.as_ref()?))
+            })
         });
         let mut sites: Vec<(u32, &Arc<JitCompileSnapshot>)> = plain.chain(methods).collect();
         sites.sort_by_key(|&(byte_pc, body)| (byte_pc, body.code_block.id));

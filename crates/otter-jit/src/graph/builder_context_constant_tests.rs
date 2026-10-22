@@ -23,7 +23,7 @@ use otter_bytecode::{ContextCoord, Op, Operand};
 use otter_vm::JitCompileSnapshot;
 use otter_vm::jit::{
     JitConstantValue, JitContextConstant, JitDirectCallPlan, JitDirectCallThisMode,
-    JitDirectCallee, JitDirectMethod, JitMethodGuard, JitPrototypeValidity, JitTestInstruction,
+    JitDirectCallee, JitMethodGuard, JitMethodTarget, JitPrototypeValidity, JitTestInstruction,
 };
 use otter_vm::native_abi::{FUNCTION_CALL_NO_RECEIVER_CONVERSION, NativeFrameKind};
 
@@ -104,7 +104,7 @@ fn caller(body: JitCompileSnapshot) -> JitCompileSnapshot {
     );
     view.cage_base = 0x1000;
     view.instructions[0].call_attempted = true;
-    let method = JitDirectMethod {
+    let method = JitMethodTarget {
         target_index: 0,
         target_count: 1,
         guard: JitMethodGuard {
@@ -120,7 +120,7 @@ fn caller(body: JitCompileSnapshot) -> JitCompileSnapshot {
             method_cell: 0x3000,
             accessor_byte: None,
         },
-        callee: JitDirectCallee {
+        callee: Some(JitDirectCallee {
             plan: JitDirectCallPlan {
                 function_id: METHOD_FID,
                 code_object_id: 91,
@@ -132,10 +132,11 @@ fn caller(body: JitCompileSnapshot) -> JitCompileSnapshot {
                 callee_cell: 0,
             },
             receiver_allocation: None,
-        },
+        }),
         body: Some(Arc::new(body)),
+        inline_fields: None,
     };
-    view.direct_methods.insert(0, vec![method]);
+    view.method_targets.insert(0, vec![method]);
     view
 }
 
@@ -192,9 +193,53 @@ fn a_proven_method_reads_its_closure_constants_behind_slot_proofs() {
 }
 
 #[test]
+fn method_guards_preserve_canonical_indices_past_template_only_targets() {
+    for polymorphic in [false, true] {
+        let mut view = caller(body());
+        let methods = view.method_targets.get_mut(&0).unwrap();
+        let mut template_only = methods[0].clone();
+        template_only.callee = None;
+        template_only.body = Some(Arc::new(body()));
+        template_only.guard.recv_shape = 0x88;
+        methods.insert(0, template_only);
+        if polymorphic {
+            let mut second = methods[1].clone();
+            second.guard.recv_shape = 0x90;
+            methods.push(second);
+        }
+        let target_count = methods.len() as u32;
+        for (index, target) in methods.iter_mut().enumerate() {
+            target.target_index = index as u32;
+            target.target_count = target_count;
+        }
+        let template_only_body = methods[0].body.as_ref().unwrap().clone();
+        let inline_plan = super::super::inline_plan::InlinePlan::choose(&view);
+        assert!(!inline_plan.admits(&template_only_body));
+        let analysis = Rc::new(Analysis::build(&view).unwrap());
+        let built = build(
+            &view,
+            &analysis,
+            &BaselineSupport {
+                supported: vec![true; view.instructions.len()],
+            },
+            None,
+        )
+        .unwrap();
+        let targets: Vec<_> = placed(&built.graph)
+            .into_iter()
+            .filter_map(|kind| match kind {
+                Kind::LoadGuardedMethod { target, .. } => Some(*target),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(targets, if polymorphic { vec![1, 2] } else { vec![1] });
+    }
+}
+
+#[test]
 fn an_unproven_method_body_ignores_closure_constants() {
     let mut view = caller(body());
-    view.direct_methods.get_mut(&0).unwrap()[0]
+    view.method_targets.get_mut(&0).unwrap()[0]
         .guard
         .slot_proven = false;
     let analysis = Rc::new(Analysis::build(&view).unwrap());

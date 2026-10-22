@@ -194,10 +194,16 @@ prepared stable traced string and BigInt literal cells available as relocation l
 `directMethodSites`, and `directMethodTargets` report stable function links
 whose current generations were available for generated plain, base-construct,
 and bounded polymorphic method linkage,
-separately from `inlineCallees` /
-`inlineMethods`, which count bodies offered to the inliner. A
+separately from `inlineCallees` (plain-call body candidates) and
+`inlineMethods` (sites with exactly one descriptor-admitted Template method
+candidate). These counts describe independent capabilities of a single
+prepared method target: its body is owned once, with optional generated-call
+linkage and Template field proofs. Graph method admission requires linkage;
+Template may accept a leaf whose native entry is unavailable. A
 `directCallPlan` event records every observed call target inspected.
 `targetIndex` / `targetCount` identify its position in the bounded chain.
+Targets without linkage leave gaps in the reported indices; filtering does not
+renumber the observed chain.
 Graph `inlineLowered` events identify bodies actually accepted by the completed
 graph, with their exact owning code object, source parent, callee, depth and
 encoded-bytecode-byte budget charge. This includes nested bodies and bodies

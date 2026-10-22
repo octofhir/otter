@@ -19,6 +19,8 @@
 //! - [`JitDirectCallPlan`], [`JitDirectCallee`], guarded static-native call
 //!   plans, and the isolate-local direct-call cache record used to reuse an
 //!   already-validated native entry.
+//! - [`JitMethodTarget`] owns each guarded method's one prepared body and
+//!   independent call-linkage and Template field-proof capabilities.
 //! - [`JitCodeGenerationSnapshot`] — explicit cold introspection over live
 //!   generations and retained entry-cell tombstones.
 //! - Collector-owned receiver-allocation windows and immutable constructor
@@ -50,6 +52,8 @@
 //!   logical resume PC.
 //! - A cached direct-call plan is reusable only at the registry invalidation
 //!   epoch at which it was selected. Dynamic callable state is never cached.
+//! - Method targets retain source-site/receiver identity. Template and Graph
+//!   inspect one body owner; no tier-specific map copies that prepared tree.
 //! - Generated receiver allocation may mutate only the published nursery
 //!   window and its accounting words; every miss returns to the rooted VM
 //!   allocator before any constructor effect begins.
@@ -882,13 +886,13 @@ pub struct JitCompileSnapshot {
     /// function or closure identity; receiver creation, derived-`this`, and
     /// `new.target` publication/inheritance are part of the generated boundary.
     pub direct_constructs: rustc_hash::FxHashMap<u32, JitDirectCallee>,
-    /// Compiler-native direct-method chains keyed by the caller's
-    /// `Op::CallMethodValue` byte-PC. Each target carries one exact receiver /
-    /// prototype / method-slot guard and one current entry-capable callee
-    /// generation. Targets retain feedback order, so generated code emits one
-    /// bounded most-frequent-first guard chain and constructs a callee frame
-    /// only after one exact guard succeeds.
-    pub direct_methods: rustc_hash::FxHashMap<u32, Vec<JitDirectMethod>>,
+    /// Identity-guarded method targets keyed by source byte PC. Each target
+    /// owns its prepared body once, shared by Template leaf admission and
+    /// Graph splicing. Optional call linkage and Template field proofs do not
+    /// own another copy. Targets retain most-frequent-first feedback order and
+    /// their original observed indices, including targets without call linkage.
+    /// Accessor targets carry linkage but no inline body or Template proof.
+    pub method_targets: rustc_hash::FxHashMap<u32, Vec<JitMethodTarget>>,
     /// Inline-candidate callees for baseline leaf-inlining, keyed by the
     /// caller's `Op::Call` byte-PC. Populated only for sites the interpreter
     /// observed resolving to a single plain synchronous bytecode callee; baked
@@ -905,20 +909,6 @@ pub struct JitCompileSnapshot {
     /// instructions, when this snapshot is a body to inline: a caller that
     /// builds it builds those again.
     pub optimized_inlined_instructions: u32,
-    /// Inline-candidate methods for `Op::CallMethodValue` sites, keyed by the
-    /// caller's call byte-PC. Populated for monomorphic method sites whose method
-    /// is a tiny body of sealed property loads/stores and pure ops; baked by
-    /// `Interpreter::bake_inline_callees`.
-    pub inline_methods: rustc_hash::FxHashMap<u32, JitInlineMethod>,
-    /// Inline-candidate method chains for *polymorphic* `Op::CallMethodValue`
-    /// sites, keyed by the caller's call byte-PC. Each value is the
-    /// most-frequent-first list (length ≥ 2) of per-receiver-shape inline
-    /// methods the baseline emits as a guard chain: each entry guards its own
-    /// receiver shape + prototype-method identity and, on a miss, falls through
-    /// to the next entry; a receiver matching none of them side-exits before
-    /// method lookup. Baked by `Interpreter::bake_inline_callees`. The optimizing
-    /// tier ignores polymorphic inline bodies.
-    pub inline_poly_methods: rustc_hash::FxHashMap<u32, Vec<JitInlineMethod>>,
     /// Guarded method calls into a declared native entry, keyed by call byte PC.
     pub guarded_method_calls: rustc_hash::FxHashMap<u32, JitGuardedMethodCall>,
     /// `f.call(...)` sites keyed by byte PC: an `Op::CallMethodValue` named
@@ -1388,25 +1378,13 @@ pub struct JitMethodGuard {
     pub accessor_byte: Option<u32>,
 }
 
-/// A method the baseline may splice into a caller's `Op::CallMethodValue` site.
-/// Carries the method's body plus the shared identity guard. Per body
-/// `LoadProperty`/`StoreProperty` byte-PC, the logical own field within the
-/// receiver's shape-owned storage bank.
-/// Method identity is verified before body entry by the receiver shape and
-/// one prototype validity cell. The holder is read from a traced root shape;
-/// the current slot must still identify [`JitMethodGuard::method_fid`].
-/// Prototype mutation invalidates the proof before any dependent call has
-/// effects. An optimizing backend may reuse that proof across iterations only
-/// after proving the receiver loop-invariant and the whole natural loop free
-/// of mutation and reentrant execution.
+/// Descriptor-checked fields for Template admission of a method target's body.
+///
+/// The exact body and callable guard belong to [`JitMethodTarget`]. This proof
+/// adds no snapshot owner, so recursive field baking never splits one method
+/// into separate Template and Graph body trees.
 #[derive(Debug, Clone)]
-pub struct JitInlineMethod {
-    /// Fully baked compile inputs for the method body, resolved against the
-    /// method's own constant pool and feedback rather than the caller's.
-    /// Nested plain and method candidates live in this snapshot's own tables.
-    pub body: Arc<JitCompileSnapshot>,
-    /// Exact receiver/prototype/method-slot guard shared with generated calls.
-    pub guard: JitMethodGuard,
+pub struct JitMethodInlineFields {
     /// Body `LoadProperty`/`StoreProperty` byte-PC → logical own field. A
     /// receiver-shape property is baked from the identity-guarded receiver shape;
     /// a non-receiver property is baked from its own monomorphic site feedback,
@@ -1417,20 +1395,6 @@ pub struct JitInlineMethod {
     /// slot load/store. A receiver property is absent here — the entry
     /// `CheckMethodIdentity` already proves its shape.
     pub prop_shapes: rustc_hash::FxHashMap<u32, u32>,
-}
-
-impl JitInlineMethod {
-    /// Method formal parameter count (excluding `this`); must equal argc.
-    #[must_use]
-    pub fn param_count(&self) -> u16 {
-        self.body.code_block.param_count
-    }
-
-    /// Method virtual-register-window length.
-    #[must_use]
-    pub fn register_count(&self) -> u16 {
-        self.body.code_block.register_count
-    }
 }
 
 /// Source opcode represented by compiler-generated call linkage.
@@ -1779,9 +1743,16 @@ pub struct JitGlobalObjectLoad {
     pub global_lexical_epoch: u64,
 }
 
-/// One guarded method target with an exact generated callee plan.
+/// One identity-guarded method target consumed by both native tiers.
+///
+/// Receiver shape, holder slot and callable identity are proved before effects.
+/// Prototype mutation retires the shared proof. A body is prepared once for
+/// this exact source site and target; another receiver with the same function
+/// id can require different context constants and field proofs. A target may
+/// have a Template body without a ready native entry, or call linkage without
+/// an inlineable body. No consumer may infer one capability from another.
 #[derive(Debug, Clone)]
-pub struct JitDirectMethod {
+pub struct JitMethodTarget {
     /// Zero-based position in the observed bounded method-target chain.
     pub target_index: u32,
     /// Total observed targets at this call site when the plan was baked.
@@ -1789,11 +1760,14 @@ pub struct JitDirectMethod {
     /// Receiver/prototype/method-slot identity checked immediately before call.
     pub guard: JitMethodGuard,
     /// Exact entry generation and callee frame shape.
-    pub callee: JitDirectCallee,
+    pub callee: Option<JitDirectCallee>,
     /// The method's fully baked body, for an optimizing caller that builds
     /// it in place of the call; absent when the method needs an activation
     /// of its own or the inline budget is spent.
     pub body: Option<Arc<JitCompileSnapshot>>,
+    /// Optional Template descriptor proof over this exact prepared body.
+    /// Present only when `body` is present; final leaf/arity checks still apply.
+    pub inline_fields: Option<JitMethodInlineFields>,
 }
 
 /// Offsets a generated `.length` read on a typed view uses. The read is the
@@ -2450,12 +2424,10 @@ impl JitCompileSnapshot {
             native_calls: rustc_hash::FxHashMap::default(),
             direct_callees: rustc_hash::FxHashMap::default(),
             direct_constructs: rustc_hash::FxHashMap::default(),
-            direct_methods: rustc_hash::FxHashMap::default(),
+            method_targets: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
             call_frequencies: rustc_hash::FxHashMap::default(),
             optimized_inlined_instructions: 0,
-            inline_methods: rustc_hash::FxHashMap::default(),
-            inline_poly_methods: rustc_hash::FxHashMap::default(),
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             function_prototype_calls: rustc_hash::FxHashMap::default(),
             instanceof_cells: rustc_hash::FxHashMap::default(),

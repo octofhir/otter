@@ -2943,7 +2943,7 @@ impl<'a> Codegen<'a> {
     ) -> Result<(), Unsupported> {
         let guard = self
             .view_of(node)
-            .direct_methods
+            .method_targets
             .get(&byte_pc)
             .and_then(|methods| methods.get(usize::from(target)))
             .map(|method| method.guard.clone())

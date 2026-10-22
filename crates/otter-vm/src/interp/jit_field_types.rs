@@ -19,6 +19,8 @@
 //!   membership for an exact current RHS shape proof, even when unstable.
 //! - Captured words are canonical. Their low byte changes on every widening,
 //!   so a live byte comparison protects every admitted load's complete bound.
+//! - Each method target owns one prepared body. The tree visits it once,
+//!   independently of its generated-call plan and Template field proof.
 //!
 //! # See also
 //! - [`crate::object::field_type`] owns the observed upper bounds.
@@ -37,15 +39,7 @@ impl Interpreter {
         for callee in view.inline_callees.values_mut() {
             self.bake_field_type_tree(std::sync::Arc::make_mut(&mut callee.body));
         }
-        for method in view.inline_methods.values_mut() {
-            self.bake_field_type_tree(std::sync::Arc::make_mut(&mut method.body));
-        }
-        for methods in view.inline_poly_methods.values_mut() {
-            for method in methods {
-                self.bake_field_type_tree(std::sync::Arc::make_mut(&mut method.body));
-            }
-        }
-        for methods in view.direct_methods.values_mut() {
+        for methods in view.method_targets.values_mut() {
             for method in methods {
                 if let Some(body) = &mut method.body {
                     self.bake_field_type_tree(std::sync::Arc::make_mut(body));

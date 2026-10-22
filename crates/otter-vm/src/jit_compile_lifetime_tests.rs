@@ -1,7 +1,7 @@
 //! Prepared source leases and exact optimizing-publication identity.
 //!
 //! # Contents
-//! - Recursive plain, method, polymorphic and direct-method source ownership.
+//! - Recursive plain and canonical guarded-method source ownership.
 //! - Physical eviction eligibility before and after source-lease release.
 //! - Foreign CodeSpace adoption with overlapping function identifiers.
 //!
@@ -17,8 +17,8 @@
 use super::*;
 use crate::code_space::{ChunkEvictionResult, ChunkResolution, CodeSpace};
 use crate::jit::{
-    JitCompileSnapshot, JitDirectCallPlan, JitDirectCallThisMode, JitDirectCallee, JitDirectMethod,
-    JitInlineCallee, JitInlineMethod, JitMethodGuard,
+    JitCompileSnapshot, JitDirectCallPlan, JitDirectCallThisMode, JitDirectCallee, JitInlineCallee,
+    JitMethodGuard, JitMethodInlineFields, JitMethodTarget,
 };
 use crate::native_abi::NativeFrameKind;
 use crate::object::FieldLocation;
@@ -40,8 +40,10 @@ fn linked_source(
         .expect("verified evictable source")
 }
 
-fn method(body: JitCompileSnapshot) -> JitInlineMethod {
-    JitInlineMethod {
+fn method(body: JitCompileSnapshot, call: bool, fields: bool) -> JitMethodTarget {
+    JitMethodTarget {
+        target_index: 0,
+        target_count: 1,
         guard: JitMethodGuard {
             method_fid: body.code_block.id,
             recv_shape: 0,
@@ -52,20 +54,9 @@ fn method(body: JitCompileSnapshot) -> JitInlineMethod {
             method_cell: 0,
             accessor_byte: None,
         },
-        body: Arc::new(body),
-        prop_fields: Default::default(),
-        prop_shapes: Default::default(),
-    }
-}
-
-fn direct_method(body: JitCompileSnapshot) -> JitDirectMethod {
-    let inline = method(body);
-    JitDirectMethod {
-        target_index: 0,
-        target_count: 1,
-        callee: JitDirectCallee {
+        callee: call.then_some(JitDirectCallee {
             plan: JitDirectCallPlan {
-                function_id: inline.body.code_block.id,
+                function_id: body.code_block.id,
                 code_object_id: 1,
                 entry_cell: 0,
                 tier: NativeFrameKind::Baseline,
@@ -75,9 +66,12 @@ fn direct_method(body: JitCompileSnapshot) -> JitDirectMethod {
                 callee_cell: 0,
             },
             receiver_allocation: None,
-        },
-        guard: inline.guard,
-        body: Some(inline.body),
+        }),
+        body: Some(Arc::new(body)),
+        inline_fields: fields.then_some(JitMethodInlineFields {
+            prop_fields: Default::default(),
+            prop_shapes: Default::default(),
+        }),
     }
 }
 
@@ -112,13 +106,16 @@ fn cancellation_sources_hold_payloads_until_release_and_reject_foreign_adoption(
         poly.code_block.id,
         direct.code_block.id,
     ];
-    // This source appears only on the direct-method body edge used by Graph's
-    // monomorphic/polymorphic method inliner, in its own reclaimable chunk.
-    poly.direct_methods.insert(0, vec![direct_method(direct)]);
+    // All capabilities use the one source edge: combined call/leaf, Graph-only,
+    // and a Template leaf with no ready call generation, in independent chunks.
+    poly.method_targets
+        .insert(0, vec![method(direct, true, true)]);
     nested_method
-        .inline_poly_methods
-        .insert(0, vec![method(poly)]);
-    plain.inline_methods.insert(0, method(nested_method));
+        .method_targets
+        .insert(0, vec![method(poly, true, false)]);
+    plain
+        .method_targets
+        .insert(0, vec![method(nested_method, false, true)]);
     root.inline_callees.insert(
         0,
         JitInlineCallee {

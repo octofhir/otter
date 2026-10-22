@@ -70,6 +70,10 @@ const OSR_ENTRY_TIER_MIN_ENTRIES: u64 = 16;
 #[path = "jit_compile_binding_tests.rs"]
 mod binding_tests;
 
+#[cfg(test)]
+#[path = "jit_method_targets_tests.rs"]
+mod method_target_tests;
+
 /// Internal result of one Template compiler invocation.
 ///
 /// Only [`TemplateCompileOutcome::Unsupported`] is stable enough to enter the
@@ -263,14 +267,36 @@ impl Interpreter {
             global_object_loads: u32::try_from(view.global_object_loads.len()).unwrap_or(u32::MAX),
             direct_callees: u32::try_from(view.direct_callees.len()).unwrap_or(u32::MAX),
             direct_constructs: u32::try_from(view.direct_constructs.len()).unwrap_or(u32::MAX),
-            direct_method_sites: u32::try_from(view.direct_methods.len()).unwrap_or(u32::MAX),
+            direct_method_sites: u32::try_from(
+                view.method_targets
+                    .values()
+                    .filter(|targets| targets.iter().any(|target| target.callee.is_some()))
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
             direct_method_targets: u32::try_from(
-                view.direct_methods.values().map(Vec::len).sum::<usize>(),
+                view.method_targets
+                    .values()
+                    .flatten()
+                    .filter(|target| target.callee.is_some())
+                    .count(),
             )
             .unwrap_or(u32::MAX),
             native_calls: u32::try_from(view.native_calls.len()).unwrap_or(u32::MAX),
             inline_callees: u32::try_from(view.inline_callees.len()).unwrap_or(u32::MAX),
-            inline_methods: u32::try_from(view.inline_methods.len()).unwrap_or(u32::MAX),
+            inline_methods: u32::try_from(
+                view.method_targets
+                    .values()
+                    .filter(|targets| {
+                        targets
+                            .iter()
+                            .filter(|target| target.inline_fields.is_some())
+                            .count()
+                            == 1
+                    })
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
         };
         self.push_reserved_jit_debug_event(event);
         self.record_property_cache_ir_sites(fid, tier, view);
@@ -1529,8 +1555,10 @@ impl Interpreter {
             for callee in view.inline_callees.values() {
                 collect(&callee.body, plans, depth + 1);
             }
-            for method in view.inline_methods.values() {
-                collect(&method.body, plans, depth + 1);
+            for method in view.method_targets.values().flatten() {
+                if let Some(body) = &method.body {
+                    collect(body, plans, depth + 1);
+                }
             }
         }
         let mut plans = rustc_hash::FxHashMap::default();
@@ -2713,8 +2741,9 @@ impl Interpreter {
     /// installed entry; it reaches its context through its SELF closure.
     /// Generated linkage binds
     /// both strict/lexical and unbound sloppy-global `this`; an explicitly bound
-    /// sloppy closure misses before entry. The emitter applies the final
-    /// pure-leaf / size / arity test to the separate monomorphic inline tables.
+    /// sloppy closure misses before entry. Each guarded method target owns one
+    /// body and its optional Template field proof; the emitter applies the final
+    /// pure-leaf, size and arity checks to that same carrier.
     pub(crate) fn bake_inline_callees(
         &mut self,
         view: &mut jit::JitCompileSnapshot,
@@ -3174,10 +3203,10 @@ impl Interpreter {
                 })
                 .collect();
         for snap in method_sites {
-            let mut direct_methods = Vec::with_capacity(snap.targets.len());
+            let mut method_targets = Vec::with_capacity(snap.targets.len());
             let target_count = u32::try_from(snap.targets.len()).unwrap_or(u32::MAX);
             for (target_index, target) in snap.targets.iter().enumerate() {
-                let (callee_function_id, outcome) = match self.bake_one_direct_method(
+                let (callee_function_id, outcome) = match self.bake_one_method_target(
                     context,
                     target,
                     u32::try_from(target_index).unwrap_or(u32::MAX),
@@ -3186,35 +3215,35 @@ impl Interpreter {
                     budget,
                     Some(snap.call_byte_pc),
                     view.call_frequencies.get(&snap.call_byte_pc).copied(),
+                    snap.accessor_byte,
                 ) {
-                    Ok(mut method) => {
-                        if snap.accessor_byte.is_some() {
-                            method.guard.accessor_byte = snap.accessor_byte;
-                            method.guard.slot_proven = false;
-                            method.guard.method_cell = 0;
-                            method.body = None;
-                        }
-                        let plan = method.callee.plan;
-                        direct_methods.push(method);
-                        (
-                            plan.function_id,
-                            jit_debug::JitDirectCallPlanOutcome::Available {
-                                code_object_id: plan.code_object_id,
-                                target_tier: match plan.tier {
-                                    native_abi::NativeFrameKind::Baseline => {
-                                        jit_debug::JitDebugTier::Template
-                                    }
-                                    native_abi::NativeFrameKind::Optimizing => {
-                                        jit_debug::JitDebugTier::Optimizing
-                                    }
-                                    native_abi::NativeFrameKind::Interpreter
-                                    | native_abi::NativeFrameKind::Host => {
-                                        jit_debug::JitDebugTier::Interpreter
-                                    }
-                                },
-                                this_mode: jit::JitDirectCallThisMode::MethodReceiver,
+                    Ok(method) => {
+                        let outcome = method.callee.map_or(
+                            jit_debug::JitDirectCallPlanOutcome::Rejected {
+                                reason: jit_debug::JitDirectCallRejectionReason::NoEntryGeneration,
                             },
-                        )
+                            |callee| {
+                                let plan = callee.plan;
+                                jit_debug::JitDirectCallPlanOutcome::Available {
+                                    code_object_id: plan.code_object_id,
+                                    target_tier: match plan.tier {
+                                        native_abi::NativeFrameKind::Baseline => {
+                                            jit_debug::JitDebugTier::Template
+                                        }
+                                        native_abi::NativeFrameKind::Optimizing => {
+                                            jit_debug::JitDebugTier::Optimizing
+                                        }
+                                        native_abi::NativeFrameKind::Interpreter
+                                        | native_abi::NativeFrameKind::Host => {
+                                            jit_debug::JitDebugTier::Interpreter
+                                        }
+                                    },
+                                    this_mode: jit::JitDirectCallThisMode::MethodReceiver,
+                                }
+                            },
+                        );
+                        method_targets.push(method);
+                        (target.method_fid, outcome)
                     }
                     Err(reason) => (
                         target.method_fid,
@@ -3232,50 +3261,9 @@ impl Interpreter {
                     outcome,
                 );
             }
-            if !direct_methods.is_empty() {
-                view.direct_methods
-                    .insert(snap.call_byte_pc, direct_methods);
-            }
-            if snap.accessor_byte.is_some() {
-                continue;
-            }
-            let mut baked: Vec<jit::JitInlineMethod> = Vec::new();
-            for target in &snap.targets {
-                // A body already baked for the direct call serves the leaf
-                // inliner too.
-                let body = view
-                    .direct_methods
-                    .get(&snap.call_byte_pc)
-                    .and_then(|methods| {
-                        methods
-                            .iter()
-                            .find(|method| method.guard.method_fid == target.method_fid)
-                    })
-                    .and_then(|method| method.body.clone());
-                if let Some(method) = self.bake_one_inline_method(
-                    context,
-                    target,
-                    body,
-                    tier,
-                    budget,
-                    snap.call_byte_pc,
-                ) {
-                    baked.push(method);
-                }
-            }
-            match baked.len() {
-                0 => {}
-                // A single inlinable target remains useful even when the site
-                // observed several shapes: other shapes miss its guard and
-                // side-exit before method lookup.
-                1 => {
-                    view.inline_methods
-                        .insert(snap.call_byte_pc, baked.pop().unwrap());
-                }
-                // Two or more: emit the guarded inline chain.
-                _ => {
-                    view.inline_poly_methods.insert(snap.call_byte_pc, baked);
-                }
+            if !method_targets.is_empty() {
+                view.method_targets
+                    .insert(snap.call_byte_pc, method_targets);
             }
         }
     }
@@ -3333,14 +3321,16 @@ impl Interpreter {
         )
     }
 
-    /// Bake one compiler-generated method call independently of leaf inlining.
+    /// Bake the guard, optional call plan and one body of an exact method target.
     ///
     /// Each bounded mono/poly feedback target reaches this helper independently.
-    /// The target must be an ordinary synchronous function with one
-    /// entry-capable native generation. Recursive entry resolves through the
-    /// same stable generation cell as every other generated call. The callee
-    /// reaches its context through the exact SELF closure.
-    fn bake_one_direct_method(
+    /// An entry-capable generation enables Graph inlining and generated calls;
+    /// Template field proofs can retain a body without that call plan. Every
+    /// body is prepared once: a refused Graph frequency/budget admission is not
+    /// retried as a second, frequency-free leaf request. Synthetic constructor
+    /// targets have no source call PC and retain only generated-call admission.
+    /// Accessors retain their guard and call plan without preparing a body.
+    fn bake_one_method_target(
         &mut self,
         context: &ExecutionContext,
         target: &PolyMethodTarget,
@@ -3350,7 +3340,8 @@ impl Interpreter {
         budget: &mut InlineSnapshotBudget,
         call_byte_pc: Option<u32>,
         site_frequency: Option<f32>,
-    ) -> Result<jit::JitDirectMethod, jit_debug::JitDirectCallRejectionReason> {
+        accessor_byte: Option<u32>,
+    ) -> Result<jit::JitMethodTarget, jit_debug::JitDirectCallRejectionReason> {
         let method_context = context
             .for_function(target.method_fid)
             .map_err(|_| jit_debug::JitDirectCallRejectionReason::MissingCallee)?;
@@ -3360,34 +3351,51 @@ impl Interpreter {
         if !method.admits_generated_call(jit::JitDirectCallKind::Method) {
             return Err(jit_debug::JitDirectCallRejectionReason::IneligibleFunction);
         }
-        let guard = self
+        let mut guard = self
             .bake_method_guard(target)
             .ok_or(jit_debug::JitDirectCallRejectionReason::MethodGuardUnavailable)?;
-        let mut plan = self
-            .current_direct_callee_plan(method)
-            .ok_or(jit_debug::JitDirectCallRejectionReason::NoEntryGeneration)?;
-        debug_assert_eq!(plan.function_id, target.method_fid);
-        plan.callee_cell = self.bake_callee_identity_cell();
-        // An optimizing caller may build the method in place of the call;
-        // one that reads its actual arguments needs a frame of its own.
-        let mut body = (tier == jit_debug::JitDebugTier::Optimizing
+        if accessor_byte.is_some() {
+            guard.accessor_byte = accessor_byte;
+            guard.slot_proven = false;
+            guard.method_cell = 0;
+        }
+        let callee = self.current_direct_callee_plan(method).map(|mut plan| {
+            debug_assert_eq!(plan.function_id, target.method_fid);
+            plan.callee_cell = self.bake_callee_identity_cell();
+            jit::JitDirectCallee {
+                plan,
+                receiver_allocation: None,
+            }
+        });
+        let template_body = call_byte_pc.is_some()
+            && accessor_byte.is_none()
             && !method.requires_argument_frame()
-            && method.admits_graph_inlining())
-        .then(|| {
+            && !method.makes_function;
+        if callee.is_none() && !template_body {
+            return Err(jit_debug::JitDirectCallRejectionReason::NoEntryGeneration);
+        }
+        let graph_body = tier == jit_debug::JitDebugTier::Optimizing
+            && accessor_byte.is_none()
+            && callee.is_some()
+            && !method.requires_argument_frame()
+            && method.admits_graph_inlining();
+        let mut body = if graph_body || template_body {
             self.bake_inline_body(
                 &method_context,
                 target.method_fid,
                 tier,
                 budget,
                 call_byte_pc,
-                site_frequency,
+                if graph_body { site_frequency } else { None },
                 None,
             )
-        })
-        .flatten();
+        } else {
+            None
+        };
         // A proven holder slot fixes the closure the body runs as, so the
         // body may read that closure's watched context slots as constants.
-        if let Some(closure) = self.proven_method(target)
+        if graph_body
+            && let Some(closure) = self.proven_method(target)
             && let Some(context) = closure
                 .as_closure(&self.gc_heap)
                 .map(|closure| closure.context(&self.gc_heap))
@@ -3396,15 +3404,25 @@ impl Interpreter {
             body.closure_constants = self.bake_closure_constants(context, &body.code_block);
             body.unique_closure_context = None;
         }
-        Ok(jit::JitDirectMethod {
+        let inline_fields = if template_body {
+            body.as_deref()
+                .and_then(|body| self.bake_method_inline_fields(&method_context, target, body))
+        } else {
+            None
+        };
+        if !graph_body && inline_fields.is_none() {
+            body = None;
+        }
+        if callee.is_none() && body.is_none() {
+            return Err(jit_debug::JitDirectCallRejectionReason::NoEntryGeneration);
+        }
+        Ok(jit::JitMethodTarget {
             target_index,
             target_count,
             guard,
-            callee: jit::JitDirectCallee {
-                plan,
-                receiver_allocation: None,
-            },
+            callee,
             body,
+            inline_fields,
         })
     }
 

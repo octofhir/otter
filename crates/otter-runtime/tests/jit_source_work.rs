@@ -197,16 +197,10 @@ impl CapturingCompiler {
             );
             snapshots.extend(
                 snapshot
-                    .inline_methods
-                    .values()
-                    .map(|method| method.body.as_ref()),
-            );
-            snapshots.extend(
-                snapshot
-                    .inline_poly_methods
+                    .method_targets
                     .values()
                     .flatten()
-                    .map(|method| method.body.as_ref()),
+                    .filter_map(|method| method.body.as_deref()),
             );
         }
         if let Some(identity) = &request.artifact_identity {

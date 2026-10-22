@@ -48,18 +48,7 @@ impl CompilationSources {
                     .map(|callee| callee.body.as_ref()),
             );
             pending.extend(
-                view.inline_methods
-                    .values()
-                    .map(|method| method.body.as_ref()),
-            );
-            pending.extend(
-                view.inline_poly_methods
-                    .values()
-                    .flatten()
-                    .map(|method| method.body.as_ref()),
-            );
-            pending.extend(
-                view.direct_methods
+                view.method_targets
                     .values()
                     .flatten()
                     .filter_map(|method| method.body.as_deref()),

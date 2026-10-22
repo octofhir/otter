@@ -19,7 +19,7 @@ use otter_vm::{
     JitArtifactBundle, JitArtifactFileName, JitCompileSnapshot, JitCompilerDiagnostic,
     JitDebugTarget, JitDebugTier, JitDirectCallKind, JitDirectCallLoweringOutcome,
     jit::{
-        JitDirectCallPlan, JitDirectCallThisMode, JitDirectCallee, JitDirectMethod, JitMethodGuard,
+        JitDirectCallPlan, JitDirectCallThisMode, JitDirectCallee, JitMethodGuard, JitMethodTarget,
         JitTestInstruction,
     },
     native_abi::{FUNCTION_CALL_NO_RECEIVER_CONVERSION, NativeFrameKind},
@@ -82,9 +82,9 @@ fn target(fid: u32, generation: u64, tier: NativeFrameKind) -> JitDirectCallee {
     }
 }
 
-fn method(index: u32, count: u32) -> JitDirectMethod {
+fn method(index: u32, count: u32) -> JitMethodTarget {
     let fid = 11 + index;
-    JitDirectMethod {
+    JitMethodTarget {
         target_index: index,
         target_count: count,
         guard: JitMethodGuard {
@@ -97,8 +97,13 @@ fn method(index: u32, count: u32) -> JitDirectMethod {
             method_cell: 0,
             accessor_byte: None,
         },
-        callee: target(fid, 91 + u64::from(index), NativeFrameKind::Baseline),
+        callee: Some(target(
+            fid,
+            91 + u64::from(index),
+            NativeFrameKind::Baseline,
+        )),
         body: None,
+        inline_fields: None,
     }
 }
 
@@ -347,12 +352,12 @@ fn plain_known_linkage_matches_diagnostic_and_call_artifacts() {
 fn monomorphic_method_known_linkage_matches_diagnostic_and_call_artifacts() {
     let mut view = view(true);
     let method = method(0, 1);
-    view.direct_methods
+    view.method_targets
         .insert(CALL_BYTE_PC, vec![method.clone()]);
     assert_generated(
         &compile(&view, true),
         JitDirectCallKind::Method,
-        &method.callee,
+        method.callee.as_ref().unwrap(),
         0,
         1,
     );
@@ -362,17 +367,36 @@ fn monomorphic_method_known_linkage_matches_diagnostic_and_call_artifacts() {
 fn polymorphic_method_known_linkage_matches_each_diagnostic_and_call_artifacts() {
     let mut view = view(true);
     let methods = vec![method(0, 2), method(1, 2)];
-    view.direct_methods.insert(CALL_BYTE_PC, methods.clone());
+    view.method_targets.insert(CALL_BYTE_PC, methods.clone());
     let output = compile(&view, true);
     for method in methods {
         assert_generated(
             &output,
             JitDirectCallKind::Method,
-            &method.callee,
+            method.callee.as_ref().unwrap(),
             method.target_index,
             method.target_count,
         );
     }
+}
+
+#[test]
+fn method_linkage_preserves_observed_index_past_targets_without_entries() {
+    let mut view = view(true);
+    let mut template_only = method(0, 2);
+    template_only.callee = None;
+    let linked = method(1, 2);
+    view.method_targets
+        .insert(CALL_BYTE_PC, vec![template_only, linked.clone()]);
+    let output = compile(&view, true);
+    assert_eq!(output.diagnostics.len(), 1);
+    assert_generated(
+        &output,
+        JitDirectCallKind::Method,
+        linked.callee.as_ref().unwrap(),
+        1,
+        2,
+    );
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -380,13 +404,13 @@ fn polymorphic_method_known_linkage_matches_each_diagnostic_and_call_artifacts()
 fn method_guard_chain_has_one_committed_resolver_after_all_known_edges() {
     let mut view = view(true);
     let methods = vec![method(0, 2), method(1, 2)];
-    view.direct_methods.insert(CALL_BYTE_PC, methods.clone());
+    view.method_targets.insert(CALL_BYTE_PC, methods.clone());
     let output = compile(&view, true);
     for method in &methods {
         assert_generated(
             &output,
             JitDirectCallKind::Method,
-            &method.callee,
+            method.callee.as_ref().unwrap(),
             method.target_index,
             2,
         );

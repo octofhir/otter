@@ -137,12 +137,11 @@ pub(crate) fn retained_source_work(
         .inline_callees
         .values()
         .map(|callee| &callee.body)
-        .chain(view.inline_methods.values().map(|method| &method.body))
         .chain(
-            view.inline_poly_methods
+            view.method_targets
                 .values()
                 .flatten()
-                .map(|method| &method.body),
+                .filter_map(|method| method.body.as_ref()),
         )
     {
         if spliced.contains(&body.code_block.id) {

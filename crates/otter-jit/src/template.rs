@@ -225,18 +225,21 @@ pub(crate) fn seed_direct_call_events(view: &JitCompileSnapshot) -> DirectCallEv
             },
         );
     }
-    for (&byte_pc, methods) in &view.direct_methods {
+    for (&byte_pc, methods) in &view.method_targets {
         let Some(instruction_pc) = instruction_pc(byte_pc) else {
             continue;
         };
         for method in methods {
+            let Some(callee) = method.callee.as_ref() else {
+                continue;
+            };
             events.insert(
                 (byte_pc, method.target_index),
                 otter_vm::JitCompilerDiagnostic::DirectCallLowered {
                     call_kind: otter_vm::JitDirectCallKind::Method,
                     instruction_pc,
                     byte_pc,
-                    callee_function_id: method.callee.plan.function_id,
+                    callee_function_id: callee.plan.function_id,
                     target_index: method.target_index,
                     target_count: method.target_count,
                     outcome: eliminated,

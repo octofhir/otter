@@ -20,7 +20,7 @@
 //!
 //! # See also
 //! - `crate::cache_ir::resolve_inherited_atom_data_slot` for the lookup.
-//! - `super::Interpreter::bake_one_direct_method` for the guard, plan and body.
+//! - `super::Interpreter::bake_one_method_target` for the guard, plan and body.
 
 use super::InlineSnapshotBudget;
 use crate::object::ShapeId;
@@ -56,7 +56,7 @@ impl Interpreter {
                 matches!(
                     instr.op(&view.code_block),
                     Op::LoadProperty | Op::CallMethodValue
-                ) && !view.direct_methods.contains_key(&instr.byte_pc)
+                ) && !view.method_targets.contains_key(&instr.byte_pc)
             })
             .filter_map(|instr| Some((instr.byte_pc, instr.const_index(&view.code_block, 2)?)))
             .collect();
@@ -68,7 +68,7 @@ impl Interpreter {
             })
             .collect();
         for (byte_pc, target) in targets {
-            if let Ok(method) = self.bake_one_direct_method(
+            if let Ok(method) = self.bake_one_method_target(
                 context,
                 &target,
                 0,
@@ -77,8 +77,9 @@ impl Interpreter {
                 budget,
                 None,
                 view.call_frequencies.get(&byte_pc).copied(),
+                None,
             ) {
-                view.direct_methods.insert(byte_pc, vec![method]);
+                view.method_targets.insert(byte_pc, vec![method]);
             }
         }
     }

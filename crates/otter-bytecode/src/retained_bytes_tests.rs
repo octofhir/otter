@@ -53,7 +53,8 @@ fn retained_module_counts_spare_rows_nested_strings_and_exception_capacity() {
     let scope_bytes =
         (scope.slots.capacity() * std::mem::size_of::<SlotDescriptor>() + name_capacity) as u64;
     assert_eq!(scope.retained_bytes(), scope_bytes);
-    let expected = function.name.capacity() as u64
+    let expected = function.code.retained_bytes()
+        + function.name.capacity() as u64
         + (function.handlers.capacity() * std::mem::size_of::<ExceptionHandler>()) as u64
         + (function.scopes.capacity() * std::mem::size_of::<ScopeDescriptor>()) as u64
         + scope_bytes;

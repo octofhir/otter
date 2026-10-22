@@ -2921,8 +2921,12 @@ impl BytecodeModule {
             (self.functions.capacity() as u64)
                 .saturating_mul(std::mem::size_of::<Function>() as u64),
         );
+        let mut wordcode_owners = rustc_hash::FxHashSet::default();
         for function in &self.functions {
             total = total.saturating_add(function.retained_bytes());
+            if !wordcode_owners.insert(function.code.storage_identity()) {
+                total = total.saturating_sub(function.code.retained_bytes());
+            }
         }
         if let Some(source) = &self.function_source {
             total = total.saturating_add(source.capacity() as u64);

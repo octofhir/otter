@@ -207,7 +207,7 @@ pub(crate) fn is_function_prototype_intrinsic_value(
 enum MethodOperands<'a> {
     Execution {
         function: &'a CodeBlock,
-        instruction: &'a CodeBlockInstruction,
+        instruction: CodeBlockInstruction<'a>,
     },
     #[cfg(test)]
     Decoded(crate::executable::OperandView<'a>),
@@ -451,7 +451,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         function: &CodeBlock,
-        instruction: &CodeBlockInstruction,
+        instruction: CodeBlockInstruction<'_>,
     ) -> Result<(), CommittedValueError> {
         self.do_call_method_value_inner(
             stack,

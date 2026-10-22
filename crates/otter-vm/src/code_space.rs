@@ -74,8 +74,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
+#[cfg(test)]
+use otter_bytecode::Op;
 use otter_bytecode::{
-    BytecodeModule, BytecodeRebaseError, BytecodeVerifyError, Constant, Op, VerifiedBytecodeModule,
+    BytecodeModule, BytecodeRebaseError, BytecodeVerifyError, Constant, VerifiedBytecodeModule,
 };
 use otter_resource::{ResourceAccount, ResourceClass, ResourceError, ResourceLease};
 
@@ -110,27 +112,39 @@ impl ChunkPayload {
     }
 }
 
-/// One immutable admitted module allocation and its inseparable lease: the
-/// function table executable code is built from, function by function.
-/// Snapshots share this owner without retaining mutable donor execution state.
+/// Immutable admitted function/proof table with its metadata lease.
+/// Each FunctionCode owns its own shared arrays and physical lease, independently
+/// of this table. Snapshots share both without mutable donor execution state.
 #[derive(Debug)]
 pub(crate) struct LinkedBytecode {
     verified: VerifiedBytecodeModule,
+    wordcode_bytes: u64,
     _lease: ResourceLease,
 }
 
 impl LinkedBytecode {
     pub(crate) fn new(
-        verified: VerifiedBytecodeModule,
+        mut verified: VerifiedBytecodeModule,
         account: &ResourceAccount,
     ) -> Result<Arc<Self>, ResourceError> {
-        let bytes =
-            (std::mem::size_of::<Self>() as u64).saturating_add(verified.module().retained_bytes());
+        let wordcode_bytes = verified.admit_wordcode(account)?;
+        let bytes = (std::mem::size_of::<Self>() as u64).saturating_add(
+            verified
+                .module()
+                .retained_bytes()
+                .saturating_sub(wordcode_bytes),
+        );
         let lease = account.reserve_exact(ResourceClass::SourceModuleBytes, bytes)?;
         Ok(Arc::new(Self {
             verified,
+            wordcode_bytes,
             _lease: lease,
         }))
+    }
+
+    /// Metadata owned here plus the immutable body owners this table retains.
+    fn retained_bytes(&self) -> u64 {
+        self._lease.amount().saturating_add(self.wordcode_bytes)
     }
 
     /// The admitted module with its per-function proofs.
@@ -444,12 +458,7 @@ fn ensure_property_ic_capacity(
             function
                 .code
                 .iter()
-                .filter(|instruction| {
-                    matches!(
-                        instruction.op,
-                        Op::LoadProperty | Op::StoreProperty | Op::CallMethodValue
-                    )
-                })
+                .filter(|instruction| crate::executable::has_property_ic_site(instruction.op))
                 .count()
         })
         .try_fold(0usize, usize::checked_add)
@@ -495,7 +504,7 @@ fn build_chunk(
     let metadata_bytes = payload_metadata_bytes(&atoms);
     retained_lease.resize(metadata_bytes)?;
     let retained_bytes = metadata_bytes
-        .saturating_add(module._lease.amount())
+        .saturating_add(module.retained_bytes())
         .saturating_add(executable.retained_bytes());
     // Retained-bytes admission: a rejected budget declines the link before
     // publication and the rejection is visible on the ledger.

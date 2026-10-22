@@ -1,8 +1,8 @@
 //! Authoritative compiler/wire wordcode storage and mutable construction.
 //!
 //! Compiler and linker code build one [`FunctionCode`] through
-//! [`FunctionCodeBuilder`]. The VM verifies and translates that frozen product
-//! once into its execution-specific layout; decoded operand DTOs are reserved
+//! [`FunctionCodeBuilder`]. The VM verifies and admits that frozen product
+//! into its shared execution body; decoded operand DTOs are reserved
 //! for cold serialization tooling.
 //!
 //! # Contents
@@ -18,16 +18,54 @@
 //! - Frozen bodies use one canonical storage form: inline padding is zero and
 //!   overflow ranges are dense, ordered, and wholly in bounds.
 //! - Instruction position is the only logical PC; records carry no PC field.
-//! - A frozen [`FunctionCode`] is the canonical compiler, wire, and debug
-//!   representation, not a required interpreter memory layout.
+//! - A frozen [`FunctionCode`] is the canonical compiler, wire, debug and VM
+//!   execution representation, shared without an instruction copy.
+//! - Cloning a frozen body shares its arrays and its physical resource lease.
+//!   Mutable builders always own separate arrays; admission never changes words.
 //!
 //! # See also
 //! - [`crate::opcode_schema`]
 //! - [`crate::encoding`]
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::sync::Arc;
+
+#[path = "wordcode_storage.rs"]
+mod storage;
+use storage::Storage;
 
 use crate::{Op, Operand, opcode_schema};
+
+/// Static work charge for one executed opcode.
+///
+/// Prepared into the immutable instruction header by every wordcode producer.
+#[must_use]
+pub const fn work_units(op: Op) -> u8 {
+    match op {
+        Op::Call
+        | Op::TailCall
+        | Op::CallWithThis
+        | Op::CallForwardArguments
+        | Op::CallMethodValue
+        | Op::CallSpread
+        | Op::New
+        | Op::NewSpread
+        | Op::SuperConstructSpread
+        | Op::Await
+        | Op::Yield => 8,
+        Op::LoadProperty
+        | Op::StoreProperty
+        | Op::LoadElement
+        | Op::StoreElement
+        | Op::HasProperty
+        | Op::HasNamedProperty
+        | Op::DeleteProperty
+        | Op::GetIterator
+        | Op::IteratorNext => 4,
+        Op::Eval => 16,
+        _ => 1,
+    }
+}
 
 /// Operand words stored directly in the common instruction record.
 pub const INLINE_OPERAND_WORDS: usize = 4;
@@ -39,6 +77,8 @@ pub struct Instruction {
     /// Opcode identity; operand formats come from its schema row.
     pub op: Op,
     operand_count: u8,
+    #[serde(skip)]
+    work_units: u8,
     inline_operand_words: [u32; INLINE_OPERAND_WORDS],
     overflow_operand_offset: u32,
 }
@@ -57,6 +97,7 @@ impl Instruction {
         Self {
             op,
             operand_count,
+            work_units: work_units(op),
             inline_operand_words,
             overflow_operand_offset,
         }
@@ -89,6 +130,22 @@ impl Instruction {
         self.overflow_operand_offset == NO_OVERFLOW_OPERANDS
     }
 
+    /// Static metering weight, prepared once with the opcode.
+    #[inline]
+    #[must_use]
+    pub const fn work_units(self) -> u8 {
+        self.work_units
+    }
+
+    /// A word of an instruction whose verified shape has at most four words.
+    #[inline]
+    #[must_use]
+    pub const fn inline_word(&self, index: usize) -> u32 {
+        debug_assert!(index < self.operand_count as usize);
+        debug_assert!(self.operand_count as usize <= INLINE_OPERAND_WORDS);
+        self.inline_operand_words[index]
+    }
+
     fn operand_word(self, overflow: &[u32], index: usize) -> Option<u32> {
         if index >= self.operand_count() {
             return None;
@@ -101,11 +158,30 @@ impl Instruction {
     }
 }
 
-/// Frozen authoritative compiler/wire wordcode for one function.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+/// Frozen compiler and execution wordcode with one physical shared owner.
+#[derive(Debug, Clone, Default)]
 pub struct FunctionCode {
-    instructions: Box<[Instruction]>,
-    overflow_operand_words: Box<[u32]>,
+    storage: Arc<Storage>,
+}
+
+impl PartialEq for FunctionCode {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw_parts() == other.raw_parts()
+    }
+}
+impl Eq for FunctionCode {}
+
+impl Serialize for FunctionCode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("FunctionCode", 2)?;
+        state.serialize_field("instructions", &self.storage.instructions)?;
+        state.serialize_field(
+            "overflow_operand_words",
+            &self.storage.overflow_operand_words,
+        )?;
+        state.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for FunctionCode {
@@ -119,11 +195,12 @@ impl<'de> Deserialize<'de> for FunctionCode {
             overflow_operand_words: Box<[u32]>,
         }
 
-        let serialized = SerializedFunctionCode::deserialize(deserializer)?;
-        let code = Self {
-            instructions: serialized.instructions,
-            overflow_operand_words: serialized.overflow_operand_words,
-        };
+        let mut serialized = SerializedFunctionCode::deserialize(deserializer)?;
+        for instruction in &mut serialized.instructions {
+            instruction.work_units = work_units(instruction.op);
+        }
+        let code =
+            Self::from_frozen_parts(serialized.instructions, serialized.overflow_operand_words);
         crate::encoding::verify_wordcode_function(&code).map_err(serde::de::Error::custom)?;
         Ok(code)
     }
@@ -135,48 +212,95 @@ impl FunctionCode {
         instructions: Vec<Instruction>,
         overflow_operand_words: Vec<u32>,
     ) -> Self {
+        Self::from_frozen_parts(
+            instructions.into_boxed_slice(),
+            overflow_operand_words.into_boxed_slice(),
+        )
+    }
+
+    fn from_frozen_parts(
+        instructions: Box<[Instruction]>,
+        overflow_operand_words: Box<[u32]>,
+    ) -> Self {
         Self {
-            instructions: instructions.into_boxed_slice(),
-            overflow_operand_words: overflow_operand_words.into_boxed_slice(),
+            storage: Arc::new(Storage::new(instructions, overflow_operand_words)),
+        }
+    }
+
+    /// Admit the immutable physical owner before executable publication.
+    /// Existing admitted clones share the same lease, including across snapshots.
+    /// Unadmitted aliases detach before admission so a refused publication cannot
+    /// attach a charge to an externally retained compiler DTO.
+    ///
+    /// # Errors
+    /// Returns the original resource refusal before an owner is published.
+    pub fn admit_storage(
+        &mut self,
+        account: &otter_resource::ResourceAccount,
+    ) -> Result<(), otter_resource::ResourceError> {
+        Storage::admit(&mut self.storage, account)
+    }
+
+    pub(crate) fn storage_identity(&self) -> usize {
+        Arc::as_ptr(&self.storage) as usize
+    }
+
+    /// Whether two immutable bodies have exactly the same physical owner.
+    #[must_use]
+    pub fn shares_storage(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.storage, &other.storage)
+    }
+
+    /// Verified operand words, with no decoded operand materialization.
+    #[must_use]
+    pub fn operand_words<'a>(&'a self, instruction: &'a Instruction) -> &'a [u32] {
+        let count = instruction.operand_count();
+        if instruction.operands_are_inline() {
+            &instruction.inline_operand_words[..count]
+        } else {
+            let start = instruction.overflow_operand_offset as usize;
+            &self.storage.overflow_operand_words[start..start + count]
         }
     }
 
     /// The two arrays a flat encoding stores.
     pub(crate) fn raw_parts(&self) -> (&[Instruction], &[u32]) {
-        (&self.instructions, &self.overflow_operand_words)
+        (
+            &self.storage.instructions,
+            &self.storage.overflow_operand_words,
+        )
     }
 
     /// Heap bytes this body retains for its owner's lifetime: the fixed
-    /// instruction records plus the overflow operand words. Saturating, so a
+    /// instruction records, overflow words and shared-owner header. Saturating, so a
     /// saturated total still exceeds any real budget and fails admission
     /// closed.
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
-        (std::mem::size_of_val::<[Instruction]>(&self.instructions) as u64)
-            .saturating_add(std::mem::size_of_val::<[u32]>(&self.overflow_operand_words) as u64)
+        self.storage.retained_bytes()
     }
 
     /// Number of logical instructions.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.instructions.len()
+        self.storage.instructions.len()
     }
 
     /// Whether the body contains no instructions.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.instructions.is_empty()
+        self.storage.instructions.is_empty()
     }
 
     /// Iterate in canonical logical-PC order.
     pub fn iter(&self) -> std::slice::Iter<'_, Instruction> {
-        self.instructions.iter()
+        self.storage.instructions.iter()
     }
 
     /// Instruction at one logical PC.
     #[must_use]
     pub fn get(&self, pc: usize) -> Option<&Instruction> {
-        self.instructions.get(pc)
+        self.storage.instructions.get(pc)
     }
 
     /// Borrow schema-typed operands for an instruction owned by this body.
@@ -191,7 +315,7 @@ impl FunctionCode {
     /// Decode one operand.
     #[must_use]
     pub fn operand(&self, instruction: &Instruction, index: usize) -> Option<Operand> {
-        let word = instruction.operand_word(&self.overflow_operand_words, index)?;
+        let word = instruction.operand_word(&self.storage.overflow_operand_words, index)?;
         let kind = opcode_schema::operand_kind_at(instruction.op, index)?;
         opcode_schema::decode_operand_word(kind, word)
     }
@@ -200,8 +324,8 @@ impl FunctionCode {
     #[must_use]
     pub fn to_builder(&self) -> FunctionCodeBuilder {
         FunctionCodeBuilder {
-            instructions: self.instructions.to_vec(),
-            overflow_operand_words: self.overflow_operand_words.to_vec(),
+            instructions: self.storage.instructions.to_vec(),
+            overflow_operand_words: self.storage.overflow_operand_words.to_vec(),
         }
     }
 }
@@ -210,7 +334,7 @@ impl std::ops::Index<usize> for FunctionCode {
     type Output = Instruction;
 
     fn index(&self, index: usize) -> &Self::Output {
-        &self.instructions[index]
+        &self.storage.instructions[index]
     }
 }
 
@@ -310,6 +434,7 @@ impl FunctionCodeBuilder {
         Instruction {
             op,
             operand_count,
+            work_units: work_units(op),
             inline_operand_words,
             overflow_operand_offset,
         }
@@ -408,19 +533,16 @@ impl FunctionCodeBuilder {
     /// Freeze the sole execution product.
     #[must_use]
     pub fn finish(self) -> FunctionCode {
-        FunctionCode {
-            instructions: self.instructions.into_boxed_slice(),
-            overflow_operand_words: self.overflow_operand_words.into_boxed_slice(),
-        }
+        FunctionCode::from_raw_parts(self.instructions, self.overflow_operand_words)
     }
 
     /// [`Self::finish`] into an exactly sized copy, leaving this builder
     /// empty with its capacity, for the next function to emit into.
     pub fn take_code(&mut self) -> FunctionCode {
-        let code = FunctionCode {
-            instructions: self.instructions.as_slice().into(),
-            overflow_operand_words: self.overflow_operand_words.as_slice().into(),
-        };
+        let code = FunctionCode::from_frozen_parts(
+            self.instructions.as_slice().into(),
+            self.overflow_operand_words.as_slice().into(),
+        );
         self.instructions.clear();
         self.overflow_operand_words.clear();
         code

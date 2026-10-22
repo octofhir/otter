@@ -160,12 +160,12 @@ fn is_numeric_sub_sort_comparator_function(
         return false;
     }
 
-    let lhs_local = context.exec_imm32(&code[0], 1);
-    let rhs_local = context.exec_imm32(&code[1], 1);
-    let lhs_load_local = context.exec_imm32(&code[2], 1);
-    let rhs_load_local = context.exec_imm32(&code[3], 1);
-    if context.exec_register(&code[0], 0) != Some(0)
-        || context.exec_register(&code[1], 0) != Some(1)
+    let lhs_local = context.exec_imm32(code.get(0).expect("matched callback body"), 1);
+    let rhs_local = context.exec_imm32(code.get(1).expect("matched callback body"), 1);
+    let lhs_load_local = context.exec_imm32(code.get(2).expect("matched callback body"), 1);
+    let rhs_load_local = context.exec_imm32(code.get(3).expect("matched callback body"), 1);
+    if context.exec_register(code.get(0).expect("matched callback body"), 0) != Some(0)
+        || context.exec_register(code.get(1).expect("matched callback body"), 0) != Some(1)
         || lhs_local != lhs_load_local
         || rhs_local != rhs_load_local
         || lhs_local == rhs_local
@@ -173,21 +173,21 @@ fn is_numeric_sub_sort_comparator_function(
         return false;
     }
 
-    let lhs_loaded = context.exec_register(&code[2], 0);
-    let rhs_loaded = context.exec_register(&code[3], 0);
-    let lhs_prim = context.exec_register(&code[4], 0);
-    let rhs_prim = context.exec_register(&code[6], 0);
-    let lhs_num = context.exec_register(&code[5], 0);
-    let rhs_num = context.exec_register(&code[7], 0);
-    let sub_dst = context.exec_register(&code[8], 0);
+    let lhs_loaded = context.exec_register(code.get(2).expect("matched callback body"), 0);
+    let rhs_loaded = context.exec_register(code.get(3).expect("matched callback body"), 0);
+    let lhs_prim = context.exec_register(code.get(4).expect("matched callback body"), 0);
+    let rhs_prim = context.exec_register(code.get(6).expect("matched callback body"), 0);
+    let lhs_num = context.exec_register(code.get(5).expect("matched callback body"), 0);
+    let rhs_num = context.exec_register(code.get(7).expect("matched callback body"), 0);
+    let sub_dst = context.exec_register(code.get(8).expect("matched callback body"), 0);
 
-    context.exec_register(&code[4], 1) == lhs_loaded
-        && context.exec_register(&code[5], 1) == lhs_prim
-        && context.exec_register(&code[6], 1) == rhs_loaded
-        && context.exec_register(&code[7], 1) == rhs_prim
-        && context.exec_register(&code[8], 1) == lhs_num
-        && context.exec_register(&code[8], 2) == rhs_num
-        && context.exec_register(&code[9], 0) == sub_dst
+    context.exec_register(code.get(4).expect("matched callback body"), 1) == lhs_loaded
+        && context.exec_register(code.get(5).expect("matched callback body"), 1) == lhs_prim
+        && context.exec_register(code.get(6).expect("matched callback body"), 1) == rhs_loaded
+        && context.exec_register(code.get(7).expect("matched callback body"), 1) == rhs_prim
+        && context.exec_register(code.get(8).expect("matched callback body"), 1) == lhs_num
+        && context.exec_register(code.get(8).expect("matched callback body"), 2) == rhs_num
+        && context.exec_register(code.get(9).expect("matched callback body"), 0) == sub_dst
 }
 
 fn array_callback_function_id(heap: &otter_gc::GcHeap, callback: Value) -> Option<u32> {
@@ -245,30 +245,30 @@ fn match_map_mul_add_callback(
     {
         return None;
     }
-    let local = context.exec_imm32(&code[0], 1)?;
-    if context.exec_register(&code[0], 0) != Some(0)
-        || context.exec_imm32(&code[1], 1) != Some(local)
+    let local = context.exec_imm32(code.get(0).expect("matched callback body"), 1)?;
+    if context.exec_register(code.get(0).expect("matched callback body"), 0) != Some(0)
+        || context.exec_imm32(code.get(1).expect("matched callback body"), 1) != Some(local)
     {
         return None;
     }
-    let loaded = context.exec_register(&code[1], 0)?;
-    let mul_const = context.exec_register(&code[2], 0)?;
-    let primitive = context.exec_register(&code[3], 0)?;
-    let numeric = context.exec_register(&code[4], 0)?;
-    let mul_dst = context.exec_register(&code[5], 0)?;
-    let add_const = context.exec_register(&code[6], 0)?;
-    let add_dst = context.exec_register(&code[7], 0)?;
-    if context.exec_register(&code[3], 1) == Some(loaded)
-        && context.exec_register(&code[4], 1) == Some(primitive)
-        && context.exec_register(&code[5], 1) == Some(numeric)
-        && context.exec_register(&code[5], 2) == Some(mul_const)
-        && context.exec_register(&code[7], 1) == Some(mul_dst)
-        && context.exec_register(&code[7], 2) == Some(add_const)
-        && context.exec_register(&code[8], 0) == Some(add_dst)
+    let loaded = context.exec_register(code.get(1).expect("matched callback body"), 0)?;
+    let mul_const = context.exec_register(code.get(2).expect("matched callback body"), 0)?;
+    let primitive = context.exec_register(code.get(3).expect("matched callback body"), 0)?;
+    let numeric = context.exec_register(code.get(4).expect("matched callback body"), 0)?;
+    let mul_dst = context.exec_register(code.get(5).expect("matched callback body"), 0)?;
+    let add_const = context.exec_register(code.get(6).expect("matched callback body"), 0)?;
+    let add_dst = context.exec_register(code.get(7).expect("matched callback body"), 0)?;
+    if context.exec_register(code.get(3).expect("matched callback body"), 1) == Some(loaded)
+        && context.exec_register(code.get(4).expect("matched callback body"), 1) == Some(primitive)
+        && context.exec_register(code.get(5).expect("matched callback body"), 1) == Some(numeric)
+        && context.exec_register(code.get(5).expect("matched callback body"), 2) == Some(mul_const)
+        && context.exec_register(code.get(7).expect("matched callback body"), 1) == Some(mul_dst)
+        && context.exec_register(code.get(7).expect("matched callback body"), 2) == Some(add_const)
+        && context.exec_register(code.get(8).expect("matched callback body"), 0) == Some(add_dst)
     {
         Some(ArrayCallbackFastPath::MapMulAdd {
-            mul: f64::from(context.exec_imm32(&code[2], 1)?),
-            add: f64::from(context.exec_imm32(&code[6], 1)?),
+            mul: f64::from(context.exec_imm32(code.get(2).expect("matched callback body"), 1)?),
+            add: f64::from(context.exec_imm32(code.get(6).expect("matched callback body"), 1)?),
         })
     } else {
         None
@@ -295,30 +295,31 @@ fn match_filter_rem_eq_zero_callback(
     {
         return None;
     }
-    let local = context.exec_imm32(&code[0], 1)?;
-    if context.exec_register(&code[0], 0) != Some(0)
-        || context.exec_imm32(&code[1], 1) != Some(local)
+    let local = context.exec_imm32(code.get(0).expect("matched callback body"), 1)?;
+    if context.exec_register(code.get(0).expect("matched callback body"), 0) != Some(0)
+        || context.exec_imm32(code.get(1).expect("matched callback body"), 1) != Some(local)
     {
         return None;
     }
-    let loaded = context.exec_register(&code[1], 0)?;
-    let divisor_reg = context.exec_register(&code[2], 0)?;
-    let primitive = context.exec_register(&code[3], 0)?;
-    let numeric = context.exec_register(&code[4], 0)?;
-    let rem_dst = context.exec_register(&code[5], 0)?;
-    let zero_reg = context.exec_register(&code[6], 0)?;
-    let eq_dst = context.exec_register(&code[7], 0)?;
-    if context.exec_register(&code[3], 1) == Some(loaded)
-        && context.exec_register(&code[4], 1) == Some(primitive)
-        && context.exec_register(&code[5], 1) == Some(numeric)
-        && context.exec_register(&code[5], 2) == Some(divisor_reg)
-        && context.exec_imm32(&code[6], 1) == Some(0)
-        && context.exec_register(&code[7], 1) == Some(rem_dst)
-        && context.exec_register(&code[7], 2) == Some(zero_reg)
-        && context.exec_register(&code[8], 0) == Some(eq_dst)
+    let loaded = context.exec_register(code.get(1).expect("matched callback body"), 0)?;
+    let divisor_reg = context.exec_register(code.get(2).expect("matched callback body"), 0)?;
+    let primitive = context.exec_register(code.get(3).expect("matched callback body"), 0)?;
+    let numeric = context.exec_register(code.get(4).expect("matched callback body"), 0)?;
+    let rem_dst = context.exec_register(code.get(5).expect("matched callback body"), 0)?;
+    let zero_reg = context.exec_register(code.get(6).expect("matched callback body"), 0)?;
+    let eq_dst = context.exec_register(code.get(7).expect("matched callback body"), 0)?;
+    if context.exec_register(code.get(3).expect("matched callback body"), 1) == Some(loaded)
+        && context.exec_register(code.get(4).expect("matched callback body"), 1) == Some(primitive)
+        && context.exec_register(code.get(5).expect("matched callback body"), 1) == Some(numeric)
+        && context.exec_register(code.get(5).expect("matched callback body"), 2)
+            == Some(divisor_reg)
+        && context.exec_imm32(code.get(6).expect("matched callback body"), 1) == Some(0)
+        && context.exec_register(code.get(7).expect("matched callback body"), 1) == Some(rem_dst)
+        && context.exec_register(code.get(7).expect("matched callback body"), 2) == Some(zero_reg)
+        && context.exec_register(code.get(8).expect("matched callback body"), 0) == Some(eq_dst)
     {
         Some(ArrayCallbackFastPath::FilterRemEqZero {
-            divisor: f64::from(context.exec_imm32(&code[2], 1)?),
+            divisor: f64::from(context.exec_imm32(code.get(2).expect("matched callback body"), 1)?),
         })
     } else {
         None
@@ -344,23 +345,23 @@ fn match_reduce_add_callback(
     {
         return None;
     }
-    let lhs_local = context.exec_imm32(&code[0], 1)?;
-    let rhs_local = context.exec_imm32(&code[1], 1)?;
-    let lhs_loaded = context.exec_register(&code[2], 0)?;
-    let rhs_loaded = context.exec_register(&code[3], 0)?;
-    let lhs_prim = context.exec_register(&code[4], 0)?;
-    let rhs_prim = context.exec_register(&code[5], 0)?;
-    let add_dst = context.exec_register(&code[6], 0)?;
-    if context.exec_register(&code[0], 0) == Some(0)
-        && context.exec_register(&code[1], 0) == Some(1)
-        && context.exec_imm32(&code[2], 1) == Some(lhs_local)
-        && context.exec_imm32(&code[3], 1) == Some(rhs_local)
+    let lhs_local = context.exec_imm32(code.get(0).expect("matched callback body"), 1)?;
+    let rhs_local = context.exec_imm32(code.get(1).expect("matched callback body"), 1)?;
+    let lhs_loaded = context.exec_register(code.get(2).expect("matched callback body"), 0)?;
+    let rhs_loaded = context.exec_register(code.get(3).expect("matched callback body"), 0)?;
+    let lhs_prim = context.exec_register(code.get(4).expect("matched callback body"), 0)?;
+    let rhs_prim = context.exec_register(code.get(5).expect("matched callback body"), 0)?;
+    let add_dst = context.exec_register(code.get(6).expect("matched callback body"), 0)?;
+    if context.exec_register(code.get(0).expect("matched callback body"), 0) == Some(0)
+        && context.exec_register(code.get(1).expect("matched callback body"), 0) == Some(1)
+        && context.exec_imm32(code.get(2).expect("matched callback body"), 1) == Some(lhs_local)
+        && context.exec_imm32(code.get(3).expect("matched callback body"), 1) == Some(rhs_local)
         && lhs_local != rhs_local
-        && context.exec_register(&code[4], 1) == Some(lhs_loaded)
-        && context.exec_register(&code[5], 1) == Some(rhs_loaded)
-        && context.exec_register(&code[6], 1) == Some(lhs_prim)
-        && context.exec_register(&code[6], 2) == Some(rhs_prim)
-        && context.exec_register(&code[7], 0) == Some(add_dst)
+        && context.exec_register(code.get(4).expect("matched callback body"), 1) == Some(lhs_loaded)
+        && context.exec_register(code.get(5).expect("matched callback body"), 1) == Some(rhs_loaded)
+        && context.exec_register(code.get(6).expect("matched callback body"), 1) == Some(lhs_prim)
+        && context.exec_register(code.get(6).expect("matched callback body"), 2) == Some(rhs_prim)
+        && context.exec_register(code.get(7).expect("matched callback body"), 0) == Some(add_dst)
     {
         Some(ArrayCallbackFastPath::ReduceAdd)
     } else {

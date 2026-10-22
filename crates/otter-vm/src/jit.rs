@@ -2538,7 +2538,7 @@ impl JitCompileSnapshot {
 impl JitInstructionMetadata {
     /// Resolve this overlay entry against its authoritative CodeBlock.
     #[must_use]
-    pub fn resolve<'a>(&self, code_block: &'a CodeBlock) -> &'a CodeBlockInstruction {
+    pub fn resolve<'a>(&self, code_block: &'a CodeBlock) -> CodeBlockInstruction<'a> {
         code_block
             .instr_at_index(self.instruction_index as usize)
             .expect("JIT metadata instruction index belongs to its CodeBlock")

@@ -10,6 +10,7 @@ description = "Otter foundation bytecode container, opcode set, disassembler, an
 workspace = true
 
 [dependencies]
+otter-resource = { path = "../otter-resource" }
 rustc-hash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -12,7 +12,7 @@
 //! - [`WorkBudgetStats`] — aggregate counters exposed for diagnostics.
 //! - [`WorkBudgetTelemetry`] — the shareable cell an embedder reads the
 //!   counters from without owning the isolate.
-//! - Static work-charge helpers for the interpreter dispatch loop.
+//! - Budget checks consume the static charge baked in canonical wordcode.
 //!
 //! # Invariants
 //! - Budget DTOs are owned, copyable data; no VM handles cross the boundary.
@@ -30,7 +30,10 @@
 //! - [`crate::Interpreter`]
 //! - [`crate::VmError`]
 
+#[cfg(test)]
 use otter_bytecode::Op;
+#[cfg(test)]
+use otter_bytecode::wordcode::work_units as opcode_work_units;
 use otter_gc::GcHeap;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
@@ -377,38 +380,6 @@ impl RuntimeHeapSnapshot {
                 .saturating_add(stats.minor_gc_cycles.saturating_mul(64))
                 .saturating_add(stats.minor_slots_scanned),
         }
-    }
-}
-
-/// Static work charge for one executed opcode.
-///
-/// The interpreter never evaluates this at dispatch time: the charge is baked
-/// into every execution record when its owning `CodeBlock` is built.
-#[must_use]
-pub(crate) const fn opcode_work_units(op: Op) -> u8 {
-    match op {
-        Op::Call
-        | Op::TailCall
-        | Op::CallWithThis
-        | Op::CallForwardArguments
-        | Op::CallMethodValue
-        | Op::CallSpread
-        | Op::New
-        | Op::NewSpread
-        | Op::SuperConstructSpread
-        | Op::Await
-        | Op::Yield => 8,
-        Op::LoadProperty
-        | Op::StoreProperty
-        | Op::LoadElement
-        | Op::StoreElement
-        | Op::HasProperty
-        | Op::HasNamedProperty
-        | Op::DeleteProperty
-        | Op::GetIterator
-        | Op::IteratorNext => 4,
-        Op::Eval => 16,
-        _ => 1,
     }
 }
 

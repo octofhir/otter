@@ -24,8 +24,9 @@
 //!   the allocation.
 //! - An object stored into another object is elided only with that object;
 //!   one escaping escapes everything stored into it.
-//! - The analysis decides everything before the graph changes: the field
-//!   walk repeats until no object escapes during it, and only then rewrites.
+//! - Graph owns merge phis from creation; speculative phis stay unplaced
+//!   and are truncated when a walk retries. Stores, uses and frame states
+//!   change only after escape analysis converges.
 //! - Fields that differ between the predecessors of a merge meet in a phi of
 //!   their common representation; a merge where an object's hidden class
 //!   differs, or where the representations differ, keeps the allocation.
@@ -75,8 +76,8 @@ struct Rewrite {
     /// A method read from a code-retained cell, which no longer takes the
     /// receiver.
     cell_reads: FxHashMap<NodeId, u64>,
-    /// Phis made at merges, with their block, inputs and representation.
-    phis: Vec<(BlockId, NodeId, SmallVec<[NodeId; 2]>, Repr)>,
+    /// Graph-owned merge phis, placed only after the walk succeeds.
+    phis: Vec<(BlockId, NodeId)>,
     /// The candidates' objects each node's eager state names.
     snapshots: FxHashMap<NodeId, State>,
 }
@@ -115,8 +116,10 @@ pub(crate) fn eliminate_allocations(
         if candidates.is_empty() {
             return;
         }
+        let nodes_before = graph.nodes.len();
         match walk(graph, layout, view, inline_views, &candidates, undefined) {
             Walk::Escaped(escaped) => {
+                graph.nodes.truncate(nodes_before);
                 for node in escaped {
                     candidates.remove(&node);
                 }
@@ -133,7 +136,7 @@ pub(crate) fn eliminate_allocations(
 fn escape_by_use(graph: &Graph, layout: &[BlockId], candidates: &mut FxHashSet<NodeId>) {
     let mut escaped = FxHashSet::default();
     let all = candidates.clone();
-    let mut named = StateCandidates::new(graph, &all);
+    let mut named = StateCandidates::new(&all);
     for &block in layout {
         let data = graph.block(block);
         for &node in data
@@ -149,7 +152,7 @@ fn escape_by_use(graph: &Graph, layout: &[BlockId], candidates: &mut FxHashSet<N
                 }
             }
             if let Some(state) = node_data.lazy {
-                escaped.extend(named.of(state));
+                escaped.extend(named.of(graph, state));
             }
         }
     }
@@ -260,27 +263,25 @@ fn chain_values(graph: &Graph, state: FrameStateId) -> SmallVec<[NodeId; 16]> {
 /// The candidates each frame state's chain names, computed once per state:
 /// a state names its own values' candidates and its caller's.
 struct StateCandidates<'g> {
-    graph: &'g Graph,
     candidates: &'g FxHashSet<NodeId>,
     named: FxHashMap<FrameStateId, SmallVec<[NodeId; 2]>>,
 }
 
 impl<'g> StateCandidates<'g> {
-    fn new(graph: &'g Graph, candidates: &'g FxHashSet<NodeId>) -> Self {
+    fn new(candidates: &'g FxHashSet<NodeId>) -> Self {
         Self {
-            graph,
             candidates,
             named: FxHashMap::default(),
         }
     }
 
-    fn of(&mut self, state: FrameStateId) -> SmallVec<[NodeId; 2]> {
+    fn of(&mut self, graph: &Graph, state: FrameStateId) -> SmallVec<[NodeId; 2]> {
         if let Some(named) = self.named.get(&state) {
             return named.clone();
         }
-        let data = self.graph.frame_state(state);
+        let data = graph.frame_state(state);
         let mut named = match &data.caller {
-            Some(caller) => self.of(caller.state),
+            Some(caller) => self.of(graph, caller.state),
             None => SmallVec::new(),
         };
         let own = data
@@ -304,7 +305,7 @@ impl<'g> StateCandidates<'g> {
 
 /// Track every candidate's hidden class and fields in layout order.
 fn walk(
-    graph: &Graph,
+    graph: &mut Graph,
     layout: &[BlockId],
     view: &JitCompileSnapshot,
     inline_views: &[std::sync::Arc<JitCompileSnapshot>],
@@ -314,16 +315,14 @@ fn walk(
     let mut escaped = FxHashSet::default();
     let mut rewrite = Rewrite::default();
     let mut exits: FxHashMap<BlockId, State> = FxHashMap::default();
-    let mut named_by = StateCandidates::new(graph, candidates);
-    let mut next_phi = graph.nodes.len() as u32;
+    let mut named_by = StateCandidates::new(candidates);
     for &block in layout {
         let mut state = match entry_state(graph, block, &exits, &mut escaped) {
             Some(Entry::State(state)) => state,
             Some(Entry::Merge(mut state, merges)) => {
                 for (candidate, slot, inputs, repr) in merges {
-                    let phi = NodeId(next_phi);
-                    next_phi += 1;
-                    rewrite.phis.push((block, phi, inputs, repr));
+                    let phi = graph.add_node(Kind::Phi, &inputs, repr);
+                    rewrite.phis.push((block, phi));
                     if let Some(object) = state.get_mut(&candidate) {
                         object.fields[slot] = phi;
                     }
@@ -338,7 +337,7 @@ fn walk(
             let node_data = graph.node(node).clone();
             if let Some(eager) = node_data.eager {
                 let named: State = named_by
-                    .of(eager)
+                    .of(graph, eager)
                     .into_iter()
                     .filter_map(|value| {
                         let object = state.get(&value).cloned();
@@ -671,12 +670,10 @@ fn receiver_program(
 
 /// Rewrite the graph as `rewrite` decided.
 fn apply(graph: &mut Graph, layout: &[BlockId], candidates: &FxHashSet<NodeId>, rewrite: Rewrite) {
-    // Merge phis, numbered from the first node id the walk saw free.
-    for (block, expected, inputs, repr) in &rewrite.phis {
-        let phi = graph.add_node(Kind::Phi, inputs, *repr);
-        debug_assert_eq!(phi, *expected);
-        graph.node_mut(phi).block = Some(*block);
-        graph.block_mut(*block).phis.push(phi);
+    // Phis already have one owner in Graph; publication only places them.
+    for &(block, phi) in &rewrite.phis {
+        graph.node_mut(phi).block = Some(block);
+        graph.block_mut(block).phis.push(phi);
     }
     let resolve = |replace: &FxHashMap<NodeId, NodeId>, mut value: NodeId| {
         while let Some(&next) = replace.get(&value) {

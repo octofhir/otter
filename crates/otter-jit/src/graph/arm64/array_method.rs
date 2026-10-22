@@ -22,7 +22,8 @@
 //! - The Array's dense length, its slab's length and its `length` move
 //!   together, as the VM's own append and truncation do.
 //! - Storage shared with a literal boilerplate reports no capacity, so an
-//!   append grows it into private storage and clears the shared mark; a
+//!   append reserves at least `length + 1` words before copying the full
+//!   prefix into private storage and clearing the shared mark; a
 //!   removal from it completes in the builtin, which copies it out.
 //!
 //! # See also
@@ -94,6 +95,10 @@ impl Codegen<'_> {
             // Double the capacity, and at least four words.
             ; lsl W(base), w16, #1
             ; mov w17, #4
+            ; cmp W(base), w17
+            ; csel W(base), W(base), w17, hs
+            // Shared storage reports capacity zero but retains its prefix.
+            ; add w17, WSP(length), #1
             ; cmp W(base), w17
             ; csel W(base), W(base), w17, hs
         );

@@ -1044,9 +1044,10 @@ impl FeedbackVector {
     pub(crate) fn allocation_bytes(ops: impl IntoIterator<Item = Op>) -> u64 {
         ops.into_iter().fold(0u64, |bytes, op| {
             let payload = match op {
-                Op::LoadProperty | Op::StoreProperty | Op::StorePropertyStrict => {
-                    std::mem::size_of::<PropertyIcSlot>()
-                }
+                Op::LoadProperty
+                | Op::HasNamedProperty
+                | Op::StoreProperty
+                | Op::StorePropertyStrict => std::mem::size_of::<PropertyIcSlot>(),
                 Op::CallMethodValue => {
                     std::mem::size_of::<PropertyIcSlot>()
                         + std::mem::size_of::<AtomicCallFeedback>()

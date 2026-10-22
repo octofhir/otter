@@ -31,6 +31,8 @@ use serde_json::json;
 mod reentrant_allocations;
 use reentrant_allocations::AllocationFixture;
 
+#[path = "allocation_probe/census.rs"]
+mod census;
 #[path = "allocation_probe/script.rs"]
 mod script;
 

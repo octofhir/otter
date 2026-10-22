@@ -1,13 +1,13 @@
 //! Independent execution state for captured code.
 //!
 //! # Contents
-//! Copy admitted code and metadata while creating empty advisory feedback.
+//! Share immutable admitted wordcode while recreating isolate-owned metadata.
 //!
 //! # Invariants
 //! Function IDs, instruction coordinates and control flow remain identical.
 //! No IC shape, validity cell, observation or source-work total crosses an isolate boundary.
-//! The admitted instruction stream is copied without parsing or revalidation.
-//! Each fresh body, function table and source-work cell admits its own physical
+//! The admitted instruction stream and its physical lease stay shared.
+//! Each fresh metadata body, function table and source-work cell admits its own physical
 //! lease on the supplied account; refusal drops the unpublished copy in full.
 //!
 //! # See also
@@ -62,8 +62,8 @@ impl ExecutableModule {
 
 impl CodeBlock {
     fn fresh_isolate_copy(&self, account: &ResourceAccount) -> Result<Self, ResourceError> {
-        // Fixed execution arrays have equal physical size in a fresh copy;
-        // advisory feedback is recreated at the same declared slot geometry.
+        // Immutable words keep their existing owner and charge. Only local
+        // identity tables and advisory feedback are allocated on this account.
         let mut lease =
             account.reserve_exact(ResourceClass::SourceModuleBytes, self._lease.amount())?;
         let mapped_argument_bindings =
@@ -73,9 +73,7 @@ impl CodeBlock {
             self.scopes.iter().map(|scope| scope.descriptor()),
             &mut lease,
         )?;
-        let code = allocation::try_copy(&self.code, &mut lease)?;
-        let overflow_operand_words =
-            allocation::try_copy(&self.overflow_operand_words, &mut lease)?;
+        let code = self.code.fresh_copy(&mut lease)?;
         let control_flow = self.control_flow.fresh_copy(&mut lease)?;
         let feedback = crate::feedback::FeedbackVector::for_instruction_ops(
             self.code.iter().map(|instruction| self.op(instruction)),
@@ -110,7 +108,6 @@ impl CodeBlock {
             contains_direct_eval: self.contains_direct_eval,
             primordial_iteration: self.primordial_iteration,
             code,
-            overflow_operand_words,
             bytecode_byte_len: self.bytecode_byte_len,
             control_flow,
             feedback,
@@ -143,6 +140,13 @@ mod tests {
         let fresh = source
             .fresh_isolate_copy(&ResourceAccount::default())
             .unwrap();
+        assert!(
+            source
+                .code
+                .wordcode()
+                .shares_storage(snapshot.code_block.code.wordcode())
+        );
+        assert!(source.code.wordcode().shares_storage(fresh.code.wordcode()));
         assert!(!Arc::ptr_eq(source.source_work(), fresh.source_work()));
         assert_eq!(fresh.source_work().total(), 0);
         fresh.source_work().charge(11);

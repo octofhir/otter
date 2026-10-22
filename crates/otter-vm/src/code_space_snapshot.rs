@@ -110,7 +110,7 @@ impl CodeSpaceSnapshot {
                     let metadata_bytes = payload_metadata_bytes(&atoms);
                     retained_lease.resize(metadata_bytes)?;
                     let retained_bytes = metadata_bytes
-                        .saturating_add(captured.module._lease.amount())
+                        .saturating_add(captured.module.retained_bytes())
                         .saturating_add(executable.retained_bytes());
                     Ok(Arc::new(ChunkPayload {
                         module: Arc::clone(&captured.module),

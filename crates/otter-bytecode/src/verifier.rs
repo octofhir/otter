@@ -203,6 +203,27 @@ impl VerifiedBytecodeModule {
         Ok(Self::unproven(module, function_base, true))
     }
 
+    /// Attach physical leases to immutable wordcode without changing proof facts.
+    /// Each shared body owns its charge independently of this module table.
+    pub fn admit_wordcode(
+        &mut self,
+        account: &otter_resource::ResourceAccount,
+    ) -> Result<u64, otter_resource::ResourceError> {
+        for function in &mut self.module.functions {
+            function.code.admit_storage(account)?;
+        }
+        let mut owners = rustc_hash::FxHashSet::default();
+        let bytes = self
+            .module
+            .functions
+            .iter()
+            .filter(|f| owners.insert(f.code.storage_identity()))
+            .fold(0u64, |bytes, f| {
+                bytes.saturating_add(f.code.retained_bytes())
+            });
+        Ok(bytes)
+    }
+
     /// Immutable access to the admitted module DTO.
     #[must_use]
     pub const fn module(&self) -> &BytecodeModule {

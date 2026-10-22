@@ -470,7 +470,7 @@ impl ExecutionContext {
     #[must_use]
     pub(crate) fn exec_operand(
         &self,
-        instr: &CodeBlockInstruction,
+        instr: CodeBlockInstruction<'_>,
         index: usize,
     ) -> Option<Operand> {
         self.exec_function(instr.code_block_id())?
@@ -479,7 +479,11 @@ impl ExecutionContext {
 
     /// Decode one register operand.
     #[must_use]
-    pub(crate) fn exec_register(&self, instr: &CodeBlockInstruction, index: usize) -> Option<u16> {
+    pub(crate) fn exec_register(
+        &self,
+        instr: CodeBlockInstruction<'_>,
+        index: usize,
+    ) -> Option<u16> {
         match self.exec_operand(instr, index) {
             Some(Operand::Register(value)) => Some(value),
             _ => None,
@@ -490,7 +494,7 @@ impl ExecutionContext {
     #[must_use]
     pub(crate) fn exec_const_index(
         &self,
-        instr: &CodeBlockInstruction,
+        instr: CodeBlockInstruction<'_>,
         index: usize,
     ) -> Option<u32> {
         match self.exec_operand(instr, index) {
@@ -501,7 +505,7 @@ impl ExecutionContext {
 
     /// Decode one signed immediate operand.
     #[must_use]
-    pub(crate) fn exec_imm32(&self, instr: &CodeBlockInstruction, index: usize) -> Option<i32> {
+    pub(crate) fn exec_imm32(&self, instr: CodeBlockInstruction<'_>, index: usize) -> Option<i32> {
         match self.exec_operand(instr, index) {
             Some(Operand::Imm32(value)) => Some(value),
             _ => None,

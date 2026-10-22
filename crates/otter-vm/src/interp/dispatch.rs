@@ -102,7 +102,7 @@ impl Interpreter {
         function: &CodeBlock,
         function_id: u32,
         idx: usize,
-        instr: &CodeBlockInstruction,
+        instr: CodeBlockInstruction<'_>,
     ) -> Result<(), VmError> {
         let function_name = context
             .function(function_id)

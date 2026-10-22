@@ -29,7 +29,7 @@ use crate::{executable::OperandView, operand_decode::register_operand};
 
 /// Operand source shared by variadic call and construct argument windows.
 ///
-/// The interpreter dispatch path owns a verified dense execution record, so
+/// The interpreter dispatch path borrows verified canonical wordcode, so
 /// it can read typed words without rebuilding and decoding
 /// [`otter_bytecode::Operand`] values.
 /// Focused malformed-operand tests retain the decoded view.
@@ -37,7 +37,7 @@ use crate::{executable::OperandView, operand_decode::register_operand};
 pub(crate) enum ArgumentOperands<'code> {
     Execution {
         function: &'code CodeBlock,
-        instruction: &'code CodeBlockInstruction,
+        instruction: CodeBlockInstruction<'code>,
     },
     #[cfg(test)]
     Decoded(OperandView<'code>),
@@ -48,7 +48,7 @@ impl<'code> ArgumentOperands<'code> {
     #[must_use]
     pub(crate) const fn execution(
         function: &'code CodeBlock,
-        instruction: &'code CodeBlockInstruction,
+        instruction: CodeBlockInstruction<'code>,
     ) -> Self {
         Self::Execution {
             function,

@@ -454,7 +454,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         caller: *mut crate::Frame,
         function: &CodeBlock,
-        instruction: &crate::CodeBlockInstruction,
+        instruction: crate::CodeBlockInstruction<'_>,
     ) -> Result<(), VmError> {
         self.do_call_inner(
             stack,
@@ -503,7 +503,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         function: &CodeBlock,
-        instruction: &crate::CodeBlockInstruction,
+        instruction: crate::CodeBlockInstruction<'_>,
     ) -> Result<(), VmError> {
         let top_idx = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
         let frame = &stack[top_idx];
@@ -590,7 +590,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         function: &CodeBlock,
-        instruction: &crate::CodeBlockInstruction,
+        instruction: crate::CodeBlockInstruction<'_>,
     ) -> Result<(), VmError> {
         self.do_construct_inner(stack, ArgumentOperands::execution(function, instruction))
     }
@@ -628,7 +628,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         function: &CodeBlock,
-        instruction: &crate::CodeBlockInstruction,
+        instruction: crate::CodeBlockInstruction<'_>,
     ) -> Result<(), VmError> {
         let operands = ArgumentOperands::execution(function, instruction);
         let dst = operands.register(0)?;
@@ -733,7 +733,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         function: &CodeBlock,
-        instruction: &crate::CodeBlockInstruction,
+        instruction: crate::CodeBlockInstruction<'_>,
     ) -> Result<(), VmError> {
         let operands = ArgumentOperands::execution(function, instruction);
         let dst = operands.register(0)?;
@@ -1063,7 +1063,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         function: &CodeBlock,
-        instruction: &crate::CodeBlockInstruction,
+        instruction: crate::CodeBlockInstruction<'_>,
     ) -> Result<(), CommittedValueError> {
         let dst = function
             .register(instruction, 0)

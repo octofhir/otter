@@ -85,11 +85,20 @@ fn captured_code_shares_compiler_but_not_donor_execution_and_restores_independen
     let old_payload = Arc::downgrade(&original);
     let old_executable = Arc::downgrade(&original.executable);
     let old_atoms = Arc::downgrade(&original.atoms);
-    let compiler_bytes = original.module._lease.amount();
+    let compiler_bytes = original.module.retained_bytes();
     let snapshot = donor.capture(&capture_account).unwrap();
     let captured = snapshot.chunks[0].payload.as_ref().unwrap();
     assert!(Arc::ptr_eq(&captured.module, &original.module));
     assert!(!Arc::ptr_eq(&captured.executable, &original.executable));
+    assert!(
+        captured
+            .executable
+            .function(0)
+            .unwrap()
+            .code
+            .wordcode()
+            .shares_storage(&original.module.functions[0].code)
+    );
     assert_eq!(
         captured
             .executable
@@ -276,8 +285,9 @@ fn escaped_code_block_and_native_source_work_keep_their_individual_physical_leas
         .unwrap();
     let block = context.executable_module().function_arc(0).unwrap();
     let work = Arc::clone(block.source_work());
-    let block_bytes =
-        std::mem::size_of::<crate::executable::CodeBlock>() as u64 + block.retained_bytes();
+    let block_bytes = std::mem::size_of::<crate::executable::CodeBlock>() as u64
+        + block.retained_bytes()
+        + block.code.wordcode().retained_bytes();
     let work_bytes = work.retained_bytes();
     let address = work.native_address();
     drop(context);

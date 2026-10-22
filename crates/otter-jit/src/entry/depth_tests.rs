@@ -140,9 +140,17 @@ fn compile(view: &JitCompileSnapshot, table: &TransitionTable) -> Vec<Box<dyn Ji
     vec![
         Box::new(crate::template::compile(view, 11, table).unwrap()),
         Box::new(
-            crate::graph::compile_optimized(view, 12, table, None, None, false)
-                .unwrap()
-                .code,
+            crate::graph::compile_optimized(
+                view,
+                12,
+                table,
+                None,
+                None,
+                false,
+                &Default::default(),
+            )
+            .unwrap()
+            .code,
         ),
     ]
 }

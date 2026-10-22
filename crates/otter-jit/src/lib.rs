@@ -73,7 +73,7 @@ pub use measurement::{
     JitCompilerMeasurement, JitCompilerProbe, JitMeasurementTier, MeasuredCompilation,
     MeasuredValidation,
 };
-pub use optimizing::{OptimizedCode, compile_optimized};
+pub use optimizing::{CompileFailure, OptimizedCode, compile_optimized};
 pub use template::{TemplateCode, compile};
 
 /// Native-tier policy selected by the embedding runtime.
@@ -223,6 +223,9 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
         &self,
         request: otter_vm::JitCompileRequest,
     ) -> Result<otter_vm::JitCompileStatus, otter_vm::JitCompileError> {
+        if request.cancellation.is_cancelled() {
+            return Ok(otter_vm::JitCompileStatus::Cancelled);
+        }
         if self.policy == JitTierPolicy::TemplateOnly {
             return Ok(otter_vm::JitCompileStatus::Unavailable);
         }
@@ -249,15 +252,15 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             request.osr_pc,
             artifact_request,
             request.debug.events_enabled(),
+            &request.cancellation,
         );
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let compiled: Result<artifact::NativeCompileOutput<OptimizedCode>, Unsupported> = {
+        let compiled: Result<artifact::NativeCompileOutput<OptimizedCode>, CompileFailure> = {
             let _ = artifact_request;
-            Err(Unsupported::OperandShape(
-                "optimizing compiler target is unavailable",
-            ))
+            Err(Unsupported::OperandShape("optimizing compiler target is unavailable").into())
         };
         match compiled {
+            _ if request.cancellation.is_cancelled() => Ok(otter_vm::JitCompileStatus::Cancelled),
             Ok(output) => Ok(otter_vm::JitCompileStatus::Compiled {
                 code: std::sync::Arc::new(output.code),
                 required_cells: output.required_cells,
@@ -265,9 +268,12 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
                 diagnostics: output.diagnostics,
                 ir_node_count: output.ir_node_count,
             }),
-            Err(reason) => Ok(otter_vm::JitCompileStatus::Unsupported {
-                reason: format!("function {fid} not in optimizing subset: {reason:?}"),
-            }),
+            Err(CompileFailure::Cancelled) => Ok(otter_vm::JitCompileStatus::Cancelled),
+            Err(CompileFailure::Unsupported(reason)) => {
+                Ok(otter_vm::JitCompileStatus::Unsupported {
+                    reason: format!("function {fid} not in optimizing subset: {reason:?}"),
+                })
+            }
         }
     }
 }

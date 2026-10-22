@@ -1,14 +1,15 @@
 //! Finalized code objects and the entry point of the optimizing tier.
 //!
-//! The graph tier compiles every function it is asked for: an instruction
-//! without a specialized form runs its baseline operation, and one that cannot
-//! run in optimized code leaves through a deopt. Only a target without the
-//! graph tier's code generator returns [`Unsupported`].
+//! An instruction without a specialized form runs its baseline operation, and
+//! one that cannot run in optimized code leaves through a deopt. Metadata or
+//! backend limits return [`CompileFailure::Unsupported`]. Cancellation stops
+//! compilation at a whole-phase boundary without publishing its output.
 //!
 //! # Contents
 //! - [`compile_optimized`] — the optimizing compilation entry point.
 //! - [`OptimizedCode`] — executable code plus deopt and safepoint metadata.
 //! - [`OptimizedMetadata`] — deterministic identity and allocation figures.
+//! - [`CompileFailure`] — unsupported compilation and cooperative cancellation.
 //!
 //! # Invariants
 //! - Both entry forms initialize and publish the complete tagged home region;
@@ -39,12 +40,39 @@
 use std::collections::BTreeSet;
 
 use otter_vm::{
-    JitCompileSnapshot, JitFunctionCode,
+    JitCompileCancellation, JitCompileSnapshot, JitFunctionCode,
     deopt::DeoptTable,
     native_abi::{CodeDependency, CodeObjectMetadata, SafepointRecord},
 };
 
 use crate::{CompiledCode, Unsupported};
+
+/// Why optimizing compilation produced no installable output.
+#[derive(Debug)]
+pub enum CompileFailure {
+    /// The snapshot or selected backend cannot produce optimized code.
+    Unsupported(Unsupported),
+    /// The request owner cancelled compilation at a whole-phase boundary.
+    Cancelled,
+}
+
+impl From<Unsupported> for CompileFailure {
+    fn from(reason: Unsupported) -> Self {
+        Self::Unsupported(reason)
+    }
+}
+
+/// Stop before the next whole phase; cancellation never denotes unsupported
+/// source and never publishes a partly completed compilation.
+pub(crate) fn check_cancellation(
+    cancellation: &JitCompileCancellation,
+) -> Result<(), CompileFailure> {
+    if cancellation.is_cancelled() {
+        Err(CompileFailure::Cancelled)
+    } else {
+        Ok(())
+    }
+}
 
 /// Deterministic metadata for one optimized compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,10 +310,20 @@ pub fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     osr_pc: Option<u32>,
-) -> Result<OptimizedCode, Unsupported> {
+    cancellation: &JitCompileCancellation,
+) -> Result<OptimizedCode, CompileFailure> {
+    check_cancellation(cancellation)?;
     let transitions = crate::entry::TransitionTable::resolve();
-    crate::graph::compile_optimized(view, code_object_id, &transitions, osr_pc, None, false)
-        .map(|output| output.code)
+    crate::graph::compile_optimized(
+        view,
+        code_object_id,
+        &transitions,
+        osr_pc,
+        None,
+        false,
+        cancellation,
+    )
+    .map(|output| output.code)
 }
 
 /// A target without the optimizing tier's code generator.
@@ -294,11 +332,11 @@ pub fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     osr_pc: Option<u32>,
-) -> Result<OptimizedCode, Unsupported> {
+    cancellation: &JitCompileCancellation,
+) -> Result<OptimizedCode, CompileFailure> {
+    check_cancellation(cancellation)?;
     let _ = (view, code_object_id, osr_pc);
-    Err(Unsupported::OperandShape(
-        "optimizing compiler target is unavailable",
-    ))
+    Err(Unsupported::OperandShape("optimizing compiler target is unavailable").into())
 }
 
 #[cfg(test)]
@@ -371,7 +409,7 @@ mod tests {
             JitTestInstruction::new(Op::ReturnValue, 1, 29, vec![Operand::Register(1)]),
         ];
         let view = JitCompileSnapshot::without_feedback(17, 1, 2, instructions);
-        let result = compile_optimized(&view, 91, None);
+        let result = compile_optimized(&view, 91, None, &Default::default());
         assert_eq!(
             result.is_ok(),
             cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))

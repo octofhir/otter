@@ -48,8 +48,15 @@ fn native_osr_consumes_live_loop_values_and_restores_the_prior_interpreter_roots
         ],
     );
     seed(&mut view, &[1, 2], ARITH_INT32);
-    let compiled =
-        crate::graph::compile(&view, 8011, &TransitionTable::resolve(), Some(1), true).unwrap();
+    let compiled = crate::graph::compile(
+        &view,
+        8011,
+        &TransitionTable::resolve(),
+        Some(1),
+        true,
+        &Default::default(),
+    )
+    .unwrap();
     assert!(compiled.built.osr_entry.is_some());
     let end = compiled
         .emission

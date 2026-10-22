@@ -797,7 +797,8 @@ impl Interpreter {
     /// waits for the tier policy's independent interpreted retraining boundary.
     /// Another tier can remain installed for the same function; the registry
     /// alone decides whether that exact map owner stays current. A compilation
-    /// of an affected function still in flight is dropped when it finishes.
+    /// of an affected function is cancelled before dispatch or at its next
+    /// compiler phase boundary, retaining its owners until terminal ACK.
     pub(crate) fn discard_invalidated_jit_state(&mut self, affected: &[u32]) {
         if affected.is_empty() {
             return;
@@ -1342,6 +1343,7 @@ mod tests {
         fid: u32,
         tier: crate::tier_policy::CostedTier,
     ) {
+        vm.code_space = Arc::clone(context.space());
         let decision = vm
             .jit_tier_work_decision(
                 context,
@@ -1674,6 +1676,7 @@ mod tests {
     struct SingleHeaderOptimizingHook {
         requests: AtomicUsize,
         decline_replacement: bool,
+        spliced: Box<[u32]>,
         /// Held by a test that asserts a compile is still in flight; a
         /// compiler thread waits on it before it compiles.
         release: std::sync::Mutex<()>,
@@ -1695,8 +1698,9 @@ mod tests {
             &self,
             request: jit::JitCompileRequest,
         ) -> Result<jit::JitCompileStatus, jit::JitCompileError> {
+            let invocation = self.requests.fetch_add(1, Ordering::Relaxed);
             drop(self.release.lock());
-            if self.requests.fetch_add(1, Ordering::Relaxed) != 0 && self.decline_replacement {
+            if invocation != 0 && self.decline_replacement {
                 return Ok(jit::JitCompileStatus::Unavailable);
             }
             let code = SelectiveInvalidationCode {
@@ -1706,7 +1710,7 @@ mod tests {
                     osr_entries: Arc::from([request.osr_pc.unwrap()]),
                 },
                 tier: native_abi::NativeFrameKind::Optimizing,
-                spliced: Box::default(),
+                spliced: self.spliced.clone(),
                 dependencies: Box::default(),
             };
             Ok(jit::JitCompileStatus::Compiled {
@@ -1726,6 +1730,7 @@ mod tests {
         let hook = Arc::new(SingleHeaderOptimizingHook {
             requests: AtomicUsize::new(0),
             decline_replacement: false,
+            spliced: Box::default(),
             release: std::sync::Mutex::new(()),
         });
         vm.jit_hook = Some(hook.clone());
@@ -1756,14 +1761,21 @@ mod tests {
     }
 
     #[test]
-    fn compiler_thread_result_installs_at_a_tier_decision_unless_invalidated() {
+    fn cancellation_rejects_active_and_completed_results_without_caching_a_decline() {
         let (context, headers) = multi_loop_context(1);
-        for invalidate in [false, true] {
+        for cancel_at in [None, Some("active"), Some("completed"), Some("bad-splice")] {
             let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
+            vm.set_jit_debug_request(crate::JitDebugRequest::events());
+            vm.code_eviction_trigger_bytes = u64::MAX;
             vm.set_jit_compiler_threads(1);
             let hook = Arc::new(SingleHeaderOptimizingHook {
                 requests: AtomicUsize::new(0),
                 decline_replacement: false,
+                spliced: if cancel_at == Some("bad-splice") {
+                    Box::new([u32::MAX])
+                } else {
+                    Box::default()
+                },
                 release: std::sync::Mutex::new(()),
             });
             vm.jit_hook = Some(hook.clone());
@@ -1785,22 +1797,76 @@ mod tests {
                     .is_none(),
                 "one compilation in flight per function"
             );
-            if invalidate {
+            while hook.requests.load(Ordering::Relaxed) == 0 {
+                std::thread::yield_now();
+            }
+            if cancel_at == Some("active") {
                 vm.discard_invalidated_jit_state(&[0]);
             }
             drop(in_flight);
             while !vm.jit_compile_queue.has_finished() {
                 std::thread::yield_now();
             }
+            if cancel_at == Some("completed") {
+                vm.discard_invalidated_jit_state(&[0]);
+                vm.jit_compile_queue.mark_cancelled_for_reclamation_retry();
+            }
             vm.install_finished_optimized_compiles();
             assert!(!vm.jit_compile_queue.is_pending(0));
             assert_eq!(hook.requests.load(Ordering::Relaxed), 1);
-            if invalidate {
+            assert_eq!(vm.jit_runtime_stats.compile_attempts, 1);
+            assert_eq!(
+                vm.optimizing_tier_policy
+                    .compile_attempts(0, crate::tier_policy::CostedTier::Optimizing),
+                1,
+                "a current root pays for entered work even when a splice is refused"
+            );
+            assert_eq!(
+                vm.code_eviction_trigger_bytes,
+                if cancel_at == Some("completed") {
+                    vm.code_eviction_high_water_bytes
+                } else {
+                    u64::MAX
+                },
+                "only pressure-marked terminal ACKs re-arm reclamation"
+            );
+            if cancel_at.is_some() {
                 assert!(
                     !vm.jit_optimized_code.contains_key(&0),
                     "code compiled from an invalidated snapshot is dropped"
                 );
-                assert!(!vm.jit_optimized_declined_epoch.contains_key(&0));
+                if cancel_at == Some("bad-splice") {
+                    assert_eq!(
+                        vm.jit_optimized_declined_epoch.get(&0),
+                        Some(&vm.code_space.feedback_epoch(0))
+                    );
+                    assert!(
+                        vm.resolve_optimized_osr_code(&context, 0, headers[0])
+                            .is_none()
+                    );
+                    assert_eq!(
+                        hook.requests.load(Ordering::Relaxed),
+                        1,
+                        "an invalid compiled source cannot create a same-feedback compile storm"
+                    );
+                    let report = vm.take_jit_debug_report().unwrap();
+                    assert!(report.events().iter().any(|event| matches!(
+                        event,
+                        crate::JitDebugEvent::CompileFinished {
+                            outcome: crate::JitDebugCompileOutcome::Compiled { .. },
+                            ..
+                        }
+                    )));
+                    assert!(report.events().iter().any(|event| matches!(
+                        event,
+                        crate::JitDebugEvent::InstallDeclined {
+                            reason: crate::JitInstallDeclineReason::InvalidCode,
+                            ..
+                        }
+                    )));
+                } else {
+                    assert!(!vm.jit_optimized_declined_epoch.contains_key(&0));
+                }
             } else {
                 let code = vm.jit_optimized_code[&0].clone().unwrap();
                 assert!(vm.jit_code_registry.is_current_for_entry(code.as_ref()));
@@ -1820,6 +1886,7 @@ mod tests {
             let hook = Arc::new(SingleHeaderOptimizingHook {
                 requests: AtomicUsize::new(0),
                 decline_replacement,
+                spliced: Box::default(),
                 release: std::sync::Mutex::new(()),
             });
             vm.jit_hook = Some(hook.clone());

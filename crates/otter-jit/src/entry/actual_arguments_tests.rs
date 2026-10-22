@@ -170,7 +170,10 @@ fn actual_only_known_and_generic_entries_initialize_missing_formals() {
         let codes = {
             let mut codes = codes;
             codes.push((
-                Box::new(crate::optimizing::compile_optimized(&snapshot, 2, None).unwrap()),
+                Box::new(
+                    crate::optimizing::compile_optimized(&snapshot, 2, None, &Default::default())
+                        .unwrap(),
+                ),
                 otter_vm::native_abi::CODE_ENTRY_HAS_SAFEPOINTS
                     | otter_vm::native_abi::CODE_ENTRY_OPTIMIZING_TIER,
             ));

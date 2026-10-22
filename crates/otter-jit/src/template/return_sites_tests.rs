@@ -150,9 +150,16 @@ fn captured_callable_entry_matches_retained_emission_for_template_and_graph() {
                 (Box::new(output.code), output.artifact.unwrap())
             }
             JitDebugTier::Optimizing => {
-                let output =
-                    crate::graph::compile_optimized(&view, 42, &transitions, None, request, false)
-                        .expect("complete Graph body");
+                let output = crate::graph::compile_optimized(
+                    &view,
+                    42,
+                    &transitions,
+                    None,
+                    request,
+                    false,
+                    &Default::default(),
+                )
+                .expect("complete Graph body");
                 (Box::new(output.code), output.artifact.unwrap())
             }
             JitDebugTier::Interpreter => unreachable!("native compiler tiers only"),

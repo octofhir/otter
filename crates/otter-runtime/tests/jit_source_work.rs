@@ -265,6 +265,7 @@ impl CapturingCompiler {
             Ok(JitCompileStatus::Compiled { artifact, .. }) => {
                 format!("compiled; artifact={}", artifact.is_some())
             }
+            Ok(JitCompileStatus::Cancelled) => "cancelled".into(),
             Ok(JitCompileStatus::Unavailable) => "unavailable".into(),
             Ok(JitCompileStatus::Unsupported { reason }) => format!("unsupported: {reason}"),
             Err(error) => format!("error: {error}"),

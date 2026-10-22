@@ -93,8 +93,12 @@ that fires before the isolate replies may have no partial batch to write.
 
 ## Structured events
 
-`compileFinished` reports the compiler-hook result and retains duration/queue
-delay as diagnostics only. A successfully compiled mapping can still fail
+`compileFinished` reports the terminal compile attempt and retains duration/queue
+delay as diagnostics only. A `cancelled` outcome is distinct from compiler
+unavailability or unsupported input. A queued cancellation has
+`compileStartedNs: null` and zero hook duration because the hook never ran; an
+active cancellation retains its actual entered-hook timing. A successfully
+compiled mapping can still fail
 canonical publication: `installDeclined` identifies the exact function,
 `codeObjectId`, tier and typed `invalidCode` or `resourceBudget` reason. Resource
 refusals include the full centrally computed `requiredBytes` and current
@@ -123,6 +127,22 @@ disables the native wakeup until a later cold policy decision sees sufficient
 headroom; retirement can admit unchanged actual work.
 Host load and elapsed compilation time do not change promotion or retry
 decisions; disabled event capture reads no compilation clock.
+
+Optimizing requests carry one cooperative cancellation token shared with their
+pending owner. Invalidation removes cancelled queued requests before hook entry;
+active compilation checks the token between complete analysis, graph building,
+optimization, allocation and emission phases. Cancellation can therefore wait
+for the current phase to finish. The VM checks again before publication, even
+when a custom compiler ignores the token. Cancelled attempts do not create an
+unsupported-input cache entry or rearm an obsolete source.
+
+Pending requests retain their exact source chunks and GC roots until terminal
+acknowledgement. Code reclamation first cancels pending work and drains ready
+acknowledgements; an active job can defer reclamation until it acknowledges.
+Installation independently checks the current CodeSpace and actual source
+owners, including spliced bodies. Installed native generations retain identity
+cells selected by emitted references and finalized context dependencies;
+unspliced prepared candidates do not become permanent constant owners.
 
 Property feedback distinguishes an unattempted site from an executed site whose
 receivers admit no cache program. Accessors, proxies, mapped arguments, and

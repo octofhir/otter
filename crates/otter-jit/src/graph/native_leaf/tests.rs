@@ -444,6 +444,7 @@ fn nested_native_leaf_has_its_own_descriptor_source_and_complete_miss_recipe() {
         &crate::entry::TransitionTable::resolve(),
         None,
         true,
+        &Default::default(),
     )
     .unwrap();
     assert_eq!(
@@ -504,6 +505,7 @@ fn nested_native_leaf_has_its_own_descriptor_source_and_complete_miss_recipe() {
             entry: otter_vm::JitDebugTarget::Entry,
         }),
         false,
+        &Default::default(),
     )
     .unwrap();
     let bundle = captured.artifact.unwrap();

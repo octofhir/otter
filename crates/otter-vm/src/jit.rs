@@ -347,6 +347,9 @@ use crate::{
 /// Owned compile request for one bytecode function.
 #[derive(Debug, Clone)]
 pub struct JitCompileRequest {
+    /// Shared monotonic stop token. The isolate retains source and GC owners
+    /// until the compiler acknowledges this request's completion.
+    pub cancellation: crate::JitCompileCancellation,
     /// Code and feedback snapshot to compile.
     pub snapshot: JitCompileSnapshot,
     /// Default-off diagnostics requested by the owning isolate.
@@ -2991,6 +2994,9 @@ pub struct JitCodeGenerationSnapshot {
 /// Result of a JIT compile attempt.
 #[derive(Debug, Clone)]
 pub enum JitCompileStatus {
+    /// The request was cancelled before publication. This is transient and
+    /// must never enter the unsupported-function or resource-refusal caches.
+    Cancelled,
     /// Executable memory or the current target backend is unavailable; the VM
     /// should silently continue in the interpreter.
     Unavailable,

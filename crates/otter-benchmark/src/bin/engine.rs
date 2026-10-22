@@ -1445,6 +1445,7 @@ fn compile_request(
     capture_artifact: bool,
 ) -> JitCompileRequest {
     JitCompileRequest {
+        cancellation: otter_vm::JitCompileCancellation::default(),
         snapshot: view.clone(),
         debug: if capture_artifact {
             JitDebugRequest::artifacts()

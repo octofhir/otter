@@ -156,7 +156,7 @@ pub enum JitDebugTarget {
     },
 }
 
-/// Structured outcome of one compiler-hook invocation.
+/// Structured terminal outcome of one prepared compile request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "kind",
@@ -164,6 +164,8 @@ pub enum JitDebugTarget {
     rename_all_fields = "camelCase"
 )]
 pub enum JitDebugCompileOutcome {
+    /// The request was cancelled; a queued cancellation never entered the hook.
+    Cancelled,
     /// Native code was produced and accepted by the compiler hook.
     Compiled {
         /// Isolate-assigned identity stamped into the code object.
@@ -676,7 +678,7 @@ pub enum JitDebugEvent {
         /// Actual lowering emitted by the backend.
         outcome: JitStaticNativeCallLoweringOutcome,
     },
-    /// One compiler-hook invocation completed.
+    /// One prepared compile request reached terminal acknowledgement.
     CompileFinished {
         /// Global bytecode function id.
         function_id: u32,
@@ -684,13 +686,13 @@ pub enum JitDebugEvent {
         tier: JitDebugTier,
         /// Function entry or loop-OSR target.
         target: JitDebugTarget,
-        /// Monotonic nanoseconds since this isolate's diagnostics clock began.
-        compile_started_ns: u64,
-        /// Delay between the ready compile request and synchronous hook entry.
-        /// This is currently measured and expected to be near zero; an
-        /// off-thread compiler may make it nonzero without changing schema.
+        /// Hook entry on the isolate's monotonic diagnostics clock, or `None`
+        /// when queued cancellation skipped the hook entirely.
+        compile_started_ns: Option<u64>,
+        /// Delay between request readiness and hook entry, or terminal queued
+        /// cancellation when the hook was never entered.
         queue_delay_ns: u64,
-        /// Monotonic wall duration of the compiler-hook invocation.
+        /// Monotonic hook wall duration; zero for a skipped hook.
         compile_duration_ns: u64,
         /// Lowered IR operations presented to native emission, or zero when no
         /// code object was produced.
@@ -1031,7 +1033,7 @@ mod tests {
             function_id: 7,
             tier: JitDebugTier::Template,
             target: JitDebugTarget::Entry,
-            compile_started_ns: 10,
+            compile_started_ns: Some(10),
             queue_delay_ns: 2,
             compile_duration_ns: 30,
             ir_node_count: 0,

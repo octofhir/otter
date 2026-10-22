@@ -44,6 +44,7 @@
 //!   spliced into the completed graph, including nested source attribution.
 //! - Finalized cell requirements include emitted references and the context
 //!   owners needed by the accepted graph's validity dependencies.
+//! - Cooperative cancellation checkpoints separate whole compilation phases.
 //!
 //! # Invariants
 //! - An instruction without a specialized form runs through its baseline
@@ -56,6 +57,8 @@
 //!   allocation. Nodes declare every other register they need.
 //! - A closure-context dependency retains its context even when slot folding
 //!   removes the context load; collection cannot invalidate an active proof.
+//! - Cancellation drops all local output before publication. A running phase
+//!   finishes before observing a cancellation request.
 //!
 //! # See also
 //! - `otter_vm::deopt` — the frame-state recipe the exits produce.
@@ -100,10 +103,10 @@ pub(crate) mod truncation;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod x86_64;
 
-use otter_vm::JitCompileSnapshot;
 use otter_vm::deopt::{DeoptExitDescriptor, DeoptRuntime, DeoptTable, FrameState};
+use otter_vm::{JitCompileCancellation, JitCompileSnapshot};
 
-use crate::optimizing::{OptimizedCode, OptimizedMetadata};
+use crate::optimizing::{CompileFailure, OptimizedCode, OptimizedMetadata, check_cancellation};
 use crate::{CompiledCode, Unsupported};
 
 /// Bounded inline prototype traversal before committed runtime completion.
@@ -162,15 +165,20 @@ pub(crate) fn compile(
     transitions: &crate::entry::TransitionTable,
     osr_pc: Option<u32>,
     capture: bool,
-) -> Result<Compiled, Unsupported> {
+    cancellation: &JitCompileCancellation,
+) -> Result<Compiled, CompileFailure> {
+    check_cancellation(cancellation)?;
     let analysis = std::rc::Rc::new(
         bytecode::Analysis::build(view)
             .map_err(|_| Unsupported::OperandShape("graph bytecode analysis"))?,
     );
+    check_cancellation(cancellation)?;
     let plan = crate::template::TemplatePlan::build_unfused(view)?;
     let baseline = BaselineSupport::of(&plan, view);
+    check_cancellation(cancellation)?;
     let mut built = builder::build(view, &analysis, &baseline, osr_pc)
         .map_err(|_| Unsupported::OperandShape("graph construction"))?;
+    check_cancellation(cancellation)?;
     let loop_states: Vec<_> = built
         .loop_headers
         .iter()
@@ -183,9 +191,13 @@ pub(crate) fn compile(
         view,
         &built.inline_views,
     );
+    check_cancellation(cancellation)?;
     escape::fold_conversions(&mut built.graph, &built.layout);
+    check_cancellation(cancellation)?;
     escape::remove_dead_values(&mut built.graph, &built.layout);
+    check_cancellation(cancellation)?;
     phi_repr::untag_phis(&mut built.graph, &built.layout, &built.loop_headers);
+    check_cancellation(cancellation)?;
     // An untagged loop phi whose back edge carried only its own retagged
     // value merges one entry value; drop it before liveness sees it.
     builder::remove_trivial_phis(&mut built.graph, &built.layout);
@@ -193,28 +205,45 @@ pub(crate) fn compile(
         let phis = &built.graph.block(header.block).phis;
         header.phis.retain(|(_, phi)| phis.contains(phi));
     }
+    check_cancellation(cancellation)?;
     let zero_insensitive = truncation::zero_insensitive(&built.graph, &built.layout);
+    check_cancellation(cancellation)?;
     range::narrow_checked_arithmetic(&mut built.graph, &built.layout, &zero_insensitive);
+    check_cancellation(cancellation)?;
     truncation::wrap_truncated_arithmetic(&mut built.graph, &built.layout);
+    check_cancellation(cancellation)?;
     licm::hoist_invariants(&mut built.graph, &mut built.layout, &built.loop_headers);
+    check_cancellation(cancellation)?;
     redundancy::eliminate(&mut built.graph, &built.layout);
+    check_cancellation(cancellation)?;
     // A forwarded store leaves its value's conversions to fold again.
     escape::fold_conversions(&mut built.graph, &built.layout);
+    check_cancellation(cancellation)?;
     fold::fold(&mut built.graph, &mut built.layout, &mut built.loop_headers);
+    check_cancellation(cancellation)?;
     branch_fold::fold_branch_negations(&mut built.graph);
+    check_cancellation(cancellation)?;
     branch_thread::thread_boolean_phis(&mut built.graph, &mut built.layout);
+    check_cancellation(cancellation)?;
     let osr_entry = built.osr_entry;
     straighten::merge(&mut built.graph, &mut built.layout, osr_entry.as_slice());
+    check_cancellation(cancellation)?;
     select::convert(&mut built.graph, &mut built.layout);
+    check_cancellation(cancellation)?;
     straighten::merge(&mut built.graph, &mut built.layout, osr_entry.as_slice());
+    check_cancellation(cancellation)?;
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);
+    check_cancellation(cancellation)?;
     let dependencies = dependency_checks::place(&mut built.graph, view, &built.inline_views);
+    check_cancellation(cancellation)?;
     backedge_fuel::carry_in_registers(&mut built.graph, &mut built.layout, &built.loop_headers);
+    check_cancellation(cancellation)?;
     #[cfg(target_arch = "aarch64")]
     let registers = registers::AARCH64;
     #[cfg(target_arch = "x86_64")]
     let registers = registers::X86_64;
     let allocation = regalloc::allocate(&built.graph, &built.layout, registers);
+    check_cancellation(cancellation)?;
     // The recipe's address is baked before its contents exist: the exits are
     // known only once the code is emitted, and the box never moves.
     let mut deopt = Box::new(DeoptRuntime::default());
@@ -222,8 +251,10 @@ pub(crate) fn compile(
     // Near branches are one instruction; only a body whose own control flow
     // spans more than a conditional branch reaches pays for the far form.
     let deopt_address = std::ptr::from_ref::<DeoptRuntime>(&deopt);
+    check_cancellation(cancellation)?;
     #[cfg(target_arch = "aarch64")]
     let emit = |far| {
+        check_cancellation(cancellation)?;
         arm64::emit(
             view,
             &built,
@@ -236,6 +267,7 @@ pub(crate) fn compile(
             capture,
             far,
         )
+        .map_err(CompileFailure::from)
     };
     // A body of this many nodes surely outgrows a `tbz`'s ±32 KiB at the
     // fewest bytes a node takes, so it starts in the far form rather than
@@ -244,7 +276,9 @@ pub(crate) fn compile(
     let surely_far = built.graph.nodes.len() > FAR_BODY_NODES;
     #[cfg(target_arch = "aarch64")]
     let mut emission = match emit(surely_far) {
-        Err(Unsupported::Backend(crate::BackendFailure::Relocation)) if !surely_far => emit(true),
+        Err(CompileFailure::Unsupported(Unsupported::Backend(
+            crate::BackendFailure::Relocation,
+        ))) if !surely_far => emit(true),
         result => result,
     }?;
     #[cfg(target_arch = "x86_64")]
@@ -259,6 +293,7 @@ pub(crate) fn compile(
         slots,
         capture,
     )?;
+    check_cancellation(cancellation)?;
     let (runtime, recipe_records) = deopt_runtime(
         &built,
         &allocation,
@@ -268,6 +303,7 @@ pub(crate) fn compile(
     )?;
     *deopt = runtime;
     emission.site_records.extend(recipe_records);
+    check_cancellation(cancellation)?;
     Ok(Compiled {
         emission,
         built,
@@ -362,14 +398,18 @@ pub(crate) fn compile_optimized(
     osr_pc: Option<u32>,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
     capture_events: bool,
-) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, Unsupported> {
+    cancellation: &JitCompileCancellation,
+) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, CompileFailure> {
     let compiled = compile(
         view,
         code_object_id,
         transitions,
         osr_pc,
         artifact_request.is_some(),
-    )?;
+        cancellation,
+    );
+    check_cancellation(cancellation)?;
+    let compiled = compiled?;
     let Compiled {
         mut emission,
         built,
@@ -378,6 +418,7 @@ pub(crate) fn compile_optimized(
         plan,
         dependencies,
     } = compiled;
+    check_cancellation(cancellation)?;
     require_dependency_contexts(
         &mut emission.relocations,
         view,
@@ -406,6 +447,7 @@ pub(crate) fn compile_optimized(
         dynasmrt::AssemblyOffset(emission.tier_entry),
     );
     let node_count = built.graph.nodes.len() as u64;
+    check_cancellation(cancellation)?;
     let diagnostics = if capture_events {
         let mut diagnostics = inline_diagnostics(view.code_block.id, &built).into_vec();
         diagnostics.extend(static_native_diagnostics(
@@ -428,6 +470,7 @@ pub(crate) fn compile_optimized(
         .into_iter()
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    check_cancellation(cancellation)?;
     let artifact = artifact_request.map(|request| {
         let mut code_map = crate::artifact::CodeMapCapture::default();
         // Both encoders return the actual canonical call-entry assembler offset.
@@ -477,7 +520,8 @@ pub(crate) fn compile_optimized(
             &emission.return_sites,
         )
     });
-    Ok(crate::artifact::NativeCompileOutput {
+    check_cancellation(cancellation)?;
+    let output = crate::artifact::NativeCompileOutput {
         code: OptimizedCode::new(
             code,
             emission.call_entry,
@@ -496,7 +540,9 @@ pub(crate) fn compile_optimized(
         artifact,
         diagnostics,
         ir_node_count: node_count,
-    })
+    };
+    check_cancellation(cancellation)?;
+    Ok(output)
 }
 
 /// A source-identity proof owns its context even if the load was optimized out.

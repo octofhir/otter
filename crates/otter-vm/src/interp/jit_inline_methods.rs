@@ -66,7 +66,9 @@ impl Interpreter {
                 return None;
             };
             let key = context.property_atom(name_idx)?;
-            let recv_shape = self.shape_runtime.handle_for_id(target.recv_shape)?;
+            let recv_shape = self
+                .shape_runtime
+                .handle_for_id(&self.gc_heap, target.recv_shape)?;
             if let Some(slot) = self.shape_offset_of(recv_shape, key.name()) {
                 let (flags, is_accessor) =
                     crate::object::shape_body::shape_slot_attrs(&self.gc_heap, recv_shape, slot)?;

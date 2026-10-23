@@ -83,7 +83,7 @@ use std::sync::Arc;
 use super::bytecode::{Analysis, Flow, Instruction, RegisterSet};
 use super::ir::{
     BlockId, BranchKind, Condition, DeoptReason, FrameState, FrameStateId, Graph, InlineCaller,
-    InlinedBody, Kind, NodeId, Repr,
+    InlinedBody, Kind, NamedStorePlan, NodeId, Repr,
 };
 use crate::field_store::{FieldStoreOwner, StoreValueBound};
 
@@ -131,7 +131,8 @@ const UNDEFINED: u64 = tag::VALUE_UNDEFINED;
 /// changes.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct NodeInfo {
-    /// The same value as an unboxed int32.
+    /// The same exact Number as an unboxed int32, excluding -0. This does
+    /// not prove that its Tagged form has the physical Int32 encoding.
     pub(crate) int32: Option<NodeId>,
     /// The same value as an unboxed double.
     pub(crate) float64: Option<NodeId>,
@@ -2044,9 +2045,13 @@ impl<'a> Builder<'a> {
         let node = self.graph.node(value);
         match (&node.kind, node.repr) {
             (_, Repr::Int32) => return value,
-            (Kind::ConstTagged(bits), _) if bits & tag::NUMBER_TAG == tag::NUMBER_TAG => {
-                let int = *bits as u32 as i32;
-                return self.constant_int32(int);
+            (Kind::ConstTagged(bits), _) => {
+                if let Some(int) = otter_vm::Value::from_bits(*bits)
+                    .as_number()
+                    .and_then(|number| number.as_exact_i32())
+                {
+                    return self.constant_int32(int);
+                }
             }
             _ => {}
         }
@@ -2055,7 +2060,7 @@ impl<'a> Builder<'a> {
         }
         let repr = self.graph.node(value).repr;
         let unboxed = match repr {
-            Repr::Tagged => self.add(Kind::CheckedTaggedToInt32, &[value], Repr::Int32),
+            Repr::Tagged => self.add(Kind::CheckedNumberToInt32, &[value], Repr::Int32),
             Repr::Float64 => self.add(Kind::CheckedFloat64ToInt32, &[value], Repr::Int32),
             Repr::Int32 | Repr::None | Repr::Word => unreachable!("not an int32 source"),
         };
@@ -2635,8 +2640,8 @@ impl<'a> Builder<'a> {
 
     /// An int32 operand of a bitwise operator: `ToInt32` of the number or
     /// the comparison's boolean. An unboxed double truncates, which never
-    /// fails; a tagged value is checked to be an int32 when the site only
-    /// saw int32.
+    /// fails; a tagged value is checked to be an exact int32 Number when
+    /// the site only saw such numbers.
     fn truncated_int32(&mut self, value: NodeId, int32: bool) -> NodeId {
         if self.graph.node(value).kind.produces_boolean() {
             return self.add(Kind::BooleanToInt32, &[value], Repr::Int32);
@@ -3049,6 +3054,22 @@ impl<'a> Builder<'a> {
             return;
         }
         let int32 = self.field_load_int32(&access.shapes, access.field);
+        if int32.is_none()
+            && let Some(double_only) = self.field_load_number(&access.shapes, access.field)
+        {
+            let value = self.add(
+                Kind::LoadNumberOwnField {
+                    field: access.field,
+                    atom: access.atom,
+                    double_only,
+                },
+                &[object],
+                Repr::Float64,
+            );
+            self.known.fields.insert(key, value);
+            self.write(instruction.writes[0], value);
+            return;
+        }
         let bound = int32
             .is_none()
             .then(|| self.field_load_bound(&access.shapes, access.field))
@@ -3246,22 +3267,33 @@ impl<'a> Builder<'a> {
         let object = self.read(instruction.reads[0]);
         let object = self.tagged(object);
         let value = self.read(instruction.reads[1]);
-        let value = self.tagged(value);
+        let double = self.graph.node(value).repr == Repr::Float64;
+        let value = if double { value } else { self.tagged(value) };
+        let object = self.property_storage(object, access.projection);
+        self.check_shapes(object, &access.shapes, true);
         let Some(owners) = self.field_store_owners(&access.shapes, access.field, value) else {
             return self.visit_named_store(instruction);
         };
-        let object = self.property_storage(object, access.projection);
-        self.check_shapes(object, &access.shapes, true);
         self.add(
-            Kind::StoreOwnField {
-                field: access.field,
-                atom: access.atom,
-                owners,
+            if double {
+                Kind::StoreDoubleOwnField {
+                    field: access.field,
+                    atom: access.atom,
+                    owners,
+                }
+            } else {
+                Kind::StoreOwnField {
+                    field: access.field,
+                    atom: access.atom,
+                    owners,
+                }
             },
             &[object, value],
             Repr::None,
         );
-        self.write_barrier(object, value);
+        if !double {
+            self.write_barrier(object, value);
+        }
         self.known.store_field(
             FieldKey {
                 object,
@@ -3270,6 +3302,9 @@ impl<'a> Builder<'a> {
             },
             value,
         );
+        // Later Phi rewriting can choose an encoded Double for this Tagged
+        // input. Final store selection may therefore turn its observer on.
+        self.known.checked_field_types.clear();
         // A slot write keeps the object's shape.
         let layout = self.known.layout_entry(object);
         layout.shapes = Some(access.shapes.clone());
@@ -3299,14 +3334,12 @@ impl<'a> Builder<'a> {
         if !self.exited_for(ExitReason::ShapeGuard)
             && let Some((projection, programs)) =
                 super::feedback::named_store_programs(self.view, byte_pc)
-            && let Some(owners) = self.named_store_owners(programs, projection, instruction)
         {
             use otter_vm::JitCacheIrOp as Op;
             let object = self.read(instruction.reads[0]);
             let object = self.tagged(object);
             let object = self.property_storage(object, projection);
-            let value = self.read(instruction.reads[1]);
-            let value = self.tagged(value);
+            let source_value = self.read(instruction.reads[1]);
             let receiver_operand =
                 if projection == otter_vm::jit::PropertyStorageProjection::ArrayExpando {
                     1
@@ -3335,9 +3368,56 @@ impl<'a> Builder<'a> {
                 }
                 _ => None,
             };
+            let compatible = |program: &otter_vm::JitCacheIrProgram| {
+                receiver_shape.is_none_or(|shape| guarded(program) == Some(shape))
+            };
+            let mut selected = programs.iter().filter(|program| compatible(program));
+            let source_shape = selected.next().and_then(guarded);
+            let one_source =
+                source_shape.is_some() && selected.all(|program| guarded(program) == source_shape);
+            // A selected transition's immutable geometry belongs to its
+            // source program. Its guards all miss before the original store.
+            let candidate = one_source
+                .then(|| {
+                    programs.iter().enumerate().find(|(_, program)| {
+                        compatible(program) && super::feedback::inline_store_transition(program)
+                    })
+                })
+                .flatten();
+            let mut plan = NamedStorePlan::Programs;
+            if projection == otter_vm::jit::PropertyStorageProjection::Receiver
+                && let Some((index, program)) = candidate
+                && super::feedback::inline_store_transition(program)
+            {
+                let node = self.graph.node(source_value);
+                let numeric = node.repr == Repr::Float64
+                    || matches!(node.kind, Kind::ConstTagged(bits)
+                        if otter_vm::Value::from_bits(bits).is_number() && !otter_vm::Value::from_bits(bits).is_int32())
+                    || self
+                        .known
+                        .get(source_value)
+                        .is_some_and(|known| known.float64.is_some() && known.int32.is_none());
+                plan = if numeric {
+                    NamedStorePlan::TransitionDouble(index as u8)
+                } else {
+                    NamedStorePlan::TransitionTagged(index as u8)
+                };
+            }
+            // Pure numeric conversion retains the original source SSA value in
+            // the eager StoreProperty frame; no speculative conversion is added.
+            let value = if plan.is_double() {
+                self.float64(source_value)
+            } else {
+                self.tagged(source_value)
+            };
+            let Some(owners) = self.named_store_owners(programs, projection, instruction, value)
+            else {
+                return self.generic(instruction);
+            };
             let fresh = self.known.fresh.contains(&object);
             self.add(
                 Kind::StoreNamedProperty {
+                    plan,
                     byte_pc,
                     owners,
                     receiver_shape,
@@ -3346,14 +3426,22 @@ impl<'a> Builder<'a> {
                 &[object, value],
                 Repr::None,
             );
-            self.write_barrier(object, value);
+            if !plan.is_double() {
+                self.write_barrier(object, value);
+            }
             // The receiver now has the shape each matching program leaves it
             // with; a published transition changes the shape of an object of
             // its old shape, which any node proved to have that shape may name.
             let mut shapes: SmallVec<[u32; 4]> = SmallVec::new();
             let mut offsets: SmallVec<[i32; 4]> = SmallVec::new();
             let mut left: SmallVec<[u32; 4]> = SmallVec::new();
-            for program in programs {
+            for (index, program) in programs.iter().enumerate() {
+                if plan
+                    .program()
+                    .is_some_and(|selected| usize::from(selected) != index)
+                {
+                    continue;
+                }
                 let from = guarded(program);
                 if receiver_shape.is_some() && from != receiver_shape {
                     continue;
@@ -3450,12 +3538,12 @@ impl<'a> Builder<'a> {
         programs: &[otter_vm::JitCacheIrProgram],
         projection: otter_vm::jit::PropertyStorageProjection,
         instruction: &Instruction,
+        value: NodeId,
     ) -> Option<SmallVec<[FieldStoreOwner; 4]>> {
         use otter_vm::JitCacheIrOp as Op;
         let operand =
             u8::from(projection == otter_vm::jit::PropertyStorageProjection::ArrayExpando);
         let receiver = self.read(instruction.reads[0]);
-        let value = self.read(instruction.reads[1]);
         let aliased = receiver == value;
         let bound = self.store_value_bound(value);
         programs
@@ -5114,7 +5202,10 @@ impl<'a> Builder<'a> {
             (_, Repr::Int32) => return true,
             (_, Repr::Float64) => return false,
             (Kind::ConstTagged(bits), _) => {
-                return bits & tag::NUMBER_TAG == tag::NUMBER_TAG;
+                return otter_vm::Value::from_bits(*bits)
+                    .as_number()
+                    .and_then(|number| number.as_exact_i32())
+                    .is_some();
             }
             _ => {}
         }

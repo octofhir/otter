@@ -21,6 +21,8 @@
 //!   its child; overwrite stores preserve the shape's stability.
 //! - Stores observe their defining field owner after complete publication.
 //!   Membership misses call a noncollecting leaf that preserves live registers.
+//! - Stores retain Value-valid words and observe physical numeric categories;
+//!   every loaded Double becomes canonical before it enters Tagged state.
 //!
 //! # See also
 //! - `otter_vm::property_ic` owns the slot layout and handler kinds.
@@ -32,6 +34,7 @@ use otter_vm::jit::{
     PROPERTY_IC_LAYOUT as IC, PropertyIcHandlerKind as Kind,
     PropertyStorageProjection as Projection,
 };
+use otter_vm::object::FieldLocation;
 
 use crate::entry::{
     OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, VALUE_UNDEFINED, VM_THREAD_ACTIVE_REALM_CELL_OFFSET,
@@ -221,6 +224,7 @@ fn emit_field_bank(
     let layout = view.field_layout;
     dynasm!(ops ; .arch aarch64
         ; tbnz W(index), 31, =>inline
+        ; and WSP(index), W(index), #FieldLocation::INDEX_MASK
         ; ldr w16, [X(holder), layout.slab_handle_byte]
         ; cbz w16, =>miss
         ; and x17, X(holder), #0xffff_ffff_0000_0000
@@ -228,7 +232,7 @@ fn emit_field_bank(
         ; add x16, x16, #layout.slab_words_byte
         ; b =>ready
         ; =>inline
-        ; and WSP(index), W(index), #0x7fff_ffff
+        ; and WSP(index), W(index), #FieldLocation::INDEX_MASK
         ; add x16, XSP(holder), #layout.inline_values_byte
         ; =>ready
     );
@@ -294,8 +298,9 @@ pub(crate) fn emit_slot_load(
     emit_field_bank(ops, view, holder, index, miss);
     dynasm!(ops ; .arch aarch64
         ; ldr X(destination), [x16, X(index), lsl #3]
-        ; b =>done
     );
+
+    dynasm!(ops ; .arch aarch64 ; b =>done);
 }
 
 /// Complete a store of `X(value)` through the slot at `X(slot)`: on a hit
@@ -355,8 +360,11 @@ pub(crate) fn emit_slot_store(
         ; tbnz w16, otter_vm::code_dependencies::ShapeFact::Stable.bit(), =>miss
         ; ldr W(child), [X(entry), IC.entry_aux_byte]
         ; cbz W(child), =>miss
+    );
+    dynasm!(ops ; .arch aarch64
         ; ldr W(index), [X(entry), IC.entry_field_byte]
         ; tbnz W(index), 31, =>inline
+        ; and WSP(index), W(index), #FieldLocation::INDEX_MASK
         ; ldr w16, [X(receiver), layout.slab_handle_byte]
         ; cbz w16, =>miss
         ; and x17, X(receiver), #0xffff_ffff_0000_0000
@@ -368,7 +376,7 @@ pub(crate) fn emit_slot_store(
         ; str X(value), [x16, X(index), lsl #3]
         ; b =>publish
         ; =>inline
-        ; and WSP(index), W(index), #0x7fff_ffff
+        ; and WSP(index), W(index), #FieldLocation::INDEX_MASK
         ; add x16, XSP(receiver), #layout.inline_values_byte
         ; str X(value), [x16, X(index), lsl #3]
         ; =>publish

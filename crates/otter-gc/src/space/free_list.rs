@@ -20,13 +20,17 @@
 use crate::header::{GcHeader, HEADER_SIZE};
 use crate::page::{CELL_SIZE, PAGE_PAYLOAD_SIZE};
 
+/// Bytes a listed free range keeps for its walkable header and next link.
+/// Physical discard must preserve the OS pages containing this prefix.
+pub(super) const FREE_RANGE_METADATA_SIZE: usize = HEADER_SIZE + size_of::<u32>();
+
 const MIN_BYTES: usize = 32;
 const DOUBLING_MIN: usize = 256;
 const PRECISE_COUNT: usize = (DOUBLING_MIN - MIN_BYTES) / CELL_SIZE;
 const DOUBLING_COUNT: usize = 10;
 const CLASS_COUNT: usize = PRECISE_COUNT + DOUBLING_COUNT;
 const _: () = assert!(CLASS_COUNT < u64::BITS as usize);
-const _: () = assert!(MIN_BYTES >= HEADER_SIZE + size_of::<u32>());
+const _: () = assert!(MIN_BYTES >= FREE_RANGE_METADATA_SIZE);
 
 /// A filler-capped range transferred from a list to its exclusive consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

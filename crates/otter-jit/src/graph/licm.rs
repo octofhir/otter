@@ -141,7 +141,7 @@ fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
         | Kind::LoadArrayExpando(_)
         | Kind::LoadFunctionBag => return header.hoist,
         Kind::LoadShapedProperty { .. } => &[R::OwnDataMiss],
-        Kind::CheckedTaggedToInt32
+        Kind::CheckedNumberToInt32
         | Kind::CheckedTaggedToFloat64
         | Kind::CheckedFloat64ToInt32
         | Kind::CheckNumber => return header.speculate,

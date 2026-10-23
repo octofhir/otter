@@ -74,12 +74,6 @@ pub(crate) fn emit_object_literal(
 ) {
     assert_eq!(inputs.len(), plan.value_count as usize);
     assert_eq!(inputs.len(), fields.len());
-    debug_assert_eq!(regs.size, 11);
-    debug_assert!(
-        [regs.buffer, regs.candidate, regs.end, regs.scratch]
-            .iter()
-            .all(|register| ![10, 11].contains(register))
-    );
     emit_source_realm_guard(ops, context, realm, regs.scratch, slow);
     emit_load_u64(ops, regs.size, u64::from(plan.cell_bytes));
     emit_bump_probe_in(ops, context, lab_offset(site), regs, slow);
@@ -102,18 +96,23 @@ pub(crate) fn emit_object_literal(
             .fields
             .inline_byte(otter_vm::object::FieldLocation::inline(index));
         match inputs.get(index as usize) {
-            Some(input) => emit_load_input(ops, *input),
+            Some(input) => {
+                emit_load_input(ops, *input);
+            }
             None => emit_load_u64(ops, 10, VALUE_UNDEFINED),
         }
         dynasm!(ops ; .arch x64 ; mov [Rq(candidate) + byte as i32], r10);
     }
     let mut observed = false;
-    for (input, record) in inputs
+    for (index, record) in fields
         .iter()
-        .zip(fields)
+        .enumerate()
         .filter(|(_, record)| record.observes())
     {
-        emit_load_input(ops, *input);
+        let byte = plan
+            .fields
+            .inline_byte(otter_vm::object::FieldLocation::inline(index as u32));
+        dynasm!(ops ; .arch x64 ; mov r10, [Rq(candidate) + byte as i32]);
         dynasm!(ops ; .arch x64 ; mov Rq(regs.buffer), r10);
         emit_load_u64(ops, regs.scratch, u64::from(record.owner_shape));
         crate::x86_64::field_type::emit_observe_known(

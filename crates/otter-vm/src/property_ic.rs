@@ -40,6 +40,8 @@
 //!   slot. Zero skips observation only for an absorbing Top summary. An append
 //!   with a null target has zero owner and flat field zero for VM dictionary
 //!   replay; generated probes reject that target before any effect.
+//! - Every data slot accepts any valid Value word. Reads preserve its encoded
+//!   representation; stores observe its incoming physical category.
 //! - One VM thread writes a slot; generated code reads it on that thread.
 //! - Megamorphic is terminal; its receivers use the isolate's shared action
 //!   table, which every resolution already records.
@@ -214,6 +216,7 @@ pub struct IcEntry {
     slot: AtomicU16,
     aux: AtomicU32,
     owner: AtomicU32,
+
     validity: AtomicU64,
 }
 
@@ -227,6 +230,7 @@ impl IcEntry {
             slot: AtomicU16::new(0),
             aux: AtomicU32::new(0),
             owner: AtomicU32::new(0),
+
             validity: AtomicU64::new(0),
         }
     }
@@ -374,6 +378,7 @@ pub(crate) struct IcHandler {
     slot: u16,
     aux: ShapeHandle,
     owner: ShapeHandle,
+
     validity: Option<Arc<PrototypeValidity>>,
     transition: TransitionGuard,
 }
@@ -410,6 +415,7 @@ impl IcHandler {
                 slot: resolved.hit.slot,
                 aux: ShapeHandle::null(),
                 owner: ShapeHandle::null(),
+
                 validity: None,
                 transition: TransitionGuard::OwnAdd,
             });
@@ -425,6 +431,7 @@ impl IcHandler {
             slot: resolved.hit.slot,
             aux: resolved.holder_root,
             owner: ShapeHandle::null(),
+
             validity: Some(resolved.validity.clone()?),
             transition: TransitionGuard::OwnAdd,
         })
@@ -444,6 +451,7 @@ impl IcHandler {
             slot: 0,
             aux: ShapeHandle::null(),
             owner: ShapeHandle::null(),
+
             validity,
             transition: TransitionGuard::OwnAdd,
         })
@@ -512,6 +520,7 @@ impl IcHandler {
                 slot: hit.slot,
                 aux: ShapeHandle::null(),
                 owner,
+
                 validity: None,
                 transition: TransitionGuard::OwnAdd,
             },
@@ -532,6 +541,9 @@ impl IcHandler {
             return None;
         }
         let to_shape = transition.to_shape.get();
+        if !to_shape.is_null() && object::shape_body::parent_of(to_shape) != from_shape {
+            return None;
+        }
         let (owner, field) = if to_shape.is_null() {
             (ShapeHandle::null(), FieldLocation::from_cache_key(0))
         } else {
@@ -577,6 +589,7 @@ impl IcHandler {
             slot: 0,
             aux: ShapeHandle::null(),
             owner: ShapeHandle::null(),
+
             validity: None,
             transition: TransitionGuard::OwnAdd,
         }
@@ -656,6 +669,7 @@ impl PropertyIcSlot {
         inline_shape_byte: std::mem::offset_of!(Self, inline_shape) as u32,
         inline_field_byte: std::mem::offset_of!(Self, inline_field) as u32,
         inline_owner_byte: std::mem::offset_of!(Self, inline_owner) as u32,
+
         state_byte: std::mem::offset_of!(Self, state) as u32,
         megamorphic_bit: STATE_MEGAMORPHIC,
         count_mask: STATE_COUNT_MASK,
@@ -667,6 +681,7 @@ impl PropertyIcSlot {
         entry_kind_byte: std::mem::offset_of!(IcEntry, kind) as u32,
         entry_aux_byte: std::mem::offset_of!(IcEntry, aux) as u32,
         entry_owner_byte: std::mem::offset_of!(IcEntry, owner) as u32,
+
         entry_validity_byte: std::mem::offset_of!(IcEntry, validity) as u32,
     };
 
@@ -681,6 +696,7 @@ impl PropertyIcSlot {
             atom: AtomicU32::new(0),
             function_id: AtomicU32::new(0),
             instruction_pc: AtomicU32::new(0),
+
             entries: [const { IcEntry::new() }; PROFILED_PROPERTY_PIC_CAPACITY],
             hits: AtomicU32::new(0),
             misses: AtomicU32::new(0),
@@ -1234,10 +1250,11 @@ impl PropertyIcSlot {
                     JitCacheIrOp::StoreField { object: 0, field },
                 ],
                 IcHandlerKind::StoreTransition => {
-                    if entry.aux().is_null() {
+                    let target = entry.aux();
+                    if !object::shape_body::append_geometry_matches(receiver, target, field) {
                         continue;
                     }
-                    let Some(to_shape) = bake_shape(entry.aux()) else {
+                    let Some(to_shape) = bake_shape(target) else {
                         continue;
                     };
                     let mut ops = vec![JitCacheIrOp::GuardShape { object: 0, shape }];
@@ -1320,8 +1337,10 @@ impl Drop for PropertyIcSlot {
 
 const _: () = {
     assert!(std::mem::size_of::<IcEntry>() == 32);
+    assert!(std::mem::offset_of!(IcEntry, validity) == 24);
     assert!(std::mem::offset_of!(PropertyIcSlot, inline_shape) == 0);
     assert!(std::mem::offset_of!(PropertyIcSlot, inline_field) == 4);
+    assert!(std::mem::offset_of!(PropertyIcSlot, entries) == 32);
 };
 
 #[cfg(test)]

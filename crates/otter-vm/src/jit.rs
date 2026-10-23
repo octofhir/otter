@@ -57,6 +57,8 @@
 //! - Generated receiver allocation may mutate only the published nursery
 //!   window and its accounting words; every miss returns to the rooted VM
 //!   allocator before any constructor effect begins.
+//! - Parameter widening describes numeric values, independently of Int32 or
+//!   Double encoding. It grants no physical field-word proof.
 //! - A compiled result crosses back as one `NativeResultPair`; only the VM may
 //!   root and collector-rewrite a validated Return/Throw payload while cold
 //!   feedback reconciliation runs.
@@ -1243,26 +1245,28 @@ pub struct JitGuardedMethodCall {
     )>,
 }
 
-/// Widest representation a parameter held at a failed optimized entry.
+/// Widest numeric class a parameter held at a failed optimized entry.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JitParameterWidening {
     /// No exit showed anything wider than Int32.
     #[default]
     Int32,
-    /// An exit showed a non-Int32 Number.
+    /// An exit showed a Number outside exact Int32 values, including `-0`.
     Number,
     /// An exit showed a non-Number.
     Tagged,
 }
 
 impl JitParameterWidening {
-    /// The representation `value` needs.
+    /// The numeric class `value` needs, independently of its encoding.
     #[must_use]
     pub fn of(value: crate::Value) -> Self {
-        if value.is_int32() {
-            Self::Int32
-        } else if value.is_number() {
-            Self::Number
+        if let Some(number) = value.as_number() {
+            if number.as_exact_i32().is_some() {
+                Self::Int32
+            } else {
+                Self::Number
+            }
         } else {
             Self::Tagged
         }

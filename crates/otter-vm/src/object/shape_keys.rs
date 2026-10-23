@@ -297,6 +297,8 @@ pub struct ShapeLookupLayout {
     pub atom_byte: u32,
     /// Accessor discriminator of a shape transition.
     pub accessor_byte: u32,
+    /// Actual geometry-only FieldLocation word for chain probes.
+    pub field_byte: u32,
     /// Directory entry capacity.
     pub capacity_byte: u32,
     /// Beginning of the key entry tail.
@@ -317,6 +319,7 @@ impl ShapeLookupLayout {
             parent_byte: header + super::shape_body::SHAPE_BODY_PARENT_OFFSET as u32,
             atom_byte: header + super::shape_body::SHAPE_BODY_ATOM_OFFSET as u32,
             accessor_byte: header + super::shape_body::SHAPE_BODY_ACCESSOR_OFFSET as u32,
+            field_byte: header + super::shape_body::SHAPE_BODY_FIELD_OFFSET as u32,
             capacity_byte: header + std::mem::offset_of!(ShapeKeysBody, capacity) as u32,
             entries_byte: header + std::mem::size_of::<ShapeKeysBody>() as u32,
             entry_bytes: std::mem::size_of::<KeyEntry>() as u32,

@@ -204,7 +204,15 @@ impl Fixture {
             slab + self.view.field_layout.slab_words_byte as usize + field.byte_offset() as usize
         }
     }
-    fn run(&self, proof: BindingHitProof, temps: [u8; 2]) -> (u64, [u64; 6], String) {
+    fn run(&self, proof: BindingHitProof, temps: [u8; 2]) -> (u64, [u64; 7], String) {
+        self.run_mode(proof, temps, false)
+    }
+    fn run_mode(
+        &self,
+        proof: BindingHitProof,
+        temps: [u8; 2],
+        proved: bool,
+    ) -> (u64, [u64; 7], String) {
         let mut ops = Assembler::new().unwrap();
         let mut relocations = RelocationCapture::new(true);
         let miss = ops.new_dynamic_label();
@@ -214,18 +222,36 @@ impl Fixture {
             ; mov r12, rsi ; mov r15, rdi
             ; mov rbx, QWORD CANARY as i64
             ; mov r13, QWORD 0x2222_2222_2222_2222_u64 as i64
-            ; mov r14, QWORD 0x3333_3333_3333_3333_u64 as i64);
-        let guard_end = emit_global_read(
-            &mut ops,
-            &mut relocations,
-            &self.view,
-            proof,
-            BYTE_PC,
-            3,
-            temps,
-            miss,
-        )
-        .unwrap();
+            ; mov r14, QWORD 0x3333_3333_3333_3333_u64 as i64
+            ; mov r11, QWORD CANARY as i64 ; movq xmm0, r11);
+        let guard_end = if proved {
+            let BindingHitProof::GlobalObject { field, .. } = proof else {
+                panic!("object proof");
+            };
+            emit_global_object_proved_read(
+                &mut ops,
+                &mut relocations,
+                &self.view,
+                field,
+                3,
+                temps,
+                miss,
+            )
+            .unwrap();
+            ops.offset().0
+        } else {
+            emit_global_read(
+                &mut ops,
+                &mut relocations,
+                &self.view,
+                proof,
+                BYTE_PC,
+                3,
+                temps,
+                miss,
+            )
+            .unwrap()
+        };
         assert!(guard_end > 0);
         dynasm!(ops ; .arch x64
             ; mov eax, 1 ; jmp =>done
@@ -233,15 +259,16 @@ impl Fixture {
             ; =>done
             ; mov [r12], rbx ; mov [r12 + 8], rdi ; mov [r12 + 16], rsi
             ; mov [r12 + 24], r13 ; mov [r12 + 32], r14 ; mov [r12 + 40], r15
+            ; movq [r12 + 48], xmm0
             ; pop r15 ; pop r14 ; pop r13 ; pop r12 ; pop rbx ; ret);
         let buffer = ops.finalize().unwrap();
         let rendered = relocations.render(&buffer).unwrap();
         // SAFETY: the private SysV function only reads stationary owned buffers
         // and scalar owners. It saves all used nonvolatile registers and makes
-        // no C/runtime/GC calls. Six output words are writable for the extent.
+        // no C/runtime/GC calls. Seven output words are writable for the extent.
         let probe: unsafe extern "sysv64" fn(*const u64, *mut u64) -> u64 =
             unsafe { std::mem::transmute(buffer.ptr(AssemblyOffset(0))) };
-        let mut observed = [0_u64; 6];
+        let mut observed = [0_u64; 7];
         // SAFETY: all input pointers remain owned and unchanged during probe.
         let result = unsafe { probe(self.context.as_ptr(), observed.as_mut_ptr()) };
         assert_eq!(observed[1], self.context.as_ptr() as u64);
@@ -249,6 +276,10 @@ impl Fixture {
         assert_eq!(observed[3], 0x2222_2222_2222_2222);
         assert_eq!(observed[4], 0x3333_3333_3333_3333);
         assert_eq!(observed[5], self.context.as_ptr() as u64);
+        assert_eq!(
+            observed[6], CANARY,
+            "read guards preserve every FP register"
+        );
         (result, observed, rendered.json)
     }
 }
@@ -463,4 +494,27 @@ fn object_read_uses_current_epoch_layout_capacity_and_suffix_before_result() {
         "inline bounds refuse before result"
     );
     assert_eq!(f.cells, before);
+}
+
+#[test]
+fn global_object_words_preserve_double_values_in_ordinary_and_proved_dictionary_reads() {
+    for (dictionary, proved) in [(false, false), (true, false), (true, true)] {
+        let mut f = Fixture::new(4, dictionary);
+        for field in [FieldLocation::inline(1), FieldLocation::overflow(1)] {
+            let proof = f.object(dictionary, field);
+            for number in [0.0, -0.0, 41.0, 1.25, f64::INFINITY, f64::NAN] {
+                let byte = f.bank_byte(SLAB, field);
+                set_u64(
+                    &mut f.cells,
+                    byte,
+                    otter_vm::Value::double(number).to_bits(),
+                );
+                let before = f.cells.clone();
+                let (status, values, _) = f.run_mode(proof, [1, 8], proved);
+                assert_eq!(status, 1);
+                assert_eq!(values[0], otter_vm::Value::double(number).to_bits());
+                assert_eq!(f.cells, before);
+            }
+        }
+    }
 }

@@ -1,9 +1,9 @@
-//! Immediate loads and canonical value materialization for x86-64 native tiers.
+//! Immediate loads and Value materialization for x86-64 native tiers.
 //!
 //! # Contents
 //! - Immediate words and artifact-aware symbol loads.
 //! - Typed runtime-stub address loads into the call scratch register.
-//! - Canonical Int32/Float64 boxing with explicit scratch ownership.
+//! - Int32 and purified Double boxing with explicit scratch ownership.
 //!
 //! # Invariants
 //! - Address-bearing immediates carry their one relocation identity.

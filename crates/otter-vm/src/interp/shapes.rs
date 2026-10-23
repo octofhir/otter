@@ -286,9 +286,8 @@ impl Interpreter {
     /// prototype chain — the hidden class describing the slots it already has.
     ///
     /// Bootstrap installers build namespace objects (`Math`, `JSON`, `Reflect`,
-    /// `Atomics`, `Intl`, …) through the heap-only define path, which has no
-    /// shape runtime to take a transition from and so leaves them in dictionary
-    /// storage for life. Nothing can be cached on such an object: an inline
+    /// `Atomics`, `Intl`, …) through descriptor-oriented heap-only paths which
+    /// may leave them in dictionary storage. Nothing can be cached on such an object: an inline
     /// cache names its receiver by hidden class, and a dictionary object has
     /// none. Migrating on the first cache attach puts them back on the ordinary
     /// shaped path, where a validity cell can cover the complete chain.

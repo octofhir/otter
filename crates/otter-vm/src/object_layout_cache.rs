@@ -19,7 +19,8 @@
 //! - A dynamic hit borrows the caller's atom slice without allocation. A fixed
 //!   hit copies its retained token without atoms, root preparation or hashing.
 //! - Fixed slots contain no realm prototype or dynamic signature entry. Their
-//!   final shapes enter the same root walk as dynamic layouts.
+//!   immutable geometry enters the same root walk as dynamic layouts and is
+//!   independent of the values instances hold.
 //!
 //! # See also
 //! - [`crate::handles::ObjectLayout`] — stable hidden-class token.
@@ -76,7 +77,7 @@ impl ObjectLayoutCache {
             .chain(self.regexp.iter().flatten().map(ObjectLayout::shape_id))
     }
 
-    /// Read a fixed token before any root preparation or name lookup.
+    /// Read the fixed slot's immutable geometry without preparation.
     #[must_use]
     pub(crate) fn regexp(&self, kind: RegExpRecordLayout) -> Option<ObjectLayout> {
         self.regexp[kind as usize]

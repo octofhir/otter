@@ -15,6 +15,7 @@
 //!   override the default cage size before any heap is created.
 //! - [`Cage`] — process-global cage owning the 4 GiB virtual region
 //!   and the page free-list.
+//! - [`discard`] — address-preserving physical release of unused cage ranges.
 //!
 //! # Invariants
 //!
@@ -40,6 +41,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 use crate::page::PAGE_SIZE;
+
+pub(crate) mod discard;
 
 /// Default cage size when [`init_cage_with_size`] has not been
 /// called: 256 MiB on 64-bit hosts.
@@ -755,22 +758,9 @@ impl Cage {
 /// `ptr..ptr + len` is page-aligned, inside the cage reservation, and no
 /// live GC object refers to it.
 unsafe fn decommit_zeroed(ptr: *mut u8, len: usize) {
-    #[cfg(unix)]
-    {
-        // SAFETY: per docstring; MAP_FIXED replaces exactly this owned range.
-        let mapped = unsafe {
-            libc::mmap(
-                ptr.cast::<libc::c_void>(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if mapped == ptr.cast::<libc::c_void>() {
-            return;
-        }
+    // SAFETY: per docstring; the range is aligned and exclusively owned.
+    if unsafe { discard::remap_zeroed(ptr, len) } {
+        return;
     }
     // SAFETY: per docstring.
     unsafe { core::ptr::write_bytes(ptr, 0, len) };

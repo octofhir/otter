@@ -36,16 +36,20 @@ pub(crate) struct FieldStoreOwner {
     pub(crate) stored_shapes: SmallVec<[u32; 2]>,
     pub(crate) nullish_mask: u8,
     pub(crate) int32: bool,
+    /// Encoded Double membership, including integral Double words.
+    pub(crate) double: bool,
     pub(crate) int32_constant: Option<i32>,
 }
 
 /// Every category a stored value can have once its store completes: at most
-/// two exact ordinary shapes, int32 numbers and nullish alternatives.
+/// two exact ordinary shapes, Int32/Double words and nullish alternatives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoreValueBound {
     pub(crate) shapes: SmallVec<[u32; 2]>,
     pub(crate) nullish: u8,
     pub(crate) int32: bool,
+    /// Encoded Double membership, including integral Double words.
+    pub(crate) double: bool,
     pub(crate) int32_constant: Option<i32>,
 }
 
@@ -56,6 +60,7 @@ impl StoreValueBound {
             shapes: smallvec::smallvec![shape],
             nullish: 0,
             int32: false,
+            double: false,
             int32_constant: None,
         }
     }
@@ -73,6 +78,7 @@ impl StoreValueBound {
             shapes,
             nullish: self.nullish,
             int32: self.int32,
+            double: self.double,
             int32_constant: self.int32_constant,
         })
     }
@@ -93,6 +99,7 @@ impl FieldStoreOwner {
             stored_shapes: record.stored_shapes.clone(),
             nullish_mask: record.nullish_mask,
             int32: record.guard.expected & field_type::INT32 != 0,
+            double: record.guard.expected & field_type::DOUBLE != 0,
             int32_constant: field_type::int32_constant(record.guard.expected),
         }
     }
@@ -104,6 +111,7 @@ impl FieldStoreOwner {
                 || (record.guard.expected & field_type::INT32 != 0
                     && field_type::int32_constant(record.guard.expected)
                         .is_none_or(|value| bound.int32_constant == Some(value))))
+            && (!bound.double || record.guard.expected & field_type::DOUBLE != 0)
             && bound
                 .shapes
                 .iter()

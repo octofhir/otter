@@ -274,6 +274,18 @@ fn int32_add_returns_boxed_sum() {
     seed(&mut view, &[0], ARITH_INT32);
     let (result, _) = run(&view, &[int(40), int(2)]);
     assert_eq!(returned(result), int(42));
+    let (result, _) = run(
+        &view,
+        &[Value::double(40.0).to_bits(), Value::double(2.0).to_bits()],
+    );
+    assert_eq!(returned(result), int(42));
+    let original = [Value::double(-0.0).to_bits(), int(0)];
+    let (result, window) = run(&view, &original);
+    assert_eq!(
+        result.validate(NativeResultDomain::Compiled),
+        Some(NativeResultStatus::SideExit)
+    );
+    assert_eq!(&window[..2], &original);
 }
 
 #[test]
@@ -637,7 +649,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::Float64Math(MathOp::Sqrt),
         Kind::Float64Math(MathOp::Pow),
         Kind::Float64Compare(condition),
-        Kind::CheckedTaggedToInt32,
+        Kind::CheckedNumberToInt32,
         Kind::CheckedTaggedToFloat64,
         Kind::Int32ToTagged,
         Kind::Float64ToTagged,
@@ -674,10 +686,20 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::LoadPresentElement,
         Kind::CheckHoleyElementPresent(holes),
         Kind::LoadOwnField { field, atom: 0 },
+        Kind::LoadNumberOwnField {
+            double_only: false,
+            field,
+            atom: 0,
+        },
         Kind::LoadArrayExpando(JitArrayLayout::default()),
         Kind::StringCharCodeAt,
         Kind::LoadFunctionBag,
         Kind::StoreOwnField {
+            field,
+            atom: 0,
+            owners: Default::default(),
+        },
+        Kind::StoreDoubleOwnField {
             field,
             atom: 0,
             owners: Default::default(),
@@ -689,6 +711,21 @@ fn every_kind() -> Vec<super::ir::Kind> {
             receiver_shape: None,
         },
         Kind::StoreNamedProperty {
+            plan: super::ir::NamedStorePlan::Programs,
+            byte_pc: 0,
+            owners: Default::default(),
+            receiver_shape: None,
+            fresh: false,
+        },
+        Kind::StoreNamedProperty {
+            plan: super::ir::NamedStorePlan::TransitionTagged(0),
+            byte_pc: 0,
+            owners: Default::default(),
+            receiver_shape: None,
+            fresh: false,
+        },
+        Kind::StoreNamedProperty {
+            plan: super::ir::NamedStorePlan::TransitionDouble(0),
             byte_pc: 0,
             owners: Default::default(),
             receiver_shape: None,
@@ -882,7 +919,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::Float64Mod
         | K::Float64Math(_)
         | K::Float64Compare(_)
-        | K::CheckedTaggedToInt32
+        | K::CheckedNumberToInt32
         | K::CheckedTaggedToFloat64
         | K::Int32ToTagged
         | K::Float64ToTagged
@@ -907,10 +944,12 @@ fn listed(kind: &super::ir::Kind) {
         | K::LoadPresentElement
         | K::CheckHoleyElementPresent(_)
         | K::LoadOwnField { .. }
+        | K::LoadNumberOwnField { .. }
         | K::LoadArrayExpando(_)
         | K::StringCharCodeAt
         | K::LoadFunctionBag
         | K::StoreOwnField { .. }
+        | K::StoreDoubleOwnField { .. }
         | K::LoadShapedProperty { .. }
         | K::LoadNamedProperty { .. }
         | K::StoreNamedProperty { .. }

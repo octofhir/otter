@@ -52,6 +52,11 @@ fn node(
         .push(super::super::super::regalloc::NodeAllocation {
             inputs: inputs.iter().copied().collect(),
             result,
+            fp_temps: if matches!(graph.node(id).kind, Kind::LoadOwnField { .. }) {
+                smallvec::smallvec![13]
+            } else {
+                smallvec::SmallVec::new()
+            },
             ..Default::default()
         });
     id

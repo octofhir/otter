@@ -5,7 +5,7 @@
 //! keeps the word the compile captured, and a context slot the compile read
 //! as a constant keeps its value. Installation verifies each fact and
 //! subscribes the generation to it; the writer that clears the shape's
-//! stability byte, widens its summary or writes the slot sets the
+//! stability byte, widens its summary, or writes the slot sets the
 //! generation's [`DependencyFlag`]. Generated code tests its own flag where
 //! it first relies on such a fact after entry or after code that can break
 //! one, and leaves through a deopt when the flag is set.

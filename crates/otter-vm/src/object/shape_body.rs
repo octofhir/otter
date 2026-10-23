@@ -52,7 +52,7 @@
 //!   summary fires the shape's subscribers of that kind before returning.
 //! - Append descendants share each ancestor's data-field summary. Its scalar
 //!   shape identities are historical and require stable targets for a proof.
-//! - Transition/cache mutation belongs to interpreter-owned side tables.
+//! - Transition/cache mutation belongs to the heap-owned shape interner.
 //!   A shape names its key table at
 //!   allocation and never changes it; the table grows in place only past
 //!   every naming shape's key count (see [`super::shape_keys`]).
@@ -62,7 +62,7 @@
 //! - The C layout exposes layout fields and monotone scalar summaries to generated
 //!   probes; shapes live in non-moving old space, so a handle
 //!   never relocates. Shapes are collectable (see
-//!   [`super::shape_runtime`]); an id is never reused, a handle may be once
+//!   [`super::shape_interner`]); an id is never reused, a handle may be once
 //!   its shape is collected.
 //!
 //! # See also
@@ -201,6 +201,8 @@ pub(crate) const SHAPE_BODY_PROTOTYPE_OFFSET: usize = std::mem::offset_of!(Shape
 pub(crate) const SHAPE_BODY_KEYS_OFFSET: usize = std::mem::offset_of!(ShapeBody, keys);
 pub(crate) const SHAPE_BODY_PARENT_OFFSET: usize = std::mem::offset_of!(ShapeBody, parent);
 pub(crate) const SHAPE_BODY_ATOM_OFFSET: usize = std::mem::offset_of!(ShapeBody, transition_atom);
+pub(crate) const SHAPE_BODY_FIELD_OFFSET: usize = std::mem::offset_of!(ShapeBody, own_field);
+
 pub(crate) const SHAPE_BODY_ACCESSOR_OFFSET: usize =
     std::mem::offset_of!(ShapeBody, own_is_accessor);
 
@@ -233,6 +235,7 @@ impl ShapeBody {
             own_flags: PropertyFlags::data_default(),
             own_is_accessor: false,
             inline_capacity: inline_capacity as u8,
+
             previous_layout_root,
             state,
             prototype,
@@ -657,12 +660,28 @@ pub(super) fn field_owner(mut shape: ShapeHandle, logical_slot: u32) -> Option<S
     }
 }
 
+/// Actual storage location of any ordinary slot, including accessor words.
+pub(crate) fn field_location(
+    shape: ShapeHandle,
+    logical_slot: u32,
+) -> Option<super::FieldLocation> {
+    if shape.is_null() || is_dictionary_of(shape) || logical_slot >= property_count_of(shape) {
+        return None;
+    }
+    Some(super::FieldLocation::for_slot(
+        logical_slot,
+        inline_capacity_of(shape),
+    ))
+}
+
+/// Current summary of the data field introduced by this shape.
 pub(super) fn field_type_snapshot(shape: ShapeHandle) -> u64 {
     let body = body_of(shape);
     debug_assert!(!body.is_root() && !body.own_is_accessor && !body.is_dictionary());
     body.field_type.load(Ordering::Relaxed)
 }
 
+/// Publish a widening through the defining field's existing watch owner.
 pub(super) fn set_field_type_snapshot(shape: ShapeHandle, value: u64) {
     let body = body_of(shape);
     debug_assert!(!body.is_root() && !body.own_is_accessor && !body.is_dictionary());
@@ -929,7 +948,7 @@ pub(crate) fn shape_offset_of_key(
 /// Walk `shape`'s parent chain and return the slot for a UTF-8 property key.
 ///
 /// This is the mutation-free bridge used by object helpers that do not have a
-/// mutable [`super::shape_runtime::ShapeRuntime`] borrow. Hot paths should keep
+/// mutable interpreter facade borrow. Hot paths should keep
 /// using the runtime cache; this helper lets legacy object code read ShapeBody
 /// state without interning or mutating side tables.
 /// Walk `shape`'s parent chain and return the slot for an interned atom.
@@ -1065,6 +1084,27 @@ pub(crate) fn property_count_of(shape: ShapeHandle) -> u32 {
             .cast::<ShapeBody>()))
         .property_count
     }
+}
+
+/// Validate the immutable ordinary append geometry accepted by generated stores.
+pub(crate) fn append_geometry_matches(
+    parent: ShapeHandle,
+    target: ShapeHandle,
+    field: super::FieldLocation,
+) -> bool {
+    if parent.is_null() || target.is_null() {
+        return false;
+    }
+    let source = body_of(parent);
+    let child = body_of(target);
+    source.state == ShapeState::ORDINARY
+        && child.state == ShapeState::ORDINARY
+        && child.parent == parent
+        && child.inline_capacity == source.inline_capacity
+        && child.property_count == source.property_count + 1
+        && child.own_field == field
+        && !child.own_is_accessor
+        && child.own_flags == PropertyFlags::data_default()
 }
 
 /// Return the transition key installed at `offset`, if the shape contains one.

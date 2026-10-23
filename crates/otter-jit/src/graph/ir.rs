@@ -16,7 +16,8 @@
 //! - [`Kind::slow_path_stubs`] — the runtime stubs a node's code may call.
 //! - [`Constraints`] / [`Kind::constraints`] — where the register allocator
 //!   must put inputs, the result, and how many temporaries a node needs.
-//! - Named-load plans retain ordered indices into their source body's programs.
+//! - Named-load plans and selected appends retain indices into their source
+//!   body's geometry-certified programs.
 //! - Field-summary checks authorize nullable value bounds; own stores select
 //!   their defining field cell by the receiver's admitted shape.
 //!
@@ -88,6 +89,29 @@ pub(crate) enum Repr {
 impl Repr {
     pub(crate) fn is_float(self) -> bool {
         self == Self::Float64
+    }
+}
+
+/// Selection into the source site's existing immutable store programs.
+/// Static transitions use that program's immutable append geometry; every
+/// miss-capable source/prototype/admission guard still precedes the write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum NamedStorePlan {
+    Programs,
+    TransitionTagged(u8),
+    TransitionDouble(u8),
+}
+
+impl NamedStorePlan {
+    pub(crate) const fn program(self) -> Option<u8> {
+        match self {
+            Self::Programs => None,
+            Self::TransitionTagged(index) | Self::TransitionDouble(index) => Some(index),
+        }
+    }
+
+    pub(crate) const fn is_double(self) -> bool {
+        matches!(self, Self::TransitionDouble(_))
     }
 }
 
@@ -405,14 +429,14 @@ pub(crate) enum Kind {
     Float64Compare(Condition),
 
     // ---- Conversions ----
-    /// Tagged int32 to Int32; eager deopt for anything else.
-    CheckedTaggedToInt32,
+    /// An exact int32 Number in either Value encoding to Int32; eager deopt
+    /// for a fraction, out-of-range Number, negative zero or non-number.
+    CheckedNumberToInt32,
     /// Tagged number (int32 or double) to Float64; eager deopt otherwise.
     CheckedTaggedToFloat64,
     /// Box an int32.
     Int32ToTagged,
-    /// Box a double in the canonical number encoding (integral int32 values
-    /// other than -0 become int32 words).
+    /// Encode a purified Double word, including integral values and -0.
     Float64ToTagged,
     Int32ToFloat64,
     /// ECMAScript `ToInt32` of a double.
@@ -516,6 +540,14 @@ pub(crate) enum Kind {
         field: otter_vm::object::FieldLocation,
         atom: u32,
     },
+    /// Read a purely numeric field under its defining summary proof.
+    /// Double-only words decode directly; a mixed domain first tests Int32.
+    /// Undefined and every non-number are excluded by that same owner proof.
+    LoadNumberOwnField {
+        double_only: bool,
+        field: otter_vm::object::FieldLocation,
+        atom: u32,
+    },
     /// Tagged live named storage of actual Array input0; miss before effects.
     LoadArrayExpando(otter_vm::jit::JitArrayLayout),
     /// The UTF-16 code unit of string input0 at int32 index input1, as an
@@ -531,6 +563,13 @@ pub(crate) enum Kind {
     /// `owners` pairs each admitted receiver shape with its selected record;
     /// it is empty when no arm observes.
     StoreOwnField {
+        field: otter_vm::object::FieldLocation,
+        atom: u32,
+        owners: SmallVec<[(u32, FieldStoreOwner); 4]>,
+    },
+    /// Encode Float64 input1 as a Value-valid Double word in input0's field.
+    /// The numeric word is observed after publication; it never needs a pointer barrier.
+    StoreDoubleOwnField {
         field: otter_vm::object::FieldLocation,
         atom: u32,
         owners: SmallVec<[(u32, FieldStoreOwner); 4]>,
@@ -560,8 +599,12 @@ pub(crate) enum Kind {
     /// matches; the value's own barrier is a separate node. A `fresh`
     /// receiver was bump-allocated on this path with no call, collection or
     /// poll since, so no code can have given it a prototype role or made it
-    /// non-extensible: neither is re-checked.
+    /// non-extensible: neither is re-checked. Static plans select one source
+    /// program's immutable geometry; a Double plan consumes Float64 input1,
+    /// every other plan consumes its Value-valid tagged word. All guards leave
+    /// before the source operation's first effect.
     StoreNamedProperty {
+        plan: NamedStorePlan,
         byte_pc: u32,
         owners: SmallVec<[FieldStoreOwner; 4]>,
         receiver_shape: Option<u32>,
@@ -985,6 +1028,7 @@ impl Kind {
             | Self::LogicalNot
             | Self::TestTypeOf { .. }
             | Self::LoadOwnField { .. }
+            | Self::LoadNumberOwnField { .. }
             | Self::LoadTaggedField(_)
             | Self::LoadContextParent
             | Self::LoadClosureContext
@@ -1009,7 +1053,7 @@ impl Kind {
             | Self::Int32Mod
             | Self::Int32Negate
             | Self::Int32ShiftRightLogical
-            | Self::CheckedTaggedToInt32
+            | Self::CheckedNumberToInt32
             | Self::CheckedTaggedToFloat64
             | Self::CheckedFloat64ToInt32
             | Self::CheckedTaggedToIndex
@@ -1111,6 +1155,7 @@ impl Kind {
                 ..Properties::default()
             },
             Self::StoreOwnField { .. }
+            | Self::StoreDoubleOwnField { .. }
             | Self::StoreTaggedField(_)
             | Self::StoreElement(_)
             | Self::WriteBarrier
@@ -1187,7 +1232,9 @@ impl Kind {
                 abi::STUB_STRICT_EQ_LEAF,
             ],
             Self::PrimitiveCompare(_) => &[abi::STUB_PRIMITIVE_STRING_ORDER],
-            Self::StoreOwnField { .. } => &[abi::STUB_FIELD_TYPE_OBSERVE],
+            Self::StoreOwnField { .. } | Self::StoreDoubleOwnField { .. } => {
+                &[abi::STUB_FIELD_TYPE_OBSERVE]
+            }
             Self::StoreNamedProperty { .. } => &[
                 abi::STUB_FIELD_TYPE_OBSERVE,
                 abi::STUB_SHAPE_LEFT,
@@ -1471,10 +1518,11 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::StoreNamedProperty { .. } => Constraints {
+            Self::StoreNamedProperty { plan, .. } => Constraints {
+                // Register class follows each input's representation.
                 inputs: registers(2),
                 result: ResultPolicy::None,
-                gp_temps: 2,
+                gp_temps: if plan.is_double() { 3 } else { 2 },
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
@@ -1516,14 +1564,16 @@ impl Kind {
             Self::StoreKeyedCached { .. } => Constraints {
                 inputs: registers(3),
                 result: ResultPolicy::None,
-                gp_temps: 2,
+                // Decode the numeric index separately; misses retain the
+                // original Tagged key for the committed operation.
+                gp_temps: 3,
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
             Self::LoadKeyedCached { .. } => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::Register,
-                gp_temps: 2,
+                gp_temps: 3,
                 fp_temps: 1,
                 fixed_gp_clobbers: SmallVec::new(),
             },
@@ -1585,13 +1635,11 @@ impl Kind {
             Self::Int32Negate
             | Self::Int32BitNot
             | Self::Float64Negate
-            | Self::CheckedTaggedToInt32
             | Self::Int32ToTagged
             | Self::Int32ToFloat64
             | Self::TruncateFloat64ToInt32
             | Self::CheckedFloat64ToInt32
             | Self::CheckedFloat64ToIndex
-            | Self::LoadOwnField { .. }
             | Self::LoadTaggedField(_)
             | Self::LoadContextParent
             | Self::LoadClosureContext
@@ -1601,21 +1649,27 @@ impl Kind {
             | Self::LoadArrayLength { .. }
             | Self::LoadTypedArrayLength
             | Self::BooleanToInt32 => simple(1, ResultPolicy::Register),
-            Self::CheckedTaggedToFloat64 | Self::Float64ToTagged | Self::CheckedTaggedToIndex => {
-                Constraints {
-                    inputs: registers(1),
-                    result: ResultPolicy::Register,
-                    gp_temps: 0,
-                    fp_temps: 1,
-                    fixed_gp_clobbers: SmallVec::new(),
-                }
-            }
+            Self::LoadOwnField { .. } | Self::Float64ToTagged => simple(1, ResultPolicy::Register),
+            Self::LoadNumberOwnField { .. } => simple(1, ResultPolicy::Register),
+            Self::CheckedNumberToInt32
+            | Self::CheckedTaggedToFloat64
+            | Self::CheckedTaggedToIndex => Constraints {
+                inputs: registers(1),
+                result: ResultPolicy::Register,
+                gp_temps: 0,
+                fp_temps: 1,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
             Self::ToBoolean | Self::LogicalNot => simple(1, ResultPolicy::Register),
             Self::CheckNumber => simple(1, ResultPolicy::None),
             Self::CheckNotNullish { .. } => simple(1, ResultPolicy::None),
             Self::CheckShapes { .. } | Self::CheckElements { .. } => simple(1, ResultPolicy::None),
             Self::StoreOwnField { owners, .. } => Constraints {
                 gp_temps: u8::from(!owners.is_empty()),
+                ..simple(2, ResultPolicy::None)
+            },
+            Self::StoreDoubleOwnField { owners, .. } => Constraints {
+                gp_temps: 1 + u8::from(!owners.is_empty()),
                 ..simple(2, ResultPolicy::None)
             },
             Self::StoreTaggedField(_) => simple(2, ResultPolicy::None),

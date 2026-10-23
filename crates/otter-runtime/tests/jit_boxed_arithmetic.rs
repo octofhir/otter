@@ -3,14 +3,14 @@
 //! # Contents
 //! - Fractional and overflowing values after Int32 warmup.
 //! - Pre-operation coercion exits after committed property reads.
-//! - Optimized double results box bit-exactly to the canonical Number
-//!   encoding across Int32 edges, -0, NaN, subnormals and infinities.
+//! - Optimized Float64 results preserve Double words across integral values,
+//!   -0, NaN, subnormals and infinities.
 //!
 //! # Invariants
-//! - A field representation change exits each dependent body at most twice;
-//!   the bodies re-optimize over the generalized representation.
+//! - Widening a stored-value category exits dependent bodies at most twice;
+//!   the bodies re-optimize over the generalized numeric domain.
 //! - A failed Number guard never repeats a getter or coercion effect.
-//! - Boxing chooses Int32 exactly for an integral non-`-0` int32 value.
+//! - Float64 boxing purifies NaN and preserves its Double encoding.
 
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
 use otter_vm::native_abi::{CodeLifetimeState, NativeFrameKind};
@@ -169,7 +169,7 @@ function isProduct(left, right, expected) {
 }
 
 #[test]
-fn optimized_float64_boxing_matches_canonical_number_bits() {
+fn optimized_float64_boxing_preserves_double_words() {
     let mut runtime = Runtime::builder()
         .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
@@ -256,8 +256,8 @@ sink;
                 .unwrap();
             assert_eq!(
                 bits,
-                otter_vm::Value::number_f64(expected).to_bits(),
-                "{name}({literal}) must box canonically"
+                otter_vm::Value::double(expected).to_bits(),
+                "{name}({literal}) must preserve its purified Double word"
             );
         }
     }

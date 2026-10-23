@@ -57,7 +57,11 @@ impl Codegen<'_> {
         let assigned = self.allocation.node(node).clone();
         let input = |i| Self::gp(assigned.inputs[i]);
         let (receiver, key, value) = (input(0), input(1), input(2));
-        let (length, base) = (assigned.gp_temps[0], assigned.gp_temps[1]);
+        let (length, base, index) = (
+            assigned.gp_temps[0],
+            assigned.gp_temps[1],
+            assigned.gp_temps[2],
+        );
         let storage = JitArrayStorage::current();
         let numeric = storage.numeric;
         let other = self.ops.new_dynamic_label();
@@ -74,11 +78,11 @@ impl Codegen<'_> {
             ; test Rq(receiver), r10 ; jnz =>other
             ; cmp BYTE [Rq(receiver)], storage.type_tag as i8 ; jne =>not_array
             ; cmp BYTE [Rq(receiver) + storage.own_guard_byte as i32], 0 ; jne =>runtime
-            // A non-negative int32 key below the live dense length.
-            ; mov r10, Rq(key) ; sar r10, 49 ; cmp r10, -1 ; jne =>runtime
-            ; test Rd(key), Rd(key) ; js =>runtime
+        );
+        crate::x86_64::index::emit_number_index(&mut self.ops, key, index, 15, runtime);
+        dynasm!(self.ops ; .arch x64
             ; mov Rd(length), [Rq(receiver) + storage.length_byte as i32]
-            ; cmp Rd(length), Rd(key) ; ja =>in_bounds ; jne =>runtime
+            ; cmp Rd(length), Rd(index) ; ja =>in_bounds ; jne =>runtime
         );
         // A key at the length appends: inline into tagged storage whose
         // dense prefix is its whole length while it has room, else through
@@ -93,9 +97,9 @@ impl Codegen<'_> {
             ; cmp Rd(length), DWORD [Rq(receiver) + storage.capacity_byte as i32]
             ; jae =>leaf
             ; mov Rq(base), [Rq(receiver) + storage.base_byte as i32]
-            ; mov r10d, Rd(key) ; mov [Rq(base) + r10 * 8], Rq(value)
+            ; mov r10d, Rd(index) ; mov [Rq(base) + r10 * 8], Rq(value)
         );
-        self.emit_element_write_barrier(node, base, key, value, &[receiver, length, base]);
+        self.emit_element_write_barrier(node, base, index, value, &[receiver, length, base]);
         dynasm!(self.ops ; .arch x64
             ; lea r10d, [Rq(length) + 1]
             ; mov DWORD [Rq(receiver) + storage.length_byte as i32], r10d
@@ -117,34 +121,34 @@ impl Codegen<'_> {
         emit_tagged_number_to_float(&mut self.ops, value, 15, runtime);
         dynasm!(self.ops ; .arch x64 ; jmp =>store_double ; =>holey);
         emit_tagged_number_to_float(&mut self.ops, value, 15, runtime);
-        self.emit_hole_bit(numeric, base, key);
+        self.emit_hole_bit(numeric, base, index);
         dynasm!(self.ops ; .arch x64 ; jnc =>store_double);
         self.emit_hole_store_permit(storage, receiver, runtime);
         // The length is dead past the bounds check.
-        self.emit_fill_hole(numeric, receiver, base, key, length);
+        self.emit_fill_hole(numeric, receiver, base, index, length);
         dynasm!(self.ops ; .arch x64
             ; =>store_double
-            ; mov r10d, Rd(key) ; movsd [Rq(base) + r10 * 8], xmm15
+            ; mov r10d, Rd(index) ; movsd [Rq(base) + r10 * 8], xmm15
             ; jmp =>done
             ; =>tagged
         );
         self.load_immediate(11, tag::VALUE_HOLE);
         dynasm!(self.ops ; .arch x64
-            ; mov r10d, Rd(key) ; cmp [Rq(base) + r10 * 8], r11 ; jne =>store_tagged
+            ; mov r10d, Rd(index) ; cmp [Rq(base) + r10 * 8], r11 ; jne =>store_tagged
         );
         self.emit_hole_store_permit(storage, receiver, runtime);
         dynasm!(self.ops ; .arch x64
             ; =>store_tagged
-            ; mov r10d, Rd(key) ; mov [Rq(base) + r10 * 8], Rq(value)
+            ; mov r10d, Rd(index) ; mov [Rq(base) + r10 * 8], Rq(value)
         );
-        self.emit_element_write_barrier(node, base, key, value, &[]);
+        self.emit_element_write_barrier(node, base, index, value, &[]);
         let typed_tag = JitTypedArrayStorage::current().type_tag;
         dynasm!(self.ops ; .arch x64
             ; jmp =>done
             ; =>not_array
             ; cmp BYTE [Rq(receiver)], typed_tag as i8 ; jne =>other
         );
-        self.emit_typed_view_store([receiver, key, value], [length, base], runtime, done);
+        self.emit_typed_view_store([receiver, key, value], [length, base, index], runtime, done);
         dynasm!(self.ops ; .arch x64 ; =>other);
         self.emit_keyed_table_store(node, [receiver, key, value], runtime, done);
         dynasm!(self.ops ; .arch x64 ; =>runtime);
@@ -169,7 +173,7 @@ impl Codegen<'_> {
     fn emit_typed_view_store(
         &mut self,
         [receiver, key, value]: [u8; 3],
-        [kind, base]: [u8; 2],
+        [kind, base, index]: [u8; 3],
         refused: DynamicLabel,
         stored: DynamicLabel,
     ) {
@@ -180,9 +184,8 @@ impl Codegen<'_> {
         let clamped = self.ops.new_dynamic_label();
         let integer = self.ops.new_dynamic_label();
         let float = self.ops.new_dynamic_label();
+        crate::x86_64::index::emit_number_index(&mut self.ops, key, index, 15, refused);
         dynasm!(self.ops ; .arch x64
-            ; mov r10, Rq(key) ; sar r10, 49 ; cmp r10, -1 ; jne =>refused
-            ; test Rd(key), Rd(key) ; js =>refused
             // The cached base stands for the buffer's liveness and extent
             // only while no buffer was ever detached.
             ; mov Rq(base), [Rq(receiver) + view.data_byte as i32]
@@ -191,7 +194,7 @@ impl Codegen<'_> {
             ; mov r10, [r10 + crate::entry::VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET as i32]
             ; test r10, r10 ; jz =>refused
             ; cmp BYTE [r10], 0 ; jne =>refused
-            ; mov r10d, Rd(key)
+            ; mov r10d, Rd(index)
             ; cmp QWORD [Rq(receiver) + view.length_byte as i32], r10 ; jbe =>refused
             ; mov Rd(kind), [Rq(receiver) + view.kind_byte as i32]
             ; mov r11, Rq(value) ; sar r11, 49 ; cmp r11, -1 ; jne =>double

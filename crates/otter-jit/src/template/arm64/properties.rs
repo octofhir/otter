@@ -100,7 +100,9 @@ fn emit_inline_own_field(
         ; ldp w13, w14, [X(slot), IC.inline_shape_byte as i32]
         ; cmp w15, w13
         ; b.ne =>miss
+        ; mov w15, w14
         ; tbnz w14, 31, =>inline
+        ; and w14, w14, #otter_vm::object::FieldLocation::INDEX_MASK
         ; ldr w16, [X(receiver), layout.slab_handle_byte]
         ; cbz w16, =>miss
         ; and x17, X(receiver), #0xffff_ffff_0000_0000
@@ -108,7 +110,7 @@ fn emit_inline_own_field(
         ; add x16, x16, #layout.slab_words_byte
         ; b =>ready
         ; =>inline
-        ; and w14, w14, #0x7fff_ffff
+        ; and w14, w14, #otter_vm::object::FieldLocation::INDEX_MASK
         ; add x16, XSP(receiver), #layout.inline_values_byte
         ; =>ready
     );
@@ -202,6 +204,7 @@ pub(super) fn emit_intrinsic_loads(
                     ; b.ne =>next
                     ; ldr x9, [x9, slot.byte]
                 );
+
                 output.emit(ops);
                 dynasm!(ops ; .arch aarch64
                     ; b =>done
@@ -287,6 +290,7 @@ pub(super) fn emit_intrinsic_loads(
                 }
                 Op::LoadField { field, .. } => {
                     ic_probe::emit_load_field(ops, relocations, view, 15, field, next);
+
                     output.emit(ops);
                     dynasm!(ops ; .arch aarch64 ; b =>done);
                 }
@@ -353,6 +357,9 @@ pub(super) fn emit_load_property(
     dynasm!(ops
         ; .arch aarch64
         ; ldr x9, [x16, x14, lsl #3]
+    );
+
+    dynasm!(ops ; .arch aarch64
         ; str x9, [x19, dst_off]
         ; b =>done
         ; =>shared
@@ -400,6 +407,8 @@ pub(super) fn emit_store_property(
     dynasm!(ops
         ; .arch aarch64
         ; ldr X(STORE_VALUE), [x19, src_off]
+    );
+    dynasm!(ops ; .arch aarch64
         ; str X(STORE_VALUE), [x16, x14, lsl #3]
         ; ldr W(STORE_SLOT), [X(STORE_SLOT), IC.inline_owner_byte]
     );

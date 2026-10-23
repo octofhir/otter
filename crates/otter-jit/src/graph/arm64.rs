@@ -12,6 +12,7 @@
 //! - Array lengths skip receiver guards only with an immutable body proof;
 //!   every length retains its full-width int32-range guard.
 //! - Defining field-summary observation after own stores and shape publication.
+//! - Numeric stores encode SSA directly into Value-valid field words.
 //! - Non-converting nullish comparisons preserve shape and field facts.
 //! - Node emitters for frame, arithmetic, conversion, check, memory, generic
 //!   and control nodes.
@@ -37,6 +38,9 @@
 //!   noncollecting leaf after the store and any child-shape publication.
 //! - Static stores use their source snapshot's captured membership only for
 //!   the defining owner selected by the destination shape and logical field.
+//! - Selected append programs retain descriptor, prototype and capacity guards
+//!   before effects. Their FP RHS is encoded into a separate GP word, preserving
+//!   canonical recovery and other live uses without a representation transition.
 //! - Cold exits materialize their selected canonical recipe, expire homes
 //!   outside it, then pass its index to writeback. Throw routing expires all
 //!   allocator homes after catch writeback; the rooted window and reserved
@@ -76,7 +80,9 @@ use super::builder::Built;
 use super::call::{CommittedArgument, IntrinsicMethod};
 use super::emission::{Emission, ExitSite};
 use super::frame::{SlotLayout, exit_reason};
-use super::ir::{BlockId, BranchKind, Condition, DeoptReason, Graph, Kind, MathOp, NodeId, Repr};
+use super::ir::{
+    BlockId, BranchKind, Condition, DeoptReason, Graph, Kind, MathOp, NamedStorePlan, NodeId, Repr,
+};
 use super::metadata::{self, FIRST_SITE_SAFEPOINT};
 use super::regalloc::{Allocation, Location, Move};
 use crate::Unsupported;
@@ -1649,18 +1655,12 @@ impl<'a> Codegen<'a> {
                 dynasm!(self.ops ; .arch aarch64 ; fcmp D(a), D(b));
                 self.emit_cset_bool(destination, *condition, true);
             }
-            Kind::CheckedTaggedToInt32 => {
+            Kind::CheckedNumberToInt32 => {
                 let a = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
+                let double = allocation.fp_temps[0];
                 let exit = self.eager_exit(node, DeoptReason::WrongType);
-                // An int32 word has the top 15 bits all set.
-                dynasm!(self.ops
-                    ; .arch aarch64
-                    ; asr x16, X(a), INT32_TAG_SHIFT
-                    ; cmn x16, 1
-                    ; b.ne =>exit
-                    ; mov W(destination), W(a)
-                );
+                crate::arm64::index::emit_exact_int32(&mut self.ops, a, destination, double, exit);
             }
             Kind::CheckedTaggedToFloat64 => {
                 let a = Self::gp(input(0));
@@ -1971,6 +1971,7 @@ impl<'a> Codegen<'a> {
                 self.emit_store_element(element, base, index, input(2))?;
             }
             Kind::LoadOwnField { field, .. } => {
+                let field = *field;
                 let object = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
                 own_fields::emit(
@@ -1978,7 +1979,7 @@ impl<'a> Codegen<'a> {
                     self.view.field_layout,
                     object,
                     destination,
-                    *field,
+                    field,
                     if data.repr == Repr::Int32 {
                         crate::field_access::FieldAccess::LoadInt32
                     } else {
@@ -1986,15 +1987,54 @@ impl<'a> Codegen<'a> {
                     },
                 );
             }
-            Kind::StoreOwnField { field, owners, .. } => {
+            Kind::LoadNumberOwnField {
+                field, double_only, ..
+            } => {
+                let field = *field;
+                let object = Self::gp(input(0));
+                let destination = Self::fp(result.expect("numeric own-field result"));
+                let double_only = *double_only;
+                own_fields::emit(
+                    &mut self.ops,
+                    self.view.field_layout,
+                    object,
+                    16,
+                    field,
+                    crate::field_access::FieldAccess::LoadTagged,
+                );
+                crate::arm64::field_word::emit_decode_number(
+                    &mut self.ops,
+                    16,
+                    destination,
+                    17,
+                    double_only,
+                );
+            }
+            Kind::StoreOwnField { field, owners, .. }
+            | Kind::StoreDoubleOwnField { field, owners, .. } => {
+                let field = *field;
                 let owners = owners.clone();
-                let (object, value) = (Self::gp(input(0)), Self::gp(input(1)));
+                let object = Self::gp(input(0));
+                let value = match &data.kind {
+                    Kind::StoreDoubleOwnField { .. } => {
+                        let physical = allocation.gp_temps[usize::from(!owners.is_empty())];
+                        crate::arm64::field_word::emit_encode_double(
+                            &mut self.ops,
+                            Self::fp(input(1)),
+                            physical,
+                            16,
+                        );
+                        physical
+                    }
+                    Kind::StoreOwnField { .. } => Self::gp(input(1)),
+                    _ => unreachable!(),
+                };
                 own_fields::emit(
                     &mut self.ops,
                     self.view.field_layout,
                     object,
                     value,
-                    *field,
+                    field,
                     crate::field_access::FieldAccess::Store,
                 );
                 if !owners.is_empty() {
@@ -2132,14 +2172,20 @@ impl<'a> Codegen<'a> {
                 owners,
                 receiver_shape,
                 fresh,
+                plan,
             } => {
-                let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
+                let receiver = Self::gp(input(0));
+                let value = if plan.is_double() {
+                    Self::fp(input(1))
+                } else {
+                    Self::gp(input(1))
+                };
                 let [holder, scratch] = [allocation.gp_temps[0], allocation.gp_temps[1]];
-                let (byte_pc, owners, receiver_shape, fresh) =
-                    (*byte_pc, owners.clone(), *receiver_shape, *fresh);
+                let (byte_pc, owners, receiver_shape, fresh, plan) =
+                    (*byte_pc, owners.clone(), *receiver_shape, *fresh, *plan);
                 self.emit_store_named_property(
                     node,
-                    (byte_pc, receiver_shape, fresh),
+                    (byte_pc, receiver_shape, fresh, plan),
                     &owners,
                     [receiver, value],
                     [holder, scratch],
@@ -2186,7 +2232,11 @@ impl<'a> Codegen<'a> {
             Kind::StoreKeyedCached { .. } => {
                 let (receiver, key, value) =
                     (Self::gp(input(0)), Self::gp(input(1)), Self::gp(input(2)));
-                let temps = [allocation.gp_temps[0], allocation.gp_temps[1]];
+                let temps = [
+                    allocation.gp_temps[0],
+                    allocation.gp_temps[1],
+                    allocation.gp_temps[2],
+                ];
                 self.emit_store_keyed_cached(node, [receiver, key, value], temps)?;
             }
             Kind::RegExpMethod { test } => {
@@ -2210,7 +2260,11 @@ impl<'a> Codegen<'a> {
             Kind::LoadKeyedCached { .. } => {
                 let (receiver, key) = (Self::gp(input(0)), Self::gp(input(1)));
                 let destination = Self::gp(result.expect("a result"));
-                let temps = [allocation.gp_temps[0], allocation.gp_temps[1]];
+                let temps = [
+                    allocation.gp_temps[0],
+                    allocation.gp_temps[1],
+                    allocation.gp_temps[2],
+                ];
                 let double = allocation.fp_temps[0];
                 self.emit_load_keyed_cached(node, [receiver, key], temps, double, destination)?;
             }
@@ -2646,50 +2700,10 @@ impl<'a> Codegen<'a> {
         );
     }
 
-    /// Box `D(source)` into `X(destination)` in the canonical encoding: an
-    /// int32 other than -0 as Int32, NaN as the one canonical pattern, every
-    /// other double offset.
+    /// Encode a Value-valid Double, preserving the source FP register.
     fn emit_box_float64(&mut self, source: u8, destination: u8) {
-        let double = self.ops.new_dynamic_label();
-        let done = self.ops.new_dynamic_label();
-        if crate::arm64::has_javascript_conversion() {
-            // FJCVTZS sets Z exactly for an int32 that is not -0.
-            crate::arm64::emit_fjcvtzs(&mut self.ops, source, 16);
-            dynasm!(self.ops ; .arch aarch64 ; b.ne =>double);
-        } else {
-            let boxed = self.ops.new_dynamic_label();
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; fcvtzs w16, D(source)
-                ; scvtf d31, w16
-                ; fcmp D(source), d31
-                ; b.ne =>double
-                ; cbnz w16, =>boxed
-                ; fmov x17, D(source)
-                ; cmp x17, #0
-                ; b.lt =>double
-                ; =>boxed
-            );
-        }
-        // Both conversions write `w16`, clearing its upper half.
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; orr XSP(destination), x16, #NUMBER_TAG
-            ; b =>done
-            ; =>double
-            ; fmov x16, D(source)
-        );
-        // NaN boxes as the one canonical pattern.
-        let not_nan = self.ops.new_dynamic_label();
-        dynasm!(self.ops ; .arch aarch64 ; fcmp D(source), D(source) ; b.vc =>not_nan);
-        self.load_immediate(16, tag::CANONICAL_NAN);
-        dynasm!(self.ops ; .arch aarch64 ; =>not_nan);
-        self.load_immediate(17, DOUBLE_OFFSET);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; add X(destination), x16, x17
-            ; =>done
-        );
+        let scratch = if destination == 16 { 17 } else { 16 };
+        crate::arm64::field_word::emit_encode_double(&mut self.ops, source, destination, scratch);
     }
 
     /// Prove an eligible baked shape. Shape identity fixes descriptor and
@@ -2998,19 +3012,20 @@ impl<'a> Codegen<'a> {
         if let Some(byte) = guard.accessor_byte {
             dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [X(destination), byte]);
         }
+
         Ok(())
     }
 
     /// The named store at `byte_pc` through its feedback programs. The
     /// receiver in `X(receiver)` must be an ordinary object that no chain
     /// proof subscribes to; each program then proves its shape and chain and
-    /// writes `X(value)` into an existing slot, or appends the slot within
-    /// the receiver's storage and publishes the child shape. No program
-    /// matching leaves through the eager deopt before any effect.
+    /// writes a boxed GP value or encodes a certified Double FP value into
+    /// its slot, then publishes an append's child shape. The source program's
+    /// ordinary descriptor and geometry guards precede every effect.
     fn emit_store_named_property(
         &mut self,
         node: NodeId,
-        (byte_pc, receiver_shape, fresh): (u32, Option<u32>, bool),
+        (byte_pc, receiver_shape, fresh, plan): (u32, Option<u32>, bool, NamedStorePlan),
         owners: &[FieldStoreOwner],
         [receiver, value]: [u8; 2],
         [holder, scratch]: [u8; 2],
@@ -3022,9 +3037,22 @@ impl<'a> Codegen<'a> {
             .get(&byte_pc)
             .ok_or(Unsupported::OperandShape("graph named store programs"))?
             .clone();
+        let selected = plan.program().map(usize::from);
+        if selected.is_some_and(|index| {
+            programs
+                .get(index)
+                .is_none_or(|program| !super::feedback::inline_store_transition(program))
+        }) {
+            return Err(Unsupported::OperandShape("graph selected store program"));
+        }
         let exit = self.eager_exit(node, DeoptReason::WrongShape);
         let done = self.ops.new_dynamic_label();
         let view = self.view;
+        let stored_value = if plan.is_double() {
+            self.allocation.node(node).gp_temps[2]
+        } else {
+            value
+        };
         // The validity cell a fresh receiver's allocation checked still holds:
         // no code ran since.
         let allocation = self.graph.node(node).inputs[0];
@@ -3050,7 +3078,10 @@ impl<'a> Codegen<'a> {
         if owners.len() != programs.len() {
             return Err(Unsupported::OperandShape("graph named store owner records"));
         }
-        for (program, authority) in programs.iter().zip(owners) {
+        for (index, (program, authority)) in programs.iter().zip(owners).enumerate() {
+            if selected.is_some_and(|selected| selected != index) {
+                continue;
+            }
             // A proved receiver matches only the programs that guard its shape.
             let receiver_guard = program.ops.iter().find_map(|op| match *op {
                 Op::GuardShape { object: 0, shape } => Some(shape),
@@ -3158,15 +3189,24 @@ impl<'a> Codegen<'a> {
                         }
                     }
                     Op::StoreField { field, .. } => {
+                        let physical = stored_value;
+                        if plan.is_double() {
+                            crate::arm64::field_word::emit_encode_double(
+                                &mut self.ops,
+                                value,
+                                physical,
+                                16,
+                            );
+                        }
                         let value_byte = field.byte_offset();
                         // Every guard has passed: the slot base, then the
                         // value word.
                         self.emit_field_storage(receiver, scratch, field);
                         if value_byte <= 32760 {
-                            dynasm!(self.ops ; .arch aarch64 ; str X(value), [X(scratch), value_byte]);
+                            dynasm!(self.ops ; .arch aarch64 ; str X(physical), [X(scratch), value_byte]);
                         } else {
                             self.load_immediate(17, u64::from(value_byte));
-                            dynasm!(self.ops ; .arch aarch64 ; str X(value), [X(scratch), x17]);
+                            dynasm!(self.ops ; .arch aarch64 ; str X(physical), [X(scratch), x17]);
                         }
                         stored_byte = Some(value_byte);
                     }
@@ -3176,8 +3216,11 @@ impl<'a> Codegen<'a> {
                         // unstable; any other is retired here.
                         if !receiver_guard.is_some_and(|parent| view.left_shapes.contains(&parent))
                         {
-                            self.emit_leave_receiver_shape(node, receiver, value);
+                            self.emit_leave_receiver_shape(node, receiver, stored_value);
                         }
+                        // The source program's baker retains this pinned shape
+                        // through physical retirement; compressed immediates
+                        // therefore never outlive their nonmoving shape owner.
                         self.load_immediate(16, u64::from(shape));
                         dynasm!(self.ops
                             ; .arch aarch64
@@ -3190,7 +3233,7 @@ impl<'a> Codegen<'a> {
                                 &mut self.relocations,
                                 view,
                                 holder,
-                                value,
+                                stored_value,
                                 authority,
                             );
                             owner = 0;
@@ -3217,7 +3260,7 @@ impl<'a> Codegen<'a> {
                     &mut self.relocations,
                     view,
                     holder,
-                    value,
+                    stored_value,
                     authority,
                 );
             }
@@ -3507,7 +3550,7 @@ impl<'a> Codegen<'a> {
         atom: Option<u32>,
         barrier: bool,
         [receiver, value]: [u8; 2],
-        temps @ [holder, child_shape, entry, index]: [u8; 4],
+        [holder, child_shape, entry, index]: [u8; 4],
     ) -> Result<(), Unsupported> {
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
@@ -3550,7 +3593,7 @@ impl<'a> Codegen<'a> {
                 view,
                 crate::arm64::property_actions::AtomOperand::Immediate(atom),
                 [receiver, value],
-                temps,
+                [holder, child_shape, entry, index],
                 slow,
             );
         } else {
@@ -4254,6 +4297,7 @@ impl<'a> Codegen<'a> {
                             self.load_immediate(17, u64::from(value_byte));
                             dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x16, x17]);
                         }
+
                         dynasm!(self.ops ; .arch aarch64 ; b =>done);
                     }
                     Op::LoadClosurePrototype { object: 0 } => {
@@ -4271,8 +4315,9 @@ impl<'a> Codegen<'a> {
                         dynasm!(self.ops
                             ; .arch aarch64
                             ; ldr X(destination), [X(receiver), slot.byte]
-                            ; b =>done
                         );
+
+                        dynasm!(self.ops ; .arch aarch64 ; b =>done);
                     }
                     _ => return Err(Unsupported::OperandShape("graph named load operation")),
                 }

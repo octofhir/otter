@@ -18,6 +18,8 @@
 //! - Replay only applies to fast-shape ordinary objects.
 //! - Replay guards run before sidecar or slab growth, so a failed probe is
 //!   allocation-free and cannot relocate a caller-owned receiver handle.
+//! - Capture and replay publish Value-valid words without changing layout for
+//!   numeric representation; every structural guard precedes allocation or writes.
 //! - Allocation failure after a matched transition propagates as OOM; it is
 //!   never converted into a miss that could reuse a stale receiver.
 //! - Receiver shapes fix prototype identity. A shared validity cell proves
@@ -40,6 +42,7 @@ use super::{
 };
 use crate::Value;
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
+use crate::rooting::RootScopeExt;
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -163,28 +166,43 @@ pub(crate) fn capture_store_property_transition(
 }
 
 pub(crate) fn capture_store_property_transition_with_shape(
-    obj: JsObject,
+    obj: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
-    value: &Value,
-    next_shape: ShapeHandle,
-) -> Option<StorePropertyTransition> {
-    let mut obj = obj;
-    let (to_shape_id, to_shape_count) =
-        heap.read_payload(next_shape, |s| (s.id(), s.property_count()));
+    value: &mut Value,
+    mut next_shape: ShapeHandle,
+) -> Result<Option<StorePropertyTransition>, otter_gc::OutOfMemory> {
+    let to_shape_count = heap.read_payload(next_shape, |s| s.property_count());
     // The appended slot's flat index is the new shape's last offset.
     let index = to_shape_count as usize - 1;
-    let slot = u16::try_from(index).ok()?;
-    // Reserve before taking the payload borrow. The incoming value is not yet
-    // in a traced object, so keep its direct word in the pending-root slice.
-    let mut stored = *value;
-    super::reserve_slot_capacity(&mut obj, heap, index + 1, std::slice::from_mut(&mut stored))
-        .ok()?;
-    let kind = transition_kind(obj, heap, key)?;
-    let from_shape_id = super::shape_id(obj, heap);
+    let Ok(slot) = u16::try_from(index) else {
+        return Ok(None);
+    };
+    if super::shape_body::parent_of(next_shape) != super::shape(*obj, heap) {
+        return Ok(None);
+    }
+    let Some(kind) = transition_kind(*obj, heap, key) else {
+        return Ok(None);
+    };
+    let from_shape_id = super::shape_id(*obj, heap);
     let existing_offset =
-        heap.read_payload(obj, |body| super::body_offset_of_atom(heap, body, key));
-    let transition = heap.with_payload(obj, |body| {
+        heap.read_payload(*obj, |body| super::body_offset_of_atom(heap, body, key));
+    if existing_offset.is_some() || !heap.read_payload(*obj, |body| body.extensible()) {
+        return Ok(None);
+    }
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: the actual receiver, canonical incoming word and proposed child
+    // stay stationary through preparation and reservation, then publish without
+    // another allocation. The immutable child is the exact publication target.
+    unsafe {
+        roots.add_object(obj);
+        roots.add_value(value);
+        roots.add_raw_slot((&mut next_shape as *mut ShapeHandle).cast());
+    }
+    super::reserve_slot_capacity(obj, heap, index + 1, std::slice::from_mut(value))?;
+    let to_shape_id = heap.read_payload(next_shape, |s| s.id());
+    let physical = *value;
+    let transition = heap.with_payload(*obj, |body| {
         if !is_fast_shape_body(body)
             || !body.extensible()
             || !transition_kind_matches_receiver_body(body, &kind)
@@ -196,7 +214,7 @@ pub(crate) fn capture_store_property_transition_with_shape(
         }
         body.invalidate_prototype_proofs();
         body.adopt_shape(next_shape);
-        body.push_slot(index, SlotMeta::data_default(), stored);
+        body.push_slot(index, SlotMeta::data_default(), physical);
         Some(StorePropertyTransition {
             from_shape_id,
             atom_id: key.atom().id(),
@@ -205,10 +223,13 @@ pub(crate) fn capture_store_property_transition_with_shape(
             kind,
             slot,
         })
-    })?;
-    super::record_slot_write(heap, obj, stored);
-    heap.record_write(obj, &next_shape);
-    Some(transition)
+    });
+    let Some(transition) = transition else {
+        return Ok(None);
+    };
+    super::record_slot_write(heap, *obj, physical);
+    heap.record_write(*obj, &next_shape);
+    Ok(Some(transition))
 }
 
 /// Replay a cached add-property transition for a fresh matching receiver.
@@ -273,11 +294,18 @@ pub(crate) fn replay_store_property_transition(
         return Ok(None);
     }
 
+    // The retained direct child preserves the complete immutable physical
+    // prefix. Every incoming Value is a legal field word without preparation.
+    if !to_shape.is_null() && super::shape_body::parent_of(to_shape) != super::shape(obj, heap) {
+        return Ok(None);
+    }
+    let stored = *value;
+
     // Only a confirmed hit may allocate for sidecar/slab growth. On a miss the
     // caller retains its original raw handle, so allocating before guard
     // validation would leave fallback holding a forwarded cell.
     let mut obj = obj;
-    let mut stored = *value;
+    let mut stored = stored;
     let mut slot_meta_table = None;
     let mut dict_table = None;
     if to_shape.is_null() {

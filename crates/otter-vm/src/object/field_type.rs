@@ -1,7 +1,7 @@
 //! Shape-owned summaries of values stored in ordinary data fields.
 //!
 //! # Contents
-//! - Int32 constants, category unions and two exact shapes describe a field.
+//! - Int32 constants, numeric/category unions and two exact shapes describe a field.
 //! - `owner` finds the shape which introduced a logical slot.
 //! - `snapshot` and `observe_owner` read and widen its scalar summary.
 //! - `seed` accounts for initialized fields at birth and shape adoption.
@@ -40,12 +40,14 @@ pub const NULL: u64 = 1 << 1;
 pub const INT32: u64 = 1 << 4;
 /// The word contains one exact Int32 payload instead of shape identities.
 pub const CONST_INT32: u64 = 1 << 5;
+/// An offset-encoded double belongs to this field's stored-value union.
+pub const DOUBLE: u64 = 1 << 6;
 /// Bit position of the count of packed exact identities.
 pub const SHAPE_COUNT_SHIFT: u32 = 2;
 /// Two count bits encode zero, one or two exact identities.
 pub const SHAPE_COUNT_MASK: u64 = 3 << SHAPE_COUNT_SHIFT;
 /// Low bits present in a constrained canonical summary.
-pub const VALID_LOW_BITS: u64 = UNDEFINED | NULL | INT32 | CONST_INT32 | SHAPE_COUNT_MASK;
+pub const VALID_LOW_BITS: u64 = UNDEFINED | NULL | INT32 | CONST_INT32 | DOUBLE | SHAPE_COUNT_MASK;
 /// Any value can belong to this field's stored-value union.
 pub const TOP: u64 = 1 << 7;
 /// Largest exact identity which fits a packed shape slot.
@@ -55,7 +57,7 @@ pub const FIRST_SHAPE_SHIFT: u32 = 8;
 /// Bit position of the second packed shape identity.
 pub const SECOND_SHAPE_SHIFT: u32 = 36;
 
-const SCALAR_BITS: u64 = UNDEFINED | NULL | INT32;
+const SCALAR_BITS: u64 = UNDEFINED | NULL | INT32 | DOUBLE;
 const LOW_MASK: u64 = (1 << FIRST_SHAPE_SHIFT) - 1;
 
 /// First observation of one Int32-tagged value.
@@ -78,6 +80,12 @@ pub const fn int32_constant(word: u64) -> Option<i32> {
 #[must_use]
 pub const fn is_int32_only(word: u64) -> bool {
     word == INT32 || int32_constant(word).is_some()
+}
+
+/// Whether every stored alternative is an Int32 or encoded double number.
+#[must_use]
+pub const fn is_number_only(word: u64) -> bool {
+    int32_constant(word).is_some() || (word != 0 && word & !(INT32 | DOUBLE) == 0)
 }
 
 /// Encode one exact shape identity, saturating identities outside the range.
@@ -199,7 +207,7 @@ pub(crate) fn observe_owner(owner: ShapeHandle, value: Value) {
     let sample = classify(value);
     // Most stores repeat a category the summary already holds.
     let covered = match sample {
-        UNDEFINED | NULL => old & CONST_INT32 == 0 && old & sample != 0,
+        UNDEFINED | NULL | DOUBLE => old & CONST_INT32 == 0 && old & sample != 0,
         _ if sample & CONST_INT32 != 0 => {
             old == sample || (old & CONST_INT32 == 0 && old & INT32 != 0)
         }
@@ -260,6 +268,9 @@ pub(super) fn seed(shape: ShapeHandle, count: usize, mut read: impl FnMut(u32) -
 fn classify(value: Value) -> u64 {
     if let Some(value) = value.as_i32() {
         return int32_sample(value);
+    }
+    if value.is_number() {
+        return DOUBLE;
     }
     if value.is_undefined() {
         return UNDEFINED;

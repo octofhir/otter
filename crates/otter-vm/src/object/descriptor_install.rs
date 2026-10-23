@@ -88,9 +88,11 @@ pub(super) fn define_string(
             == (source.flags, false)
     {
         let stored = source.value;
-        heap.with_payload(*object, |body| body.set_data_value(offset as usize, stored));
-        apply_mapped_arguments_partial_define(*object, heap, key, descriptor, Some(offset));
-        record_slot_write(heap, *object, stored);
+        write_layout_slot(object, heap, offset as usize, stored);
+        if descriptor.value.is_some() {
+            descriptor.value = Some(stored);
+        }
+        apply_mapped_arguments_partial_define(object, heap, key, descriptor, Some(offset))?;
         return Ok(true);
     }
     let mut stored = Value::undefined();
@@ -159,7 +161,7 @@ pub(super) fn define_string(
     if descriptor.value.is_some() && !meta.is_accessor {
         descriptor.value = Some(stored);
     }
-    apply_mapped_arguments_partial_define(*object, heap, key, descriptor.clone(), offset);
+    apply_mapped_arguments_partial_define(object, heap, key, descriptor.clone(), offset)?;
     record_slot_write(heap, *object, stored);
     Ok(true)
 }
@@ -191,9 +193,10 @@ pub(super) fn define_string_with_shape(
         |offset| offset as usize,
     );
     reserve_slot_capacity(object, heap, index + 1, std::slice::from_mut(&mut stored))?;
+    let physical = stored;
     heap.with_payload(*object, |body| {
         if offset.is_some() {
-            body.set_slot(index, meta, stored, Some(next_shape));
+            body.set_slot(index, meta, physical, Some(next_shape));
         } else {
             debug_assert_object_shape_handle(next_shape, "shape-slot store");
             assert_eq!(
@@ -203,13 +206,13 @@ pub(super) fn define_string_with_shape(
             );
             body.invalidate_prototype_proofs();
             body.adopt_shape(next_shape);
-            body.push_slot(index, meta, stored);
+            body.push_slot(index, meta, physical);
         }
     });
     if descriptor.value.is_some() && !meta.is_accessor {
         descriptor.value = Some(stored);
     }
-    apply_mapped_arguments_partial_define(*object, heap, key, descriptor.clone(), offset);
+    apply_mapped_arguments_partial_define(object, heap, key, descriptor.clone(), offset)?;
     record_slot_write(heap, *object, stored);
     record_exotic_write(heap, *object, &next_shape);
     #[cfg(debug_assertions)]

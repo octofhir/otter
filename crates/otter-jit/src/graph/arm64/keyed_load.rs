@@ -33,7 +33,7 @@ impl Codegen<'_> {
         &mut self,
         node: NodeId,
         [receiver, key]: [u8; 2],
-        [length, base]: [u8; 2],
+        [length, base, index]: [u8; 3],
         double: u8,
         destination: u8,
     ) -> Result<(), Unsupported> {
@@ -54,13 +54,12 @@ impl Codegen<'_> {
             ; b.ne =>other
             ; ldrb w17, [X(receiver), storage.own_guard_byte]
             ; tbnz w17, storage.own_exotic_bit, =>runtime
-            // A non-negative int32 key below the live dense length.
-            ; asr x16, X(key), super::INT32_TAG_SHIFT
-            ; cmn x16, 1
-            ; b.ne =>runtime
-            ; tbnz W(key), 31, =>runtime
+        );
+        crate::arm64::index::emit_number_index(&mut self.ops, key, index, double, runtime);
+        dynasm!(self.ops
+            ; .arch aarch64
             ; ldr W(length), [X(receiver), storage.length_byte]
-            ; cmp W(length), W(key)
+            ; cmp W(length), W(index)
             ; b.ls =>runtime
             ; ldr X(base), [X(receiver), storage.base_byte]
             ; ldrb w17, [X(receiver), numeric.kind_byte]
@@ -71,15 +70,15 @@ impl Codegen<'_> {
             ; cmp w17, u32::from(numeric.packed_kind)
             ; b.ne =>runtime
             // Packed numeric storage has no hole below its length.
-            ; ldr D(double), [X(base), W(key), uxtw #3]
+            ; ldr D(double), [X(base), W(index), uxtw #3]
             ; b =>boxed
             ; =>holey
         );
-        self.emit_hole_bit(numeric, base, key);
+        self.emit_hole_bit(numeric, base, index);
         dynasm!(self.ops
             ; .arch aarch64
             ; b.ne =>runtime
-            ; ldr D(double), [X(base), W(key), uxtw #3]
+            ; ldr D(double), [X(base), W(index), uxtw #3]
             ; =>boxed
         );
         self.emit_box_float64(double, destination);
@@ -87,7 +86,7 @@ impl Codegen<'_> {
             ; .arch aarch64
             ; b =>done
             ; =>tagged
-            ; ldr x16, [X(base), W(key), uxtw #3]
+            ; ldr x16, [X(base), W(index), uxtw #3]
         );
         self.load_immediate(17, VALUE_HOLE);
         dynasm!(self.ops

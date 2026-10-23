@@ -3,6 +3,7 @@
 //! # Contents
 //! - A live nullable Array edge, two own storage objects and one current IC row.
 //! - Source-preservation and storage-owner captures from the production emitter.
+//! - Valid value stores remain legal with a zero observation owner.
 //!
 //! # Invariants
 //! - Initialized aligned host words model only the fields each emitter reads.
@@ -33,6 +34,7 @@ pub(super) struct Invocation {
     pub(super) returned_receiver: usize,
     pub(super) returned_slot: usize,
     pub(super) child: u64,
+    pub(super) returned_value: u64,
 }
 
 pub(super) struct Fixture {
@@ -109,6 +111,9 @@ impl Fixture {
             kind as u8,
         );
     }
+    pub(super) fn set_field(&mut self, physical: u64) {
+        self.write(BAG_A + FIELD, physical);
+    }
     pub(super) fn field(&self, second: bool) -> u64 {
         self.cells[((if second { BAG_B } else { BAG_A }) + FIELD) / 8]
     }
@@ -123,9 +128,26 @@ impl Fixture {
 }
 
 pub(super) fn check_store_contract(mut call: impl FnMut(&mut Invocation) -> usize) {
+    use otter_vm::Value;
+    for value in [
+        Value::number_i32(7),
+        Value::number_f64(1.25),
+        Value::UNDEFINED,
+        Value::TRUE,
+    ] {
+        let fixture = Fixture::new();
+        let mut invocation = fixture.invocation();
+        invocation.value = value.to_bits();
+        assert_eq!(call(&mut invocation), 1);
+        assert_eq!(invocation.returned_receiver, invocation.receiver);
+        assert_eq!(invocation.returned_value, invocation.value);
+        assert_eq!(fixture.field(false), invocation.value);
+        assert_eq!(fixture.field(true), ORIGINAL);
+    }
     let mut fixture = Fixture::new();
     let mut invocation = fixture.invocation();
     assert_eq!(call(&mut invocation), 1);
+    assert_eq!(invocation.returned_value, invocation.value);
     assert_eq!(invocation.returned_receiver, fixture.array());
     assert_eq!(
         invocation.returned_slot,
@@ -165,4 +187,26 @@ pub(super) fn check_store_contract(mut call: impl FnMut(&mut Invocation) -> usiz
     assert_eq!(call(&mut invocation), 0);
     assert_eq!(invocation.returned_receiver, invocation.receiver);
     assert_eq!(invocation.returned_slot, invocation.slot);
+}
+
+pub(super) fn check_double_load_contract(mut call: impl FnMut(&mut Invocation) -> u64) {
+    use otter_vm::Value;
+    let mut fixture = Fixture::new();
+    fixture.set_kind(PropertyIcHandlerKind::OwnField);
+    for value in [
+        Value::number_i32(7),
+        Value::number_f64(-0.0),
+        Value::number_f64(1.25),
+        Value::number_f64(f64::NAN),
+        Value::UNDEFINED,
+    ] {
+        let physical = if value.is_number() {
+            otter_vm::Value::double(value.as_f64().unwrap())
+        } else {
+            value
+        };
+        fixture.set_field(physical.to_bits());
+        let mut invocation = fixture.invocation();
+        assert_eq!(call(&mut invocation), physical.to_bits());
+    }
 }

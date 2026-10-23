@@ -85,6 +85,141 @@ fn own_load_handler(obj: object::JsObject, heap: &otter_gc::GcHeap, name: &str) 
     IcHandler::load_resolved(object::keyed_shape(obj, heap), &resolved).expect("own handler")
 }
 
+#[test]
+fn numeric_cache_words_preserve_values_with_an_absorbing_top_owner() {
+    use object::field_type;
+    let mut vm = crate::Interpreter::new().expect("fixture interpreter");
+    vm.with_handle_scope(|vm, scope| {
+        let mut receiver = object::alloc_object_old_for_fixture(&mut vm.gc_heap).unwrap();
+        let rooted = vm.scoped_value(scope, Value::object(receiver));
+        vm.create_data_property(&mut receiver, "numericWord", Value::number_i32(0))
+            .unwrap();
+        let shape = object::shape(receiver, &vm.gc_heap);
+        let owner = field_type::owner(shape, 0).unwrap();
+        field_type::set_snapshot_for_test(owner, field_type::TOP);
+        let atom = crate::isolate_names::names(&vm.gc_heap).lookup("numericWord");
+        let property = AtomizedPropertyKey::new(PropertyAtom::new(atom), "numericWord");
+        let (handler, hit) =
+            IcHandler::store_existing_hit(receiver, &vm.gc_heap, property).unwrap();
+        assert!(handler.owner.is_null(), "Top skips observation only");
+        let store = PropertyIcSlot::new(PropertyIcKind::Store);
+        store.install(handler);
+        vm.property_cache.record_own_store(hit);
+        let load = PropertyIcSlot::new(PropertyIcKind::Load);
+        let resolved =
+            crate::cache_ir::resolve_atom_data_slot(receiver, &vm.gc_heap, property).unwrap();
+        load.install(IcHandler::load_resolved(shape, &resolved).unwrap());
+        for physical in [
+            Value::double(0.0),
+            Value::double(-0.0),
+            Value::double(1.25),
+            Value::TRUE,
+            Value::UNDEFINED,
+        ] {
+            assert!(
+                store
+                    .probe_store(receiver, &mut vm.gc_heap, property, &physical)
+                    .unwrap()
+            );
+            assert_eq!(load.probe_load(receiver, &vm.gc_heap), Some(physical));
+            assert_eq!(object::shape(receiver, &vm.gc_heap), shape);
+            assert!(
+                vm.property_cache
+                    .replay_store(receiver, &mut vm.gc_heap, property, &physical)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                object::get_own(receiver, &vm.gc_heap, "numericWord"),
+                Some(physical)
+            );
+        }
+        assert_eq!(vm.escape_scoped(rooted).as_object(), Some(receiver));
+        assert_eq!(field_type::snapshot(owner), field_type::TOP);
+    });
+}
+
+#[test]
+fn numeric_capture_updates_moving_receiver_and_incoming_on_overflow() {
+    struct Reclaimable([u64; 16384]);
+    impl otter_gc::SafeTraceable for Reclaimable {
+        const TYPE_TAG: u8 = 0xe8;
+        fn trace_slots_safe(&mut self, _: &mut otter_gc::raw::SlotVisitor<'_>) {
+            let _ = self.0[0];
+        }
+    }
+    let mut heap = otter_gc::GcHeap::with_max_heap_bytes(4 * 1024 * 1024).expect("capped heap");
+    heap.set_gc_stress(0, false);
+    object::register_gc_traceables(&mut heap);
+    let mut shapes = object::ShapeRuntime::new(&mut heap).expect("shape owner");
+    let root = shapes
+        .new_root(
+            &mut heap,
+            object::shape_body::ShapePrototype::Null,
+            0,
+            object::ShapeHandle::null(),
+            object::ShapeState::ORDINARY,
+            &mut |_| {},
+        )
+        .expect("zero-inline-capacity root");
+    let child = shapes
+        .child_with_roots(
+            &mut heap,
+            root,
+            "movingCapture",
+            object::PropertyFlags::data_default(),
+            false,
+            &mut |_| {},
+        )
+        .expect("prebuilt append child");
+    let atom = crate::isolate_names::names(&heap).lookup("movingCapture");
+    let property = AtomizedPropertyKey::new(PropertyAtom::new(atom), "movingCapture");
+    let mut receiver = object::alloc_object_with_shape_roots(&mut heap, root, &mut |_| {})
+        .expect("young receiver");
+    let incoming = object::alloc_object_with_shape_roots(&mut heap, root, &mut |_| {})
+        .expect("young incoming object");
+    let mut value = Value::object(incoming);
+    // The cap forces the first overflow slab's old allocation to full-collect.
+    // No frame/provider or handle arena owns either object: only the capture
+    // API's actual mutable operand slots can preserve and rewrite them.
+    let _ = heap
+        .alloc_old(Reclaimable([0; 16384]))
+        .expect("reclaimable slab budget");
+    let reserved = heap.max_heap_bytes() - heap.tracked_bytes();
+    heap.reserve_bytes_no_collect(reserved)
+        .expect("fill cap without collection");
+    let receiver_before = receiver.offset();
+    let incoming_before = incoming.offset();
+    let cycles_before = heap.gc_cycle_counts();
+    let transition = object::capture_store_property_transition_with_shape(
+        &mut receiver,
+        &mut heap,
+        property,
+        &mut value,
+        child,
+    )
+    .expect("collecting append preparation")
+    .expect("ordinary own append");
+    heap.release_bytes(reserved);
+    assert!(heap.gc_cycle_counts().1 > cycles_before.1);
+    assert_ne!(
+        receiver.offset(),
+        receiver_before,
+        "receiver actually moved"
+    );
+    assert_ne!(
+        value.as_object().unwrap().offset(),
+        incoming_before,
+        "incoming object actually moved"
+    );
+    assert_eq!(object::shape(receiver, &heap), transition.to_shape.get());
+    assert!(!object::field_location_at(receiver, &heap, 0).is_inline());
+    assert_eq!(
+        object::get_own(receiver, &heap, property.name()),
+        Some(value)
+    );
+}
+
 /// `count` objects with pairwise distinct shapes, each owning `x`.
 fn distinct_receivers(heap: &mut otter_gc::GcHeap, count: usize) -> Vec<object::JsObject> {
     const PREFIX: [&str; 5] = ["a", "b", "c", "d", "e"];
@@ -647,12 +782,13 @@ fn jit_snapshot_preserves_transition_guards_and_publication() {
         .read_payload(to_handle, object::ShapeBody::transition_atom);
     let property = AtomizedPropertyKey::new(PropertyAtom::new(atom), "x");
     let transition = object::capture_store_property_transition_with_shape(
-        obj,
+        &mut obj,
         interpreter.gc_heap_mut(),
         property,
-        &value,
+        &mut value,
         to_handle,
     )
+    .expect("own-add preparation")
     .expect("resident own-add transition");
     assert!(matches!(
         transition.kind,

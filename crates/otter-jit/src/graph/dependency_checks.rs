@@ -15,14 +15,10 @@
 //! - [`place`] — rewrite proofs into flag tests and return the dependencies.
 //!
 //! # Invariants
-//! - A fact can break only through a node that runs JavaScript or calls out,
-//!   a named store (its transitions leave shapes and observe field
-//!   summaries), an own-field store that observes a summary, an object
-//!   literal (its values seed field summaries), a context-slot store whose
-//!   watch may fire, or a closure birth that can break source-context
-//!   identity. Everything else, including an allocation that collects and an
-//!   interrupt poll, leaves every fact as it was: no collector path fires a
-//!   code dependency.
+//! - Calls, JavaScript, observing stores, literal births, watched context
+//!   writes and closure births can continue after breaking a subscribed fact.
+//!   They begin a new unchecked region. Collection and interrupt polls never
+//!   fire code dependencies.
 //! - A block entered from outside the graph (function or OSR entry) or with
 //!   no predecessor starts unchecked; a join is checked only when every
 //!   predecessor leaves checked.
@@ -45,8 +41,8 @@ use otter_vm::native_abi::{CodeDependency, CodeDependencyKind};
 
 use super::ir::{Graph, Kind, NodeId, Repr};
 
-/// Whether `node` can break a subscribed fact. A collection fires no
-/// dependency: only JavaScript and the stores and births below do.
+/// Whether `node` can continue after breaking a subscribed fact. A collection
+/// fires no dependency.
 fn breaks_facts(graph: &Graph, node: NodeId) -> bool {
     let kind = &graph.node(node).kind;
     let properties = kind.properties();
@@ -59,7 +55,9 @@ fn breaks_facts(graph: &Graph, node: NodeId) -> bool {
         | Kind::NoteContextWrite(_)
         | Kind::NewClosure
         | Kind::NewObjectLiteral { .. } => true,
-        Kind::StoreOwnField { owners, .. } => !owners.is_empty(),
+        Kind::StoreOwnField { owners, .. } | Kind::StoreDoubleOwnField { owners, .. } => {
+            !owners.is_empty()
+        }
         _ => false,
     }
 }
@@ -136,9 +134,8 @@ pub(crate) fn global_layout_validity(view: &JitCompileSnapshot, byte_pc: u32) ->
     }
 }
 
-/// Rewrite the graph's stability and field-summary proofs into dependency
-/// flag tests, test the flag before method loads that rely on a validity
-/// cell, and return the facts, in a deterministic order.
+/// Rewrite proofs into dependency tests, guard subscribed method loads, and
+/// return the facts in a deterministic order.
 pub(crate) fn place(
     graph: &mut Graph,
     view: &JitCompileSnapshot,
@@ -206,7 +203,8 @@ pub(crate) fn place(
         for &node in &graph.blocks[block].body {
             if is_proof(&graph.node(node).kind) || methods.contains(&node) {
                 checked = true;
-            } else if breaks_facts(graph, node) {
+            }
+            if breaks_facts(graph, node) {
                 checked = false;
             }
         }
@@ -259,6 +257,11 @@ pub(crate) fn place(
                     checked = true;
                 }
             } else if breaks_facts(graph, node) {
+                checked = false;
+            }
+            // A guarded birth may itself widen observed field summaries;
+            // a guarded generated call can execute arbitrary JavaScript.
+            if breaks_facts(graph, node) {
                 checked = false;
             }
         }
@@ -370,6 +373,7 @@ mod tests {
                     stored_shapes: SmallVec::new(),
                     nullish_mask: 0,
                     int32: false,
+                    double: false,
                     int32_constant: None,
                 }
             )],

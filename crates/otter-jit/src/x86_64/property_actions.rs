@@ -6,8 +6,8 @@
 //! - Live persistent-prefix/suffix addressing and pre-effect guards.
 //!
 //! # Invariants
-//! - A probe preserves receiver/value and clobbers four assigned GPs, r10/r11
-//!   and flags only; a successful load additionally writes its destination.
+//! - A probe preserves receiver/value and clobbers only explicit GP
+//!   temporaries, r10/r11 and flags; a load additionally writes its destination.
 //! - The VM owns the table, action discriminants, immutable shapes and retained
 //!   validity words. Native probes neither allocate nor clone a proof.
 //! - Every store check finishes before the first write. Append commits slot
@@ -185,6 +185,7 @@ pub(crate) fn emit_action_probe(
             let own = ops.new_dynamic_label();
             let absent = ops.new_dynamic_label();
             let undefined = ops.new_dynamic_label();
+            let canonical = ops.new_dynamic_label();
             dynasm!(ops ; .arch x64
                 ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::OwnData as i8 ; je =>own
                 ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::NonExistent as i8 ; je =>absent
@@ -215,7 +216,7 @@ pub(crate) fn emit_action_probe(
             emit_slot_storage(ops, view, shape, identity, base, miss);
             dynasm!(ops ; .arch x64
                 ; mov Rq(destination), [Rq(base) + Rq(identity) * 8]
-                ; jmp =>done
+                ; jmp =>canonical
                 // The matched key already proved the receiver's exact shape,
                 // whose address the key decode left in `shape`.
                 ; =>own
@@ -223,7 +224,7 @@ pub(crate) fn emit_action_probe(
             emit_slot_storage_of_shape(ops, view, receiver, shape, identity, base, miss);
             dynasm!(ops ; .arch x64
                 ; mov Rq(destination), [Rq(base) + Rq(identity) * 8]
-                ; jmp =>done
+                ; jmp =>canonical
                 // Absent from the whole chain: the proof (none for a `null`
                 // prototype the receiver shape fixes) authorizes `undefined`.
                 ; =>absent
@@ -232,6 +233,11 @@ pub(crate) fn emit_action_probe(
                 ; cmp DWORD [r10], 0 ; je =>miss
                 ; =>undefined);
             emit_load_u64(ops, destination, crate::entry::VALUE_UNDEFINED);
+            dynasm!(ops ; .arch x64
+                ; jmp =>done
+                ; =>canonical
+            );
+
             dynasm!(ops ; .arch x64 ; jmp =>done);
         }
         PropertySourceAccess::Store => {
@@ -256,9 +262,11 @@ pub(crate) fn emit_action_probe(
             emit_load_u64(ops, 11, 0xffff_ffff_0000_0000);
             dynasm!(ops ; .arch x64
                 ; and r11, Rq(receiver) ; add r10, r11
-                ; mov r10, [r10 + cache.shape_id_byte as i32]
+                ; mov Rq(base), r10
+                ; mov r10, [Rq(base) + cache.shape_id_byte as i32]
                 ; cmp r10, [Rq(entry) + cache.target_shape_id_byte as i32] ; jne =>miss
-                ; movzx Rd(identity), WORD [Rq(entry) + cache.store_slot_byte as i32]);
+                ; mov Rd(identity), [Rq(entry) + cache.target_shape_byte as i32]);
+            dynasm!(ops ; .arch x64 ; movzx Rd(identity), WORD [Rq(entry) + cache.store_slot_byte as i32]);
             emit_slot_storage(ops, view, receiver, identity, base, miss);
             dynasm!(ops ; .arch x64
                 ; mov [Rq(base) + Rq(identity) * 8], Rq(value)

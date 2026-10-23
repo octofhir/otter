@@ -7,7 +7,7 @@
 //! - No cache residency, allocation, call, safepoint or retained raw pointer.
 //! - Shared directories are bounded by the receiver shape's immutable prefix.
 //! - Accessors, absent properties and exotic lookup leave before the read.
-//! - Inputs survive every miss; four assigned GPs and x16/x17 are scratch.
+//! - Inputs survive every miss; assigned GP temporaries and x16/x17 are scratch.
 //!
 //! # See also
 //! - `otter_vm::object::ShapeLookupLayout` owns the physical contract.
@@ -68,7 +68,8 @@ pub(crate) fn emit_load(
         ; tbnz x16, #16, =>miss
         ; ubfx W(slot), w16, #0, #16 ; sub WSP(slot), WSP(slot), #1
         ; ldr w17, [X(shape), view.shape_property_count_byte]
-        ; cmp W(slot), w17 ; b.hs =>miss ; b =>read
+        ; cmp W(slot), w17 ; b.hs =>miss
+        ; b =>read
         ; =>next ; add WSP(slot), WSP(slot), #1 ; and W(slot), W(slot), W(mask) ; b =>probe
         ; =>chain ; mov X(entry), X(shape)
         ; =>walk ; ldr W(slot), [X(entry), view.shape_property_count_byte] ; cbz W(slot), =>miss
@@ -80,10 +81,14 @@ pub(crate) fn emit_load(
         ; ldr W(entry), [X(entry), l.parent_byte] ; cbz W(entry), =>miss
         ; add X(entry), x17, X(entry) ; b =>walk
         ; =>chain_found ; ldrb w16, [X(entry), l.accessor_byte] ; cbnz w16, =>miss
+        ; ldr W(entry), [X(entry), l.field_byte]
         ; sub WSP(slot), WSP(slot), #1
         ; =>read);
     super::property_actions::bank_of_shape(ops, view, receiver, shape, slot, mask, miss);
     dynasm!(ops ; .arch aarch64
             ; ldr X(destination), [X(mask), X(slot), lsl #3]
     );
+    let done = ops.new_dynamic_label();
+
+    dynasm!(ops ; .arch aarch64 ; =>done);
 }

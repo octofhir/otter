@@ -1363,7 +1363,7 @@ fn deopt_homes_separate_tagged_int32_and_float64_values() {
     let integer = append(
         &mut graph,
         block,
-        Kind::CheckedTaggedToInt32,
+        Kind::CheckedNumberToInt32,
         &[tagged],
         Repr::Int32,
     );
@@ -1692,7 +1692,7 @@ fn float_pressure_preserves_untagged_homes_through_collection_call_reload_and_ba
             let integer = append(
                 &mut graph,
                 entry,
-                Kind::CheckedTaggedToInt32,
+                Kind::CheckedNumberToInt32,
                 &[tagged],
                 Repr::Int32,
             );

@@ -7,6 +7,9 @@
 //! - [`RootSlotVisitor`] — caller-supplied root source closure for full GC.
 //! - [`HeapStats`] — tiny snapshot of accounting (used by tests).
 //! - Bounded default-off collection-service captures with exact trigger metadata.
+//! - Request-owned full-sweep release of unused nursery payload and old holes.
+//! - One-shot startup survival and post-major allocation budgets (see
+//!   [`allocation_limits`]).
 //! - [`GcHeap::embedder_root`] — strong handles the embedder keeps at fixed
 //!   indices for code that holds only the heap.
 //! - [`GcHeap::isolate_data`] — the embedder's per-isolate state, owned and
@@ -91,7 +94,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::compressed::{Cage, Gc, RawGc, cage_base, cage_size};
+use crate::collection_goal::FullGcGoal;
+use crate::compressed::{Cage, Gc, RawGc, cage_base};
 use crate::ephemeron::EphemeronRegistry;
 use crate::external::{ExternalMemory, SharedExternalMemory, SharedExternalState};
 use crate::external_refs::ExternalRefTable;
@@ -116,6 +120,13 @@ use crate::stats::{GcStats, TYPE_TAG_COUNT};
 use crate::store::GcStore;
 use crate::trace::{TraceTable, Traceable};
 
+#[path = "heap/allocation_limits.rs"]
+mod allocation_limits;
+use allocation_limits::{
+    EXTERNAL_ALLOCATION_SOFT_LIMIT, INITIAL_OLD_GENERATION_SIZE, cage_hardcap_bytes,
+    concurrent_marking_start,
+};
+
 /// Embedder weak-semantics pass run between strong marking and sweep.
 ///
 /// It may mark additional objects (ephemeron values) and clear weak slots,
@@ -138,68 +149,11 @@ pub fn empty() -> EmptyRoots {
 /// Number of [`GcHeap::embedder_root`] slots.
 pub const EMBEDDER_ROOT_SLOTS: usize = 2;
 
-/// Old-generation cell bytes before the first mark-sweep. The heap grows
-/// freely up to it; collections before then would re-mark a young, mostly
-/// live old generation for little reclamation. Every page this limit lets
-/// the old generation touch stays resident after the collection, so it
-/// bounds the peak footprint of a program that promotes garbage steadily.
-const INITIAL_OLD_GENERATION_SIZE: u64 = 256 * 1024 * 1024;
 /// Old-generation size from which a stop-the-world mark drain runs on the
 /// helper threads too.
 const PARALLEL_MARK_MIN_OLD_BYTES: u64 = 8 * 1024 * 1024;
 /// Old-space pages from which a sweep runs on the helper threads too.
 const PARALLEL_SWEEP_MIN_PAGES: usize = 32;
-/// Lower bound of every recomputed old-generation limit.
-const MIN_OLD_GENERATION_SIZE: u64 = 16 * 1024 * 1024;
-/// The growing-factor bounds and the mutator utilization the limit targets
-/// (at most 3% of mutator time in mark-compact).
-const MIN_GROWING_FACTOR: f64 = 1.1;
-const MAX_GROWING_FACTOR: f64 = 4.0;
-const TARGET_MUTATOR_UTILIZATION: f64 = 0.97;
-/// A limit always leaves this much old-generation room above the surviving
-/// set.
-const MINIMUM_ALLOCATION_LIMIT_GROWING_STEP: u64 = 8 * 1024 * 1024;
-/// External (backing-store) bytes that may accumulate above the surviving
-/// reservations before they force a mark-compact. Objects owning them are
-/// small cells with drop glue, so page occupancy barely moves while their
-/// payloads can pin gigabytes of native memory; the separate limit reclaims
-/// dead payloads without letting a large live external set license
-/// proportional garbage.
-const EXTERNAL_ALLOCATION_SOFT_LIMIT: u64 = 64 * 1024 * 1024;
-/// Near-cage hard ceiling on the old-generation limit (numerator/256
-/// of the cage). A cap-less heap always attempts a full GC before cage
-/// exhaustion, while a live set that legitimately approaches it settles
-/// just under rather than thrashing (the limit — not occupancy — is what's
-/// clamped; see `major_gc_due`). ~92% leaves headroom for the young
-/// semispaces + per-page slack.
-const MAJOR_GC_CAGE_SOFTCAP_NUM: u64 = 236; // 236/256 ≈ 92% of cage
-
-/// Old-generation ceiling inside the cage ([`MAJOR_GC_CAGE_SOFTCAP_NUM`]).
-fn cage_hardcap_bytes() -> u64 {
-    (cage_size() as u64) / 256 * MAJOR_GC_CAGE_SOFTCAP_NUM
-}
-
-/// The old-generation growing factor that keeps mark-compact at
-/// `1 - TARGET_MUTATOR_UTILIZATION` of the time if collection and allocation
-/// keep their measured speeds (bytes per millisecond).
-/// `F = R(1 - MU) / (R(1 - MU) - MU)` with `R = gc / mutator`, bounded to
-/// `[MIN_GROWING_FACTOR, MAX_GROWING_FACTOR]`; without both speeds the factor
-/// is the maximum.
-fn dynamic_growing_factor(gc_speed: f64, mutator_speed: f64) -> f64 {
-    if !(gc_speed > 0.0 && mutator_speed > 0.0) {
-        return MAX_GROWING_FACTOR;
-    }
-    let ratio = gc_speed / mutator_speed;
-    let a = ratio * (1.0 - TARGET_MUTATOR_UTILIZATION);
-    let b = a - TARGET_MUTATOR_UTILIZATION;
-    let factor = if a < b * MAX_GROWING_FACTOR {
-        a / b
-    } else {
-        MAX_GROWING_FACTOR
-    };
-    factor.max(MIN_GROWING_FACTOR)
-}
-
 /// Trivial empty-roots implementation; useful in tests where all
 /// reachable objects sit in handle scopes.
 pub struct EmptyRoots;
@@ -395,14 +349,18 @@ pub struct GcHeap {
     /// state changes; shrinks follow every release path, including drained
     /// shared-token releases. `None` until the runtime installs its account.
     external_ledger: Option<otter_resource::ResourceLease>,
-    /// Old-generation allocation limit over old/large page bytes. It starts
-    /// at [`INITIAL_OLD_GENERATION_SIZE`] and every mark-compact recomputes it
-    /// from the surviving pages and the measured collection and allocation
-    /// speeds ([`dynamic_growing_factor`]). Without it a cap-less heap never
+    /// Old-generation allocation limit over occupied old/large bytes. The
+    /// default starts at [`INITIAL_OLD_GENERATION_SIZE`], first successful
+    /// nursery survival seeds it once, and every mark-compact recomputes it
+    /// from the surviving cells and measured collection/allocation speeds
+    /// (see [`allocation_limits`]). Without it a cap-less heap never
     /// runs a full GC, so old space — fed by scavenge promotion and the
     /// nursery-overflow path — grows unbounded until the cage or the cap is
     /// exhausted even when most of it is garbage.
     old_generation_limit: u64,
+    /// The default startup budget has not yet consumed nursery survival,
+    /// an explicit override or a completed major controller update.
+    initial_old_limit_pending: bool,
     /// Old-generation occupancy at which a concurrent marking cycle starts,
     /// so that it can finish before [`Self::old_generation_limit`].
     concurrent_marking_start: u64,
@@ -630,6 +588,7 @@ impl GcHeap {
             tracked_bytes: 0,
             reserved_bytes: 0,
             old_generation_limit: INITIAL_OLD_GENERATION_SIZE.min(cage_hardcap_bytes()),
+            initial_old_limit_pending: true,
             concurrent_marking_start: concurrent_marking_start(
                 0,
                 INITIAL_OLD_GENERATION_SIZE.min(cage_hardcap_bytes()),
@@ -1076,7 +1035,11 @@ impl GcHeap {
         self.with_gc_pause(
             GcPauseKind::Full,
             GcPauseTrigger::HeapCap,
-            |heap| match heap.collect_full(external_visit) {
+            |heap| match heap.collect_full_observed(
+                external_visit,
+                GcPauseTrigger::HeapCap,
+                FullGcGoal::ReleaseMemory,
+            ) {
                 Err(error) => (Err(error), GcPauseOutcome::CollectionFailed),
                 Ok(()) => {
                     let admitted = heap.tracked_bytes.saturating_add(bytes) <= cap;
@@ -1939,8 +1902,11 @@ impl GcHeap {
                         )?;
                     } else {
                         self.in_major_gc = true;
-                        let collect_result = self
-                            .collect_full_observed(&mut allocation_roots, GcPauseTrigger::Stress);
+                        let collect_result = self.collect_full_observed(
+                            &mut allocation_roots,
+                            GcPauseTrigger::Stress,
+                            FullGcGoal::Throughput,
+                        );
                         self.in_major_gc = false;
                         collect_result?;
                     }
@@ -2740,6 +2706,7 @@ impl GcHeap {
         }
         self.stats.last_scavenge = stats;
         self.gc_stats.record_minor(&stats);
+        self.seed_initial_old_generation_limit(&stats);
         // Per-tag counters drift between scavenges (young
         // allocations counted at alloc-time but never
         // decremented when the scavenger reclaims them); the
@@ -2758,31 +2725,38 @@ impl GcHeap {
         Ok(())
     }
 
-    /// Run a full GC (young-gen scavenge + old-gen mark-sweep).
+    /// Run an explicit full GC and release unused physical payload.
     ///
     /// `external_visit` yields every external root slot.
     pub fn collect_full(
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
-        self.collect_full_observed(external_visit, GcPauseTrigger::Explicit)
+        self.collect_full_observed(
+            external_visit,
+            GcPauseTrigger::Explicit,
+            FullGcGoal::ReleaseMemory,
+        )
     }
 
-    /// Collect with exact trigger provenance supplied by the owning runtime.
-    /// This preserves the same collector and canonical root visitors.
+    /// Collect with the owning request's physical-memory goal and exact trigger
+    /// provenance. Both goals use the same collector and canonical root visitors;
+    /// capture state and trigger labels never choose the goal.
     pub fn collect_full_observed(
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
         trigger: GcPauseTrigger,
+        goal: FullGcGoal,
     ) -> Result<(), OutOfMemory> {
         self.with_gc_pause_result(GcPauseKind::Full, trigger, |heap| {
-            heap.collect_full_work(external_visit)
+            heap.collect_full_work(external_visit, goal)
         })
     }
 
     fn collect_full_work(
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
+        goal: FullGcGoal,
     ) -> Result<(), OutOfMemory> {
         let pause_start = Instant::now();
         let old_generation_before = self.old_generation_consumed_bytes();
@@ -2794,66 +2768,9 @@ impl GcHeap {
             self.mark_phase(external_visit)?;
         }
         self.run_post_mark_processing();
-        self.sweep_phase_with_pause_start(pause_start);
+        self.sweep_phase_with_pause_start(pause_start, goal);
         self.recompute_allocation_limits(pause_start, old_generation_before);
         Ok(())
-    }
-
-    /// Recompute the old-generation and external limits after a
-    /// mark-compact.
-    ///
-    /// The collection speed is the old generation it processed per
-    /// millisecond of this pause; the mutator speed is the old generation
-    /// allocated since the previous mark-compact per millisecond of mutator
-    /// time, scavenge pauses excluded. The limit is the surviving cells'
-    /// bytes times their growing factor, at least the minimum growing step
-    /// above them, plus the nursery's capacity, bounded below by
-    /// [`MIN_OLD_GENERATION_SIZE`] and above by the cage ceiling, where a
-    /// legitimately large live set settles instead of collecting on every
-    /// allocation.
-    fn recompute_allocation_limits(&mut self, pause_start: Instant, old_generation_before: u64) {
-        let now = Instant::now();
-        let live = self.old_generation_consumed_bytes();
-        let pause_ms = now.duration_since(pause_start).as_secs_f64() * 1000.0;
-        let minor_ms = self
-            .gc_stats
-            .minor_pause_ns_total
-            .saturating_sub(self.minor_pause_ns_at_last_major_gc) as f64
-            / 1.0e6;
-        let mutator_ms = (pause_start
-            .duration_since(self.last_major_gc_end)
-            .as_secs_f64()
-            * 1000.0
-            - minor_ms)
-            .max(0.0);
-        let allocated = old_generation_before.saturating_sub(self.old_generation_bytes_at_last_gc);
-        let gc_speed = if pause_ms > 0.0 {
-            old_generation_before as f64 / pause_ms
-        } else {
-            0.0
-        };
-        let mutator_speed = if mutator_ms > 0.0 {
-            allocated as f64 / mutator_ms
-        } else {
-            0.0
-        };
-        let factor = dynamic_growing_factor(gc_speed, mutator_speed);
-        let new_space_capacity =
-            (self.new_space.from_pages().len() * crate::page::PAGE_SIZE) as u64;
-        let computed = (live as f64 * factor) as u64;
-        let limit = computed
-            .max(live.saturating_add(MINIMUM_ALLOCATION_LIMIT_GROWING_STEP))
-            .saturating_add(new_space_capacity);
-        self.old_generation_limit = limit.max(MIN_OLD_GENERATION_SIZE).min(cage_hardcap_bytes());
-        self.concurrent_marking_start = concurrent_marking_start(live, self.old_generation_limit);
-        // The completed sweep has already reconciled released backing
-        // stores; only the surviving reservations remain.
-        self.external_limit = self
-            .reserved_bytes
-            .saturating_add(EXTERNAL_ALLOCATION_SOFT_LIMIT);
-        self.old_generation_bytes_at_last_gc = live;
-        self.last_major_gc_end = now;
-        self.minor_pause_ns_at_last_major_gc = self.gc_stats.minor_pause_ns_total;
     }
 
     /// Install the embedder's weak-semantics pass. The VM installs it once
@@ -2898,17 +2815,6 @@ impl GcHeap {
     /// whether it is armed yet.
     pub fn gc_stress_enabled(&self) -> bool {
         self.gc_stress_stride != 0
-    }
-
-    /// Set the old-generation allocation limit that holds until the first
-    /// mark-compact. Embedders with small heaps lower it from
-    /// [`INITIAL_OLD_GENERATION_SIZE`]; it has no effect once a mark-compact
-    /// has recomputed the limits.
-    pub fn set_initial_old_generation_size(&mut self, bytes: u64) {
-        if self.gc_stats.gc_cycles == 0 {
-            self.old_generation_limit = bytes.min(cage_hardcap_bytes());
-            self.concurrent_marking_start = concurrent_marking_start(0, self.old_generation_limit);
-        }
     }
 
     /// Configure GC stress on this heap: a scavenge (and, with `full`, a
@@ -3008,7 +2914,11 @@ impl GcHeap {
             return Ok(());
         }
         self.in_major_gc = true;
-        let collect_result = self.collect_full(external_visit);
+        let collect_result = self.collect_full_observed(
+            external_visit,
+            GcPauseTrigger::GrowthBudget,
+            FullGcGoal::Throughput,
+        );
         self.in_major_gc = false;
         collect_result
     }
@@ -3414,17 +3324,23 @@ impl GcHeap {
         self.weak_finalization.retain_marked(raw_is_marked);
     }
 
-    /// Finish a full-GC cycle by sweeping everything left white.
+    /// Finish an explicit split full-GC cycle and release unused physical payload.
     pub fn sweep_phase(&mut self) {
         self.with_gc_pause(GcPauseKind::SplitSweep, GcPauseTrigger::Explicit, |heap| {
-            heap.sweep_phase_with_pause_start(Instant::now());
+            heap.sweep_phase_with_pause_start(Instant::now(), FullGcGoal::ReleaseMemory);
             ((), GcPauseOutcome::Completed)
         });
     }
 
-    fn sweep_phase_with_pause_start(&mut self, pause_start: Instant) {
+    fn sweep_phase_with_pause_start(&mut self, pause_start: Instant, goal: FullGcGoal) {
         self.retire_machine_labs();
         self.prepare_collection_observations();
+        // Heap-owned weak state is always present, even when a split sweep
+        // has no temporary mutator/root-source registration. Mark bits are
+        // final and no old-space cell has been reclaimed yet.
+        if let Some(data) = &self.isolate_data {
+            data.sweep_weak(self);
+        }
         // This is also the split mark/sweep entry. Resolve observations here
         // so even a caller without an embedder post-mark pass cannot leave a
         // freed old offset in an owner cache. Full collections have already
@@ -3441,13 +3357,12 @@ impl GcHeap {
         self.prune_weak_finalization_registry_to_marked();
         self.weak_cleanup_due |= self.weak_finalization.has_finalization_registries();
 
-        // Sweep — anything still white in old / large / young
-        // is dead. For old-space, walk pages; reap pages whose
-        // live_bytes is zero. For young, our scavenger already
-        // ran; any white survivor in from-space (post-flip) is
-        // garbage we can drop at next scavenge but right now we
-        // simply reset the whole thing — the next mutator alloc
-        // path needs an empty from-space.
+        // Sweep white old/large cells and reap wholly dead pages.
+        // The finishing scavenge has already copied nursery survivors
+        // into the active from-space. Preserve its initialized prefix,
+        // including cells whose old parent became unreachable only in
+        // this full mark; the next scavenge can reclaim those cells.
+        // Only inactive payload and unused active tails may be discarded.
         //
         // The same walk also accumulates per-tag live counts
         // for [`crate::stats::GcStats`] reconciliation — fused
@@ -3575,17 +3490,13 @@ impl GcHeap {
                 });
             }
         }
-        // Reap pages whose live bytes is zero, then publish the free
-        // ranges recovered from the surviving pages.
+        // Reap empty pages. Free-range publication follows every reader
+        // and the physical discard below, using the sweep's same range vector.
         let _ = self.old_space.reap_dead_pages();
         let _ = self.large_space.reap_dead_pages();
         // A dead tail was handed back to bump allocation above; reopen every
         // page that has real bump room again.
         self.old_space.reopen_bump_pages();
-        for (offset, bytes) in free_ranges {
-            self.old_space.push_free_range(offset, bytes);
-        }
-
         self.marking.finish_cycle();
         // The walks above whitened every surviving cell.
         self.marks_white = true;
@@ -3594,6 +3505,21 @@ impl GcHeap {
         self.drain_shared_external_releases();
         if self.max_heap_bytes != 0 {
             self.tracked_bytes = retained_bytes.saturating_add(self.reserved_bytes);
+        }
+        if goal == FullGcGoal::ReleaseMemory {
+            // Every weak/finalizer/trace consumer is finished and marker
+            // workers are stopped. Throughput requests retain resident payload
+            // for reuse; release requests preserve its virtual ownership.
+            // SAFETY: this STW sweep retired both LABs before walking the heap;
+            // finish_cycle above drained the marker and all reclamation hooks ran.
+            unsafe { self.new_space.discard_unused_payload() };
+            // Preserve every FREE header/link prefix before publication.
+            // SAFETY: all workers and hooks finished, dead pages were reaped,
+            // the old free list is still clear and both LABs are retired.
+            unsafe { self.old_space.discard_swept_unused_payload(&free_ranges) };
+        }
+        for (offset, bytes) in free_ranges {
+            self.old_space.push_free_range(offset, bytes);
         }
         self.stats.last_full_reclaimed = reclaimed;
         self.stats.total_full_reclaimed = self.stats.total_full_reclaimed.saturating_add(reclaimed);
@@ -4007,14 +3933,6 @@ fn raw_is_marked(raw: RawGc) -> bool {
     }
 }
 
-/// Old-generation occupancy at which a concurrent marking cycle starts
-/// between the `live` bytes the last mark-compact kept and the `limit` the
-/// next one runs at: seven eighths of the way, leaving the last eighth of
-/// the growth for the mutator to allocate while the helpers mark.
-fn concurrent_marking_start(live: u64, limit: u64) -> u64 {
-    live.saturating_add(limit.saturating_sub(live) / 8 * 7)
-}
-
 #[path = "heap/tenured.rs"]
 mod tenured;
 
@@ -4086,3 +4004,11 @@ mod cap_admission_tests;
 
 #[cfg(test)]
 mod collection_accounting_tests;
+
+#[cfg(test)]
+#[path = "heap/nursery_discard_tests.rs"]
+mod nursery_discard_tests;
+
+#[cfg(test)]
+#[path = "heap/old_space_discard_tests.rs"]
+mod old_space_discard_tests;

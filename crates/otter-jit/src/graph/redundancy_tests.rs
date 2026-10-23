@@ -8,6 +8,7 @@
 //! - Frame states and phis read the surviving node.
 //! - A site-relative read of one inlined body never stands for another's.
 //! - A field store answers the same object's later reads of that field.
+//! - Representation migration preserves decoded field values, but not maps.
 //!
 //! # Invariants
 //! The graphs are built by hand in the pass's input form: placed blocks,
@@ -128,6 +129,7 @@ fn a_shape_read_after_field_only_arms_is_the_dominating_read() {
 #[test]
 fn a_shape_changing_arm_keeps_the_reload() {
     let store = Kind::StoreNamedProperty {
+        plan: crate::graph::ir::NamedStorePlan::Programs,
         byte_pc: 0,
         owners: Default::default(),
         receiver_shape: None,
@@ -201,7 +203,7 @@ fn a_field_store_answers_the_next_reads_of_the_same_field() {
     let mut b = Builder::new(2);
     let object = b.node(0, Kind::InitialRegister(0), &[], Repr::Tagged);
     let other = b.node(0, Kind::InitialRegister(1), &[], Repr::Tagged);
-    let int = b.node(0, Kind::CheckedTaggedToInt32, &[other], Repr::Int32);
+    let int = b.node(0, Kind::CheckedNumberToInt32, &[other], Repr::Int32);
     let tagged = b.node(0, Kind::Int32ToTagged, &[int], Repr::Tagged);
     b.node(0, field_store(7), &[object, tagged], Repr::None);
     b.jump(0, 1);

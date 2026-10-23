@@ -1,13 +1,14 @@
-//! x86 Number conversions over canonical tagged values and unboxed scalars.
+//! x86 Number conversions over Value words and unboxed scalars.
 //!
 //! # Contents
-//! - Checked tag removal and exact integral/index conversions.
-//! - Canonical Number boxing through the shared x86 value encoder.
+//! - Semantic Number-to-Int32 projection and exact integral/index conversions.
+//! - Pure Double boxing through the shared x86 value encoder.
 //! - Total ECMAScript ToInt32 through its typed NoAlloc leaf.
 //!
 //! # Invariants
 //! - CVTTSD2SI's sentinel is accepted only after an ordered exact round trip.
 //! - Numeric conversion rejects negative zero; an element index accepts it.
+//! - A semantic Int32 result does not prove its original Value's physical tag.
 //! - Tagged checks and precision guards commit no allocated result on failure.
 //!
 //! # See also
@@ -18,14 +19,12 @@ use super::*;
 impl Codegen<'_> {
     pub(super) fn emit_conversion(&mut self, node: NodeId) -> Result<bool, Unsupported> {
         match self.graph.node(node).kind.clone() {
-            Kind::CheckedTaggedToInt32 => {
+            Kind::CheckedNumberToInt32 => {
                 let a = Self::gp(self.loc(node).inputs[0]);
                 let dst = Self::gp(self.loc(node).result.unwrap());
+                let fp = self.loc(node).fp_temps[0];
                 let exit = self.eager_exit(node, DeoptReason::WrongType);
-                dynasm!(self.ops ; .arch x64
-                    ; mov r10, Rq(a) ; sar r10, 49 ; cmp r10, -1 ; jne =>exit
-                    ; mov Rd(dst), Rd(a)
-                );
+                crate::x86_64::index::emit_exact_int32(&mut self.ops, a, dst, fp, exit);
             }
             Kind::CheckedTaggedToFloat64 => {
                 let a = Self::gp(self.loc(node).inputs[0]);
@@ -146,20 +145,7 @@ pub(super) fn emit_checked_float_to_int(
     dynasm!(ops ; .arch x64 ; mov Rd(dst), r10d);
 }
 
-/// Prefer the int32 representation only when the exact round trip succeeds
-/// and the zero has a positive sign; all other doubles use the shared encoder.
+/// Encode a purified Double without changing its floating-point source.
 pub(super) fn emit_box_number(ops: &mut Assembler, a: u8, dst: u8) {
-    let double = ops.new_dynamic_label();
-    let integer = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
-    dynasm!(ops ; .arch x64
-        ; cvttsd2si r10d, Rx(a) ; cvtsi2sd xmm15, r10d
-        ; ucomisd Rx(a), xmm15 ; jp =>double ; jne =>double
-        ; test r10d, r10d ; jnz =>integer
-        ; movq r11, Rx(a) ; test r11, r11 ; js =>double ; =>integer
-    );
-    crate::x86_64::values::emit_box_int32(ops, 10, dst, 11);
-    dynasm!(ops ; .arch x64 ; jmp =>done ; =>double);
-    crate::x86_64::values::emit_box_double(ops, a, dst, 11);
-    dynasm!(ops ; .arch x64 ; =>done);
+    crate::x86_64::field_word::emit_encode_double(ops, a, dst, 11);
 }

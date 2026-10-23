@@ -9,7 +9,7 @@
 //!
 //! # Contents
 //! - [`IsolateData`] — the embedder value's contract: its strong old-space
-//!   handles.
+//!   handles and pre-sweep weak maintenance.
 //! - [`IsolateDataSlot`] — the heap's owned slot: the value plus the type it
 //!   was installed as.
 //!
@@ -19,6 +19,7 @@
 //! - The value is boxed, so its address and the addresses of the boxes it
 //!   owns are stable for the heap's life: generated code may embed them.
 //! - A typed read answers only for the type the value was installed as.
+//! - Weak maintenance runs once at the physical sweep boundary, after final marking.
 //! - The value names old-space cells only. Old space never moves, so its
 //!   handles are visited as roots by every marking and by no scavenge.
 //!
@@ -37,6 +38,13 @@ pub trait IsolateData: Any {
     /// an old-space cell, which never moves, so the visitor never rewrites
     /// a slot.
     fn visit_old_roots(&self, visitor: &mut dyn FnMut(*mut RawGc));
+
+    /// Forget old-space weak entries after marking and before physical sweep.
+    ///
+    /// The hook must not allocate, mark, reenter the mutator or retain `heap`.
+    /// It runs for full and split mark/sweep collections, independently of
+    /// temporary extra-root registrations. Old-space handles never move.
+    fn sweep_weak(&self, _heap: &crate::heap::GcHeap) {}
 }
 
 /// The heap's owned embedder value and the type it was installed as.
@@ -73,6 +81,10 @@ impl IsolateDataSlot {
         // SAFETY: as in `get`; the unique borrow of the slot is the unique
         // borrow of its value.
         Some(unsafe { &mut *std::ptr::from_mut::<dyn IsolateData>(&mut *self.data).cast::<T>() })
+    }
+
+    pub(crate) fn sweep_weak(&self, heap: &crate::heap::GcHeap) {
+        self.data.sweep_weak(heap);
     }
 
     pub(crate) fn visit_old_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {

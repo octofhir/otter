@@ -61,8 +61,8 @@ use otter_vm::runtime_stubs::{
 };
 
 use super::values::{
-    CellTest, emit_box_int32, emit_box_number_with_scratch, emit_cell_test, emit_load_reg,
-    emit_load_symbol_u64, emit_load_u64,
+    CellTest, emit_box_int32, emit_box_number, emit_cell_test, emit_load_reg, emit_load_symbol_u64,
+    emit_load_u64,
 };
 use crate::artifact::relocation::{GuardedHeapComponent, RelocationCapture, RelocationTarget};
 use crate::entry::{
@@ -567,11 +567,11 @@ fn emit_through_local_buffer(
 /// Prove one index against an already validated in-body dense view.
 ///
 /// The caller supplies the raw base in `x16` and normalized length in `x14`.
-/// On success `x16` is advanced to the addressed element. The tagged index
-/// must carry the exact int32 number tag; the sign test then rejects a
-/// negative index before the unsigned bounds comparison.
+/// On success `x16` is advanced to the addressed element. Either numeric
+/// encoding may hold an exact nonnegative index; negative zero is index zero.
+/// The original key remains intact for a committed miss.
 ///
-/// Clobbers `x11`, `x12`, `x15`, and `x16`.
+/// Clobbers `x11`, `x12`, `x15`–`x17`, and `d31`.
 pub(crate) fn emit_element_address_from_dense_view<I>(
     ops: &mut Assembler,
     access: &JitElementAccess,
@@ -582,33 +582,27 @@ where
     I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
     load_index(ops, 15)?;
-    dynasm!(ops
-        ; .arch aarch64
-        ; lsr x11, x15, #48
-        ; movz x12, NUMBER_TAG_HI16
-        ; cmp x11, x12
-        ; b.ne =>miss
-        ; tst w15, 0x80000000
-        ; b.ne =>miss
-    );
+    // Projection uses x16/x17 as reserved scratches. Keep the already
+    // validated base separately, and never decode over the original key.
+    dynasm!(ops ; .arch aarch64 ; mov x11, x16);
+    crate::arm64::index::emit_number_index(ops, 15, 12, 31, miss);
     match access.length_width {
         JitGuardWidth::Byte | JitGuardWidth::Word32 => dynasm!(ops
             ; .arch aarch64
-            ; cmp w15, w14
+            ; cmp w12, w14
             ; b.hs =>miss
         ),
         JitGuardWidth::Word64 => dynasm!(ops
             ; .arch aarch64
-            ; mov w15, w15
-            ; cmp x15, x14
+            ; cmp x12, x14
             ; b.hs =>miss
         ),
     }
     match access.element.stride_shift() {
-        0 => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw),
-        1 => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #1),
-        2 => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #2),
-        _ => dynasm!(ops ; .arch aarch64 ; add x16, x16, w15, uxtw #3),
+        0 => dynasm!(ops ; .arch aarch64 ; add x16, x11, w12, uxtw),
+        1 => dynasm!(ops ; .arch aarch64 ; add x16, x11, w12, uxtw #1),
+        2 => dynasm!(ops ; .arch aarch64 ; add x16, x11, w12, uxtw #2),
+        _ => dynasm!(ops ; .arch aarch64 ; add x16, x11, w12, uxtw #3),
     }
     Ok(())
 }
@@ -618,7 +612,7 @@ where
 ///
 /// The guard is one program over the declared family: the receiver is a heap
 /// cell carrying that cell tag, its latch reads clean, the index is a
-/// non-negative int32 below the body's live element count, a fixed typed view's
+/// Number holding an exact index below the body's live element count, a fixed typed view's
 /// complete construction-time extent still fits its live backing buffer, and
 /// the address comes from the body's element base pointer so the backing
 /// container's layout stays unobserved. Nothing here allocates, so no
@@ -628,7 +622,7 @@ where
 /// they are handed and run inside the guard sequence, so they must touch no
 /// other register. That is the only thing a tier supplies: the guard itself is
 /// written once, and the family is [`JitElementAccess`] data. Clobbers `x9`,
-/// `x11`–`x16`.
+/// `x11`–`x17` and `d31`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_element_address<R, I>(
     ops: &mut Assembler,
@@ -655,9 +649,8 @@ where
 /// A boxed hole is an absent property — the prototype chain answers a read, and
 /// a prototype setter may observe a write — so it is a guard failure. A scalar
 /// element has no such state and always produces a value; narrow integer
-/// kinds extend into an int32 box, `Uint32` and `Float32` box through the
-/// canonical number encoding. Clobbers `x10`–`x12`, `x14`, `x15`, `d30`, and
-/// `d31`.
+/// kinds extend into an Int32 box; `Uint32`, `Float32` and `Float64` produce
+/// Value-valid Double words. Clobbers `x10`–`x12`, `x14`, `x15` and `d31`.
 pub(crate) fn emit_element_read(ops: &mut Assembler, element: JitElementRepr, miss: DynamicLabel) {
     match element {
         JitElementRepr::Boxed => {
@@ -694,22 +687,18 @@ pub(crate) fn emit_element_read(ops: &mut Assembler, element: JitElementRepr, mi
             emit_box_int32(ops, 9, 11);
         }
         JitElementRepr::Uint32 => {
-            // Values above i32::MAX are not int32s: convert exactly and let
-            // the canonical number box pick the representation.
+            // Convert the full unsigned domain exactly into a Double word.
             dynasm!(ops ; .arch aarch64 ; ldr w9, [x16] ; ucvtf d31, w9);
-            emit_box_number_with_scratch(ops, 31, 9, 30);
+            emit_box_number(ops, 31, 9);
         }
         JitElementRepr::Float32 => {
             dynasm!(ops ; .arch aarch64 ; ldr s31, [x16] ; fcvt d31, s31);
-            emit_box_number_with_scratch(ops, 31, 9, 30);
+            emit_box_number(ops, 31, 9);
         }
         JitElementRepr::Float64 => {
-            // Match `NumberValue::from_f64`: exact int32 values use the Smi
-            // representation, while -0, fractions, infinities and values
-            // outside int32 remain doubles. This is required before a later
-            // representation guard observes the loaded value.
+            // Preserve the scalar encoding, including integral values and -0.
             dynasm!(ops ; .arch aarch64 ; ldr d31, [x16]);
-            emit_box_number_with_scratch(ops, 31, 9, 30);
+            emit_box_number(ops, 31, 9);
         }
     }
 }

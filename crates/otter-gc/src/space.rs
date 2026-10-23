@@ -18,9 +18,9 @@
 //!
 //! # Invariants
 //!
-//! - `NewSpace::flip()` swaps `from`/`to` *and* clears the
-//!   freshly-from-space pages so the next mutator alloc sees a
-//!   pristine bump cursor.
+//! - `NewSpace::flip()` retains the copied survivors in the new `from`
+//!   pages and resets recycled inactive `to` pages. Mutator allocation
+//!   continues after the survivors; the next evacuation starts with empty `to`.
 //! - Promotion (young → old) happens inside the scavenger for objects
 //!   below their page's `age_mark`, i.e. objects that already survived one
 //!   scavenge. New-space pages carry the mark; old-space pages do not.
@@ -32,6 +32,10 @@
 //! - Unused standby pages stay reserved across scavenges, so a steady nursery
 //!   cycle neither zeroes nor re-faults promotion pages. A full collection's
 //!   page reap returns them to the cage.
+//! - A memory-releasing full sweep discards unused nursery payload physically,
+//!   preserving page headers, virtual addresses and semispace capacity.
+//! - The same request may discard recovered old ranges and unused bump tails;
+//!   filler headers and intrusive links retain their OS pages.
 //!
 //! # See also
 //!
@@ -241,8 +245,43 @@ impl NewSpace {
         self.from.iter().map(|p| p.header().allocated_bytes).sum()
     }
 
-    /// Flip semantic: swap `from` ↔ `to`, reset the new from-space
-    /// bump cursors and active index. Called by the scavenger
+    /// Release unused physical nursery pages after a completed full sweep.
+    /// Inactive pages have reset bump cursors; active pages retain every byte
+    /// up to their published bump cursor. Inward OS-page rounding also retains
+    /// the page-header OS page. No capacity or allocation metadata changes.
+    ///
+    /// # Safety
+    /// The mutator and all marker/scavenger workers must be stopped. All LABs
+    /// must be retired, weak processing and reclamation hooks completed, and
+    /// no reader may retain a pointer into either inactive payload or active
+    /// unused tails. Ordinary minor collections deliberately do not call this.
+    pub(crate) unsafe fn discard_unused_payload(&self) -> usize {
+        let Some(granule) = crate::compressed::discard::system_page_size() else {
+            return 0;
+        };
+        debug_assert!(self.to.iter().all(|page| {
+            page.header().bump_cursor == PAGE_HEADER_SIZE && page.header().allocated_bytes == 0
+        }));
+        let mut discarded = 0usize;
+        for page in self.from.iter().chain(&self.to) {
+            let cursor = page.header().bump_cursor;
+            debug_assert!(cursor >= PAGE_HEADER_SIZE && cursor <= page.header().span_bytes());
+            // SAFETY: the caller has completed all readers and published the
+            // cursor. The entire supplied suffix is unused, including on an
+            // inactive page whose reset cursor follows its retained header.
+            discarded = discarded.saturating_add(unsafe {
+                crate::compressed::discard::unused_range(
+                    page.base_ptr().add(cursor),
+                    page.header().span_bytes() - cursor,
+                    granule,
+                )
+            });
+        }
+        discarded
+    }
+
+    /// Swap `from` ↔ `to`, retaining copied survivors and resetting the
+    /// recycled inactive pages and allocation indices. Called by the scavenger
     /// after evacuating survivors and (optionally) after the
     /// caller has fixed up external roots.
     pub fn flip(&mut self) {
@@ -260,6 +299,7 @@ impl NewSpace {
 }
 
 mod free_list;
+mod old_discard;
 use free_list::{FreeEntry, OldFreeList};
 
 /// Old-generation space: a list of pages plus a size-classed free list

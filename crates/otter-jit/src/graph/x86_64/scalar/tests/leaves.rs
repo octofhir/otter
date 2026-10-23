@@ -336,6 +336,7 @@ fn tagged_predicates_keep_all_live_words_and_numeric_nan_zero_semantics() {
         tag::VALUE_UNDEFINED,
         tag::box_int32(0),
         tag::box_int32(-731),
+        tag::box_double((-731.0_f64).to_bits()),
         tag::box_double((-0.0_f64).to_bits()),
         tag::box_double(0.0_f64.to_bits()),
         tag::box_double(1.5_f64.to_bits()),
@@ -348,7 +349,7 @@ fn tagged_predicates_keep_all_live_words_and_numeric_nan_zero_semantics() {
         Kind::LogicalNot,
     ] {
         let code = fixture(kind.clone());
-        // SAFETY: canonical tagged inputs, a live heap for cold predicates,
+        // SAFETY: Value-valid tagged inputs, a live heap for cold predicates,
         // and an owned output window; the wrapper preserves C nonvolatiles.
         let run: extern "sysv64" fn(*mut JitCtx, *mut u64, u64, u64) =
             unsafe { std::mem::transmute(code.entry_ptr()) };

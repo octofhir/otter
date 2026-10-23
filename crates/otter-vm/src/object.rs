@@ -71,8 +71,11 @@
 //!   only the suffix; inline prefix words never migrate. Capacity roots are
 //!   cached per prototype, capacity and complete immutable state.
 //! - GC shape layouts are immutable except for constructor slack completion;
-//!   scalar stability and field summaries widen monotonically. Transition
-//!   tables and offset maps live in interpreter-owned side caches.
+//!   scalar stability and field summaries widen monotonically. One heap-owned
+//!   interner owns canonical shape transitions.
+//! - Every data field accepts any valid Value word, including offset doubles.
+//!   Reads, copies and tracing preserve the stored word without changing its
+//!   numeric representation or the object's geometry.
 //! - Every live shaped data field contributes to its defining shape's summary
 //!   at birth, store and adoption into an independent lineage. Collector
 //!   handle rewrites do not change these scalar summaries.
@@ -134,6 +137,7 @@ mod persistent_fields_tests;
 pub(crate) mod prototype_validity;
 pub(crate) mod shape_body;
 mod shape_cache;
+pub(crate) mod shape_interner;
 pub(crate) mod shape_keys;
 #[cfg(test)]
 mod shape_lookup_tests;
@@ -2275,6 +2279,12 @@ impl ObjectBody {
         self.slot_word(i)
     }
 
+    /// Complete physical location, independent of the stored word's category.
+    #[inline]
+    fn data_location_for_slot(&self, index: usize) -> FieldLocation {
+        self.location_for_slot(index)
+    }
+
     /// Write a value into string-keyed slot `i`.
     #[inline]
     fn set_data_value(&mut self, i: usize, value: Value) {
@@ -2373,10 +2383,10 @@ impl ObjectBody {
     ) {
         match attr_shape {
             Some(shape) => {
-                self.set_data_value(i, value);
                 debug_assert_object_shape_handle(shape, "slot attribute shape install");
                 debug_assert_object_shape_handle(shape, "shape-slot store");
                 self.adopt_shape(shape);
+                self.set_data_value(i, value);
                 assert!(
                     !self.is_dictionary(),
                     "attribute shape owns all descriptors"
@@ -3224,17 +3234,8 @@ pub(crate) fn alloc_object_old_for_fixture(
 /// installed on a heap no interpreter owns.
 #[cfg(test)]
 pub(crate) fn fixture_root_shape(heap: &mut GcHeap) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
-    if shape_body::null_root(heap).is_null() {
-        let mut no_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let root = shape_body::alloc_root_shape_body_with_roots(
-            heap,
-            shape_body::ShapePrototype::Null,
-            DEFAULT_INLINE_CAPACITY,
-            ShapeHandle::null(),
-            ShapeState::ORDINARY,
-            &mut no_roots,
-        )?;
-        shape_body::set_null_root(heap, root);
+    if crate::isolate_names::IsolateNames::get(heap).is_none() {
+        let _facade = ShapeRuntime::new(heap)?;
     }
     Ok(shape_body::null_root(heap))
 }
@@ -3324,7 +3325,7 @@ pub(crate) fn alloc_object_with_shape_roots(
 /// no later per-property mutator store is required.
 pub(crate) fn alloc_object_with_shape_and_values_roots(
     heap: &mut GcHeap,
-    mut shape: ShapeHandle,
+    shape: ShapeHandle,
     values: &mut [Value],
     placement: otter_gc::SitePlacement,
     external_visit: &mut RootSlotVisitor<'_>,
@@ -3335,39 +3336,36 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
         "shape slot count and initialization values diverged"
     );
 
-    let shape_slot = std::ptr::addr_of_mut!(shape).cast::<RawGc>();
-    let all_values = values.as_mut_ptr();
-    let all_values_len = values.len();
-    let mut visit_owner_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        external_visit(visitor);
-        visitor(shape_slot);
-        for index in 0..all_values_len {
-            unsafe { (*all_values.add(index)).trace_value_slot_mut(visitor) };
-        }
-    };
-
+    let mut shape = shape;
     let capacity = shape_body::inline_capacity_of(shape);
-    let prefix = values.len().min(capacity);
-    let slab = if values.len() <= capacity {
+    let count = values.len();
+    let prefix = count.min(capacity);
+    let shape_slot = std::ptr::addr_of_mut!(shape).cast::<RawGc>();
+    let slab = if count <= capacity {
         slot_slab::SlotSlabHandle::null()
     } else {
-        slot_slab::alloc_slot_slab_with_values(
-            heap,
-            values.len() - capacity,
-            &mut values[capacity..],
-            &mut visit_owner_roots,
-        )?
+        let (inline, tail) = values.split_at_mut(capacity);
+        let inline_base = inline.as_mut_ptr();
+        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            visitor(shape_slot);
+            for index in 0..prefix {
+                // SAFETY: this prefix is disjoint from the protected mutable
+                // tail; the slab allocator roots and rewrites the tail itself.
+                unsafe { (*inline_base.add(index)).trace_value_slot_mut(visitor) };
+            }
+        };
+        slot_slab::alloc_slot_slab_with_values(heap, count - capacity, tail, &mut visit)?
     };
     let PendingObject { mut body } = empty_object_body(shape);
     body.slab = slab;
+    // The tail borrow ended. One mutable-derived pointer serves both root
+    // rewriting and initialization, without a second value buffer or reborrow.
     let values_base = values.as_mut_ptr();
-    let values_len = values.len();
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         external_visit(visitor);
-        // The pending body owns and traces the slab handle. Only the input
-        // buffer needs extra roots; do not expose an immutable local as a
-        // collector-writable root.
-        for index in 0..values_len {
+        visitor(shape_slot);
+        for index in 0..count {
             unsafe { (*values_base.add(index)).trace_value_slot_mut(visitor) };
         }
     };
@@ -3388,27 +3386,19 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
                     *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) = value
                 };
             }
-            body.seed_field_types(values_len);
+            body.seed_field_types(count);
         },
     )
 }
 
-/// An object of `shape` holding `values` in its in-object slots, built from
-/// the allocation buffer without collecting: the bytes the caller reserved
-/// ([`object_cell_bytes`] of the shape's in-object capacity). The cell
-/// [`alloc_object_with_shape_and_values_roots`] makes, its field types seeded
-/// the same way. `None` when the values do not all fit in object or the
-/// buffer has no room.
+/// Publish initialized Value words from an already reserved allocation buffer.
+/// No allocation, JavaScript or representation preparation occurs here.
 pub(crate) fn try_alloc_object_with_values_no_collect(
     heap: &mut GcHeap,
     shape: ShapeHandle,
     values: &[Value],
 ) -> Option<JsObject> {
-    debug_assert_eq!(
-        shape_property_count(shape, heap) as usize,
-        values.len(),
-        "shape slot count and initialization values diverged"
-    );
+    debug_assert_eq!(shape_body::property_count_of(shape) as usize, values.len());
     let capacity = shape_body::inline_capacity_of(shape);
     if values.len() > capacity {
         return None;
@@ -3467,7 +3457,7 @@ pub(crate) fn install_pending_receiver_shape(
 fn install_fresh_shape(
     obj: JsObject,
     heap: &mut GcHeap,
-    shape: ShapeHandle,
+    mut shape: ShapeHandle,
     values: &[Value],
     capacity: usize,
     observe: bool,
@@ -3481,6 +3471,13 @@ fn install_fresh_shape(
     );
     let mut obj = obj;
     let mut stored = SmallVec::<[Value; 8]>::from_slice(values);
+    let mut roots = otter_gc::RootScope::new(heap);
+    // SAFETY: the receiver/shape slots remain stationary through preparation.
+    unsafe {
+        use crate::rooting::RootScopeExt;
+        roots.add_object(&mut obj);
+        roots.add_raw_slot(std::ptr::addr_of_mut!(shape).cast::<RawGc>());
+    }
     debug_assert_eq!(heap.read_payload(obj, ObjectBody::slot_count), 0);
     if reserve_slot_capacity(&mut obj, heap, capacity.max(stored.len()), &mut stored).is_err() {
         return;
@@ -3867,15 +3864,15 @@ fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
 }
 
 fn apply_mapped_arguments_partial_define(
-    obj: JsObject,
+    obj: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     key: &str,
     descriptor: PartialPropertyDescriptor,
     existing_offset: Option<u32>,
-) {
-    let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key));
+) -> Result<(), otter_gc::OutOfMemory> {
+    let mapped_cell = heap.read_payload(*obj, |body| mapped_argument_cell(body, key));
     let Some(cell) = mapped_cell else {
-        return;
+        return Ok(());
     };
 
     // §10.4.4.2 steps 5-6 — consult the partial descriptor:
@@ -3884,8 +3881,8 @@ fn apply_mapped_arguments_partial_define(
     // writable:false is present without [[Value]], the unmapped own
     // data property must first capture the current parameter value.
     if descriptor.is_accessor() {
-        heap.with_payload(obj, |body| remove_mapped_argument(body, key));
-        return;
+        heap.with_payload(*obj, |body| remove_mapped_argument(body, key));
+        return Ok(());
     }
 
     if let Some(value) = descriptor.value {
@@ -3897,20 +3894,18 @@ fn apply_mapped_arguments_partial_define(
             let current = mapped_read(heap, cell);
             let stored = current;
             if let Some(offset) = existing_offset {
-                let is_data_slot = heap.read_payload(obj, |body| {
+                let is_data_slot = heap.read_payload(*obj, |body| {
                     ((offset as usize) < body_property_count(heap, body))
                         && !body.slot_attrs(heap, offset as usize).1
                 });
                 if is_data_slot {
-                    heap.with_payload(obj, |body| {
-                        body.set_data_value(offset as usize, stored);
-                    });
-                    record_slot_write(heap, obj, stored);
+                    write_layout_slot(obj, heap, offset as usize, stored);
                 }
             }
         }
-        heap.with_payload(obj, |body| remove_mapped_argument(body, key));
+        heap.with_payload(*obj, |body| remove_mapped_argument(body, key));
     }
+    Ok(())
 }
 
 /// Immutable semantic state of an object's exact hidden class.
@@ -4443,75 +4438,10 @@ pub(crate) fn load_own_data_slot_by_shape(
     })
 }
 
-/// Store through a cached own data slot after validating shape and atom guards.
-///
-/// Returns `Some(())` only when the write was completed. `None` means the
-/// cache no longer applies and callers must fall back to ordinary `[[Set]]`.
-pub(crate) fn store_own_data_slot_atom(
-    obj: JsObject,
-    heap: &mut otter_gc::GcHeap,
-    key: AtomizedPropertyKey<'_>,
-    hit: AtomOwnPropertyHit,
-    value: &Value,
-) -> Option<()> {
-    // Validate before compressing. Boxing a double or wide int32 may scavenge
-    // and relocate `obj`; a failed IC probe cannot communicate that relocated
-    // handle to its caller, which still owns the canonical rooted slot. A miss
-    // must therefore remain allocation-free so fallback can safely re-read or
-    // reuse the caller's receiver.
-    let guard_matches = heap.read_payload(obj, |body| {
-        let offset = hit.slot as usize;
-        let shape_ok = if !body.is_dictionary() {
-            shaped_hit_matches(body.shape, &hit)
-        } else {
-            body_shape_id(heap, body) == hit.shape_id
-        };
-        if !shape_ok || key.atom().id() != hit.atom_id {
-            return false;
-        }
-        // Store hits are installed only for a writable data slot, and a
-        // matching fast shape fixes every slot's attributes, so neither the
-        // chain walk for this slot's attributes nor the bounds need
-        // consulting. Dictionary storage still does.
-        if !body.is_dictionary() {
-            return true;
-        }
-        let key_matches = !body.is_dictionary() || body_key_matches(heap, body, offset, key.name());
-        let slot_attrs =
-            (offset < body_property_count(heap, body)).then(|| body.slot_attrs(heap, offset));
-        key_matches
-            && slot_attrs.is_some_and(|(flags, is_accessor)| flags.writable() && !is_accessor)
-    });
-    if !guard_matches {
-        return None;
-    }
-    debug_assert!(
-        heap.read_payload(obj, |body| body_key_matches(
-            heap,
-            body,
-            hit.slot as usize,
-            key.name()
-        )),
-        "shape-id store hit resolved to a slot whose key differs from the request"
-    );
-
-    let stored = *value;
-    let mapped_cell = heap.read_payload(obj, |body| mapped_argument_cell(body, key.name()));
-    heap.with_payload(obj, |body| {
-        let offset = hit.slot as usize;
-        body.set_data_value(offset, stored);
-    });
-    if let Some(cell) = mapped_cell {
-        mapped_write(heap, cell, *value);
-    }
-    record_slot_write(heap, obj, stored);
-    Some(())
-}
-
 /// Read a data slot authorized by a live prototype validity proof.
 /// No allocation or JavaScript may occur between checking the proof and reading.
 pub(crate) fn load_proven_data_slot(obj: JsObject, heap: &GcHeap, slot: u16) -> Value {
-    heap.read_payload(obj, |body| body.slot_word(usize::from(slot)))
+    heap.read_payload(obj, |body| body.data_value(heap, usize::from(slot)))
 }
 
 /// The value of the live own slot `obj`'s current layout stores at `field`,
@@ -4523,8 +4453,8 @@ pub(crate) fn load_slot_at_field(
 ) -> Option<Value> {
     heap.read_payload(obj, |body| {
         (0..body.slot_count())
-            .find(|&index| body.location_for_slot(index) == field)
-            .map(|index| body.slot_word(index))
+            .find(|&index| body.data_location_for_slot(index) == field)
+            .map(|index| body.data_value(heap, index))
     })
 }
 
@@ -5540,13 +5470,13 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 
 /// Overwrite slot `index` of an object whose hidden class already names it.
 pub(crate) fn write_layout_slot(
-    obj: JsObject,
+    obj: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
     index: usize,
     value: Value,
 ) {
-    heap.with_payload(obj, |body| body.set_data_value(index, value));
-    record_slot_write(heap, obj, value);
+    heap.with_payload(*obj, |body| body.set_data_value(index, value));
+    record_slot_write(heap, *obj, value);
 }
 
 /// Read slot `index` of an object whose hidden class already names it.
@@ -5848,10 +5778,10 @@ pub(crate) fn object_prototype_of_value(proto: Option<Value>) -> ObjectPrototype
     }
 }
 
-/// `prototype`'s root shape without a shape runtime: the `null`-prototype
-/// root, the one cached on an ordinary prototype (created and cached on first
-/// use), or a fresh root. The runtime registers such a root when it next
-/// meets it.
+/// `prototype`'s root shape through the heap's one shape authority: the
+/// `null`-prototype chain, the chain cached on an ordinary prototype, or a
+/// fresh root for a non-ordinary prototype. Every new pair is registered
+/// before publication, including heap-only callers.
 pub(crate) fn heap_instance_root(
     prototype: ObjectPrototype,
     heap: &mut GcHeap,
@@ -5886,7 +5816,7 @@ pub(crate) fn heap_instance_root(
         } else {
             shape_body::ShapePrototype::Value(prototype_value)
         };
-        return shape_body::alloc_root_shape_body_with_roots(
+        return shape_interner::ShapeInterner::new_root(
             heap,
             prototype,
             capacity,
@@ -5900,7 +5830,7 @@ pub(crate) fn heap_instance_root(
         if let Some(root) = shape_body::root_for_layout(head, capacity, state) {
             return Ok(root);
         }
-        let root = shape_body::alloc_root_shape_body_with_roots(
+        let root = shape_interner::ShapeInterner::new_root(
             heap,
             shape_body::ShapePrototype::Null,
             capacity,
@@ -5916,7 +5846,7 @@ pub(crate) fn heap_instance_root(
         if let Some(root) = shape_body::root_for_layout(previous, capacity, state) {
             return Ok(root);
         }
-        let root = shape_body::alloc_root_shape_body_with_roots(
+        let root = shape_interner::ShapeInterner::new_root(
             heap,
             shape_body::ShapePrototype::Object(ordinary_proto),
             capacity,
@@ -5927,7 +5857,7 @@ pub(crate) fn heap_instance_root(
         cache_instance_root(&mut ordinary_proto, heap, root)?;
         return Ok(root);
     }
-    shape_body::alloc_root_shape_body_with_roots(
+    shape_interner::ShapeInterner::new_root(
         heap,
         shape_body::ShapePrototype::Value(prototype_value),
         capacity,
@@ -7707,64 +7637,6 @@ mod tests {
         assert_eq!(load_own_data_slot_atom(o, &heap, key, hit), None);
     }
 
-    #[test]
-    fn atom_slot_store_updates_guarded_data_slot() {
-        let mut heap = fresh_heap();
-        let mut o = alloc_object_old_for_fixture(&mut heap).unwrap();
-        assert!(
-            define_own_property_in_place(
-                &mut o,
-                &mut heap,
-                "x",
-                PropertyDescriptor::data(Value::boolean(true), true, true, true)
-            )
-            .expect("fixture property allocation")
-        );
-        let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
-            "x",
-        );
-        let hit = lookup_own_atom(o, &heap, key).hit.expect("atom hit");
-
-        let allocations_before_hit = total_allocations(&mut heap);
-        assert_eq!(
-            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::number_f64(1.25)),
-            Some(())
-        );
-        assert_eq!(
-            total_allocations(&mut heap),
-            allocations_before_hit,
-            "a matching store IC writes the complete numeric Value without allocation"
-        );
-        assert_eq!(
-            load_own_data_slot_atom(o, &heap, key, hit)
-                .and_then(|value| value.as_number())
-                .map(|number| number.as_f64()),
-            Some(1.25)
-        );
-
-        assert!(
-            define_own_property_in_place(
-                &mut o,
-                &mut heap,
-                "y",
-                PropertyDescriptor::data(Value::null(), true, true, true)
-            )
-            .expect("fixture property allocation")
-        );
-
-        let allocations_before_miss = total_allocations(&mut heap);
-        assert_eq!(
-            store_own_data_slot_atom(o, &mut heap, key, hit, &Value::number_f64(1.25)),
-            None
-        );
-        assert_eq!(
-            total_allocations(&mut heap),
-            allocations_before_miss,
-            "a rejected store IC must not allocate"
-        );
-    }
-
     /// Install one ordinary shape slot through the real transition owner.
     /// Build the actual immutable append; the dictionary-only test helper
     /// intentionally cannot supply this ordinary IC premise.
@@ -8896,7 +8768,8 @@ mod tests {
 
 /// Resolve one logical slot against the exact immutable shape layout.
 pub(crate) fn field_location(shape: ShapeHandle, slot: u32) -> FieldLocation {
-    FieldLocation::for_slot(slot, shape_body::inline_capacity_of(shape))
+    shape_body::field_location(shape, slot)
+        .unwrap_or_else(|| FieldLocation::for_slot(slot, shape_body::inline_capacity_of(shape)))
 }
 
 /// Resolve a dictionary or shaped object's immutable prefix layout.

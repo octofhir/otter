@@ -327,8 +327,9 @@ impl Interpreter {
         if let Some(shape) = self
             .simple_constructor_shape_cache
             .get(&(function_id, root_id))
+            .copied()
         {
-            return Ok(*shape);
+            return Ok(shape);
         }
 
         let mut shape = root;

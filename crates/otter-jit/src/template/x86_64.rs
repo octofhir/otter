@@ -1630,6 +1630,7 @@ fn emit_inline_own_field(
         ; cmp r8d, [Rq(slot) + ic.inline_shape_byte as i32] ; jne =>miss
         ; mov eax, [Rq(slot) + ic.inline_field_byte as i32]
         ; test eax, eax ; js =>inline
+        ; and eax, otter_vm::object::FieldLocation::INDEX_MASK as i32
         ; mov r8d, [Rq(receiver) + layout.slab_handle_byte as i32]
         ; test r8d, r8d ; jz =>miss);
     emit_load_u64(ops, 11, 0xffff_ffff_0000_0000);
@@ -1637,7 +1638,7 @@ fn emit_inline_own_field(
         ; and r11, Rq(receiver) ; add r8, r11
         ; add r8, layout.slab_words_byte as i32 ; jmp =>ready
         ; =>inline
-        ; and eax, 0x7fff_ffff
+        ; and eax, otter_vm::object::FieldLocation::INDEX_MASK as i32
         ; lea r8, [Rq(receiver) + layout.inline_values_byte as i32]
         ; =>ready);
 }
@@ -1788,8 +1789,9 @@ fn emit_intrinsic_loads(
                     ; cmp BYTE [rax], slot.type_tag as i8
                     ; jne =>next
                     ; mov rax, [rax + slot.byte as i32]
-                    ; jmp =>done
-                    ; =>next);
+                );
+
+                dynasm!(ops ; .arch x64 ; jmp =>done ; =>next);
             }
             continue;
         }
@@ -1884,7 +1886,9 @@ fn emit_intrinsic_loads(
         }
         emit_field_base(ops, relocations, view, 8, 11, 9, field);
         dynasm!(ops ; .arch x64
-            ; mov rax, [r11 + field.byte_offset() as i32]
+            ; mov rax, [r11 + field.byte_offset() as i32]);
+
+        dynasm!(ops ; .arch x64
             ; jmp =>done
             ; =>next);
     }
@@ -1913,6 +1917,9 @@ fn emit_load_property(
     emit_inline_own_field(ops, view, LOAD_RECEIVER, LOAD_SLOT, shared);
     dynasm!(ops ; .arch x64
         ; mov rax, [r8 + rax * 8]
+    );
+
+    dynasm!(ops ; .arch x64
         ; jmp =>done
         ; =>shared);
     let routine = shared_property.label(ops, false);

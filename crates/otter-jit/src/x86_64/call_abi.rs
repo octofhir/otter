@@ -568,7 +568,10 @@ mod tests {
         // boundary moves them to their Microsoft positions.
         let run: extern "sysv64" fn(u32, f64, f64) -> f64 =
             unsafe { std::mem::transmute(code.entry_ptr()) };
-        assert_eq!(run(3, 1.5, -2.0).to_bits(), method_combine(3, 1.5, -2.0).to_bits());
+        assert_eq!(
+            run(3, 1.5, -2.0).to_bits(),
+            method_combine(3, 1.5, -2.0).to_bits()
+        );
     }
 
     #[test]

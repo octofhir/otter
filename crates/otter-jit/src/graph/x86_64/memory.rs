@@ -57,21 +57,56 @@ impl Codegen<'_> {
                     Some(output()),
                 )?;
             }
-            Kind::LoadOwnField { field, .. } => crate::x86_64::fields::emit_own_field(
-                &mut self.ops,
-                self.view.field_layout,
-                Self::gp(input(0)),
-                output(),
-                field,
-                if self.graph.node(node).repr == crate::graph::ir::Repr::Int32 {
-                    crate::field_access::FieldAccess::LoadInt32
-                } else {
-                    crate::field_access::FieldAccess::LoadTagged
-                },
-            ),
-            Kind::StoreOwnField { field, owners, .. } => {
+            Kind::LoadOwnField { field, .. } => {
+                crate::x86_64::fields::emit_own_field(
+                    &mut self.ops,
+                    self.view.field_layout,
+                    Self::gp(input(0)),
+                    output(),
+                    field,
+                    if self.graph.node(node).repr == crate::graph::ir::Repr::Int32 {
+                        crate::field_access::FieldAccess::LoadInt32
+                    } else {
+                        crate::field_access::FieldAccess::LoadTagged
+                    },
+                );
+            }
+            Kind::LoadNumberOwnField {
+                field, double_only, ..
+            } => {
+                crate::x86_64::fields::emit_own_field(
+                    &mut self.ops,
+                    self.view.field_layout,
+                    Self::gp(input(0)),
+                    10,
+                    field,
+                    crate::field_access::FieldAccess::LoadTagged,
+                );
+                crate::x86_64::field_word::emit_decode_number(
+                    &mut self.ops,
+                    10,
+                    Self::fp(allocation.result.unwrap()),
+                    11,
+                    double_only,
+                );
+            }
+            Kind::StoreOwnField { field, owners, .. }
+            | Kind::StoreDoubleOwnField { field, owners, .. } => {
                 let object = Self::gp(input(0));
-                let value = Self::gp(input(1));
+                let value = match self.graph.node(node).kind {
+                    Kind::StoreDoubleOwnField { .. } => {
+                        let physical = allocation.gp_temps[usize::from(!owners.is_empty())];
+                        crate::x86_64::field_word::emit_encode_double(
+                            &mut self.ops,
+                            Self::fp(input(1)),
+                            physical,
+                            11,
+                        );
+                        physical
+                    }
+                    Kind::StoreOwnField { .. } => Self::gp(input(1)),
+                    _ => unreachable!(),
+                };
                 crate::x86_64::fields::emit_own_field(
                     &mut self.ops,
                     self.view.field_layout,

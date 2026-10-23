@@ -1,4 +1,4 @@
-//! The isolate's property-name state, owned and rooted by its heap.
+//! The isolate's property-name and hidden-class state, owned and rooted by its heap.
 //!
 //! A property name's identity, its atom, is minted by one interner per
 //! isolate. Code that holds only the heap needs it as much as the shape
@@ -10,7 +10,7 @@
 //!
 //! # Contents
 //! - [`IsolateNames`] — the interner, the dense canonical key strings and
-//!   the integer-key atom cache.
+//!   the integer-key atom cache and the one weak shape interner.
 //! - [`names`] / [`names_mut`] — the interner of a heap's isolate.
 //!
 //! # Invariants
@@ -23,6 +23,8 @@
 //! - `key_strings` is indexed by atom id; a null entry is an atom no shape
 //!   has keyed yet. An entry, once set, never changes.
 //! - The integer-key atom cache box never moves for the heap's life.
+//! - Shape tables hold only old-space handles; current-turn pins are strong,
+//!   and all remaining shape entries are pruned before physical sweep.
 //!
 //! # See also
 //! - [`crate::property_atom`] — atoms and the interner.
@@ -73,6 +75,8 @@ impl IndexAtomCache {
 pub(crate) struct IsolateNames {
     /// The isolate's one property-name interner.
     names: NameInterner,
+    /// The heap's one canonical hidden-class and weak-lifetime authority.
+    shapes: crate::object::shape_interner::ShapeInterner,
     /// The canonical key string of each atom, by atom id; null where no
     /// shape has keyed the atom.
     key_strings: Vec<Cell<JsStringHandle>>,
@@ -85,19 +89,28 @@ pub(crate) struct IsolateNames {
 
 impl otter_gc::IsolateData for IsolateNames {
     fn visit_old_roots(&self, visitor: &mut dyn FnMut(*mut RawGc)) {
+        self.shapes.trace_roots(visitor);
         for handle in &self.key_strings {
             if !handle.get().is_null() {
                 visitor(handle.as_ptr().cast::<RawGc>());
             }
         }
     }
+    fn sweep_weak(&self, heap: &GcHeap) {
+        self.shapes.sweep_dead(heap);
+    }
 }
 
 impl IsolateNames {
+    pub(crate) fn shapes(&self) -> &crate::object::shape_interner::ShapeInterner {
+        &self.shapes
+    }
+
     /// Give `heap` its isolate's names, starting from `names`.
     pub(crate) fn install(heap: &mut GcHeap, names: NameInterner) {
         heap.install_isolate_data(Self {
             names,
+            shapes: Default::default(),
             key_strings: Vec::new(),
             index_atoms: IndexAtomCache::new(),
         });

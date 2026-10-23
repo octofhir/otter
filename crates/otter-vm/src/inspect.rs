@@ -398,7 +398,7 @@ pub(crate) fn build_shape_transition_snapshot(
     });
 
     let mut raw: Vec<(u64, u64, String, u32)> = Vec::new();
-    for (parent_id, child) in shape_runtime.transitions_for_snapshot() {
+    for (parent_id, child) in shape_runtime.transitions_for_snapshot(heap) {
         let (child_id, transition_key_handle, property_count, _own_offset) =
             heap.read_payload(child, |body| {
                 (
@@ -416,7 +416,11 @@ pub(crate) fn build_shape_transition_snapshot(
         };
         raw.push((parent_id.raw(), child_id.raw(), key, property_count));
     }
-    raw.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+    raw.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.2.cmp(&b.2))
+            .then_with(|| a.1.cmp(&b.1))
+    });
     for (parent_shape_id, shape_id, transition_key, property_count) in raw {
         nodes.push(ShapeNodeSnapshot {
             shape_id,

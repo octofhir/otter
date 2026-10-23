@@ -11,6 +11,8 @@
 //!   subject and the receiver are rooted across the reservation and the
 //!   record layout, which may collect even when the reservation is declined:
 //!   the caller's copies are updated in place.
+//! - The immutable layout is only geometry. The rooted canonical record is
+//!   consumed directly after reservation; every valid Value word is admissible.
 //! - The cells are the ones the scoped builder
 //!   ([`crate::regexp_prototype::build_match_result_native`]) makes: a
 //!   substring per participating group, `undefined` for the others, a dense
@@ -54,11 +56,29 @@ pub(crate) fn build_match_result_folded(
         roots.add_value(receiver);
         roots.add_value(input);
     }
-    let layout =
-        interp.regexp_record_layout(crate::object_layout_cache::RegExpRecordLayout::Match)?;
-    let Some(shape) = interp.shape_runtime.handle_for_id(layout.shape_id()) else {
+    let kind = crate::object_layout_cache::RegExpRecordLayout::Match;
+    let layout = match interp.object_layout_cache.regexp(kind) {
+        Some(layout) => layout,
+        None => interp.regexp_record_layout(kind)?,
+    };
+    let Some(mut shape) = interp
+        .shape_runtime
+        .handle_for_id(&interp.gc_heap, layout.shape_id())
+    else {
         return Ok(None);
     };
+    let mut record = [
+        Value::number_f64(matched.range().start as f64),
+        *input,
+        Value::undefined(),
+    ];
+    // SAFETY: canonical record words remain stationary through reservation.
+    unsafe {
+        roots.add_raw_slot((&mut shape as *mut crate::object::ShapeHandle).cast());
+        for value in &mut record {
+            roots.add_value(value);
+        }
+    }
     let groups = matched.groups();
     let substrings = 1 + matched.captures().filter(Option::is_some).count();
     let bytes = substrings * crate::string::gc_body::SUBSTRING_CELL_BYTES
@@ -72,9 +92,6 @@ pub(crate) fn build_match_result_folded(
     }
     drop(roots);
     // Nothing below collects: every cell comes out of the reservation.
-    let Some(shape) = interp.shape_runtime.handle_for_id(layout.shape_id()) else {
-        return Ok(None);
-    };
     let heap = &mut interp.gc_heap;
     let text = input.as_string(heap).ok_or(VmError::TypeMismatch)?.handle();
     let mut elements = smallvec::SmallVec::<[Value; 16]>::with_capacity(groups);
@@ -87,14 +104,123 @@ pub(crate) fn build_match_result_folded(
     .ok_or(VmError::TypeMismatch)?;
     let array = crate::array::try_tagged_from_values_no_collect(heap, &elements)
         .ok_or(VmError::TypeMismatch)?;
-    let record = [
-        Value::number_f64(matched.range().start as f64),
-        *input,
-        Value::undefined(),
-    ];
     let bag = crate::object::try_alloc_object_with_values_no_collect(heap, shape, &record)
         .ok_or(VmError::TypeMismatch)?;
     heap.with_payload(array, |body| body.expando = bag);
     heap.record_write(array, &bag);
     Ok(Some(Value::array(array)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::object;
+    use crate::object_layout_cache::RegExpRecordLayout;
+
+    fn folded(vm: &mut Interpreter, receiver: &mut Value, input: &mut Value) -> Value {
+        let Some(Ok(crate::regexp_fast::DirectExec::Matched(offsets))) =
+            crate::regexp_fast::exec_direct(vm, *receiver, *input, false)
+        else {
+            panic!("plain matching RegExp");
+        };
+        let result = build_match_result_folded(vm, receiver, input, &offsets);
+        vm.recycle_match_offsets(offsets);
+        result
+            .expect("record representation preparation")
+            .expect("prepared record retains folded allocation")
+    }
+
+    #[test]
+    fn regexp_result_keeps_one_layout_across_numeric_and_nonnumber_history() {
+        let mut vm = Interpreter::new().expect("fixture interpreter");
+        vm.gc_heap.set_gc_stress(0, false);
+        let _runtime_roots = vm.scope_runtime_roots_guard();
+        vm.with_handle_scope(|vm, scope| {
+            let regexp = crate::regexp::JsRegExp::compile_cached(
+                &mut vm.gc_heap,
+                &mut vm.regex_compile_cache,
+                &[u16::from(b'a')],
+                "",
+            )
+            .expect("plain pattern");
+            let receiver_root = vm.scoped_value(scope, Value::regexp(regexp));
+            let text = crate::string::JsString::from_str("a", &mut vm.gc_heap).expect("subject");
+            let input_root = vm.scoped_value(scope, Value::string(text));
+            let mut receiver = vm.escape_scoped(receiver_root);
+            let mut input = vm.escape_scoped(input_root);
+            // No scoped result builder has observed the fixed layout yet:
+            // its first String input must prepare the ordinary cold birth.
+            let first = folded(vm, &mut receiver, &mut input);
+            let first_root = vm.scoped_value(scope, first);
+            let logical = vm.regexp_record_layout(RegExpRecordLayout::Match).unwrap();
+            let first_bag =
+                crate::array::expando_object(first.as_array().unwrap(), &vm.gc_heap).unwrap();
+            assert_eq!(
+                object::get_own(first_bag, &vm.gc_heap, "input"),
+                Some(input)
+            );
+            assert_eq!(
+                object::get_own(first_bag, &vm.gc_heap, "groups"),
+                Some(Value::UNDEFINED)
+            );
+            assert!(
+                vm.ordinary_set_data_property(first_bag, "index", Value::number_f64(1.5))
+                    .expect("user assignment promotes the actual record field")
+            );
+            receiver = vm.escape_scoped(receiver_root);
+            input = vm.escape_scoped(input_root);
+            let second = folded(vm, &mut receiver, &mut input);
+            assert_eq!(
+                vm.regexp_record_layout(RegExpRecordLayout::Match).unwrap(),
+                logical
+            );
+            let second_bag =
+                crate::array::expando_object(second.as_array().unwrap(), &vm.gc_heap).unwrap();
+            assert_eq!(
+                vm.object_layout_cache
+                    .regexp(RegExpRecordLayout::Match)
+                    .unwrap()
+                    .shape_id(),
+                object::shape_id(second_bag, &vm.gc_heap),
+                "the existing private slot retains the one geometric layout"
+            );
+            assert_eq!(
+                object::get_own(second_bag, &vm.gc_heap, "index"),
+                Some(Value::number_i32(0)),
+                "the next integral index is independent of prior field values"
+            );
+            assert_eq!(
+                object::get_own(second_bag, &vm.gc_heap, "input"),
+                Some(input)
+            );
+            let first = vm.escape_scoped(first_root).as_array().unwrap();
+            let first_bag = crate::array::expando_object(first, &vm.gc_heap).unwrap();
+            assert_eq!(
+                object::get_own(first_bag, &vm.gc_heap, "index"),
+                Some(Value::number_f64(1.5)),
+                "a new result does not rewrite the previous match"
+            );
+            assert!(
+                vm.ordinary_set_data_property(first_bag, "index", Value::null())
+                    .expect("non-number assignment keeps the same geometry")
+            );
+            receiver = vm.escape_scoped(receiver_root);
+            input = vm.escape_scoped(input_root);
+            let third = folded(vm, &mut receiver, &mut input);
+            let third_bag =
+                crate::array::expando_object(third.as_array().unwrap(), &vm.gc_heap).unwrap();
+            assert_eq!(
+                vm.regexp_record_layout(RegExpRecordLayout::Match).unwrap(),
+                logical,
+                "layout tokens are independent of stored value history"
+            );
+            assert_eq!(
+                vm.object_layout_cache
+                    .regexp(RegExpRecordLayout::Match)
+                    .unwrap()
+                    .shape_id(),
+                object::shape_id(third_bag, &vm.gc_heap)
+            );
+        });
+    }
 }

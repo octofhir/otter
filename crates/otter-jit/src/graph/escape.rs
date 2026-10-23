@@ -27,6 +27,9 @@
 //! - Graph owns merge phis from creation; speculative phis stay unplaced
 //!   and are truncated when a walk retries. Stores, uses and frame states
 //!   change only after escape analysis converges.
+//! - A virtual field retains its one typed SSA value. Tagged reads box it;
+//!   typed reads require a pure projection of that value. Observing stores
+//!   keep the allocation so later historical field proofs see their widening.
 //! - Fields that differ between the predecessors of a merge meet in a phi of
 //!   their common representation; a merge where an object's hidden class
 //!   differs, or where the representations differ, keeps the allocation.
@@ -78,6 +81,8 @@ struct Rewrite {
     cell_reads: FxHashMap<NodeId, u64>,
     /// Graph-owned merge phis, placed only after the walk succeeds.
     phis: Vec<(BlockId, NodeId)>,
+    /// Pure conversions placed immediately before the read they replace.
+    conversions: Vec<(NodeId, NodeId)>,
     /// The candidates' objects each node's eager state names.
     snapshots: FxHashMap<NodeId, State>,
 }
@@ -167,8 +172,11 @@ fn admitted_use(kind: &Kind, index: usize) -> bool {
     match kind {
         // The receiver of a field write; a value stored into a candidate
         // escapes with it ([`propagate_escapes`]).
-        Kind::StoreNamedProperty { .. } | Kind::StoreOwnField { .. } => index <= 1,
+        Kind::StoreNamedProperty { .. }
+        | Kind::StoreOwnField { .. }
+        | Kind::StoreDoubleOwnField { .. } => index <= 1,
         Kind::LoadOwnField { .. }
+        | Kind::LoadNumberOwnField { .. }
         | Kind::LoadNamedProperty { .. }
         | Kind::CheckShapes { .. }
         | Kind::LoadGuardedMethod { .. } => index == 0,
@@ -187,7 +195,9 @@ fn propagate_escapes(graph: &Graph, layout: &[BlockId], candidates: &mut FxHashS
                 let data = graph.node(node);
                 let stores = matches!(
                     data.kind,
-                    Kind::StoreNamedProperty { .. } | Kind::StoreOwnField { .. }
+                    Kind::StoreNamedProperty { .. }
+                        | Kind::StoreOwnField { .. }
+                        | Kind::StoreDoubleOwnField { .. }
                 );
                 if stores
                     && let [receiver, value, ..] = data.inputs[..]
@@ -228,7 +238,9 @@ fn escape_through_loops(graph: &Graph, layout: &[BlockId], candidates: &mut FxHa
                 let data = graph.node(node);
                 if !matches!(
                     data.kind,
-                    Kind::StoreNamedProperty { .. } | Kind::StoreOwnField { .. }
+                    Kind::StoreNamedProperty { .. }
+                        | Kind::StoreOwnField { .. }
+                        | Kind::StoreDoubleOwnField { .. }
                 ) {
                     continue;
                 }
@@ -375,13 +387,28 @@ fn walk(
                     byte_pc,
                     receiver_shape,
                     fresh,
-                    ..
+                    plan,
+                    owners,
                 } => {
                     let receiver = node_data.inputs[0];
                     let Some(object) = candidate_object(&state, candidates, receiver, &mut escaped)
                     else {
                         continue;
                     };
+                    let index = plan.program().map(usize::from).or_else(|| {
+                        source.property_programs.get(byte_pc)?.iter().position(|program| {
+                            matches!(program.ops.first(), Some(JitCacheIrOp::GuardShape { object: 0, shape }) if *shape == object.shape)
+                        })
+                    });
+                    if index
+                        .and_then(|index| owners.get(index))
+                        .is_none_or(|owner| owner.observes())
+                    {
+                        // Historical field-type proofs after the store still
+                        // need the actual widening/flag effect when it observes.
+                        escaped.insert(receiver);
+                        continue;
+                    }
                     match store_effect(source, *byte_pc, object.shape, *fresh)
                         .filter(|_| receiver_shape.is_none_or(|shape| shape == object.shape))
                     {
@@ -399,12 +426,22 @@ fn walk(
                         }
                     }
                 }
-                Kind::StoreOwnField { field, .. } => {
+                Kind::StoreOwnField { field, owners, .. }
+                | Kind::StoreDoubleOwnField { field, owners, .. } => {
                     let receiver = node_data.inputs[0];
                     if candidate_object(&state, candidates, receiver, &mut escaped).is_none() {
                         continue;
                     }
                     let object = state.get_mut(&receiver).expect("a live object");
+                    if !owners.is_empty()
+                        && owners
+                            .iter()
+                            .find(|(shape, _)| *shape == object.shape)
+                            .is_none_or(|(_, owner)| owner.observes())
+                    {
+                        escaped.insert(receiver);
+                        continue;
+                    }
                     match inline_slot(*field) {
                         Some(slot) if slot < object.fields.len() => {
                             object.fields[slot] = node_data.inputs[1];
@@ -415,16 +452,21 @@ fn walk(
                         }
                     }
                 }
-                Kind::LoadOwnField { field, .. } => {
+                Kind::LoadOwnField { field, .. } | Kind::LoadNumberOwnField { field, .. } => {
                     let receiver = node_data.inputs[0];
                     let Some(object) = candidate_object(&state, candidates, receiver, &mut escaped)
                     else {
                         continue;
                     };
                     match inline_slot(*field).and_then(|slot| object.fields.get(slot)) {
-                        Some(&value) => {
-                            rewrite.replace.insert(node, value);
-                        }
+                        Some(&value) => match virtual_load(graph, &mut rewrite, node, value) {
+                            Some(value) => {
+                                rewrite.replace.insert(node, value);
+                            }
+                            None => {
+                                escaped.insert(receiver);
+                            }
+                        },
                         None => {
                             escaped.insert(receiver);
                         }
@@ -439,9 +481,14 @@ fn walk(
                     match own_load_slot(source, *byte_pc, object.shape)
                         .and_then(|slot| object.fields.get(slot))
                     {
-                        Some(&value) => {
-                            rewrite.replace.insert(node, value);
-                        }
+                        Some(&value) => match virtual_load(graph, &mut rewrite, node, value) {
+                            Some(value) => {
+                                rewrite.replace.insert(node, value);
+                            }
+                            None => {
+                                escaped.insert(receiver);
+                            }
+                        },
                         None => {
                             escaped.insert(receiver);
                         }
@@ -502,6 +549,50 @@ fn walk(
     } else {
         Walk::Escaped(escaped)
     }
+}
+
+/// Project a virtual field into the load's representation without adding a
+/// speculative check. An incompatible typed read keeps the actual object and
+/// its observing store, whose dependency exit owns that mismatch.
+fn virtual_load(
+    graph: &mut Graph,
+    rewrite: &mut Rewrite,
+    load: NodeId,
+    mut value: NodeId,
+) -> Option<NodeId> {
+    while let Some(&next) = rewrite.replace.get(&value) {
+        value = next;
+    }
+    let required = graph.node(load).repr;
+    let stored = graph.node(value);
+    let (kind, input) = match (required, stored.repr, &stored.kind) {
+        (target, actual, _) if target == actual => return Some(value),
+        (Repr::Tagged, Repr::Float64, _) => (Kind::Float64ToTagged, value),
+        (Repr::Tagged, Repr::Int32, _) => (Kind::Int32ToTagged, value),
+        (Repr::Float64, Repr::Int32, _) => (Kind::Int32ToFloat64, value),
+        (Repr::Float64, Repr::Tagged, Kind::Float64ToTagged) => return Some(stored.inputs[0]),
+        (Repr::Float64, Repr::Tagged, Kind::Int32ToTagged) => {
+            (Kind::Int32ToFloat64, stored.inputs[0])
+        }
+        (Repr::Int32, Repr::Tagged, Kind::Int32ToTagged) => return Some(stored.inputs[0]),
+        (Repr::Float64, Repr::Tagged, Kind::ConstTagged(bits)) => {
+            let number = otter_vm::Value::from_bits(*bits).as_f64()?;
+            // This walk can roll back the node arena. Do not publish a
+            // provisional constant into Graph's permanent interning table.
+            return Some(graph.add_node(Kind::ConstFloat64(number.to_bits()), &[], Repr::Float64));
+        }
+        (Repr::Int32, Repr::Tagged, Kind::ConstTagged(bits)) => {
+            let number = otter_vm::Value::from_bits(*bits).as_i32()?;
+            return Some(graph.add_node(Kind::ConstInt32(number), &[], Repr::Int32));
+        }
+        _ => return None,
+    };
+    let conversion = graph.add_node(kind, &[input], required);
+    let (pc, origin) = (graph.node(load).pc, graph.node(load).origin);
+    graph.node_mut(conversion).pc = pc;
+    graph.node_mut(conversion).origin = origin;
+    rewrite.conversions.push((load, conversion));
+    Some(conversion)
 }
 
 /// A block's entry: its one predecessor's exit, or the merge of every
@@ -708,13 +799,20 @@ fn apply(graph: &mut Graph, layout: &[BlockId], candidates: &FxHashSet<NodeId>, 
         graph.node_mut(node).eager = Some(copy);
     }
     for &block in layout {
-        let data = graph.block(block).clone();
-        let body: Vec<NodeId> = data
-            .body
-            .iter()
-            .copied()
-            .filter(|node| !rewrite.remove.contains(node) && !rewrite.replace.contains_key(node))
-            .collect();
+        let mut body = Vec::new();
+        for node in graph.block(block).body.clone() {
+            for &(_, conversion) in rewrite
+                .conversions
+                .iter()
+                .filter(|&&(before, _)| before == node)
+            {
+                graph.node_mut(conversion).block = Some(block);
+                body.push(conversion);
+            }
+            if !rewrite.remove.contains(&node) && !rewrite.replace.contains_key(&node) {
+                body.push(node);
+            }
+        }
         graph.block_mut(block).body = body;
     }
     for (&node, &cell) in &rewrite.cell_reads {
@@ -804,10 +902,9 @@ fn copy_chain(
     graph.add_frame_state(copy)
 }
 
-/// Replace a number boxed and unboxed again by the number, or by the
-/// direct conversion when the two representations differ: a boxed double is
-/// an int32 word exactly when it is an integral int32 other than -0, which is
-/// when the exact conversion succeeds, and a boxed int32 is always a number.
+/// Replace matching numeric box/unbox pairs or widen an Int32 source.
+/// Exact int32 Number checks are independent of the input's physical encoding;
+/// peeling a Double box keeps the exact narrowing and its eager recovery.
 pub(crate) fn fold_conversions(graph: &mut Graph, layout: &[BlockId]) {
     let mut replace: FxHashMap<NodeId, NodeId> = FxHashMap::default();
     let mut convert: Vec<(NodeId, Kind, NodeId)> = Vec::new();
@@ -820,14 +917,14 @@ pub(crate) fn fold_conversions(graph: &mut Graph, layout: &[BlockId]) {
             let boxed = graph.node(input);
             match (&data.kind, &boxed.kind) {
                 (Kind::CheckedTaggedToFloat64, Kind::Float64ToTagged)
-                | (Kind::CheckedTaggedToInt32, Kind::Int32ToTagged) => {
+                | (Kind::CheckedNumberToInt32, Kind::Int32ToTagged) => {
                     replace.insert(node, boxed.inputs[0]);
-                }
-                (Kind::CheckedTaggedToInt32, Kind::Float64ToTagged) => {
-                    convert.push((node, Kind::CheckedFloat64ToInt32, boxed.inputs[0]));
                 }
                 (Kind::CheckedTaggedToFloat64, Kind::Int32ToTagged) => {
                     convert.push((node, Kind::Int32ToFloat64, boxed.inputs[0]));
+                }
+                (Kind::CheckedNumberToInt32, Kind::Float64ToTagged) => {
+                    convert.push((node, Kind::CheckedFloat64ToInt32, boxed.inputs[0]));
                 }
                 _ => {}
             }
@@ -918,6 +1015,144 @@ pub(crate) fn remove_dead_values(graph: &mut Graph, layout: &[BlockId]) {
         }
         if !removed {
             return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ir::FrameState;
+    use super::*;
+    use crate::field_store::FieldStoreOwner;
+
+    #[test]
+    fn numeric_virtual_fields_preserve_typed_values_recovery_and_required_observation() {
+        for (observing, read_repr) in [
+            (false, Repr::Tagged),
+            (false, Repr::Float64),
+            (true, Repr::Float64),
+            (false, Repr::Int32),
+        ] {
+            let mut graph = Graph::default();
+            let block = graph.new_block();
+            let place = |graph: &mut Graph, kind, inputs: &[NodeId], repr| {
+                let node = graph.add_node(kind, inputs, repr);
+                graph.node_mut(node).block = Some(block);
+                graph.block_mut(block).body.push(node);
+                node
+            };
+            let callee = graph.constant(Kind::ConstTagged(otter_vm::Value::undefined().to_bits()));
+            let value = graph.constant(Kind::ConstFloat64((-0.0f64).to_bits()));
+            let receiver = place(
+                &mut graph,
+                Kind::NewReceiver(otter_vm::jit::JitReceiverAllocationPlan {
+                    new_target_function_id: 1,
+                    new_target_is_class: false,
+                    family_id: 1,
+                    family_cell: 8,
+                    receiver_shape: 128,
+                    initial_field_count: 1,
+                    inline_capacity: 1,
+                    prototype_validity: None,
+                    prototype_root: 16,
+                }),
+                &[callee],
+                Repr::Tagged,
+            );
+            let owners = if observing {
+                smallvec::smallvec![(
+                    128,
+                    FieldStoreOwner {
+                        owner_shape: 128,
+                        stored_shapes: Default::default(),
+                        nullish_mask: 0,
+                        int32: true,
+                        double: false,
+                        int32_constant: None,
+                    }
+                )]
+            } else {
+                SmallVec::new()
+            };
+            let field = FieldLocation::inline(0);
+            let store = place(
+                &mut graph,
+                Kind::StoreDoubleOwnField {
+                    field,
+                    atom: 1,
+                    owners,
+                },
+                &[receiver, value],
+                Repr::None,
+            );
+            let load = place(
+                &mut graph,
+                if read_repr == Repr::Float64 {
+                    Kind::LoadNumberOwnField {
+                        field,
+                        atom: 1,
+                        double_only: true,
+                    }
+                } else {
+                    Kind::LoadOwnField { field, atom: 1 }
+                },
+                &[receiver],
+                read_repr,
+            );
+            let state = graph.add_frame_state(FrameState {
+                pc: 3,
+                byte_pc: 12,
+                function_id: 1,
+                register_count: 1,
+                registers: vec![(0, receiver)],
+                caller: None,
+            });
+            let check = place(&mut graph, Kind::CheckDependencies, &[], Repr::None);
+            graph.node_mut(check).eager = Some(state);
+            let returned = graph.add_node(Kind::Return, &[load], Repr::None);
+            graph.node_mut(returned).block = Some(block);
+            graph.block_mut(block).control = Some(returned);
+            let view = JitCompileSnapshot::without_feedback(1, 0, 0, vec![]);
+            eliminate_allocations(&mut graph, &[block], &[], &view, &[]);
+            let elided = !observing && read_repr != Repr::Int32;
+            assert_eq!(
+                matches!(graph.node(receiver).kind, Kind::CheckReceiverPlan(_)),
+                elided
+            );
+            assert_eq!(graph.block(block).body.contains(&store), !elided);
+            if elided {
+                let result = graph.node(returned).inputs[0];
+                if read_repr == Repr::Float64 {
+                    assert_eq!(result, value);
+                } else {
+                    assert_eq!(graph.node(result).kind, Kind::Float64ToTagged);
+                    assert_eq!(graph.node(result).inputs.as_slice(), &[value]);
+                    let narrow = place(
+                        &mut graph,
+                        Kind::CheckedNumberToInt32,
+                        &[result],
+                        Repr::Int32,
+                    );
+                    graph.node_mut(narrow).eager = Some(state);
+                    fold_conversions(&mut graph, &[block]);
+                    assert_eq!(
+                        graph.node(narrow).kind,
+                        Kind::CheckedFloat64ToInt32,
+                        "the peeled numeric check must still reject -0"
+                    );
+                    assert_eq!(graph.node(narrow).inputs.as_slice(), &[value]);
+                    assert_eq!(graph.node(narrow).eager, Some(state));
+                }
+                let virtual_object = graph
+                    .frame_state(graph.node(check).eager.unwrap())
+                    .registers[0]
+                    .1;
+                assert!(matches!(
+                    graph.node(virtual_object).kind,
+                    Kind::VirtualObject { shape: 128 }
+                ));
+                assert_eq!(graph.node(virtual_object).inputs.as_slice(), &[value]);
+            }
         }
     }
 }

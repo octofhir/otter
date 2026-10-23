@@ -203,15 +203,18 @@ pub(crate) fn own_data_load(
         {
             return None;
         }
+        let (shape, field) = (*shape, *field);
         i32::try_from(field.byte_offset()).ok()?;
-        if location.is_some_and(|known| known != *field)
+        if location.is_some_and(|known| known != field)
             || atom.is_some_and(|known| known != *slot_atom)
         {
             return None;
         }
-        location = Some(*field);
+        location = Some(field);
         atom = Some(*slot_atom);
-        shapes.push(*shape);
+        if !shapes.contains(&shape) {
+            shapes.push(shape);
+        }
     }
     Some(OwnDataLoad {
         projection: projection?,
@@ -300,15 +303,18 @@ pub(crate) fn own_data_store(
         {
             return None;
         }
+        let (shape, field) = (*shape, *field);
         i32::try_from(field.byte_offset()).ok()?;
-        if location.is_some_and(|known| known != *field)
+        if location.is_some_and(|known| known != field)
             || atom.is_some_and(|known| known != *slot_atom)
         {
             return None;
         }
-        location = Some(*field);
+        location = Some(field);
         atom = Some(*slot_atom);
-        shapes.push(*shape);
+        if !shapes.contains(&shape) {
+            shapes.push(shape);
+        }
     }
     Some(OwnDataLoad {
         projection: projection?,
@@ -484,7 +490,7 @@ pub(crate) fn named_store_programs(
                 } if !stored && object == operand => {}
                 JitCacheIrOp::GuardExtensible { object: 0, field }
                     if !stored && operand == 0 && field.is_inline() => {}
-                JitCacheIrOp::StoreField { object, field } if !stored && object == operand => {
+                JitCacheIrOp::StoreField { object, field, .. } if !stored && object == operand => {
                     stored = true;
                     stored_field = Some(field);
                 }
@@ -501,6 +507,34 @@ pub(crate) fn named_store_programs(
         view.field_types.get(&(receiver_shape?, stored_field?))?;
     }
     Some((projection?, programs))
+}
+
+/// Select a complete ordinary inline append. The VM's StoreTransition
+/// producer has verified exact immutable parent/count/capacity/slot geometry.
+/// Every prototype/extensibility guard remains before the first write.
+pub(crate) fn inline_store_transition(program: &otter_vm::JitCacheIrProgram) -> bool {
+    if !matches!(
+        program.ops.first(),
+        Some(JitCacheIrOp::GuardShape { object: 0, .. })
+    ) || !matches!(
+        program.ops.last(),
+        Some(JitCacheIrOp::PublishShape { object: 0, .. })
+    ) {
+        return false;
+    }
+    let mut fields = program.ops.iter().filter_map(|op| match *op {
+        JitCacheIrOp::StoreField { object: 0, field } => Some(field),
+        _ => None,
+    });
+    let Some(field) = fields.next() else {
+        return false;
+    };
+    fields.next().is_none()
+        && field.is_inline()
+        && program.ops.iter().any(|op| {
+            matches!(*op,
+        JitCacheIrOp::GuardExtensible { object: 0, field: guarded } if guarded == field)
+        })
 }
 
 #[cfg(test)]

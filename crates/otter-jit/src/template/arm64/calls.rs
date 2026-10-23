@@ -298,6 +298,7 @@ fn emit_inline_receiver_property(
         emit_load_u64(ops, 9, u64::from(byte));
         dynasm!(ops ; .arch aarch64 ; ldr x9, [x13, x9]);
     }
+
     emit_store_inline_slot(ops, 9, dst);
     Ok(())
 }

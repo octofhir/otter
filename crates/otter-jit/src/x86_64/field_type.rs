@@ -27,7 +27,8 @@
 
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::object::field_type::{
-    CONST_INT32, FIRST_SHAPE_SHIFT, INT32, NULL, SECOND_SHAPE_SHIFT, SHAPE_MASK, TOP, UNDEFINED,
+    CONST_INT32, DOUBLE, FIRST_SHAPE_SHIFT, INT32, NULL, SECOND_SHAPE_SHIFT, SHAPE_MASK, TOP,
+    UNDEFINED,
 };
 use otter_vm::value::tag;
 use otter_vm::{JitCompileSnapshot, native_abi as abi, object::ShapeState};
@@ -56,7 +57,7 @@ pub(crate) fn emit_observe_known(
     debug_assert!(stored_shapes.len() <= 2 && stored_shapes.iter().all(|shape| *shape != 0));
     let nullish_mask = u64::from(nullish_mask);
     debug_assert!(nullish_mask & !(NULL | UNDEFINED) == 0);
-    if stored_shapes.is_empty() && nullish_mask == 0 && !record.int32 {
+    if stored_shapes.is_empty() && nullish_mask == 0 && !record.int32 && !record.double {
         emit_observe(ops, relocations, view, owner, value);
         return;
     }
@@ -86,6 +87,12 @@ pub(crate) fn emit_observe_known(
         } else {
             dynasm!(ops ; .arch x64 ; je =>done);
         }
+    }
+    if record.double {
+        dynasm!(ops ; .arch x64
+            ; mov r10, Rq(value) ; sar r10, 49 ; cmp r10, -1 ; je =>fallback);
+        emit_load_u64(ops, 10, tag::NUMBER_TAG);
+        dynasm!(ops ; .arch x64 ; test Rq(value), r10 ; jnz =>done);
     }
     if nullish_mask == NULL | UNDEFINED {
         dynasm!(ops ; .arch x64
@@ -122,6 +129,8 @@ pub(crate) fn emit_observe(
     let null = ops.new_dynamic_label();
     let undefined = ops.new_dynamic_label();
     let int32 = ops.new_dynamic_label();
+    let double = ops.new_dynamic_label();
+    let double_union = ops.new_dynamic_label();
     let int32_constant = ops.new_dynamic_label();
     let int32_union = ops.new_dynamic_label();
     let int32_store = ops.new_dynamic_label();
@@ -162,6 +171,8 @@ pub(crate) fn emit_observe(
     dynasm!(ops ; .arch x64
         ; mov r10, Rq(value) ; sar r10, tag::NUMBER_TAG.trailing_zeros() as i8
         ; cmp r10, -1 ; je =>int32);
+    emit_load_u64(ops, 10, tag::NUMBER_TAG);
+    dynasm!(ops ; .arch x64 ; test Rq(value), r10 ; jnz =>double);
     emit_load_u64(ops, 10, VALUE_NULL);
     dynasm!(ops ; .arch x64 ; cmp Rq(value), r10 ; je =>null);
     emit_load_u64(ops, 10, VALUE_UNDEFINED);
@@ -198,6 +209,16 @@ pub(crate) fn emit_observe(
         ; cmp r11d, Rd(value) ; je =>done
         ; test BYTE [Rq(owner) + view.shape_watched_byte as i32], WATCHED ; jnz =>slow
         ; mov QWORD [Rq(owner) + view.shape_field_type_byte as i32], INT32 as i32 ; jmp =>done
+        ; =>double
+        ; test BYTE [Rq(owner) + view.shape_field_type_byte as i32], DOUBLE as i8 ; jnz =>done
+        ; test BYTE [Rq(owner) + view.shape_watched_byte as i32], WATCHED ; jnz =>slow
+        ; mov r11, [Rq(owner) + view.shape_field_type_byte as i32]
+        ; test r11b, CONST_INT32 as i8 ; jz =>double_union
+        ; mov r11, INT32 as i32
+        ; =>double_union
+        ; or r11, DOUBLE as i32
+        ; mov [Rq(owner) + view.shape_field_type_byte as i32], r11
+        ; jmp =>done
         ; =>top
         ; test BYTE [Rq(owner) + view.shape_watched_byte as i32], WATCHED ; jnz =>slow
         ; mov QWORD [Rq(owner) + view.shape_field_type_byte as i32], TOP as i32 ; jmp =>done

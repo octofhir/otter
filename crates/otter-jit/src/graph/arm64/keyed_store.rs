@@ -55,7 +55,7 @@ impl Codegen<'_> {
         &mut self,
         node: NodeId,
         [receiver, key, value]: [u8; 3],
-        [length, base]: [u8; 2],
+        [length, base, index]: [u8; 3],
     ) -> Result<(), Unsupported> {
         let storage = JitArrayStorage::current();
         let numeric = storage.numeric;
@@ -77,13 +77,12 @@ impl Codegen<'_> {
             ; b.ne =>not_array
             ; ldrb w17, [X(receiver), storage.own_guard_byte]
             ; cbnz w17, =>runtime
-            // A non-negative int32 key below the live dense length.
-            ; asr x16, X(key), super::INT32_TAG_SHIFT
-            ; cmn x16, 1
-            ; b.ne =>runtime
-            ; tbnz W(key), 31, =>runtime
+        );
+        crate::arm64::index::emit_number_index(&mut self.ops, key, index, 31, runtime);
+        dynasm!(self.ops
+            ; .arch aarch64
             ; ldr W(length), [X(receiver), storage.length_byte]
-            ; cmp W(length), W(key)
+            ; cmp W(length), W(index)
             ; b.hi =>in_bounds
             ; b.ne =>runtime
         );
@@ -104,9 +103,9 @@ impl Codegen<'_> {
             ; cmp W(length), w17
             ; b.hs =>leaf
             ; ldr X(base), [X(receiver), storage.base_byte]
-            ; str X(value), [X(base), W(key), uxtw #3]
+            ; str X(value), [X(base), W(index), uxtw #3]
         );
-        self.emit_element_write_barrier(node, base, key, value, &[receiver, length, base]);
+        self.emit_element_write_barrier(node, base, index, value, &[receiver, length, base]);
         dynasm!(self.ops
             ; .arch aarch64
             ; add w16, WSP(length), #1
@@ -133,22 +132,22 @@ impl Codegen<'_> {
         self.emit_tagged_to_float(value, 31, runtime);
         dynasm!(self.ops ; .arch aarch64 ; b =>store_double ; =>holey);
         self.emit_tagged_to_float(value, 31, runtime);
-        self.emit_hole_bit(numeric, base, key);
+        self.emit_hole_bit(numeric, base, index);
         dynasm!(self.ops ; .arch aarch64 ; b.eq =>store_double);
         self.emit_hole_store_permit(storage, receiver, runtime);
         // The length is dead past the bounds check.
-        self.emit_fill_hole(numeric, receiver, base, key, length);
+        self.emit_fill_hole(numeric, receiver, base, index, length);
         dynasm!(self.ops
             ; .arch aarch64
             ; =>store_double
-            ; str d31, [X(base), W(key), uxtw #3]
+            ; str d31, [X(base), W(index), uxtw #3]
             ; b =>done
             ; =>tagged
         );
         self.load_immediate(17, VALUE_HOLE);
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldr x16, [X(base), W(key), uxtw #3]
+            ; ldr x16, [X(base), W(index), uxtw #3]
             ; cmp x16, x17
             ; b.ne =>store_tagged
         );
@@ -156,9 +155,9 @@ impl Codegen<'_> {
         dynasm!(self.ops
             ; .arch aarch64
             ; =>store_tagged
-            ; str X(value), [X(base), W(key), uxtw #3]
+            ; str X(value), [X(base), W(index), uxtw #3]
         );
-        self.emit_element_write_barrier(node, base, key, value, &[]);
+        self.emit_element_write_barrier(node, base, index, value, &[]);
         dynasm!(self.ops
             ; .arch aarch64
             ; b =>done
@@ -166,7 +165,7 @@ impl Codegen<'_> {
             ; cmp w17, u32::from(JitTypedArrayStorage::current().type_tag)
             ; b.ne =>other
         );
-        self.emit_typed_view_store([receiver, key, value], [length, base], runtime, done);
+        self.emit_typed_view_store([receiver, key, value], [length, base, index], runtime, done);
         dynasm!(self.ops ; .arch aarch64 ; =>other);
         self.emit_keyed_table_store(node, [receiver, key, value], runtime, done);
         dynasm!(self.ops ; .arch aarch64 ; =>runtime);
@@ -191,7 +190,7 @@ impl Codegen<'_> {
     fn emit_typed_view_store(
         &mut self,
         [receiver, key, value]: [u8; 3],
-        [kind, base]: [u8; 2],
+        [kind, base, index]: [u8; 3],
         refused: DynamicLabel,
         stored: DynamicLabel,
     ) {
@@ -205,12 +204,9 @@ impl Codegen<'_> {
         let word = self.ops.new_dynamic_label();
         let float = self.ops.new_dynamic_label();
         let float64 = self.ops.new_dynamic_label();
+        crate::arm64::index::emit_number_index(&mut self.ops, key, index, 31, refused);
         dynasm!(self.ops
             ; .arch aarch64
-            ; asr x16, X(key), INT32_TAG_SHIFT
-            ; cmn x16, 1
-            ; b.ne =>refused
-            ; tbnz W(key), 31, =>refused
             // The cached base stands for the buffer's liveness and extent
             // only while no buffer was ever detached.
             ; ldr X(base), [X(receiver), view.data_byte]
@@ -221,7 +217,7 @@ impl Codegen<'_> {
             ; ldrb w16, [x16]
             ; cbnz w16, =>refused
             ; ldr X(kind), [X(receiver), view.length_byte]
-            ; cmp XSP(kind), W(key), uxtw
+            ; cmp XSP(kind), W(index), uxtw
             ; b.ls =>refused
             ; ldr W(kind), [X(receiver), view.kind_byte]
             ; asr x16, X(value), INT32_TAG_SHIFT
@@ -273,33 +269,33 @@ impl Codegen<'_> {
         dynasm!(self.ops
             ; .arch aarch64
             ; =>clamped
-            ; strb w16, [X(base), W(key), uxtw]
+            ; strb w16, [X(base), W(index), uxtw]
             ; b =>stored
             // `w16` holds the int32 whose low bits the element keeps.
             ; =>integer
             ; cmp WSP(kind), code(TypedArrayKind::Uint8)
             ; b.hi =>half
-            ; strb w16, [X(base), W(key), uxtw]
+            ; strb w16, [X(base), W(index), uxtw]
             ; b =>stored
             ; =>half
             ; cmp WSP(kind), code(TypedArrayKind::Uint16)
             ; b.hi =>word
-            ; strh w16, [X(base), W(key), uxtw #1]
+            ; strh w16, [X(base), W(index), uxtw #1]
             ; b =>stored
             ; =>word
-            ; str w16, [X(base), W(key), uxtw #2]
+            ; str w16, [X(base), W(index), uxtw #2]
             ; b =>stored
             // `d31` holds the Number; BigInt and half-precision views refuse.
             ; =>float
             ; cmp WSP(kind), code(TypedArrayKind::Float32)
             ; b.ne =>float64
             ; fcvt s31, d31
-            ; str s31, [X(base), W(key), uxtw #2]
+            ; str s31, [X(base), W(index), uxtw #2]
             ; b =>stored
             ; =>float64
             ; cmp WSP(kind), code(TypedArrayKind::Float64)
             ; b.ne =>refused
-            ; str d31, [X(base), W(key), uxtw #3]
+            ; str d31, [X(base), W(index), uxtw #3]
             ; b =>stored
         );
     }

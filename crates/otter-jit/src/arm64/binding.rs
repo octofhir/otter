@@ -9,7 +9,7 @@
 //!
 //! # Invariants
 //! The VM's existing BindingHitProof and opcode schema own source and semantics.
-//! Two caller-declared GPs plus x16/x17 and flags are the only scratch; the
+//! Two caller-declared GPs, x16/x17 and flags are scratch; the
 //! result is written after all guards. Nothing allocates, collects or calls,
 //! and no interior pointer survives a miss. Every global hit proves the
 //! source realm against the existing live activation realm cell; the canonical

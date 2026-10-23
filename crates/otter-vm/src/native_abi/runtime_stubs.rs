@@ -1910,6 +1910,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_JIT_REGEXP_TEST.id => "jit_regexp_test",
         id if id == STUB_CONTEXT_SLOT_WRITTEN.id => "context_slot_written",
         id if id == STUB_MATH_F64_LEAF.id => "math_f64_leaf",
+
         _ => "unknown_runtime_stub",
     }
 }

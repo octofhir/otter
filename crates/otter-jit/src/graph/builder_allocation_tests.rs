@@ -422,7 +422,10 @@ fn an_allocation_keeps_the_layout_of_a_constructed_receiver() {
         "{:?}",
         store.kind
     );
-    assert_eq!(built.graph.node(store.inputs[0]).kind, kinds[receiver].clone());
+    assert_eq!(
+        built.graph.node(store.inputs[0]).kind,
+        kinds[receiver].clone()
+    );
     // The array may have collected: the receiver is no longer known young,
     // so the stored array is barriered.
     assert!(

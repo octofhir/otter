@@ -11,7 +11,7 @@
 //! - Exact target shapes require a live stability check before layout use.
 //! - Owner guards stay at their source loads and survive only when consumed.
 //! - Nullable bounds never enter ordinary layout facts before refinement.
-//! - Only an exact int32 summary authorizes an untagged field load.
+//! - Exact Int32 or Number summaries authorize untagged field loads.
 //! - Every admitted store receiver selects its own defining field owner.
 //! - Named and literal stores select records from proofs the path already
 //!   owns: current exact layouts, nullish constants, or a field bound whose
@@ -191,6 +191,33 @@ impl Builder<'_> {
         })
     }
 
+    /// Every defining summary is purely numeric. Int32-only loads keep their
+    /// raw payload path; this proof authorizes direct or mixed Float64 decoding.
+    pub(super) fn field_load_number(
+        &mut self,
+        receivers: &[u32],
+        field: FieldLocation,
+    ) -> Option<bool> {
+        if receivers.is_empty() {
+            return None;
+        }
+        let mut guards = SmallVec::new();
+        let mut double_only = true;
+        for &receiver in receivers {
+            let record = self.view.field_types.get(&(receiver, field))?;
+            if !field_type::is_number_only(record.guard.expected) {
+                return None;
+            }
+            double_only &= record.guard.expected & field_type::INT32 == 0;
+            if !guards.contains(&record.guard) {
+                guards.push(record.guard);
+            }
+        }
+        let proofs = self.guard_field_owners(guards);
+        self.required_field_guards.extend(proofs);
+        Some(double_only)
+    }
+
     fn guard_field_owners(
         &mut self,
         owners: SmallVec<[otter_vm::jit::JitFieldTypeGuard; 4]>,
@@ -352,6 +379,7 @@ impl Builder<'_> {
                 shapes: rhs.shapes.clone(),
                 nullish: rhs.nullish,
                 int32: false,
+                double: false,
                 int32_constant: None,
             })
         });
@@ -414,12 +442,19 @@ impl Builder<'_> {
     /// whose owner guards other consumers demand and whose ordinary targets
     /// this path already rechecked. Adds no node and demands no guard.
     pub(super) fn store_value_bound(&self, value: NodeId) -> Option<StoreValueBound> {
+        if self.graph.node(value).repr == Repr::Float64
+            || self.graph.node(value).kind == Kind::Float64ToTagged
+        {
+            return Some(StoreValueBound {
+                shapes: SmallVec::new(),
+                nullish: 0,
+                int32: false,
+                double: true,
+                int32_constant: None,
+            });
+        }
         if self.graph.node(value).repr == Repr::Int32
             || matches!(self.graph.node(value).kind, Kind::Int32ToTagged)
-            || self
-                .known
-                .get(value)
-                .is_some_and(|info| info.int32.is_some())
             || matches!(self.graph.node(value).kind, Kind::ConstTagged(bits)
                 if otter_vm::Value::from_bits(bits).as_i32().is_some())
         {
@@ -427,7 +462,34 @@ impl Builder<'_> {
                 shapes: SmallVec::new(),
                 nullish: 0,
                 int32: true,
+                double: false,
                 int32_constant: self.store_int32_constant(value),
+            });
+        }
+        if self
+            .known
+            .get(value)
+            .is_some_and(|info| info.int32.is_some() || info.float64.is_some())
+        {
+            // An exact integer Number can still be an encoded Double.
+            // Semantic narrowing never proves the stored word's encoding.
+            return Some(StoreValueBound {
+                shapes: SmallVec::new(),
+                nullish: 0,
+                int32: true,
+                double: true,
+                int32_constant: None,
+            });
+        }
+        if matches!(self.graph.node(value).kind, Kind::ConstTagged(bits)
+            if otter_vm::Value::from_bits(bits).is_number())
+        {
+            return Some(StoreValueBound {
+                shapes: SmallVec::new(),
+                nullish: 0,
+                int32: false,
+                double: true,
+                int32_constant: None,
             });
         }
         if let Some(shapes) = self
@@ -441,6 +503,7 @@ impl Builder<'_> {
                 shapes: shapes.iter().copied().collect(),
                 nullish: 0,
                 int32: false,
+                double: false,
                 int32_constant: None,
             });
         }
@@ -450,6 +513,7 @@ impl Builder<'_> {
                     shapes: SmallVec::new(),
                     nullish: UNDEFINED,
                     int32: false,
+                    double: false,
                     int32_constant: None,
                 });
             }
@@ -458,6 +522,7 @@ impl Builder<'_> {
                     shapes: SmallVec::new(),
                     nullish: NULL,
                     int32: false,
+                    double: false,
                     int32_constant: None,
                 });
             }
@@ -476,6 +541,7 @@ impl Builder<'_> {
             shapes: bound.shapes.clone(),
             nullish: bound.nullish,
             int32: false,
+            double: false,
             int32_constant: None,
         })
     }

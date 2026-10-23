@@ -56,7 +56,10 @@ fn seed_top_fields(view: &mut JitCompileSnapshot) {
                 })
                 .unwrap_or(*shape);
             for op in &program.ops {
-                if let JitCacheIrOp::StoreField { object: 0, field } = op {
+                if let JitCacheIrOp::StoreField {
+                    object: 0, field, ..
+                } = op
+                {
                     view.field_types.insert(
                         (shape, *field),
                         JitFieldType {
@@ -890,4 +893,260 @@ fn complete_shape_lookup_survives_old_shape_bails_but_backs_off_its_own_miss() {
             );
         }
     }
+}
+
+#[test]
+fn number_field_bounds_select_raw_int32_double_and_mixed_reads() {
+    for expected in [
+        field_type::INT32,
+        field_type::DOUBLE,
+        field_type::INT32 | field_type::DOUBLE,
+        field_type::DOUBLE | field_type::UNDEFINED,
+        field_type::INT32 | field_type::NULL,
+        field_type::TOP,
+    ] {
+        let field = FieldLocation::inline(0);
+        let mut view = JitCompileSnapshot::without_feedback(
+            90,
+            1,
+            3,
+            vec![
+                load_instruction(0, 2),
+                JitTestInstruction::new(Op::ReturnValue, 1, 4, vec![Operand::Register(2)]),
+            ],
+        );
+        view.property_programs
+            .insert(0, vec![load_program(128, field, false)]);
+        view.field_types.insert(
+            (128, field),
+            JitFieldType {
+                guard: JitFieldTypeGuard {
+                    owner_shape: 136,
+                    expected,
+                },
+                shapes: Default::default(),
+                stored_shapes: Default::default(),
+                nullish_mask: (expected & (field_type::NULL | field_type::UNDEFINED)) as u8,
+            },
+        );
+        let built = load_graph(&view);
+        let load = built
+            .graph
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(
+                    node.kind,
+                    Kind::LoadOwnField { .. } | Kind::LoadNumberOwnField { .. }
+                )
+            })
+            .unwrap();
+        let numeric = field_type::is_number_only(expected);
+        if numeric && !field_type::is_int32_only(expected) {
+            assert_eq!(
+                load.kind,
+                Kind::LoadNumberOwnField {
+                    field,
+                    atom: 1,
+                    double_only: expected & field_type::INT32 == 0
+                }
+            );
+            assert_eq!(load.repr, Repr::Float64);
+            assert!(
+                !load.kind.properties().eager_deopt,
+                "the defining summary excludes undefined"
+            );
+        } else {
+            assert_eq!(load.kind, Kind::LoadOwnField { field, atom: 1 });
+            assert_eq!(load.repr, if numeric { Repr::Int32 } else { Repr::Tagged });
+        }
+        assert_eq!(built.graph.nodes.iter().filter(|node| node.block.is_some()
+            && matches!(node.kind, Kind::CheckFieldTypes(_))).count(), usize::from(numeric));
+    }
+}
+
+#[test]
+fn selected_inline_append_keeps_numeric_source_and_recovery() {
+    use crate::graph::ir::{FrameState, Graph, NamedStorePlan};
+    for numeric in [false, true] {
+        let field = FieldLocation::inline(1);
+        let mut view = JitCompileSnapshot::without_feedback(
+            90,
+            2,
+            3,
+            vec![
+                load_instruction(0, 2),
+                if numeric {
+                    JitTestInstruction::new(
+                        Op::LoadNumber,
+                        1,
+                        4,
+                        vec![Operand::Register(1), Operand::ConstIndex(1)],
+                    )
+                } else {
+                    JitTestInstruction::new(Op::Nop, 1, 4, vec![])
+                },
+                JitTestInstruction::new(
+                    Op::StoreProperty,
+                    2,
+                    8,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstIndex(2),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnValue, 3, 12, vec![Operand::Register(1)]),
+            ],
+        );
+        view.instructions[1].load_number = numeric.then_some(0.5);
+        view.property_programs
+            .insert(0, vec![load_program(128, FieldLocation::inline(0), false)]);
+        view.property_programs.insert(
+            8,
+            vec![
+                transition_program(256, field),
+                transition_program(128, field),
+            ],
+        );
+        seed_top_fields(&mut view);
+        let built = load_graph(&view);
+        let store = built
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, Kind::StoreNamedProperty { .. }))
+            .unwrap();
+        let Kind::StoreNamedProperty {
+            plan,
+            receiver_shape,
+            ..
+        } = store.kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(receiver_shape, Some(128));
+        assert_eq!(
+            plan,
+            if numeric {
+                NamedStorePlan::TransitionDouble(1)
+            } else {
+                NamedStorePlan::TransitionTagged(1)
+            }
+        );
+        assert_eq!(
+            built.graph.node(store.inputs[1]).repr,
+            if numeric { Repr::Float64 } else { Repr::Tagged }
+        );
+        let state = built.graph.frame_state(store.eager.unwrap());
+        assert_eq!((state.function_id, state.pc, state.byte_pc), (90, 2, 8));
+        assert!(store.lazy.is_none());
+        assert!(!store.kind.properties().call && !store.kind.properties().may_collect);
+        if numeric {
+            assert!(
+                !built
+                    .graph
+                    .nodes
+                    .iter()
+                    .any(|node| node.kind == Kind::WriteBarrier)
+            );
+        }
+        for target in [
+            &crate::graph::registers::AARCH64,
+            &crate::graph::registers::X86_64,
+        ] {
+            let constraints = store.kind.constraints(2, target);
+            assert_eq!(
+                (constraints.gp_temps, constraints.fp_temps),
+                (if numeric { 3 } else { 2 }, 0)
+            );
+        }
+    }
+    // A numeric merge acquires its FP representation after builder selection.
+    let field = FieldLocation::inline(1);
+    let mut view = JitCompileSnapshot::without_feedback(90, 0, 0, vec![]);
+    view.property_programs
+        .insert(8, vec![transition_program(128, field)]);
+    seed_top_fields(&mut view);
+    view.field_types
+        .get_mut(&(136, field))
+        .unwrap()
+        .guard
+        .expected = field_type::INT32;
+    let mut graph = Graph::default();
+    let left = graph.new_block();
+    let right = graph.new_block();
+    let merge = graph.new_block();
+    graph.block_mut(merge).predecessors = vec![left, right];
+    let receiver = graph.constant(Kind::ConstTagged(otter_vm::Value::undefined().to_bits()));
+    let zero = graph.constant(Kind::ConstTagged(otter_vm::Value::number_i32(0).to_bits()));
+    let negative_zero = graph.constant(Kind::ConstTagged(
+        otter_vm::Value::number_f64(-0.0).to_bits(),
+    ));
+    let phi = graph.add_node(Kind::Phi, &[zero, negative_zero], Repr::Tagged);
+    graph.node_mut(phi).block = Some(merge);
+    graph.block_mut(merge).phis.push(phi);
+    let state = graph.add_frame_state(FrameState {
+        function_id: 90,
+        pc: 2,
+        byte_pc: 8,
+        register_count: 2,
+        registers: vec![(0, receiver), (1, phi)],
+        caller: None,
+    });
+    let record = &view.field_types[&(136, field)];
+    let owner = crate::field_store::FieldStoreOwner::select(record, None);
+    let store = graph.add_node(
+        Kind::StoreNamedProperty {
+            plan: NamedStorePlan::TransitionTagged(0),
+            byte_pc: 8,
+            owners: smallvec::smallvec![owner],
+            receiver_shape: Some(128),
+            fresh: false,
+        },
+        &[receiver, phi],
+        Repr::None,
+    );
+    graph.node_mut(store).block = Some(merge);
+    graph.node_mut(store).pc = 2;
+    graph.node_mut(store).eager = Some(state);
+    graph.block_mut(merge).body.push(store);
+    let barrier = graph.add_node(Kind::WriteBarrier, &[receiver, phi], Repr::None);
+    graph.node_mut(barrier).block = Some(merge);
+    graph.block_mut(merge).body.push(barrier);
+    let layout = [left, right, merge];
+    crate::graph::phi_repr::untag_phis(&mut graph, &layout, &[]);
+    assert_eq!(graph.node(phi).repr, Repr::Float64);
+    let boxed = graph.node(store).inputs[1];
+    assert_eq!(graph.node(boxed).kind, Kind::Float64ToTagged);
+    assert_eq!(graph.frame_state(state).registers[1].1, phi);
+    graph.frame_states[state.0 as usize].registers[1].1 = boxed;
+    assert!(crate::graph::named_store::refine(
+        &mut graph,
+        &layout,
+        &view,
+        &[]
+    ));
+    assert!(matches!(
+        graph.node(store).kind,
+        Kind::StoreNamedProperty {
+            plan: NamedStorePlan::TransitionDouble(0),
+            ..
+        }
+    ));
+    assert_eq!(graph.node(store).inputs[1], phi);
+    assert_eq!(graph.node(store).eager, Some(state));
+    assert_eq!(graph.frame_state(state).registers[1].1, phi);
+    crate::graph::field_store_selection::finalize(&mut graph, &layout, &view, &[]);
+    let Kind::StoreNamedProperty { ref owners, .. } = graph.node(store).kind else {
+        unreachable!()
+    };
+    assert!(
+        owners[0].observes(),
+        "physical F64 must widen an old raw-Int32 summary, even for integral words"
+    );
+    crate::graph::escape::remove_dead_values(&mut graph, &layout);
+    assert!(!graph.block(merge).body.contains(&boxed));
+    assert!(!graph.block(merge).body.contains(&barrier));
 }

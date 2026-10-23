@@ -103,7 +103,11 @@ fn fixed_layouts_survive_completed_scopes_and_full_gc_without_instances() {
         vm.force_gc().expect("full collection without records");
         assert!(vm.gc_heap_mut().gc_stats().gc_cycles > full_before);
         for layout in layouts {
-            assert!(vm.shape_runtime.handle_for_id(layout.shape_id()).is_some());
+            assert!(
+                vm.shape_runtime
+                    .handle_for_id(&vm.gc_heap, layout.shape_id())
+                    .is_some()
+            );
             assert!(
                 vm.object_layout_cache
                     .shape_ids()

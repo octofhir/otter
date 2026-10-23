@@ -7,7 +7,7 @@
 //! - No cache, call, allocation or safepoint; inputs survive every miss.
 //! - A bucket outside the receiver's prefix cannot authorize a read.
 //! - Other descriptors and exotic receivers leave before the operation.
-//! - Only the four assigned GPs, r10/r11 and destination are clobbered.
+//! - Only assigned GP temporaries, r10/r11 and destination are clobbered.
 //!
 //! # See also
 //! - `crate::arm64::shape_lookup` implements the same VM-owned contract.
@@ -67,10 +67,14 @@ pub(crate) fn emit_load(
         ; mov Rd(entry), [Rq(entry) + l.parent_byte as i32]
         ; test Rd(entry), Rd(entry) ; jz =>miss ; add Rq(entry), r11 ; jmp =>walk
         ; =>chain_found ; cmp BYTE [Rq(entry) + l.accessor_byte as i32], 0 ; jne =>miss
+        ; mov Rd(entry), [Rq(entry) + l.field_byte as i32]
         ; dec Rd(slot)
         ; =>read);
     super::property_actions::emit_slot_storage_of_shape(
         ops, view, receiver, shape, slot, mask, miss,
     );
     dynasm!(ops ; .arch x64 ; mov Rq(destination), [Rq(mask) + Rq(slot) * 8]);
+    let done = ops.new_dynamic_label();
+
+    dynasm!(ops ; .arch x64 ; =>done);
 }

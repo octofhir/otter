@@ -50,7 +50,7 @@ fn proto_cycle_reaped() {
     // End the fixture's implicit runtime turn, just as the activation-stack
     // owner does. Its shape pins deliberately retain source/prototype edges
     // until this boundary; the mixed cycle then has no strong root.
-    interp.shape_runtime.unpin_turn_shapes();
+    interp.shape_runtime.unpin_turn_shapes(&interp.gc_heap);
     interp.force_gc().expect("unrooted full GC");
     let after = interp.gc_heap_mut().gc_stats().by_type[OBJECT_BODY_TYPE_TAG as usize].live_bytes;
     assert!(

@@ -1,7 +1,7 @@
 //! Rooted immutable object-state preparation and publication.
 //!
 //! # Contents
-//! - `prepare_state_shape` copies one immutable lineage into a new state.
+//! - `prepare_state_shape` interns one rooted immutable lineage in a new state.
 //! - `install_state_shape` publishes a prepared same-geometry variant.
 //! - `transition_state` is the heap-only rooted state-mutation owner.
 //!
@@ -15,7 +15,7 @@
 //! - Prototype validity is retired before publication; state lives only in shape.
 //!
 //! # See also
-//! - `super::shape_runtime` caches state variants under stable shape identities.
+//! - `super::shape_interner` owns state variants and canonical append identity.
 //! - `crate::interp::shapes` prepares descriptor variants using the same roots.
 
 use super::{JsObject, ShapeHandle, ShapeState, shape_body};
@@ -23,6 +23,15 @@ use crate::rooting::RootScopeExt;
 use otter_gc::{GcHeap, HandleScope, RootScope, heap::RootSlotVisitor};
 
 pub(super) fn prepare_state_shape(
+    heap: &mut GcHeap,
+    source: ShapeHandle,
+    state: ShapeState,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
+    super::shape_interner::ShapeInterner::state_with_roots(heap, source, state, external_visit)
+}
+
+pub(super) fn prepare_state_shape_uncached(
     heap: &mut GcHeap,
     source: ShapeHandle,
     state: ShapeState,
@@ -71,7 +80,7 @@ pub(super) fn prepare_state_shape(
     } else {
         // Constructor families own provisional roots. A state mutation cannot
         // merge sampling families or keep an old family through the root cache.
-        shape_body::alloc_root_shape_body_with_roots(
+        super::shape_interner::ShapeInterner::new_root(
             heap,
             prototype,
             capacity,
@@ -95,7 +104,7 @@ pub(super) fn prepare_state_shape(
                 body.own_is_accessor(),
             )
         });
-        let next = shape_body::alloc_child_shape_body_with_roots(
+        let (next, _) = super::shape_interner::ShapeInterner::child_atom_with_roots(
             heap,
             result.get(),
             key,

@@ -3,6 +3,7 @@
 //! # Contents
 //! - Int32 fast paths with overflow promotion to the double path.
 //! - Full double arithmetic and NaN-correct comparisons.
+//! - Numeric feedback classifies exact Int32 values independently of boxing.
 //! - Strict/loose equality over numbers and non-number immediates.
 //! - Early int32 equality before the complete nullish/double/coercive loose
 //!   comparison path.
@@ -89,10 +90,10 @@ fn numeric_slow_path(
 
 /// The live arithmetic observation byte of the instruction being emitted.
 ///
-/// The interpreter records every operand representation. Baseline code
-/// records the representations it handles off its int32 fast path here, and
-/// its runtime completions record theirs, so the optimizing tier reads a site
-/// nothing recorded as int32-only or unexecuted.
+/// The interpreter records every operand's numeric domain. Baseline code
+/// records the domains it handles off its raw int32 fast path here, and
+/// its runtime completions record theirs. An empty byte retains the existing
+/// Int32 speculation for an unexecuted or raw-Int32-only site.
 #[derive(Clone, Copy)]
 pub(super) struct ArithSite {
     pub(super) cell: u64,
@@ -109,6 +110,19 @@ impl ArithSite {
             pc,
         })
     }
+
+    fn emit_address(self, ops: &mut Assembler, relocations: &mut RelocationCapture) {
+        super::values::emit_load_symbol_u64(
+            ops,
+            relocations,
+            16,
+            self.cell,
+            crate::artifact::relocation::RelocationTarget::ArithFeedbackCell {
+                function_id: self.function_id,
+                pc: self.pc,
+            },
+        );
+    }
 }
 
 /// OR `bits` into the site's observation byte. Clobbers `x14` and `x16`.
@@ -121,22 +135,49 @@ pub(super) fn emit_record_arith(
     let Some(site) = site else {
         return;
     };
-    super::values::emit_load_symbol_u64(
-        ops,
-        relocations,
-        16,
-        site.cell,
-        crate::artifact::relocation::RelocationTarget::ArithFeedbackCell {
-            function_id: site.function_id,
-            pc: site.pc,
-        },
-    );
+    site.emit_address(ops, relocations);
     dynasm!(ops
         ; .arch aarch64
         ; ldrb w14, [x16]
         ; orr w14, w14, u32::from(bits)
         ; strb w14, [x16]
     );
+}
+
+/// Observe decoded numeric operands and, when present, their numeric result.
+/// An integral Double has the Int32 domain unless it is negative zero. The
+/// FLOAT observation saturates numeric feedback: later Int32 observations
+/// cannot narrow it. The probes preserve every source and use only x11–x14,
+/// x16/x17 and d31. The floating call sites have no live value in x13.
+fn emit_record_numeric_arith(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    site: Option<ArithSite>,
+    values: &[u8],
+) {
+    let Some(site) = site else {
+        return;
+    };
+    let saturated = ops.new_dynamic_label();
+    site.emit_address(ops, relocations);
+    dynasm!(ops ; .arch aarch64
+        ; ldrb w14, [x16]
+        ; tbnz w14, #1, =>saturated
+        ; mov x13, x16
+        ; mov w12, wzr);
+    for &value in values {
+        let float = ops.new_dynamic_label();
+        let done = ops.new_dynamic_label();
+        crate::arm64::index::emit_float64_int32(ops, value, 11, 31, float);
+        dynasm!(ops ; .arch aarch64
+            ; orr w12, w12, u32::from(otter_vm::jit_feedback::ARITH_INT32)
+            ; b =>done ; =>float
+            ; orr w12, w12, u32::from(otter_vm::jit_feedback::ARITH_FLOAT64)
+            ; =>done);
+    }
+    dynasm!(ops ; .arch aarch64
+        ; orr w14, w14, w12 ; strb w14, [x13]
+        ; =>saturated);
 }
 
 /// Function-id immediate low tag as a 32-bit `dynasm` operand.
@@ -292,12 +333,6 @@ pub(super) fn emit_binary_arith(
     emit_box_int32(ops, 13, 12);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
-    emit_record_arith(
-        ops,
-        relocations,
-        site,
-        otter_vm::jit_feedback::ARITH_FLOAT64,
-    );
     emit_num_to_double(ops, 9, 0, slow);
     emit_num_to_double(ops, 10, 1, slow);
     match kind {
@@ -307,6 +342,7 @@ pub(super) fn emit_binary_arith(
         ArithKind::Add => unreachable!("addition has its own template operation"),
         _ => unreachable!("Rem returned above"),
     }
+    emit_record_numeric_arith(ops, relocations, site, &[0, 1, 2]);
     emit_box_double(ops, 2, 13);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; =>done ; =>resume);
@@ -398,15 +434,10 @@ pub(super) fn emit_add_generic(
     emit_box_int32(ops, 13, 12);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
-    emit_record_arith(
-        ops,
-        relocations,
-        site,
-        otter_vm::jit_feedback::ARITH_FLOAT64,
-    );
     emit_num_to_double(ops, 9, 0, runtime_path);
     emit_num_to_double(ops, 10, 1, runtime_path);
     dynasm!(ops ; .arch aarch64 ; fadd d2, d0, d1);
+    emit_record_numeric_arith(ops, relocations, site, &[0, 1, 2]);
     emit_box_double(ops, 2, 13);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime_path);
@@ -576,14 +607,6 @@ pub(super) fn emit_compare(
     );
     emit_cset(ops, kind, IntCondition);
     dynasm!(ops ; .arch aarch64 ; b =>have_bool ; =>float_path);
-    if !matches!(kind, CompareKind::Eq | CompareKind::Ne) {
-        emit_record_arith(
-            ops,
-            relocations,
-            site,
-            otter_vm::jit_feedback::ARITH_FLOAT64,
-        );
-    }
     if matches!(kind, CompareKind::Eq | CompareKind::Ne) {
         let lhs_non_number = ops.new_dynamic_label();
         let number_path = ops.new_dynamic_label();
@@ -680,6 +703,9 @@ pub(super) fn emit_compare(
     }
     emit_num_to_double(ops, 9, 0, number_miss);
     emit_num_to_double(ops, 10, 1, number_miss);
+    if !matches!(kind, CompareKind::Eq | CompareKind::Ne) {
+        emit_record_numeric_arith(ops, relocations, site, &[0, 1]);
+    }
     dynasm!(ops ; .arch aarch64 ; fcmp d0, d1);
     emit_cset(ops, kind, FloatCondition);
     if relational_slow.is_some() {
@@ -964,14 +990,9 @@ pub(super) fn emit_increment(
     emit_box_int32(ops, 13, 11);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>float_path);
-    emit_record_arith(
-        ops,
-        relocations,
-        site,
-        otter_vm::jit_feedback::ARITH_FLOAT64,
-    );
     emit_num_to_double(ops, 9, 0, slow);
     dynasm!(ops ; .arch aarch64 ; scvtf d1, w12 ; fadd d2, d0, d1);
+    emit_record_numeric_arith(ops, relocations, site, &[0, 1, 2]);
     emit_box_double(ops, 2, 13);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; =>done ; =>resume);
@@ -1039,12 +1060,6 @@ pub(super) fn emit_negate(
         ; tst x9, x15
         ; b.eq =>slow                 // cell / immediate → VM numeric completion
     );
-    emit_record_arith(
-        ops,
-        relocations,
-        site,
-        otter_vm::jit_feedback::ARITH_FLOAT64,
-    );
     dynasm!(ops
         ; .arch aarch64
         ; movz x14, DOUBLE_OFFSET_HI16, lsl #48
@@ -1052,6 +1067,7 @@ pub(super) fn emit_negate(
         ; fmov d0, x14
         ; fneg d1, d0
     );
+    emit_record_numeric_arith(ops, relocations, site, &[0, 1]);
     emit_box_double(ops, 1, 13);
     emit_store_reg(ops, 13, dst)?;
     dynasm!(ops ; .arch aarch64 ; =>done ; =>resume);
@@ -1221,3 +1237,7 @@ pub(crate) fn emit_coercion_slow_paths(
         dynasm!(ops ; .arch aarch64 ; b =>resume);
     }
 }
+
+#[cfg(test)]
+#[path = "arith_feedback_tests.rs"]
+mod feedback_tests;

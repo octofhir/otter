@@ -91,7 +91,7 @@ fn origin_free(kind: &Kind) -> bool {
             | Kind::Float64ToTagged
             | Kind::Int32ToFloat64
             | Kind::TruncateFloat64ToInt32
-            | Kind::CheckedTaggedToInt32
+            | Kind::CheckedNumberToInt32
             | Kind::CheckedTaggedToFloat64
             | Kind::CheckedFloat64ToInt32
             | Kind::CheckedTaggedToIndex
@@ -107,6 +107,7 @@ fn origin_free(kind: &Kind) -> bool {
             | Kind::LoadPresentElement
             | Kind::LoadShapedProperty { .. }
             | Kind::LoadOwnField { .. }
+            | Kind::LoadNumberOwnField { .. }
             | Kind::LoadTaggedField(_)
             | Kind::LoadContextParent
             | Kind::LoadClosureContext
@@ -153,6 +154,20 @@ fn forwarded(graph: &Graph, node: NodeId) -> SmallVec<[(Kind, NodeId, Repr, Node
     let data = graph.node(node);
     let mut out = SmallVec::new();
     match data.kind {
+        Kind::StoreDoubleOwnField { field, atom, .. } => {
+            for double_only in [false, true] {
+                out.push((
+                    Kind::LoadNumberOwnField {
+                        field,
+                        atom,
+                        double_only,
+                    },
+                    data.inputs[0],
+                    Repr::Float64,
+                    data.inputs[1],
+                ));
+            }
+        }
         Kind::StoreOwnField { field, atom, .. } => {
             let (object, value) = (data.inputs[0], data.inputs[1]);
             let load = Kind::LoadOwnField { field, atom };

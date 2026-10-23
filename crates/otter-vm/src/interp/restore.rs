@@ -10,9 +10,9 @@
 //! side state — atoms, global lexicals, registered symbols, dynamic-native
 //! closures, regexp and array records by body handle. What
 //! is neither pages nor roots nor keyed state is a cache, and caches
-//! start empty: the shape runtime's side tables refill on use (only
-//! its id registry is re-populated from the restored shape bodies),
-//! while realm intrinsics, iterator prototypes, and function-kind
+//! start empty: shape identities, transitions and provisional descendants
+//! rebuild from the restored bodies, while source-to-state associations
+//! refill on demand. Realm intrinsics, iterator prototypes, and function-kind
 //! prototypes are installed from captured, relocated roots without
 //! allocating against the restored heap.
 //!
@@ -394,27 +394,10 @@ impl Interpreter {
             });
         }
 
-        // Re-register every restored shape body under its id; the other
-        // shape-runtime tables are lookup caches that refill on use.
-        let mut restored_shapes: Vec<(crate::object::ShapeId, object::ShapeHandle)> = Vec::new();
-        let cage_base = otter_gc::cage_base() as usize;
-        interp
-            .gc_heap
-            .for_each_live_payload::<object::ShapeBody, _>(|_space, body| {
-                let header = (body as *const object::ShapeBody as usize)
-                    - std::mem::size_of::<otter_gc::GcHeader>();
-                let offset = (header - cage_base) as u32;
-                // SAFETY: the payload walk visited a live `ShapeBody`
-                // cell at this cage offset.
-                let handle: object::ShapeHandle = unsafe { otter_gc::Gc::from_offset(offset) };
-                // A dictionary shape fixes no layout; no id names it.
-                if !body.is_dictionary() {
-                    restored_shapes.push((body.id(), handle));
-                }
-            });
-        for (id, handle) in restored_shapes {
-            interp.shape_runtime.register_restored_shape(id, handle);
-        }
+        // The admitted pages contain the canonical lineage graph. Rebuild
+        // ids, transitions, provisional descendants and canonical key cells
+        // together before any mutator can allocate against this heap.
+        object::shape_interner::ShapeInterner::rebuild_restored(&mut interp.gc_heap);
         interp.constructor_families =
             crate::constructor_layout::ConstructorFamilies::restored(&interp.gc_heap);
 

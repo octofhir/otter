@@ -83,6 +83,7 @@ pub(crate) mod effects;
 pub(crate) mod emission;
 pub(crate) mod escape;
 pub(crate) mod feedback;
+mod field_store_selection;
 mod fold;
 pub(crate) mod frame;
 mod inline_plan;
@@ -91,6 +92,7 @@ pub(crate) mod licm;
 pub(crate) mod liveness;
 pub(crate) mod metadata;
 pub(crate) mod moves;
+mod named_store;
 mod native_leaf;
 pub(crate) mod phi_repr;
 mod range;
@@ -231,6 +233,12 @@ pub(crate) fn compile(
     select::convert(&mut built.graph, &mut built.layout);
     check_cancellation(cancellation)?;
     straighten::merge(&mut built.graph, &mut built.layout, osr_entry.as_slice());
+    check_cancellation(cancellation)?;
+    if named_store::refine(&mut built.graph, &built.layout, view, &built.inline_views) {
+        escape::remove_dead_values(&mut built.graph, &built.layout);
+    }
+    check_cancellation(cancellation)?;
+    field_store_selection::finalize(&mut built.graph, &built.layout, view, &built.inline_views);
     check_cancellation(cancellation)?;
     allocation_groups::fold(&mut built.graph, &built.layout, view, &built.inline_views);
     check_cancellation(cancellation)?;

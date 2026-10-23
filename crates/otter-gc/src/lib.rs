@@ -23,6 +23,7 @@
 //!   roots.
 //! - [`branded`] — experimental isolate-branded session/root API.
 //! - [`heap`] — `GcHeap` orchestrator.
+//! - [`collection_goal`] — physical-memory intent of one full request.
 //! - [`external`] — RAII accounting for native backing stores.
 //! - [`external_refs`] — isolate-local interner for non-GC addresses
 //!   (Rust function entries) that bodies reference by index.
@@ -70,6 +71,7 @@ pub mod barrier;
 pub mod branded;
 pub mod cell_map;
 pub mod census;
+pub mod collection_goal;
 #[doc(hidden)]
 pub mod compressed;
 pub mod devtools_snapshot;
@@ -112,6 +114,7 @@ pub mod trace;
 
 pub use branded::{GcSession, MutationSession, Root, Weak, with_gc_session};
 pub use census::{HeapCensus, LivePayload, SpaceCensus, TagRow};
+pub use collection_goal::FullGcGoal;
 pub use compressed::{CageStats, Gc, cage_base, cage_size, cage_stats, init_cage_with_size};
 pub use external::{ExternalMemory, SharedExternalMemory};
 pub use external_refs::{ExternalRefTable, NO_EXTERNAL_REF};

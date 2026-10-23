@@ -265,12 +265,6 @@ impl Interpreter {
         }
     }
 
-    /// Borrow the GC-managed shape side tables for root tracing.
-    #[must_use]
-    pub(crate) fn shape_runtime_for_trace(&self) -> &object::ShapeRuntime {
-        &self.shape_runtime
-    }
-
     /// Borrow cached simple-constructor and arguments final shapes for root
     /// tracing.
     pub(crate) fn simple_constructor_shapes_for_trace(
@@ -303,7 +297,7 @@ impl Interpreter {
             .map(|layout| layout.shape_id())
             .chain(self.object_layout_cache.shape_ids());
         for id in ids {
-            if let Some(mut shape) = self.shape_runtime.handle_for_id(id) {
+            if let Some(mut shape) = self.shape_runtime.handle_for_id(&self.gc_heap, id) {
                 // Shapes never move, so the local copy is never rewritten.
                 visitor(std::ptr::addr_of_mut!(shape).cast::<otter_gc::raw::RawGc>());
             }

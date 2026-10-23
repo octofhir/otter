@@ -12,17 +12,17 @@
 //! # See also
 //! - `super::shape_transition` implements the real replay contracts.
 
-use super::{JsObject, PropertyFlags, shape, shape_body};
+use super::{JsObject, PropertyFlags, shape};
 use crate::Value;
 use crate::property_atom::AtomizedPropertyKey;
 use crate::string::alloc_flat_string_body_with_roots;
 use otter_gc::GcHeap;
 
 pub(crate) fn append_shaped_data_for_fixture(
-    object: JsObject,
+    mut object: JsObject,
     heap: &mut GcHeap,
     key: AtomizedPropertyKey<'_>,
-    value: Value,
+    mut value: Value,
 ) {
     assert!(
         value.as_number().is_some()
@@ -40,24 +40,26 @@ pub(crate) fn append_shaped_data_for_fixture(
     let name =
         alloc_flat_string_body_with_roots(heap, &name, &mut |_| {}).expect("fixture shape key");
     let name = scope.local(name);
-    let child = shape_body::alloc_child_shape_body_with_roots(
+    let (child, _) = super::shape_interner::ShapeInterner::child_atom_with_roots(
         heap,
         shape(receiver.get(), heap),
         name.get(),
         key.atom().id(),
         PropertyFlags::data_default(),
         false,
+
         &mut |_| {},
     )
     .expect("actual child shape");
     let child = scope.local(child);
     super::capture_store_property_transition_with_shape(
-        receiver.get(),
+        &mut object,
         heap,
         key,
-        &value,
+        &mut value,
         child.get(),
     )
+    .expect("shaped append preparation")
     .expect("actual ordinary shaped append");
     assert_eq!(receiver.get(), object, "old receiver is stationary");
     assert!(!super::is_dictionary(object, heap));

@@ -111,7 +111,7 @@ fn collecting_ordinary_append_rewrites_banks_and_pending_shape_without_turn_pins
             );
             // Weak transition caches and released turn pins cannot keep the
             // provided shape alive; the production pending slot must do it.
-            vm.shape_runtime.unpin_turn_shapes();
+            vm.shape_runtime.unpin_turn_shapes(&vm.gc_heap);
             let reserved = vm.gc_heap.max_heap_bytes() - vm.gc_heap.tracked_bytes();
             vm.gc_heap
                 .reserve_bytes_no_collect(reserved)

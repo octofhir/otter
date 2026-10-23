@@ -3,7 +3,7 @@
 //! # Contents
 //! - Aliased integer results, division traps and complete eager input words.
 //! - CL/count masking and two-address floating operand preservation.
-//! - Ordered/unordered predicates, exact conversions and canonical Number words.
+//! - Ordered/unordered predicates, exact conversions and Value-valid Double words.
 //!
 //! # Invariants
 //! - Fixtures call production encoders, never a simulated instruction model.
@@ -404,7 +404,7 @@ fn exact_float_conversions_reject_nan_range_fraction_and_distinguish_index_negat
 }
 
 #[test]
-fn graph_number_boxing_is_canonical_at_integer_edges_nan_and_signed_zero() {
+fn graph_number_boxing_preserves_double_words_at_integer_edges_nan_and_signed_zero() {
     let mut ops = Assembler::new().unwrap();
     let start = ops.offset();
     convert::emit_box_number(&mut ops, 0, 0);
@@ -429,20 +429,7 @@ fn graph_number_boxing_is_canonical_at_integer_edges_nan_and_signed_zero() {
         f64::from_bits(0xfff8_0037_cafe_7319),
     ] {
         let mut source = 0;
-        let exact_integer = value.is_finite()
-            && value.fract() == 0.0
-            && value >= i32::MIN as f64
-            && value <= i32::MAX as f64
-            && value.to_bits() != (-0.0_f64).to_bits();
-        let expected = if exact_integer {
-            tag::box_int32(value as i32)
-        } else {
-            tag::box_double(if value.is_nan() {
-                tag::CANONICAL_NAN
-            } else {
-                value.to_bits()
-            })
-        };
+        let expected = otter_vm::Value::double(value).to_bits();
         assert_eq!(run(value, &mut source), expected, "{value:?}");
         assert_eq!(source, value.to_bits());
     }

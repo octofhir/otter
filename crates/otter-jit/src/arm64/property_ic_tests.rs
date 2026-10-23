@@ -51,6 +51,7 @@ fn projected_store_returns_storage_owner_and_misses_preserve_source() {
         ; str x0, [x6, std::mem::offset_of!(Invocation, returned_receiver) as u32]
         ; str x2, [x6, std::mem::offset_of!(Invocation, returned_slot) as u32]
         ; str x5, [x6, std::mem::offset_of!(Invocation, child) as u32]
+        ; str x1, [x6, std::mem::offset_of!(Invocation, returned_value) as u32]
         ; mov x0, x7 ; ret);
     let code = CompiledCode::new(ops.finalize().unwrap(), entry);
     // SAFETY: the fixture uses initialized host cells, a zero observation owner,
@@ -58,6 +59,29 @@ fn projected_store_returns_storage_owner_and_misses_preserve_source() {
     let call: extern "C" fn(*mut Invocation) -> usize =
         unsafe { std::mem::transmute(code.entry_ptr()) };
     fixture::check_store_contract(|invocation| call(invocation));
+}
+
+#[test]
+fn projected_double_loads_return_canonical_values() {
+    use fixture::Invocation;
+    let model = fixture::Fixture::new();
+    let mut ops = Assembler::new().unwrap();
+    let entry = ops.offset();
+    let miss = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64
+        ; mov x6, x0
+        ; ldr x0, [x6, std::mem::offset_of!(Invocation, receiver) as u32]
+        ; ldr x2, [x6, std::mem::offset_of!(Invocation, slot) as u32]);
+    emit_slot_load(&mut ops, &model.view, 0, 2, [3, 4, 5], 0, miss, miss, done);
+    dynasm!(ops ; .arch aarch64
+        ; =>miss ; mov x0, #0
+        ; =>done ; ret);
+    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    // SAFETY: the mapping reads initialized host cells and calls no helper.
+    let call: extern "C" fn(*mut Invocation) -> u64 =
+        unsafe { std::mem::transmute(code.entry_ptr()) };
+    fixture::check_double_load_contract(|invocation| call(invocation));
 }
 
 #[test]

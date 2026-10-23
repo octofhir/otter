@@ -19,6 +19,9 @@
 //! A shaped store uses zero owner only for an absorbing Top summary. An append
 //! with a null child has zero owner for VM dictionary replay; generated probes
 //! reject null children before effects and never use that replay marker.
+//! Inherited loads and own additions retain independent slots. All data words
+//! are valid Values; reads preserve their encoding and writes observe the
+//! incoming category even when the summary is already Top.
 //!
 //! # See also
 //! - `crate::object::shape_transition` owns the one add-property replay kernel.
@@ -85,7 +88,6 @@ struct PropertyActionEntry {
     load_slot: u16,
     store_slot: u16,
     load_writable: bool,
-    reserved: u8,
     holder_shape: object::ShapeHandle,
     holder_root: object::ShapeHandle,
     target_shape: object::ShapeHandle,
@@ -106,7 +108,6 @@ impl PropertyActionEntry {
         load_slot: 0,
         store_slot: 0,
         load_writable: false,
-        reserved: 0,
         holder_shape: object::ShapeHandle::null(),
         holder_root: object::ShapeHandle::null(),
         target_shape: object::ShapeHandle::null(),
@@ -348,6 +349,7 @@ impl PropertyActionCache {
                 PropertyLoadAction::InheritedData
             };
             entry.load_slot = resolved.hit.slot;
+
             entry.load_writable = resolved.is_writable;
             entry.holder_shape = resolved.hit.shape;
             entry.holder_shape_id = resolved.hit.shape_id;
@@ -367,6 +369,7 @@ impl PropertyActionCache {
                 };
                 entry.store_action = PropertyStoreAction::OwnWritable;
                 entry.store_slot = resolved.hit.slot;
+
                 entry.target_shape = object::ShapeHandle::null();
                 entry.target_shape_id = ShapeId::UNASSIGNED;
                 entry.store_validity = 0;
@@ -395,7 +398,7 @@ impl PropertyActionCache {
         };
         let index = self.record_way(hit.shape_id, hit.atom_id);
         self.owners[index].replace(ActionOwners::default());
-        self.entries[index].set(PropertyActionEntry {
+        let entry = PropertyActionEntry {
             receiver_shape_id: hit.shape_id,
             atom: hit.atom_id,
             load_action: PropertyLoadAction::OwnData,
@@ -408,13 +411,22 @@ impl PropertyActionCache {
             store_owner: owner,
             store_receiver: hit.shape,
             ..PropertyActionEntry::EMPTY
-        });
+        };
+
+        self.entries[index].set(entry);
     }
 
     /// Merge a committed add sample into its original key, retaining any load.
     pub(crate) fn record_store(&self, transition: object::StorePropertyTransition) {
         if transition.atom_id == AtomId::NONE {
             return;
+        }
+        let target = transition.to_shape.get();
+        if !target.is_null() {
+            let parent = object::shape_body::parent_of(target);
+            if parent.is_null() || object::shape_body::id_of(parent) != transition.from_shape_id {
+                return;
+            }
         }
         let owner = if transition.to_shape.get().is_null() {
             object::ShapeHandle::null()
@@ -431,6 +443,7 @@ impl PropertyActionCache {
         let mut entry = self.entries[index].get();
         entry.store_action = PropertyStoreAction::AddOwn;
         entry.store_slot = transition.slot;
+
         entry.target_shape = transition.to_shape.get();
         entry.target_shape_id = transition.to_shape_id;
         entry.store_owner = owner;
@@ -461,20 +474,10 @@ impl PropertyActionCache {
             return Ok(None);
         };
         match entry.store_action {
-            PropertyStoreAction::OwnWritable => Ok(object::store_own_data_slot_atom(
-                obj,
-                heap,
-                key,
-                AtomOwnPropertyHit {
-                    shape_id: entry.receiver_shape_id,
-                    shape: object::shape(obj, heap),
-                    atom_id: entry.atom,
-                    slot: entry.store_slot,
-                    is_data: true,
-                },
-                value,
-            )
-            .map(|()| PropertyStoreAction::OwnWritable)),
+            PropertyStoreAction::OwnWritable => {
+                object::store_proven_data_slot(obj, heap, entry.store_slot, *value);
+                Ok(Some(PropertyStoreAction::OwnWritable))
+            }
             PropertyStoreAction::AddOwn => {
                 // No proof borrow crosses the allocating replay/weak sweep.
                 let Some(kind) = self.owners[index].borrow().store.clone() else {

@@ -502,7 +502,7 @@ impl Interpreter {
         self.runtime_turn_depth -= 1;
         if self.runtime_turn_depth == 0 {
             // No Rust frame of this turn still holds a fresh shape.
-            self.shape_runtime.unpin_turn_shapes();
+            self.shape_runtime.unpin_turn_shapes(&self.gc_heap);
         }
         drop(extra_roots_guard);
         drop(frame_roots_guard);

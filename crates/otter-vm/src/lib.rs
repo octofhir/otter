@@ -126,7 +126,6 @@ mod executable;
 pub mod execution_context;
 #[path = "jit_feedback.rs"]
 pub mod feedback;
-pub mod field_repr;
 mod frame_ops;
 mod frame_state;
 mod function_kind;
@@ -1498,10 +1497,6 @@ impl Drop for Interpreter {
         // optimizing queue. Cancel and join all readers while the isolate's
         // heap, registry, roots and defining source chunks still exist.
         drop(std::mem::take(&mut self.jit_compile_queue));
-        // Shape side tables store raw compressed GC handles outside the heap.
-        // Clear them before `gc_heap` drops so stale offsets cannot outlive the
-        // collector they came from.
-        self.shape_runtime.clear();
     }
 }
 
@@ -1659,7 +1654,6 @@ impl otter_gc::ExtraRootSource for Interpreter {
     /// probes by shape handle. Rust-side hits that outlive their shape are
     /// rejected by id ([`object::load_own_data_slot_atom`] and siblings).
     fn sweep_weak(&self, heap: &otter_gc::GcHeap) {
-        self.shape_runtime.sweep_dead(heap);
         self.property_cache.sweep_dead_holders(heap);
         self.code_space.sweep_property_ics(heap);
         self.constructor_families.sweep_dead(heap);

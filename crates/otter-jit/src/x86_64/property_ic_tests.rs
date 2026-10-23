@@ -28,6 +28,7 @@ fn projected_store_returns_storage_owner_and_misses_preserve_source() {
     let done = ops.new_dynamic_label();
     let mut relocations = RelocationCapture::default();
     dynasm!(ops ; .arch x64
+        ; push rbx
         ; mov r8, rdi
         ; mov rdi, [r8 + std::mem::offset_of!(Invocation, receiver) as i32]
         ; mov rsi, [r8 + std::mem::offset_of!(Invocation, value) as i32]
@@ -51,13 +52,37 @@ fn projected_store_returns_storage_owner_and_misses_preserve_source() {
         ; mov [r8 + std::mem::offset_of!(Invocation, returned_receiver) as i32], rdi
         ; mov [r8 + std::mem::offset_of!(Invocation, returned_slot) as i32], rdx
         ; mov [r8 + std::mem::offset_of!(Invocation, child) as i32], r9
-        ; mov eax, ecx ; ret);
+        ; mov [r8 + std::mem::offset_of!(Invocation, returned_value) as i32], rsi
+        ; mov eax, ecx ; pop rbx ; ret);
     let code = CompiledCode::new(ops.finalize().unwrap(), entry);
     // SAFETY: the fixture uses initialized host cells, a zero observation owner,
     // and the generated SysV signature; no helper or collection can run.
     let call: extern "sysv64" fn(*mut Invocation) -> usize =
         unsafe { std::mem::transmute(code.entry_ptr()) };
     fixture::check_store_contract(|invocation| call(invocation));
+}
+
+#[test]
+fn projected_double_loads_return_canonical_values() {
+    use fixture::Invocation;
+    let model = fixture::Fixture::new();
+    let mut ops = Assembler::new().unwrap();
+    let entry = ops.offset();
+    let miss = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64
+        ; mov r8, rdi
+        ; mov rdi, [r8 + std::mem::offset_of!(Invocation, receiver) as i32]
+        ; mov rdx, [r8 + std::mem::offset_of!(Invocation, slot) as i32]);
+    emit_slot_load(&mut ops, &model.view, 7, 2, [0, 1, 9], 6, miss, miss, done);
+    dynasm!(ops ; .arch x64
+        ; =>miss ; xor esi, esi
+        ; =>done ; mov rax, rsi ; ret);
+    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    // SAFETY: this System V mapping reads bounded initialized host cells.
+    let call: extern "sysv64" fn(*mut Invocation) -> u64 =
+        unsafe { std::mem::transmute(code.entry_ptr()) };
+    fixture::check_double_load_contract(|invocation| call(invocation));
 }
 
 #[test]

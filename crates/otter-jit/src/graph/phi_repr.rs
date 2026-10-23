@@ -9,6 +9,7 @@
 //! # Invariants
 //! - Int32 untagging runs first; float64 untagging then considers the phis
 //!   left tagged, so a phi is float64 only when it is not int32.
+//!   Exact int32 Number constants admit either encoding and exclude -0.
 //! - A phi is untagged when every input is a constant of the target
 //!   representation, the box of such a value (for float64, of an int32 value
 //!   too, converted at the end of its predecessor), another phi being
@@ -61,7 +62,7 @@ impl Target {
     /// The check that unboxes a tagged value to the target.
     fn check_kind(self) -> Kind {
         match self {
-            Self::Int32 => Kind::CheckedTaggedToInt32,
+            Self::Int32 => Kind::CheckedNumberToInt32,
             Self::Float64 => Kind::CheckedTaggedToFloat64,
         }
     }
@@ -73,7 +74,7 @@ impl Target {
             // An int32 phi is its own int32 form and its own element index.
             Self::Int32 => matches!(
                 kind,
-                Kind::CheckedTaggedToInt32 | Kind::CheckedTaggedToIndex
+                Kind::CheckedNumberToInt32 | Kind::CheckedTaggedToIndex
             ),
             Self::Float64 => matches!(kind, Kind::CheckedTaggedToFloat64),
         }
@@ -82,9 +83,10 @@ impl Target {
     /// Whether `node` is a constant or a box this target unboxes for free.
     fn source(self, graph: &Graph, node: NodeId) -> bool {
         match (self, &graph.node(node).kind) {
-            (Self::Int32, Kind::ConstTagged(bits)) => {
-                bits & otter_vm::value::tag::NUMBER_TAG == otter_vm::value::tag::NUMBER_TAG
-            }
+            (Self::Int32, Kind::ConstTagged(bits)) => otter_vm::Value::from_bits(*bits)
+                .as_number()
+                .and_then(|number| number.as_exact_i32())
+                .is_some(),
             (Self::Float64, Kind::ConstTagged(bits)) => {
                 otter_vm::Value::from_bits(*bits).as_number().is_some()
             }
@@ -98,7 +100,11 @@ impl Target {
         let data = graph.node(input);
         match (self, data.kind.clone()) {
             (Self::Int32, Kind::ConstTagged(bits)) => {
-                graph.constant(Kind::ConstInt32(bits as u32 as i32))
+                let integer = otter_vm::Value::from_bits(bits)
+                    .as_number()
+                    .and_then(|number| number.as_exact_i32())
+                    .expect("an exact int32 Number constant");
+                graph.constant(Kind::ConstInt32(integer))
             }
             (Self::Float64, Kind::ConstTagged(bits)) => {
                 let number = otter_vm::Value::from_bits(bits)

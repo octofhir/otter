@@ -100,18 +100,23 @@ pub(crate) fn emit_object_literal(
             .fields
             .inline_byte(otter_vm::object::FieldLocation::inline(index));
         match inputs.get(index as usize) {
-            Some(input) => emit_load_input(ops, *input),
+            Some(input) => {
+                emit_load_input(ops, *input);
+            }
             None => emit_load_u64(ops, 16, VALUE_UNDEFINED),
         }
         dynasm!(ops ; .arch aarch64 ; str x16, [X(candidate), byte]);
     }
     let mut observed = false;
-    for (input, record) in inputs
+    for (index, record) in fields
         .iter()
-        .zip(fields)
+        .enumerate()
         .filter(|(_, record)| record.observes())
     {
-        emit_load_input(ops, *input);
+        let byte = plan
+            .fields
+            .inline_byte(otter_vm::object::FieldLocation::inline(index as u32));
+        dynasm!(ops ; .arch aarch64 ; ldr x16, [X(candidate), byte]);
         dynasm!(ops ; .arch aarch64 ; mov X(regs.buffer), x16);
         emit_load_u64(ops, regs.scratch, u64::from(record.owner_shape));
         crate::arm64::field_type::emit_observe_known(

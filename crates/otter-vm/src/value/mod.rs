@@ -8,15 +8,13 @@
 //! # Construction surface
 //!
 //! - Immediates: [`Value::undefined`], [`Value::null`], [`Value::hole`],
-//!   [`Value::boolean`], [`Value::number_i32`], [`Value::number_f64`],
+//!   [`Value::boolean`], [`Value::number_i32`], [`Value::number_f64`], [`Value::double`],
 //!   [`Value::number`], [`Value::function_id`].
-//! - Heap-backed: every JS object family converts through a single
-//!   compressed 32-bit GC offset, packed under one of the four
-//!   `TAG_PTR_*` tags. Per-type wrapper structs (`JsObject`, `JsArray`,
-//!   …) call [`Value::from_object_gc`] / [`Value::from_string_gc`] /
-//!   [`Value::from_function_gc`] / [`Value::from_other_gc`] on their
-//!   own raw offset. Type discrimination back to the original wrapper
-//!   goes through [`otter_gc::header::GcHeader::type_tag`].
+//! - Heap-backed: every object family stores its full low-48-bit cage address.
+//!   Because the cage is 4 GiB-aligned, its low 32 bits are the compressed GC
+//!   offset. Typed wrappers convert through [`Value::from_object_gc`],
+//!   [`Value::from_string_gc`], [`Value::from_function_gc`] or
+//!   [`Value::from_other_gc`]; the header type tag distinguishes families.
 //! - Engine-internal: [`Value::context`] and [`Value::eval_extension`]
 //!   carry binding contexts and eval extensions through registers. They
 //!   form the internal family ([`ValueKind::Internal`]): never an Object,
@@ -26,28 +24,32 @@
 //!
 //! Use the typed accessors (`as_i32`, `as_boolean`, `as_number`,
 //! `as_raw_gc`, `read_gc_type_tag`, …) and predicates (`is_undefined`,
-//! `is_callable`, …). Pattern matching against the legacy
-//! `Value::Object(…)` enum form is unsupported — call sites move to
-//! accessors.
+//! `is_callable`, …). The header type tag selects heap families; immediate
+//! predicates inspect the one NaN-box encoding.
 //!
 //! # Invariants
 //!
 //! - `size_of::<Value>() == 8` and `align_of::<Value>() == 8` (static
 //!   asserts below).
 //! - `Value::default()` is [`Value::UNDEFINED`].
-//! - Every incoming NaN is canonicalised to [`tag::CANONICAL_NAN`].
-//! - Pointer payloads always store the 32-bit GC offset returned by
-//!   [`otter_gc::Gc::offset`]; bits 32..48 stay zero.
-//! - GC type discrimination for pointer tags goes through
-//!   [`otter_gc::header::GcHeader::type_tag`], not the NaN-box tag —
-//!   the four pointer tags only select the *family* (object-like,
-//!   string, callable, other).
+//! - Numeric constructors purify NaN to [`tag::CANONICAL_NAN`].
+//! - Int32 and offset Double are both valid numeric representations in every
+//!   register, argument, return value and heap slot. Integral Doubles, including
+//!   positive zero, need no normalization when copied or loaded.
+//! - [`Value::number_f64`] prefers Int32 boxing where possible; [`Value::double`]
+//!   preserves Double representation. Both purify NaN.
+//! - Rust `Eq` and `Hash` compare encoding identity. JavaScript equality uses
+//!   [`crate::abstract_ops`], whose numeric operations compare Int32 and Double
+//!   by value and apply the appropriate NaN and signed-zero rules.
+//! - Cell addresses retain the cage prefix in bits 32..48 and have zero high
+//!   16 bits. Moving GC updates their low 32-bit compressed offset in place.
+//! - Heap family discrimination uses [`otter_gc::header::GcHeader::type_tag`].
+//!   Number and immediate tags distinguish values without reading a header.
 //!
 //! # See also
 //!
 //! - <https://tc39.es/ecma262/#sec-ecmascript-language-types>
-//! - [`docs/book/src/engine/architecture.md`](../../../../docs/book/src/engine/architecture.md)
-//!   — the value-model section.
+//! - [`crate::abstract_ops`] owns JavaScript equality and numeric coercions.
 
 pub mod tag;
 
@@ -89,6 +91,10 @@ use tag::*;
 /// owned by exactly one isolate. The `PhantomData<*const ()>` second
 /// field (ZST) removes the auto-Send / auto-Sync impls without
 /// changing the runtime layout.
+///
+/// Rust equality and hashing identify the encoded word, not JavaScript numeric
+/// equality: `Value::number_i32(0)` and `Value::double(0.0)` have different
+/// encodings. Use [`crate::abstract_ops`] for JavaScript equality.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Value(u64, std::marker::PhantomData<*const ()>);
@@ -96,7 +102,7 @@ pub struct Value(u64, std::marker::PhantomData<*const ()>);
 const _NOT_SEND: std::marker::PhantomData<*const ()> = std::marker::PhantomData;
 
 // ---------------------------------------------------------------------------
-// Layout guards (Phase 1.1 — load-bearing).
+// Runtime value layout guards.
 // ---------------------------------------------------------------------------
 const _: () = {
     if std::mem::size_of::<Value>() != 8 {
@@ -335,17 +341,25 @@ impl Value {
         }
     }
 
-    /// Number from an `f64`, in the one canonical encoding every tier
-    /// shares: an integral value in the int32 range other than `-0` is an
-    /// int32 word, and NaNs are purified to the canonical pattern before the
-    /// double offset is applied (so no boxed double aliases the cell space).
+    /// Number from an `f64`, preferring Int32 for an integral value in range
+    /// other than `-0`. Other values use [`Self::double`]. This representation
+    /// preference is optional: both numeric encodings are valid everywhere.
     #[inline]
     #[must_use]
     pub fn number_f64(d: f64) -> Self {
-        let int = d as i32;
-        if f64::from(int) == d && (int != 0 || d.is_sign_positive()) {
+        if let Some(int) = NumberValue::Double(d).as_exact_i32() {
             return Self::number_i32(int);
         }
+        Self::double(d)
+    }
+
+    /// Number in Double representation, including integral values and `+0`.
+    ///
+    /// NaN is purified before applying the numeric offset, so every result is
+    /// a valid non-cell Value word. No Int32 conversion is attempted.
+    #[inline]
+    #[must_use]
+    pub fn double(d: f64) -> Self {
         let bits = if d.is_nan() {
             CANONICAL_NAN
         } else {
@@ -2149,6 +2163,56 @@ mod tests {
         );
         assert!(nan_a.is_number());
         assert!(nan_a.as_f64().unwrap().is_nan());
+    }
+
+    #[test]
+    fn double_values_preserve_encoding_and_numeric_semantics() {
+        let heap = otter_gc::GcHeap::new().expect("heap");
+        for number in [
+            0.0,
+            -0.0,
+            7.0,
+            f64::from(i32::MIN),
+            f64::from(i32::MAX),
+            1.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            let value = Value::double(number);
+            assert!(tag::is_double_bits(value.to_bits()));
+            assert!(!value.is_cell());
+            assert_eq!(value.as_i32(), None, "Int32 is an exact encoding proof");
+            assert_eq!(value.as_f64().unwrap().to_bits(), number.to_bits());
+            let preferred = Value::number_f64(number);
+            assert!(crate::abstract_ops::same_value(&value, &preferred, &heap));
+            assert!(crate::abstract_ops::is_strictly_equal(
+                &value, &preferred, &heap
+            ));
+            assert_eq!(value.display_string(&heap), preferred.display_string(&heap));
+        }
+        let zero = Value::double(0.0);
+        assert_ne!(zero, Value::number_i32(0), "Rust Eq identifies encoding");
+        assert!(!zero.to_boolean(&heap));
+        assert!(!crate::abstract_ops::same_value(
+            &zero,
+            &Value::double(-0.0),
+            &heap
+        ));
+        assert!(crate::abstract_ops::same_value_zero(
+            &zero,
+            &Value::double(-0.0),
+            &heap
+        ));
+        let nan = Value::double(f64::from_bits(0x7ffc_0000_0000_0001));
+        assert_eq!(nan, Value::double(f64::NAN));
+        assert!(crate::abstract_ops::same_value(&nan, &nan, &heap));
+        assert!(!crate::abstract_ops::is_strictly_equal(&nan, &nan, &heap));
+        assert!(
+            crate::collections::MapKey::from_value(&zero, &heap).matches(
+                &crate::collections::MapKey::from_value(&Value::number_i32(0), &heap),
+                &heap
+            )
+        );
     }
 
     #[test]

@@ -882,7 +882,7 @@ impl DeoptTable {
     }
 
     /// Owned packed recipe bytes: reserved id capacity, frames, slot tables,
-    /// virtual-object fields and the literal pool.
+    /// actual arguments, virtual-object fields and the literal pool.
     fn retained_bytes(&self) -> u64 {
         let mut total = (self.entries.capacity() as u64)
             .saturating_mul(std::mem::size_of::<Option<FrameState<PackedDeoptSlot>>>() as u64)
@@ -899,6 +899,9 @@ impl DeoptTable {
                 total = total.saturating_add(std::mem::size_of_val::<[(u16, PackedDeoptSlot)]>(
                     &frame.slots,
                 ) as u64);
+                if let Some(arguments) = &frame.arguments {
+                    total = total.saturating_add(std::mem::size_of_val(arguments.as_ref()) as u64);
+                }
             }
             for object in &state.virtual_objects {
                 total = total.saturating_add(std::mem::size_of_val::<[PackedDeoptSlot]>(
@@ -1080,7 +1083,7 @@ mod tests {
             DeoptLocation::Literal(Value::undefined().to_bits()),
             DeoptRepr::Tagged,
         );
-        let state = FrameState {
+        let mut state = FrameState {
             frames: Box::new([
                 DeoptFrame::with_window(7, 11, None, [literal; 3]),
                 DeoptFrame::with_window(
@@ -1101,6 +1104,9 @@ mod tests {
                 fields: Box::new([literal; 2]),
             }]),
         };
+        // Legacy activation reads retain all actual arguments independently
+        // of the inlined frame's reconstructed parameter registers.
+        state.frames[1].arguments = Some(Box::new([literal; 4]));
         state.verify(verify_limits()).unwrap();
         let mut entries = Vec::with_capacity(16);
         entries.push(None);
@@ -1116,7 +1122,8 @@ mod tests {
             }]),
         };
         let capacity = runtime.table.entries.capacity();
-        // Packed recipes: one deduplicated literal shared by all seven slots.
+        // Packed recipes: one deduplicated literal shared by the register,
+        // virtual-object and actual-argument slots.
         let expected = std::mem::size_of::<DeoptRuntime>()
             + capacity * std::mem::size_of::<Option<FrameState<PackedDeoptSlot>>>()
             + std::mem::size_of::<u64>()
@@ -1124,6 +1131,7 @@ mod tests {
             + 2 * std::mem::size_of::<u32>()
             + 2 * std::mem::size_of::<DeoptFrame<PackedDeoptSlot>>()
             + 5 * std::mem::size_of::<(u16, PackedDeoptSlot)>()
+            + 4 * std::mem::size_of::<PackedDeoptSlot>()
             + 2 * std::mem::size_of::<PackedDeoptSlot>()
             + std::mem::size_of::<VirtualObject<PackedDeoptSlot>>();
         assert_eq!(runtime.retained_bytes(), expected as u64);
@@ -1146,6 +1154,14 @@ mod tests {
         assert_eq!(
             runtime.retained_bytes() - before,
             (extra_capacity * std::mem::size_of::<Option<FrameState<PackedDeoptSlot>>>()) as u64,
+        );
+        let before = runtime.retained_bytes();
+        let state = runtime.table.entries[1].as_mut().unwrap();
+        assert_eq!(state.frames[1].arguments.as_ref().unwrap().len(), 4);
+        state.frames[1].arguments = None;
+        assert_eq!(
+            before - runtime.retained_bytes(),
+            (4 * std::mem::size_of::<PackedDeoptSlot>()) as u64,
         );
     }
 

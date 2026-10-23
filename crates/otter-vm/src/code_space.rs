@@ -74,8 +74,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 
-#[cfg(test)]
-use otter_bytecode::Op;
 use otter_bytecode::{
     BytecodeModule, BytecodeRebaseError, BytecodeVerifyError, Constant, VerifiedBytecodeModule,
 };

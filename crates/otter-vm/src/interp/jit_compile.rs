@@ -1374,7 +1374,7 @@ impl Interpreter {
     /// that shape has been collected since or cannot authorize a native proof.
     pub(crate) fn bake_shape_id(&self, id: crate::object::ShapeId) -> Option<u32> {
         self.shape_runtime
-            .handle_for_id(id)
+            .handle_for_id(&self.gc_heap, id)
             .and_then(|shape| self.bake_shape(shape))
     }
 
@@ -1473,7 +1473,7 @@ impl Interpreter {
                                 vm.object_literal_layout(context, fid, first_key, count)?;
                             let shape = vm
                                 .shape_runtime
-                                .handle_for_id(layout.shape_id())
+                                .handle_for_id(&vm.gc_heap, layout.shape_id())
                                 .ok_or(crate::VmError::TypeMismatch)?;
                             let Some(_) = vm.bake_shape(shape) else {
                                 return Ok(None);
@@ -2191,7 +2191,9 @@ impl Interpreter {
             };
             // Feedback names shapes by id; a shape collected since then leaves
             // the site on the runtime path.
-            let Some(recv_shape_handle) = self.shape_runtime.handle_for_id(recv_shape) else {
+            let Some(recv_shape_handle) =
+                self.shape_runtime.handle_for_id(&self.gc_heap, recv_shape)
+            else {
                 continue;
             };
             let holder = match &prototype.validity {
@@ -3306,7 +3308,7 @@ impl Interpreter {
         }
         let root = self
             .shape_runtime
-            .handle_for_id(target.prototype.holder_root)?;
+            .handle_for_id(&self.gc_heap, target.prototype.holder_root)?;
         let crate::object::shape_body::ShapePrototype::Object(holder) =
             crate::object::shape_body::prototype_of(root)
         else {
@@ -3576,29 +3578,27 @@ impl Interpreter {
         let (receiver_shape, initial_field_count) = match (
             self.simple_constructor_init_cache
                 .get(&base_function_id)
-                .and_then(Option::as_ref),
+                .and_then(Option::as_ref)
+                .map(|init| init.fields.len()),
             self.simple_constructor_shape_cache
                 .get(&(base_function_id, root_id))
                 .copied(),
         ) {
-            (Some(init), Some(shape))
-                if init.fields.len() <= inline_capacity
+            (Some(field_count), Some(shape))
+                if field_count <= inline_capacity
                     && !crate::object::shape_body::state_of(shape).is_provisional()
                     && crate::object::shape_body::inline_capacity_of(shape) == inline_capacity =>
             {
                 debug_assert_eq!(
                     crate::object::shape_property_count(shape, &self.gc_heap) as usize,
-                    init.fields.len(),
+                    field_count,
                     "source initial fields and final shape diverged"
                 );
                 // Generated receivers hold undefined in these fields only
                 // until the store-only body overwrites them, before anything
                 // can read them: the bound records the stored values alone.
                 initial_shape = shape;
-                (
-                    self.bake_shape(shape)?,
-                    u8::try_from(init.fields.len()).ok()?,
-                )
+                (self.bake_shape(shape)?, u8::try_from(field_count).ok()?)
             }
             _ => (0, 0),
         };

@@ -3,8 +3,7 @@
 //! # Contents
 //! - `bake_field_type_tree` captures defining words and rooted ordinary targets
 //!   after the complete bounded source tree's allocation plans are prepared.
-//! - Own property programs and literal births share one field-record bank.
-//!   Literal geometry names no owner; this bank is the only field authority.
+//! - Each physical storage location has one defining field-record authority.
 //!
 //! # Invariants
 //! - Only ordinary own data fields receive result bounds; inherited and
@@ -48,12 +47,12 @@ impl Interpreter {
         }
     }
 
-    /// Prepare defining cells for own property programs and literal births.
+    /// Prepare defining cells for every own property and native birth field.
     pub(super) fn bake_field_types(&self, view: &mut JitCompileSnapshot) {
         let mut locations = BTreeSet::new();
         for programs in view.property_programs.values() {
             for program in programs {
-                let operand = if matches!(
+                let operand = u8::from(matches!(
                     program.ops.first(),
                     Some(
                         JitCacheIrOp::LoadArrayExpando {
@@ -62,31 +61,27 @@ impl Interpreter {
                             ..
                         } | JitCacheIrOp::LoadFunctionBag {
                             object: 0,
-                            result: 1,
+                            result: 1
                         }
                     )
-                ) {
-                    1
-                } else {
-                    0
-                };
+                ));
                 let Some(shape) = program.ops.iter().find_map(|op| match *op {
                     JitCacheIrOp::GuardShape { object, shape } if object == operand => Some(shape),
                     _ => None,
                 }) else {
                     continue;
                 };
-                let destination = program.ops.iter().find_map(|op| match op {
-                    JitCacheIrOp::PublishShape { shape, .. } => Some(*shape),
+                let destination = program.ops.iter().find_map(|op| match *op {
+                    JitCacheIrOp::PublishShape { shape, .. } => Some(shape),
                     _ => None,
                 });
                 for op in &program.ops {
-                    match op {
-                        JitCacheIrOp::LoadField { object, field } if *object == operand => {
-                            locations.insert((shape, *field));
+                    match *op {
+                        JitCacheIrOp::LoadField { object, field } if object == operand => {
+                            locations.insert((shape, field));
                         }
-                        JitCacheIrOp::StoreField { object, field } if *object == operand => {
-                            locations.insert((destination.unwrap_or(shape), *field));
+                        JitCacheIrOp::StoreField { object, field } if object == operand => {
+                            locations.insert((destination.unwrap_or(shape), field));
                         }
                         _ => {}
                     }
@@ -96,6 +91,15 @@ impl Interpreter {
         for plan in view.literal_allocations.objects.values() {
             for slot in 0..plan.value_count {
                 locations.insert((plan.shape, FieldLocation::inline(slot)));
+            }
+        }
+        for callee in view.direct_constructs.values() {
+            if let Some(plan) = callee.receiver_allocation
+                && plan.receiver_shape != 0
+            {
+                for slot in 0..u32::from(plan.initial_field_count) {
+                    locations.insert((plan.receiver_shape, FieldLocation::inline(slot)));
+                }
             }
         }
         view.field_types.clear();
@@ -123,7 +127,8 @@ impl Interpreter {
             && expected != field_type::TOP
             && field_type::int32_constant(expected).is_none()
         {
-            let mut complete_stable_bound = expected & field_type::INT32 == 0;
+            let mut complete_stable_bound =
+                expected & (field_type::INT32 | field_type::DOUBLE) == 0;
             for shift in [
                 field_type::FIRST_SHAPE_SHIFT,
                 field_type::SECOND_SHAPE_SHIFT,
@@ -132,7 +137,9 @@ impl Interpreter {
                 if id == 0 {
                     continue;
                 }
-                let target = self.shape_runtime.handle_for_id(ShapeId::from_raw(id));
+                let target = self
+                    .shape_runtime
+                    .handle_for_id(&self.gc_heap, ShapeId::from_raw(id));
                 let Some((target, baked)) =
                     target.and_then(|target| self.bake_shape(target).map(|baked| (target, baked)))
                 else {
@@ -231,7 +238,12 @@ mod tests {
             }
 
             let missing = ShapeId::from_raw(field_type::SHAPE_MASK);
-            assert!(interpreter.shape_runtime.handle_for_id(missing).is_none());
+            assert!(
+                interpreter
+                    .shape_runtime
+                    .handle_for_id(&interpreter.gc_heap, missing)
+                    .is_none()
+            );
             let expected = field_type::merge(
                 field_type::shape_id_sample(shape_body::id_of(first_shape).raw()),
                 field_type::shape_id_sample(missing.raw()),

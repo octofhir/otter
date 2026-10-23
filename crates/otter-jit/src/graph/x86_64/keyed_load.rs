@@ -39,7 +39,11 @@ impl Codegen<'_> {
         let assigned = self.allocation.node(node).clone();
         let (receiver, key) = (Self::gp(assigned.inputs[0]), Self::gp(assigned.inputs[1]));
         let destination = Self::gp(assigned.result.expect("a keyed load result"));
-        let (length, base) = (assigned.gp_temps[0], assigned.gp_temps[1]);
+        let (length, base, index) = (
+            assigned.gp_temps[0],
+            assigned.gp_temps[1],
+            assigned.gp_temps[2],
+        );
         let double = assigned.fp_temps[0];
         let storage = JitArrayStorage::current();
         let numeric = storage.numeric;
@@ -54,32 +58,32 @@ impl Codegen<'_> {
             ; test Rq(receiver), r10 ; jnz =>other
             ; cmp BYTE [Rq(receiver)], storage.type_tag as i8 ; jne =>other
             ; test BYTE [Rq(receiver) + storage.own_guard_byte as i32], (1 << storage.own_exotic_bit) as i8 ; jne =>runtime
-            // A non-negative int32 key below the live dense length.
-            ; mov r10, Rq(key) ; sar r10, 49 ; cmp r10, -1 ; jne =>runtime
-            ; test Rd(key), Rd(key) ; js =>runtime
+        );
+        crate::x86_64::index::emit_number_index(&mut self.ops, key, index, double, runtime);
+        dynasm!(self.ops ; .arch x64
             ; mov Rd(length), [Rq(receiver) + storage.length_byte as i32]
-            ; cmp Rd(length), Rd(key) ; jbe =>runtime
+            ; cmp Rd(length), Rd(index) ; jbe =>runtime
             ; mov Rq(base), [Rq(receiver) + storage.base_byte as i32]
             ; movzx r10d, BYTE [Rq(receiver) + numeric.kind_byte as i32]
             ; cmp r10d, i32::from(storage.tagged_kind) ; je =>tagged
             ; cmp r10d, i32::from(numeric.holey_kind) ; je =>holey
             ; cmp r10d, i32::from(numeric.packed_kind) ; jne =>runtime
             // Packed numeric storage has no hole below its length.
-            ; mov r10d, Rd(key) ; movsd Rx(double), [Rq(base) + r10 * 8]
+            ; mov r10d, Rd(index) ; movsd Rx(double), [Rq(base) + r10 * 8]
             ; jmp =>boxed
             ; =>holey
         );
-        self.emit_hole_bit(numeric, base, key);
+        self.emit_hole_bit(numeric, base, index);
         dynasm!(self.ops ; .arch x64
             ; jc =>runtime
-            ; mov r10d, Rd(key) ; movsd Rx(double), [Rq(base) + r10 * 8]
+            ; mov r10d, Rd(index) ; movsd Rx(double), [Rq(base) + r10 * 8]
             ; =>boxed
         );
         self.emit_box_float64(node, destination, double);
         dynasm!(self.ops ; .arch x64
             ; jmp =>done
             ; =>tagged
-            ; mov r10d, Rd(key) ; mov r10, [Rq(base) + r10 * 8]
+            ; mov r10d, Rd(index) ; mov r10, [Rq(base) + r10 * 8]
         );
         self.load_immediate(11, tag::VALUE_HOLE);
         dynasm!(self.ops ; .arch x64

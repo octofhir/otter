@@ -152,6 +152,15 @@ impl Activation {
 }
 
 fn executable(view: &JitCompileSnapshot, proof: BindingHitProof, destination: u8) -> CompiledCode {
+    executable_mode(view, proof, destination, false)
+}
+
+fn executable_mode(
+    view: &JitCompileSnapshot,
+    proof: BindingHitProof,
+    destination: u8,
+    proved: bool,
+) -> CompiledCode {
     let mut ops = Assembler::new().unwrap();
     let entry = ops.offset();
     let miss = ops.new_dynamic_label();
@@ -163,17 +172,32 @@ fn executable(view: &JitCompileSnapshot, proof: BindingHitProof, destination: u8
     }
     emit_load_u64(&mut ops, 7, CANARY);
     dynasm!(ops ; .arch aarch64 ; fmov d0, x7);
-    emit_global_read(
-        &mut ops,
-        &mut relocations,
-        view,
-        proof,
-        BYTE_PC,
-        destination,
-        [12, 13],
-        miss,
-    )
-    .unwrap();
+    if proved {
+        let BindingHitProof::GlobalObject { field, .. } = proof else {
+            panic!("object proof");
+        };
+        emit_global_object_proved_read(
+            &mut ops,
+            &mut relocations,
+            view,
+            field,
+            destination,
+            [12, 13],
+            miss,
+        );
+    } else {
+        emit_global_read(
+            &mut ops,
+            &mut relocations,
+            view,
+            proof,
+            BYTE_PC,
+            destination,
+            [12, 13],
+            miss,
+        )
+        .unwrap();
+    }
     dynasm!(ops ; .arch aarch64 ; mov x0, X(destination) ; b =>done ; =>miss);
     emit_load_u64(&mut ops, 0, POISON);
     dynasm!(ops ; .arch aarch64 ; =>done
@@ -379,6 +403,50 @@ fn global_reader_proves_current_alias_epoch_identity_state_and_bank_bounds() {
                     (SLAB + view.field_layout.slab_capacity_byte) as usize,
                     2u32,
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn global_object_words_preserve_double_values_in_ordinary_and_proved_dictionary_reads() {
+    let mut cage = vec![0u64; 256];
+    let view = snapshot(&mut cage);
+    let mut activation = Activation::new();
+    for (dictionary, proved) in [(false, false), (true, false), (true, true)] {
+        put(
+            &mut cage,
+            (SHAPE + view.shape_state_byte) as usize,
+            if dictionary {
+                ShapeState::ORDINARY.with_dictionary(true).bits()
+            } else {
+                ShapeState::ORDINARY.bits()
+            },
+        );
+        for field in [FieldLocation::inline(1), FieldLocation::overflow(1)] {
+            let proof = BindingHitProof::GlobalObject {
+                shape: u64::from(if dictionary { LAYOUT } else { SHAPE }),
+                dictionary,
+                field,
+                global_lexical_epoch: EPOCH,
+                writable: false,
+                layout: None,
+            };
+            for destination in [0, 12, 13] {
+                let code = executable_mode(&view, proof, destination, proved);
+                for number in [0.0, -0.0, 41.0, 1.25, f64::INFINITY, f64::NAN] {
+                    let raw = otter_vm::Value::double(number);
+                    let byte = if field.is_inline() {
+                        GLOBAL + view.field_layout.inline_values_byte
+                    } else {
+                        SLAB + view.field_layout.slab_words_byte
+                    } + field.byte_offset();
+                    put(&mut cage, byte as usize, raw.to_bits());
+                    assert_eq!(
+                        run(&code, &mut activation, &mut cage),
+                        Value::double(number).to_bits()
+                    );
+                }
             }
         }
     }

@@ -173,11 +173,10 @@ impl<'a> RuntimeState<'a> {
         interp.trace_iterator_prototypes(visitor);
         interp.trace_function_kind_roots(visitor);
         interp.trace_iterator_side_tables(visitor);
-        // 7) Hidden classes: the shapes pinned this turn (the id and
-        //    transition tables are weak; the heap roots the canonical key
-        //    strings), the constructor and arguments shape caches, and every
-        //    shape a cached object layout names.
-        interp.shape_runtime_for_trace().trace_roots(roots, visitor);
+        // 7) Hidden-class layout and constructor caches. The heap's isolate
+        // data roots current-turn pins and canonical key strings itself; its
+        // identity and transition tables are weak.
+
         interp.trace_compiled_shapes(visitor);
         if roots == RootSet::All {
             interp.trace_layout_shapes(visitor);

@@ -241,7 +241,7 @@ fn proves_inputs(kind: &Kind) -> bool {
         | Kind::CheckNumber
         | Kind::CheckNotNullish { .. }
         | Kind::CheckNotHole
-        | Kind::CheckedTaggedToInt32
+        | Kind::CheckedNumberToInt32
         | Kind::CheckedTaggedToFloat64
         | Kind::CheckedFloat64ToInt32
         | Kind::CheckedTaggedToIndex
@@ -310,7 +310,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::Float64Mod
         | Kind::Float64Math(_)
         | Kind::Float64Compare(_)
-        | Kind::CheckedTaggedToInt32
+        | Kind::CheckedNumberToInt32
         | Kind::CheckedTaggedToFloat64
         | Kind::Int32ToTagged
         | Kind::Float64ToTagged
@@ -356,7 +356,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::LoadPresentElement
         | Kind::CheckHoleyElementPresent(_) => Effects::deref(&[H::Elements]),
         Kind::LoadShapedProperty { atom } => Effects::reads(&[H::MapWords, H::Field(*atom)]),
-        Kind::LoadOwnField { atom, .. } => Effects::deref(&[H::Field(*atom)]),
+        Kind::LoadOwnField { atom, .. } | Kind::LoadNumberOwnField { atom, .. } => Effects::deref(&[H::Field(*atom)]),
         Kind::LoadTaggedField(offset) => Effects::reads(&[H::ContextSlot(*offset)]),
         Kind::LoadArrayLength { array_proved } => {
             if *array_proved {
@@ -419,7 +419,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         // Stores. A store into an existing field may change a watched field
         // type; an appending store also publishes a child shape and ends the
         // stability of the shape it leaves.
-        Kind::StoreOwnField { atom, .. } => {
+        Kind::StoreOwnField { atom, .. } | Kind::StoreDoubleOwnField { atom, .. } => {
             Effects::writes(&[], &[H::Field(*atom), H::FieldTypes])
         }
         Kind::StoreNamedProperty { .. } => Effects::writes(
@@ -545,6 +545,7 @@ mod tests {
         // A field-type check still sees the overwrite.
         assert!(clobberize(&Kind::CheckFieldTypes(Default::default())).reads_overlap(&overwrite));
         let append = writes(&Kind::StoreNamedProperty {
+            plan: crate::graph::ir::NamedStorePlan::Programs,
             byte_pc: 0,
             owners: Default::default(),
             receiver_shape: None,

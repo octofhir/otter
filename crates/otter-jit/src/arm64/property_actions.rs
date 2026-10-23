@@ -7,7 +7,7 @@
 //! - Current shape-selected inline/slab bank resolution before any effect.
 //!
 //! # Invariants
-//! Four caller-declared GP temporaries and reserved x16/x17 are the only
+//! Caller-declared GP temporaries and reserved x16/x17 are the only
 //! scratch. Inputs remain unchanged through every pre-effect miss. Neither
 //! probe allocates or collects; field-summary membership misses use a
 //! noncollecting metadata leaf. No storage address escapes to a cold transition. Load and store facts share a key, never a holder or slot. The
@@ -257,6 +257,7 @@ pub(crate) fn emit_load(
     let own = ops.new_dynamic_label();
     let absent = ops.new_dynamic_label();
     let undefined = ops.new_dynamic_label();
+    let canonical = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64
         ; ldrb w16, [X(entry), cache.load_action_byte]
@@ -284,14 +285,14 @@ pub(crate) fn emit_load(
     bank_of_shape(ops, view, holder, base, slot, base, miss);
     dynasm!(ops ; .arch aarch64
         ; ldr X(destination), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
-        ; b =>done
+        ; b =>canonical
         // The matched key already proved the receiver's exact shape, whose
         // address `key` left in the holder temporary.
         ; =>own ; ldrh W(slot), [X(entry), cache.load_slot_byte]);
     bank_of_shape(ops, view, receiver, holder, slot, base, miss);
     dynasm!(ops ; .arch aarch64
         ; ldr X(destination), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
-        ; b =>done
+        ; b =>canonical
         // Absent from the whole chain: the proof (none for a `null`
         // prototype the receiver shape fixes) authorizes `undefined`.
         ; =>absent
@@ -299,6 +300,11 @@ pub(crate) fn emit_load(
         ; ldr w16, [x16] ; cbz w16, =>miss
         ; =>undefined);
     emit_load_u64(ops, destination, crate::entry::VALUE_UNDEFINED);
+    dynasm!(ops ; .arch aarch64
+        ; b =>done
+        ; =>canonical
+    );
+
     dynasm!(ops ; .arch aarch64 ; =>done);
 }
 
@@ -352,10 +358,11 @@ pub(crate) fn emit_store(
         // store fires it, before anything is written.
         ; ldrb w16, [X(holder), view.shape_watched_byte] ; tbnz w16, otter_vm::code_dependencies::ShapeFact::Stable.bit(), =>miss
         ; and x17, X(receiver), #0xffff_ffff_0000_0000
-        ; ldr w16, [X(entry), cache.target_shape_byte] ; add x16, x17, x16
-        ; ldr x16, [x16, cache.shape_id_byte]
+        ; ldr W(base), [X(entry), cache.target_shape_byte] ; add X(base), x17, X(base)
+        ; ldr x16, [X(base), cache.shape_id_byte]
         ; ldr x17, [X(entry), cache.target_shape_id_byte] ; cmp x16, x17 ; b.ne =>miss
-        ; ldrh W(slot), [X(entry), cache.store_slot_byte]);
+        ; ldr W(slot), [X(entry), cache.target_shape_byte]);
+    dynasm!(ops ; .arch aarch64 ; ldrh W(slot), [X(entry), cache.store_slot_byte]);
     bank(ops, view, receiver, slot, base, miss);
     dynasm!(ops ; .arch aarch64
         ; str X(value), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]

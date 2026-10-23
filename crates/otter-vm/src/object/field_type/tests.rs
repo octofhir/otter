@@ -225,6 +225,9 @@ fn append_descendants_share_only_defining_data_cells() {
     assert_eq!(snapshot(first.get()), INT32 | NULL | UNDEFINED);
     assert_eq!(observer_owner(second.get(), 0), Some(first.get()));
     observe_owner(first.get(), Value::number_f64(3.5));
+    assert_eq!(snapshot(first.get()), INT32 | DOUBLE | NULL | UNDEFINED);
+    assert_eq!(observer_owner(second.get(), 0), Some(first.get()));
+    observe_owner(first.get(), Value::TRUE);
     assert_eq!(snapshot(first.get()), TOP);
     assert_eq!(observer_owner(second.get(), 0), Some(ShapeHandle::null()));
     assert_eq!(observer_owner(second.get(), 99), None);
@@ -349,14 +352,14 @@ fn live_stores_widen_two_shapes_and_alias_changes_retire_target_stability() {
         targets.push(target);
     }
     object::write_layout_slot(
-        receiver.get(),
+        &mut receiver.get(),
         &mut heap,
         0,
         Value::object(targets[0].get()),
     );
-    object::write_layout_slot(receiver.get(), &mut heap, 0, Value::NULL);
+    object::write_layout_slot(&mut receiver.get(), &mut heap, 0, Value::NULL);
     object::write_layout_slot(
-        receiver.get(),
+        &mut receiver.get(),
         &mut heap,
         0,
         Value::object(targets[1].get()),
@@ -378,13 +381,13 @@ fn live_stores_widen_two_shapes_and_alias_changes_retire_target_stability() {
         "alias mutation does not rewrite history"
     );
     object::write_layout_slot(
-        receiver.get(),
+        &mut receiver.get(),
         &mut heap,
         0,
         Value::object(targets[2].get()),
     );
     assert_eq!(snapshot(field.get()), TOP);
-    object::write_layout_slot(receiver.get(), &mut heap, 0, Value::NULL);
+    object::write_layout_slot(&mut receiver.get(), &mut heap, 0, Value::NULL);
     assert_eq!(snapshot(field.get()), TOP, "widening never narrows");
 }
 
@@ -402,7 +405,12 @@ fn relocation_rewrites_values_without_rewriting_field_identities() {
     let target =
         scope.local(object::alloc_object_with_roots(&mut heap, root.get(), &mut |_| {}).unwrap());
     let original = target.get().offset();
-    object::write_layout_slot(receiver.get(), &mut heap, 0, Value::object(target.get()));
+    object::write_layout_slot(
+        &mut receiver.get(),
+        &mut heap,
+        0,
+        Value::object(target.get()),
+    );
     let observed = snapshot(layout.get());
     assert_eq!(observed, UNDEFINED | sample(root.get()));
     heap.collect_minor(EmptyRoots).expect("moving collection");
@@ -477,5 +485,101 @@ fn native_scoped_slot_writes_widen_the_birth_contract() {
                 assert_eq!(snapshot(field), TOP);
             });
         },
+    );
+}
+
+#[test]
+fn numeric_words_preserve_int32_constant_and_double_categories() {
+    let mut heap = object::fixture_heap();
+    let zero = Value::double(0.0);
+    assert!(zero.as_i32().is_none());
+    assert_eq!(classify(zero), DOUBLE);
+    let exact = classify(Value::number_i32(0));
+    assert_eq!(int32_constant(exact), Some(0));
+    assert_eq!(merge(exact, DOUBLE), INT32 | DOUBLE);
+    assert!(is_number_only(INT32 | DOUBLE));
+    assert!(is_number_only(DOUBLE));
+    assert!(!is_int32_only(DOUBLE));
+    assert!(!is_number_only(DOUBLE | UNDEFINED));
+    let root = object::fixture_root_shape(&mut heap).unwrap();
+    let shape = child(&mut heap, root, 0, false);
+    observe_owner(shape, zero);
+    assert_eq!(snapshot(shape), DOUBLE);
+    observe_owner(shape, Value::number_i32(0));
+    assert_eq!(snapshot(shape), INT32 | DOUBLE);
+    observe_owner(shape, Value::TRUE);
+    assert_eq!(snapshot(shape), TOP);
+}
+
+#[test]
+fn numeric_birth_rewrites_disjoint_inline_and_overflow_input_roots() {
+    struct Reclaimable([u64; 16384]);
+    impl otter_gc::SafeTraceable for Reclaimable {
+        const TYPE_TAG: u8 = 0xe8;
+        fn trace_slots_safe(&mut self, _: &mut otter_gc::raw::SlotVisitor<'_>) {
+            let _ = self.0[0];
+        }
+    }
+    let mut heap = GcHeap::with_max_heap_bytes(4 * 1024 * 1024).unwrap();
+    heap.set_gc_stress(0, false);
+    object::register_gc_traceables(&mut heap);
+    let mut shapes = object::ShapeRuntime::new(&mut heap).unwrap();
+    let root = shapes
+        .new_root(
+            &mut heap,
+            shape_body::ShapePrototype::Null,
+            1,
+            ShapeHandle::null(),
+            ShapeState::ORDINARY,
+            &mut |_| {},
+        )
+        .unwrap();
+    let mut layout = root;
+    for name in ["prefix", "number", "suffix"] {
+        layout = shapes
+            .child_with_roots(
+                &mut heap,
+                layout,
+                name,
+                PropertyFlags::data_default(),
+                false,
+                &mut |_| {},
+            )
+            .unwrap();
+    }
+    let prefix = object::alloc_object_with_roots(&mut heap, root, &mut |_| {}).unwrap();
+    let suffix = object::alloc_object_with_roots(&mut heap, root, &mut |_| {}).unwrap();
+    let before = [prefix.offset(), suffix.offset()];
+    let mut values = [
+        Value::object(prefix),
+        Value::double(0.0),
+        Value::object(suffix),
+    ];
+    let _ = heap.alloc_old(Reclaimable([0; 16384])).unwrap();
+    let reserved = heap.max_heap_bytes() - heap.tracked_bytes();
+    heap.reserve_bytes_no_collect(reserved).unwrap();
+    let cycles = heap.gc_cycle_counts();
+    let result = object::alloc_object_with_shape_and_values_roots(
+        &mut heap,
+        layout,
+        &mut values,
+        otter_gc::SitePlacement::Young(0),
+        &mut |_| {},
+    )
+    .unwrap();
+    heap.release_bytes(reserved);
+    assert!(
+        heap.gc_cycle_counts().1 > cycles.1,
+        "slab allocation really collected"
+    );
+    assert_ne!(values[0].as_object().unwrap().offset(), before[0]);
+    assert_ne!(values[2].as_object().unwrap().offset(), before[1]);
+    assert_eq!(object::layout_slot(result, &heap, 0), values[0]);
+    assert_eq!(object::layout_slot(result, &heap, 1), values[1]);
+    assert_eq!(object::layout_slot(result, &heap, 2), values[2]);
+    assert_eq!(
+        snapshot(owner(layout, 1).unwrap()),
+        DOUBLE,
+        "raw Double(0) was not changed into an Int32 observation"
     );
 }

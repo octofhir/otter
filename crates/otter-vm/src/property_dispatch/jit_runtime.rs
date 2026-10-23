@@ -14,6 +14,10 @@
 //!   restores its depth, and every post-allocation read resolves the live slot.
 //! - Every source site records its first attempt before receiver classification
 //!   or user code, including receivers no handler can describe.
+//! - A committed cold data store refreshes the shared own action even at a
+//!   terminal megamorphic site; a cached load alone cannot refresh store policy.
+//! - Dense element completion accepts numeric array indices independently of
+//!   their Int32 or Double Value encoding, without coercing them to strings.
 //!
 //! # See also
 //! - `property_ic` and `object::shape_transition` own the complete store guards.
@@ -320,7 +324,7 @@ impl Interpreter {
             // now may the cache install a writable existing slot or capture the
             // first add as its authoritative transition sample; the very next peer
             // receiver can then stay entirely in generated code.
-            let current_obj = self
+            let mut current_obj = self
                 .escape_scoped(receiver_root)
                 .as_object()
                 .ok_or(VmError::InvalidOperand)
@@ -342,12 +346,13 @@ impl Interpreter {
             // move, so the pre-store layout still names the handler.
             path = Path::InstallTransition;
             let from_shape = object::keyed_shape(current_obj, &self.gc_heap);
+            let mut value = self.escape_scoped(value_root);
             if let Some(transition) = self
                 .capture_store_property_transition_with_stack_roots(
                     stack,
-                    current_obj,
+                    &mut current_obj,
                     atomized_key,
-                    &value,
+                    &mut value,
                 )
                 .map_err(CommittedValueError::JavaScript)?
             {
@@ -378,7 +383,7 @@ impl Interpreter {
                     format!("Cannot assign to property '{}'", atomized_key.name()),
                 )
                 .map_err(CommittedValueError::JavaScript)?;
-            } else if slot.is_megamorphic() {
+            } else {
                 // The committed store may have allocated a slab or published a
                 // child shape. Re-read the rooted receiver, then make that
                 // final own writable slot available to already-installed
@@ -388,7 +393,19 @@ impl Interpreter {
                     .as_object()
                     .ok_or(VmError::InvalidOperand)
                     .map_err(CommittedValueError::Fatal)?;
-                let _ = self.resolve_property_data_slot(current_obj, atomized_key);
+                if let Some((handler, hit)) = crate::property_ic::IcHandler::store_existing_hit(
+                    current_obj,
+                    &self.gc_heap,
+                    atomized_key,
+                ) {
+                    // Preference can widen while returning to the same Tagged
+                    // shape. Its existing load action may still hit, so refresh
+                    // the independent store policy from this committed owner.
+                    self.property_cache.record_own_store(hit);
+                    if !slot.is_megamorphic() {
+                        slot.install(handler);
+                    }
+                }
             }
             Ok(())
         })();
@@ -618,8 +635,8 @@ impl Interpreter {
         let allow_plain_hole = !self.array_index_accessor_protector;
         if let Some(arr) = receiver.as_array()
             && let Some(index) = key_value
-                .as_i32()
-                .and_then(|index| usize::try_from(index).ok())
+                .as_number()
+                .and_then(crate::array::index_from_number)
         {
             if crate::array::set_plain_dense_slot(
                 arr,
@@ -641,7 +658,7 @@ impl Interpreter {
         // ordinary non-prototype receiver, or an append the shared table
         // recorded for its class, completes without rooting or `[[Set]]`
         // resolution, as a megamorphic named store does.
-        if let Some(obj) = receiver.as_object()
+        if let Some(mut obj) = receiver.as_object()
             && let Some(string) = key_value.as_string(&self.gc_heap)
             && object::supports_fast_property_ic(obj, &self.gc_heap)
             && !object::state(obj, &self.gc_heap).is_prototype()
@@ -687,7 +704,9 @@ impl Interpreter {
                     roots.add_value(&mut key_value);
                 }
                 let transition = self
-                    .capture_store_property_transition_with_stack_roots(stack, obj, key, &value)
+                    .capture_store_property_transition_with_stack_roots(
+                        stack, &mut obj, key, &mut value,
+                    )
                     .map_err(CommittedValueError::JavaScript)?;
                 drop(roots);
                 if let Some(transition) = transition {

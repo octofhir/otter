@@ -1,5 +1,73 @@
 # Архитектурный аудит Otter и план крупных рефакторов
 
+## Текущий срез — 23 октября, 02:44 UTC
+
+Default release CLI: `629dcf4e7409eb64e69d92a4c6d6d10c178cf673484b62dd671a0281f317a4fb`. Baseline `805ec838`: `5651d0a7f1ba674de390cd3b3f1cd2981fcf87cbd1edb8894ccb4831465de69a`. Все новые binaries, exact source patches, hashes, watchdog records и raw сохранены вне очищаемого каталога: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/`.
+
+Финальный A/B: восемь неизменённых workload, пять чередующихся измеренных пар и одна исключённая warm-пара на класс, свежий процесс на наблюдение, production policy, CPU=user+sys, без параллельных builds/profiler. Все 96 процессов дали одинаковый stdout. CPU улучшился у Raytrace; остальные классы близки к baseline или медленнее. Общего ускорения движка этим срезом не доказано.
+
+| Workload | CPU до → после, с | Peak RSS до → после, MiB | Wall Δ |
+|---|---:|---:|---:|
+| crypto | 0.20 → 0.21 | 43.81 → 45.08 | +4.36% |
+| deltablue | 0.65 → 0.65 | 54.28 → 55.00 | -1.25% |
+| box2d | 0.69 → 0.72 | 133.94 → 118.16 | +2.91% |
+| raytrace | 0.81 → 0.76 | 46.50 → 45.55 | -6.50% |
+| splay | 1.04 → 1.07 | 369.89 → 372.83 | +2.80% |
+| regexp | 1.28 → 1.29 | 141.00 → 100.34 | -0.41% |
+| mandreel | 1.04 → 1.06 | 222.89 → 223.95 | +2.07% |
+| ts | 3.95 → 4.08 | 489.92 → 390.39 | +2.65% |
+
+Отдельная retention workload — неизменённый TS require и два explicit full GC, три чередующиеся измеренные пары плюс warm-пара: post-GC RSS median 314195968 → 224559104 Б (299.64 → 214.16 MiB, -28.5%). Live JS 8267576 → 8255640 Б почти не изменился. Это возврат лишних физических страниц, а не сокращение живых данных. Peak RSS и post-GC RSS не смешиваются.
+
+Реализованные архитектурные границы:
+
+- Один heap-owned weak ShapeInterner хранит immutable geometry. Numeric writes не создают physical shape variants и не запускают migration. Property/global slots переносят один Value word напрямую.
+- Int32 и purified offset-Double, включая integral Double, допустимы в любом Value. Физический Int32 tag и семантическое точное Int32 число имеют разные доказательства. Exact numeric index projection сохраняет исходный key на каждом промахе; typed scalar replacement сохраняет представление виртуальных полей на обеих ISA.
+- Стартовый old-generation budget один раз учитывает реальное nursery survival. Сохраняются прежние growth bounds, headroom/cage clamp, явный embedder override и post-major formula. Это сокращает избыточную начальную promotion-driven память.
+- FullGcGoal передаётся от запроса до одного sweep: natural growth/concurrent completion/stress используют Throughput; explicit GC, heap-cap и code reclamation — ReleaseMemory. Trigger/capture не выбирают policy.
+- ReleaseMemory возвращает ОС целые внутренние OS pages в неиспользуемых nursery payload/tails и в существующих old-space dead ranges/tails. Реальный OS page size, live prefixes, page/FREE headers и intrusive links сохраняются; addresses/capacity/free-list facts не меняются. Unsupported/failure path не трогает unused bytes.
+- GeneratedCodeBytes учитывает принадлежащие deopt/safepoint metadata actual-argument arrays. Исправление accounting не объявляется экономией RSS.
+
+Разделение memory-release/throughput и сохранение FreeSpace prefix сверены с pinned V8 `926c0e5…`, `src/heap/sweeper.cc:1008–1063`, `memory-reducer.cc:58–94`. Exact primary sites и локальный аудит: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/gc-collection-goal/v8-policy-audit.txt`.
+
+Проверки: 135 focused numeric cases на ARM64/x86-64 и 7 адресных случаев после FLOAT saturation; 17 GC/accounting cases; дополнительная проверка active/inactive nursery tails с capture off/on; 32 CLI differential/GC observations (interpreter/jitless/production, affected stress 1/4/16). Targeted Test262 closing gate: все 171 canonical file прошли, без skips/failed/crash/timeout/OOM (Number.isInteger 9, Object.is 22, unary-minus 14, String.replace 56, RegExp @@replace 70). Runner SHA-256 `b9058e97b8f8b90946b2cb9a8d613fbca676a3e980ca712b64c78eeb4488b5fa`; reports и exact pinned selection: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/targeted-test262/final-run/`. Это не полный свежий conformance report; исторический `ES_CONFORMANCE.md` не переписывался.
+
+Отклонённый CPU-кандидат: прямой pristine static-string replace entry прошёл source review, но новый stress unit дал literal `$<part>` вместо named substitution при доказанном pristine receiver. Production-entry и его новые fixture edits полностью откатили, failure logs/patch сохранены в `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/regexp-pristine-entry/`. Причина не установлена; переносом теста её не скрывали.
+
+Неподтверждённые объяснения отклонены: установленный код не удерживает целиком Graph/regalloc/snapshot/AST, dense TS feedback даёт upper bound около 1.82 MiB; ShapeInterner weak prune вызывается ровно один раз на physical sweep. Vmmap нашёл ~152 MiB mimalloc mappings вне GC cage, но не различает живые Rust owners и allocator fragmentation. Нельзя объявлять это утечкой или приписывать одному компоненту.
+
+Дальнейший крупный CPU-план: исследовать Box2D Number-union loads и GC startup cost Splay по actual installed code/cycles; для следующего шага code-GC сначала доказать inactive-generation/active-frame ownership. Не возвращать numeric migrations, per-read canonicalization, второй interner или несовместимые parallel stacks.
+
+
+### История поиска числовой границы до 01:32 UTC
+
+Принятый baseline — `805ec838`, executable SHA-256 `5651d0a7f1ba674de390cd3b3f1cd2981fcf87cbd1edb8894ccb4831465de69a`. Новые raw находятся в `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/`. Более ранние потерянные raw остаются потерянными.
+
+Физические numeric shapes и затем geometry-only fields с canonicalization каждого чтения отвергнуты по whole-run CPU. Последний `3ce990bd` прошёл 106 адресных tests на двух ISA и 23 CLI observations, но RayTrace CPU вырос 0,79 → 0,91 с, TS 3,97 → 4,38 с. Он не принят в Git. Текущий working tree закрывает одну числовую границу целиком:
+
+- один heap-owned weak `ShapeInterner` владеет геометрией; numeric writes не создают physical shape variants;
+- любой `Value` может содержать Int32 либо purified offset-Double, включая integral Double; `as_i32` доказывает только физический Int32 tag;
+- property/global reads переносят word без canonicalization; F64 boxing только очищает NaN и добавляет offset;
+- shape-owned `FieldType` различает Int32, Double и Number union, без второго representation registry;
+- финальный выбор store observers использует фактически записываемое слово после representation/escape/folding; semantic Int32 knowledge не выдаётся за raw Int32 proof;
+- scalar replacement сохраняет тип виртуального поля, поддерживает Float64 store/Number load/Tagged reconstruction; наблюдаемые записи остаются физическими;
+- старые preferences, representation banks/dependencies, migrations и birth packets удалены. Canonical births используют один буфер и раздельные GC roots.
+
+```mermaid
+flowchart LR
+    S["ShapeInterner: геометрия"] --> P["Property field: Value word"]
+    F["F64 SSA"] --> E["Purify NaN + offset"] --> P
+    V["Int32 / Double Value"] --> P
+    T["FieldType: I32 / Double / union"] --> N["Числовое чтение"]
+    P --> N
+    P --> B["Прямое Tagged чтение: регистры, args, globals"]
+    F --> Q["Typed virtual field: scalar replacement"]
+```
+
+JSC `compilePutByOffset` пишет purified offset-Double напрямую (`DFGSpeculativeJIT.cpp:14876–14905`, ревизия `e9c03b…`). Его JSValue bit equality/hash остаются физическими; JS strict equality/SameValue имеют отдельную numeric семантику. Otter сохраняет это разделение. Узкий JSC `unboxRealNumberDouble` не переносится как полный Number decoder: он исключает Double NaN, тогда как Otter numeric field contract допускает NaN и ±Infinity.
+
+Universal-Value release `8ac95d00` прошёл 119 адресных tests, 32 CLI observations и 64 whole-run observations. RayTrace CPU улучшился 0,83 → 0,74 с, TS вернулся к baseline, но crypto вырос 0,21 → 0,90 с, Box2D 0,73 → 0,93 с. Этот вариант также отвергнут. Exact crypto profile нашёл потерянную числовую границу: StoreKeyedCached принимает только raw Int32 key, а цикл производит integral Double. На runtime completion приходится 451/892 isolate inclusive samples. Текущий срез добавляет отдельную exact numeric-index projection с сохранением исходного Value на промахах, на обеих ISA. VM использует существующий `array::index_from_number`; raw Int32 proofs не расширяются. Index release `0d81a354` убрал основную crypto-регрессию, но сохранил CPU 0,20 → 0,37 с; Box2D 0,70 → 0,90 с. После этого исправлена сама граница numeric feedback: точный целый Double, кроме `-0`, допускает Int32 SSA. `as_i32`/FieldType остаются физическими; semantic backlink больше не выдаёт physical INT32 bound. Release `9b275330` прошёл 135 адресных cases и 32 CLI observations; crypto вернулся к baseline, RayTrace CPU улучшился примерно на 10%, остальные классы ещё имеют небольшие регрессии. Следующий вариант пропускает повторную FP-классификацию, когда существующий numeric feedback cell уже содержит FLOAT; новый release ещё не измерен. Дополнительно подтверждён GC resource target: после полного GC неизменённый Splay удерживает около 260 МиБ old extent при 62 МиБ занятых ячеек. Свободные промежутки переиспользуются между GC; это не доказательство потери freelist. Проверяется возврат OS pages внутри мёртвых диапазонов без перемещения живых объектов.
+
 > Состояние артефактов, 22 октября 2026, около 20:15 UTC: во время текущих проверок исчезли созданные в этой сессии каталоги `benchmarks/results/*2026-10-21*` и `*2026-10-22*`, включая raw A/B, patches и сохранённые baseline executables. Причина не установлена; команды этого чата удаляли только Cargo build caches. Числа ниже остаются исторически наблюдёнными результатами, но соответствующие старые raw-ссылки сейчас недоступны и не являются воспроизводимым набором доказательств. Исходники и Git-коммиты целы. Новые records/executables сохраняются в `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/`; baseline текущего среза требуется пересобрать из коммита, а адресные gates повторить для восстановления записей.
 
 ## Текущий план по конкретным механизмам V8 и JavaScriptCore
@@ -93,7 +161,7 @@ Pending сохраняет `CompilationSources` с физическими `Execu
 
 Первый дефектный executable, прерванная матрица, sample compile storm, repaired source patch, hashes, cold build failures, команды и сырые gates: `benchmarks/results/compile-cancellation-2026-10-22/`; исправленный финальный набор — `repair/`.
 
-### Текущий срез: один владелец подготовленного method target
+### Законченный срез: один владелец подготовленного method target
 
 До этого рефактора `jit_compile.rs` передавал `direct_methods[*].body.clone()` в legacy method baking; `jit_inline_methods.rs` повторно сохранял тот же Arc в mono **или** poly таблице. Graph читал direct carrier, Template — legacy carrier. Затем `jit_field_types.rs` вызывал `Arc::make_mut` отдельно для обеих ветвей: sharing превращался в две owned snapshot copies на overlap edge, включая instruction overlays и вложенные maps. Цепочка трёх таких edges допускала восемь leaf copies и 14 descendant snapshots вместо трёх различных descendants. Inline bytecode budget оплачивал `bake_inline_body`, но не эти copy-on-write copies. Это статически доказанный механизм; прежние events показывают присутствие обеих групп на DeltaBlue, но не позволяют честно вычислить runtime bytes или процент CPU.
 
@@ -103,7 +171,74 @@ Budget policy теперь одна: Graph-capable method body готовитс�
 
 Реальный VM producer regression создаёт verified root → три nested methods, живые shaped descriptors/PIC и опубликованные entry cells. Он наблюдает 3/6 уникальных body owners для mono/poly случая; каждый Arc имеет strong count=1. После `bake_field_type_tree` адреса Arc и instruction buffers совпадают, реальный leaf field bound заполнен; budget расходуется ровно по одному разу на body. Одинаковый function id на двух receiver shapes сохраняет отдельные targets/field locations. Native unit regressions проверяют отсутствие Graph admission у Template-only target и исходные индексы после его пропуска. Дополнительный JS corpus проверяет разные captured contexts одного method source, prototype replacement, method getter и own-field accessor; старый production и interpreter дают одинаковый результат, поэтому существовавшее runtime-падение ему не приписывается.
 
-Основной ожидаемый эффект — compile CPU и temporary snapshot peak; steady-state heap или ускорение полного исполнения заранее не заявляются. Сырые gates, отдельные ENOSPC/stale-fixture failures и будущий финальный A/B: `benchmarks/results/method-targets-2026-10-22/`. Устаревшие exact artifact assertions (5 registers/5 opcodes) проверены сохранённым baseline CLI: он уже выдавал 4 registers/4 opcodes и slots `[0,1,0,null]`; тест обновлён к этой действующей форме, без ослабления range/ownership checks.
+Завершён в `805ec8380960a48d83a1fba4094fee60ae9d56fd`. После потери старого каталога повторно сохранены адресные gates: x86_64 JIT method 11, ARM64 VM method-owner 2, source lease 1, ARM64 JIT method 10, runtime method 11, descriptor/accessor 1 и method artifact 1 — всего 37 tests. CLI driver сохранил 29 успешных процессов: четыре затронутых corpus против interpreter, production/jitless/interpreter, GC strides 1/4/16 и отдельный native events proof. Native context case получил entry и OSR optimizing compilations и 11 фактических inline splices. Полные suites не запускались.
+
+Production `after-otter` SHA256 `5651d0a7f1ba674de390cd3b3f1cd2981fcf87cbd1edb8894ccb4831465de69a` сохранён вне каталога результатов. Предыдущий source `2995db95596f3b76ebb70a78a4d54591b04cd3f6` пересобран в том же checkout командой `cargo build --release -p otter-cli` без profile/env overrides; получен baseline SHA256 `352e9c31dd69ce0d17e5f225cd7634e323a9fc468ac59a0eae4b71f1350dd3e8`. Затем `main` восстановлен на тот же чистый source commit. Дополнительных source checkouts/copies не создавалось.
+
+Три чередующиеся AB/BA-пары плюс исключённая warmup-пара для каждого из восьми неизменённых классов: все 64 процесса дали одинаковые результаты. Process snapshots не содержат Cargo/rustc/profiler; обычная UI/system host load остаётся. CPU — median от user+sys каждого процесса, RSS — peak.
+
+| Класс | Wall median, с до → после | Δ wall | CPU median, с до → после | Peak RSS median, МиБ до → после |
+|---|---:|---:|---:|---:|
+| crypto | 0.2029 → 0.2021 | -0.40% | 0.20 → 0.20 | 43.44 → 44.14 |
+| deltablue | 0.6349 → 0.6460 | +1.74% | 0.66 → 0.66 | 61.95 → 53.36 |
+| box2d | 0.7548 → 0.6949 | -7.94% | 0.84 → 0.77 | 133.39 → 133.69 |
+| raytrace | 0.7993 → 0.7860 | -1.67% | 0.80 → 0.79 | 46.64 → 46.28 |
+| splay | 0.6344 → 0.6054 | -4.56% | 1.05 → 1.02 | 371.55 → 371.41 |
+| regexp | 1.2998 → 1.2829 | -1.30% | 1.31 → 1.29 | 140.77 → 140.84 |
+| mandreel | 0.9869 → 1.0010 | +1.44% | 1.04 → 1.05 | 224.41 → 222.73 |
+| ts | 3.0587 → 3.0603 | +0.05% | 4.02 → 4.07 | 488.09 → 496.86 |
+
+| Класс | Wall min…max до / после, с | RSS min…max до / после, МиБ |
+|---|---:|---:|
+| crypto | 0.2005…0.2054 / 0.2003…0.2024 | 42.80…43.64 / 44.02…44.97 |
+| deltablue | 0.6337…0.6411 / 0.6198…0.6561 | 58.59…62.58 / 52.39…56.22 |
+| box2d | 0.5977…1.0618 / 0.6098…0.8487 | 132.70…135.81 / 130.44…134.69 |
+| raytrace | 0.7834…1.1694 / 0.7614…1.0591 | 46.42…46.67 / 46.23…47.58 |
+| splay | 0.6308…0.6373 / 0.6009…0.6083 | 365.06…372.69 / 368.66…375.97 |
+| regexp | 1.2777…1.4486 / 1.2689…1.2961 | 140.03…141.08 / 139.11…140.86 |
+| mandreel | 0.9802…1.0104 / 0.9986…1.0132 | 223.36…226.45 / 220.58…225.81 |
+| ts | 3.0187…3.1574 / 3.0280…3.3164 | 487.20…490.66 / 494.23…499.12 |
+
+**Общего выигрыша speed+memory нет.** Splay wall −4,56% при CPU 1,05 → 1,02 с; Box2D median −7,94%, но диапазон велик и перекрывается. TS wall практически одинаков, CPU +1,24% и RSS +1,80%; Mandreel немного хуже. Это устранение доказанного copy-on-write fan-out и повторного planning, а не достигнутая цель крупного ускорения. Стоимость snapshot preparation отдельно по CPU не измерена, RSS нельзя приписать только этому владельцу. Следующий execution срез меняет физический формат числовых полей.
+
+Устаревшие exact artifact assertions (5 registers/5 opcodes) до потери executable проверены baseline CLI: он уже выдавал 4 registers/4 opcodes и slots `[0,1,0,null]`; тест обновлён к этой действующей форме, без ослабления range/ownership checks. Старая запись проверки недоступна; повторный текущий artifact gate сохранён.
+
+Новые исходные команды, snapshots, raw stdout/time, source/binary hashes, `baseline-build.json`, `gates.json`, `diagnostics.json`, `whole-ab/results.json`, executables и source patch: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/method-targets/`. Эти records не восстанавливают утраченные ранние matrices.
+
+### Следующий срез: числовой формат поля и один shape interner
+
+Выбран `DoubleEncodedOrUndefined` как immutable physical field codec рядом с обычным Tagged. Int32/undefined в обычных полях сохраняют прежнюю кодировку; только выбранное Double-поле нормализует числовые записи. Undefined остаётся точным sentinel, поэтому numeric load проверяет инициализацию до F64 decode. На границе обычного Value read/deopt число возвращается в canonical Number. Нечисловая запись переводит lineage preference в absorbing General до эффекта; native probe обязан отказать до store. Полностью сменить глобальный number boxing или применить только Graph store недостаточно — прежние такие эксперименты дали регрессии.
+
+Neutral defining shape владеет монотонной preference Candidate → Double → General, physical shapes остаются immutable. Все поля repair/birth переигрываются по одному предпочтительному вектору, чтобы порядок переходов сходился к одному layout. Старые Graph constructor/literal plans подписываются на изменение preference через существующие code dependencies; следующий объект должен рождаться с актуальным codec. Field summary описывает фактические physical words определяющего shape, а не neutral origin. No second registry, compatibility mode или новая схема artifact format.
+
+Первый необходимый foundation — одна heap-owned таблица переходов. Сейчас interpreter facade и heap-only state transitions не имеют общей mutable authority. `IsolateNames` получает существующий interner; producers, restore, root pins и GC weak pruning переводятся одновременно. Nonalloc table borrow никогда не пересекает allocator или root-publication reentry. Weak sweep выполняется до физического освобождения, включая split mark/sweep. Этот foundation сам по себе не объявляется performance result; он задаёт единственного владельца для следующего physical codec.
+
+### Первый полный field-codec вариант: не принят, модель уточняется
+
+Production CLI SHA256 `5bf51dfde1c6bed4bbf90257ff5a84dd9f94733510110194099b2878af833dc4` собран отдельно default `cargo build --release -p otter-cli`, без profile/env overrides. Baseline — предыдущий `805ec838` executable `5651d0a7f1ba674de390cd3b3f1cd2981fcf87cbd1edb8894ccb4831465de69a`. Exact source patch, build manifest, binaries и все новые raw records сохранены вне очищенного дерева: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/shape-interner/`.
+
+Полная реализация уже имеет общий heap interner, физические codecs и оба native backend, точное admission до store/barrier/summary, canonical boxed boundaries, предпочтительные births и retirement stale Graph birth plans. Удалён прежний отдельный `field_repr` registry и неиспользуемый альтернативный atom-store owner. Носители не растут: ShapeBody 96 B, FieldLocation 4 B, ShapeKeys entry 16 B, PIC entry 32 B, shared property row 72 B; поля остаются **8 B**, поэтому уменьшение object footprint не заявляется. Дополнительные historical variants, compilation facts и dependencies имеют реальную цену. Два birth обхода сделаны линейными; same-neutral-prefix write не повторяет наблюдение всех старых значений. Это не substitutes для whole-process результата.
+
+Адресные gates первого варианта: heap-interner 4; representation/owned-layout 3; VM `double_` 6, включая реальное перемещение receiver и incoming object на overflow allocation; обе ISA codec по 2; ARM property actions 2 + typed fields 1 + literals 11; x86 actions 4 + typed fields 1 + literals 8; настоящий Runtime Graph birth invalidation по 1 на ISA. CLI сохранил 16 успешных процессов: два corpus против старого interpreter, текущие interpreter/Template/production и production GC strides 1/4/16; numeric corpus дополнительно проверен при stride 1 в interpreter и Template. Полные suites не запускались.
+
+A/B остановлен на **42-м процессе из 64**: unchanged RegExp завершился TypeError в excluded warmup after. Поэтому это незавершённая, failed матрица, не общий performance score. Пять законченных классов до ошибки имеют три AB/BA пары и excluded warm pair; Rust builds/profiler не запускались вместе с ними. Обычная system/UI нагрузка сохраняется в process snapshots.
+
+| Класс | Wall median, с | Δ wall | CPU median, с | Peak RSS median, МиБ | Wall min…max до / после, с |
+|---|---:|---:|---:|---:|---:|
+| crypto | 0.2108 → 0.2042 | -3.14% | 0.21 → 0.21 | 42.89 → 43.70 | 0.202…0.215 / 0.203…0.215 |
+| deltablue | 0.6347 → 0.6505 | +2.48% | 0.65 → 0.67 | 53.28 → 53.89 | 0.621…0.745 / 0.644…0.653 |
+| box2d | 0.6166 → 0.9324 | +51.22% | 0.70 → 1.05 | 131.83 → 138.42 | 0.602…0.627 / 0.918…0.959 |
+| raytrace | 0.8080 → 1.1438 | +41.56% | 0.81 → 1.14 | 46.86 → 45.58 | 0.790…0.838 / 1.091…1.237 |
+| splay | 0.5966 → 0.6352 | +6.47% | 1.00 → 1.04 | 374.27 → 370.77 | 0.590…0.598 / 0.612…0.646 |
+
+RegExp ошибка воспроизводится во всех трёх tier modes, включая `/a/.exec("a")`: folded builder входил напрямую в no-collect allocation и не готовил первый String `input` через общий birth owner. Исправление вызывает тот же `field_storage::prepare_birth` до reservation и удерживает actual physical shape/record roots; новый адресный VM regression первого input и следующего рождения после `match.index = 1.5` прошёл. Исправленный release ещё не измерен на этом этапе.
+
+Box2D — существенная регрессия, а не noise: executed instructions median 9.573 → 14.079 млрд. Полные статические artifacts показывают, что numeric lowering работает: в latest emitted body per function есть 1 021 Double load/226 Double stores; CheckedTaggedToFloat64 1 246 → 394. Но optimizing code вырос с 1 440 456 до 2 116 696 B, главным образом за счёт cached/named property paths. В f1217 прежний 4-B LoadOwnField после ShapeGuard превратился в 604-B cached operation; runtime store counters этой функции 23 → 17 920. Исторические Tagged и Double PIC cases мешают общей direct-field admission. Captured ShapeGuard exits 10 → 31, TypeMismatch 3 → 2: гипотеза неограниченного TypeMismatch churn этими данными **не подтверждается**. Event capture bounded/truncated 16 384; counts — только захваченный prefix, latest emitted artifact не доказывает active generation. Отдельный launchprof дал 641/926 isolate self samples, из них optimizing 398/613; это один диагностический профиль, не A/B score.
+
+Следующая корректировка переносит адаптацию старых физических объектов в один noncollecting representation migration owner: exact neutral origin и полный текущий preferred vector, без изменения observable JS values. Own-field compile projection нормализует исторические equivalent layouts к текущему physical target; native shape guard мигрирует только на cold mismatch, а generation подписывается на preferences **до** shape check. Unrelated polymorphism не стирается и не переучивается безусловно. В V8 этому соответствует `TryMigrateInstance` на mismatch с повторной проверкой map и field-representation dependency на defining owner ([выбор check kind](https://github.com/v8/v8/blob/926c0e5fb9cd60257e49cbdf7855ba42dd13963c/src/compiler/property-access-builder.cc#L109), [migration/recheck](https://github.com/v8/v8/blob/926c0e5fb9cd60257e49cbdf7855ba42dd13963c/src/compiler/turboshaft/machine-lowering-reducer-inl.h#L3564), [invalidation](https://github.com/v8/v8/blob/926c0e5fb9cd60257e49cbdf7855ba42dd13963c/src/objects/map-updater.cc#L1391)). Это адаптация механизма; deprecated V8 maps не объявляются уже существовавшим контрактом Otter. Результат корректировки пока не измерен.
+
+Отвергнут отдельный кандидат frame-state pruning: `graph/builder.rs` уже берёт live_at(pc)/live_at(next), parent inline frames сохраняют нужное after-call state, regalloc/deopt потребляют сокращённые states. V8 `BytecodeGraphBuilder::PrepareEagerCheckpoint` на pinned revision также использует in-liveness и sparse StateValues. Повторно внедрять тот же механизм не требуется.
+
 
 ### 3. JSC: weak code dependencies и активный стек
 
@@ -448,3 +583,239 @@ Eager/lazy reconstruction обязана хранить virtual identity и ак
 Сборочный анализ и прежние эксперименты сохранены в `benchmarks/results/metadata-ownership-2026-10-21/`. Там одинаковые release-параметры, baseline executable, Cargo timings/features/dependency graph, checkpoint diff и неудавшиеся гипотезы. Старый сентябрьский архитектурный отчёт полезен как история, но его object/context sizes и старые проценты не выдаются за текущее состояние.
 
 Финальный CLI соответствует `final/compiled-source.patch`; `final/post-build-format-docs.patch` фиксирует последующее форматирование одной Rust expression и уточнение docstring без изменения исполняемых выражений/типов. `final/source.patch` содержит полный итоговый working-tree diff. Raw manifests сохраняют отдельные SHA бинарников и patch.
+
+
+## Второй physical-field кандидат: семантика прошла, производительность не прошла
+
+Кандидат `27ebff14f7ff42de0a1006ccf08b89b5ada818c66b844846998d7452d2a083b8` добавил неаллоцирующую миграцию старого экземпляра на уже подготовленный предпочтительный layout. ARM64 и x86_64 сохраняют live GP/FP и eager-only значения; после эффекта проверяют общий dependency flag поколения и точный физический shape. Отказ не имеет эффектов. Исправлен folded RegExp result builder: canonical birth values проходят тот же протокол подготовки до публикации.
+
+Все 64 отдельных процесса восьми классов дали одинаковые результаты. Это **семантический pass, performance fail**. Три измеряемые чередующиеся пары и исключённая прогревочная пара на класс; production release без profile/env overrides. База — executable коммита `805ec838`, SHA `5651d0a7f1ba674de390cd3b3f1cd2981fcf87cbd1edb8894ccb4831465de69a`.
+
+| Класс | Wall до → после, с | Δ wall | CPU до → после, с | Peak RSS до → после, МиБ |
+|---|---:|---:|---:|---:|
+| crypto | 0.2039 → 0.2087 | +2.38% | 0.21 → 0.21 | 43.52 → 45.36 |
+| deltablue | 0.6264 → 0.6706 | +7.06% | 0.65 → 0.71 | 54.70 → 55.95 |
+| box2d | 0.6574 → 0.8387 | +27.58% | 0.76 → 0.92 | 135.58 → 138.47 |
+| raytrace | 0.8549 → 1.1534 | +34.91% | 0.85 → 1.14 | 45.30 → 46.25 |
+| splay | 0.5974 → 0.6139 | +2.76% | 1.01 → 1.01 | 370.80 → 374.28 |
+| regexp | 1.2601 → 1.3577 | +7.75% | 1.27 → 1.37 | 140.67 → 139.83 |
+| mandreel | 0.9948 → 1.0017 | +0.69% | 1.05 → 1.05 | 222.58 → 226.69 |
+| ts | 2.9711 → 3.6179 | +21.77% | 3.96 → 4.57 | 492.70 → 495.25 |
+
+Отдельный unchanged TS require + два принудительных GC: median live GC bytes 8 267 608 → 8 267 168; post-GC resident bytes 313 638 912 → 308 232 192 при перекрывающихся диапазонах. Это не существенное сокращение retained heap и не доказанный общий RSS выигрыш. Raw rows, process snapshots, ranges, stdout, executable и exact source patch сохранены вне очищаемого репозитория: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/shape-migration/`.
+
+Свежие Box artifacts показали устранение части shape-exit poisoning, но compiled code всё ещё 2 001 944 против 1 440 456 байт у базы. Dependency checks выросли с 602 до 2235. Причина следующей правки установлена в compiler contract: representation guard ошибочно clobber-ил logical fields, field-type и dependency facts, хотя успешная миграция сохраняет все JS-значения и проверяет целый generation flag до продолжения. Следующая проверяемая ревизия инвалидирует физические MapWords, сохраняет decoded SSA/CSE и уже проверенные подписанные факты. Это пока гипотеза ускорения, а не принятый результат.
+
+
+## Ревизия d402: правильные effects уменьшили регрессию, цель всё ещё не достигнута
+
+Default-release executable SHA `d402eda27c6bf7de1b6d8faded460558a5916055db687f5b924c344736bf8a03`. Убраны ложные clobbers logical fields/FieldTypes/Dependencies у неаллоцирующей миграции; сохранена инвалидизация физических map proofs. Допустимые холодные writes и cached append сохраняют уже корректный старый physical prefix. Исправлена публикация shared store policy после committed megamorphic store; TOP owner уже поддерживался и причиной не был.
+
+IR preservation, runtime migration/birth на обеих ISA, адресные VM regressions и 16 CLI сравнений с interpreter/GC 1,4,16 прошли. Все 64 A/B процесса совпали по результату; performance снова **fail**:
+
+| Класс | Wall до → после, с | Δ wall | CPU до → после, с | Peak RSS до → после, МиБ |
+|---|---:|---:|---:|---:|
+| crypto | 0.2096 → 0.2355 | +12.35% | 0.21 → 0.23 | 43.83 → 43.36 |
+| deltablue | 0.6331 → 0.6619 | +4.55% | 0.66 → 0.69 | 55.91 → 53.20 |
+| box2d | 0.6164 → 0.6825 | +10.73% | 0.70 → 0.78 | 133.73 → 137.05 |
+| raytrace | 0.8074 → 0.9843 | +21.91% | 0.81 → 0.99 | 46.66 → 46.06 |
+| splay | 0.5953 → 0.6117 | +2.75% | 1.00 → 1.01 | 367.33 → 369.17 |
+| regexp | 1.2695 → 1.3613 | +7.23% | 1.28 → 1.37 | 140.62 → 138.44 |
+| mandreel | 0.9887 → 0.9880 | -0.08% | 1.04 → 1.04 | 220.89 → 229.62 |
+| ts | 3.0220 → 3.6209 | +19.82% | 3.97 → 4.57 | 497.61 → 493.78 |
+
+Raw команды, ranges, stdout, source/executable hashes и process snapshots: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/shape-effects/`. Это сравнение с принятой базой 805, а не с предыдущим замедлившим кандидатом.
+
+Свежие RayTrace events полные (3656/3870), без uncached-store storm. В latest IR стало меньше nodes (3578 → 3513), но code вырос 292 696 → 349 216 B. StoreNamedProperty занимает 47 968 → 80 452 B; один constructor store вырос 28 → 172 B. Из 439 показанных оптимизирующих self samples нового launch-профиля 147 попали в StoreNamed, из них 58 — в повторный birth-target guard, 44 — в admission/normalization; 39 других samples — Float64ToTagged. Это частичная top-200 выборка, не доля всего времени и не отдельный performance benchmark. Profiler с artifact capture запускался отдельно от timed A/B.
+
+Graph уже специализирует append programs и знает resulting shape. Следующий срез не добавляет второй transition engine: immutable parent/codec/slot facts проверяются при bake, текущая preference последнего поля подписывается через существующий generation dependency owner. Один selected program сохраняет Tagged RHS либо принимает F64 напрямую. Descriptor/prototype/extensibility/capacity guards, physical summary observation, source-stability notification и publication остаются у действующего native program. Промах выходит до первого эффекта на точный source StoreProperty; полное preferred состояние старого prefix не требуется.
+
+Отдельное упрощение birth-протокола объединяет admission, preferred-vector check и encoding в один PreparedBirth вместо трёх проходов. Первый packet build отвергнут до performance-замера: source audit выявил mutable-parent reborrow при защищённом slab tail. Исправление разделяет shape/prefix/tail; callee один владеет tail roots, после возврата object tracing и initializer используют один mutable-derived pointer. Адресный фактический moving-GC overflow test прошёл на обеих ISA. Это исправление memory-safety контракта; прохождение output-тестов само по себе не использовано как доказательство отсутствия Rust alias UB.
+
+
+### Safe birth packet: whole-run rejection and selected append closure
+
+Default release `71ff1f772fa3a657ddec62857677cdea153ad61458ca68bad4dab25366172511` passed 23 CLI observations, including interpreter/Template/production comparison and affected GC strides 1/4/16. The unchanged eight-class alternating matrix passed all 64 output observations, including excluded warmups. Performance still fails against accepted `805ec838` executable `5651d0a7f1ba674de390cd3b3f1cd2981fcf87cbd1edb8894ccb4831465de69a`; this revision is not an accepted optimization.
+
+| Workload | Wall median, s before → after | Wall delta | CPU median, s before → after | Peak RSS, MiB before → after | Instructions, B before → after |
+|---|---:|---:|---:|---:|---:|
+| crypto | 0.2340 → 0.2121 | -9.34% | 0.23 → 0.21 | 42.97 → 45.50 | 3.858 → 3.971 |
+| deltablue | 0.6238 → 0.6608 | +5.92% | 0.65 → 0.69 | 54.78 → 54.58 | 11.960 → 12.339 |
+| box2d | 0.6066 → 0.7787 | +28.37% | 0.69 → 0.87 | 133.91 → 135.78 | 9.574 → 10.672 |
+| raytrace | 0.7884 → 0.9794 | +24.23% | 0.79 → 0.99 | 46.16 → 45.03 | 13.002 → 16.287 |
+| splay | 0.6127 → 0.6446 | +5.22% | 1.01 → 1.07 | 371.23 → 368.09 | 8.948 → 9.013 |
+| regexp | 1.2716 → 1.3245 | +4.16% | 1.28 → 1.33 | 140.91 → 138.42 | 18.538 → 19.271 |
+| mandreel | 0.9889 → 0.9806 | -0.83% | 1.04 → 1.03 | 224.80 → 227.14 | 15.929 → 15.937 |
+| ts | 2.9802 → 3.7196 | +24.81% | 3.96 → 4.71 | 497.78 → 492.97 | 33.746 → 37.154 |
+
+Raw data, source/executable hashes, per-run ranges and host process snapshots: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/shape-birth-packet-safe/whole-ab/`. Box2D instructions stayed near the previous candidate while wall time varied substantially; this is evidence against attributing every wall delta to a single source change. RegExp work fell from the previous candidate, but remains above the accepted baseline. The all-thread TypeScript samples also show increased generated Graph and Template work, rather than a compiler-only problem.
+
+The next coherent change keeps one existing CacheIR program as the owner of a selected append. Bake proves immutable parent/slot/codec properties; the existing generation dependency owns the last field preference. A numeric SSA operand writes its purified F64 word directly. A late post-phi refinement uses the same certificate when normal representation selection reveals a numeric phi; deopt frame states continue to reconstruct canonical Values. No speculative numeric assumption is introduced for arbitrary CallJs results. Source shape, descriptor, extensibility, capacity and admission checks still precede the first effect.
+
+The focused runtime regression passed on native ARM64 and x86_64: actual normal-policy compiled IR contains the selected numeric append; Candidate → Double → General changes retire the right generation; a prototype setter and an argument callback each run exactly once; an FP value live across the constructor remains correct. The fixture obtains its numeric proof with ordinary `argument() * 1`. An earlier fixture without this operation correctly retained Tagged because the call result had no numeric proof; its failed strict IR assertion was diagnosed and the fixture corrected, without relaxing the IR requirement. Both ISA selected-append and dependency tests, plus the VM stale-own-codec / old-prefix certificate test, passed. Raw logs and the exact next compiled patch are in `shape-static-append/` outside the repository. Whole-run performance for this next candidate is still pending.
+
+
+### Typed append result: physical shape formats rejected
+
+Default release `43f7c80a4e2c0f58c1e5002fa91c13b0f9c4069a5b5a872f303fea53c4d66e47` passed all 23 CLI and 64 whole-run observations. The strict actual Runtime regression passed on ARM64 and x86_64. Against accepted 805 it still fails the performance/resource criterion:
+
+| Workload | Wall delta | CPU median, s before → after | Peak RSS, MiB before → after | Instructions, B before → after |
+|---|---:|---:|---:|---:|
+| crypto | +0.07% | 0.21 → 0.21 | 43.73 → 44.16 | 3.857 → 3.964 |
+| deltablue | +0.08% | 0.66 → 0.65 | 56.34 → 54.95 | 12.038 → 12.056 |
+| box2d | +10.72% | 0.69 → 0.78 | 133.64 → 134.67 | 9.574 → 10.726 |
+| raytrace | +3.65% | 0.80 → 0.84 | 46.59 → 46.61 | 13.005 → 13.727 |
+| splay | +6.38% | 1.00 → 1.05 | 368.09 → 375.44 | 8.950 → 9.061 |
+| regexp | +4.43% | 1.28 → 1.34 | 139.95 → 138.66 | 18.540 → 19.266 |
+| mandreel | -2.05% | 1.06 → 1.04 | 218.16 → 226.17 | 15.925 → 15.938 |
+| ts | +21.18% | 4.00 → 4.62 | 494.23 → 501.98 | 33.752 → 37.101 |
+
+Raw commands/ranges/hashes/output/process snapshots: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/shape-static-append/whole-ab/`. Direct F64 append reduces the prior RayTrace regression substantially, but TS and Box2D still lose CPU and RSS does not compensate. Physical shape variants, preferences, representation dependencies and migration are therefore being removed as a model. No cache or epoch is being added to rescue them.
+
+The replacement retains one heap-owned structural interner and stores either canonical Value words or purified Value-valid Double words in ordinary fields. Numeric writes preserve geometry. All Tagged reads canonicalize, including native object-global bindings; Int32 remains Int32 when naturally produced. Existing field-type words gain the free DOUBLE bit: raw encoded Double zero is DOUBLE, never an Int32 constant. Existing field-type dependencies permit Int32-only payload loads, Double-only F64 loads, or a mixed Int32/Double decode. Undefined, null, exact shape identities and TOP cannot earn a complete numeric bound. No new representation owner or metadata bank exists. Native FP stores retain source/eager recovery and the existing field summary/barrier/publication owners.
+
+### Current primary-engine reference distance
+
+A separate rotated three-engine matrix ran unchanged fixture text with one excluded warmup and three measured fresh processes per engine per fixture: 96 output observations passed. Otter is the accepted 805 executable, Node is locally installed `v24.16.0`, Bun reports `1.4.3` (its diagnostic identifies canary `1.4.3-canary.1+bf80d21c6`). Node and Bun use the identical `node:vm` classic Script runner because direct Bun module entry rejects the legacy fixtures' undeclared assignments. File reading and this runner are included in their CPU/wall/RSS; Otter uses its default production file entry. This is a whole-process workload comparison, not an isolated throughput or compiler-only measurement.
+
+| Workload | CPU, s Otter / Node / Bun | Peak RSS, MiB Otter / Node / Bun | Wall, s Otter / Node / Bun |
+|---|---:|---:|---:|
+| crypto | 0.20 / 0.16 / 0.13 | 45.0 / 54.9 / 33.9 | 0.200 / 0.152 / 0.110 |
+| deltablue | 0.66 / 0.32 / 0.51 | 54.2 / 71.8 / 53.6 | 0.633 / 0.289 / 0.406 |
+| box2d | 0.68 / 0.51 / 0.55 | 133.5 / 99.6 / 72.0 | 0.600 / 0.302 / 0.287 |
+| raytrace | 0.82 / 0.46 / 0.41 | 46.8 / 62.2 / 59.5 | 0.812 / 0.432 / 0.289 |
+| splay | 1.04 / 0.50 / 0.50 | 381.6 / 390.4 / 220.6 | 0.614 / 0.300 / 0.184 |
+| regexp | 1.30 / 0.45 / 0.41 | 140.7 / 76.2 / 60.0 | 1.300 / 0.408 / 0.341 |
+| mandreel | 1.03 / 0.69 / 0.77 | 221.9 / 133.2 / 150.9 | 0.978 / 0.576 / 0.453 |
+| ts | 4.05 / 2.31 / 2.72 | 491.2 / 504.6 / 467.9 | 3.054 / 1.176 / 0.990 |
+
+Raw data and runner: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/reference-engines-805-script/`, `compare-engines.py`, `run-classic-script.cjs`. The first direct-module Bun attempt is preserved separately as failed and is excluded. These observations do not support a claim that Otter is already faster or smaller overall. A separate fresh RegExp launch profile contains 1357 all-thread samples: 636 VM runtime, 86 optimizing JS, 80 GC and 32 Template. Replacement/matcher/native protocol work remains a substantial independent target; it is not fixed by object shape changes alone. Profile raw data are in `numeric-field-words/regexp-profile-before/`.
+
+### Geometry-only fields с канонизацией чтения: измеренный отказ
+
+Default release `3ce990bdbf3db58c22cfff3edd5df1a20cbad223cfb9317f1cca9ca49f52e940` прошёл 106 адресных тестов на ARM64/x86_64, CLI differential/stress и 64 whole-run observations. Performance не проходит:
+
+| Workload | Wall delta | CPU median, s before → after | Peak RSS, MiB before → after | Instructions, B before → after |
+|---|---:|---:|---:|---:|
+| crypto | -0.62% | 0.20 → 0.21 | 43.19 → 43.14 | 3.844 → 3.952 |
+| deltablue | +10.40% | 0.65 → 0.72 | 54.23 → 52.47 | 12.021 → 12.829 |
+| box2d | +4.83% | 0.71 → 0.74 | 134.45 → 132.05 | 9.573 → 9.842 |
+| raytrace | +14.50% | 0.79 → 0.91 | 46.88 → 46.22 | 13.005 → 13.775 |
+| splay | +2.31% | 1.03 → 1.04 | 375.45 → 370.88 | 8.961 → 9.127 |
+| regexp | -1.26% | 1.27 → 1.25 | 139.39 → 140.38 | 18.538 → 18.573 |
+| mandreel | -3.58% | 1.08 → 1.05 | 227.84 → 224.02 | 15.922 → 15.933 |
+| ts | +15.35% | 3.97 → 4.38 | 497.23 → 500.09 | 33.744 → 35.041 |
+
+Raw: `numeric-field-words/whole-ab/` вне репозитория. Отдельный exact-process RayTrace profile сопоставил все 799 Graph self samples с теми же runtime artifacts. 41 PC находится внутри read canonicalizers; 902 статические копии добавляют около 108 байт каждая. Это частичная доля whole-process времени, не обещание такого же ускорения. Более существенная регрессия: `rayTrace` имеет 8 NewReceiver против baseline 5, `blend` — 3 против 1, поскольку прежний escape pass отклонял Float64 stores/Number reads. Все конкретные потерянные sinks имеют нулевые observer owners; их можно восстановить, сохранив наблюдаемые записи. Новый срез устраняет обе причины через общий Value contract и typed virtual fields, без добавления cache.
+
+### Подтверждённое удержание старых GC-страниц
+
+Два последовательных неизменённых Splay запуска (805 и 3ce) с `--trace-gc` дали после full GC old extent/allocated около 262,5/62,6 и 259,5/61,7 МиБ. До GC extent/allocated почти совпадают, следовательно свободные диапазоны действительно возвращаются в allocator. Большая post-GC разница — фрагментация внутри частично живых 256-КиБ страниц nonmoving old space. Это не 198 МиБ лишних живых payload и не доказательство потери freelist. Сырой trace/time/hash: `numeric-field-words/splay-gc-diagnostic/` вне репозитория. Исследуется возврат полностью свободных OS pages внутри dead runs после finalizers; coverage и whole-run CPU/RSS ещё не доказаны. Blind GC growth-factor tuning и moving-old compaction в этот срез не добавлены.
+
+### Universal Double Values: индексная граница найдена после whole-run отказа
+
+Default release `8ac95d007f991ffcfcce07b901cb1840a9b32489d9372043f7d8fe84da92f866` прошёл 59 ARM64 и 60 x86_64 адресных cases, 25 CLI corpus observations, 7 RegExp observations и все 64 whole-run processes. Это correctness evidence, не performance acceptance:
+
+| Workload | Wall delta | CPU median, s before → after | Peak RSS, MiB before → after | Instructions, B before → after |
+|---|---:|---:|---:|---:|
+| crypto | +337.87% | 0.21 → 0.90 | 43.36 → 43.97 | 3.851 → 14.501 |
+| deltablue | -3.13% | 0.66 → 0.64 | 53.42 → 52.45 | 11.893 → 11.886 |
+| box2d | +23.34% | 0.73 → 0.93 | 132.08 → 142.50 | 9.712 → 11.621 |
+| raytrace | -11.63% | 0.83 → 0.74 | 46.12 → 46.48 | 13.002 → 12.586 |
+| splay | -0.97% | 1.01 → 0.99 | 369.17 → 374.16 | 8.957 → 8.993 |
+| regexp | -1.25% | 1.28 → 1.27 | 140.83 → 139.41 | 18.539 → 18.559 |
+| mandreel | +8.52% | 1.03 → 1.15 | 220.47 → 226.31 | 15.925 → 17.165 |
+| ts | -0.57% | 3.99 → 3.97 | 492.78 → 490.94 | 33.760 → 33.884 |
+
+Raw `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/universal-number-values/whole-ab/` содержит hashes, commands, ranges и host process snapshots. Срез не принят. Exact-process crypto profile (`crypto-profile/`, `crypto-artifacts/`, `crypto-events.json`) показал 451/892 isolate inclusive samples в `jit_runtime_store_element_value`. В настоящем c25 `bnpSquareTo` цикл создаёт Float64Add → Float64ToTagged → StoreKeyedCached. Native cached index guard принимал только raw Int32; runtime dense completion тоже принимал только raw Int32. Поэтому каждый integral Double индекс превращался в slow property-key path. Это не повод вернуть канонизацию каждого property read: numeric indexed access получает собственную semantic projection в отдельный GP register, а оригинальный Value остаётся для named-table/runtime/typed-array/push-leaf miss. Fraction/NaN/Inf/negative/out-of-native-range inputs выходят до эффекта. `-0` адресует нулевой элемент. VM full-range array-index projection переиспользуется из одного существующего owner. Новые canary tests проверяют обе ISA и actual Template ARM address path; differential corpus проверяет fractional/NaN/max-u32 names и inherited setter once.
+
+Отдельные exact-process Box2D artifacts baseline/new не доказывают время без diagnostic capture: I/O/assembly formatting в этих профилях существенно. Они используются только для локализации операций. До/после source/value изменений native Graph self samples составили 402/417; старые LoadOwnField+CheckedTaggedToFloat64 вместе114 samples заменены 105 LoadNumberOwnField samples. Число typeMismatch recompile exits выросло 3 → 14. Следующий unchanged A/B определит, устраняет ли индексная граница whole-run регрессии.
+
+### Числовое значение и физическая кодировка: окончательная граница
+
+Index-only `0d81a3540559e64c65130d4d9217643edcb363a567690f28845722ef75195355` прошёл 124 адресных cases, 32 CLI и 64 whole-run observations, но CPU оставался хуже baseline: crypto0,20→0,37, Box2D0,70→0,90, Mandreel1,04→1,14, TS3,91→4,09. Raw: `numeric-indices/whole-ab/` вне репозитория. Он не принят.
+
+Semantic release `9b275330b9b2fab728cc845d2c879180209222822481eaae48509cede9dd26fd` разделяет numeric Int32 speculation и physical Int32 word proof. Единственный Rust classifier `NumberValue::as_exact_i32` использует точный roundtrip и исключает `-0`; его используют arithmetic feedback, parameter widening и explicit canonicalizing constructors. `CheckedNumberToInt32` обеих ISA принимает оба Number encoding и сохраняет исходный boxed input для eager recovery, включая совпавший destination register. Raw `as_i32`, FieldType, field-load forwarding и virtual raw-I32 reads остаются физическими. `Known.int32` даёт Tagged operand лишь Number union, никогда raw INT32 bound. ARM Template использует тот же смысл numeric class; x86 Template собственного inline feedback writer не имеет. Новая actual Runtime-регрессия проверяет Double bits настоящего producer, установленный Int32Add IR, отсутствие повторных deopt/Template entries и единственный выход на `-0`.
+
+135 адресных cases (ARM68/x8667), 32 CLI и 64 whole-run processes прошли. Итог ещё не принят как общий performance выигрыш:
+
+| Workload | Wall delta | CPU median, s before → after | Peak RSS, MiB before → after | Instructions, B before → after |
+|---|---:|---:|---:|---:|
+| crypto | +0.46% | 0.21 → 0.21 | 43.41 → 45.34 | 3.851 → 3.966 |
+| deltablue | +2.65% | 0.65 → 0.67 | 53.91 → 54.08 | 11.884 → 12.059 |
+| box2d | +5.96% | 0.69 → 0.74 | 132.34 → 133.09 | 9.576 → 9.450 |
+| raytrace | -9.46% | 0.80 → 0.72 | 46.33 → 46.19 | 13.002 → 12.576 |
+| splay | -1.81% | 1.00 → 1.00 | 372.92 → 371.62 | 8.943 → 8.943 |
+| regexp | +3.53% | 1.29 → 1.33 | 140.84 → 140.59 | 18.540 → 18.573 |
+| mandreel | +3.05% | 1.04 → 1.06 | 220.27 → 224.44 | 15.927 → 16.204 |
+| ts | +2.01% | 3.93 → 4.02 | 486.67 → 500.11 | 33.743 → 34.005 |
+
+Raw: `semantic-integers/whole-ab/` вне репозитория. Следующая адресная проверка устраняет повторную semantic FP classification после насыщения существующего FLOAT bit. Это тот же монотонный feedback owner, без нового cache или epoch.
+
+### GC startup и allocator: проверенные границы следующего среза
+
+Pinned V8 использует те же bounds1,1…4 и target mutator utilization0,97 (`src/heap/heap-controller.{h,cc}`), поэтому простое уменьшение коэффициента не является переносом архитектуры. Его default preconfigured old space32MiB; legacy initial-limit shrink применяется только без заранее заданного размера. JSC `e9c03b26665d…` имеет Small heap1MiB и Large/shell до32MiB; VM embedding defaultSmall, Bun choice данным checkout не доказан. На ARM и RAM≥16GiB proportional factor близок4: `1+3*exp(-2*min(H,RAM)/RAM)`, где H включает visited cells и external bytes (`Heap.cpp:141–195,2583–2656`). Поэтому Bun RSS нельзя объяснить универсальным1,5×live.
+
+Otter пока сохраняет initial old limit256MiB до первого full, несмотря на реальные minor survival/promotion counters. Готовится один first-successful-minor seed существующего контроллера: conservative working set = old consumed after minor + copied survivors; promoted и promotedLarge уже входят в old и не суммируются повторно. Используются существующие factor/headroom/floor/cage bounds и текущая nursery capacity. Seed однократный; explicit initial limit сохраняет владельца, последующие major используют прежнюю динамическую формулу. Это будущий кандидат, ещё не измеренный.
+
+Неизменённый TS на `0d81` впервые собирает old234,2MiB→33,2MiB extent/9,8MiB allocated; ранний стартовый feedback имеет реальный target для peak RSS. Splay после full по-прежнему имеет около261/62MiB extent/allocated. Raw: `numeric-indices/gc-diagnostic/`.
+
+Три чередующиеся TS retention пары после warmup дали baseline805 postGC RSS295,95MiB и live7,88MiB; `0d81`293,17MiB и7,87MiB. Forced-full old extent после этого31,5/33MiB; весь RSS нельзя приписать old holes. Отдельный causal allocator experiment использовал один immutable `9b2753` binary: default mimalloc purge delay1000ms против `MIMALLOC_PURGE_DELAY=0`, без сборок/профилей. PostGC RSS296,81→298,34MiB, CPU4,16→4,26s; peak RSS494,72→491,30MiB находится в перекрывающихся диапазонах. Настройка не принимается. Raw: `semantic-integers/allocator-diagnostic/`. Mimalloc3.3.2 essential stats доступны, но exit CURRENT печатается после force collect и не выдаётся за внутренний postGC snapshot.
+
+
+### 2026-10-23 01:48 UTC — numeric Value model frozen, physical RSS attribution
+
+Default-release numeric candidate SHA-256 `60db42190c136b1a80566542084b69bf95ffdc6ff3781446a1fe8e6de19b4f28` passed the focused ARM64/x86-64 gates, 32 CLI differential/stress observations and all 64 observations on the unchanged eight-class workload. Semantic success is separate from performance acceptance. Three alternating measured pairs plus one excluded warm pair per class:
+
+| Workload | CPU before → after, s | Peak RSS before → after, MiB | Wall delta |
+|---|---:|---:|---:|
+| crypto | 0.21 → 0.21 | 44.94 → 44.88 | +2.43% |
+| deltablue | 0.66 → 0.66 | 54.28 → 55.28 | -0.24% |
+| box2d | 0.68 → 0.73 | 130.64 → 132.70 | +3.58% |
+| raytrace | 0.81 → 0.74 | 46.38 → 45.78 | -9.45% |
+| splay | 1.02 → 0.99 | 369.83 → 368.33 | -2.95% |
+| regexp | 1.28 → 1.28 | 140.77 → 140.25 | -2.06% |
+| mandreel | 1.04 → 1.07 | 220.62 → 223.89 | +1.68% |
+| ts | 3.97 → 3.96 | 495.12 → 492.00 | +0.76% |
+
+Raytrace improves, Box2D CPU regresses despite fewer retired instructions, and the other deltas are mixed. This candidate is not an overall engine speed or memory breakthrough. Raw: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/feedback-saturation/whole-ab/results.json`.
+
+The default-binary vmmap diagnostic ran after unchanged TS require plus two explicit full collections, then held the process with a timer only to inspect mappings. Approximately 96–100 MiB resident belongs to the inferred GC cage, 25.25 MiB to 988 retained code RX mappings, and about 152 MiB lies in mimalloc-tagged mappings demonstrably outside the cage. The `IOAccelerator` label is mimalloc OS tag 100, not GPU allocation. Mapping attribution cannot distinguish live Rust owners from allocator holes; immediate mimalloc purge delay already failed to lower RSS in the same-binary causal diagnostic. Do not attribute the entire retained footprint to GC old-space fragmentation. Raw topology, commands and hashes: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/feedback-saturation/vmmap-diagnostic/`.
+
+Next bounded resource slices: seed the initial old-generation budget from the first successful nursery survival, then return wholly unused nursery OS pages only after full collection. Keep old-space growth coefficients unchanged; verify full CPU/peak RSS A/B plus distinct post-full-GC retention before claiming a win.
+
+### 2026-10-23 02:07 UTC — nursery physical discard, measured resource/CPU tradeoff
+
+Default release SHA-256 `3b5f20c54b2448524669af778c857c6de75842780fab482629524028ba48ccb7` contains full/split-sweep-only inward OS-page remapping of inactive nursery payload and active unused tails. The same existing cage remap owner also serves freed whole-page recycling; unsupported/failed unused-range remaps do not zero or touch memory. Headers, live prefixes, virtual addresses, capacity and ordinary minor reuse are retained. Full pause accounting includes discard time. Independent lifecycle review, 2 actual OS/live/capacity/reuse tests, 3 startup tests, all 8 collection observation cases, cap admission, and 32 CLI differential/stress runs passed.
+
+| Workload | CPU before → after, s | Peak RSS before → after, MiB |
+|---|---:|---:|
+| crypto | 0.21 → 0.20 | 43.19 → 43.53 |
+| deltablue | 0.66 → 0.65 | 55.19 → 53.98 |
+| box2d | 0.70 → 0.71 | 132.61 → 119.45 |
+| raytrace | 0.78 → 0.72 | 46.27 → 45.67 |
+| splay | 1.01 → 1.09 | 369.92 → 335.12 |
+| regexp | 1.28 → 1.31 | 140.91 → 99.75 |
+| mandreel | 1.03 → 1.07 | 223.09 → 223.33 |
+| ts | 3.91 → 4.11 | 502.83 → 410.89 |
+
+64/64 unchanged-workload observations match. Separate TS require + two explicit full GCs: RSS median 311689216 → 241336320 B, live JS 8267640 → 8255704 B. Strong footprint improvement has a CPU price, particularly Splay (+8%) and TS (+5%); it is not accepted as a general speedup. Incremental A/B against startup-only binary and existing V8/JSC footprint-versus-throughput GC policy are being checked before selecting the final policy. Raw: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/nursery-discard/`.
+
+Actual-argument slices omitted from deopt/safepoint `retained_bytes` now count toward generated-code admission. Two extended existing tests passed. This accounting correctness fix is not advertised as RSS savings; installed Graph/AST leakage was not proven. Exact ownership audit: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/deopt-arguments-accounting/ownership-audit.md`.
+
+### 2026-10-23 02:45 UTC — финальный Otter против актуальных локальных Node/V8 и Bun/JSC
+
+96 свежих процессов: три измеренных наблюдения и warm observation на каждый engine/class, с вращением порядка. Все stdout совпадают. Node v24.16.0, Bun 1.4.3. Одинаковый `node:vm Script` wrapper для Node/Bun сохраняет classic-script semantics неизменённых старых fixtures; чтение wrapper/source и startup включены, Otter использует обычный file entry. Это whole-launch сравнение, не чистый mutator throughput.
+
+| Workload | CPU Otter / Node / Bun, с | Peak RSS Otter / Node / Bun, MiB |
+|---|---:|---:|
+| crypto | 0.21 / 0.17 / 0.13 | 44.94 / 54.81 / 34.06 |
+| deltablue | 0.65 / 0.33 / 0.52 | 53.42 / 71.48 / 53.39 |
+| box2d | 0.72 / 0.51 / 0.57 | 120.08 / 99.83 / 71.44 |
+| raytrace | 0.72 / 0.46 / 0.41 | 46.05 / 62.31 / 60.41 |
+| splay | 1.07 / 0.52 / 0.51 | 374.16 / 384.61 / 216.25 |
+| regexp | 1.29 / 0.45 / 0.42 | 102.88 / 76.30 / 59.94 |
+| mandreel | 1.06 / 0.69 / 0.80 | 223.22 / 133.38 / 151.31 |
+| ts | 4.08 / 2.24 / 2.73 | 382.17 / 503.39 / 390.61 |
+
+CPU Otter остаётся хуже обоих reference engines на всех восьми классах этого захвата. Снижение памяти относительно собственного baseline не означает общего лидерства. RegExp/Splay — явные CPU targets; Box2D/Mandreel также сохраняют большой RSS gap с Bun. Raw, versions, executable/source hashes, process snapshots и wrapper note: `/Users/alexanderstreltsov/.codex/artifacts/otter-2026-10-22/reference-engines-final/results.json`.

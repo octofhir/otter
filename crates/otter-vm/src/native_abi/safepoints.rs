@@ -227,15 +227,24 @@ impl SafepointRecord {
     }
 
     /// Owned heap backing retained by this root record, excluding the record
-    /// itself: the spill bitmap and all inline frame slot slices, allocated
-    /// for the generation's complete lifetime.
+    /// itself: the spill bitmap, inline frame slots and actual-argument
+    /// slices, allocated for the generation's complete lifetime.
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
         self.inline_frames.iter().fold(
             self.spill_roots
                 .retained_bytes()
                 .saturating_add(std::mem::size_of_val(self.inline_frames.as_ref()) as u64),
-            |bytes, frame| bytes.saturating_add(std::mem::size_of_val(frame.slots.as_ref()) as u64),
+            |bytes, frame| {
+                bytes
+                    .saturating_add(std::mem::size_of_val(frame.slots.as_ref()) as u64)
+                    .saturating_add(
+                        frame
+                            .arguments
+                            .as_deref()
+                            .map_or(0, |arguments| std::mem::size_of_val(arguments) as u64),
+                    )
+            },
         )
     }
 
@@ -284,24 +293,40 @@ mod tests {
 
     #[test]
     fn retained_bytes_include_spill_bitmap_and_nested_inline_slots_once() {
-        let record = SafepointRecord {
+        let mut record = SafepointRecord {
             id: 4,
             frame_state: NO_FRAME_STATE,
             spill_roots: SpillRoots::from_slots([0, 1, 70]),
             inline_frames: Box::new([
                 crate::deopt::DeoptFrame::with_window(7, 11, None, [home(0), home(8), home(16)]),
-                crate::deopt::DeoptFrame::with_window(8, 12, None, [home(8)]),
+                crate::deopt::DeoptFrame::with_window(
+                    8,
+                    12,
+                    Some(crate::deopt::DeoptFrameEntry {
+                        return_register: 0,
+                        this: home(8),
+                        closure: home(16),
+                        new_target: home(24),
+                    }),
+                    [home(8)],
+                ),
             ]),
             call_pc: NO_CALL_PC,
         };
+        record.inline_frames[1].arguments = Some(Box::new([home(8), home(16), home(24)]));
         let inline_slots: usize = record
             .inline_frames
             .iter()
             .map(|frame| std::mem::size_of_val(frame.slots.as_ref()))
             .sum();
-        let expected = 2 * 8 + 2 * std::mem::size_of::<crate::deopt::DeoptFrame>() + inline_slots;
+        let argument_bytes = 3 * std::mem::size_of::<crate::deopt::DeoptSlot>();
+        let expected = 2 * 8
+            + 2 * std::mem::size_of::<crate::deopt::DeoptFrame>()
+            + inline_slots
+            + argument_bytes;
         assert_eq!(record.retained_bytes(), expected as u64);
-        let mut record = record;
+        record.inline_frames[1].arguments = None;
+        assert_eq!(record.retained_bytes(), (expected - argument_bytes) as u64);
         record.inline_frames = Box::default();
         assert_eq!(record.retained_bytes(), 2 * 8);
     }

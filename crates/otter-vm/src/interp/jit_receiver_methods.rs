@@ -95,7 +95,9 @@ impl Interpreter {
         receiver: ConstructReceiver,
     ) -> Option<PolyMethodTarget> {
         let key = context.property_atom_for_function(function_id, name)?;
-        let shape = self.shape_runtime.handle_for_id(receiver.shape)?;
+        let shape = self
+            .shape_runtime
+            .handle_for_id(&self.gc_heap, receiver.shape)?;
         if self.shape_slot_of_atom(shape, key.atom().id()).is_some() {
             return None;
         }

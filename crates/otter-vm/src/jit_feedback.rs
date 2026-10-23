@@ -1,6 +1,6 @@
 //! Dense tier-neutral instruction feedback owned by executable code.
 //!
-//! The interpreter records observed operand/value representations at numeric
+//! The interpreter records observed operand/value classes at numeric
 //! bytecode sites while a hot function is still warming up. Cells live in the
 //! owning [`crate::CodeBlock`] at the canonical instruction index, so recording
 //! and compilation never hash `(function_id, pc)` pairs or copy feedback into a
@@ -27,6 +27,9 @@
 //!   only less fast.
 //! - Recording happens only while a JIT hook is installed; interpreter-only
 //!   execution never touches these cells.
+//! - Integer arithmetic feedback describes exact numeric values, excluding
+//!   negative zero, independently of Int32/Double encoding. It never proves a
+//!   physical field word; field summaries retain their own raw tag checks.
 //! - A call site's executions and its function's entries are counted by the
 //!   interpreter and by baseline code alike, so their ratio is the site's
 //!   calls per entry before the function was optimized.
@@ -58,7 +61,7 @@ use crate::Value;
 use crate::property_ic::{IcHandler, InstallOutcome, PropertyIcKind, PropertyIcSlot};
 use crate::tier_policy::PROFILED_CALL_TARGET_CAPACITY;
 
-/// At least one operand was an `int32` fast-path number.
+/// At least one operand was an exact Int32 numeric value, excluding `-0`.
 pub const ARITH_INT32: u8 = 1 << 0;
 /// At least one operand was a non-int32 (double) number, including
 /// NaN / ±Infinity.
@@ -693,12 +696,14 @@ impl ArithFeedback {
         self.0 |= Self::classify(lhs) | Self::classify(rhs);
     }
 
-    /// Representation bit for one operand value.
+    /// Numeric class for one operand, independently of its Value encoding.
     fn classify(value: Value) -> u8 {
-        if value.is_int32() {
-            ARITH_INT32
-        } else if value.is_number() {
-            ARITH_FLOAT64
+        if let Some(number) = value.as_number() {
+            if number.as_exact_i32().is_some() {
+                ARITH_INT32
+            } else {
+                ARITH_FLOAT64
+            }
         } else if value.is_string() {
             ARITH_STRING
         } else if value.is_big_int() {
@@ -716,16 +721,17 @@ impl ArithFeedback {
         self.0 != 0 && (self.0 & NON_NUMERIC) == 0
     }
 
-    /// `true` when every operand ever seen was an `int32` — the precondition for
-    /// speculating an unboxed `Int32` lowering with an "is int32" guard.
+    /// `true` when every operand ever seen was an exact Int32 numeric value —
+    /// the precondition for an unboxed `Int32` lowering with an exact numeric
+    /// projection guard, which also accepts integral Double words.
     #[must_use]
     pub const fn is_int32_only(self) -> bool {
         self.0 == ARITH_INT32
     }
 
     /// `true` when an optimizing lowering may speculate `int32` operands: no
-    /// tier has observed any other representation. The interpreter records
-    /// every operand; baseline code records every representation its fast
+    /// tier has observed a value outside that numeric class. The interpreter
+    /// records every operand; baseline code records every class its fast
     /// paths and runtime completions handle except `int32`, so a site no tier
     /// has recorded ran on `int32` operands only, or never ran. A wrong
     /// speculation exits and widens the site.
@@ -1341,6 +1347,43 @@ mod tests {
         fb.record(Value::number_i32(-1), Value::number_i32(0));
         assert!(fb.is_int32_only());
         assert!(fb.is_numeric_only());
+    }
+
+    #[test]
+    fn semantic_integer_feedback_accepts_double_words_without_losing_widening() {
+        let cell = InstructionFeedback::default();
+        for integer in [i32::MIN, -731, 0, 719, i32::MAX] {
+            let value = Value::double(f64::from(integer));
+            assert_eq!(value.as_i32(), None, "encoding stays Double");
+            assert_eq!(
+                crate::jit::JitParameterWidening::of(value),
+                crate::jit::JitParameterWidening::Int32
+            );
+            cell.record_arith(value, Value::number_i32(1));
+            assert_eq!(cell.arith_bits(), ARITH_INT32);
+        }
+        assert!(cell.widen_arith_to_float());
+        cell.record_arith(Value::double(0.0), Value::double(1.0));
+        assert_eq!(cell.arith_bits(), ARITH_INT32 | ARITH_FLOAT64);
+
+        for number in [
+            -0.0,
+            -0.5,
+            0.5,
+            f64::from(i32::MIN) - 1.0,
+            f64::from(i32::MAX) + 1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            let cell = InstructionFeedback::default();
+            assert_eq!(
+                crate::jit::JitParameterWidening::of(Value::double(number)),
+                crate::jit::JitParameterWidening::Number
+            );
+            cell.record_arith(Value::double(number), Value::number_i32(1));
+            assert_eq!(cell.arith_bits(), ARITH_INT32 | ARITH_FLOAT64);
+        }
     }
 
     #[test]

@@ -62,6 +62,8 @@ fn snapshot() -> JitCompileSnapshot {
     view.shape_stable_byte = 10;
     view.shape_watched_byte = 11;
     view.shape_prototype_byte = 12;
+    view.shape_lookup.parent_byte = 24;
+    view.shape_lookup.field_byte = 28;
     assert_ne!(view.object_shape_byte, 0, "object tag cannot alias shape");
     assert_ne!(view.shape_state_byte, view.shape_inline_capacity_byte);
     assert!(view.shape_prototype_byte > view.shape_inline_capacity_byte);
@@ -132,6 +134,7 @@ impl Fixture {
         }
         fixture.table_u64(fixture.entry, RECEIVER_ID);
         fixture.table_u32(fixture.entry + 8, atom);
+
         let object_shape = fixture.view.object_shape_byte as usize;
         let slab_handle = fixture.view.field_layout.slab_handle_byte as usize;
         for (object, shape, slab) in [(0, SHAPE, SLAB), (HOLDER, HOLDER_SHAPE, HOLDER_SLAB)] {
@@ -157,6 +160,15 @@ impl Fixture {
             fixture.cell_u8(shape + fixture.view.shape_watched_byte as usize, 0);
             fixture.cell_u32(shape + fixture.view.shape_prototype_byte as usize, 0);
         }
+        fixture.cell_u32(
+            TARGET + fixture.view.shape_lookup.parent_byte as usize,
+            fixture.address(SHAPE) as u32,
+        );
+        fixture.cell_u32(
+            TARGET + fixture.view.shape_lookup.field_byte as usize,
+            otter_vm::object::FieldLocation::inline(1).cache_key(),
+        );
+
         fixture.cell_u32(
             ROOT + fixture.view.shape_prototype_byte as usize,
             fixture.address(HOLDER) as u32,
@@ -590,6 +602,7 @@ fn shape_directory_reads_banks_and_refuses_shared_suffix_and_accessors() {
         parent_byte: 28,
         atom_byte: 32,
         accessor_byte: 36,
+        field_byte: 44,
         capacity_byte: 4,
         entries_byte: 8,
         entry_bytes: 16,
@@ -639,6 +652,16 @@ fn shape_directory_reads_banks_and_refuses_shared_suffix_and_accessors() {
         let packed = u64::from(atom) << 32;
         f.cells[bucket_byte / 8] = packed | 2;
         assert_eq!(call(receiver), inline);
+        f.cells[bucket_byte / 8] = packed | 2 | 0;
+        f.cells[inline_byte / 8] = otter_vm::Value::double(41.0).to_bits();
+        assert_eq!(
+            call(receiver),
+            otter_vm::Value::double(41.0).to_bits(),
+            "directory preserves integral Double words"
+        );
+        f.cells[inline_byte / 8] = tag::VALUE_UNDEFINED;
+        assert_eq!(call(receiver), tag::VALUE_UNDEFINED);
+        f.cells[inline_byte / 8] = inline;
         f.cells[bucket_byte / 8] = packed | 4;
         assert_eq!(call(receiver), suffix);
         f.cells[bucket_byte / 8] = packed | 5;
@@ -651,7 +674,28 @@ fn shape_directory_reads_banks_and_refuses_shared_suffix_and_accessors() {
         f.cell_u32(SHAPE + 32, atom);
         f.cell_u8(SHAPE + 36, 0);
         f.cell_u32(SHAPE + 40, 2);
+        f.cell_u32(
+            SHAPE + 44,
+            otter_vm::object::FieldLocation::inline(1).cache_key(),
+        );
         assert_eq!(call(receiver), inline);
+        f.cell_u32(
+            SHAPE + 44,
+            otter_vm::object::FieldLocation::inline(1).cache_key(),
+        );
+        f.cells[inline_byte / 8] = otter_vm::Value::double(41.0).to_bits();
+        assert_eq!(
+            call(receiver),
+            otter_vm::Value::double(41.0).to_bits(),
+            "chain preserves integral Double words"
+        );
+        f.cells[inline_byte / 8] = tag::VALUE_UNDEFINED;
+        assert_eq!(call(receiver), tag::VALUE_UNDEFINED);
+        f.cells[inline_byte / 8] = inline;
+        f.cell_u32(
+            SHAPE + 44,
+            otter_vm::object::FieldLocation::inline(1).cache_key(),
+        );
         f.cell_u8(SHAPE + 36, 1);
         assert_eq!(call(receiver), poison);
         f.cell_u8(SHAPE + 36, 0);

@@ -68,6 +68,8 @@ fn snapshot() -> JitCompileSnapshot {
         view.shape_stable_byte = 10;
         view.shape_watched_byte = 11;
         view.shape_prototype_byte = 16;
+        view.shape_lookup.parent_byte = 24;
+        view.shape_lookup.field_byte = 28;
         // The real layout: shape, slab handle, exotic handle, then inline words.
         assert!(view.field_layout.slab_handle_byte >= view.object_shape_byte + 4);
         assert!(view.field_layout.slab_handle_byte + 4 <= view.object_exotic_handle_byte);
@@ -147,6 +149,17 @@ fn prepare(arena: &mut [u64], view: &mut JitCompileSnapshot, proof: &AtomicU32) 
         );
     }
     put_offset(arena, ROOT + view.shape_prototype_byte as usize, HOLDER);
+    put_offset(
+        arena,
+        CHILD + view.shape_lookup.parent_byte as usize,
+        RECEIVER_SHAPE,
+    );
+    put(
+        arena,
+        CHILD + view.shape_lookup.field_byte as usize,
+        otter_vm::object::FieldLocation::inline(1).cache_key(),
+    );
+
     put(
         arena,
         HOLDER + view.field_layout.inline_values_byte as usize,
@@ -176,6 +189,7 @@ fn prepare(arena: &mut [u64], view: &mut JitCompileSnapshot, proof: &AtomicU32) 
     put(arena, row + 14, 0u16);
     put(arena, row + 16, 1u16);
     put(arena, row + 18, true);
+
     put_offset(arena, row + 20, HOLDER_SHAPE);
     put_offset(arena, row + 24, ROOT);
     put_offset(arena, row + 28, CHILD);
@@ -447,6 +461,7 @@ fn shape_directory_reads_live_banks_and_rejects_accessor_and_shared_suffix() {
         parent_byte: 28,
         atom_byte: 32,
         accessor_byte: 36,
+        field_byte: 44,
         capacity_byte: 4,
         entries_byte: 8,
         entry_bytes: 16,
@@ -526,6 +541,28 @@ fn shape_directory_reads_live_banks_and_rejects_accessor_and_shared_suffix() {
         let packed = u64::from(atom) << 32;
         put(&mut arena, bucket_byte, packed | 2);
         assert_eq!(probe(), inline_value);
+        put(&mut arena, bucket_byte, packed | 2 | 0);
+        put(
+            &mut arena,
+            RECEIVER + view.field_layout.inline_values_byte as usize + 8,
+            otter_vm::Value::double(41.0).to_bits(),
+        );
+        assert_eq!(
+            probe(),
+            otter_vm::Value::double(41.0).to_bits(),
+            "directory preserves integral Double words"
+        );
+        put(
+            &mut arena,
+            RECEIVER + view.field_layout.inline_values_byte as usize + 8,
+            Value::UNDEFINED.to_bits(),
+        );
+        assert_eq!(probe(), Value::UNDEFINED.to_bits());
+        put(
+            &mut arena,
+            RECEIVER + view.field_layout.inline_values_byte as usize + 8,
+            inline_value,
+        );
         put(&mut arena, bucket_byte, packed | 4);
         assert_eq!(probe(), suffix_value);
         put(&mut arena, bucket_byte, packed | 5);
@@ -539,7 +576,43 @@ fn shape_directory_reads_live_banks_and_rejects_accessor_and_shared_suffix() {
         put(&mut arena, RECEIVER_SHAPE + 24, 0u32);
         put(&mut arena, RECEIVER_SHAPE + 32, atom);
         put(&mut arena, RECEIVER_SHAPE + 40, 2u32);
+        put(
+            &mut arena,
+            RECEIVER_SHAPE + 44,
+            otter_vm::object::FieldLocation::inline(1).cache_key(),
+        );
         assert_eq!(probe(), inline_value);
+        put(
+            &mut arena,
+            RECEIVER_SHAPE + 44,
+            otter_vm::object::FieldLocation::inline(1).cache_key(),
+        );
+        put(
+            &mut arena,
+            RECEIVER + view.field_layout.inline_values_byte as usize + 8,
+            otter_vm::Value::double(41.0).to_bits(),
+        );
+        assert_eq!(
+            probe(),
+            otter_vm::Value::double(41.0).to_bits(),
+            "chain preserves integral Double words"
+        );
+        put(
+            &mut arena,
+            RECEIVER + view.field_layout.inline_values_byte as usize + 8,
+            Value::UNDEFINED.to_bits(),
+        );
+        assert_eq!(probe(), Value::UNDEFINED.to_bits());
+        put(
+            &mut arena,
+            RECEIVER + view.field_layout.inline_values_byte as usize + 8,
+            inline_value,
+        );
+        put(
+            &mut arena,
+            RECEIVER_SHAPE + 44,
+            otter_vm::object::FieldLocation::inline(1).cache_key(),
+        );
         put(&mut arena, RECEIVER_SHAPE + 36, 1u8);
         assert_eq!(probe(), POISON);
         put(&mut arena, RECEIVER_SHAPE + 36, 0u8);

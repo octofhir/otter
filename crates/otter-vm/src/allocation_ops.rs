@@ -896,9 +896,9 @@ impl Interpreter {
         Ok(())
     }
 
-    /// The complete hidden class of one static object-literal site: an
-    /// ordinary shape chain of default data properties from the root, built
-    /// on the site's first execution and cached by function and key run.
+    /// The complete hidden class of one static object-literal site, cached by
+    /// function and key run. Successful births refresh this private token to
+    /// their actual physical shape; later births still honor live preferences.
     pub(crate) fn object_literal_layout(
         &mut self,
         context: &ExecutionContext,
@@ -938,7 +938,7 @@ impl Interpreter {
         }
         let mut shape = self
             .shape_runtime
-            .handle_for_id(layout.shape_id())
+            .handle_for_id(&self.gc_heap, layout.shape_id())
             .ok_or(VmError::TypeMismatch)?;
         let shape_slot = std::ptr::addr_of_mut!(shape).cast::<RawGc>();
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {

@@ -21,9 +21,9 @@
 //!   and per-type records for the payloads that cannot ride a page image
 //!   at all (compiled regexps, indexed array descriptors).
 //!
-//! `ShapeRuntime`'s side tables are deliberately *not* captured: they
-//! are caches over heap state (`trace_roots` shows exactly which
-//! cells), and a restore rebuilds them from the restored shape bodies.
+//! The heap-owned shape interner's side tables are deliberately not captured:
+//! a restore rebuilds canonical ids, transitions, provisional descendants and
+//! key roots from the relocated shape bodies. Current-turn pins start empty.
 //! [`IsolateSnapshot::encode`] / [`IsolateSnapshot::decode`] carry the
 //! snapshot as the startup image of the executable that wrote it; it never
 //! crosses an executable or Rust type-layout boundary.

@@ -10,6 +10,8 @@
 //!   eligibility agrees with its current exotic state.
 //! - A dense hole bypasses prototype lookup only while the one-shot indexed
 //!   accessor protector remains intact.
+//! - Numeric keys are classified by their Number value; integral Double
+//!   words and Int32 words address the same indexed element, including `-0`.
 //! - Expando storage never replaces the original Array receiver during
 //!   prototype lookup or accessor invocation.
 //!
@@ -46,10 +48,10 @@ impl Interpreter {
 
     /// Whether an indexed store to `recv` at `key` reaches past the
     /// receiver's dense elements: an append or a gap. Only Array and
-    /// typed-array receivers under an int32 index qualify; every other store
+    /// typed-array receivers under a numeric array index qualify; every other store
     /// is not an element-bounds question.
     pub(crate) fn element_index_out_of_bounds(&self, recv: Value, key: Value) -> bool {
-        let Some(index) = key.as_i32().and_then(|index| usize::try_from(index).ok()) else {
+        let Some(index) = key.as_number().and_then(crate::array::index_from_number) else {
             return false;
         };
         if let Some(array) = recv.as_array() {
@@ -141,8 +143,8 @@ impl Interpreter {
         if !self.array_index_accessor_protector
             && let Some(arr) = recv.as_array()
             && let Some(index) = idx_value_raw
-                .as_i32()
-                .and_then(|index| usize::try_from(index).ok())
+                .as_number()
+                .and_then(crate::array::index_from_number)
             && crate::array::is_plain_dense_absent(arr, &self.gc_heap, index)
         {
             return Ok(Value::undefined());

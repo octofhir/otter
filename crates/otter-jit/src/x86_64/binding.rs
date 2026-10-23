@@ -171,6 +171,7 @@ pub(crate) fn emit_global_object_proved_read(
         ; add Rq(header), r11);
     emit_field_base(ops, relocations, view, header, base, 10, field);
     dynasm!(ops ; .arch x64 ; mov Rq(destination), [Rq(base) + offset]);
+
     Ok(())
 }
 
@@ -271,6 +272,7 @@ pub(crate) fn emit_global_read(
             emit_global_field_bank(ops, relocations, view, header, base, field, miss);
             let guard_end = ops.offset().0;
             dynasm!(ops ; .arch x64 ; mov Rq(destination), [Rq(base) + offset]);
+
             Ok(guard_end)
         }
     }

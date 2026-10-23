@@ -154,7 +154,7 @@ fn an_arm_that_may_deopt_stays_below_its_edge() {
                 place(
                     graph,
                     arm,
-                    Kind::CheckedTaggedToInt32,
+                    Kind::CheckedNumberToInt32,
                     &[value],
                     Repr::Int32,
                 );

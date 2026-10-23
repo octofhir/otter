@@ -1,5 +1,5 @@
-// Optimized double results box to the one canonical Number encoding: an
-// integral non--0 int32 as Int32, NaN canonical, every other double offset.
+// Optimized Double words preserve Number semantics across integral values,
+// signed zero, NaN, map keys, fields, arguments and array elements.
 let calls = 0;
 function divideBox(x) { calls++; return x / 2; }
 function negateBox(x) { calls++; return -x; }

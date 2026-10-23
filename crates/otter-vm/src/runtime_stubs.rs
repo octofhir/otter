@@ -142,7 +142,12 @@ impl Float64MathLeafStub {
 
     /// Invoke the typed leaf without boxing or a status channel.
     #[must_use]
-    pub fn invoke(self, method: otter_bytecode::method_id::MathMethod, left: f64, right: f64) -> f64 {
+    pub fn invoke(
+        self,
+        method: otter_bytecode::method_id::MathMethod,
+        left: f64,
+        right: f64,
+    ) -> f64 {
         (self.entry)(method.as_u32(), left, right)
     }
 }
@@ -1788,10 +1793,14 @@ pub extern "C" fn math_f64_leaf(method: u32, left: f64, right: f64) -> f64 {
     use otter_bytecode::method_id::MathMethod;
     match MathMethod::from_u32(method) {
         Some(MathMethod::Random) | None => f64::NAN,
-        Some(method @ (MathMethod::Atan2 | MathMethod::Pow | MathMethod::Max
-            | MathMethod::Min | MathMethod::Hypot | MathMethod::Imul)) => {
-            crate::math::apply_f64(method, &[left, right])
-        }
+        Some(
+            method @ (MathMethod::Atan2
+            | MathMethod::Pow
+            | MathMethod::Max
+            | MathMethod::Min
+            | MathMethod::Hypot
+            | MathMethod::Imul),
+        ) => crate::math::apply_f64(method, &[left, right]),
         Some(method) => crate::math::apply_f64(method, &[left]),
     }
 }
@@ -3383,10 +3392,17 @@ mod tests {
         {
             use otter_bytecode::method_id::MathMethod as M;
             assert_eq!(MATH_F64_LEAF.invoke(M::Cos, 0.0, f64::NAN), 1.0);
-            assert_eq!(MATH_F64_LEAF.invoke(M::Atan2, 0.0, -1.0), std::f64::consts::PI);
+            assert_eq!(
+                MATH_F64_LEAF.invoke(M::Atan2, 0.0, -1.0),
+                std::f64::consts::PI
+            );
             assert_eq!(MATH_F64_LEAF.invoke(M::Pow, f64::NAN, 0.0), 1.0);
             assert_eq!(MATH_F64_LEAF.invoke(M::Round, -2.5, f64::NAN), -2.0);
-            assert!(MATH_F64_LEAF.invoke(M::Round, -0.4, f64::NAN).is_sign_negative());
+            assert!(
+                MATH_F64_LEAF
+                    .invoke(M::Round, -0.4, f64::NAN)
+                    .is_sign_negative()
+            );
             assert!(MATH_F64_LEAF.invoke(M::Max, f64::NAN, 1.0).is_nan());
             assert!(MATH_F64_LEAF.invoke(M::Random, 0.0, 0.0).is_nan());
         }

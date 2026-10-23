@@ -1,4 +1,4 @@
-//! Foundation numeric model + the surfaces built on top of it.
+//! Number representations, arithmetic and conversions.
 //!
 //! Two-state representation:
 //!
@@ -9,12 +9,13 @@
 //!   demotes to [`NumberValue::Double`].
 //! - [`NumberValue::Double`] — IEEE-754 fallback. Carries `NaN`,
 //!   `±Infinity`, and `-0.0`. Arithmetic that enters this path stays here so
-//!   feedback and optimized representations do not oscillate at exact integer
-//!   results.
+//!   the inspected encoding does not oscillate at exact integer results.
+//!   Arithmetic feedback classifies the numeric value independently.
 //!
 //! # Invariants
-//! - The value `0_i32` is always represented as `Smi(0)`, never
-//!   `Double(+0.0)`. Negative zero is always `Double(-0.0)`.
+//! - Int32 and Double are inspection views of valid Number representations;
+//!   an integral Double, including positive zero, need not become `Smi`.
+//!   Negative zero is always `Double(-0.0)`.
 //! - `NaN` is always `Double(f64::NAN)`.
 //! - Explicit conversions through [`NumberValue::canonicalize`] normalize
 //!   `Double` payloads back to `Smi` when they hold an exact
@@ -60,8 +61,9 @@ pub use parse::{
 
 /// JavaScript Number value.
 ///
-/// Storage form is `i32` when the value fits exactly and is not
-/// `-0.0`, otherwise `f64`.
+/// Int32 and Double views preserve the inspected representation. Explicit
+/// canonicalizing constructors prefer `i32` when the value fits exactly and is
+/// not `-0.0`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum NumberValue {
     /// Small integer fast path.
@@ -77,8 +79,8 @@ impl NumberValue {
         Self::Smi(n)
     }
 
-    /// Construct from a `f64`. Normalizes integer-valued, non-`-0.0`
-    /// doubles to `Smi` so equality semantics stay consistent.
+    /// Construct from a `f64`, preferring `Smi` for integer-valued, non-`-0.0`
+    /// numbers. Numeric equality accepts either representation.
     #[must_use]
     pub fn from_f64(n: f64) -> Self {
         Self::Double(n).canonicalize()
@@ -90,19 +92,25 @@ impl NumberValue {
     /// - everything else stays `Double`.
     #[must_use]
     pub fn canonicalize(self) -> Self {
+        match self.as_exact_i32() {
+            Some(integer) => Self::Smi(integer),
+            None => self,
+        }
+    }
+
+    /// Project an exact Int32 numeric value independently of its encoding.
+    ///
+    /// Negative zero is excluded because Int32 arithmetic cannot retain its
+    /// sign. NaN, infinities, fractions and out-of-range integers also fail.
+    /// This proves the numeric value, never an Int32-tagged Value word.
+    #[inline]
+    #[must_use]
+    pub fn as_exact_i32(self) -> Option<i32> {
         match self {
-            Self::Smi(_) => self,
-            Self::Double(d) => {
-                if d == 0.0 && d.is_sign_negative() {
-                    // `-0.0` stays `Double` so it round-trips.
-                    Self::Double(d)
-                } else if d.is_nan() || d.is_infinite() {
-                    Self::Double(d)
-                } else if d.fract() == 0.0 && (i32::MIN as f64..=i32::MAX as f64).contains(&d) {
-                    Self::Smi(d as i32)
-                } else {
-                    Self::Double(d)
-                }
+            Self::Smi(integer) => Some(integer),
+            Self::Double(number) => {
+                let integer = number as i32;
+                (f64::from(integer).to_bits() == number.to_bits()).then_some(integer)
             }
         }
     }

@@ -22,6 +22,8 @@
 //!   its child; overwrite stores preserve the shape's stability.
 //! - Stores observe their defining field owner after complete publication.
 //!   Membership misses call a noncollecting leaf that preserves live registers.
+//! - Stores retain Value-valid words and observe physical numeric categories;
+//!   every loaded Double becomes canonical before it enters Tagged state.
 //!
 //! # See also
 //! - `otter_vm::property_ic` owns the slot layout and handler kinds.
@@ -33,6 +35,7 @@ use otter_vm::jit::{
     PROPERTY_IC_LAYOUT as IC, PropertyIcHandlerKind as Kind,
     PropertyStorageProjection as Projection,
 };
+use otter_vm::object::FieldLocation;
 
 use super::values::emit_load_u64;
 use crate::artifact::relocation::RelocationCapture;
@@ -218,6 +221,7 @@ fn emit_field_bank(
     let layout = view.field_layout;
     dynasm!(ops ; .arch x64
         ; test Rd(index), Rd(index) ; js =>inline
+        ; and Rd(index), FieldLocation::INDEX_MASK as i32
         ; mov r10d, [Rq(holder) + layout.slab_handle_byte as i32]
         ; test r10d, r10d ; jz =>miss);
     emit_load_u64(ops, 11, CAGE_MASK);
@@ -245,6 +249,7 @@ pub(crate) fn emit_slot_load(
     let prototype = ops.new_dynamic_label();
     let field = ops.new_dynamic_label();
     let inline = ops.new_dynamic_label();
+    let field_loaded = ops.new_dynamic_label();
     let layout = view.field_layout;
     emit_select_entry(
         ops,
@@ -267,24 +272,28 @@ pub(crate) fn emit_slot_load(
     emit_entry_proof(ops, entry, true, miss);
     emit_load_u64(ops, 11, CAGE_MASK);
     dynasm!(ops ; .arch x64
-        ; and r11, Rq(receiver)
-        ; mov Rd(holder), [Rq(entry) + IC.entry_aux_byte as i32] ; add Rq(holder), r11
-        ; mov Rd(holder), [Rq(holder) + view.shape_prototype_byte as i32]
-        ; test Rd(holder), Rd(holder) ; jz =>miss ; add Rq(holder), r11
-        ; jmp =>field
-        // An own field lives on the lookup-start object the selection left
-        // in the holder register.
-        ; =>own
-        ; =>field
-        ; mov Rd(index), [Rq(entry) + IC.entry_field_byte as i32]);
+            ; and r11, Rq(receiver)
+            ; mov Rd(holder), [Rq(entry) + IC.entry_aux_byte as i32] ; add Rq(holder), r11
+            ; mov Rd(holder), [Rq(holder) + view.shape_prototype_byte as i32]
+            ; test Rd(holder), Rd(holder) ; jz =>miss ; add Rq(holder), r11
+            ; jmp =>field
+            // An own field lives on the lookup-start object the selection left
+            // in the holder register.
+            ; =>own
+            ; =>field
+            ; mov Rd(index), [Rq(entry) + IC.entry_field_byte as i32]
+    );
     emit_field_bank(ops, view, holder, index, inline, miss);
     dynasm!(ops ; .arch x64
-        ; mov Rq(destination), [r10 + Rq(index) * 8 + layout.slab_words_byte as i32]
-        ; jmp =>done
-        ; =>inline
-        ; and Rd(index), 0x7fff_ffff
-        ; mov Rq(destination), [Rq(holder) + Rq(index) * 8 + layout.inline_values_byte as i32]
-        ; jmp =>done);
+            ; mov Rq(destination), [r10 + Rq(index) * 8 + layout.slab_words_byte as i32]
+            ; jmp =>field_loaded
+            ; =>inline
+            ; and Rd(index), FieldLocation::INDEX_MASK as i32
+            ; mov Rq(destination), [Rq(holder) + Rq(index) * 8 + layout.inline_values_byte as i32]
+            ; =>field_loaded
+    );
+
+    dynasm!(ops ; .arch x64 ; jmp =>done);
 }
 
 /// Complete a store of `Rq(value)` through the slot at `Rq(slot)`: on a hit
@@ -340,7 +349,8 @@ pub(crate) fn emit_slot_store(
         ; add r10, r11
         ; test BYTE [r10 + view.shape_watched_byte as i32], otter_vm::code_dependencies::ShapeFact::Stable as i8 ; jnz =>miss
         ; mov Rd(child), [Rq(entry) + IC.entry_aux_byte as i32]
-        ; test Rd(child), Rd(child) ; jz =>miss
+        ; test Rd(child), Rd(child) ; jz =>miss);
+    dynasm!(ops ; .arch x64
         ; mov Rd(index), [Rq(entry) + IC.entry_field_byte as i32]);
     emit_field_bank(ops, view, receiver, index, append_inline, miss);
     dynasm!(ops ; .arch x64
@@ -348,7 +358,7 @@ pub(crate) fn emit_slot_store(
         ; mov [r10 + Rq(index) * 8 + layout.slab_words_byte as i32], Rq(value)
         ; jmp =>publish
         ; =>append_inline
-        ; and Rd(index), 0x7fff_ffff
+        ; and Rd(index), FieldLocation::INDEX_MASK as i32
         ; mov [Rq(receiver) + Rq(index) * 8 + layout.inline_values_byte as i32], Rq(value)
         ; =>publish);
     emit_load_u64(ops, 11, CAGE_MASK);
@@ -371,7 +381,7 @@ pub(crate) fn emit_slot_store(
         ; mov [r10 + Rq(index) * 8 + layout.slab_words_byte as i32], Rq(value)
         ; jmp =>overwritten
         ; =>own_inline
-        ; and Rd(index), 0x7fff_ffff
+        ; and Rd(index), FieldLocation::INDEX_MASK as i32
         ; mov [Rq(child) + Rq(index) * 8 + layout.inline_values_byte as i32], Rq(value)
         ; =>overwritten
         ; mov Rd(entry), [Rq(entry) + IC.entry_owner_byte as i32]

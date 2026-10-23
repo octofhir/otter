@@ -89,6 +89,7 @@ impl PropertyActionCache {
             store_slot_byte: offset_of!(PropertyActionEntry, store_slot) as u32,
             store_owner_byte: offset_of!(PropertyActionEntry, store_owner) as u32,
             load_writable_byte: offset_of!(PropertyActionEntry, load_writable) as u32,
+
             holder_shape_byte: offset_of!(PropertyActionEntry, holder_shape) as u32,
             holder_root_byte: offset_of!(PropertyActionEntry, holder_root) as u32,
             holder_shape_id_byte: offset_of!(PropertyActionEntry, holder_shape_id) as u32,
@@ -117,7 +118,6 @@ const _: () = {
     assert!(offset_of!(PropertyActionEntry, load_slot) == 14);
     assert!(offset_of!(PropertyActionEntry, store_slot) == 16);
     assert!(offset_of!(PropertyActionEntry, load_writable) == 18);
-    assert!(offset_of!(PropertyActionEntry, reserved) == 19);
     assert!(offset_of!(PropertyActionEntry, holder_shape) == 20);
     assert!(offset_of!(PropertyActionEntry, holder_root) == 24);
     assert!(offset_of!(PropertyActionEntry, target_shape) == 28);

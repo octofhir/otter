@@ -1082,7 +1082,8 @@ impl Interpreter {
         property_slot.record_attempt();
         let receiver =
             *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
-        let value = *read_register(&stack[top_idx], src_reg).map_err(CommittedValueError::Fatal)?;
+        let mut value =
+            *read_register(&stack[top_idx], src_reg).map_err(CommittedValueError::Fatal)?;
         // §15.7.1 — Op::StorePropertyStrict forces strict PutValue
         // failure semantics for class parts lowered into sloppy frames.
         let strict = force_strict || Self::current_frame_is_strict(stack, context);
@@ -1354,7 +1355,7 @@ impl Interpreter {
                 scratch_reg,
             );
         }
-        let obj = if let Some(o) = receiver.as_object() {
+        let mut obj = if let Some(o) = receiver.as_object() {
             o
         } else if let Some(c) = receiver.as_class_constructor() {
             if self
@@ -1477,21 +1478,19 @@ impl Interpreter {
                 {
                     self.capture_store_property_transition_with_stack_roots(
                         stack,
-                        obj,
+                        &mut obj,
                         atomized_key,
-                        &value,
+                        &mut value,
                     )
                     .map_err(CommittedValueError::JavaScript)?
                 } else {
                     None
                 };
                 if transition.is_none() {
-                    // `capture_store_property_transition_with_stack_roots` above
-                    // roots the stack but not this local `obj`; a scavenge there
-                    // relocates the receiver, so re-read it from its rooted
-                    // register before the ordinary (shape-advancing) store. Only
-                    // plain-object receivers live in `obj_reg` — statics/function
-                    // bags are derived from the receiver and keep their handle.
+                    // The capture owner updates the actual receiver/value
+                    // locals across any preparation. The frame remains the
+                    // canonical receiver for this source operation; callable
+                    // bags use the explicitly rooted local instead.
                     let store_obj = if receiver.is_object() {
                         read_register(&stack[top_idx], obj_reg)
                             .map_err(CommittedValueError::Fatal)?

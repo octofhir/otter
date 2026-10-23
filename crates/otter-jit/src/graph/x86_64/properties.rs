@@ -13,6 +13,9 @@
 //!   membership misses use a noncollecting leaf with live-register preservation.
 //! - Static stores use their source snapshot's captured membership only for
 //!   the defining owner selected by the destination shape and logical field.
+//! - Selected programs keep ordinary descriptor, prototype and capacity guards
+//!   before effects. A numeric RHS is encoded into a separate GP word; all
+//!   property reads become canonical before they enter Tagged state.
 //! - Cold operations run once with canonical roots, never by replaying a hit.
 //! - Instanceof passes its operation explicitly while source records retain
 //!   root and reconstruction ownership.
@@ -43,7 +46,7 @@ use crate::{
     artifact::relocation::{GuardedHeapComponent, PropertySourceAccess, RelocationTarget},
     graph::{
         call::CommittedArgument,
-        ir::{DeoptReason, Kind, NodeId},
+        ir::{DeoptReason, Kind, NamedStorePlan, NodeId},
     },
 };
 
@@ -183,11 +186,17 @@ impl Codegen<'_> {
                 [assigned.gp_temps[0], assigned.gp_temps[1]],
                 Some(result()),
             )?,
-            Kind::StoreNamedProperty { byte_pc: pc, .. } => self.emit_named_program(
+            Kind::StoreNamedProperty {
+                byte_pc: pc, plan, ..
+            } => self.emit_named_program(
                 node,
                 pc,
                 input(0),
-                Some(input(1)),
+                Some(if plan.is_double() {
+                    Self::fp(assigned.inputs[1])
+                } else {
+                    input(1)
+                }),
                 [assigned.gp_temps[0], assigned.gp_temps[1]],
                 None,
             )?,
@@ -385,39 +394,66 @@ impl Codegen<'_> {
             .get(&pc)
             .ok_or(Unsupported::OperandShape("x86 graph named programs"))?
             .clone();
-        let (selected, receiver_shape, owners, fresh) = match self.graph.node(node).kind.clone() {
-            Kind::LoadNamedProperty {
-                programs,
-                receiver_shape,
-                ..
-            } => (programs, receiver_shape, smallvec::SmallVec::new(), false),
-            Kind::StoreNamedProperty {
-                owners,
-                receiver_shape,
-                fresh,
-                ..
-            } if owners.len() == programs.len() => (
-                // A proved receiver matches only the programs that guard its
-                // shape.
-                (0..programs.len())
-                    .filter(|&index| {
-                        receiver_shape.is_none()
-                            || programs[index].ops.iter().find_map(|op| match *op {
-                                Op::GuardShape { object: 0, shape } => Some(shape),
-                                _ => None,
-                            }) == receiver_shape
-                    })
-                    .map(|index| index as u32)
-                    .collect(),
-                receiver_shape,
-                owners,
-                fresh,
-            ),
-            _ => return Err(Unsupported::OperandShape("x86 graph named program plan")),
-        };
+        let (selected, receiver_shape, owners, fresh, plan) =
+            match self.graph.node(node).kind.clone() {
+                Kind::LoadNamedProperty {
+                    programs,
+                    receiver_shape,
+                    ..
+                } => (
+                    programs,
+                    receiver_shape,
+                    smallvec::SmallVec::new(),
+                    false,
+                    NamedStorePlan::Programs,
+                ),
+                Kind::StoreNamedProperty {
+                    owners,
+                    receiver_shape,
+                    fresh,
+                    plan,
+                    ..
+                } if owners.len() == programs.len() => (
+                    // A proved receiver matches only the programs that guard its
+                    // shape.
+                    (0..programs.len())
+                        .filter(|&index| {
+                            plan.program()
+                                .is_none_or(|selected| usize::from(selected) == index)
+                                && (receiver_shape.is_none()
+                                    || programs[index].ops.iter().find_map(|op| match *op {
+                                        Op::GuardShape { object: 0, shape } => Some(shape),
+                                        _ => None,
+                                    }) == receiver_shape)
+                        })
+                        .map(|index| index as u32)
+                        .collect(),
+                    receiver_shape,
+                    owners,
+                    fresh,
+                    plan,
+                ),
+                _ => return Err(Unsupported::OperandShape("x86 graph named program plan")),
+            };
+        if plan.program().is_some_and(|index| {
+            programs
+                .get(usize::from(index))
+                .is_none_or(|program| !crate::graph::feedback::inline_store_transition(program))
+        }) {
+            return Err(Unsupported::OperandShape(
+                "x86 graph selected store program",
+            ));
+        }
         let exit = self.eager_exit(node, DeoptReason::WrongShape);
         let done = self.ops.new_dynamic_label();
         let view = self.view;
+        let stored_value = value.map(|value| {
+            if plan.is_double() {
+                self.allocation.node(node).gp_temps[2]
+            } else {
+                value
+            }
+        });
         // The validity cell a fresh receiver's allocation checked still holds:
         // no code ran since.
         let allocation = self.graph.node(node).inputs[0];
@@ -492,7 +528,9 @@ impl Codegen<'_> {
                         self.emit_body_slot_receiver(receiver, slot, next);
                         dynasm!(self.ops ; .arch x64
                             ; mov Rq(destination), [Rq(receiver) + slot.byte as i32]
-                            ; jmp =>done);
+                        );
+
+                        dynasm!(self.ops ; .arch x64 ; jmp =>done);
                         committed = true;
                     }
                     Op::LoadIntrinsicPrototype { target, .. } if value.is_none() => self
@@ -580,15 +618,25 @@ impl Codegen<'_> {
                             field,
                             crate::field_access::FieldAccess::LoadTagged,
                         );
+
                         committed = true;
                         dynasm!(self.ops ; .arch x64 ; jmp =>done);
                     }
                     Op::StoreField { field, .. } if value.is_some() => {
+                        let physical = stored_value.expect("named store value");
+                        if plan.is_double() {
+                            crate::x86_64::field_word::emit_encode_double(
+                                &mut self.ops,
+                                value.unwrap(),
+                                physical,
+                                10,
+                            );
+                        }
                         crate::x86_64::fields::emit_own_field(
                             &mut self.ops,
                             view.field_layout,
                             receiver,
-                            value.unwrap(),
+                            physical,
                             field,
                             crate::field_access::FieldAccess::Store,
                         );
@@ -606,9 +654,11 @@ impl Codegen<'_> {
                             self.emit_leave_receiver_shape(
                                 node,
                                 receiver,
-                                value.expect("named store value"),
+                                stored_value.expect("named store value"),
                             );
                         }
+                        // Source-program baking retains this pinned target
+                        // until its native generation physically retires.
                         dynasm!(self.ops ; .arch x64
                             ; mov DWORD [Rq(receiver) + view.object_shape_byte as i32], shape as i32);
                         if let Some(record) = known.filter(|_| owner != 0) {
@@ -618,7 +668,7 @@ impl Codegen<'_> {
                                 &mut self.relocations,
                                 view,
                                 holder,
-                                value.expect("named store value"),
+                                stored_value.expect("named store value"),
                                 record,
                             );
                             owner = 0;
@@ -649,7 +699,7 @@ impl Codegen<'_> {
                     &mut self.relocations,
                     view,
                     holder,
-                    value.expect("named store value"),
+                    stored_value.expect("named store value"),
                     record,
                 );
             }
@@ -845,7 +895,7 @@ impl Codegen<'_> {
             PropertySourceAccess::Store,
             receiver,
             Some(value),
-            temps,
+            temps[..4].try_into().unwrap(),
             None,
             slow,
             table_stored,

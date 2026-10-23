@@ -1,231 +1,76 @@
-//! Interpreter-owned hidden-class side tables.
-//!
-//! GC-managed [`super::shape_body::ShapeBody`] nodes stay immutable and contain
-//! only collector handles plus numeric layout metadata. This module owns the
-//! mutable runtime state around those nodes: transition reuse, immutable
-//! state-variant reuse, and flattened offset caches. Keeping those tables
-//! off-GC mirrors the VM's single-mutator model while preserving a simple
-//! traced payload shape. Key interning lives with the heap
-//! ([`crate::isolate_names`]); this runtime mints the canonical key strings
-//! there.
+//! Interpreter observation facade over the heap's canonical hidden-class owner.
 //!
 //! # Contents
-//! - [`ShapeRuntime`] — transitions and offset cache; creating it creates
-//!   the `null`-prototype root and the heap's isolate names.
-//! - [`ShapeRuntime::new_root`] — a prototype's root and dictionary shapes.
-//! - [`ShapeRuntime::trace_roots`] — root walker for the strong handles: the
-//!   distinct shapes pinned for the current turn.
-//! - [`ShapeRuntime::sweep_dead`] — the full collection's weak pass over the
-//!   id and transition tables.
+//! - `ShapeRuntime` installs the heap's isolate state and owns the optional observer.
+//! - Preparation and lookup delegate to `shape_interner` through the supplied heap.
 //!
 //! # Invariants
-//! - Side-table keys never contain `Gc` offsets; moving GC may rewrite handles,
-//!   so keys use stable [`super::ShapeId`] plus isolate-global
-//!   [`crate::property_atom::AtomId`] values.
-//! - The heap's [`IsolateNames`] hold the isolate's [`NameInterner`], the
-//!   single authority for a name's atom, and per atom the shape layer has
-//!   keyed, the canonical GC string body shape nodes and key enumeration
-//!   hold. This runtime installs them with the `null`-prototype root; those
-//!   bodies live as long as the isolate and are allocated in old space.
-//! - Hidden classes are collectable: the id and transition tables hold
-//!   shapes weakly, and a shape lives while an object, a compiled code object
-//!   or a strong cache names it. [`Self::sweep_dead`] forgets every shape the
-//!   marking left unreached before the sweep frees it, so no table ever hands
-//!   out a dead cell; ids are never reused, so an id that outlives its shape
-//!   only misses.
-//! - Shapes live in non-moving old space: a weak entry never needs rewriting.
-//! - The id table never names a dictionary shape: all dictionary objects of a
-//!   lineage share one whatever their keys, so a guard baked from an id must
-//!   never resolve to it.
-//! - Every lineage starts at a prototype's root: the heap's embedder root
-//!   slot keeps the `null`-prototype root
-//!   (`super::shape_body::null_root_head`), an ordinary prototype keeps its
-//!   instances' root on itself, and a non-ordinary prototype's root lives as
-//!   long as the objects built from it.
-//! - No table borrow is held across an allocation — the collection it may
-//!   run prunes the tables through `&self`.
-//! - A shape created during a runtime turn is pinned (strong) until the
-//!   outermost turn ends: Rust code holds new shapes in locals across the
-//!   allocations that precede installing them into an object, and the pin
-//!   keeps every such window sound without rooting each local. Shapes
-//!   become collectable at the next full collection after their turn. Repeated
-//!   registration pins each stable shape identity once, so root traversal is
-//!   bounded by distinct shapes rather than allocation or lookup count.
-//! - Caches are derived data and can be cleared without semantic changes.
-//! - Shape bodies themselves remain mutation-free after allocation.
+//! - This facade owns no shape table, GC handle or heap backpointer.
+//! - The heap's one `IsolateNames` owns all shape identity and lifetime state.
+//! - Observation runs after table borrows end and never reenters the interpreter.
 //!
 //! # See also
-//! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots>
-//! - <https://tc39.es/ecma262/#sec-ordinary-object-internal-methods-and-internal-slots-ownpropertykeys>
-//! - Architecture plan §4.1 (hidden classes).
-
-use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::RefCell;
-
-use otter_gc::GcHeap;
-use otter_gc::heap::RootSlotVisitor;
-use otter_gc::raw::{RawGc, SlotVisitor};
-
-use crate::inspect::{ShapeTransitionEvent, ShapeTransitionObserver};
-use crate::isolate_names::IsolateNames;
-use crate::property_atom::{AtomId, NameInterner};
-use crate::string::JsStringHandle;
-use crate::string::gc_body::alloc_old_flat_string_body_with_roots;
+//! - `super::shape_interner` owns canonical children, roots and weak maintenance.
+//! - `crate::isolate_names` is the heap-owned VM payload.
 
 use super::descriptor::PropertyFlags;
-use super::shape_body::{
-    ShapeBody, ShapeHandle, alloc_child_shape_body_with_roots, alloc_root_shape_body_with_roots,
-};
+use super::shape_body::{ShapeBody, ShapeHandle};
+use super::shape_interner::ShapeInterner;
 use super::{ShapeId, ShapeState};
+use crate::inspect::{ShapeTransitionEvent, ShapeTransitionObserver};
+use crate::isolate_names::IsolateNames;
+use crate::property_atom::NameInterner;
+use otter_gc::GcHeap;
+use otter_gc::heap::RootSlotVisitor;
+#[cfg(test)]
+use otter_gc::raw::RawGc;
 
-/// Record a root under its id. Its dictionary shape stays unnamed: every
-/// dictionary object of the lineage shares it whatever its keys, so no
-/// id-keyed cache or baked guard may resolve to it.
-fn register_root(heap: &GcHeap, tables: &mut WeakShapeTables, root: ShapeHandle) {
-    let root_id = heap.read_payload(root, ShapeBody::id);
-    tables.handles_by_id.insert(root_id, root);
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct TransitionKey {
-    parent: ShapeId,
-    atom: AtomId,
-    /// Attribute bits of the appended slot. Keying transitions by attributes
-    /// (not just the key) keeps a `define`-with-non-default-attributes append
-    /// on a distinct shape from an ordinary default-data append of the same
-    /// key, so shape-id IC guards invalidate correctly.
-    flags: PropertyFlags,
-    /// Data vs accessor for the appended slot — part of the transition
-    /// identity for the same reason as [`Self::flags`].
-    is_accessor: bool,
-}
-
-/// The weakly held tables: every shape by id and the transition cache.
+/// Optional transition observation; the heap owns every shape table.
 #[derive(Default)]
-struct WeakShapeTables {
-    handles_by_id: FxHashMap<ShapeId, ShapeHandle>,
-    transitions: FxHashMap<TransitionKey, ShapeHandle>,
-    /// Rooted state variants are weak and keyed by stable source identity.
-    state_variants: FxHashMap<(ShapeId, ShapeState), ShapeHandle>,
-    /// Transitions out of each provisional shape: the tree slack tracking
-    /// finishes in place.
-    provisional_children: FxHashMap<ShapeId, smallvec::SmallVec<[ShapeHandle; 2]>>,
-    /// Distinct shapes pinned during the current outermost turn, in first-pin order.
-    /// The stable id is only an index; the handle is the sole strong root slot.
-    pinned: indexmap::IndexMap<
-        ShapeId,
-        ShapeHandle,
-        std::hash::BuildHasherDefault<rustc_hash::FxHasher>,
-    >,
-}
-
-impl WeakShapeTables {
-    /// Retain a shape once per turn. Shapes are non-moving and their ids are
-    /// never reused; ending a turn clears this same strong-root authority.
-    fn pin(&mut self, heap: &GcHeap, shape: ShapeHandle) {
-        let id = heap.read_payload(shape, ShapeBody::id);
-        self.pinned.entry(id).or_insert(shape);
-    }
-}
-
-/// Mutable side tables for GC-managed hidden classes.
 pub(crate) struct ShapeRuntime {
-    tables: RefCell<WeakShapeTables>,
     observer: Option<Box<dyn ShapeTransitionObserver>>,
 }
 
 impl std::fmt::Debug for ShapeRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let tables = self.tables.borrow();
         f.debug_struct("ShapeRuntime")
-            .field("transitions", &tables.transitions.len())
             .field("observer_installed", &self.observer.is_some())
             .finish()
     }
 }
 
 impl ShapeRuntime {
-    /// Create the `null`-prototype root in the heap's embedder root slot and
-    /// the heap's isolate names, with empty side tables.
     pub(crate) fn new(heap: &mut GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
         IsolateNames::install(heap, NameInterner::default());
-        let mut roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        let root = alloc_root_shape_body_with_roots(
+        let root = ShapeInterner::new_root(
             heap,
             super::shape_body::ShapePrototype::Null,
             super::DEFAULT_INLINE_CAPACITY,
             ShapeHandle::null(),
             ShapeState::ORDINARY,
-            &mut roots,
+            &mut |_| {},
         )?;
-        let mut tables = WeakShapeTables::default();
-        register_root(heap, &mut tables, root);
         super::shape_body::set_null_root(heap, root);
-        Ok(Self {
-            tables: RefCell::new(tables),
-            observer: None,
-        })
+        Ok(Self::default())
     }
 
-    /// Install or clear the shape-transition observer. The
-    /// observer fires on every transition take —
-    /// [`ShapeTransitionEvent::reused`] distinguishes cached lookups
-    /// from fresh shape allocations.
+    pub(crate) fn restored_shell(heap: &mut GcHeap, names: NameInterner) -> Self {
+        IsolateNames::install(heap, names);
+        Self::default()
+    }
+
     pub(crate) fn set_observer(&mut self, observer: Option<Box<dyn ShapeTransitionObserver>>) {
         self.observer = observer;
     }
 
-    /// Read-only access to the live transition table for the
-    /// snapshot builder. Each entry yields the parent shape id and
-    /// the child shape handle; callers read the child's stored
-    /// transition key from the heap as needed.
-    pub(crate) fn transitions_for_snapshot(&self) -> Vec<(ShapeId, ShapeHandle)> {
-        self.tables
-            .borrow()
-            .transitions
-            .iter()
-            .map(|(key, child)| (key.parent, *child))
-            .collect()
+    pub(crate) fn transitions_for_snapshot(&self, heap: &GcHeap) -> Vec<(ShapeId, ShapeHandle)> {
+        ShapeInterner::transitions_for_snapshot(heap)
     }
 
-    /// Register a live ordinary lineage created by a heap-only state producer.
-    /// Every entry stays weak after the current turn; dictionary IDs never name
-    /// ordinary layout assumptions. No payload or table borrow crosses allocation.
-    ///
-    /// A shape already pinned this turn was registered with its lineage (its
-    /// pin keeps every ancestor alive through the traced parent edges), so a
-    /// repeated registration is O(1) instead of a lineage walk.
     pub(crate) fn register_shape(&self, heap: &GcHeap, shape: ShapeHandle) {
-        if !super::shape_body::is_dictionary_of(shape) {
-            let id = heap.read_payload(shape, ShapeBody::id);
-            let tables = self.tables.borrow();
-            if tables.pinned.get(&id) == Some(&shape)
-                && tables.handles_by_id.get(&id) == Some(&shape)
-            {
-                return;
-            }
-        }
-        let root = super::shape_body::lineage_root_of(heap, shape);
-        let dictionary = super::shape_body::dictionary_of(root);
-        let mut tables = self.tables.borrow_mut();
-        register_root(heap, &mut tables, root);
-        tables.pin(heap, root);
-        tables.pin(heap, dictionary);
-        if super::shape_body::is_dictionary_of(shape) {
-            return;
-        }
-        let mut current = shape;
-        while !heap.read_payload(current, ShapeBody::is_root) {
-            tables
-                .handles_by_id
-                .insert(heap.read_payload(current, ShapeBody::id), current);
-            tables.pin(heap, current);
-            current = heap.read_payload(current, ShapeBody::parent);
-        }
+        ShapeInterner::register_shape(heap, shape);
     }
 
-    /// Allocate and register `prototype`'s root and dictionary shapes, and
-    /// return the root. Both stay pinned for the current turn.
     pub(crate) fn new_root(
         &self,
         heap: &mut GcHeap,
@@ -235,33 +80,16 @@ impl ShapeRuntime {
         state: ShapeState,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
-        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            self.trace_roots(otter_gc::RootSet::All, visitor);
-            external_visit(visitor);
-        };
-        let root = alloc_root_shape_body_with_roots(
+        ShapeInterner::new_root(
             heap,
             prototype,
             inline_capacity,
             previous_layout_root,
             state,
-            &mut visit,
-        )?;
-        let mut tables = self.tables.borrow_mut();
-        register_root(heap, &mut tables, root);
-        let dictionary = heap.read_payload(root, |body| body.dictionary(root));
-        tables.pin(heap, root);
-        tables.pin(heap, dictionary);
-        Ok(root)
+            external_visit,
+        )
     }
 
-    /// Complete in-object slack tracking of the provisional lineage `root`
-    /// heads: every shape of its transition tree shrinks in place to the
-    /// fewest in-object slots that still hold every field any of them
-    /// places, and at least `required`; the lineage becomes ordinary and gets
-    /// a dictionary shape of that capacity. One lineage serves the
-    /// constructor's objects before and after, so no site sees a second shape
-    /// for the same layout.
     pub(crate) fn finish_slack_tracking(
         &self,
         heap: &mut GcHeap,
@@ -269,52 +97,9 @@ impl ShapeRuntime {
         required: usize,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), otter_gc::OutOfMemory> {
-        let mut nodes = vec![root];
-        {
-            let tables = self.tables.borrow();
-            let mut index = 0;
-            while index < nodes.len() {
-                let id = heap.read_payload(nodes[index], ShapeBody::id);
-                if let Some(children) = tables.provisional_children.get(&id) {
-                    nodes.extend(children.iter().copied());
-                }
-                index += 1;
-            }
-        }
-        let capacity = super::shape_body::inline_capacity_of(root);
-        let used = nodes
-            .iter()
-            .map(|&node| (super::shape_body::property_count_of(node) as usize).min(capacity))
-            .max()
-            .unwrap_or(0);
-        let finished = used.max(required).min(capacity);
-        // Old-space shapes never move; the visit keeps a node the weak
-        // transition table alone names alive across the allocation.
-        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for node in &mut nodes {
-                visitor(std::ptr::from_mut(node).cast::<RawGc>());
-            }
-            self.trace_roots(otter_gc::RootSet::All, visitor);
-            external_visit(visitor);
-        };
-        let dictionary = super::shape_body::alloc_dictionary_shape_body_with_roots(
-            heap, root, finished, &mut visit,
-        )?;
-        for &node in &nodes {
-            super::shape_body::finish_slack_tracking(heap, node, finished, dictionary);
-        }
-        let mut tables = self.tables.borrow_mut();
-        tables.pin(heap, dictionary);
-        for &node in &nodes {
-            let id = heap.read_payload(node, ShapeBody::id);
-            tables.provisional_children.remove(&id);
-        }
-        Ok(())
+        ShapeInterner::finish_slack_tracking(heap, root, required, external_visit)
     }
 
-    /// Prepare a same-geometry immutable state variant without retaining a
-    /// table or payload borrow across allocation. Runtime IC eligibility and
-    /// native bakeability remain separate facts of the resulting shape.
     pub(crate) fn state_with_roots(
         &self,
         heap: &mut GcHeap,
@@ -322,158 +107,21 @@ impl ShapeRuntime {
         state: ShapeState,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
-        if super::shape_body::state_of(source) == state {
-            return Ok(source);
-        }
-        let source_id = heap.read_payload(source, ShapeBody::id);
-        if let Some(shape) = self
-            .tables
-            .borrow()
-            .state_variants
-            .get(&(source_id, state))
-            .copied()
-        {
-            return Ok(shape);
-        }
-        let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            self.trace_roots(otter_gc::RootSet::All, visitor);
-            external_visit(visitor);
-        };
-        let result = super::state_transition::prepare_state_shape(heap, source, state, &mut visit)?;
-        self.register_shape(heap, result);
-        self.tables
-            .borrow_mut()
-            .state_variants
-            .insert((source_id, state), result);
-        Ok(result)
+        ShapeInterner::state_with_roots(heap, source, state, external_visit)
     }
 
-    /// Remove every side-table entry before heap teardown.
-    pub(crate) fn clear(&mut self) {
-        *self.tables.borrow_mut() = WeakShapeTables::default();
+    pub(crate) fn unpin_turn_shapes(&self, heap: &GcHeap) {
+        ShapeInterner::unpin_turn_shapes(heap);
     }
 
-    /// A shell for the snapshot restore path: empty side tables, and the
-    /// heap's isolate names starting from the replayed `names`. The
-    /// snapshot root walk restores the `null`-prototype root into the heap's
-    /// embedder root slot; [`Self::register_restored_shape`]
-    /// re-populates `handles_by_id` from the restored heap, and the
-    /// remaining tables are lookup caches that refill on use.
-    #[must_use]
-    pub(crate) fn restored_shell(heap: &mut GcHeap, names: NameInterner) -> Self {
-        IsolateNames::install(heap, names);
-        Self {
-            tables: RefCell::new(WeakShapeTables::default()),
-            observer: None,
-        }
+    pub(crate) fn handle_for_id(&self, heap: &GcHeap, id: ShapeId) -> Option<ShapeHandle> {
+        ShapeInterner::handle_for_id(heap, id)
     }
 
-    /// Record one restored shape body under its id.
-    pub(crate) fn register_restored_shape(&mut self, id: ShapeId, handle: ShapeHandle) {
-        self.tables.borrow_mut().handles_by_id.insert(id, handle);
-    }
-
-    /// Yield the strong handles: the pinned shapes. The id and transition
-    /// tables are weak ([`Self::sweep_dead`]); the heap roots the canonical
-    /// key strings itself. Shapes are old-space cells, so a scavenge visits
-    /// none of them.
-    pub(crate) fn trace_roots(&self, roots: otter_gc::RootSet, visitor: &mut SlotVisitor<'_>) {
-        if roots == otter_gc::RootSet::Young {
-            return;
-        }
-        for shape in self.tables.borrow().pinned.values() {
-            // Shapes never move, so the slot is never rewritten.
-            visitor(std::ptr::from_ref(shape).cast_mut().cast::<RawGc>());
-        }
-    }
-
-    /// Release the shapes created during the turn that just ended: from the
-    /// next full collection on they live only while something names them.
-    pub(crate) fn unpin_turn_shapes(&self) {
-        self.tables.borrow_mut().pinned.clear();
-    }
-
-    /// The full collection's weak pass: forget every shape the marking left
-    /// unreached before the sweep frees the cells.
-    pub(crate) fn sweep_dead(&self, heap: &GcHeap) {
-        let mut dead = FxHashSet::default();
-        let mut tables = self.tables.borrow_mut();
-        let WeakShapeTables {
-            handles_by_id,
-            transitions,
-            state_variants,
-            provisional_children,
-            ..
-        } = &mut *tables;
-        handles_by_id.retain(|_, shape| {
-            let live = heap.is_marked(shape.raw());
-            if !live {
-                dead.insert(shape.offset());
-            }
-            live
-        });
-        state_variants.retain(|(source, _), result| {
-            handles_by_id.contains_key(source) && heap.is_marked(result.raw())
-        });
-        if dead.is_empty() {
-            return;
-        }
-        transitions.retain(|_, child| !dead.contains(&child.offset()));
-        provisional_children.retain(|parent, children| {
-            children.retain(|child| !dead.contains(&child.offset()));
-            handles_by_id.contains_key(parent)
-        });
-    }
-
-    /// Resolve stable feedback identity back to the isolate-local GC handle.
-    #[must_use]
-    pub(crate) fn handle_for_id(&self, id: ShapeId) -> Option<ShapeHandle> {
-        self.tables.borrow().handles_by_id.get(&id).copied()
-    }
-
-    #[must_use]
     pub(crate) fn id_for_handle(&self, heap: &GcHeap, shape: ShapeHandle) -> ShapeId {
         heap.read_payload(shape, ShapeBody::id)
     }
 
-    /// Intern a property-key spelling as its canonical GC string body,
-    /// holding the code units it stands for, plus its global atom.
-    pub(crate) fn intern_key_with_roots(
-        &mut self,
-        heap: &mut GcHeap,
-        key: &str,
-        external_visit: &mut RootSlotVisitor<'_>,
-    ) -> Result<(JsStringHandle, AtomId), otter_gc::OutOfMemory> {
-        let isolate = IsolateNames::of(heap);
-        let known = isolate.names().lookup(key);
-        if let Some(handle) = isolate.key_string(known) {
-            return Ok((handle, known));
-        }
-        let units: Vec<u16> = crate::wtf16_escape::units(key).collect();
-        let mut visit_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            self.trace_roots(otter_gc::RootSet::All, visitor);
-            external_visit(visitor);
-        };
-        // An interned key lives as long as the isolate.
-        let handle = alloc_old_flat_string_body_with_roots(heap, &units, &mut visit_roots)?;
-        let isolate = IsolateNames::of_mut(heap);
-        let atom = isolate.names_mut().intern(key);
-        isolate.set_key_string(atom, handle);
-        heap.with_payload(handle, |body| body.set_cached_atom(atom));
-        Ok((handle, atom))
-    }
-
-    /// Return the cached transition for appending `key` to `parent`, or
-    /// `None` when no such transition exists yet.
-    ///
-    /// This is the allocation-free fast path: an already-interned key plus a
-    /// recorded transition resolve through two hash lookups and two payload
-    /// reads with **no rooting and no allocation**. Construction of an object
-    /// with a previously seen field shape (the overwhelmingly common case)
-    /// hits here, so callers can skip the eager root-set collection that the
-    /// allocating [`Self::child_with_roots`] path requires. A `None` result
-    /// means the key has never been interned or the transition has not been
-    /// taken before — the caller must fall back to `child_with_roots`.
     pub(crate) fn child_if_cached(
         &mut self,
         heap: &GcHeap,
@@ -482,106 +130,42 @@ impl ShapeRuntime {
         flags: PropertyFlags,
         is_accessor: bool,
     ) -> Option<ShapeHandle> {
-        let atom = crate::isolate_names::names(heap).lookup(key);
-        let parent_id = heap.read_payload(parent, ShapeBody::id);
-        let transition_key = TransitionKey {
-            parent: parent_id,
-            atom,
-            flags,
-            is_accessor,
-        };
-        let child = self
-            .tables
-            .borrow()
-            .transitions
-            .get(&transition_key)
-            .copied()?;
-        self.notify_observer(heap, parent_id, child, key, true);
+        let child = ShapeInterner::child_if_cached(heap, parent, key, flags, is_accessor)?;
+        self.notify_observer(heap, parent, child, key, true);
         Some(child)
     }
 
-    /// Return the transition reached by appending `key` to `parent`.
     pub(crate) fn child_with_roots(
         &mut self,
         heap: &mut GcHeap,
-        mut parent: ShapeHandle,
+        parent: ShapeHandle,
         key: &str,
         flags: PropertyFlags,
         is_accessor: bool,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
-        let mut visit_parent = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            let p = &mut parent as *mut ShapeHandle as *mut RawGc;
-            visitor(p);
-            external_visit(visitor);
-        };
-        let (key_handle, atom) = self.intern_key_with_roots(heap, key, &mut visit_parent)?;
-        let parent_id = heap.read_payload(parent, ShapeBody::id);
-        let transition_key = TransitionKey {
-            parent: parent_id,
-            atom,
-            flags,
-            is_accessor,
-        };
-        let existing = self
-            .tables
-            .borrow()
-            .transitions
-            .get(&transition_key)
-            .copied();
-        if let Some(child) = existing {
-            self.notify_observer(heap, parent_id, child, key, true);
-            return Ok(child);
-        }
-
-        let mut visit_child_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            self.trace_roots(otter_gc::RootSet::All, visitor);
-            external_visit(visitor);
-        };
-        let child = alloc_child_shape_body_with_roots(
-            heap,
-            parent,
-            key_handle,
-            atom,
-            flags,
-            is_accessor,
-            &mut visit_child_roots,
-        )?;
-        let child_id = heap.read_payload(child, ShapeBody::id);
-        let mut tables = self.tables.borrow_mut();
-        tables.handles_by_id.insert(child_id, child);
-        tables.transitions.insert(transition_key, child);
-        if super::shape_body::state_of(child).is_provisional() {
-            tables
-                .provisional_children
-                .entry(parent_id)
-                .or_default()
-                .push(child);
-        }
-        tables.pin(heap, child);
-        drop(tables);
-        self.notify_observer(heap, parent_id, child, key, false);
+        let (child, reused) =
+            ShapeInterner::child_with_roots(heap, parent, key, flags, is_accessor, external_visit)?;
+        self.notify_observer(heap, parent, child, key, reused);
         Ok(child)
     }
 
     fn notify_observer(
         &mut self,
         heap: &GcHeap,
-        parent_id: ShapeId,
+        parent: ShapeHandle,
         child: ShapeHandle,
         key: &str,
         reused: bool,
     ) {
-        let Some(observer) = self.observer.as_deref_mut() else {
-            return;
-        };
-        let child_id = heap.read_payload(child, ShapeBody::id);
-        observer.on_transition(&ShapeTransitionEvent {
-            from_shape_id: parent_id.raw(),
-            to_shape_id: child_id.raw(),
-            key: key.to_string(),
-            reused,
-        });
+        if let Some(observer) = self.observer.as_deref_mut() {
+            observer.on_transition(&ShapeTransitionEvent {
+                from_shape_id: heap.read_payload(parent, ShapeBody::id).raw(),
+                to_shape_id: heap.read_payload(child, ShapeBody::id).raw(),
+                key: key.to_string(),
+                reused,
+            });
+        }
     }
 }
 
@@ -638,22 +222,27 @@ mod tests {
         let mut expected = [root, dictionary, child];
         expected.sort_by_key(|shape| heap.read_payload(*shape, ShapeBody::id).raw());
         let pinned = || {
-            let mut values: Vec<_> = runtime.tables.borrow().pinned.values().copied().collect();
+            let mut values: Vec<_> = ShapeInterner::pinned_shapes(&heap);
             values.sort_by_key(|shape| heap.read_payload(*shape, ShapeBody::id).raw());
             values
         };
         assert_eq!(pinned(), expected);
         let mut slots = 0;
-        runtime.trace_roots(otter_gc::RootSet::All, &mut |_| slots += 1);
+        IsolateNames::of(&heap)
+            .shapes()
+            .trace_roots(&mut |_| slots += 1);
         assert_eq!(slots, expected.len());
         let mut key_roots = 0;
         otter_gc::IsolateData::visit_old_roots(IsolateNames::of(&heap), &mut |_| key_roots += 1);
-        assert_eq!(key_roots, IsolateNames::of(&heap).key_string_count());
-        assert_eq!(key_roots, 1);
+        assert_eq!(
+            key_roots,
+            IsolateNames::of(&heap).key_string_count() + expected.len()
+        );
+        assert_eq!(IsolateNames::of(&heap).key_string_count(), 1);
         let dictionary_id = heap.read_payload(dictionary, ShapeBody::id);
-        assert!(runtime.handle_for_id(dictionary_id).is_none());
+        assert!(runtime.handle_for_id(&heap, dictionary_id).is_none());
 
-        runtime.unpin_turn_shapes();
+        runtime.unpin_turn_shapes(&heap);
         assert!(pinned().is_empty());
         runtime.register_shape(&heap, child);
         assert_eq!(pinned(), expected);
@@ -665,14 +254,24 @@ mod tests {
         let root = interp.null_prototype_root();
         let first = interp.shape_child(root, "x").expect("child");
         let first_id = interp.gc_heap.read_payload(first, ShapeBody::id);
-        assert_eq!(interp.shape_runtime.handle_for_id(first_id), Some(first));
+        assert_eq!(
+            interp
+                .shape_runtime
+                .handle_for_id(&interp.gc_heap, first_id),
+            Some(first)
+        );
         assert_eq!(interp.shape_offset_of(first, "x"), Some(0));
 
         interp.force_gc().expect("force GC");
 
         let root = interp.null_prototype_root();
         let second = interp.shape_child(root, "x").expect("child after gc");
-        assert_eq!(interp.shape_runtime.handle_for_id(first_id), Some(second));
+        assert_eq!(
+            interp
+                .shape_runtime
+                .handle_for_id(&interp.gc_heap, first_id),
+            Some(second)
+        );
         assert_eq!(interp.shape_offset_of(second, "x"), Some(0));
     }
 
@@ -699,11 +298,30 @@ mod tests {
 
         // Pinned while the (implicit) turn that created them is open.
         interp.force_gc().expect("force GC");
-        assert!(interp.shape_runtime.handle_for_id(unused_id).is_some());
+        assert!(
+            interp
+                .shape_runtime
+                .handle_for_id(&interp.gc_heap, unused_id)
+                .is_some()
+        );
 
-        interp.shape_runtime.unpin_turn_shapes();
+        interp.shape_runtime.unpin_turn_shapes(&interp.gc_heap);
         interp.force_gc().expect("force GC");
-        assert!(interp.shape_runtime.handle_for_id(unused_id).is_none());
-        assert!(interp.shape_runtime.handle_for_id(kept_id).is_some());
+        assert!(
+            interp
+                .shape_runtime
+                .handle_for_id(&interp.gc_heap, unused_id)
+                .is_none()
+        );
+        assert!(
+            interp
+                .shape_runtime
+                .handle_for_id(&interp.gc_heap, kept_id)
+                .is_some()
+        );
     }
 }
+
+#[cfg(test)]
+#[path = "shape_interner_tests.rs"]
+mod interner_tests;

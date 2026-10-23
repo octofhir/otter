@@ -151,7 +151,7 @@ fn char_code_at_reads_its_unit_inline_from_the_evaluated_operands() {
         .expect("an inline code-unit read");
     assert_eq!(graph.node(unit.inputs[0]).kind, Kind::InitialRegister(1));
     let index = graph.node(unit.inputs[1]);
-    assert_eq!(index.kind, Kind::CheckedTaggedToInt32);
+    assert_eq!(index.kind, Kind::CheckedNumberToInt32);
     assert_eq!(graph.node(index.inputs[0]).kind, Kind::InitialRegister(2));
 }
 

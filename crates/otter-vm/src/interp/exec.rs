@@ -303,7 +303,11 @@ impl Interpreter {
         let extra_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
         let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         let mut noop = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
-        self.gc_heap.collect_full_observed(&mut noop, trigger)?;
+        self.gc_heap.collect_full_observed(
+            &mut noop,
+            trigger,
+            otter_gc::FullGcGoal::ReleaseMemory,
+        )?;
         self.enqueue_finalization_cleanup();
         Ok(())
     }
@@ -1265,7 +1269,10 @@ mod tests {
         let object_load = vm.global_object_load_ic[&(before_fid, 1)];
         let layout = vm.object_layout(&["field"]).unwrap();
         let shape_id = layout.shape_id();
-        let shape = vm.shape_runtime.handle_for_id(shape_id).unwrap();
+        let shape = vm
+            .shape_runtime
+            .handle_for_id(&vm.gc_heap, shape_id)
+            .unwrap();
         let mut prototype = vm.realm_intrinsics.object_prototype().unwrap();
         vm.migrate_slow_to_fast(&mut prototype);
         let validity =

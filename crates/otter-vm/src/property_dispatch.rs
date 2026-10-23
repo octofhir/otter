@@ -62,11 +62,11 @@ impl Interpreter {
     pub(crate) fn capture_store_property_transition_with_stack_roots(
         &mut self,
         stack: &ActivationStack,
-        mut obj: JsObject,
+        obj: &mut JsObject,
         key: AtomizedPropertyKey<'_>,
-        value: &Value,
+        value: &mut Value,
     ) -> Result<Option<object::StorePropertyTransition>, VmError> {
-        let parent = object::keyed_shape(obj, &self.gc_heap);
+        let parent = object::keyed_shape(*obj, &self.gc_heap);
         if parent.is_null()
             || (key.atom().id() != crate::property_atom::AtomId::NONE
                 && self.shape_slot_of_atom(parent, key.atom().id()).is_some())
@@ -84,13 +84,20 @@ impl Interpreter {
             return Ok(None);
         }
         let roots = self.collect_allocation_roots(stack);
+        let mut operand_roots = otter_gc::RootScope::new(&mut self.gc_heap);
+        // SAFETY: these actual caller-owned slots remain stationary throughout
+        // shape preparation and capture, including refused allocating attempts.
+        unsafe {
+            operand_roots.add_object(obj);
+            operand_roots.add_value(value);
+            for &slot in &roots {
+                operand_roots.add_raw_slot(slot);
+            }
+        }
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
             }
-            let p = &mut obj as *mut JsObject as *mut RawGc;
-            visitor(p);
-            value.trace_value_slots(visitor);
         };
         let next_shape = self
             .shape_runtime
@@ -103,13 +110,14 @@ impl Interpreter {
                 &mut external_visit,
             )
             .map_err(VmError::from)?;
-        Ok(object::capture_store_property_transition_with_shape(
+        object::capture_store_property_transition_with_shape(
             obj,
             &mut self.gc_heap,
             key,
             value,
             next_shape,
-        ))
+        )
+        .map_err(VmError::from)
     }
 
     /// §7.1.19 `ToPropertyKey(value)` — primitives round through

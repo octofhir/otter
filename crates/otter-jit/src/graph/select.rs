@@ -66,6 +66,7 @@ fn loads_stored_value(kind: &Kind) -> bool {
     matches!(
         kind,
         Kind::LoadOwnField { .. }
+            | Kind::LoadNumberOwnField { .. }
             | Kind::LoadTaggedField(_)
             | Kind::LoadShapedProperty { .. }
             | Kind::LoadNamedProperty { .. }

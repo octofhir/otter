@@ -113,7 +113,7 @@ fn exact_int32_fields_load_the_payload_under_their_owner_proof() {
                 .graph
                 .nodes
                 .iter()
-                .any(|node| node.kind == Kind::CheckedTaggedToInt32)
+                .any(|node| node.kind == Kind::CheckedNumberToInt32)
         );
         let guards: Vec<_> = built
             .graph
@@ -212,6 +212,7 @@ fn a_constant_numeric_owner_elides_only_proven_equal_stores() {
             shapes: SmallVec::new(),
             nullish: 0,
             int32: true,
+            double: false,
             int32_constant: constant,
         };
         assert_eq!(
@@ -224,9 +225,93 @@ fn a_constant_numeric_owner_elides_only_proven_equal_stores() {
         shapes: SmallVec::new(),
         nullish: 0,
         int32: true,
+        double: false,
         int32_constant: None,
     };
     assert!(!FieldStoreOwner::select(&record, Some(&bound)).observes());
+}
+
+#[test]
+fn semantic_integer_proofs_do_not_claim_a_tagged_parameters_physical_encoding() {
+    let field = FieldLocation::inline(0);
+    for expected in [
+        field_type::INT32,
+        field_type::DOUBLE,
+        field_type::INT32 | field_type::DOUBLE,
+    ] {
+        let mut view = field_type_view(
+            vec![
+                (
+                    Op::AddImm,
+                    vec![
+                        Operand::Register(2),
+                        Operand::Register(1),
+                        Operand::Imm32(0),
+                    ],
+                ),
+                (
+                    Op::StoreProperty,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(3),
+                    ],
+                ),
+                (Op::ReturnValue, vec![Operand::Register(2)]),
+            ],
+            0,
+        );
+        view.seed_arith_feedback_for_test(
+            0,
+            otter_vm::jit_feedback::ArithFeedback::from_bits(otter_vm::jit_feedback::ARITH_INT32),
+        );
+        view.property_programs.insert(
+            4,
+            vec![JitCacheIrProgram {
+                ops: vec![
+                    JitCacheIrOp::GuardShape {
+                        object: 0,
+                        shape: 128,
+                    },
+                    JitCacheIrOp::GuardAtomSlot {
+                        object: 0,
+                        atom: 1,
+                        field,
+                        writable: true,
+                    },
+                    JitCacheIrOp::StoreField { object: 0, field },
+                ]
+                .into_boxed_slice(),
+            }],
+        );
+        let record = view.field_types.get_mut(&(128, field)).unwrap();
+        record.guard.expected = expected;
+        record.shapes.clear();
+        record.stored_shapes.clear();
+        let built = load_graph(&view);
+        let check = built
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == Kind::CheckedNumberToInt32)
+            .unwrap();
+        let store = built
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.kind, Kind::StoreOwnField { .. }))
+            .unwrap();
+        assert_eq!(store.inputs[1], check.inputs[0]);
+        let Kind::StoreOwnField { owners, .. } = &store.kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            owners.iter().any(|(_, owner)| owner.observes()),
+            expected != (field_type::INT32 | field_type::DOUBLE),
+            "a semantic integer may have either numeric encoding"
+        );
+    }
 }
 
 #[test]
@@ -825,7 +910,7 @@ fn strict_nullish_refinement_preserves_polarity_and_live_comparison_values() {
                 assert!(built.graph.nodes.iter().all(|node| {
                     !matches!(
                         node.kind,
-                        Kind::CheckedTaggedToInt32 | Kind::Int32Compare(_)
+                        Kind::CheckedNumberToInt32 | Kind::Int32Compare(_)
                     )
                 }));
             }
@@ -907,6 +992,7 @@ fn polymorphic_own_stores_select_each_defining_owner() {
                     stored_shapes: smallvec::smallvec![640],
                     nullish_mask: 1,
                     int32: false,
+                    double: false,
                     int32_constant: None,
                 },
             ),
@@ -917,6 +1003,7 @@ fn polymorphic_own_stores_select_each_defining_owner() {
                     stored_shapes: smallvec::smallvec![768],
                     nullish_mask: 2,
                     int32: false,
+                    double: false,
                     int32_constant: None,
                 },
             ),
@@ -1000,6 +1087,7 @@ fn partially_elided_stores_retain_every_admitted_receiver_arm() {
                             stored_shapes: smallvec::SmallVec::new(),
                             nullish_mask: 2,
                             int32: false,
+                            double: false,
                             int32_constant: None,
                         },
                     ),
@@ -1010,6 +1098,7 @@ fn partially_elided_stores_retain_every_admitted_receiver_arm() {
                             stored_shapes: smallvec::SmallVec::new(),
                             nullish_mask: 0,
                             int32: false,
+                            double: false,
                             int32_constant: None,
                         },
                     ),
@@ -1212,6 +1301,7 @@ fn named_store_owner(
                     stored_shapes: record_stored.clone(),
                     nullish_mask: record_nullish,
                     int32: false,
+                    double: false,
                     int32_constant: None,
                 },
                 [(_, owner)] => owner.clone(),

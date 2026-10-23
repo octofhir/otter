@@ -5,6 +5,7 @@
 //! - Full GC clears weak loads while retaining the actual append target word.
 //! - A matched allocating recipe preserves its real OOM and moving input roots.
 //! - Fixed table and proof-owner payloads stay within the replaced cache budget.
+//! - Numeric words and nonnumbers reuse the same immutable slot geometry.
 //!
 //! # Invariants
 //! Fixtures use the production interpreter handle arena and collection roots.
@@ -23,6 +24,102 @@ fn key<'a>(vm: &mut Interpreter, name: &'a str) -> AtomizedPropertyKey<'a> {
         PropertyAtom::new(crate::isolate_names::names_mut(&mut vm.gc_heap).intern(name)),
         name,
     )
+}
+
+#[test]
+fn shared_store_keeps_geometry_and_numeric_summary_across_value_categories() {
+    let mut vm = Interpreter::new().unwrap();
+    vm.with_handle_scope(|vm, scope| {
+        let rooted = vm.scoped_object_bare(scope).unwrap();
+        let mut receiver = vm.escape_scoped(rooted).as_object().unwrap();
+        vm.create_data_property(&mut receiver, "x", Value::number_i32(0))
+            .unwrap();
+        let property = key(vm, "x");
+        let shape = object::shape(receiver, &vm.gc_heap);
+        vm.resolve_property_data_slot(receiver, property).unwrap();
+        for physical in [Value::double(0.0), Value::double(1.25), Value::TRUE] {
+            assert_eq!(
+                vm.property_cache
+                    .replay_store(receiver, &mut vm.gc_heap, property, &physical)
+                    .unwrap(),
+                Some(PropertyStoreAction::OwnWritable)
+            );
+            assert_eq!(object::shape(receiver, &vm.gc_heap), shape);
+            let resolved = vm.resolve_property_data_slot(receiver, property).unwrap();
+            assert_eq!(resolved.value, physical);
+        }
+        assert_eq!(
+            object::field_type::snapshot(object::field_type::owner(shape, 0).unwrap()),
+            object::field_type::TOP
+        );
+    });
+}
+
+#[test]
+fn inherited_numeric_load_and_own_append_keep_independent_values() {
+    vm_numeric_actions(|vm, mut first, second, property| {
+        let resolved = vm.resolve_property_data_slot(second, property).unwrap();
+        assert_eq!(resolved.hops, 1);
+        let source = object::shape(second, &vm.gc_heap);
+        let child = vm.shape_child(source, property.name()).unwrap();
+        let mut value = Value::TRUE;
+        let transition = object::capture_store_property_transition_with_shape(
+            &mut first,
+            &mut vm.gc_heap,
+            property,
+            &mut value,
+            child,
+        )
+        .expect("own append preparation")
+        .expect("actual own tagged append over inherited double");
+        vm.property_cache.record_store(transition);
+        let index = vm
+            .property_cache
+            .find(object::shape_body::id_of(source), property.atom().id())
+            .unwrap();
+        let entry = vm.property_cache.entries[index].get();
+        assert_eq!(entry.load_slot, resolved.hit.slot);
+        assert_eq!(entry.store_slot, 0);
+        let PropertyProbe::Resolved(load) =
+            vm.property_cache.probe_load(second, &vm.gc_heap, property)
+        else {
+            panic!("independent inherited load");
+        };
+        assert_eq!(load.value, Value::number_f64(1.25));
+        assert!(
+            vm.property_cache
+                .replay_store(second, &mut vm.gc_heap, property, &Value::FALSE)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            object::get_own(second, &vm.gc_heap, property.name()),
+            Some(Value::FALSE)
+        );
+    });
+}
+
+fn vm_numeric_actions(
+    test: impl FnOnce(&mut Interpreter, JsObject, JsObject, AtomizedPropertyKey<'_>),
+) {
+    let mut vm = Interpreter::new().expect("fixture interpreter");
+    vm.with_handle_scope(|vm, scope| {
+        let mut prototype = object::alloc_object_old_for_fixture(&mut vm.gc_heap).unwrap();
+        let prototype_root = vm.scoped_value(scope, Value::object(prototype));
+        vm.create_data_property(&mut prototype, "independentPolicy", Value::number_f64(1.25))
+            .unwrap();
+        let mut first = object::alloc_object_old_for_fixture(&mut vm.gc_heap).unwrap();
+        let first_root = vm.scoped_value(scope, Value::object(first));
+        object::set_prototype(&mut first, &mut vm.gc_heap, Some(prototype)).unwrap();
+        let mut second = object::alloc_object_old_for_fixture(&mut vm.gc_heap).unwrap();
+        let second_root = vm.scoped_value(scope, Value::object(second));
+        let prototype = vm.escape_scoped(prototype_root).as_object().unwrap();
+        object::set_prototype(&mut second, &mut vm.gc_heap, Some(prototype)).unwrap();
+        let property = key(vm, "independentPolicy");
+        let first = vm.escape_scoped(first_root).as_object().unwrap();
+        let second = vm.escape_scoped(second_root).as_object().unwrap();
+        test(vm, first, second, property);
+    });
 }
 
 #[test]
@@ -65,13 +162,15 @@ fn inherited_load_and_own_append_preserve_independent_slots_and_writability() {
         assert_eq!(before_store.value, Value::number_i32(53));
         let source = object::shape(second, &vm.gc_heap);
         let child = vm.shape_child(source, key.name()).unwrap();
+        let mut value = Value::number_i32(71);
         let transition = object::capture_store_property_transition_with_shape(
-            first,
+            &mut first,
             &mut vm.gc_heap,
             key,
-            &Value::number_i32(71),
+            &mut value,
             child,
         )
+        .expect("writable append preparation")
         .expect("actual direct-prototype writable append");
         assert!(matches!(
             transition.kind,
@@ -140,11 +239,14 @@ fn inherited_load_and_own_append_preserve_independent_slots_and_writability() {
         // clear the old weak holder fact without dropping the independent
         // retained append recipe, whose nonreviving proof remains invalid.
         let old_holder_id = after_store.hit.shape_id;
-        vm.shape_runtime.unpin_turn_shapes();
+        vm.shape_runtime.unpin_turn_shapes(&vm.gc_heap);
         vm.gc_heap
             .collect_full(&mut |_| {})
             .expect("actual descriptor-retirement collection");
-        assert_eq!(vm.shape_runtime.handle_for_id(old_holder_id), None);
+        assert_eq!(
+            vm.shape_runtime.handle_for_id(&vm.gc_heap, old_holder_id),
+            None
+        );
         let original_way = vm
             .property_cache
             .find(
@@ -192,17 +294,19 @@ fn full_gc_clears_weak_loads_and_keeps_the_actual_append_word_live() {
         let (target_id, target) = vm.with_handle_scope(|vm, inner| {
             let first = object::alloc_object_old_for_fixture(&mut vm.gc_heap).unwrap();
             let first = vm.scoped_value(inner, Value::object(first));
-            let first = vm.escape_scoped(first).as_object().unwrap();
+            let mut first = vm.escape_scoped(first).as_object().unwrap();
             let child = vm
                 .shape_child(object::shape(first, &vm.gc_heap), append_key.name())
                 .unwrap();
+            let mut value = Value::TRUE;
             let transition = object::capture_store_property_transition_with_shape(
-                first,
+                &mut first,
                 &mut vm.gc_heap,
                 append_key,
-                &Value::boolean(true),
+                &mut value,
                 child,
             )
+            .unwrap()
             .unwrap();
             let target_id = transition.to_shape_id;
             vm.property_cache.record_store(transition);
@@ -234,14 +338,14 @@ fn full_gc_clears_weak_loads_and_keeps_the_actual_append_word_live() {
                 .find(weak_receiver, weak_key.atom().id())
                 .is_some()
         );
-        vm.shape_runtime.unpin_turn_shapes();
+        vm.shape_runtime.unpin_turn_shapes(&vm.gc_heap);
         let before = vm.gc_heap.gc_cycle_counts();
         vm.gc_heap
             .collect_full(&mut |_| {})
             .expect("actual full collection");
         assert!(vm.gc_heap.gc_cycle_counts().1 > before.1);
         assert_eq!(
-            vm.shape_runtime.handle_for_id(weak_holder),
+            vm.shape_runtime.handle_for_id(&vm.gc_heap, weak_holder),
             None,
             "dead holder actually swept"
         );
@@ -251,7 +355,7 @@ fn full_gc_clears_weak_loads_and_keeps_the_actual_append_word_live() {
             "weak fact removed before reuse"
         );
         assert_eq!(
-            vm.shape_runtime.handle_for_id(target_id),
+            vm.shape_runtime.handle_for_id(&vm.gc_heap, target_id),
             Some(target),
             "cache scalar word alone retains append child"
         );
@@ -311,7 +415,7 @@ fn allocating_shared_replay_preserves_cap_cause_and_does_not_commit_or_hold_proo
         assert!(entry.target_shape.is_null());
         assert!(entry.store_owner.is_null());
         let mut settled = false;
-        vm.shape_runtime.unpin_turn_shapes();
+        vm.shape_runtime.unpin_turn_shapes(&vm.gc_heap);
         for round in 0..8 {
             let before = vm.gc_heap.stats().allocated_bytes;
             vm.gc_heap.collect_full(&mut |_| {}).expect("settle actual live heap");

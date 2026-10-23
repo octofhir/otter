@@ -70,7 +70,8 @@ use crate::{Interpreter, JsString, Value, VmError};
 /// collections: the isolate's root-keyed layout cache strongly retains the final
 /// shape, and an id resolves to the current handle each time it is used. Build one with
 /// [`crate::NativeScope::object_layout`] and keep it for as long as objects of
-/// that shape keep coming.
+/// that logical layout keep coming. Physical representation preferences are
+/// resolved at each birth, so an old owned layout remains valid after widening.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObjectLayout {
     shape: crate::object::ShapeId,
@@ -84,7 +85,7 @@ impl ObjectLayout {
         self.len as usize
     }
 
-    /// Interned hidden-class id every object of this layout starts with.
+    /// Stable logical layout id; each birth selects its current physical representation.
     #[must_use]
     pub(crate) const fn shape_id(&self) -> crate::object::ShapeId {
         self.shape
@@ -481,7 +482,7 @@ impl Interpreter {
         self.record_layout_for_atoms(None, tag, keys)
     }
 
-    /// Read or prepare a fixed null-prototype RegExp record's retained final shape.
+    /// Return the stable neutral token of a fixed null-prototype RegExp record.
     pub(crate) fn regexp_record_layout(
         &mut self,
         kind: crate::object_layout_cache::RegExpRecordLayout,
@@ -636,7 +637,7 @@ impl Interpreter {
     ) -> Result<Local<'s>, VmError> {
         let mut shape = self
             .shape_runtime
-            .handle_for_id(layout.shape)
+            .handle_for_id(&self.gc_heap, layout.shape)
             .ok_or(VmError::TypeMismatch)?;
         let count = layout.len as usize;
         let mut slots = smallvec::SmallVec::<[Value; 8]>::from_elem(Value::undefined(), count);
@@ -666,7 +667,7 @@ impl Interpreter {
         }
         let mut shape = self
             .shape_runtime
-            .handle_for_id(layout.shape)
+            .handle_for_id(&self.gc_heap, layout.shape)
             .ok_or(VmError::TypeMismatch)?;
         let mut stored = smallvec::SmallVec::<[Value; 8]>::with_capacity(values.len());
         stored.extend(
@@ -692,8 +693,8 @@ impl Interpreter {
     /// Overwrite slot `index` of an object built by
     /// [`Self::scoped_object_of_layout`].
     ///
-    /// The layout already says the slot exists and which name answers to it,
-    /// so this is a store and a write barrier — no lookup, no shape work.
+    /// The immutable layout proves the slot exists and which name answers to
+    /// it. Any valid Value word can replace its current data word.
     pub(crate) fn scoped_set_slot(
         &mut self,
         _scope: &HandleScope,
@@ -702,8 +703,8 @@ impl Interpreter {
         value: Local<'_>,
     ) -> Result<(), VmError> {
         let stored = self.handle_arena.get(value.index());
-        let object = self.scoped_object_handle(obj)?;
-        crate::object::write_layout_slot(object, &mut self.gc_heap, index, stored);
+        let mut object = self.scoped_object_handle(obj)?;
+        crate::object::write_layout_slot(&mut object, &mut self.gc_heap, index, stored);
         Ok(())
     }
 

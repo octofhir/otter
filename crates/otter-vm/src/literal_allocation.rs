@@ -434,7 +434,10 @@ mod tests {
                         }
                         let layout = vm.object_literal_layouts[&(function_id, 0)];
                         assert_eq!(layout.len(), COUNT);
-                        let shape = vm.shape_runtime.handle_for_id(layout.shape_id()).unwrap();
+                        let shape = vm
+                            .shape_runtime
+                            .handle_for_id(&vm.gc_heap, layout.shape_id())
+                            .unwrap();
                         assert_eq!(crate::object::shape_body::inline_capacity_of(shape), 64);
                         Ok(())
                     })?;

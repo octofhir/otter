@@ -25,6 +25,8 @@ pub struct FieldLocation(u32);
 
 impl FieldLocation {
     const INLINE: u32 = 1 << 31;
+    /// Address index bits, independent of the bank bit.
+    pub const INDEX_MASK: u32 = u32::MAX / Self::WORD_BYTES;
     /// Size in bytes of one tagged property word in either storage bank.
     pub const WORD_BYTES: u32 = std::mem::size_of::<crate::Value>() as u32;
     /// Left shift that converts a word index into a byte offset.
@@ -85,7 +87,7 @@ impl FieldLocation {
     /// Zero-based word index relative to the selected storage bank.
     #[must_use]
     pub const fn index(self) -> u32 {
-        self.0 & !Self::INLINE
+        self.0 & Self::INDEX_MASK
     }
 
     /// Recover a logical property slot using the owning shape's capacity.
@@ -115,7 +117,7 @@ impl FieldLocation {
         self.index() * Self::WORD_BYTES
     }
 
-    /// Stable scalar identity including the storage bank, for compiler caches.
+    /// Stable scalar identity including the storage bank and storage geometry.
     #[must_use]
     pub const fn cache_key(self) -> u32 {
         self.0

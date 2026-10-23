@@ -142,6 +142,21 @@ mod tests {
         assert_eq!(store.feedback_epoch(), 1);
         assert!(store.feedback_at(0).unwrap().element_out_of_bounds());
 
+        // A computed Number key need not carry an Int32 tag. The same
+        // append/gap observation must survive pure Double boxing.
+        for key in [
+            Value::double(0.0),
+            Value::double(-0.0),
+            Value::double(3.0),
+            Value::double(2_147_483_648.0),
+        ] {
+            let site = element_site(Op::StoreElement);
+            assert!(interpreter.record_element_bounds_feedback(&site, 0, receiver, key));
+            assert_eq!(site.feedback_epoch(), 1);
+            assert!(!interpreter.record_element_bounds_feedback(&site, 0, receiver, key));
+            assert_eq!(site.feedback_epoch(), 1);
+        }
+
         // Loads, negative and non-int keys, and non-element receivers are not
         // element-bounds questions.
         let load = element_site(Op::LoadElement);
@@ -155,6 +170,9 @@ mod tests {
         for (receiver, key) in [
             (receiver, Value::number_i32(-1)),
             (receiver, Value::number_f64(0.5)),
+            (receiver, Value::double(f64::NAN)),
+            (receiver, Value::double(f64::INFINITY)),
+            (receiver, Value::double(4_294_967_295.0)),
             (Value::UNDEFINED, Value::number_i32(0)),
         ] {
             assert!(!interpreter.record_element_bounds_feedback(&other, 0, receiver, key));

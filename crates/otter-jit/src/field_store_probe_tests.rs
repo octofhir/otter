@@ -16,7 +16,7 @@
 use super::FieldStoreOwner;
 use crate::artifact::relocation::RelocationCapture;
 use dynasmrt::{AssemblyOffset, DynasmApi, ExecutableBuffer, dynasm};
-use otter_vm::object::field_type::{self, INT32, NULL, TOP, UNDEFINED};
+use otter_vm::object::field_type::{self, DOUBLE, INT32, NULL, TOP, UNDEFINED};
 use otter_vm::{JitCompileSnapshot, Value};
 
 #[cfg(target_arch = "aarch64")]
@@ -95,17 +95,28 @@ fn native_scalar_probes_preserve_constants_and_erase_payload_on_widening() {
             Value::number_i32(i32::MAX),
             INT32 | NULL | UNDEFINED,
         ),
-        (constant(7), Value::number_f64(-0.0), TOP),
-        (constant(7), Value::number_f64(3.5), TOP),
+        (constant(7), Value::number_f64(-0.0), INT32 | DOUBLE),
+        (constant(7), Value::number_f64(3.5), INT32 | DOUBLE),
+        (0, otter_vm::Value::double(0.0), DOUBLE),
+        (DOUBLE, Value::number_i32(7), INT32 | DOUBLE),
+        (DOUBLE, Value::number_f64(f64::NAN), DOUBLE),
+        (DOUBLE, otter_vm::Value::double(0.0), DOUBLE),
         (TOP, Value::number_i32(7), TOP),
     ];
-    for captured in [None, Some(7), Some(i32::MIN), Some(i32::MAX)] {
-        let record = captured.map(|value| FieldStoreOwner {
+    for (captured, captured_double) in [
+        (None, false),
+        (Some(7), false),
+        (Some(i32::MIN), false),
+        (Some(i32::MAX), false),
+        (None, true),
+    ] {
+        let record = (captured.is_some() || captured_double).then(|| FieldStoreOwner {
             owner_shape: owner,
             stored_shapes: smallvec::SmallVec::new(),
             nullish_mask: 0,
-            int32: true,
-            int32_constant: Some(value),
+            int32: captured.is_some(),
+            double: captured_double,
+            int32_constant: captured,
         });
         let code = compile(&view, record.as_ref());
         // SAFETY: the native probe uses the platform's three integer argument
@@ -117,6 +128,9 @@ fn native_scalar_probes_preserve_constants_and_erase_payload_on_widening() {
         let probe: unsafe extern "sysv64" fn(u64, u64, u64) -> u64 =
             unsafe { std::mem::transmute(code.ptr(AssemblyOffset(0))) };
         for (initial, value, expected) in cases {
+            if captured_double && initial & DOUBLE == 0 {
+                continue;
+            }
             if captured.is_some_and(|value| field_type::merge(constant(value), initial) != initial)
             {
                 continue;

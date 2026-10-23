@@ -164,7 +164,7 @@ fn state_preparation_moves_keys_and_distinct_bank_children_without_changing_sour
             let state_shape = object::shape(current, &vm.gc_heap);
             assert_eq!(
                 vm.shape_runtime
-                    .handle_for_id(shape_body::id_of(state_shape)),
+                    .handle_for_id(&vm.gc_heap, shape_body::id_of(state_shape)),
                 Some(state_shape)
             );
             vm.gc_heap.read_payload(current, |body| {

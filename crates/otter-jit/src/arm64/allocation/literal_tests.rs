@@ -113,12 +113,13 @@ fn execute(
             }
         })
         .collect::<Vec<_>>();
+    let view = otter_vm::JitCompileSnapshot::without_feedback(0, 0, 0, vec![]);
     let mut relocations = RelocationCapture::default();
     match layout {
         Layout::Object(plan) => emit_object_literal(
             &mut ops,
             &mut relocations,
-            &otter_vm::JitCompileSnapshot::without_feedback(0, 0, 0, vec![]),
+            &view,
             20,
             0,
             plan,
@@ -129,6 +130,7 @@ fn execute(
                     stored_shapes: smallvec::SmallVec::new(),
                     nullish_mask: 0,
                     int32: false,
+                    double: false,
                     int32_constant: None,
                 };
                 inputs.len()
@@ -367,6 +369,7 @@ fn zero_records_emit_no_observation_and_keep_the_buffer_live() {
         ops.finalize().unwrap().to_vec()
     };
     let view = otter_vm::JitCompileSnapshot::without_feedback(0, 0, 0, vec![]);
+
     for observed in [false, true] {
         let records: Vec<_> = (0..2)
             .map(|index| crate::field_store::FieldStoreOwner {
@@ -374,6 +377,7 @@ fn zero_records_emit_no_observation_and_keep_the_buffer_live() {
                 stored_shapes: smallvec::smallvec![4096],
                 nullish_mask: 0,
                 int32: false,
+                double: false,
                 int32_constant: None,
             })
             .collect();

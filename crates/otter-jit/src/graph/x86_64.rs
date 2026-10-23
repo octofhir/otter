@@ -414,7 +414,9 @@ impl<'a> Codegen<'a> {
                 self.emit_move(mov.from, mov.to);
             }
             let next = order.get(position + 1).copied();
-            self.audited(control, |codegen| codegen.emit_control(block, control, next))?;
+            self.audited(control, |codegen| {
+                codegen.emit_control(block, control, next)
+            })?;
         }
         debug_assert!(forwarders.is_empty());
         Ok(())

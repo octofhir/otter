@@ -140,6 +140,11 @@ pub type PostMarkProcessor = fn(&mut GcHeap);
 /// `type_complexity` lint quiet.
 pub type RootSlotVisitor<'a> = dyn FnMut(&mut dyn FnMut(*mut RawGc)) + 'a;
 
+/// Weak-reference processing over one collection's forwarding: the callback
+/// receives a resolver mapping a pre-collection cell to its survivor, or to
+/// `None` when it died.
+pub type WeakRefProcessor<'a> = dyn FnMut(&mut dyn FnMut(RawGc) -> Option<RawGc>) + 'a;
+
 /// Empty root set — every reachable object must come from a
 /// handle scope or a global handle.
 pub fn empty() -> EmptyRoots {

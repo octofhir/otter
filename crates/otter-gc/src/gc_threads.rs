@@ -2,25 +2,34 @@
 //!
 //! # Contents
 //! - [`GcThreads`] — the heap's helper threads and [`GcThreads::run`], which
-//!   runs one job on every helper and on the calling thread at once, or
-//!   [`GcThreads::start_background`] / [`GcThreads::join_background`], which
-//!   run one job on the helpers alone while the calling thread continues.
+//!   runs one job on the calling thread and on every helper that joins it
+//!   while it is open, or [`GcThreads::start_background`] /
+//!   [`GcThreads::join_background`], which run one job on the helpers alone
+//!   while the calling thread continues.
 //! - [`WorkPool`] — chunks of work the workers of one job hand each other,
-//!   and the termination test of a job that ends when all of them run dry.
+//!   and the termination test of a job that ends when every worker that
+//!   joined it runs dry.
 //!
 //! # Invariants
 //! - The threads belong to one heap: they start at its first parallel job and
 //!   are stopped and joined when it drops. No state is shared between heaps.
+//! - Participation is dynamic. A helper runs a job only if it joins while the
+//!   job is open; the posting thread closes it when its own part returns and
+//!   then waits only for the helpers that joined. A helper that wakes after
+//!   the close skips the job without touching its context, so a pause never
+//!   waits for a thread the scheduler has not run yet, and a job's work must
+//!   be complete with any number of helpers, none included.
 //! - A job runs only while the collecting thread is inside
-//!   [`GcThreads::run`]; `run` returns after every helper finished it, so a
-//!   job may borrow the caller's stack. A background job runs from
+//!   [`GcThreads::run`]; `run` returns after every joined helper finished it,
+//!   so a job may borrow the caller's stack. A background job runs from
 //!   `start_background` until `join_background` returns; its context must
 //!   outlive that, and no other job starts in between.
 //! - A panic on any thread inside a job aborts the process: the heap is
 //!   partially collected and cannot be resumed or unwound safely.
-//! - [`WorkPool::take`] reports the end of a job only when every worker is
-//!   waiting in it with nothing shared and no other source of work left, so
-//!   no worker can still produce a chunk.
+//! - [`WorkPool::take`] reports the end of a job only when every worker that
+//!   joined the pool is waiting in it with nothing shared and no other source
+//!   of work left, so no worker can still produce a chunk; a worker joining
+//!   after that finds the job ended.
 //!
 //! # See also
 //! - [`crate::scavenger`] — the parallel copying collection that uses them.
@@ -50,8 +59,10 @@ struct State {
     /// Incremented once per job.
     generation: u64,
     job: Option<Job>,
-    /// Helpers still running the current job.
-    running: usize,
+    /// Helpers may still join the current job.
+    open: bool,
+    /// Helpers that joined the current job and have not finished it.
+    active: usize,
     stopping: bool,
 }
 
@@ -101,30 +112,33 @@ impl GcThreads {
         self.threads.len() + 1
     }
 
-    /// Run `work(context, index)` on every worker, the calling thread as
-    /// index 0, and return when all of them have finished.
+    /// Run `work(context, 0)` on the calling thread and `work(context, index)`
+    /// on every helper that joins before that returns, and return when the
+    /// joined helpers have finished.
     ///
     /// # Safety
     /// `work` must be safe to run concurrently with itself for distinct
     /// indices below [`Self::workers`] over the same `context`, which must
-    /// stay valid until this returns.
+    /// stay valid until this returns, and must complete the job whichever
+    /// helpers run it.
     pub(crate) unsafe fn run(&mut self, work: unsafe fn(*const (), usize), context: *const ()) {
         debug_assert!(!self.background, "a background job holds the helpers");
-        let helpers = self.threads.len();
-        if helpers != 0 {
-            self.post(Job { work, context }, helpers);
+        let helpers = !self.threads.is_empty();
+        if helpers {
+            self.post(Job { work, context });
         }
         abort_on_panic(|| {
             // SAFETY: forwarded from the caller.
             unsafe { work(context, 0) }
         });
-        if helpers != 0 {
-            self.wait_helpers();
+        if helpers {
+            self.close_and_wait();
         }
     }
 
-    /// Run `work(context, index)` on every helper, indices from 1, and return
-    /// at once; the number of helpers running it, zero when there are none.
+    /// Run `work(context, index)` on the helpers, indices from 1, and return
+    /// at once; the number of helpers that may join it, zero when there are
+    /// none.
     ///
     /// # Safety
     /// As [`Self::run`] for the helpers' indices; `context` must stay valid
@@ -139,31 +153,33 @@ impl GcThreads {
         self.workers();
         let helpers = self.threads.len();
         if helpers != 0 {
-            self.post(Job { work, context }, helpers);
+            self.post(Job { work, context });
             self.background = true;
         }
         helpers
     }
 
-    /// Wait until every helper returned from the background job.
+    /// Close the background job and wait until every helper that joined it
+    /// returned.
     pub(crate) fn join_background(&mut self) {
         if std::mem::take(&mut self.background) {
-            self.wait_helpers();
+            self.close_and_wait();
         }
     }
 
-    fn post(&self, job: Job, helpers: usize) {
+    fn post(&self, job: Job) {
         let mut state = self.shared.lock();
         state.generation += 1;
         state.job = Some(job);
-        state.running = helpers;
+        state.open = true;
         drop(state);
         self.shared.start.notify_all();
     }
 
-    fn wait_helpers(&self) {
+    fn close_and_wait(&self) {
         let mut state = self.shared.lock();
-        while state.running != 0 {
+        state.open = false;
+        while state.active != 0 {
             state = self
                 .shared
                 .done
@@ -194,11 +210,16 @@ fn help(shared: &Shared, index: usize) {
                 if state.stopping {
                     return;
                 }
-                if state.generation != seen
-                    && let Some(job) = state.job
-                {
+                if state.generation != seen {
+                    // A closed job is over for this helper: its context may
+                    // already be gone.
                     seen = state.generation;
-                    break job;
+                    if state.open
+                        && let Some(job) = state.job
+                    {
+                        state.active += 1;
+                        break job;
+                    }
                 }
                 state = shared
                     .start
@@ -212,8 +233,8 @@ fn help(shared: &Shared, index: usize) {
             unsafe { (job.work)(job.context, index) }
         });
         let mut state = shared.lock();
-        state.running -= 1;
-        if state.running == 0 {
+        state.active -= 1;
+        if state.active == 0 {
             shared.done.notify_all();
         }
     }
@@ -231,28 +252,36 @@ pub(crate) struct WorkPool<T> {
     wake: Condvar,
     /// Workers waiting in [`Self::take`]; read without the lock as a hint.
     idle: AtomicUsize,
-    workers: usize,
 }
 
 struct PoolState<T> {
     chunks: Vec<Vec<T>>,
     idle: usize,
+    /// Workers that joined: the collecting thread and every helper that
+    /// called [`WorkPool::join`].
+    workers: usize,
     done: bool,
 }
 
 impl<T> WorkPool<T> {
-    /// A pool shared by `workers` workers.
-    pub(crate) fn new(workers: usize) -> Self {
+    /// A pool the collecting thread works on; helpers [`Self::join`] it.
+    pub(crate) fn new() -> Self {
         Self {
             state: Mutex::new(PoolState {
                 chunks: Vec::new(),
                 idle: 0,
+                workers: 1,
                 done: false,
             }),
             wake: Condvar::new(),
             idle: AtomicUsize::new(0),
-            workers,
         }
+    }
+
+    /// Count a helper as a worker of this pool before it takes or shares
+    /// anything. After the job ended its [`Self::take`] returns `None`.
+    pub(crate) fn join(&self) {
+        self.lock().workers += 1;
     }
 
     fn lock(&self) -> MutexGuard<'_, PoolState<T>> {
@@ -272,8 +301,8 @@ impl<T> WorkPool<T> {
     }
 
     /// Take a shared chunk, waiting while another worker may still share
-    /// one. `None` once every worker waits here with nothing shared and
-    /// `exhausted` reports no other source of work.
+    /// one. `None` once every joined worker waits here with nothing shared
+    /// and `exhausted` reports no other source of work.
     pub(crate) fn take(&self, exhausted: impl Fn() -> bool) -> Option<Vec<T>> {
         let mut state = self.lock();
         loop {
@@ -283,7 +312,7 @@ impl<T> WorkPool<T> {
             if state.done {
                 return None;
             }
-            if state.idle + 1 == self.workers && exhausted() {
+            if state.idle + 1 == state.workers && exhausted() {
                 state.done = true;
                 self.wake.notify_all();
                 return None;

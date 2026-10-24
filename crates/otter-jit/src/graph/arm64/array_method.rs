@@ -7,9 +7,11 @@
 //!
 //! # Invariants
 //! - The receiver is proved an Array that reads the site's builtin from its
-//!   pinned `%Array.prototype%` before any effect; a failed proof, or for an
-//!   append an indexed accessor anywhere in the realm, leaves through the
-//!   eager deopt.
+//!   pinned `%Array.prototype%` before any effect: by the prototype's layout
+//!   and slot, or, when the site carries that prototype's chain proof, by the
+//!   generation's subscription to it, tested before the node. A failed proof,
+//!   or for an append an indexed accessor anywhere in the realm, leaves
+//!   through the eager deopt.
 //! - The inline paths cover an Array whose dense prefix is its whole length:
 //!   an append to tagged storage, which grows full or absent storage into a
 //!   nursery slab while no marking runs, and the removal of a present tagged
@@ -246,8 +248,14 @@ impl Codegen<'_> {
             field: call.method_field,
             native_ref: call.builtin_native_ref,
         };
-        let site = (byte_pc, call.entry_stub_id);
-        self.emit_intrinsic_method_identity(method, site, receiver, temp, exit);
+        // A subscribed chain proof is a dependency the generation tested
+        // before this node; only the receiver remains to prove.
+        if call.holder_validity.is_some() {
+            self.emit_intrinsic_receiver(target, receiver, exit);
+        } else {
+            let site = (byte_pc, call.entry_stub_id);
+            self.emit_intrinsic_method_identity(method, site, receiver, temp, exit);
+        }
         Ok(())
     }
 

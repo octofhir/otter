@@ -242,9 +242,7 @@ impl Interpreter {
         let source_work = view.code_block.source_work().total();
         let exit_count = u64::from(self.jit_entry_bail_counts.get(&fid).copied().unwrap_or(0))
             .saturating_add(
-                self.jit_optimized_exit_profiles
-                    .iter()
-                    .filter(|((profile_fid, _, _), _)| *profile_fid == fid)
+                self.exit_profiles_of(fid)
                     .map(|(_, profile)| u64::from(profile.count))
                     .sum::<u64>(),
             );
@@ -623,6 +621,7 @@ impl Interpreter {
         let owner = context.for_function(fid).ok()?;
         let context = &*owner;
         self.prewarm_literal_cells(context, fid)?;
+        self.prewarm_array_prototype_chain();
         let mut snapshot = context.jit_compile_snapshot(fid)?;
         snapshot.dependency_flag = self.jit_code_registry.dependency_flag();
         self.bake_literal_allocations(&mut snapshot, context, fid)?;
@@ -1080,6 +1079,7 @@ impl Interpreter {
         if self.prewarm_literal_cells(context, fid).is_none() {
             return TemplateCompileOutcome::Deferred;
         }
+        self.prewarm_array_prototype_chain();
         let Some(mut view) = context.jit_compile_snapshot(fid) else {
             return TemplateCompileOutcome::Deferred;
         };
@@ -2261,6 +2261,7 @@ impl Interpreter {
                     safepoint_id: native_abi::NO_SAFEPOINT,
                     argument_count: declaration.argument_count,
                     grow: None,
+                    holder_validity: None,
                 },
             );
         }
@@ -2545,6 +2546,22 @@ impl Interpreter {
     /// to be registered with the collector. Allocation failure only declines
     /// this optional compile; it does not publish a pending JavaScript throw or
     /// retain an error for later execution.
+    /// Give the default realm's %Array.prototype% chain the prototype role
+    /// whose writes retire proofs, once, so a bake reads that chain's validity
+    /// cell for an Array method call without allocating. Like the literal
+    /// prewarm, it runs before a body's snapshot and may collect.
+    fn prewarm_array_prototype_chain(&mut self) {
+        if self.active_realm_id != 0 || !self.gc_heap.has_frame_root_providers() {
+            return;
+        }
+        let Some(prototype) = self.default_array_prototype() else {
+            return;
+        };
+        if crate::object::prototype_validity::chain_validity(prototype, &self.gc_heap).is_none() {
+            let _ = self.prove_chain(Self::default_array_prototype);
+        }
+    }
+
     fn prewarm_literal_cells(&mut self, context: &ExecutionContext, fid: u32) -> Option<()> {
         if self.jit_retraining_blocks(fid) {
             return None;
@@ -2646,6 +2663,7 @@ impl Interpreter {
         }
         let result = (|| {
             self.prewarm_literal_cells(context, fid)?;
+            self.prewarm_array_prototype_chain();
             let mut body = context.jit_compile_snapshot(fid)?;
             self.bake_literal_allocations(&mut body, context, fid)?;
             Self::bake_typed_array_layout(&mut body);
@@ -2693,6 +2711,17 @@ impl Interpreter {
         }
     }
 
+    /// The optimizing exit evidence recorded for sites of `fid`, by PC and
+    /// reason: one range of the profile map, never a walk of every function's.
+    fn exit_profiles_of(
+        &self,
+        fid: u32,
+    ) -> impl Iterator<Item = (&(u32, u32, native_abi::ExitReason), &jit::JitExitProfile)> {
+        self.jit_optimized_exit_profiles
+            .range((fid, 0, native_abi::ExitReason::TypeMismatch)..)
+            .take_while(move |((profile_fid, _, _), _)| *profile_fid == fid)
+    }
+
     /// Bake the typed reasons at which earlier optimized generations of `fid`
     /// exited, and widen the baked feedback of those instructions.
     ///
@@ -2709,23 +2738,21 @@ impl Interpreter {
             .unwrap_or_default();
         let code_block = &snapshot.code_block;
         snapshot.optimized_exit_reasons = self
-            .jit_optimized_exit_profiles
-            .iter()
+            .exit_profiles_of(fid)
             // An insufficient-feedback exit only collected feedback, and a
             // runtime transition resumed a call no speculation guarded; the
             // site speculates again from what it has observed since. So does
             // a property site whose inline cache learned another receiver
             // program after its shape guard failed: the receiver that left
             // is now part of the feedback.
-            .filter_map(|(&(profile_fid, pc, reason), profile)| {
+            .filter_map(|(&(_, pc, reason), profile)| {
                 let relearned = reason == native_abi::ExitReason::ShapeGuard
                     && profile.feedback_population.is_some_and(|population| {
                         code_block
                             .property_site_population(pc as usize)
                             .is_some_and(|current| current != population)
                     });
-                (profile_fid == fid
-                    && !relearned
+                (!relearned
                     && !matches!(
                         reason,
                         native_abi::ExitReason::InsufficientFeedback
@@ -2750,8 +2777,8 @@ impl Interpreter {
         // A site that an earlier generation left to collect feedback has
         // executed since. An element site that still records no family meets
         // receivers no generated access describes, and is no longer unseen.
-        for &(profile_fid, pc, reason) in self.jit_optimized_exit_profiles.keys() {
-            if profile_fid == fid && reason == native_abi::ExitReason::InsufficientFeedback {
+        for (&(_, pc, reason), _) in self.exit_profiles_of(fid) {
+            if reason == native_abi::ExitReason::InsufficientFeedback {
                 snapshot.feedback_exits.insert(pc);
                 if let Some(instruction) = snapshot.instructions.get(pc as usize) {
                     snapshot.unseen_element_sites.remove(&instruction.byte_pc);

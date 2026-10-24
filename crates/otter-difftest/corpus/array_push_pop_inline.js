@@ -1,6 +1,7 @@
 // Array push and pop at hot method sites: inline appends and removals, growth,
-// holes, numeric storage, young values in retained arrays, and every receiver
-// state that leaves the inline path.
+// holes, numeric storage, young values in retained arrays, every receiver
+// state that leaves the inline path, and a callee that replaces the builtin
+// or extends %Array.prototype% while a hot loop runs.
 const results = [];
 
 // A collection whose add and removeLast are inlined into their callers.
@@ -96,5 +97,25 @@ const observed = [0, 1, 2];
 results.push(pushOne(observed, 3), setterCalls, observed.length, Object.prototype.hasOwnProperty.call(observed, 3));
 delete Object.prototype[3];
 results.push(pushOne(observed, 4), observed.join());
+
+// A call inside the hot loop replaces push, then adds an unrelated method:
+// the pushes after it see the replacement, then the restored builtin.
+const pushes = [];
+function sometimes(round) {
+  if (round === 4000) Array.prototype.push = function (value) { return originalPush.call(this, -value); };
+  if (round === 6000) { Array.prototype.push = originalPush; Array.prototype.extra = function () { return 1; }; }
+}
+function pushLoop(rounds) {
+  let sum = 0;
+  for (let round = 0; round < rounds; round++) {
+    pushes.push(round);
+    sum += pushes[pushes.length - 1];
+    sometimes(round);
+    if (pushes.length > 8) pushes.length = 0;
+  }
+  return sum;
+}
+results.push(pushLoop(9000), [].extra());
+delete Array.prototype.extra;
 
 console.log(JSON.stringify(results));

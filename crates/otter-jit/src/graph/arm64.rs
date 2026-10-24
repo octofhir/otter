@@ -2861,31 +2861,9 @@ impl<'a> Codegen<'a> {
         temp: u8,
         miss: DynamicLabel,
     ) {
+        self.emit_intrinsic_receiver(method.receiver, value, miss);
         let target = method.receiver;
         let view = self.view;
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; tst X(value), #0xfffe_0000_0000_0007
-            ; b.ne =>miss
-            ; cbz X(value), =>miss
-            ; ldrb w16, [X(value)]
-            ; cmp w16, u32::from(target.type_tag)
-            ; b.ne =>miss
-        );
-        if let Some(guard) = target.guard {
-            self.emit_body_guard(value, guard, miss);
-        }
-        if let Some(realm) = target.active_realm {
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; ldr x16, [x20, THREAD_OFFSET]
-                ; ldr x16, [x16, crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
-                ; cbz x16, =>miss
-                ; ldr w16, [x16]
-            );
-            self.load_immediate(17, u64::from(realm));
-            dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>miss);
-        }
         // The pinned prototype, its shape, and the native in the slot.
         emit_load_symbol_u64(
             &mut self.ops,
@@ -2915,6 +2893,40 @@ impl<'a> Codegen<'a> {
             dynasm!(self.ops ; .arch aarch64 ; ldr X(temp), [x16, x17]);
         }
         self.emit_native_identity(temp, method.native_ref, miss);
+    }
+
+    /// Branch to `miss` unless `X(value)` is a body of `target`'s family whose
+    /// named lookup starts at its pinned prototype, in the realm the proof
+    /// names. Clobbers only `x16` and `x17`.
+    fn emit_intrinsic_receiver(
+        &mut self,
+        target: otter_vm::jit::JitIntrinsicPrototype,
+        value: u8,
+        miss: DynamicLabel,
+    ) {
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(value), #0xfffe_0000_0000_0007
+            ; b.ne =>miss
+            ; cbz X(value), =>miss
+            ; ldrb w16, [X(value)]
+            ; cmp w16, u32::from(target.type_tag)
+            ; b.ne =>miss
+        );
+        if let Some(guard) = target.guard {
+            self.emit_body_guard(value, guard, miss);
+        }
+        if let Some(realm) = target.active_realm {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; ldr x16, [x20, THREAD_OFFSET]
+                ; ldr x16, [x16, crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
+                ; cbz x16, =>miss
+                ; ldr w16, [x16]
+            );
+            self.load_immediate(17, u64::from(realm));
+            dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>miss);
+        }
     }
 
     /// The method of the guarded method call at `byte_pc` into

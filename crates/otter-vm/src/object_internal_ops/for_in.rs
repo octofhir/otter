@@ -32,7 +32,9 @@ impl Interpreter {
     /// The keys `for (k in target)` visits when no prototype contributes an
     /// enumerable string key: a shaped receiver's from its shape's enum
     /// cache, a dictionary receiver's read from its own storage. `None` when
-    /// the receiver or a prototype needs the general enumeration.
+    /// the receiver or a prototype needs the general enumeration. Building a
+    /// prototype's key array may collect even on the way to `None`: the
+    /// caller re-reads `target` from a root before using it again.
     pub(crate) fn for_in_cached_keys(&mut self, target: Value) -> Result<Option<Value>, VmError> {
         let Some(receiver) = target.as_object() else {
             return Ok(None);

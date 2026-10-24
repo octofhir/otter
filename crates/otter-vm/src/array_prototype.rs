@@ -439,7 +439,8 @@ fn try_dense_array_callback_fast_path(
                 &mapped,
                 &mut external_visit,
             )
-            .map(|_| target)
+            // The visitor rewrote `target_root` if the write moved it.
+            .map(|_| target_root)
             .map_err(|_| NativeError::TypeError {
                 name: "map",
                 reason: "out of memory".to_string(),
@@ -478,7 +479,8 @@ fn try_dense_array_callback_fast_path(
                 &filtered,
                 &mut external_visit,
             )
-            .map(|_| target)
+            // The visitor rewrote `target_root` if the write moved it.
+            .map(|_| target_root)
             .map_err(|_| NativeError::TypeError {
                 name: "filter",
                 reason: "out of memory".to_string(),
@@ -1359,24 +1361,35 @@ impl Interpreter {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
                 .map_err(CommittedValueError::JavaScript)?
         };
-        let len = length_of_array_like(self, stack, context, &o)?;
-        let n = self.coerce_to_number(stack, context, &index)?.as_f64();
-        let relative = if n.is_nan() {
-            0.0
-        } else if n.is_infinite() {
-            n
-        } else {
-            n.trunc()
-        };
-        let actual = if relative < 0.0 {
-            len as f64 + relative
-        } else {
-            relative
-        };
-        if !actual.is_finite() || actual < 0.0 || actual >= len as f64 {
-            return Ok(Value::undefined());
-        }
-        self.array_method_get_property(stack, context, o, &format_index_key(actual))
+        // `length` and the index coercion can run user code that collects:
+        // the receiver and index are anchored and read back after each.
+        let o_anchor = self.push_iteration_anchor(o) - 1;
+        let index_anchor = self.push_iteration_anchor(index) - 1;
+        let result = (|| {
+            let o = self.iteration_anchor(o_anchor);
+            let len = length_of_array_like(self, stack, context, &o)?;
+            let index = self.iteration_anchor(index_anchor);
+            let n = self.coerce_to_number(stack, context, &index)?.as_f64();
+            let relative = if n.is_nan() {
+                0.0
+            } else if n.is_infinite() {
+                n
+            } else {
+                n.trunc()
+            };
+            let actual = if relative < 0.0 {
+                len as f64 + relative
+            } else {
+                relative
+            };
+            if !actual.is_finite() || actual < 0.0 || actual >= len as f64 {
+                return Ok(Value::undefined());
+            }
+            let o = self.iteration_anchor(o_anchor);
+            self.array_method_get_property(stack, context, o, &format_index_key(actual))
+        })();
+        self.pop_iteration_anchors_to(o_anchor);
+        result
     }
 
     /// §23.1.3.27 live `Array.prototype.reverse`.
@@ -2874,23 +2887,42 @@ impl Interpreter {
                 return Ok(crate::array::pop(arr, self.gc_heap_mut()));
             }
         }
-        let len = length_of_array_like(self, stack, context, &o)? as f64;
-        if len == 0.0 {
-            self.array_set_length_throwing(stack, context, o, 0.0)?;
-            return Ok(Value::undefined());
-        }
-        let new_len = len - 1.0;
-        let key = format_index_key(new_len);
-        let element = self.get_property_value_for_call(stack, context, o, &key)?;
-        let deleted =
-            self.ordinary_delete_value(stack, context, o, &crate::VmPropertyKey::String(&key), 0)?;
-        if !deleted {
-            return Err(CommittedValueError::JavaScript(
-                self.err_type((format!("Cannot delete property '{key}'")).into()),
-            ));
-        }
-        self.array_set_length_throwing(stack, context, o, new_len)?;
-        Ok(element)
+        // Every step below can run user code that collects: the receiver and
+        // the removed element are anchored and read back after each.
+        let o_anchor = self.push_iteration_anchor(o) - 1;
+        let element_anchor = self.push_iteration_anchor(Value::undefined()) - 1;
+        let result = (|| {
+            let o = self.iteration_anchor(o_anchor);
+            let len = length_of_array_like(self, stack, context, &o)? as f64;
+            if len == 0.0 {
+                let o = self.iteration_anchor(o_anchor);
+                self.array_set_length_throwing(stack, context, o, 0.0)?;
+                return Ok(Value::undefined());
+            }
+            let new_len = len - 1.0;
+            let key = format_index_key(new_len);
+            let o = self.iteration_anchor(o_anchor);
+            let element = self.get_property_value_for_call(stack, context, o, &key)?;
+            self.set_iteration_anchor(element_anchor, element);
+            let o = self.iteration_anchor(o_anchor);
+            let deleted = self.ordinary_delete_value(
+                stack,
+                context,
+                o,
+                &crate::VmPropertyKey::String(&key),
+                0,
+            )?;
+            if !deleted {
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type((format!("Cannot delete property '{key}'")).into()),
+                ));
+            }
+            let o = self.iteration_anchor(o_anchor);
+            self.array_set_length_throwing(stack, context, o, new_len)?;
+            Ok(self.iteration_anchor(element_anchor))
+        })();
+        self.pop_iteration_anchors_to(o_anchor);
+        result
     }
 
     /// §23.1.3.26 live `Array.prototype.shift`.
@@ -2923,34 +2955,51 @@ impl Interpreter {
                 return Ok(crate::array::dense_shift(arr, self.gc_heap_mut()));
             }
         }
-        let len = length_of_array_like(self, stack, context, &o)?;
-        if len == 0 {
-            self.array_set_length_throwing(stack, context, o, 0.0)?;
-            return Ok(Value::undefined());
-        }
-        let first = self.get_property_value_for_call(stack, context, o, "0")?;
-        let scan_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
-        for k in 1..scan_len {
-            let from = k.to_string();
-            let to = (k - 1).to_string();
-            let has = self.ordinary_has_property_value(
-                stack,
-                Some(context),
-                o,
-                &crate::VmPropertyKey::String(&from),
-                0,
-            )?;
-            if has {
-                let value = self.get_property_value_for_call(stack, context, o, &from)?;
-                self.array_set_property_throwing(stack, context, o, &to, value)?;
-            } else {
-                self.array_delete_property_throwing(stack, context, o, &to)?;
+        // Every step below can run user code that collects: the receiver and
+        // the first element are anchored and read back after each.
+        let o_anchor = self.push_iteration_anchor(o) - 1;
+        let first_anchor = self.push_iteration_anchor(Value::undefined()) - 1;
+        let result = (|| {
+            let o = self.iteration_anchor(o_anchor);
+            let len = length_of_array_like(self, stack, context, &o)?;
+            if len == 0 {
+                let o = self.iteration_anchor(o_anchor);
+                self.array_set_length_throwing(stack, context, o, 0.0)?;
+                return Ok(Value::undefined());
             }
-        }
-        let tail = format_index_key((len - 1) as f64);
-        self.array_delete_property_throwing(stack, context, o, &tail)?;
-        self.array_set_length_throwing(stack, context, o, (len - 1) as f64)?;
-        Ok(first)
+            let o = self.iteration_anchor(o_anchor);
+            let first = self.get_property_value_for_call(stack, context, o, "0")?;
+            self.set_iteration_anchor(first_anchor, first);
+            let scan_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
+            for k in 1..scan_len {
+                let from = k.to_string();
+                let to = (k - 1).to_string();
+                let o = self.iteration_anchor(o_anchor);
+                let has = self.ordinary_has_property_value(
+                    stack,
+                    Some(context),
+                    o,
+                    &crate::VmPropertyKey::String(&from),
+                    0,
+                )?;
+                let o = self.iteration_anchor(o_anchor);
+                if has {
+                    let value = self.get_property_value_for_call(stack, context, o, &from)?;
+                    let o = self.iteration_anchor(o_anchor);
+                    self.array_set_property_throwing(stack, context, o, &to, value)?;
+                } else {
+                    self.array_delete_property_throwing(stack, context, o, &to)?;
+                }
+            }
+            let tail = format_index_key((len - 1) as f64);
+            let o = self.iteration_anchor(o_anchor);
+            self.array_delete_property_throwing(stack, context, o, &tail)?;
+            let o = self.iteration_anchor(o_anchor);
+            self.array_set_length_throwing(stack, context, o, (len - 1) as f64)?;
+            Ok(self.iteration_anchor(first_anchor))
+        })();
+        self.pop_iteration_anchors_to(o_anchor);
+        result
     }
 
     /// §23.1.3.34 live `Array.prototype.unshift`.
@@ -2987,9 +3036,14 @@ impl Interpreter {
                 )
             {
                 let mut new_len = cur;
+                // Each insertion may grow the storage and collect: the array
+                // is traced through this slot and read back before the next.
+                let array_root = Value::array(arr);
                 for (i, &arg) in args.iter().enumerate().rev() {
                     let rest = &args[..i];
+                    let arr = array_root.as_array().expect("unshift receiver is an Array");
                     let mut visit = |v: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                        array_root.trace_value_slots(v);
                         for slice in roots {
                             for val in *slice {
                                 val.trace_value_slots(v);
@@ -4025,16 +4079,30 @@ impl Interpreter {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
                 .map_err(CommittedValueError::JavaScript)?
         };
-        let len = length_of_array_like(self, stack, context, &o)?;
-        self.ensure_change_by_copy_len(len)
-            .map_err(CommittedValueError::JavaScript)?;
-        let mut out = Vec::with_capacity(len);
-        for k in 0..len {
-            let from = format_index_key((len - k - 1) as f64);
-            out.push(self.array_method_get_property(stack, context, o, &from)?);
-        }
-        self.array_create_from_dense_values(out)
-            .map_err(CommittedValueError::JavaScript)
+        // Each read can run user code that collects: the receiver and every
+        // value read so far are anchored until the copy is built.
+        let o_anchor = self.push_iteration_anchor(o) - 1;
+        let result = (|| {
+            let o = self.iteration_anchor(o_anchor);
+            let len = length_of_array_like(self, stack, context, &o)?;
+            self.ensure_change_by_copy_len(len)
+                .map_err(CommittedValueError::JavaScript)?;
+            let mut items = Vec::with_capacity(len);
+            for k in 0..len {
+                let from = format_index_key((len - k - 1) as f64);
+                let o = self.iteration_anchor(o_anchor);
+                let item = self.array_method_get_property(stack, context, o, &from)?;
+                items.push(self.push_iteration_anchor(item) - 1);
+            }
+            let values = items
+                .into_iter()
+                .map(|anchor| self.iteration_anchor(anchor))
+                .collect();
+            self.array_create_from_dense_values(values)
+                .map_err(CommittedValueError::JavaScript)
+        })();
+        self.pop_iteration_anchors_to(o_anchor);
+        result
     }
 
     /// §23.1.3.40 live `Array.prototype.toSpliced`.
@@ -4052,52 +4120,63 @@ impl Interpreter {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
                 .map_err(CommittedValueError::JavaScript)?
         };
-        let len = length_of_array_like(self, stack, context, &o)?;
-        let actual_start = self.array_relative_index(stack, context, args.first(), 0.0, len)?;
-        let insert_count = args.len().saturating_sub(2);
-        let skip_count = match args.len() {
-            0 => 0,
-            1 => len.saturating_sub(actual_start),
-            _ => self.array_clamped_count(
-                stack,
-                context,
-                &args[1],
-                len.saturating_sub(actual_start),
-            )?,
-        };
-        let new_len = len
-            .checked_sub(skip_count)
-            .and_then(|n| n.checked_add(insert_count))
-            .ok_or_else(|| self.err_type(("Invalid array length".to_string()).into()))
-            .map_err(CommittedValueError::JavaScript)?;
-        if new_len > MAX_SAFE_ARRAY_LENGTH {
-            return Err(CommittedValueError::JavaScript(
-                self.err_type(("Invalid array length".to_string()).into()),
-            ));
-        }
-        self.ensure_change_by_copy_len(new_len)
-            .map_err(CommittedValueError::JavaScript)?;
+        // Each coercion and read can run user code that collects: the
+        // receiver and every value of the copy are anchored until it is
+        // built. `args` is the call's rooted window.
+        let o_anchor = self.push_iteration_anchor(o) - 1;
+        let result = (|| {
+            let o = self.iteration_anchor(o_anchor);
+            let len = length_of_array_like(self, stack, context, &o)?;
+            let actual_start = self.array_relative_index(stack, context, args.first(), 0.0, len)?;
+            let insert_count = args.len().saturating_sub(2);
+            let skip_count = match args.len() {
+                0 => 0,
+                1 => len.saturating_sub(actual_start),
+                _ => self.array_clamped_count(
+                    stack,
+                    context,
+                    &args[1],
+                    len.saturating_sub(actual_start),
+                )?,
+            };
+            let new_len = len
+                .checked_sub(skip_count)
+                .and_then(|n| n.checked_add(insert_count))
+                .ok_or_else(|| self.err_type(("Invalid array length".to_string()).into()))
+                .map_err(CommittedValueError::JavaScript)?;
+            if new_len > MAX_SAFE_ARRAY_LENGTH {
+                return Err(CommittedValueError::JavaScript(
+                    self.err_type(("Invalid array length".to_string()).into()),
+                ));
+            }
+            self.ensure_change_by_copy_len(new_len)
+                .map_err(CommittedValueError::JavaScript)?;
 
-        let mut out = Vec::with_capacity(new_len);
-        for k in 0..actual_start {
-            out.push(self.array_method_get_property(
-                stack,
-                context,
-                o,
-                &format_index_key(k as f64),
-            )?);
-        }
-        out.extend(args.iter().skip(2).copied());
-        for k in (actual_start + skip_count)..len {
-            out.push(self.array_method_get_property(
-                stack,
-                context,
-                o,
-                &format_index_key(k as f64),
-            )?);
-        }
-        self.array_create_from_dense_values(out)
-            .map_err(CommittedValueError::JavaScript)
+            let mut items = Vec::with_capacity(new_len);
+            for k in 0..actual_start {
+                let o = self.iteration_anchor(o_anchor);
+                let item =
+                    self.array_method_get_property(stack, context, o, &format_index_key(k as f64))?;
+                items.push(self.push_iteration_anchor(item) - 1);
+            }
+            for &inserted in args.iter().skip(2) {
+                items.push(self.push_iteration_anchor(inserted) - 1);
+            }
+            for k in (actual_start + skip_count)..len {
+                let o = self.iteration_anchor(o_anchor);
+                let item =
+                    self.array_method_get_property(stack, context, o, &format_index_key(k as f64))?;
+                items.push(self.push_iteration_anchor(item) - 1);
+            }
+            let values = items
+                .into_iter()
+                .map(|anchor| self.iteration_anchor(anchor))
+                .collect();
+            self.array_create_from_dense_values(values)
+                .map_err(CommittedValueError::JavaScript)
+        })();
+        self.pop_iteration_anchors_to(o_anchor);
+        result
     }
 
     /// §23.1.3.41 live `Array.prototype.toSorted`.
@@ -4177,25 +4256,43 @@ impl Interpreter {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
                 .map_err(CommittedValueError::JavaScript)?
         };
-        let len = length_of_array_like(self, stack, context, &o)?;
-        self.ensure_change_by_copy_len(len)
-            .map_err(CommittedValueError::JavaScript)?;
-        let actual = self.array_relative_index_strict(stack, context, &index, len)?;
-        let mut out = Vec::with_capacity(len);
-        for k in 0..len {
-            if k == actual {
-                out.push(value);
-            } else {
-                out.push(self.array_method_get_property(
-                    stack,
-                    context,
-                    o,
-                    &format_index_key(k as f64),
-                )?);
+        // Each coercion and read can run user code that collects: the
+        // receiver, the arguments and every value of the copy are anchored
+        // until it is built.
+        let o_anchor = self.push_iteration_anchor(o) - 1;
+        let index_anchor = self.push_iteration_anchor(index) - 1;
+        let value_anchor = self.push_iteration_anchor(value) - 1;
+        let result = (|| {
+            let o = self.iteration_anchor(o_anchor);
+            let len = length_of_array_like(self, stack, context, &o)?;
+            self.ensure_change_by_copy_len(len)
+                .map_err(CommittedValueError::JavaScript)?;
+            let index = self.iteration_anchor(index_anchor);
+            let actual = self.array_relative_index_strict(stack, context, &index, len)?;
+            let mut items = Vec::with_capacity(len);
+            for k in 0..len {
+                if k == actual {
+                    items.push(value_anchor);
+                } else {
+                    let o = self.iteration_anchor(o_anchor);
+                    let item = self.array_method_get_property(
+                        stack,
+                        context,
+                        o,
+                        &format_index_key(k as f64),
+                    )?;
+                    items.push(self.push_iteration_anchor(item) - 1);
+                }
             }
-        }
-        self.array_create_from_dense_values(out)
-            .map_err(CommittedValueError::JavaScript)
+            let values = items
+                .into_iter()
+                .map(|anchor| self.iteration_anchor(anchor))
+                .collect();
+            self.array_create_from_dense_values(values)
+                .map_err(CommittedValueError::JavaScript)
+        })();
+        self.pop_iteration_anchors_to(o_anchor);
+        result
     }
 
     fn ensure_change_by_copy_len(&self, len: usize) -> Result<(), VmError> {

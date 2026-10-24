@@ -1,7 +1,9 @@
 // Keyed stores at an array's length append: hot loops filling fresh arrays
 // with objects, closures and numbers, gaps past the length, arrays that
-// turn holey, frozen or sealed arrays, and an indexed setter on the
-// prototype must answer exactly what the interpreter answers.
+// turn holey, frozen or sealed arrays, an indexed setter on the prototype,
+// and numeric storage appended to, popped, truncated, grown past its
+// capacity and turned tagged by a later value must answer exactly what the
+// interpreter answers.
 'use strict';
 function fill(count, make) {
   const out = [];
@@ -47,4 +49,21 @@ log.push(viaSetter.length, 7 in viaSetter, setterHits);
 delete Array.prototype[7];
 const after = fill(10, (i) => i);
 log.push(after.length, after[7]);
+function numeric(rounds) {
+  let sum = 0;
+  for (let r = 0; r < rounds; r++) {
+    const a = [];
+    for (let i = 0; i < 40; i++) a[i] = i * 0.5;
+    a.pop();
+    a[a.length] = -1;
+    a.length = 10;
+    a[a.length] = 2.25;
+    if (r % 97 === 0) a[a.length] = 'tag';
+    const holey = [1.5, , 3.5];
+    holey[holey.length] = 4.5;
+    sum += a.length + a[10] + (typeof a[11] === 'string' ? 100 : 0) + holey.length + (1 in holey ? 1 : 0);
+  }
+  return sum;
+}
+log.push(numeric(3000));
 console.log(checksum, JSON.stringify(log));

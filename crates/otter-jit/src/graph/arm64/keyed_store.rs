@@ -3,7 +3,8 @@
 //! # Contents
 //! - [`Codegen::emit_store_keyed_cached`] stores into an Array's dense
 //!   storage of any kind inline, appends at its length inline into tagged
-//!   storage with room and through the VM's push leaf otherwise, stores a
+//!   or packed numeric storage with room and through the VM's push leaf
+//!   otherwise, stores a
 //!   Number into a typed view of any non-BigInt kind inline, a name key
 //!   through the code object's keyed table routine, and every other store in
 //!   the runtime.
@@ -18,10 +19,11 @@
 //!   cleared and counted, and the last one makes the storage packed. A
 //!   tagged cell value takes the element write barrier.
 //! - An append is an ordinary own addition under the same permit as a
-//!   hole store, and never allocates: inline only into tagged storage whose
-//!   dense prefix is the whole length and below its capacity, the value
-//!   taking the element write barrier before the Array's dense length, its
-//!   slab's length and its `length` move together; the push leaf completes
+//!   hole store, and never allocates: inline only into tagged or packed
+//!   numeric storage whose dense prefix is the whole length and below its
+//!   capacity, a tagged value taking the element write barrier and a numeric
+//!   one stored as its double over a clear hole bit, before the Array's dense
+//!   length, its slab's length and its `length` move together; the push leaf completes
 //!   any other append only within the storage's capacity and its own
 //!   dense-range guards.
 //! - A typed view is stored into inline only through its cached element
@@ -91,11 +93,10 @@ impl Codegen<'_> {
         // the push leaf.
         self.emit_hole_store_permit(storage, receiver, runtime);
         let leaf = self.ops.new_dynamic_label();
+        let append_tagged = self.ops.new_dynamic_label();
+        let appended = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
-            ; ldrb w17, [X(receiver), numeric.kind_byte]
-            ; cmp w17, u32::from(storage.tagged_kind)
-            ; b.ne =>leaf
             ; ldr w17, [X(receiver), storage.logical_length_byte]
             ; cmp w17, W(length)
             ; b.ne =>leaf
@@ -103,11 +104,28 @@ impl Codegen<'_> {
             ; cmp W(length), w17
             ; b.hs =>leaf
             ; ldr X(base), [X(receiver), storage.base_byte]
+            ; ldrb w17, [X(receiver), numeric.kind_byte]
+            ; cmp w17, u32::from(storage.tagged_kind)
+            ; b.eq =>append_tagged
+            ; cmp w17, u32::from(numeric.packed_kind)
+            ; b.ne =>leaf
+        );
+        // Packed numeric storage takes a Number as its double; its new slot
+        // must read as present, as the VM's own write leaves it.
+        self.emit_tagged_to_float(value, 31, leaf);
+        self.emit_hole_bit(numeric, base, index);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; b.ne =>leaf
+            ; str d31, [X(base), W(index), uxtw #3]
+            ; b =>appended
+            ; =>append_tagged
             ; str X(value), [X(base), W(index), uxtw #3]
         );
         self.emit_element_write_barrier(node, base, index, value, &[receiver, length, base]);
         dynasm!(self.ops
             ; .arch aarch64
+            ; =>appended
             ; add w16, WSP(length), #1
             ; str w16, [X(receiver), storage.length_byte]
             ; stur w16, [X(base), storage.slab_length_from_base]

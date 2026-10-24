@@ -2617,10 +2617,13 @@ fn reserve_dense_capacity(
         return Ok(());
     }
     // A shared slab reports no capacity, but its whole live prefix moves.
-    let grown = target_len
-        .max(live_len)
-        .max(current_capacity.saturating_mul(2))
-        .max(4);
+    // Growth adds half the capacity plus sixteen, so a run of appends grows
+    // a few times and a small array's first growth already leaves room.
+    let grown = target_len.max(live_len).max(
+        current_capacity
+            .saturating_add(current_capacity / 2)
+            .saturating_add(16),
+    );
     let target_kind = match (current_kind, preferred_kind) {
         (DenseElementKind::Tagged, _) | (_, DenseElementKind::Tagged) => DenseElementKind::Tagged,
         (DenseElementKind::Empty, preferred) => preferred,
@@ -2648,6 +2651,18 @@ fn reserve_dense_capacity(
     heap.with_payload(owner, |body| {
         let old_slab = elements::body_of(body.slab);
         let new_slab = elements::body_of(slab).expect("fresh element slab");
+        // A prefix of the same kind moves as a block.
+        if let Some(old_slab) = old_slab
+            && live_len != 0
+            // SAFETY: both handles remain live through the owner payload.
+            && unsafe { (*old_slab).kind() == (*new_slab).kind() && (*old_slab).len() == live_len }
+        {
+            // SAFETY: distinct live slabs; the new one is private and fresh.
+            unsafe { (*new_slab).copy_prefix_from(&*old_slab) };
+            unsafe { (*new_slab).set_len(live_len) };
+            body.adopt_slab(slab, live_len);
+            return true;
+        }
         for index in 0..live_len {
             // SAFETY: both handles remain live through the owner payload;
             // `index` lies in the old prefix and the new capacity is `grown`.

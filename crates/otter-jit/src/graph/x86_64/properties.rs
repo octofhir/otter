@@ -324,6 +324,31 @@ impl Codegen<'_> {
         miss: DynamicLabel,
         stub_id: u32,
     ) {
+        self.emit_intrinsic_receiver(target, receiver, miss);
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            holder,
+            u64::from(target.proto_offset),
+            RelocationTarget::GuardedHeapReference {
+                component: GuardedHeapComponent::Prototype,
+                byte_pc: pc,
+                runtime_stub_id: stub_id,
+            },
+        );
+        self.load_immediate(10, 0xffff_ffff_0000_0000);
+        dynasm!(self.ops ; .arch x64 ; and r10, Rq(receiver) ; add Rq(holder), r10);
+    }
+
+    /// Branch to `miss` unless `receiver` is a body of `target`'s family
+    /// whose named lookup starts at its pinned prototype, in the realm the
+    /// proof names. Clobbers `r10`.
+    pub(super) fn emit_intrinsic_receiver(
+        &mut self,
+        target: JitIntrinsicPrototype,
+        receiver: u8,
+        miss: DynamicLabel,
+    ) {
         if !target.is_generated_receiver() {
             dynasm!(self.ops ; .arch x64 ; jmp =>miss);
             return;
@@ -339,19 +364,6 @@ impl Codegen<'_> {
                 ; mov r10, [r10 + crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET as i32]
                 ; test r10, r10 ; jz =>miss ; cmp DWORD [r10], realm as i32 ; jne =>miss);
         }
-        emit_load_symbol_u64(
-            &mut self.ops,
-            &mut self.relocations,
-            holder,
-            u64::from(target.proto_offset),
-            RelocationTarget::GuardedHeapReference {
-                component: GuardedHeapComponent::Prototype,
-                byte_pc: pc,
-                runtime_stub_id: stub_id,
-            },
-        );
-        self.load_immediate(10, 0xffff_ffff_0000_0000);
-        dynasm!(self.ops ; .arch x64 ; and r10, Rq(receiver) ; add Rq(holder), r10);
     }
 
     fn emit_validity_guard(

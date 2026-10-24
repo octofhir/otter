@@ -3,7 +3,8 @@
 //! The builder places a stability, field-summary or context-slot proof
 //! before every use of such a fact, as if each re-read its word after any
 //! operation that may have run code, and an inherited method load names the
-//! prototype-chain validity cell it relies on, and a dictionary global
+//! prototype-chain validity cell it relies on, as does an Array method call
+//! whose pinned prototype's chain proves its builtin, and a dictionary global
 //! object read the slot-layout proof it reads through. The generation instead
 //! subscribes to those facts at installation, and a writer that breaks one
 //! sets its dependency flag. This pass collects the facts as the
@@ -72,8 +73,8 @@ fn is_proof(kind: &Kind) -> bool {
     )
 }
 
-/// The validity cell an inherited method load or a dictionary global
-/// object read relies on.
+/// The validity cell an inherited method load, an Array method call through
+/// its pinned prototype or a dictionary global object read relies on.
 fn method_validity(
     view: &JitCompileSnapshot,
     inline_views: &[Arc<JitCompileSnapshot>],
@@ -85,6 +86,13 @@ fn method_validity(
             super::metadata::source_view(view, inline_views, graph, node),
             byte_pc,
         );
+    }
+    if let Kind::ArrayPush(byte_pc) | Kind::ArrayPop(byte_pc) = graph.node(node).kind {
+        return super::metadata::source_view(view, inline_views, graph, node)
+            .guarded_method_calls
+            .get(&byte_pc)?
+            .holder_validity
+            .map(|validity| validity.address);
     }
     let Kind::LoadGuardedMethod {
         byte_pc, target, ..

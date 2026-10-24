@@ -573,7 +573,7 @@ impl Interpreter {
 
     /// The validity cell of the chain starting at `prototype`, after giving
     /// every prototype on it the prototype role whose writes retire proofs.
-    fn prove_chain(
+    pub(crate) fn prove_chain(
         &mut self,
         prototype: impl Fn(&Self) -> Option<JsObject>,
     ) -> Option<(Arc<PrototypeValidity>, JsObject)> {

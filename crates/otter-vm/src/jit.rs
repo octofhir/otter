@@ -1238,6 +1238,12 @@ pub struct JitGuardedMethodCall {
     pub safepoint_id: crate::native_abi::SafepointId,
     /// Exact JavaScript argument count the entry implements.
     pub argument_count: u8,
+    /// For an exotic receiver, the chain proof of its pinned prototype:
+    /// every write to a prototype on that chain retires it, so while it holds
+    /// the method slot holds this builtin. An optimizing generation subscribes
+    /// to it as a code dependency and reads neither the prototype's layout
+    /// nor the slot; `None` keeps those guards.
+    pub holder_validity: Option<JitPrototypeValidity>,
     /// An allocating entry with the same operands, and the safepoint it
     /// publishes, that completes the call when the declared entry misses for
     /// storage it would have to grow; `None` when a miss takes the ordinary

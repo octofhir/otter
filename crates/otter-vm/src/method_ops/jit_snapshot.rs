@@ -137,6 +137,8 @@ impl Interpreter {
             safepoint_id,
             argument_count,
             grow,
+            holder_validity: crate::object::prototype_validity::chain_validity(proto, &self.gc_heap)
+                .and_then(|cell| self.bake_prototype_validity(&cell)),
         })
     }
 
@@ -200,6 +202,7 @@ impl Interpreter {
             safepoint_id: NO_SAFEPOINT,
             argument_count: 1,
             grow: None,
+            holder_validity: None,
         })
     }
 
@@ -282,6 +285,7 @@ impl Interpreter {
             safepoint_id,
             argument_count: ic.op.argument_count(),
             grow: None,
+            holder_validity: None,
         })
     }
 }

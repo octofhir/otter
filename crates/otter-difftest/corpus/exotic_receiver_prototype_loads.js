@@ -1,5 +1,5 @@
 // Named and computed loads on builtin iterators, collections, promises,
-// buffers and generators walk the receiver's live prototype chain. Compiled
+// buffers, generators and primitives walk the receiver's live prototype chain. Compiled
 // miss transitions and the interpreter resolve them through one ladder, so a
 // saturated site still finds `next` on %ArrayIteratorPrototype%.
 function named(o) { return o.next; }
@@ -33,4 +33,19 @@ const sub = new Sub();
 let subHits = 0;
 for (let i = 0; i < 300; i++) if (computed(sub, "extra") === Sub.prototype.extra && sub.extra() === 7) subHits++;
 const iterNextShared = [][Symbol.iterator]().next === new Uint8Array(1)[Symbol.iterator]().next;
-JSON.stringify({ namedHits, computedHits, subHits, iterNextShared });
+// A primitive owns no named property but a string's: methods, user
+// properties and getters (called with the primitive as `this`) all resolve
+// on its wrapper prototype.
+Symbol.prototype.tag = "sym";
+Number.prototype.tag = "num";
+Boolean.prototype.tag = "bool";
+BigInt.prototype.tag = "big";
+Object.defineProperty(Symbol.prototype, "kind", { configurable: true, get() { return typeof this; } });
+function primitiveNamed(v) {
+  return [typeof v.toString, typeof v.valueOf, v.tag, typeof v.constructor, v.description, v.kind].join();
+}
+const primitives = [Symbol("p"), Symbol(), 1.5, 7, true, 10n];
+const primitiveRounds = [];
+for (let round = 0; round < 300; round++) primitiveRounds.push(primitives.map(primitiveNamed).join("|"));
+const primitiveStable = primitiveRounds.every(r => r === primitiveRounds[0]);
+JSON.stringify({ namedHits, computedHits, subHits, iterNextShared, primitiveStable, primitive: primitiveRounds[299] });

@@ -6371,7 +6371,7 @@ fn dense_arith_feedback_accumulates_in_the_owning_code_block() {
         5,
         0,
         4,
-        vec![16u32, 32, 48]
+        vec![0u32, 16, 32]
             .into_iter()
             .map(|byte_pc| {
                 jit::JitTestInstruction::new(
@@ -6414,8 +6414,8 @@ fn dense_arith_feedback_accumulates_in_the_owning_code_block() {
         1,
         vec![jit::JitTestInstruction::new(
             Op::Add,
-            1,
-            16,
+            0,
+            0,
             vec![
                 Operand::Register(0),
                 Operand::Register(0),

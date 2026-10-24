@@ -839,6 +839,8 @@ fn full_collection_forgets_entries_naming_dead_shapes() {
         slot.install(IcHandler::load_resolved(object::keyed_shape(obj, &heap), &resolved).unwrap());
     }
     assert_eq!(slot.entry_count(), 1);
+    // The turn that built the shapes ends; only its pins kept them strong.
+    crate::object::shape_interner::ShapeInterner::unpin_turn_shapes(&heap);
     let mut no_roots = |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
     heap.mark_phase(&mut no_roots).expect("mark phase");
     slot.sweep_dead(&heap);

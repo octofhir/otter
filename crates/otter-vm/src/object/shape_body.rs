@@ -557,7 +557,8 @@ pub(crate) fn alloc_dictionary_shape_body_with_roots(
 
 /// Complete in-object slack tracking on one node of a provisional lineage:
 /// its in-object capacity shrinks to `inline_capacity`, which every node of
-/// the lineage's tree fits, it becomes ordinary, and its lineage's
+/// the lineage's tree fits unless the capacity stays as it was, it becomes
+/// ordinary, and its lineage's
 /// dictionary shape becomes `dictionary`. No existing field moves; later
 /// transitions place fields against the new capacity, and objects allocated
 /// before keep their wider cells.
@@ -569,7 +570,12 @@ pub(crate) fn finish_slack_tracking(
 ) {
     heap.with_payload(shape, |body| {
         debug_assert!(body.state.is_provisional() && !body.is_dictionary());
-        debug_assert!(body.property_count as usize <= inline_capacity);
+        // A node whose keys already spill past the lineage's capacity keeps
+        // that capacity; only a lineage every node fits shrinks.
+        debug_assert!(
+            body.property_count as usize <= inline_capacity
+                || inline_capacity == usize::from(body.inline_capacity)
+        );
         debug_assert!(inline_capacity <= usize::from(body.inline_capacity));
         body.inline_capacity = inline_capacity as u8;
         if body.parent.is_null() {
@@ -640,7 +646,7 @@ pub(crate) fn parent_of(shape: ShapeHandle) -> ShapeHandle {
     body_of(shape).parent
 }
 
-pub(super) fn field_owner(mut shape: ShapeHandle, logical_slot: u32) -> Option<ShapeHandle> {
+pub(super) fn field_owner(shape: ShapeHandle, logical_slot: u32) -> Option<ShapeHandle> {
     if shape.is_null() {
         return None;
     }
@@ -648,10 +654,30 @@ pub(super) fn field_owner(mut shape: ShapeHandle, logical_slot: u32) -> Option<S
     if first.is_dictionary() || logical_slot >= first.property_count {
         return None;
     }
+    // A key table names each slot's owner: one read instead of a walk past
+    // every later key.
+    if !first.keys.is_null() {
+        let (owner, is_accessor) = super::shape_keys::owner_of(first.keys, logical_slot);
+        if !owner.is_null() {
+            debug_assert_eq!(
+                Some(owner),
+                walk_field_owner(shape, logical_slot).map(|(owner, _)| owner),
+                "a key table names the slot's defining shape"
+            );
+            return (!is_accessor).then_some(owner);
+        }
+    }
+    walk_field_owner(shape, logical_slot)
+        .and_then(|(owner, is_accessor)| (!is_accessor).then_some(owner))
+}
+
+/// The ancestor of `shape` whose transition added `logical_slot`, and
+/// whether that slot is an accessor, found by walking the chain.
+fn walk_field_owner(mut shape: ShapeHandle, logical_slot: u32) -> Option<(ShapeHandle, bool)> {
     loop {
         let body = body_of(shape);
         if body.own_offset() == logical_slot {
-            return (!body.own_is_accessor).then_some(shape);
+            return Some((shape, body.own_is_accessor));
         }
         shape = body.parent;
         if shape.is_null() {
@@ -820,6 +846,11 @@ pub(crate) fn alloc_child_shape_body_with_roots(
         )
     });
     let child = heap.alloc_old_with_roots(body, external_visit)?;
+    // The table's last entry is the slot this child adds.
+    let keys = heap.read_payload(child, |body| body.keys);
+    if !keys.is_null() {
+        super::shape_keys::set_last_owner(heap, keys, child);
+    }
     // The pending body was collector-rewritten during allocation. A local
     // prototype copied beforehand would still carry the pre-move handle.
     let prototype = heap.read_payload(child, ShapeBody::prototype);
@@ -858,6 +889,7 @@ fn child_keys(
         hash: hash as u32,
         flags,
         is_accessor,
+        owner: ShapeHandle::null(),
     };
     let key_slot = key as *mut JsStringHandle;
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -902,6 +934,7 @@ fn chain_key_entries(
                     as u32,
                 flags: body.own_flags,
                 is_accessor: body.own_is_accessor,
+                owner: shape,
             });
         }
         shape = body.parent;

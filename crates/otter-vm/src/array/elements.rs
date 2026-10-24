@@ -344,6 +344,34 @@ impl ElementSlabBody {
         self.mark_dirty_range(index, index + 1);
     }
 
+    /// Copy `source`'s whole live prefix into this fresh private slab of the
+    /// same kind, leaving what a `set` of each slot in order would: the
+    /// element words, and for numeric storage the hole bits and count; tagged
+    /// storage marks the copied range dirty. The caller publishes the length.
+    pub(crate) fn copy_prefix_from(&mut self, source: &ElementSlabBody) {
+        self.assert_private();
+        let len = source.len();
+        assert!(self.kind == source.kind && len <= self.capacity());
+        // SAFETY: both slabs hold at least `len` eight-byte element words,
+        // and a numeric slab's bitmap at least the words `len` bits need;
+        // distinct cells never overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(source.data_ptr(), self.data_ptr(), len * 8);
+            if self.kind.is_numeric() {
+                std::ptr::copy_nonoverlapping(
+                    source.bitmap_ptr(),
+                    self.bitmap_ptr(),
+                    Self::bitmap_words_for(len),
+                );
+            }
+        }
+        if self.kind.is_numeric() {
+            self.hole_count = source.hole_count;
+        } else {
+            self.mark_dirty_range(0, len);
+        }
+    }
+
     /// Mark mutations using element indices, without allocating or retaining
     /// host pointers. Appends leave only the newly written suffix dirty;
     /// disjoint writes conservatively include the intervening slots.

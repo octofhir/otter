@@ -368,6 +368,22 @@ pub fn native_regexp_symbol_match(
         let input = coerce_to_jsstring_runtime(scope.context(), &input_arg_value, NAME)?;
         let input = scope.value(Value::string(input));
 
+        // A pristine receiver's flags and `exec` are its own: match in place.
+        let receiver_value = scope.raw(receiver);
+        if scope
+            .context()
+            .interp_mut()
+            .is_pristine_regexp(receiver_value)
+        {
+            let (receiver_value, input_value) = (scope.raw(receiver), scope.raw(input));
+            if let Some(result) =
+                crate::regexp_fast::match_pristine(scope.context(), receiver_value, input_value)?
+            {
+                let result = scope.value(result);
+                return Ok(scope.finish(result));
+            }
+        }
+
         let receiver_value = scope.raw(receiver);
         let flags = get_property_runtime(scope.context(), &receiver_value, "flags", NAME)?;
         let flags = scope.value(flags);
@@ -378,14 +394,12 @@ pub fn native_regexp_symbol_match(
         let flags_string = flags_value
             .as_string(scope.context().heap())
             .ok_or_else(|| native_type_error(NAME, "flags root is not a string"))?;
-        let (global, full_unicode, sticky) =
-            flags_string.with_utf16(scope.context().heap(), |units| {
-                (
-                    units.contains(&(b'g' as u16)),
-                    units.contains(&(b'u' as u16)) || units.contains(&(b'v' as u16)),
-                    units.contains(&(b'y' as u16)),
-                )
-            });
+        let (global, full_unicode) = flags_string.with_utf16(scope.context().heap(), |units| {
+            (
+                units.contains(&(b'g' as u16)),
+                units.contains(&(b'u' as u16)) || units.contains(&(b'v' as u16)),
+            )
+        });
 
         if !global {
             let receiver_value = scope.raw(receiver);
@@ -411,65 +425,6 @@ pub fn native_regexp_symbol_match(
             .as_string(scope.context().heap())
             .ok_or_else(|| native_type_error(NAME, "input root is not a string"))?;
         let input_units = input_string.to_utf16_vec(scope.context().heap());
-
-        // Keep the allocation-free builtin fast path, but treat the arena as
-        // authoritative after the observable `exec` lookup. An accessor can
-        // allocate, relocate, or even recompile the receiver before returning
-        // the builtin function.
-        if scope.raw(receiver).as_regexp().is_some() && !sticky {
-            let receiver_value = scope.raw(receiver);
-            let exec = get_property_runtime(scope.context(), &receiver_value, "exec", NAME)?;
-            let exec = scope.value(exec);
-            let exec_value = scope.raw(exec);
-            if exec_value.as_native_function().is_some_and(|native| {
-                native.is_static_native(scope.context().heap(), crate::bootstrap_regexp::proto_exec)
-            }) {
-                let receiver_value = scope.raw(receiver);
-                let re = receiver_value
-                    .as_regexp()
-                    .ok_or_else(|| native_type_error(NAME, "receiver root is not a RegExp"))?;
-                // A custom exec getter may have recompiled the RegExp into
-                // another mode or changed lastIndex. The one-pass scan models
-                // only an unmodified global builtin starting from zero.
-                let current_flags = re.flags(scope.context().heap());
-                let current_last_index = re.last_index_value(scope.context().heap());
-                if current_flags.global
-                    && !current_flags.sticky
-                    && crate::abstract_ops::same_value(
-                        &current_last_index,
-                        &Value::number_i32(0),
-                        scope.context().heap(),
-                    )
-                {
-                    let context = scope.context();
-                    let search = context.regex_search();
-                    let execution = re.find_batch(
-                        context.heap(),
-                        crate::string::CodeUnits::Utf16(&input_units),
-                        0,
-                        usize::MAX,
-                        &search,
-                    );
-                    let found = crate::regexp::finish_execution(scope.context(), execution)?;
-                    if found.is_empty() {
-                        return Ok(Value::null());
-                    }
-                    let mut output = Vec::with_capacity(found.len());
-                    for matched in found.iter() {
-                        output.push(slice_subject_string(
-                            &mut scope,
-                            input,
-                            matched.range.clone(),
-                        )?);
-                    }
-                    let array = scope.array(output.len())?;
-                    for (index, value) in output.iter().copied().enumerate() {
-                        scope.set_index(array, index, value)?;
-                    }
-                    return Ok(scope.finish(array));
-                }
-            }
-        }
 
         let mut output: Vec<Local<'_>> = Vec::new();
         loop {
@@ -550,6 +505,18 @@ pub fn native_regexp_symbol_search(
         let input_arg_value = scope.raw(input_arg);
         let input = coerce_to_jsstring_runtime(scope.context(), &input_arg_value, NAME)?;
         let input = scope.value(Value::string(input));
+
+        // A pristine receiver's `lastIndex` reads and writes run no code and
+        // cancel out: search in place.
+        let receiver_value = scope.raw(receiver);
+        if scope
+            .context()
+            .interp_mut()
+            .is_pristine_regexp(receiver_value)
+        {
+            let (receiver_value, input_value) = (scope.raw(receiver), scope.raw(input));
+            return crate::regexp_fast::search(scope.context(), receiver_value, input_value);
+        }
 
         let receiver_value = scope.raw(receiver);
         let previous = get_property_runtime(scope.context(), &receiver_value, "lastIndex", NAME)?;

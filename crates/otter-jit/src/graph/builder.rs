@@ -3910,10 +3910,11 @@ impl<'a> Builder<'a> {
         plan: Option<otter_vm::jit::JitDirectCallPlan>,
         destination: Option<u16>,
     ) {
-        // The realm's own RegExp `exec` or `test`, its identity proved, runs
-        // through its runtime entry without a native call frame.
-        if let [argument] = arguments
-            && !self.exited_for(ExitReason::IdentityGuard)
+        // The realm's own RegExp `exec` / `test` or String `replace` /
+        // `split` / `match` / `search`, its identity proved, runs through its
+        // runtime entry without a native call frame; an argument the call
+        // does not pass is the `undefined` the method would read.
+        if !self.exited_for(ExitReason::IdentityGuard)
             && let Some(&otter_vm::JitNativeCall::Intrinsic(proof)) =
                 self.view.native_calls.get(&instruction.byte_pc)
             && let Some(form) = crate::intrinsic_calls::method_form(
@@ -3927,13 +3928,13 @@ impl<'a> Builder<'a> {
                 &[callee],
                 Repr::None,
             );
-            let node = self.add(
-                Kind::RegExpMethod {
-                    test: form == crate::intrinsic_calls::IntrinsicMethodForm::RegExpTest,
-                },
-                &[receiver, *argument],
-                Repr::Tagged,
-            );
+            let mut inputs: SmallVec<[NodeId; 3]> = SmallVec::new();
+            inputs.push(receiver);
+            inputs.extend(arguments.iter().copied());
+            while inputs.len() < 1 + form.arity() {
+                inputs.push(self.graph.constant(Kind::ConstTagged(UNDEFINED)));
+            }
+            let node = self.add(Kind::BuiltinMethod(form), &inputs, Repr::Tagged);
             if let Some(destination) = destination {
                 self.write(destination, node);
             }

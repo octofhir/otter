@@ -16,6 +16,8 @@
 //!   code for contiguous string operations.
 //! - `alloc_*` helpers and heap-level
 //!   [`concat`] / [`slice`] / [`flatten`] / [`equals`] / [`to_utf16_vec`].
+//! - [`splice_string_body`] — one sequential string of runs taken from
+//!   contiguous sources: one allocation, one copy per run.
 //!
 //! # Invariants
 //! - String bytes/code units live in the cell's trailing storage. No `Rc` /
@@ -39,6 +41,7 @@
 //!   equal hashes. Allocation, slicing, concatenation and flattening never
 //!   hash; rope equality and ordering stream the immutable code units.
 //! - A short slice is copied into a sequential body: no parent retention.
+//! - A splice is Latin-1 exactly when every unit of every run fits a byte.
 //! - Cons depth never exceeds [`MAX_ROPE_DEPTH`]; concatenations
 //!   that would exceed it flatten the deeper child eagerly.
 //! - Slicing a flat body is O(1) for either storage width. Slicing a `Cons`
@@ -367,6 +370,44 @@ impl JsStringBody {
         }
     }
 
+    /// Copy `len` units from `data` (Latin-1 bytes, or WTF-16 units when
+    /// `wide`) into this sequential body's units starting at `at`, narrowing
+    /// into a Latin-1 body.
+    ///
+    /// # Safety
+    /// `data` holds `len` readable units of its width outside this cell,
+    /// `at + len` is within this body's length, and a Latin-1 body receives
+    /// only units that fit a byte.
+    unsafe fn write_units_at(&mut self, at: usize, data: *const u8, wide: bool, len: usize) {
+        debug_assert!(at + len <= self.len as usize);
+        let base = self.trailing_ptr().cast_mut();
+        // SAFETY: per the caller's contract.
+        unsafe {
+            match (self.kind == STRING_REPR_SEQ_LATIN1, wide) {
+                (true, false) => std::ptr::copy_nonoverlapping(data, base.add(at), len),
+                (true, true) => {
+                    let units = std::slice::from_raw_parts(data.cast::<u16>(), len);
+                    let out = std::slice::from_raw_parts_mut(base.add(at), len);
+                    for (byte, &unit) in out.iter_mut().zip(units) {
+                        *byte = unit as u8;
+                    }
+                }
+                (false, false) => {
+                    let bytes = std::slice::from_raw_parts(data, len);
+                    let out = std::slice::from_raw_parts_mut(base.cast::<u16>().add(at), len);
+                    for (unit, &byte) in out.iter_mut().zip(bytes) {
+                        *unit = u16::from(byte);
+                    }
+                }
+                (false, true) => std::ptr::copy_nonoverlapping(
+                    data.cast::<u16>(),
+                    base.cast::<u16>().add(at),
+                    len,
+                ),
+            }
+        }
+    }
+
     /// Write the trailing Latin-1 bytes of a freshly allocated body.
     fn init_seq_latin1(&mut self, bytes: &[u8]) {
         debug_assert_eq!(bytes.len(), self.len as usize);
@@ -434,23 +475,29 @@ pub fn alloc_flat_string_body_with_roots(
     )
 }
 
-/// Allocate a flat WTF-16 string body directly in old space, for a string
-/// that lives as long as the isolate: no scavenge copies it, and a root
-/// naming it need not be visited by one.
+/// Allocate a sequential string body of `units` directly in old space, for
+/// a string that lives as long as the isolate: no scavenge copies it, and a
+/// root naming it need not be visited by one. It is Latin-1 when every unit
+/// fits a byte, as every other sequential string is.
 ///
 /// # Errors
 /// Surfaces [`otter_gc::OutOfMemory`] verbatim.
-pub(crate) fn alloc_old_flat_string_body_with_roots(
+pub(crate) fn alloc_old_string_body_with_roots(
     heap: &mut GcHeap,
     units: &[u16],
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
+    let latin1 = units.iter().all(|&unit| unit <= 0xFF);
     let handle = heap.alloc_old_trailing_with_roots(
-        JsStringBody::seq(false, units.len() as u32),
-        JsStringBody::trailing_bytes(false, units.len()),
+        JsStringBody::seq(latin1, units.len() as u32),
+        JsStringBody::trailing_bytes(latin1, units.len()),
         external_visit,
     )?;
-    heap.with_payload(handle, |body| body.init_seq_flat(units));
+    heap.with_payload(handle, |body| {
+        // SAFETY: the body reserved `units.len()` units of its width, every
+        // unit fits a byte when it is Latin-1, and `units` is Rust-owned.
+        unsafe { body.write_units_at(0, units.as_ptr().cast::<u8>(), true, units.len()) };
+    });
     Ok(handle)
 }
 
@@ -755,6 +802,84 @@ pub fn slice_string_body(
             alloc_flat_string_body_with_roots(heap, &units, external_visit)
         }
     }
+}
+
+/// One run of a [`splice_string_body`] result: `len` units of source
+/// `source` from its unit `start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpliceRun {
+    pub(crate) source: u8,
+    pub(crate) start: u32,
+    pub(crate) len: u32,
+}
+
+/// The sequential string of `runs` in order, each a span of one of
+/// `sources`, built with a single allocation of the exact length and one
+/// copy per run. Every source reads contiguously (a caller flattens a rope
+/// first) and its runs lie within it; `sources` are rooted across the
+/// allocation and updated in place if it moves them. The result is Latin-1
+/// when every unit of every run fits a byte, and WTF-16 otherwise.
+///
+/// # Errors
+/// Surfaces [`otter_gc::OutOfMemory`] verbatim.
+pub(crate) fn splice_string_body(
+    heap: &mut GcHeap,
+    sources: &mut [JsStringHandle],
+    runs: &[SpliceRun],
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<JsStringHandle, otter_gc::OutOfMemory> {
+    let run_content = |heap: &GcHeap, sources: &[JsStringHandle], run: SpliceRun| {
+        let (parent, base, _) = contiguous_view(heap, sources[usize::from(run.source)])
+            .expect("splice source reads contiguously");
+        (parent, base + run.start, run.len)
+    };
+    let mut total = 0usize;
+    let mut latin1 = true;
+    for &run in runs {
+        total += run.len as usize;
+        if latin1 {
+            let (parent, start, len) = run_content(heap, sources, run);
+            latin1 = heap.read_payload(parent, |body| {
+                match flat_content_range(body, start, len).expect("sequential parent") {
+                    FlatContent::Latin1(_) => true,
+                    FlatContent::Wide(units) => units.iter().all(|&unit| unit <= 0xFF),
+                }
+            });
+        }
+    }
+    let length = u32::try_from(total).expect("a splice is no longer than its sources");
+    let slots = sources.as_mut_ptr();
+    let count = sources.len();
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        for index in 0..count {
+            // SAFETY: `sources` outlives the allocation that visits it.
+            visitor(unsafe { slots.add(index) }.cast::<RawGc>());
+        }
+        external_visit(visitor);
+    };
+    let handle = heap.alloc_trailing_with_roots(
+        JsStringBody::seq(latin1, length),
+        JsStringBody::trailing_bytes(latin1, total),
+        &mut visit,
+    )?;
+    // Nothing below allocates: the source and destination cells stay put.
+    let mut at = 0usize;
+    for &run in runs {
+        let (parent, start, len) = run_content(heap, sources, run);
+        let (data, wide) = heap.read_payload(parent, |body| {
+            match flat_content_range(body, start, len).expect("sequential parent") {
+                FlatContent::Latin1(bytes) => (bytes.as_ptr(), false),
+                FlatContent::Wide(units) => (units.as_ptr().cast::<u8>(), true),
+            }
+        });
+        heap.with_payload(handle, |body| {
+            // SAFETY: the run lies within its distinct, live source cell;
+            // the destination reserved `total` units and `at + len <= total`.
+            unsafe { body.write_units_at(at, data, wide, len as usize) };
+        });
+        at += len as usize;
+    }
+    Ok(handle)
 }
 
 /// Allocation-buffer bytes [`try_substrings_no_collect`] takes per substring
@@ -1134,6 +1259,15 @@ impl CodeUnits<'_> {
         match self {
             Self::Latin1(bytes) => bytes.get(index).map(|&byte| u16::from(byte)),
             Self::Utf16(units) => units.get(index).copied(),
+        }
+    }
+
+    /// Whether some unit equals `unit`.
+    #[must_use]
+    pub fn contains(&self, unit: u16) -> bool {
+        match self {
+            Self::Latin1(bytes) => u8::try_from(unit).is_ok_and(|byte| bytes.contains(&byte)),
+            Self::Utf16(units) => units.contains(&unit),
         }
     }
 

@@ -276,12 +276,8 @@ impl Intrinsic {
 pub(crate) struct RealmIntrinsics {
     slots: [JsObject; Intrinsic::COUNT],
     array_values: crate::native_function::NativeFunction,
-    array_constructor: crate::native_function::NativeFunction,
-    boolean_constructor: crate::native_function::NativeFunction,
-    number_constructor: crate::native_function::NativeFunction,
-    object_constructor: crate::native_function::NativeFunction,
-    regexp_exec: crate::native_function::NativeFunction,
-    regexp_test: crate::native_function::NativeFunction,
+    /// The original callable of every intrinsic call kind, by kind.
+    callables: [crate::native_function::NativeFunction; crate::IntrinsicCallKind::COUNT],
     /// Whether this realm's `%RegExp.prototype%` is built-in, while proven.
     pub(crate) regexp_protocol: Option<crate::regexp_fast::RegExpProtocolProof>,
     /// Which iteration reads have built-in answers in this realm, while proven.
@@ -299,18 +295,8 @@ impl Default for RealmIntrinsics {
         Self {
             slots: [JsObject::null(); Intrinsic::COUNT],
             array_values: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
-            array_constructor: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
-            boolean_constructor: crate::native_function::NativeFunction::from_gc(
-                otter_gc::Gc::null(),
-            ),
-            number_constructor: crate::native_function::NativeFunction::from_gc(
-                otter_gc::Gc::null(),
-            ),
-            object_constructor: crate::native_function::NativeFunction::from_gc(
-                otter_gc::Gc::null(),
-            ),
-            regexp_exec: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
-            regexp_test: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
+            callables: [crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null());
+                crate::IntrinsicCallKind::COUNT],
             regexp_protocol: None,
             iteration: crate::iteration_protocol::IterationProofs::default(),
             object_conversion: None,
@@ -323,7 +309,17 @@ impl Default for RealmIntrinsics {
 /// prototype rather than indexing an array.
 macro_rules! intrinsic_accessors {
     ($($method:ident => $variant:ident,)*) => {
-        impl RealmIntrinsics {
+        /// The global constructor name of a non-method intrinsic call kind.
+fn kind_constructor_name(kind: crate::IntrinsicCallKind) -> &'static str {
+    match kind {
+        crate::IntrinsicCallKind::Array => "Array",
+        crate::IntrinsicCallKind::Boolean => "Boolean",
+        crate::IntrinsicCallKind::Number => "Number",
+        _ => "Object",
+    }
+}
+
+impl RealmIntrinsics {
             $(
                 #[doc = concat!("Cached `", stringify!($variant), "`, or `None` before bootstrap fills it.")]
                 #[must_use]
@@ -358,14 +354,7 @@ impl RealmIntrinsics {
         &self,
         kind: crate::IntrinsicCallKind,
     ) -> &crate::native_function::NativeFunction {
-        match kind {
-            crate::IntrinsicCallKind::Array => &self.array_constructor,
-            crate::IntrinsicCallKind::Boolean => &self.boolean_constructor,
-            crate::IntrinsicCallKind::Number => &self.number_constructor,
-            crate::IntrinsicCallKind::Object => &self.object_constructor,
-            crate::IntrinsicCallKind::RegExpExec => &self.regexp_exec,
-            crate::IntrinsicCallKind::RegExpTest => &self.regexp_test,
-        }
+        &self.callables[kind as usize]
     }
 
     /// Original canonical callable, independent of mutable global properties.
@@ -406,21 +395,25 @@ impl RealmIntrinsics {
                     crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
                 })
         };
-        self.array_constructor = callable(heap, "Array");
-        self.boolean_constructor = callable(heap, "Boolean");
-        self.number_constructor = callable(heap, "Number");
-        self.object_constructor = callable(heap, "Object");
-        let method = |heap: &mut otter_gc::GcHeap, prototype: Option<JsObject>, name| {
-            prototype
-                .and_then(|prototype| object::get(prototype, heap, name))
-                .and_then(|value| value.as_native_function())
-                .unwrap_or_else(|| {
-                    crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
-                })
-        };
-        let regexp_prototype = self.regexp_prototype();
-        self.regexp_exec = method(heap, regexp_prototype, "exec");
-        self.regexp_test = method(heap, regexp_prototype, "test");
+        let (regexp_prototype, string_prototype) =
+            (self.regexp_prototype(), self.string_prototype());
+        for kind in crate::IntrinsicCallKind::ALL {
+            self.callables[kind as usize] = match kind.method_home() {
+                None => callable(heap, kind_constructor_name(kind)),
+                Some((home, name)) => {
+                    let prototype = match home {
+                        crate::jit::MethodHome::RegExpPrototype => regexp_prototype,
+                        crate::jit::MethodHome::StringPrototype => string_prototype,
+                    };
+                    prototype
+                        .and_then(|prototype| object::get(prototype, heap, name))
+                        .and_then(|value| value.as_native_function())
+                        .unwrap_or_else(|| {
+                            crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
+                        })
+                }
+            };
+        }
     }
 
     /// Visit every slot address, filled or not.
@@ -435,12 +428,9 @@ impl RealmIntrinsics {
             visitor(p);
         }
         self.array_values.trace_gc_roots(visitor);
-        self.array_constructor.trace_gc_roots(visitor);
-        self.boolean_constructor.trace_gc_roots(visitor);
-        self.number_constructor.trace_gc_roots(visitor);
-        self.object_constructor.trace_gc_roots(visitor);
-        self.regexp_exec.trace_gc_roots(visitor);
-        self.regexp_test.trace_gc_roots(visitor);
+        for callable in &self.callables {
+            callable.trace_gc_roots(visitor);
+        }
     }
 
     /// Trace cached prototype handles as root slots.
@@ -652,6 +642,10 @@ mod tests {
                 "object-root",
                 "regexp-exec-root",
                 "regexp-test-root",
+                "string-replace-root",
+                "string-split-root",
+                "string-match-root",
+                "string-search-root",
             ]) {
                 let callable = crate::native_function::NativeFunction::new_static(
                     &mut vm.gc_heap,
@@ -659,26 +653,7 @@ mod tests {
                     0,
                     native,
                 )?;
-                match kind {
-                    crate::IntrinsicCallKind::Array => {
-                        vm.realm_intrinsics.array_constructor = callable
-                    }
-                    crate::IntrinsicCallKind::Boolean => {
-                        vm.realm_intrinsics.boolean_constructor = callable
-                    }
-                    crate::IntrinsicCallKind::Number => {
-                        vm.realm_intrinsics.number_constructor = callable
-                    }
-                    crate::IntrinsicCallKind::Object => {
-                        vm.realm_intrinsics.object_constructor = callable
-                    }
-                    crate::IntrinsicCallKind::RegExpExec => {
-                        vm.realm_intrinsics.regexp_exec = callable
-                    }
-                    crate::IntrinsicCallKind::RegExpTest => {
-                        vm.realm_intrinsics.regexp_test = callable
-                    }
-                }
+                vm.realm_intrinsics.callables[kind as usize] = callable;
             }
             Ok::<_, crate::VmError>(())
         })

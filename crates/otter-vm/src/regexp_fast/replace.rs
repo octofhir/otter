@@ -1,23 +1,35 @@
-//! RegExp replacement from rooted, borrowed string code units.
+//! RegExp replacement as a splice of subject and template runs.
 //!
 //! # Contents
-//! - Collect match ranges before running any functional replacer.
-//! - Assemble string templates while borrowing subject and template together.
-//! - Copy only selected subject spans around collecting callbacks.
-//! - Build the final result in an owned, width-preserving Rust buffer.
+//! - [`replace()`] — `@@replace` of a pristine receiver: matches visited in
+//!   place, the result described as runs of the subject and the template and
+//!   built with one exact-size allocation.
+//! - [`replace_direct`] — the same core with no native frame or handle
+//!   scope, for generated code and the String method's own fast path.
+//! - `expand_template` — `GetSubstitution` as runs, never as copied units.
+//! - The functional replacer path: matches collected before any callback,
+//!   callback results assembled in an owned width-preserving buffer.
 //!
 //! # Invariants
 //! - A string borrow never spans JavaScript, VM allocation or result publication.
+//! - No match leaves the subject itself as the result: nothing is allocated.
+//! - Runs are offsets into the rooted subject and template, so a collection
+//!   during the result allocation moves nothing they describe.
 //! - Match records and the output buffer own their data across callbacks.
 //! - Every callback argument and subject is held in a native handle scope.
-//! - Substitution order, legacy statics and abrupt completion remain observable.
+//! - Substitution order, `lastIndex`, legacy statics and abrupt completion
+//!   remain observable exactly as the spec ladder leaves them.
 //!
 //! # See also
 //! - `super` owns the pristine receiver proof and shared substring builder.
+//! - `crate::string::gc_body::splice_string_body` builds the result.
 //! - `crate::regexp_prototype` owns the general replacement protocol.
+
+use smallvec::SmallVec;
 
 use crate::runtime_cx::{NativeCtx, NativeScope};
 use crate::string::CodeUnits;
+use crate::string::gc_body::SpliceRun;
 use crate::{Local, NativeError, Value};
 
 use super::slice;
@@ -28,6 +40,14 @@ mod tests;
 
 const NAME: &str = "RegExp.prototype[@@replace]";
 
+/// Splice source index of the subject.
+const SUBJECT: u8 = 0;
+/// Splice source index of the replacement template.
+const TEMPLATE: u8 = 1;
+
+/// Longest string `@@replace` builds before reporting a RangeError.
+const MAX_STRING_UNITS: usize = 1 << 29;
+
 /// `RegExp.prototype[@@replace]` for a pristine, non-sticky receiver after
 /// subject and replacement coercion. Matches precede every replacer call.
 pub(crate) fn replace(
@@ -37,11 +57,264 @@ pub(crate) fn replace(
     replacement: Value,
     functional: bool,
 ) -> Result<Value, NativeError> {
+    if functional {
+        return replace_functional(ctx, receiver, input, replacement);
+    }
+    ctx.scope(|mut scope| {
+        let receiver = scope.value(receiver);
+        let input = scope.value(input);
+        let template = scope.value(replacement);
+        for string in [input, template] {
+            scope
+                .raw(string)
+                .as_string(scope.context().heap())
+                .expect("replace operand is a string")
+                .flatten_in_place(scope.context().heap_mut())?;
+        }
+        let (receiver_value, input_value, template_value) =
+            (scope.raw(receiver), scope.raw(input), scope.raw(template));
+        let interp = scope.context().interp_mut();
+        let result = match replace_direct(interp, receiver_value, input_value, template_value) {
+            Some(Ok(result)) => result,
+            Some(Err(error)) => {
+                return Err(crate::native_function::vm_to_native_error(
+                    interp, error, NAME,
+                ));
+            }
+            // Contiguous operands decline only a result past the longest string.
+            None => return Err(invalid_length()),
+        };
+        let result = scope.value(result);
+        Ok(scope.finish(result))
+    })
+}
+
+/// `RegExp.prototype[@@replace]` with the string `template` of a `receiver`
+/// the caller proved pristine and non-sticky, over the string `input`,
+/// without a native frame or handle scope. `None`, before any observable
+/// effect, unless the receiver is a non-sticky RegExp and both strings read
+/// contiguously, or when the result would pass the longest string. Only the
+/// result allocation can collect, and it roots both strings itself.
+pub(crate) fn replace_direct(
+    interp: &mut crate::Interpreter,
+    receiver: Value,
+    input: Value,
+    template: Value,
+) -> Option<Result<Value, crate::VmError>> {
+    let regexp = receiver.as_regexp()?;
+    let heap = &interp.gc_heap;
+    let (subject, replacement) = (input.as_string(heap)?, template.as_string(heap)?);
+    let flags = regexp.flags(heap);
+    if flags.sticky || !subject.is_contiguous(heap) || !replacement.is_contiguous(heap) {
+        return None;
+    }
+    let mut last = std::mem::take(&mut interp.regexp_offsets);
+    let mut runs: SmallVec<[SpliceRun; 16]> = SmallVec::new();
+    let search = interp.regex_search();
+    let heap = &interp.gc_heap;
+    if flags.global {
+        regexp.set_last_index(heap, 0);
+    }
+    let named = regexp.has_named_groups(heap);
+    let size = subject.len() as usize;
+    let mut next = 0usize;
+    let execution = subject.with_code_units(heap, |units| {
+        replacement.with_code_units(heap, |template| {
+            let plain = !template.contains(u16::from(b'$'));
+            regexp.for_each_match(
+                heap,
+                units,
+                0,
+                if flags.global { usize::MAX } else { 1 },
+                &search,
+                |matched| {
+                    let position = matched.range.start;
+                    if position > next {
+                        runs.push(run(SUBJECT, next..position));
+                    }
+                    let mark = runs.len();
+                    if plain {
+                        if !template.is_empty() {
+                            runs.push(run(TEMPLATE, 0..template.len()));
+                        }
+                    } else {
+                        expand_template(&mut runs, template, size, matched, named);
+                    }
+                    if position >= next {
+                        next = matched.range.end;
+                    } else {
+                        runs.truncate(mark);
+                    }
+                    super::matching::record_offsets(&mut last, matched);
+                    true
+                },
+            )
+        })
+    });
+    let finish = |interp: &mut crate::Interpreter, last: Vec<u32>| interp.regexp_offsets = last;
+    if let Err(error) = interp.charge_regex_backtrack_steps(execution.steps) {
+        finish(interp, last);
+        return Some(Err(error));
+    }
+    let found = match execution.result {
+        Ok(found) => found,
+        Err(_) => {
+            finish(interp, last);
+            return Some(Err(interp.err_budget(
+                "work budget exceeded in a regular expression search".into(),
+            )));
+        }
+    };
+    if found == 0 {
+        finish(interp, last);
+        return Some(Ok(input));
+    }
+    if next < size {
+        runs.push(run(SUBJECT, next..size));
+    }
+    let total: usize = runs.iter().map(|run| run.len as usize).sum();
+    if total > MAX_STRING_UNITS {
+        finish(interp, last);
+        return None;
+    }
+    if regexp.legacy_features_enabled(&interp.gc_heap) {
+        let offsets = crate::regexp::engine::MatchOffsets(last);
+        interp.regexp_legacy.record_offsets(input, &offsets);
+        last = offsets.0;
+    }
+    finish(interp, last);
+    let mut sources = [subject.handle(), replacement.handle()];
+    let heap = &mut interp.gc_heap;
+    Some(
+        crate::string::gc_body::splice_string_body(heap, &mut sources, &runs, &mut |_| {})
+            .map(|result| Value::string(crate::string::JsString::from_handle(result, heap)))
+            .map_err(crate::VmError::from),
+    )
+}
+
+fn run(source: u8, range: std::ops::Range<usize>) -> SpliceRun {
+    SpliceRun {
+        source,
+        start: range.start as u32,
+        len: (range.end - range.start) as u32,
+    }
+}
+
+/// §22.2.6.11.1 `GetSubstitution` for one match as runs: literal template
+/// spans stay template runs and every substitution is a subject run.
+fn expand_template(
+    runs: &mut SmallVec<[SpliceRun; 16]>,
+    template: CodeUnits<'_>,
+    subject_len: usize,
+    matched: &crate::regexp::engine::Match<'_>,
+    named: bool,
+) {
+    const DOLLAR: u16 = b'$' as u16;
+    let digit = |unit: u16| {
+        (u16::from(b'0')..=u16::from(b'9'))
+            .contains(&unit)
+            .then(|| usize::from(unit - u16::from(b'0')))
+    };
+    let groups = matched.captures.len();
+    let tail = matched.range.end.min(subject_len);
+    // The literal template span not yet emitted starts here.
+    let mut literal = 0;
+    let mut i = 0;
+    let substitute = |runs: &mut SmallVec<[SpliceRun; 16]>,
+                      literal: &mut usize,
+                      at: usize,
+                      resume: usize,
+                      piece: Option<std::ops::Range<usize>>| {
+        if at > *literal {
+            runs.push(run(TEMPLATE, *literal..at));
+        }
+        if let Some(piece) = piece.filter(|piece| !piece.is_empty()) {
+            runs.push(run(SUBJECT, piece));
+        }
+        *literal = resume;
+    };
+    while let Some(unit) = template.get(i) {
+        let Some(next) = template.get(i + 1).filter(|_| unit == DOLLAR) else {
+            i += 1;
+            continue;
+        };
+        match next {
+            // `$$`: the second dollar is the literal kept.
+            DOLLAR => {
+                substitute(runs, &mut literal, i, i + 1, None);
+                i += 2;
+            }
+            0x26 => {
+                substitute(runs, &mut literal, i, i + 2, Some(matched.range.clone()));
+                i += 2;
+            }
+            0x60 => {
+                substitute(runs, &mut literal, i, i + 2, Some(0..matched.range.start));
+                i += 2;
+            }
+            0x27 => {
+                substitute(runs, &mut literal, i, i + 2, Some(tail..subject_len));
+                i += 2;
+            }
+            _ if digit(next).is_some() => {
+                let first = digit(next).expect("digit");
+                let second = template.get(i + 2).and_then(digit);
+                let group = |index: usize| (index > 0 && index <= groups).then_some(index);
+                let (index, consumed) = match second.map(|second| first * 10 + second) {
+                    Some(two) if group(two).is_some() => (Some(two), 3),
+                    _ => (group(first), 2),
+                };
+                if let Some(index) = index {
+                    let piece = matched.captures.get(index - 1);
+                    substitute(runs, &mut literal, i, i + consumed, piece);
+                }
+                i += consumed;
+            }
+            0x3c if named => {
+                let close =
+                    (i + 2..template.len()).find(|&j| template.get(j) == Some(u16::from(b'>')));
+                let Some(close) = close else {
+                    i += 1;
+                    continue;
+                };
+                let name: String =
+                    char::decode_utf16((i + 2..close).filter_map(|j| template.get(j)))
+                        .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+                        .collect();
+                let piece = matched
+                    .named_groups()
+                    .find(|(group, _)| *group == name)
+                    .and_then(|(_, range)| range);
+                substitute(runs, &mut literal, i, close + 1, piece);
+                i = close + 1;
+            }
+            _ => i += 2,
+        }
+    }
+    if template.len() > literal {
+        runs.push(run(TEMPLATE, literal..template.len()));
+    }
+}
+
+fn invalid_length() -> NativeError {
+    NativeError::RangeError {
+        name: NAME,
+        reason: "Invalid string length".to_string(),
+    }
+}
+
+/// `@@replace` with a callable replacer: every match is found first, then
+/// each callback runs with the subject re-read after it.
+fn replace_functional(
+    ctx: &mut NativeCtx<'_>,
+    receiver: Value,
+    input: Value,
+    replacement: Value,
+) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         let receiver = scope.value(receiver);
         let input = scope.value(input);
         let replacement = scope.value(replacement);
-        // Flatten once; failure leaves a correct, less direct code-unit view.
         let _ = scope
             .raw(input)
             .as_string(scope.context().heap())
@@ -85,62 +358,11 @@ pub(crate) fn replace(
         let named = matches
             .first()
             .is_some_and(|m| m.named_groups().next().is_some());
-        let out = if functional {
-            build_functional(&mut scope, replacement, input, &matches, named)?
-        } else {
-            let subject = scope.raw(input);
-            let template = scope.raw(replacement);
-            let heap = scope.context().heap();
-            let subject = subject
-                .as_string(heap)
-                .expect("replace subject is a string");
-            let template = template
-                .as_string(heap)
-                .expect("replace template is a string");
-            subject.with_code_units(heap, |subject| {
-                template.with_code_units(heap, |template| {
-                    build_template(subject, template, &matches, named)
-                })
-            })?
-        };
+        let out = build_functional(&mut scope, replacement, input, &matches, named)?;
         let result = out.finish(scope.context().heap_mut())?;
         let result = scope.value(Value::string(result));
         Ok(scope.finish(result))
     })
-}
-
-/// Build from immutable borrowed inputs; only Rust-owned output may escape.
-fn build_template(
-    subject: CodeUnits<'_>,
-    template: CodeUnits<'_>,
-    matches: &crate::regexp::engine::MatchBatch,
-    named: bool,
-) -> Result<UnitSink, NativeError> {
-    let mut out = UnitSink::with_capacity(subject.len());
-    let mut next = 0;
-    for matched in matches.iter() {
-        let position = matched.range.start;
-        if position >= next {
-            out.extend(subject.slice(next..position));
-        }
-        let start = out.len();
-        if !expand_template(&mut out, template, subject, &matched, named) {
-            return Err(invalid_length());
-        }
-        if position >= next {
-            next = matched.range.end;
-        } else {
-            out.truncate(start);
-        }
-        if out.len() > MAX_STRING_UNITS {
-            return Err(invalid_length());
-        }
-    }
-    out.extend(subject.slice(next.min(subject.len())..subject.len()));
-    if out.len() > MAX_STRING_UNITS {
-        return Err(invalid_length());
-    }
-    Ok(out)
 }
 
 /// Re-read each rooted subject span after callbacks may have moved its cell.
@@ -184,6 +406,7 @@ fn build_functional(
     }
     Ok(out)
 }
+
 fn extend_subject(
     scope: &mut NativeScope<'_, '_>,
     input: Local<'_>,
@@ -198,15 +421,8 @@ fn extend_subject(
         .with_code_units(heap, |units| out.extend(units.slice(range)));
 }
 
-fn invalid_length() -> NativeError {
-    NativeError::RangeError {
-        name: NAME,
-        reason: "Invalid string length".to_string(),
-    }
-}
-
-/// A result string assembled one byte per unit until a unit past Latin-1
-/// arrives, then widened once.
+/// A callback-built result assembled one byte per unit until a unit past
+/// Latin-1 arrives, then widened once.
 enum UnitSink {
     Latin1(Vec<u8>),
     Utf16(Vec<u16>),
@@ -243,13 +459,6 @@ impl UnitSink {
         }
     }
 
-    fn push(&mut self, unit: u16) {
-        match self {
-            Self::Latin1(bytes) if unit <= 0xff => bytes.push(unit as u8),
-            _ => self.widen().push(unit),
-        }
-    }
-
     fn extend(&mut self, units: CodeUnits<'_>) {
         match (&mut *self, units) {
             (Self::Latin1(bytes), CodeUnits::Latin1(more)) => bytes.extend_from_slice(more),
@@ -273,9 +482,6 @@ impl UnitSink {
         }
     }
 }
-
-/// Longest string `@@replace` builds before reporting a RangeError.
-const MAX_STRING_UNITS: usize = 1 << 29;
 
 /// `Call(replaceValue, undefined, « matched, ...captures, position, S [,
 /// groups] »)` with every argument rooted.
@@ -310,94 +516,4 @@ fn call_replacer<'scope>(
     }
     let undefined = scope.undefined();
     scope.call(replacer, undefined, &args)
-}
-
-/// §22.2.6.11.1 `GetSubstitution` over code-unit ranges of `subject`;
-/// `false` once the expansion passes the longest string a result can be.
-fn expand_template(
-    out: &mut UnitSink,
-    template: CodeUnits<'_>,
-    subject: CodeUnits<'_>,
-    matched: &crate::regexp::engine::Match<'_>,
-    named: bool,
-) -> bool {
-    const DOLLAR: u16 = b'$' as u16;
-    let digit = |unit: u16| {
-        (b'0' as u16..=b'9' as u16)
-            .contains(&unit)
-            .then(|| usize::from(unit - b'0' as u16))
-    };
-    let groups = matched.captures.len();
-    let tail = matched.range.end.min(subject.len());
-    let mut i = 0;
-    while let Some(unit) = template.get(i) {
-        if out.len() > MAX_STRING_UNITS {
-            return false;
-        }
-        let Some(next) = template.get(i + 1).filter(|_| unit == DOLLAR) else {
-            out.push(unit);
-            i += 1;
-            continue;
-        };
-        match next {
-            DOLLAR => {
-                out.push(DOLLAR);
-                i += 2;
-            }
-            0x26 => {
-                out.extend(subject.slice(matched.range.clone()));
-                i += 2;
-            }
-            0x60 => {
-                out.extend(subject.slice(0..matched.range.start));
-                i += 2;
-            }
-            0x27 => {
-                out.extend(subject.slice(tail..subject.len()));
-                i += 2;
-            }
-            _ if digit(next).is_some() => {
-                let first = digit(next).expect("digit");
-                let second = template.get(i + 2).and_then(digit);
-                let group = |index: usize| (index > 0 && index <= groups).then_some(index);
-                let (index, consumed) = match second.map(|second| first * 10 + second) {
-                    Some(two) if group(two).is_some() => (Some(two), 3),
-                    _ => (group(first), 2),
-                };
-                match index {
-                    Some(index) => {
-                        if let Some(range) = matched.captures.get(index - 1) {
-                            out.extend(subject.slice(range.clone()));
-                        }
-                    }
-                    None => out.extend(template.slice(i..i + consumed)),
-                }
-                i += consumed;
-            }
-            0x3c if named => {
-                let close = (i + 2..template.len()).find(|&j| template.get(j) == Some(b'>' as u16));
-                let Some(close) = close else {
-                    out.push(DOLLAR);
-                    i += 1;
-                    continue;
-                };
-                let name: String =
-                    char::decode_utf16((i + 2..close).filter_map(|j| template.get(j)))
-                        .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
-                        .collect();
-                if let Some((_, Some(range))) =
-                    matched.named_groups().find(|(group, _)| *group == name)
-                {
-                    out.extend(subject.slice(range));
-                }
-                i = close + 1;
-            }
-            _ => {
-                out.push(DOLLAR);
-                out.push(next);
-                i += 2;
-            }
-        }
-    }
-    out.len() <= MAX_STRING_UNITS
 }

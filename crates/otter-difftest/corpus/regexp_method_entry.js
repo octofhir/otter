@@ -2,6 +2,10 @@
 // plain, global and sticky lastIndex updates, a lastIndex that needs a
 // coercion or cannot be written, legacy statics, the `d` flag, subjects
 // that are not strings or are ropes, and the method replaced mid-loop.
+// Hot String `replace` / `split` / `match` / `search` with RegExp arguments:
+// templates, missing and extra arguments, non-string operands, sticky and
+// global lastIndex, legacy statics, limits and captures, and the RegExp
+// prototype changed while the loop is hot.
 const results = [];
 
 function execAll(re, inputs, n) {
@@ -83,4 +87,60 @@ for (let i = 0; i < 30000; i++) {
 }
 RegExp.prototype.exec = original;
 results.push(replaced);
+
+function stringOps(i) {
+  const w = ['purpx', 'a b  c', 'tzk%2Sb%2S', '', 'x-y-z', 'ÿ中ÿ'][i % 6];
+  let r = 0;
+  r += w.replace(/\s+/g, '').length;
+  r += w.replace(/%2S/gi, '[$&]').length;
+  r += w.replace(/(\w)(-)?/, '$2$1$$').length;
+  r += w.replace(/[a-z]/g).length;
+  r += w.replace(/b/g, (m, at) => m + at).length;
+  r += w.replace(/b/g, { toString() { return '#'; } }).length;
+  r += w.split(/ /).length + w.split(/(-)/, 3).length + w.split(/(?:)/u).length;
+  r += (w.match(/[a-z]/g) || []).length + (w.match(/(\w)(\w)?/) || [0]).length;
+  r += w.search(/z/) + w.search(/q/);
+  return r;
+}
+let stringSum = 0;
+for (let i = 0; i < 30000; i++) stringSum += stringOps(i);
+results.push(stringSum, RegExp.lastMatch, RegExp.$1);
+// lastIndex across the String methods: global ends at zero, sticky and plain
+// ones keep theirs, search restores it.
+const sticky = /a/y;
+const global = /a/g;
+const plain = /a/;
+let lastIndexes = 0;
+for (let i = 0; i < 20000; i++) {
+  sticky.lastIndex = i & 1;
+  global.lastIndex = 3;
+  plain.lastIndex = 2;
+  lastIndexes += 'aab'.replace(sticky, 'x').length + sticky.lastIndex;
+  lastIndexes += 'aab'.replace(global, 'x').length + global.lastIndex;
+  lastIndexes += 'aab'.search(plain) + plain.lastIndex + 'baa'.search(global) + global.lastIndex;
+  lastIndexes += ('aab'.match(global) || []).length + global.lastIndex;
+}
+results.push(lastIndexes);
+// Non-string receivers and a replaceAll without the global flag.
+let coercions = 0;
+for (let i = 0; i < 20000; i++) {
+  coercions += String.prototype.replace.call(1234 + i, /3/, '!').length;
+  try {
+    'aa'.replaceAll(/a/, 'b');
+  } catch (e) {
+    coercions += e instanceof TypeError ? 1 : 100;
+  }
+}
+results.push(coercions);
+// An own property on the RegExp prototype while the loop is hot.
+let patched = 0;
+for (let i = 0; i < 30000; i++) {
+  if (i === 20000) {
+    RegExp.prototype[Symbol.replace] = function () {
+      return 'patched';
+    };
+  }
+  patched += 'abc'.replace(/b/, 'x').length;
+}
+results.push(patched);
 console.log(JSON.stringify(results));

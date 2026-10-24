@@ -616,6 +616,31 @@ impl JsRegExp {
         })
     }
 
+    /// Visit successive matches from a code-unit offset in place (see
+    /// [`engine::for_each_match`]); a sticky RegExp admits only matches that
+    /// begin where the previous one ended.
+    pub(crate) fn for_each_match(
+        &self,
+        heap: &otter_gc::GcHeap,
+        text_units: crate::string::CodeUnits<'_>,
+        start: usize,
+        max_matches: usize,
+        search: &RegexSearch<'_>,
+        visit: impl FnMut(&engine::Match<'_>) -> bool,
+    ) -> engine::Execution<usize> {
+        heap.read_payload(self.inner, |body| {
+            engine::for_each_match(
+                &body.pattern.regex,
+                text_units,
+                start,
+                body.flags.sticky,
+                max_matches,
+                search,
+                visit,
+            )
+        })
+    }
+
     /// Whether some capture group of the pattern has a name.
     pub(crate) fn has_named_groups(&self, heap: &otter_gc::GcHeap) -> bool {
         heap.read_payload(self.inner, |body| body.pattern.regex.has_named_groups())

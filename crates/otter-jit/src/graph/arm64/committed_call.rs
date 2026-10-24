@@ -57,7 +57,7 @@ impl Codegen<'_> {
         destination: Option<u8>,
         span_bytes: u32,
     ) -> Result<(), crate::Unsupported> {
-        assert!(arguments.len() <= 3, "bounded committed ABI arguments");
+        assert!(arguments.len() <= 4, "bounded committed ABI arguments");
         let live = self.allocation.node(node).live_homes.clone();
         for &(location, home) in &live {
             if !matches!(home, Location::Constant(_)) {
@@ -68,12 +68,24 @@ impl Codegen<'_> {
         self.load_word32(16, self.graph.outer_pc(node));
         dynasm!(self.ops ; .arch aarch64 ; str w16, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]);
         // Values may sit in any argument register: stage the first two in the
-        // scratch pair and a third on the stack before any is overwritten.
-        let mut staged = 0u8;
+        // scratch pair and the rest on the stack before any is overwritten.
+        let values = arguments
+            .iter()
+            .filter(|argument| matches!(argument, CommittedArgument::Value(_)))
+            .count();
+        let pushed = values.saturating_sub(2) as u32;
+        debug_assert!(
+            pushed == 0
+                || !arguments
+                    .iter()
+                    .any(|argument| matches!(argument, CommittedArgument::StackAddress(_))),
+            "stack-staged values would move a stack-address argument"
+        );
+        let mut staged = 0u32;
         for argument in arguments {
             if let CommittedArgument::Value(value) = *argument {
                 if staged < 2 {
-                    dynasm!(self.ops ; .arch aarch64 ; mov X(16 + staged), X(value));
+                    dynasm!(self.ops ; .arch aarch64 ; mov X(16 + staged as u8), X(value));
                 } else {
                     dynasm!(self.ops ; .arch aarch64 ; str X(value), [sp, #-16]!);
                 }
@@ -87,9 +99,11 @@ impl Codegen<'_> {
             match argument {
                 CommittedArgument::Value(_) => {
                     if staged < 2 {
-                        dynasm!(self.ops ; .arch aarch64 ; mov X(register), X(16 + staged));
+                        dynasm!(self.ops ; .arch aarch64 ; mov X(register), X(16 + staged as u8));
                     } else {
-                        dynasm!(self.ops ; .arch aarch64 ; ldr X(register), [sp], #16);
+                        // The last value pushed sits lowest.
+                        let offset = (pushed - 1 - (staged - 2)) * 16;
+                        dynasm!(self.ops ; .arch aarch64 ; ldr X(register), [sp, offset]);
                     }
                     staged += 1;
                 }
@@ -105,6 +119,9 @@ impl Codegen<'_> {
                     dynasm!(self.ops ; .arch aarch64 ; add XSP(register), sp, *offset);
                 }
             }
+        }
+        if pushed != 0 {
+            dynasm!(self.ops ; .arch aarch64 ; add sp, sp, pushed * 16);
         }
         emit_load_symbol_u64(
             &mut self.ops,

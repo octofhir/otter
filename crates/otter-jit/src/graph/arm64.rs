@@ -2277,23 +2277,24 @@ impl<'a> Codegen<'a> {
                 ];
                 self.emit_store_keyed_cached(node, [receiver, key, value], temps)?;
             }
-            Kind::RegExpMethod { test } => {
-                let (receiver, argument) = (Self::gp(input(0)), Self::gp(input(1)));
+            Kind::BuiltinMethod(form) => {
                 let destination = Self::gp(result.expect("a result"));
-                let stub = if *test {
-                    abi::STUB_JIT_REGEXP_TEST
-                } else {
-                    abi::STUB_JIT_REGEXP_EXEC
-                };
-                self.emit_committed_call(
-                    node,
-                    stub,
-                    &[
-                        CommittedArgument::Value(receiver),
-                        CommittedArgument::Value(argument),
-                    ],
-                    Some(destination),
-                )?;
+                let mut arguments: smallvec::SmallVec<[CommittedArgument; 4]> = (0..=form.arity())
+                    .map(|index| CommittedArgument::Value(Self::gp(input(index))))
+                    .collect();
+                let stub = form.stub();
+                if stub.id == abi::STUB_JIT_STRING_METHOD.id {
+                    // The entry reads two arguments and the kind.
+                    while arguments.len() < 3 {
+                        arguments.push(CommittedArgument::Scalar(
+                            otter_vm::value::tag::VALUE_UNDEFINED,
+                        ));
+                    }
+                    arguments.push(CommittedArgument::Scalar(u64::from(
+                        form.kind().feedback_payload(),
+                    )));
+                }
+                self.emit_committed_call(node, stub, &arguments, Some(destination))?;
             }
             Kind::LoadKeyedCached { .. } => {
                 let (receiver, key) = (Self::gp(input(0)), Self::gp(input(1)));

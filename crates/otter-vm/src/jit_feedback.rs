@@ -1657,8 +1657,10 @@ mod tests {
     #[test]
     fn intrinsic_targets_keep_distinct_kinds_counts_and_epoch_without_handles() {
         let vector = feedback_for([Op::Call, Op::New]);
+        // As many distinct kinds as a polymorphic site profiles.
+        let profiled = &crate::IntrinsicCallKind::ALL[..PROFILED_CALL_TARGET_CAPACITY];
         for index in 0..2 {
-            for (ordinal, kind) in crate::IntrinsicCallKind::ALL.into_iter().enumerate() {
+            for (ordinal, &kind) in profiled.iter().enumerate() {
                 let target = OrdinaryCallTarget::Intrinsic(kind);
                 assert_eq!(
                     vector.record_call(index, target),
@@ -1678,18 +1680,15 @@ mod tests {
             else {
                 panic!("every canonical kind remains a typed target population");
             };
-            assert_eq!(targets.len(), crate::IntrinsicCallKind::ALL.len());
-            for kind in crate::IntrinsicCallKind::ALL {
+            assert_eq!(targets.len(), profiled.len());
+            for &kind in profiled {
                 assert!(targets.contains(&CallTargetCount {
                     target: OrdinaryCallTarget::Intrinsic(kind),
                     hits: 2,
                 }));
             }
         }
-        assert_eq!(
-            vector.epoch(),
-            2 * crate::IntrinsicCallKind::ALL.len() as u32
-        );
+        assert_eq!(vector.epoch(), 2 * profiled.len() as u32);
     }
 
     #[test]

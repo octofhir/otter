@@ -662,13 +662,13 @@ pub(crate) enum Kind {
     LoadKeyedCached {
         pc: u32,
     },
-    /// `input0.exec(input1)` (or `.test` when `test`) of the realm's
-    /// original RegExp method, whose identity a preceding check proved: the
-    /// method's complete semantics through its runtime entry, without a
-    /// native call frame. May run code (a `lastIndex` coercion) and throw.
-    RegExpMethod {
-        test: bool,
-    },
+    /// `input0.method(input1, ...)` of the realm's original builtin method
+    /// the form names, whose identity a preceding check proved, with one
+    /// input per argument the method reads: the method's complete semantics
+    /// through its runtime entry, without a native call frame. May run code
+    /// (a `lastIndex` or argument coercion, a non-pristine RegExp's
+    /// protocol) and throw.
+    BuiltinMethod(crate::intrinsic_calls::IntrinsicMethodForm),
     /// Tagged word at `[input0 + offset]` (input0 a `Word` base or a tagged
     /// cell address).
     LoadTaggedField(i32),
@@ -1150,7 +1150,7 @@ impl Kind {
             | Self::StorePropertyCached { .. }
             | Self::StoreKeyedCached { .. }
             | Self::LoadKeyedCached { .. }
-            | Self::RegExpMethod { .. }
+            | Self::BuiltinMethod(_)
             | Self::Instanceof
             | Self::ArrayPush(_)
             | Self::ArrayPop(_)
@@ -1271,8 +1271,17 @@ impl Kind {
                 abi::STUB_FIELD_TYPE_OBSERVE,
                 abi::STUB_WRITE_BARRIER,
             ],
-            Self::RegExpMethod { test: true } => &[abi::STUB_JIT_REGEXP_TEST],
-            Self::RegExpMethod { test: false } => &[abi::STUB_JIT_REGEXP_EXEC],
+            Self::BuiltinMethod(form) => {
+                use crate::intrinsic_calls::IntrinsicMethodForm as Form;
+                match form {
+                    Form::RegExpExec => &[abi::STUB_JIT_REGEXP_EXEC],
+                    Form::RegExpTest => &[abi::STUB_JIT_REGEXP_TEST],
+                    Form::StringReplace
+                    | Form::StringSplit
+                    | Form::StringMatch
+                    | Form::StringSearch => &[abi::STUB_JIT_STRING_METHOD],
+                }
+            }
             Self::Instanceof => &[
                 abi::STUB_INSTANCEOF_LEAF,
                 abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
@@ -1588,7 +1597,7 @@ impl Kind {
                 fp_temps: 1,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::RegExpMethod { .. } => simple(2, ResultPolicy::Register),
+            Self::BuiltinMethod(form) => simple(1 + form.arity(), ResultPolicy::Register),
             Self::Int32Div | Self::Int32Mod => {
                 if let Some(pair) = target.integer_division {
                     Constraints {

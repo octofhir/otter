@@ -4,7 +4,9 @@
 //! - [`IntrinsicCallForm`] selects the operation shared by both generated tiers.
 //! - [`proof_form`] validates the source-owned callable proof and call form.
 //! - [`IntrinsicMethodForm`] / [`method_form`] select a builtin method the
-//!   optimizing tier calls through its runtime entry without a native frame.
+//!   optimizing tier calls through its runtime entry without a native frame:
+//!   RegExp `exec` / `test` and String `replace` / `split` / `match` /
+//!   `search`.
 //!
 //! # Invariants
 //! - Selection follows an evaluated callable, never a source identifier.
@@ -29,29 +31,79 @@ pub(crate) enum IntrinsicCallForm {
     ObjectEmpty,
 }
 
-/// An intrinsic operation admitted at a `receiver.method(argument)` site.
+/// An intrinsic operation admitted at a `receiver.method(...arguments)` site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IntrinsicMethodForm {
-    /// `%RegExp.prototype.exec%` with one argument.
+    /// `%RegExp.prototype.exec%`.
     RegExpExec,
-    /// `%RegExp.prototype.test%` with one argument.
+    /// `%RegExp.prototype.test%`.
     RegExpTest,
+    /// `%String.prototype.replace%`.
+    StringReplace,
+    /// `%String.prototype.split%`.
+    StringSplit,
+    /// `%String.prototype.match%`.
+    StringMatch,
+    /// `%String.prototype.search%`.
+    StringSearch,
 }
 
-/// Validate one baked method proof in the owning source realm.
+impl IntrinsicMethodForm {
+    /// The arguments the method reads; a call passing fewer reads the rest
+    /// as `undefined`, which is what the method receives for them.
+    pub(crate) const fn arity(self) -> usize {
+        match self {
+            Self::RegExpExec | Self::RegExpTest | Self::StringMatch | Self::StringSearch => 1,
+            Self::StringReplace | Self::StringSplit => 2,
+        }
+    }
+
+    /// The canonical callable kind this form specializes.
+    pub(crate) const fn kind(self) -> IntrinsicCallKind {
+        match self {
+            Self::RegExpExec => IntrinsicCallKind::RegExpExec,
+            Self::RegExpTest => IntrinsicCallKind::RegExpTest,
+            Self::StringReplace => IntrinsicCallKind::StringReplace,
+            Self::StringSplit => IntrinsicCallKind::StringSplit,
+            Self::StringMatch => IntrinsicCallKind::StringMatch,
+            Self::StringSearch => IntrinsicCallKind::StringSearch,
+        }
+    }
+
+    /// The committed runtime entry running the method.
+    pub(crate) const fn stub(self) -> otter_vm::native_abi::RuntimeStubDescriptor {
+        use otter_vm::native_abi as abi;
+        match self {
+            Self::RegExpExec => abi::STUB_JIT_REGEXP_EXEC,
+            Self::RegExpTest => abi::STUB_JIT_REGEXP_TEST,
+            Self::StringReplace | Self::StringSplit | Self::StringMatch | Self::StringSearch => {
+                abi::STUB_JIT_STRING_METHOD
+            }
+        }
+    }
+}
+
+/// Validate one baked method proof in the owning source realm for a call
+/// passing `argc` arguments: no more than the method reads, so none
+/// evaluated beyond them is dropped from the call.
 pub(crate) fn method_form(
     proof: JitIntrinsicCallProof,
     source_realm: u32,
     argc: usize,
 ) -> Option<IntrinsicMethodForm> {
-    if proof.identity_cell == 0 || proof.realm_id != source_realm || argc != 1 {
+    if proof.identity_cell == 0 || proof.realm_id != source_realm {
         return None;
     }
-    match proof.kind {
-        IntrinsicCallKind::RegExpExec => Some(IntrinsicMethodForm::RegExpExec),
-        IntrinsicCallKind::RegExpTest => Some(IntrinsicMethodForm::RegExpTest),
-        _ => None,
-    }
+    let form = match proof.kind {
+        IntrinsicCallKind::RegExpExec => IntrinsicMethodForm::RegExpExec,
+        IntrinsicCallKind::RegExpTest => IntrinsicMethodForm::RegExpTest,
+        IntrinsicCallKind::StringReplace => IntrinsicMethodForm::StringReplace,
+        IntrinsicCallKind::StringSplit => IntrinsicMethodForm::StringSplit,
+        IntrinsicCallKind::StringMatch => IntrinsicMethodForm::StringMatch,
+        IntrinsicCallKind::StringSearch => IntrinsicMethodForm::StringSearch,
+        _ => return None,
+    };
+    (argc <= form.arity()).then_some(form)
 }
 
 /// Select the semantic operation without broadening its runtime domain.
@@ -69,7 +121,6 @@ pub(crate) fn admitted_form(
         (Kind::Number, false, 0) => Some(Form::NumberZero),
         (Kind::Object, _, 0) => Some(Form::ObjectEmpty),
         // Method intrinsics specialize only `receiver.method(...)` sites.
-        (Kind::RegExpExec | Kind::RegExpTest, _, _) => None,
         _ => None,
     }
 }
@@ -92,35 +143,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn method_forms_admit_one_argument_regexp_methods_in_their_realm() {
+    fn method_forms_admit_calls_up_to_the_arity_in_their_realm() {
         let proof = |kind| JitIntrinsicCallProof {
             kind,
             identity_cell: 8,
             realm_id: 3,
         };
-        assert_eq!(
-            method_form(proof(IntrinsicCallKind::RegExpExec), 3, 1),
-            Some(IntrinsicMethodForm::RegExpExec)
-        );
-        assert_eq!(
-            method_form(proof(IntrinsicCallKind::RegExpTest), 3, 1),
-            Some(IntrinsicMethodForm::RegExpTest)
-        );
-        assert_eq!(
-            method_form(proof(IntrinsicCallKind::RegExpExec), 3, 0),
-            None
-        );
-        assert_eq!(
-            method_form(proof(IntrinsicCallKind::RegExpExec), 4, 1),
-            None
-        );
-        assert_eq!(method_form(proof(IntrinsicCallKind::Array), 3, 1), None);
-        for construct in [false, true] {
-            assert_eq!(
-                admitted_form(IntrinsicCallKind::RegExpExec, construct, 1),
-                None
-            );
+        for (kind, form) in [
+            (
+                IntrinsicCallKind::RegExpExec,
+                IntrinsicMethodForm::RegExpExec,
+            ),
+            (
+                IntrinsicCallKind::RegExpTest,
+                IntrinsicMethodForm::RegExpTest,
+            ),
+            (
+                IntrinsicCallKind::StringReplace,
+                IntrinsicMethodForm::StringReplace,
+            ),
+            (
+                IntrinsicCallKind::StringSplit,
+                IntrinsicMethodForm::StringSplit,
+            ),
+            (
+                IntrinsicCallKind::StringMatch,
+                IntrinsicMethodForm::StringMatch,
+            ),
+            (
+                IntrinsicCallKind::StringSearch,
+                IntrinsicMethodForm::StringSearch,
+            ),
+        ] {
+            assert_eq!(form.kind(), kind);
+            for argc in 0..=form.arity() {
+                assert_eq!(method_form(proof(kind), 3, argc), Some(form));
+            }
+            // An extra argument is evaluated by the call and stays its own.
+            assert_eq!(method_form(proof(kind), 3, form.arity() + 1), None);
+            assert_eq!(method_form(proof(kind), 4, 1), None);
+            for construct in [false, true] {
+                assert_eq!(admitted_form(kind, construct, 1), None);
+            }
         }
+        assert_eq!(method_form(proof(IntrinsicCallKind::Array), 3, 1), None);
     }
 
     #[test]

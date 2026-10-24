@@ -410,10 +410,13 @@ fn regexp_method_call(kind: IntrinsicCallKind, realm: u32) -> JitCompileSnapshot
 }
 
 #[test]
-fn proved_regexp_methods_run_without_a_call_activation() {
-    for (kind, test) in [
-        (IntrinsicCallKind::RegExpExec, false),
-        (IntrinsicCallKind::RegExpTest, true),
+fn proved_builtin_methods_run_without_a_call_activation() {
+    use crate::intrinsic_calls::IntrinsicMethodForm as Form;
+    for (kind, form) in [
+        (IntrinsicCallKind::RegExpExec, Form::RegExpExec),
+        (IntrinsicCallKind::RegExpTest, Form::RegExpTest),
+        (IntrinsicCallKind::StringReplace, Form::StringReplace),
+        (IntrinsicCallKind::StringSearch, Form::StringSearch),
     ] {
         let built = graph(&regexp_method_call(kind, 7));
         let kinds: Vec<&Kind> = built
@@ -424,7 +427,21 @@ fn proved_regexp_methods_run_without_a_call_activation() {
             .map(|&node| &built.graph.node(node).kind)
             .collect();
         assert!(kinds.contains(&&Kind::CheckCellValue(32)));
-        assert!(kinds.contains(&&Kind::RegExpMethod { test }));
+        let method = built
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == Kind::BuiltinMethod(form))
+            .expect("the proved method runs as its builtin");
+        // The receiver, then one input per argument the method reads: an
+        // argument the call does not pass is `undefined`.
+        assert_eq!(method.inputs.len(), 1 + form.arity());
+        if form.arity() == 2 {
+            assert_eq!(
+                built.graph.node(method.inputs[2]).kind,
+                Kind::ConstTagged(otter_vm::value::tag::VALUE_UNDEFINED)
+            );
+        }
         assert!(!kinds.iter().any(|kind| matches!(kind, Kind::CallJs { .. })));
         // A proof from another realm keeps the ordinary native call.
         let foreign = graph(&regexp_method_call(kind, 8));
@@ -433,7 +450,7 @@ fn proved_regexp_methods_run_without_a_call_activation() {
                 .graph
                 .nodes
                 .iter()
-                .all(|node| { !matches!(node.kind, Kind::RegExpMethod { .. }) })
+                .all(|node| { !matches!(node.kind, Kind::BuiltinMethod(_)) })
         );
         assert!(
             foreign

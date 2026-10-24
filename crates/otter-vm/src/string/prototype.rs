@@ -1933,6 +1933,28 @@ fn string_replace_spec(
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let name: &'static str = if replace_all { "replaceAll" } else { "replace" };
+    // A string subject, a pristine RegExp and a string template: the
+    // built-in `@@replace` core, before any handle scope exists.
+    let this_value = *ctx.this_value();
+    let search_value = args.first().copied().unwrap_or(Value::undefined());
+    let template_value = args.get(1).copied().unwrap_or(Value::undefined());
+    if this_value.is_string()
+        && template_value.is_string()
+        && search_value
+            .as_regexp()
+            .is_some_and(|regexp| !replace_all || regexp.flags(ctx.heap()).global)
+        && ctx.interp_mut().is_pristine_regexp_proved(search_value)
+        && let Some(result) = crate::regexp_fast::replace_direct(
+            ctx.interp_mut(),
+            search_value,
+            this_value,
+            template_value,
+        )
+    {
+        let interp = ctx.interp_mut();
+        return result
+            .map_err(|error| crate::native_function::vm_to_native_error(interp, error, name));
+    }
     ctx.scope(|mut scope| {
         let this = scope.this();
         if scope.raw(this).is_nullish() {
@@ -1944,6 +1966,41 @@ fn string_replace_spec(
         // §22.1.3.19 step 2 — only an Object searchValue is probed for
         // `@@replace`; a primitive never has its `@@replace` accessed.
         if scope.raw(search).is_object_type() {
+            // A pristine RegExp's `IsRegExp`, `flags` and `@@replace` reads
+            // run no code; with a string subject and a string or callable
+            // replacement its `@@replace` is exactly the match-and-splice
+            // core, entered without the method call.
+            let search_value = scope.raw(search);
+            if let Some(regexp) = search_value.as_regexp()
+                && scope
+                    .context()
+                    .interp_mut()
+                    .is_pristine_regexp(search_value)
+            {
+                let flags = regexp.flags(scope.context().heap());
+                if replace_all && !flags.global {
+                    return Err(type_error(
+                        name,
+                        "replaceAll must be called with a global RegExp",
+                    ));
+                }
+                let (this_value, replacement) = (scope.raw(this), scope.raw(replace_value));
+                let functional = scope.is_callable(replace_value);
+                if this_value.is_string()
+                    && !flags.sticky
+                    && (functional || replacement.is_string())
+                {
+                    let result = crate::regexp_fast::replace(
+                        scope.context(),
+                        search_value,
+                        this_value,
+                        replacement,
+                        functional,
+                    )?;
+                    let result = scope.value(result);
+                    return Ok(scope.finish(result));
+                }
+            }
             if replace_all {
                 let search_value = scope.raw(search);
                 if is_reg_exp(scope.context(), search_value, name)? {
@@ -2879,6 +2936,25 @@ fn native_string_method(
             if !scope.raw(separator).is_object_type() {
                 return Ok(None);
             }
+            // A pristine RegExp separator with the built-in species splits
+            // with its own matcher: its `@@split` read and call run no code.
+            let (this_value, separator_value) = (scope.raw(this), scope.raw(separator));
+            if this_value.is_string()
+                && separator_value.as_regexp().is_some()
+                && let Some(limit) = crate::regexp_fast::plain_split_limit(
+                    args.get(1).copied().unwrap_or(Value::undefined()),
+                )
+                && scope
+                    .context()
+                    .interp_mut()
+                    .is_pristine_regexp(separator_value)
+                && scope.context().interp_mut().regexp_species_is_builtin()
+            {
+                let result =
+                    crate::regexp_fast::split(scope.context(), separator_value, this_value, limit)?;
+                let result = scope.value(result);
+                return Ok(Some(scope.finish(result)));
+            }
             let separator_value = scope.raw(separator);
             let Some(splitter_value) =
                 get_symbol_method(scope.context(), separator_value, WellKnown::Split, "split")?
@@ -2935,6 +3011,28 @@ fn native_string_method(
             let arg = scope.argument(args, 0);
             if !scope.raw(arg).is_object_type() {
                 return Ok(None);
+            }
+            // A pristine RegExp's `@@match` / `@@search` read and call run
+            // no code: match a string subject in place.
+            let (this_value, arg_value) = (scope.raw(this), scope.raw(arg));
+            if wk != WellKnown::MatchAll
+                && this_value.is_string()
+                && arg_value.as_regexp().is_some()
+                && scope.context().interp_mut().is_pristine_regexp(arg_value)
+            {
+                let result = if wk == WellKnown::Search {
+                    Some(crate::regexp_fast::search(
+                        scope.context(),
+                        arg_value,
+                        this_value,
+                    )?)
+                } else {
+                    crate::regexp_fast::match_pristine(scope.context(), arg_value, this_value)?
+                };
+                if let Some(result) = result {
+                    let result = scope.value(result);
+                    return Ok(Some(scope.finish(result)));
+                }
             }
             // §22.1.3.14 step 5.b — `matchAll` requires a global RegExp.
             if name == "matchAll" {

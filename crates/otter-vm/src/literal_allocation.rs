@@ -175,7 +175,7 @@ impl Interpreter {
                             value.trace_value_slots(visitor);
                         }
                     };
-                    let string = crate::string::gc_body::alloc_old_flat_string_body_with_roots(
+                    let string = crate::string::gc_body::alloc_old_string_body_with_roots(
                         &mut self.gc_heap,
                         utf16,
                         &mut visit,

@@ -194,7 +194,7 @@ impl Interpreter {
             || receiver.is_big_int()
         {
             let boxed = self
-                .box_sloppy_this_primitive_stack_rooted(stack, receiver, &[])
+                .box_sloppy_this_primitive_stack_rooted(stack, receiver, &mut [])
                 .map_err(CommittedValueError::JavaScript)?;
             // Boxing can move a string, symbol or BigInt receiver. Its source
             // register is the existing root; the copied value is no longer live.
@@ -852,9 +852,9 @@ impl Interpreter {
         value_anchor: usize,
         scratch_reg: u16,
     ) -> Result<bool, CommittedValueError> {
-        let receiver = self.iteration_anchor(receiver_anchor);
+        let mut receiver = self.iteration_anchor(receiver_anchor);
         let Some(base_object) = self
-            .object_for_primitive_property_base_stack_rooted(stack, &receiver)
+            .object_for_primitive_property_base_stack_rooted(stack, &mut receiver)
             .map_err(CommittedValueError::JavaScript)?
         else {
             return Ok(false);
@@ -983,7 +983,10 @@ impl Interpreter {
                                             .map_err(CommittedValueError::JavaScript)?;
                                         }
                                         object::SetOutcome::ExoticParent { parent } => {
-                                            let (value, receiver) = (self.iteration_anchor(value_anchor), self.iteration_anchor(receiver_anchor));
+                                            let (value, receiver) = (
+                                                self.iteration_anchor(value_anchor),
+                                                self.iteration_anchor(receiver_anchor),
+                                            );
                                             if !self.ordinary_set_data_value(
                                                 stack,
                                                 context,
@@ -1032,7 +1035,10 @@ impl Interpreter {
                                             .map_err(CommittedValueError::JavaScript)?;
                                         }
                                         object::SetOutcome::ExoticParent { parent } => {
-                                            let (value, receiver) = (self.iteration_anchor(value_anchor), self.iteration_anchor(receiver_anchor));
+                                            let (value, receiver) = (
+                                                self.iteration_anchor(value_anchor),
+                                                self.iteration_anchor(receiver_anchor),
+                                            );
                                             if !self.ordinary_set_data_value(
                                                 stack,
                                                 context,
@@ -1116,7 +1122,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)
             .map_err(CommittedValueError::Fatal)?;
         property_slot.record_attempt();
-        let receiver =
+        let mut receiver =
             *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
         let mut value =
             *read_register(&stack[top_idx], src_reg).map_err(CommittedValueError::Fatal)?;
@@ -1462,7 +1468,12 @@ impl Interpreter {
             match self.callable_bag_read(owner, fid) {
                 Some(bag) => bag,
                 None => self
-                    .function_user_bag_with_stack_roots(stack, owner, fid, &[&receiver, &value])
+                    .function_user_bag_with_stack_roots(
+                        stack,
+                        owner,
+                        fid,
+                        &mut [&mut receiver, &mut value],
+                    )
                     .map_err(CommittedValueError::JavaScript)?,
             }
         } else {

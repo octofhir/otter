@@ -292,7 +292,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: Option<&ExecutionContext>,
         g: crate::generator::JsGenerator,
-        recv_value: Value,
+        mut recv_value: Value,
         kind: GeneratorResumeKind,
     ) -> Result<Value, CommittedValueError> {
         let source_function = g.with_body(&self.gc_heap, |body| {
@@ -319,7 +319,7 @@ impl Interpreter {
                 | GeneratorResumeKind::Throw(v) => self.push_iteration_anchor(*v) - 1,
             };
             let cap = match promise_dispatch::PromiseBuilder::with_context(context.cloned())
-                .capability_stack_rooted(self, stack, &[&recv_value], &[])
+                .capability_stack_rooted(self, stack, &mut [&mut recv_value], &mut [])
             {
                 Ok(cap) => cap,
                 Err(err) => {
@@ -1876,7 +1876,7 @@ impl Interpreter {
         let _roots_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-        self.array_live_method_dispatch(stack, context, tag, roots.recv, roots.args, &[roots.args])
+        self.array_live_method_dispatch(stack, context, tag, roots.recv, roots.args, &mut [])
     }
 
     fn try_fast_primitive_string_char_code_at(

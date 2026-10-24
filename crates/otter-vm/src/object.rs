@@ -7090,7 +7090,7 @@ mod tests {
     fn runtime_object_allocation_installs_shape_root() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
 
         assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
@@ -7133,7 +7133,7 @@ mod tests {
     fn runtime_construction_set_advances_shape() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
 
         interp
@@ -7158,7 +7158,7 @@ mod tests {
     fn runtime_construction_set_preserves_slots_when_fast_shape_overflows() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
 
         for i in 0..MAX_FAST_PROPERTIES {
@@ -7204,7 +7204,7 @@ mod tests {
     fn keyed_additions_past_the_soft_limit_normalize_only_ordinary_objects() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
         let limit =
             shape_body::inline_capacity_of(shape(o, interp.gc_heap())) + KEYED_FAST_PROPERTIES;
@@ -7292,7 +7292,7 @@ mod tests {
     fn shape_id_prefers_installed_shape() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
 
         interp
@@ -7310,7 +7310,7 @@ mod tests {
     fn own_property_reads_prefer_installed_shape_offsets() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
 
         interp
@@ -7354,7 +7354,7 @@ mod tests {
     fn runtime_define_property_advances_shape() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
         let descriptor = PartialPropertyDescriptor {
             value: Some(Value::number_i32(42)),
@@ -7384,7 +7384,7 @@ mod tests {
     fn runtime_delete_invalidates_shape() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
 
         interp
@@ -7413,7 +7413,7 @@ mod tests {
             "x",
         );
         let first = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("first object");
 
         let transition = capture_store_property_transition(
@@ -7431,7 +7431,7 @@ mod tests {
         );
 
         let second = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("second object");
         assert_eq!(
             shape(second, interp.gc_heap()),
@@ -7463,7 +7463,7 @@ mod tests {
     fn raw_set_invalidates_shape_for_new_property() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
         assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
 
@@ -7483,7 +7483,7 @@ mod tests {
     fn raw_ordinary_set_invalidates_shape_for_new_property() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
         assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
 
@@ -7503,7 +7503,7 @@ mod tests {
     fn raw_define_property_invalidates_shape_for_new_property() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
         assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
 
@@ -7528,7 +7528,7 @@ mod tests {
     fn raw_define_property_partial_invalidates_shape_for_new_property() {
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         let mut o = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
         assert_eq!(shape(o, interp.gc_heap()), interp.null_prototype_root());
         let descriptor = PartialPropertyDescriptor {

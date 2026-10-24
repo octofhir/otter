@@ -220,10 +220,15 @@ impl Interpreter {
         value_reg: u16,
         function_id: u32,
     ) -> Result<JsObject, VmError> {
-        let receiver = *read_register(&stack[top_idx], obj_reg)?;
-        let value = *read_register(&stack[top_idx], value_reg)?;
+        let mut receiver = *read_register(&stack[top_idx], obj_reg)?;
+        let mut value = *read_register(&stack[top_idx], value_reg)?;
         let owner = receiver.as_closure(&self.gc_heap);
-        self.function_user_bag_with_stack_roots(stack, owner, function_id, &[&receiver, &value])
+        self.function_user_bag_with_stack_roots(
+            stack,
+            owner,
+            function_id,
+            &mut [&mut receiver, &mut value],
+        )
     }
 
     fn function_user_bag_with_stack_roots(
@@ -231,7 +236,7 @@ impl Interpreter {
         stack: &ActivationStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
-        value_roots: &[&Value],
+        value_roots: &mut [&mut Value],
     ) -> Result<JsObject, VmError> {
         if let Some(c) = owner {
             if let Some(bag) = c.own_props(&self.gc_heap) {
@@ -246,11 +251,13 @@ impl Interpreter {
             // fixes the function's ordinary lookup for every key the closure
             // does not synthesize: property ICs use it as the function's map.
             let prototype = self.get_prototype_for_op(&owner_value)?.as_object();
-            let mut roots: smallvec::SmallVec<[&Value; 4]> = value_roots.iter().copied().collect();
-            roots.push(&owner_value);
-            let bag = self.alloc_stack_rooted_object_with_prototype(stack, &roots, prototype)?;
-            // SAFETY: an initialized `Value` local the collector rewrote.
-            let owner_now = unsafe { std::ptr::read_volatile(&owner_value) }
+            let mut roots: smallvec::SmallVec<[&mut Value; 4]> =
+                value_roots.iter_mut().map(|value| &mut **value).collect();
+            roots.push(&mut owner_value);
+            let bag =
+                self.alloc_stack_rooted_object_with_prototype(stack, &mut roots, prototype)?;
+            drop(roots);
+            let owner_now = owner_value
                 .as_closure(&self.gc_heap)
                 .ok_or(VmError::TypeMismatch)?;
             self.retire_instanceof_proofs_for(owner_now);

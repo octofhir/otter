@@ -360,7 +360,7 @@ fn string_units<'a>(ctx: &NativeCtx<'a>, arg: Option<&Value>) -> Result<Vec<u16>
 
 fn fresh_uint8array(ctx: &mut NativeCtx<'_>, bytes: &[u8]) -> Result<Value, NativeError> {
     let buf = ctx
-        .alloc_array_buffer_zeroed(bytes.len(), &[], &[])
+        .alloc_array_buffer_zeroed(bytes.len(), &mut [], &mut [])
         .map_err(|_| type_err("out of memory"))?
         .ok_or_else(|| type_err("allocation failed"))?;
     let view = JsTypedArray::new(ctx.heap_mut(), buf, TypedArrayKind::Uint8, 0, bytes.len())
@@ -458,7 +458,7 @@ fn u8_to_hex(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeEr
 /// `setFrom*` methods (ordinary object, enumerable data properties).
 fn set_result(ctx: &mut NativeCtx<'_>, read: usize, written: usize) -> Result<Value, NativeError> {
     let obj = ctx
-        .alloc_object_with_roots(&[], &[])
+        .alloc_object_with_roots(&mut [], &mut [])
         .map_err(|_| type_err("out of memory"))?;
     object::define_own_property(
         obj,
@@ -538,7 +538,7 @@ pub fn install_uint8_base64(
     else {
         return Ok(());
     };
-    let ctor_value = Value::native_function(ctor);
+    let mut ctor_value = Value::native_function(ctor);
     let proto = match ctor
         .own_property_descriptor(heap, "prototype")
         .ok()
@@ -550,35 +550,36 @@ pub fn install_uint8_base64(
         Some(p) => p,
         None => return Ok(()),
     };
-    let proto_value = Value::object(proto);
+    let mut proto_value = Value::object(proto);
 
     fn make_fn(
         heap: &mut otter_gc::GcHeap,
         name: &'static str,
         length: u8,
         call: crate::native_function::NativeFastFn,
-        root: &Value,
+        root: &mut Value,
     ) -> Result<Value, JsSurfaceError> {
-        let f = crate::bootstrap::native_static_with_value_roots(heap, name, length, call, &[root])
-            .map_err(JsSurfaceError::from)?;
+        let f =
+            crate::bootstrap::native_static_with_value_roots(heap, name, length, call, &mut [root])
+                .map_err(JsSurfaceError::from)?;
         Ok(Value::native_function(f))
     }
 
     // Statics on the constructor.
-    let from_base64 = make_fn(heap, "fromBase64", 1, u8_from_base64, &ctor_value)?;
+    let from_base64 = make_fn(heap, "fromBase64", 1, u8_from_base64, &mut ctor_value)?;
     ctor.define_own_property(
         heap,
         "fromBase64",
         PropertyDescriptor::data(from_base64, true, false, true),
     )?;
-    let from_hex = make_fn(heap, "fromHex", 1, u8_from_hex, &ctor_value)?;
+    let from_hex = make_fn(heap, "fromHex", 1, u8_from_hex, &mut ctor_value)?;
     ctor.define_own_property(
         heap,
         "fromHex",
         PropertyDescriptor::data(from_hex, true, false, true),
     )?;
     // Methods on Uint8Array.prototype.
-    let to_base64 = make_fn(heap, "toBase64", 0, u8_to_base64, &proto_value)?;
+    let to_base64 = make_fn(heap, "toBase64", 0, u8_to_base64, &mut proto_value)?;
     if !object::define_own_property(
         proto,
         heap,
@@ -587,7 +588,7 @@ pub fn install_uint8_base64(
     )? {
         return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
     };
-    let to_hex = make_fn(heap, "toHex", 0, u8_to_hex, &proto_value)?;
+    let to_hex = make_fn(heap, "toHex", 0, u8_to_hex, &mut proto_value)?;
     if !object::define_own_property(
         proto,
         heap,
@@ -596,7 +597,13 @@ pub fn install_uint8_base64(
     )? {
         return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
     };
-    let set_from_base64 = make_fn(heap, "setFromBase64", 1, u8_set_from_base64, &proto_value)?;
+    let set_from_base64 = make_fn(
+        heap,
+        "setFromBase64",
+        1,
+        u8_set_from_base64,
+        &mut proto_value,
+    )?;
     if !object::define_own_property(
         proto,
         heap,
@@ -605,7 +612,7 @@ pub fn install_uint8_base64(
     )? {
         return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
     };
-    let set_from_hex = make_fn(heap, "setFromHex", 1, u8_set_from_hex, &proto_value)?;
+    let set_from_hex = make_fn(heap, "setFromHex", 1, u8_set_from_hex, &mut proto_value)?;
     if !object::define_own_property(
         proto,
         heap,

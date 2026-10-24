@@ -171,7 +171,7 @@ mod tests {
             let provisional = vm.gc_heap.read_payload(layout, ConstructorLayoutBody::root);
             for _ in 0..7 {
                 let receiver = vm
-                    .alloc_runtime_rooted_object_with_shape(provisional, &[], &[])
+                    .alloc_runtime_rooted_object_with_shape(provisional, &mut [], &mut [])
                     .unwrap();
                 let receiver = vm.scoped_value(scope, Value::object(receiver));
                 let mut frame = Frame::new(
@@ -244,7 +244,7 @@ mod tests {
             );
             for _ in 0..7 {
                 let receiver = vm
-                    .alloc_runtime_rooted_object_with_shape(provisional, &[], &[])
+                    .alloc_runtime_rooted_object_with_shape(provisional, &mut [], &mut [])
                     .unwrap();
                 let receiver = vm.scoped_value(scope, Value::object(receiver));
                 let mut frame = Frame::new(

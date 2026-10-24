@@ -85,7 +85,7 @@ impl Interpreter {
         let field_count = simple_shape
             .map_or(0, |(_, fields)| fields)
             .max(reserved_field_count);
-        let receiver = self.alloc_runtime_rooted_object_with_shape(root, &[], &[])?;
+        let receiver = self.alloc_runtime_rooted_object_with_shape(root, &mut [], &mut [])?;
         self.jit_runtime_stats.receiver_alloc_canonical += 1;
         roots.receiver.set(Value::object(receiver));
         self.publish_constructor_receiver_ticket(context, function_id, roots)?;

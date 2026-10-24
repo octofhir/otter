@@ -2257,17 +2257,17 @@ fn impl_split(
     if limit == 0 {
         return Ok(Value::array(ctx.array_from_elements_with_roots(
             std::iter::empty(),
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?));
     }
     // step 9 — a `undefined` / missing separator yields `[S]`.
     let Some(separator) = separator else {
         let singleton = [Value::string(recv)];
         return Ok(Value::array(ctx.array_from_elements_with_roots(
-            singleton.iter().cloned(),
-            &[],
-            &[singleton.as_slice()],
+            singleton,
+            &mut [],
+            &mut [],
         )?));
     };
 
@@ -2289,9 +2289,9 @@ fn impl_split(
             out.push(Value::string(part));
         }
         return Ok(Value::array(ctx.array_from_elements_with_roots(
-            out.iter().cloned(),
-            &[],
-            &[out.as_slice()],
+            out,
+            &mut [],
+            &mut [],
         )?));
     }
 
@@ -2333,9 +2333,9 @@ fn impl_split(
         out.push(Value::string(part));
     }
     Ok(Value::array(ctx.array_from_elements_with_roots(
-        out.iter().cloned(),
-        &[],
-        &[out.as_slice()],
+        out,
+        &mut [],
+        &mut [],
     )?))
 }
 
@@ -2427,8 +2427,8 @@ fn regex_split(
     if limit == 0 {
         return Ok(Value::array(ctx.array_from_elements_with_roots(
             std::iter::empty(),
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?));
     }
     let recv_units = recv.to_utf16_vec(ctx.heap_mut());
@@ -2478,9 +2478,9 @@ fn regex_split(
         out.push(Value::string(part));
     }
     Ok(Value::array(ctx.array_from_elements_with_roots(
-        out.iter().cloned(),
-        &[],
-        &[out.as_slice()],
+        out,
+        &mut [],
+        &mut [],
     )?))
 }
 

@@ -34,7 +34,7 @@ use crate::{NativeCtx, NativeError, Value, VmGetOutcome, VmPropertyKey, descript
 /// the `pub(crate)` form directly.
 pub fn alloc_object_with_value_roots_pub(
     heap: &mut otter_gc::GcHeap,
-    value_roots: &[&Value],
+    value_roots: &mut [&mut Value],
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     alloc_object_with_value_roots(heap, value_roots)
 }
@@ -43,11 +43,11 @@ pub fn alloc_object_with_value_roots_pub(
 /// alive across the allocation.
 pub(crate) fn alloc_object_with_value_roots(
     heap: &mut otter_gc::GcHeap,
-    value_roots: &[&Value],
+    value_roots: &mut [&mut Value],
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for value in value_roots {
-            value.trace_value_slots(visitor);
+        for value in value_roots.iter_mut() {
+            value.trace_value_slot_mut(visitor);
         }
     };
     object::alloc_dictionary_object_with_roots(heap, &mut external_visit)
@@ -64,11 +64,11 @@ pub fn native_constructor_static_with_value_roots(
     name: &'static str,
     length: u8,
     call: crate::native_function::NativeFastFn,
-    value_roots: &[&Value],
+    value_roots: &mut [&mut Value],
 ) -> Result<crate::native_function::NativeFunction, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for value in value_roots {
-            value.trace_value_slots(visitor);
+        for value in value_roots.iter_mut() {
+            value.trace_value_slot_mut(visitor);
         }
     };
     crate::native_function::NativeFunction::new_constructor_static_with_roots(
@@ -90,11 +90,11 @@ pub fn native_static_with_value_roots(
     name: &'static str,
     length: u8,
     call: crate::native_function::NativeFastFn,
-    value_roots: &[&Value],
+    value_roots: &mut [&mut Value],
 ) -> Result<crate::native_function::NativeFunction, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for value in value_roots {
-            value.trace_value_slots(visitor);
+        for value in value_roots.iter_mut() {
+            value.trace_value_slot_mut(visitor);
         }
     };
     crate::native_function::NativeFunction::new_static_with_roots(
@@ -121,11 +121,11 @@ pub fn native_from_call_with_value_roots(
     name: &'static str,
     length: u8,
     call: crate::native_function::NativeCall,
-    value_roots: &[&Value],
+    value_roots: &mut [&mut Value],
 ) -> Result<crate::native_function::NativeFunction, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for value in value_roots {
-            value.trace_value_slots(visitor);
+        for value in value_roots.iter_mut() {
+            value.trace_value_slot_mut(visitor);
         }
     };
     crate::native_function::NativeFunction::from_call_with_roots(
@@ -235,10 +235,13 @@ pub(crate) fn install_placeholder(
         scope.add_value(&mut placeholder_root);
         scope.add_value(&mut proto_root);
     }
-    placeholder_root = Value::object(alloc_object_with_value_roots(heap, &[&global_root])?);
+    placeholder_root = Value::object(alloc_object_with_value_roots(
+        heap,
+        &mut [&mut global_root],
+    )?);
     proto_root = Value::object(alloc_object_with_value_roots(
         heap,
-        &[&global_root, &placeholder_root],
+        &mut [&mut global_root, &mut placeholder_root],
     )?);
     let mut placeholder = placeholder_root
         .as_object()

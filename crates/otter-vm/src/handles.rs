@@ -808,8 +808,8 @@ impl Interpreter {
         // re-trace the arena, which by then holds one live handle per name.
         let array = self.alloc_runtime_rooted_array_from_values(
             std::iter::repeat_n(Value::undefined(), keys.len()),
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?;
         self.with_handle_scope(|interp, scope| {
             let parked = interp.scoped_value(scope, Value::array(array));
@@ -840,8 +840,8 @@ impl Interpreter {
     pub(crate) fn scoped_code_unit_strings(&mut self, units: &[u16]) -> Result<Value, VmError> {
         let array = self.alloc_runtime_rooted_array_from_values(
             std::iter::repeat_n(Value::undefined(), units.len()),
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?;
         self.with_handle_scope(|interp, scope| {
             let parked = interp.scoped_value(scope, Value::array(array));
@@ -871,8 +871,8 @@ impl Interpreter {
         scope: &'s HandleScope,
     ) -> Result<Local<'s>, VmError> {
         let object = match self.object_prototype_object_opt() {
-            Some(proto) => self.alloc_runtime_rooted_object_with_proto(proto, &[], &[])?,
-            None => self.alloc_runtime_rooted_object_with_roots(&[], &[])?,
+            Some(proto) => self.alloc_runtime_rooted_object_with_proto(proto, &mut [], &mut [])?,
+            None => self.alloc_runtime_rooted_object_with_roots(&mut [], &mut [])?,
         };
         Ok(self.scoped_value(scope, Value::object(object)))
     }
@@ -884,7 +884,7 @@ impl Interpreter {
         &mut self,
         scope: &'s HandleScope,
     ) -> Result<Local<'s>, VmError> {
-        let object = self.alloc_runtime_rooted_object_with_roots(&[], &[])?;
+        let object = self.alloc_runtime_rooted_object_with_roots(&mut [], &mut [])?;
         Ok(self.scoped_value(scope, Value::object(object)))
     }
 
@@ -1215,8 +1215,8 @@ impl Interpreter {
         proto: Local<'_>,
     ) -> Result<Local<'s>, VmError> {
         let object = match self.handle_arena.get(proto.index()).as_object() {
-            Some(proto) => self.alloc_runtime_rooted_object_with_proto(proto, &[], &[])?,
-            None => self.alloc_runtime_rooted_object_with_roots(&[], &[])?,
+            Some(proto) => self.alloc_runtime_rooted_object_with_proto(proto, &mut [], &mut [])?,
+            None => self.alloc_runtime_rooted_object_with_roots(&mut [], &mut [])?,
         };
         Ok(self.scoped_value(scope, Value::object(object)))
     }

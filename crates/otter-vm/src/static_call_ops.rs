@@ -553,7 +553,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         args: &[Value],
     ) -> Result<Value, CommittedValueError> {
-        let proto = args.first().cloned().unwrap_or(Value::undefined());
+        let mut proto = args.first().cloned().unwrap_or(Value::undefined());
         // Validate the argument type up front, but DO NOT snapshot the
         // prototype `Value` yet: the allocation below can trigger a
         // scavenge that relocates `proto`. The alloc roots `&proto`, so
@@ -566,7 +566,7 @@ impl Interpreter {
             return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
         }
         let mut obj = self
-            .alloc_stack_rooted_object_with_value_roots(stack, &[&proto], args)
+            .alloc_stack_rooted_object_with_value_roots(stack, &mut [&mut proto], &mut [])
             .map_err(CommittedValueError::JavaScript)?;
         let proto_value = if proto.is_null() { None } else { Some(proto) };
         if !object::set_prototype_value(&mut obj, &mut self.gc_heap, proto_value)
@@ -708,7 +708,7 @@ impl Interpreter {
                 )));
             } else {
                 interp
-                    .box_sloppy_this_primitive_stack_rooted(stack, target_input, &[args])
+                    .box_sloppy_this_primitive_stack_rooted(stack, target_input, &mut [])
                     .map_err(CommittedValueError::JavaScript)?
             };
             // Copying a source can allocate or reenter JavaScript. Keep the
@@ -870,8 +870,8 @@ impl Interpreter {
                     .alloc_stack_rooted_array_from_values_with_root_slices(
                         stack,
                         values,
-                        &[],
-                        &[args],
+                        &mut [],
+                        &mut [],
                     )
                     .map_err(CommittedValueError::JavaScript)?;
                 Ok(Some(Value::array(array)))
@@ -949,8 +949,8 @@ impl Interpreter {
                             .alloc_stack_rooted_array_from_values_with_root_slices(
                                 stack,
                                 [key_value, value],
-                                &[],
-                                &[args],
+                                &mut [],
+                                &mut [],
                             )
                             .map_err(CommittedValueError::JavaScript)?;
                         // Park the freshly built pair so later pair allocations
@@ -965,8 +965,8 @@ impl Interpreter {
                         .alloc_stack_rooted_array_from_values_with_root_slices(
                             stack,
                             pairs,
-                            &[],
-                            &[args],
+                            &mut [],
+                            &mut [],
                         )
                         .map_err(CommittedValueError::JavaScript)
                 })?;
@@ -1488,13 +1488,13 @@ impl Interpreter {
                 } else {
                     return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 };
-                let target_root = args.first().cloned().unwrap_or(Value::undefined());
+                let mut target_root = args.first().cloned().unwrap_or(Value::undefined());
                 let array = self
                     .alloc_stack_rooted_array_from_values_with_root_slices(
                         stack,
                         syms,
-                        &[&target_root],
-                        &[args],
+                        &mut [&mut target_root],
+                        &mut [],
                     )
                     .map_err(CommittedValueError::JavaScript)?;
                 Ok(Some(Value::array(array)))

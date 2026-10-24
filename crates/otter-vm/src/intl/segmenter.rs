@@ -262,7 +262,7 @@ fn segments_symbol_iterator(
         });
     };
     interp
-        .array_iterator_method(context, receiver, "values", &[])
+        .array_iterator_method(context, receiver, "values", &mut [])
         .map_err(|err| crate::native_function::vm_to_native_error(interp, err, "[Symbol.iterator]"))
 }
 

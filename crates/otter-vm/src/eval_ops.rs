@@ -326,7 +326,7 @@ impl Interpreter {
         self.with_handle_scope(|interp, scope| {
             let entry_promise = if entry_is_async {
                 let result = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                    .pending_stack_rooted(interp, stack, &[], &[])?;
+                    .pending_stack_rooted(interp, stack, &mut [], &mut [])?;
                 let frame = stack.pending_mut().expect("entry inputs were just queued");
                 interp.prepared_set_async_state(
                     frame,

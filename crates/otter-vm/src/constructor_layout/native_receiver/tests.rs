@@ -55,7 +55,7 @@ fn finalize(vm: &mut Interpreter, target: Value, prototype: Value, fid: u32) -> 
         let provisional = vm.gc_heap.read_payload(layout, ConstructorLayoutBody::root);
         for _ in 0..7 {
             let receiver = vm
-                .alloc_runtime_rooted_object_with_shape(provisional, &[], &[])
+                .alloc_runtime_rooted_object_with_shape(provisional, &mut [], &mut [])
                 .unwrap();
             let receiver = vm.scoped_value(scope, Value::object(receiver));
             let mut frame = Frame::new(
@@ -108,7 +108,7 @@ fn pure_receiver_probe_uses_current_moving_aliases_and_revoked_real_proof() {
         let target = vm.scoped_value(scope, Value::closure(closure));
         miss(probe(vm, vm.escape_scoped(target), 9));
         let mut target_value = vm.escape_scoped(target);
-        vm.ensure_closure_rare(None, &mut target_value, &[])
+        vm.ensure_closure_rare(None, &mut target_value, &mut [])
             .unwrap();
         let target_now = vm.escape_scoped(target).as_closure(&vm.gc_heap).unwrap();
         let proto_now = vm.escape_scoped(prototype);

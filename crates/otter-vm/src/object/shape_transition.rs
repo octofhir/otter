@@ -456,10 +456,10 @@ mod tests {
         let owner = otter_gc::ExtraRoots::new(&interp);
         let _owner = interp.gc_heap_mut().register_extra_roots(owner);
         let mut first = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("first receiver");
         let mut second = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("second receiver");
         let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
         // SAFETY: both receiver slots precede the scope and stay stationary

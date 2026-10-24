@@ -204,7 +204,7 @@ pub fn call(
         // §28.1.11 Reflect.ownKeys(target)
         // <https://tc39.es/ecma262/#sec-reflect.ownkeys>
         M::OwnKeys => {
-            let target =
+            let mut target =
                 expect_object_value(args.first()).map_err(CommittedValueError::JavaScript)?;
             let keys = interp.own_property_keys_value(stack, context, &target)?;
             Ok(Value::array(
@@ -212,8 +212,8 @@ pub fn call(
                     .alloc_stack_rooted_array_from_values_with_root_slices(
                         stack,
                         keys,
-                        &[&target],
-                        &[args],
+                        &mut [&mut target],
+                        &mut [],
                     )
                     .map_err(CommittedValueError::JavaScript)?,
             ))

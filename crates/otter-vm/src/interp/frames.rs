@@ -122,7 +122,7 @@ impl Interpreter {
         } else {
             let result_promise =
                 crate::promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                    .pending_stack_rooted(self, stack, &[], &[])?;
+                    .pending_stack_rooted(self, stack, &mut [], &mut [])?;
             // SAFETY: as above; the record keeps its address across allocation.
             self.frame_set_async_state(
                 unsafe { &mut *frame },

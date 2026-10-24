@@ -620,7 +620,7 @@ mod tests {
         );
 
         let mut obj = interp
-            .alloc_host_object_with_roots(&[], &[])
+            .alloc_host_object_with_roots(&mut [], &mut [])
             .expect("alloc object after scavenge");
         let cached_proto = interp.object_prototype_object_opt().unwrap();
         assert!(

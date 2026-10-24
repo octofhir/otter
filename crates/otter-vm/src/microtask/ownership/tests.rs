@@ -33,8 +33,11 @@ struct Observation {
 
 /// Allocate a pending Promise under the runtime roots and park it in `scope`.
 fn pending_promise<'s>(scope: &mut NativeScope<'s, '_>) -> Result<Local<'s>, NativeError> {
-    let handle =
-        crate::promise_dispatch::pending_runtime_rooted(scope.context().interp_mut(), &[], &[])?;
+    let handle = crate::promise_dispatch::pending_runtime_rooted(
+        scope.context().interp_mut(),
+        &mut [],
+        &mut [],
+    )?;
     Ok(scope.value(Value::promise(handle)))
 }
 
@@ -762,7 +765,7 @@ fn finalization_jobs_keep_creation_realm_async_and_held_aliases_through_actual_g
                     let callback = scope.raw(cleanup);
                     let registry = scope
                         .context()
-                        .alloc_finalization_registry(callback, None, &[], &[])
+                        .alloc_finalization_registry(callback, None, &mut [], &mut [])
                         .map_err(|error| {
                             crate::native_function::vm_to_native_error(
                                 scope.context().interp_mut(),

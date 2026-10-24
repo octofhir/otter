@@ -433,7 +433,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             "[Symbol.match]",
             1,
             crate::regexp_prototype::native_regexp_symbol_match,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );
@@ -443,7 +443,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             "[Symbol.search]",
             1,
             crate::regexp_prototype::native_regexp_symbol_search,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );
@@ -453,7 +453,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             "[Symbol.replace]",
             2,
             crate::regexp_prototype::native_regexp_symbol_replace,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );
@@ -463,7 +463,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             "[Symbol.split]",
             2,
             crate::regexp_prototype::native_regexp_symbol_split,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );
@@ -473,7 +473,7 @@ pub fn install_regexp_well_knowns_post_bootstrap(
             "[Symbol.matchAll]",
             1,
             crate::regexp_prototype::native_regexp_symbol_match_all,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );

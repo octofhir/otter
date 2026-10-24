@@ -143,7 +143,7 @@ impl Interpreter {
             let prototype = vm.scoped_value(scope, prototype);
             if vm.escape_scoped(target).as_closure(&vm.gc_heap).is_some() {
                 let mut target_now = vm.escape_scoped(target);
-                vm.ensure_closure_rare(None, &mut target_now, &[])?;
+                vm.ensure_closure_rare(None, &mut target_now, &mut [])?;
             }
             let target_now = vm.escape_scoped(target);
             let Some(head) = vm.constructor_layout_head(target_now) else {

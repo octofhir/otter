@@ -18,7 +18,7 @@ use crate::promise::PromiseState;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 fn rooted_pending(vm: &mut Interpreter) -> (PersistentRootId, PersistentRootId) {
-    let promise = crate::promise_dispatch::pending_runtime_rooted(vm, &[], &[])
+    let promise = crate::promise_dispatch::pending_runtime_rooted(vm, &mut [], &mut [])
         .expect("rooted pending promise");
     let value = Value::promise(promise);
     (

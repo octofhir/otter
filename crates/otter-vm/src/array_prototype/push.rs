@@ -60,7 +60,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
-        _roots: &[&[Value]],
+        _roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let receiver = interp.scoped_value(scope, receiver);
@@ -82,7 +82,7 @@ impl Interpreter {
         let value = self.escape_scoped(receiver);
         if !value.is_object_type() {
             let boxed = self
-                .box_sloppy_this_primitive_runtime_rooted(value, &[])
+                .box_sloppy_this_primitive_runtime_rooted(value, &mut [])
                 .map_err(CommittedValueError::JavaScript)?;
             // This driver owns the receiver slot; replace its primitive with
             // ToObject's result immediately, before another allocation.

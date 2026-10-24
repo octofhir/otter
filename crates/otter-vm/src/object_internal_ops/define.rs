@@ -188,7 +188,7 @@ impl Interpreter {
                 .map_err(CommittedValueError::JavaScript)?;
             let key_root = self.scoped_value(&scope, key_value);
             let descriptor_object = self
-                .partial_descriptor_to_object(&current_descriptor(self), &[])
+                .partial_descriptor_to_object(&current_descriptor(self), &mut [])
                 .map_err(CommittedValueError::JavaScript)?;
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 self.escape_scoped(target_root),
@@ -459,7 +459,7 @@ impl Interpreter {
             if let VmPropertyKey::Symbol(sym) = key {
                 let owner = target.as_closure(&self.gc_heap);
                 let (mut bag, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
-                    this.function_user_bag(stack, owner, function_id, &[])
+                    this.function_user_bag(stack, owner, function_id, &mut [])
                         .map_err(CommittedValueError::JavaScript)
                 })?;
                 return object::define_own_symbol_property_partial(
@@ -1053,10 +1053,10 @@ impl Interpreter {
     pub(crate) fn partial_descriptor_to_object(
         &mut self,
         descriptor: &object::PartialPropertyDescriptor,
-        value_roots: &[&Value],
+        value_roots: &mut [&mut Value],
     ) -> Result<object::JsObject, VmError> {
         self.with_handle_scope(|interp, scope| {
-            for value in value_roots {
+            for value in value_roots.iter_mut() {
                 let _ = interp.scoped_value(scope, **value);
             }
             let value = descriptor

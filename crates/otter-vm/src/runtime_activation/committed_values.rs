@@ -377,9 +377,9 @@ impl Interpreter {
             }
             ObjectProtocolValueOp::Binary(_) => unreachable!("binary operators return above"),
             ObjectProtocolValueOp::ArrayPush => {
-                self.array_push(stack, context, value0, &[value1], &[])?
+                self.array_push(stack, context, value0, &[value1], &mut [])?
             }
-            ObjectProtocolValueOp::ArrayPop => self.array_pop(stack, context, value0, &[])?,
+            ObjectProtocolValueOp::ArrayPop => self.array_pop(stack, context, value0, &mut [])?,
             ObjectProtocolValueOp::HasProperty => {
                 if !value1.is_object_type() {
                     return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
@@ -482,7 +482,7 @@ impl Interpreter {
                 if value0.is_nullish() {
                     return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                 }
-                self.box_sloppy_this_primitive_runtime_rooted(value0, &[])
+                self.box_sloppy_this_primitive_runtime_rooted(value0, &mut [])
                     .map_err(CommittedValueError::JavaScript)?
             }
             ScalarValueOp::ToPropertyKey => {

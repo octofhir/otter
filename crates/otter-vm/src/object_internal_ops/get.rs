@@ -1897,21 +1897,21 @@ impl Interpreter {
             // key set (enumerable + non-enumerable) for Proxy targets,
             // validated against §10.5.11 invariants.
             M::GetOwnPropertyNames => {
-                let target_clone = *target;
+                let mut target_clone = *target;
                 let trap_keys = self.own_property_keys_value(stack, context, &target_clone)?;
                 let values: Vec<Value> = trap_keys.into_iter().filter(|v| v.is_string()).collect();
                 let array = self
                     .alloc_stack_rooted_array_from_values_with_root_slices(
                         stack,
                         values,
-                        &[&target_clone],
-                        &[args],
+                        &mut [&mut target_clone],
+                        &mut [],
                     )
                     .map_err(CommittedValueError::JavaScript)?;
                 Ok(Some(Value::array(array)))
             }
             M::GetOwnPropertySymbols => {
-                let target_clone = *target;
+                let mut target_clone = *target;
                 // A byte view's own keys are its element indices plus its
                 // expandos. Building the whole key list to keep the symbols
                 // would spell out one string per element and discard every
@@ -1936,8 +1936,8 @@ impl Interpreter {
                     .alloc_stack_rooted_array_from_values_with_root_slices(
                         stack,
                         values,
-                        &[&target_clone],
-                        &[args],
+                        &mut [&mut target_clone],
+                        &mut [],
                     )
                     .map_err(CommittedValueError::JavaScript)?;
                 Ok(Some(Value::array(array)))

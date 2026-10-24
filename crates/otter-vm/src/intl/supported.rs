@@ -174,7 +174,7 @@ pub fn canonicalize_locale_list(
             scope
                 .context()
                 .interp_mut()
-                .box_sloppy_this_primitive_runtime_rooted(locales, &[])
+                .box_sloppy_this_primitive_runtime_rooted(locales, &mut [])
                 .map_err(|error| {
                     crate::native_function::vm_to_native_error(
                         scope.context().interp_mut(),
@@ -305,7 +305,7 @@ pub(crate) fn supported_locales_of(
             let boxed = scope
                 .context()
                 .interp_mut()
-                .box_sloppy_this_primitive_runtime_rooted(options, &[])
+                .box_sloppy_this_primitive_runtime_rooted(options, &mut [])
                 .map_err(|error| {
                     crate::native_function::vm_to_native_error(
                         scope.context().interp_mut(),

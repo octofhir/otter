@@ -76,7 +76,7 @@ impl Interpreter {
         let this_value_slot = self.push_iteration_anchor(this_value) - 1;
         let capability =
             match crate::promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                .capability_stack_rooted(self, stack, &[], &[])
+                .capability_stack_rooted(self, stack, &mut [], &mut [])
             {
                 Ok(capability) => capability,
                 Err(error) => {
@@ -90,7 +90,7 @@ impl Interpreter {
         let reject_slot = self.push_iteration_anchor(capability.reject) - 1;
         let result = (|| -> Result<Value, CommittedValueError> {
             let state_obj = self
-                .alloc_runtime_rooted_object_with_roots(&[], &[])
+                .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
                 .map_err(CommittedValueError::JavaScript)?;
             let st = self.push_iteration_anchor(Value::object(state_obj)) - 1;
             let resolve = self.iteration_anchor(resolve_slot);
@@ -271,7 +271,7 @@ impl Interpreter {
                 let array_like = if items.is_object_type() || items.is_proxy() {
                     items
                 } else {
-                    self.box_sloppy_this_primitive_runtime_rooted(items, &[])
+                    self.box_sloppy_this_primitive_runtime_rooted(items, &mut [])
                         .map_err(CommittedValueError::JavaScript)?
                 };
                 let array_like_slot = self.push_iteration_anchor(array_like) - 1;
@@ -397,7 +397,7 @@ impl Interpreter {
             let rejected_slot = self.push_iteration_anchor(on_rejected) - 1;
             let capability =
                 crate::promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                    .capability_stack_rooted(self, stack, &[], &[])
+                    .capability_stack_rooted(self, stack, &mut [], &mut [])
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let inner_value = self.iteration_anchor(inner_slot);
             let inner = inner_value

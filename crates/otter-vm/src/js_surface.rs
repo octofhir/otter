@@ -209,15 +209,15 @@ pub struct NamespaceSpec {
 
 fn visit_value_roots(
     visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) {
-    for value in value_roots {
-        value.trace_value_slots(visitor);
+    for value in value_roots.iter_mut() {
+        value.trace_value_slot_mut(visitor);
     }
-    for slice in slice_roots {
-        for value in *slice {
-            value.trace_value_slots(visitor);
+    for slice in slice_roots.iter_mut() {
+        for value in slice.iter_mut() {
+            value.trace_value_slot_mut(visitor);
         }
     }
 }
@@ -225,8 +225,8 @@ fn visit_value_roots(
 fn visit_raw_and_value_roots(
     visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
     raw_roots: &[*mut otter_gc::raw::RawGc],
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) {
     for &slot in raw_roots {
         visitor(slot);
@@ -236,8 +236,8 @@ fn visit_raw_and_value_roots(
 
 fn alloc_object_with_roots(
     heap: &mut otter_gc::GcHeap,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         visit_value_roots(visitor, value_roots, slice_roots);
@@ -248,8 +248,8 @@ fn alloc_object_with_roots(
 fn alloc_object_with_raw_roots(
     heap: &mut otter_gc::GcHeap,
     raw_roots: &[*mut otter_gc::raw::RawGc],
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         visit_raw_and_value_roots(visitor, raw_roots, value_roots, slice_roots);
@@ -263,8 +263,8 @@ fn native_from_call_with_raw_roots(
     length: u8,
     call: NativeCall,
     raw_roots: &[*mut otter_gc::raw::RawGc],
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<NativeFunction, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         visit_raw_and_value_roots(visitor, raw_roots, value_roots, slice_roots);
@@ -335,7 +335,7 @@ pub struct ObjectBuilder<'rt> {
 impl<'rt> ObjectBuilder<'rt> {
     /// Allocate a fresh object and bind the builder to `heap`.
     pub fn new(heap: &'rt mut otter_gc::GcHeap) -> Result<Self, otter_gc::OutOfMemory> {
-        let object = alloc_object_with_roots(heap, &[], &[])?;
+        let object = alloc_object_with_roots(heap, &mut [], &mut [])?;
         Ok(Self {
             heap,
             object: RootedObject::new(object),
@@ -446,8 +446,8 @@ impl<'rt> ObjectBuilder<'rt> {
             length,
             call,
             self.raw_roots.as_slice(),
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)
     }
@@ -691,14 +691,14 @@ impl<'rt> ConstructorBuilder<'rt> {
         ctor_root = Value::object(alloc_object_with_raw_roots(
             heap,
             raw_roots.as_slice(),
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?);
         proto_root = Value::object(alloc_object_with_raw_roots(
             heap,
             raw_roots.as_slice(),
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?);
         function_root = Value::native_function(native_from_call_with_raw_roots(
             heap,
@@ -706,8 +706,8 @@ impl<'rt> ConstructorBuilder<'rt> {
             spec.length,
             spec.call.clone(),
             raw_roots.as_slice(),
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?);
         define_data(
             ctor_root
@@ -825,14 +825,14 @@ impl<'rt> ClassBuilder<'rt> {
         prototype_root = Value::object(alloc_object_with_raw_roots(
             heap,
             raw_roots.as_slice(),
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?);
         statics_root = Value::object(alloc_object_with_raw_roots(
             heap,
             raw_roots.as_slice(),
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?);
         constructor_root = Value::native_function(native_from_call_with_raw_roots(
             heap,
@@ -840,8 +840,8 @@ impl<'rt> ClassBuilder<'rt> {
             spec.constructor.length,
             spec.constructor.call.clone(),
             raw_roots.as_slice(),
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?);
 
         {
@@ -918,7 +918,7 @@ impl<'rt> NamespaceBuilder<'rt> {
         heap: &'rt mut otter_gc::GcHeap,
         spec: &'static NamespaceSpec,
     ) -> Result<Self, otter_gc::OutOfMemory> {
-        let object = alloc_object_with_roots(heap, &[], &[])?;
+        let object = alloc_object_with_roots(heap, &mut [], &mut [])?;
         Ok(Self {
             heap,
             spec,
@@ -934,10 +934,9 @@ impl<'rt> NamespaceBuilder<'rt> {
     pub fn from_spec_with_value_roots(
         heap: &'rt mut otter_gc::GcHeap,
         spec: &'static NamespaceSpec,
-        value_roots: Vec<Value>,
+        mut value_roots: Vec<Value>,
     ) -> Result<Self, otter_gc::OutOfMemory> {
-        let root_refs: Vec<&Value> = value_roots.iter().collect();
-        let object = alloc_object_with_roots(heap, root_refs.as_slice(), &[])?;
+        let object = alloc_object_with_roots(heap, &mut [], &mut [value_roots.as_mut_slice()])?;
         Ok(Self {
             heap,
             spec,

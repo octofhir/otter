@@ -61,10 +61,13 @@ impl Interpreter {
         };
         let next_root = self.json_root_push(next_method);
         let result = (|| {
-            let sync_iterator = self.json_root_get(base);
-            let next_method = self.json_root_get(next_root);
+            let mut sync_iterator = self.json_root_get(base);
+            let mut next_method = self.json_root_get(next_root);
             let wrapper = self
-                .alloc_runtime_rooted_object_with_roots(&[&sync_iterator, &next_method], &[])
+                .alloc_runtime_rooted_object_with_roots(
+                    &mut [&mut sync_iterator, &mut next_method],
+                    &mut [],
+                )
                 .map_err(CommittedValueError::JavaScript)?;
             let wrapper_root = self.json_root_push(Value::object(wrapper));
             for (name, call, caches_next) in [
@@ -290,7 +293,7 @@ impl Interpreter {
 
             let capability =
                 crate::promise_dispatch::PromiseBuilder::with_context(context.cloned())
-                    .capability_stack_rooted(self, stack, &[], &[])
+                    .capability_stack_rooted(self, stack, &mut [], &mut [])
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let promise_root = self.json_root_push(capability.promise);
             let inner = self
@@ -346,12 +349,12 @@ fn rejected_promise(
 fn reject_with(
     ctx: &mut NativeCtx<'_>,
     context: Option<&ExecutionContext>,
-    reason: Value,
+    mut reason: Value,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     ctx.with_turn_parts(|interp, stack| {
         crate::promise_dispatch::PromiseBuilder::with_context(context.cloned())
-            .rejected_stack_rooted(interp, stack, reason, &[&reason], &[])
+            .rejected_stack_rooted(interp, stack, reason, &mut [&mut reason], &mut [])
             .map(Value::promise)
             .map_err(|error| {
                 CommittedValueError::JavaScript(VmError::from(error)).into_native(interp, name)
@@ -437,13 +440,14 @@ fn step_return(
             // A sync iterator with no `return` is already finished, and the
             // answer is still a promise.
             let context = ctx.execution_context().cloned();
-            let record = match iter_result_object(ctx, arg.unwrap_or_else(Value::undefined), true) {
-                Ok(record) => record,
-                Err(err) => return Some(Err(err)),
-            };
+            let mut record =
+                match iter_result_object(ctx, arg.unwrap_or_else(Value::undefined), true) {
+                    Ok(record) => record,
+                    Err(err) => return Some(Err(err)),
+                };
             Some(ctx.with_turn_parts(|interp, stack| {
                 crate::promise_dispatch::PromiseBuilder::with_context(context)
-                    .fulfilled_stack_rooted(interp, stack, record, &[&record], &[])
+                    .fulfilled_stack_rooted(interp, stack, record, &mut [&mut record], &mut [])
                     .map(Value::promise)
                     .map_err(|error| {
                         CommittedValueError::JavaScript(VmError::from(error))

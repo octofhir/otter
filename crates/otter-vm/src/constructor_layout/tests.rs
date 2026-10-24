@@ -33,7 +33,7 @@ fn receiver(vm: &mut Interpreter, root: ShapeHandle, fields: usize) -> Value {
             .expect("receiver's source fields");
     }
     let object = vm
-        .alloc_runtime_rooted_object_with_shape(root, &[], &[])
+        .alloc_runtime_rooted_object_with_shape(root, &mut [], &mut [])
         .expect("physical receiver cell");
     let values = vec![Value::UNDEFINED; fields];
     object::install_fresh_shape_with_slots(object, &mut vm.gc_heap, shape, &values, fields);

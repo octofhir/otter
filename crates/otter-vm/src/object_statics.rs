@@ -1444,7 +1444,7 @@ fn call(
                 crate::object::ShapeState::ORDINARY,
                 &mut |_| {},
             )?;
-            let mut obj = rooted_object(gc_heap, root, &[], &[])?;
+            let mut obj = rooted_object(gc_heap, root, &mut [], &mut [])?;
             let mut object_roots = otter_gc::RootScope::new(gc_heap);
             // SAFETY: the actual result slot stays stationary until returned.
             unsafe { object_roots.add_object(&mut obj) };
@@ -2045,12 +2045,12 @@ fn call(
             let values: Vec<Value> = crate::object::with_properties(target, gc_heap, |p| {
                 p.enumerable_data_iter().map(|(_, v)| v).collect()
             });
-            let target_root = Value::object(target);
+            let mut target_root = Value::object(target);
             Ok(Value::array(rooted_array_from_elements(
                 gc_heap,
                 values,
-                &[&target_root],
-                &[args],
+                &mut [&mut target_root],
+                &mut [],
             )?))
         }
         // §20.1.2.5 Object.entries(O) — `[key, value]` pairs in
@@ -2080,12 +2080,12 @@ fn call(
                     // allocation, which traces its pending element vector.
                     let key = interp.escape_scoped(key_h);
                     let value = interp.escape_scoped(value_h);
-                    let target_root = interp.escape_scoped(target_h);
+                    let mut target_root = interp.escape_scoped(target_h);
                     let pair = rooted_array_from_elements(
                         interp.gc_heap_for_cx_mut(),
                         [key, value],
-                        &[&target_root],
-                        &[args],
+                        &mut [&mut target_root],
+                        &mut [],
                     )?;
                     // Park the freshly built pair so later pair allocations
                     // never strand it.
@@ -2095,12 +2095,12 @@ fn call(
                     .iter()
                     .map(|pair_h| interp.escape_scoped(*pair_h))
                     .collect();
-                let target_root = interp.escape_scoped(target_h);
+                let mut target_root = interp.escape_scoped(target_h);
                 rooted_array_from_elements(
                     interp.gc_heap_for_cx_mut(),
                     pairs,
-                    &[&target_root],
-                    &[args],
+                    &mut [&mut target_root],
+                    &mut [],
                 )
             })?;
             Ok(Value::array(array))
@@ -2242,8 +2242,8 @@ fn call(
                 return Ok(Value::array(rooted_array_from_elements(
                     gc_heap,
                     Vec::new(),
-                    &[],
-                    &[args],
+                    &mut [],
+                    &mut [],
                 )?));
             }
             let target = expect_object(args.first())?;
@@ -2255,12 +2255,12 @@ fn call(
                     .map(Value::symbol)
                     .collect()
             });
-            let target_root = Value::object(target);
+            let mut target_root = Value::object(target);
             Ok(Value::array(rooted_array_from_elements(
                 gc_heap,
                 syms,
-                &[&target_root],
-                &[args],
+                &mut [&mut target_root],
+                &mut [],
             )?))
         }
         // §20.1.2.7 `Object.groupBy(items, callbackfn)` — the
@@ -2340,16 +2340,16 @@ pub fn coerce_to_descriptor(
 fn rooted_object(
     gc_heap: &mut otter_gc::GcHeap,
     root: crate::object::ShapeHandle,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<JsObject, VmError> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for value in value_roots {
-            value.trace_value_slots(visitor);
+        for value in value_roots.iter_mut() {
+            value.trace_value_slot_mut(visitor);
         }
-        for slice in slice_roots {
-            for value in *slice {
-                value.trace_value_slots(visitor);
+        for slice in slice_roots.iter_mut() {
+            for value in slice.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
         }
     };
@@ -2360,19 +2360,19 @@ fn rooted_object(
 fn rooted_array_from_elements<I>(
     gc_heap: &mut otter_gc::GcHeap,
     values: I,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<crate::array::JsArray, VmError>
 where
     I: IntoIterator<Item = Value>,
 {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for value in value_roots {
-            value.trace_value_slots(visitor);
+        for value in value_roots.iter_mut() {
+            value.trace_value_slot_mut(visitor);
         }
-        for slice in slice_roots {
-            for value in *slice {
-                value.trace_value_slots(visitor);
+        for slice in slice_roots.iter_mut() {
+            for value in slice.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
         }
     };

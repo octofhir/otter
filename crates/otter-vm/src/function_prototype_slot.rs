@@ -69,7 +69,7 @@ impl Interpreter {
                 // allocation; the closure slot is rewritten in place.
                 let value = interp.scoped_value(scope, value);
                 let mut closure_value = Value::closure(closure);
-                interp.ensure_closure_rare(stack, &mut closure_value, &[])?;
+                interp.ensure_closure_rare(stack, &mut closure_value, &mut [])?;
                 let value = interp.escape_scoped(value);
                 let closure = closure_value
                     .as_closure(&interp.gc_heap)
@@ -101,7 +101,7 @@ impl Interpreter {
         match owner {
             Some(closure) => {
                 let mut closure_value = Value::closure(closure);
-                self.ensure_closure_rare(stack, &mut closure_value, &[])?;
+                self.ensure_closure_rare(stack, &mut closure_value, &mut [])?;
                 closure_value
                     .as_closure(&self.gc_heap)
                     .ok_or(VmError::TypeMismatch)?
@@ -147,7 +147,7 @@ impl Interpreter {
                 owner_handle
                     .and_then(|handle| interp.escape_scoped(handle).as_closure(&interp.gc_heap))
             };
-            let proto = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
+            let proto = interp.alloc_stack_rooted_object_with_extra_roots(stack, &mut [])?;
             let proto_handle = interp.scoped_value(scope, Value::object(proto));
             let proto_now = |interp: &Self| -> JsObject {
                 interp
@@ -185,7 +185,8 @@ impl Interpreter {
                         return Err(VmError::TypeError);
                     }
                 } else {
-                    let parent = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
+                    let parent =
+                        interp.alloc_stack_rooted_object_with_extra_roots(stack, &mut [])?;
                     let proto = proto_now(interp);
                     interp.finish_generator_function_prototype(
                         context,

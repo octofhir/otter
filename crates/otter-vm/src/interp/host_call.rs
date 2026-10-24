@@ -618,7 +618,7 @@ fn native_construct_with(
     turn.frame_mut().this_value = proto;
     let mut receiver = turn
         .vm
-        .alloc_stack_rooted_object_with_extra_roots(turn.stack, &[])
+        .alloc_stack_rooted_object_with_extra_roots(turn.stack, &mut [])
         .map_err(CommittedValueError::JavaScript)?;
     let proto = turn.frame().this_value;
     if !crate::object::set_prototype_value(&mut receiver, &mut turn.vm.gc_heap, Some(proto))
@@ -840,7 +840,7 @@ fn proxy_entry(turn: &mut HostTurn<'_>, ctx: &mut JitCtx) -> Result<HostStep, Co
     let args = turn.actuals();
     let argv = turn
         .vm
-        .alloc_stack_rooted_array_from_values(turn.stack, args.iter().copied(), &[], &args)
+        .alloc_stack_rooted_array_from_values(turn.stack, args.iter().copied(), &mut [], &mut [])
         .map_err(CommittedValueError::JavaScript)?;
     let trap = turn.frame().this_value;
     let receiver = turn.register(TRAP_ARGUMENTS_REGISTER + 1);
@@ -912,7 +912,7 @@ pub extern "C" fn prepare_activation(ctx: *mut JitCtx) -> NativeResultPair {
         let receiver = turn.frame().this_value;
         let receiver = turn
             .vm
-            .this_for_bytecode_call_stack_rooted(function, turn.stack, receiver, &[])
+            .this_for_bytecode_call_stack_rooted(function, turn.stack, receiver, &mut [])
             .map_err(CommittedValueError::JavaScript)?;
         turn.frame_mut().this_value = receiver;
         Ok(HostStep::Complete(NativeResultPair::success(

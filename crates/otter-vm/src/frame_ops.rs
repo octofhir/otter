@@ -66,7 +66,8 @@ impl Interpreter {
         let elements: SmallVec<[Value; 4]> = (usize::from(parameter_count)..count)
             .map(|index| frame.incoming_argument(index))
             .collect::<Result<_, _>>()?;
-        let array = self.alloc_stack_rooted_array_from_values(&*stack, elements, &[], &[])?;
+        let array =
+            self.alloc_stack_rooted_array_from_values(&*stack, elements, &mut [], &mut [])?;
         ActiveFrameMut::from_frame(&mut stack[top_idx]).write(dst, Value::array(array))
     }
 }

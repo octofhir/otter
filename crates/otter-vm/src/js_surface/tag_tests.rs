@@ -25,7 +25,9 @@ fn string_tag_builder_keeps_receiver_current_at_strides_1_to_16() {
         let mut vm = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         vm.gc_heap.set_gc_stress(0, false);
         vm.with_runtime_roots(|vm| {
-            let object = vm.alloc_runtime_rooted_object_with_roots(&[], &[]).unwrap();
+            let object = vm
+                .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
+                .unwrap();
             let mut receiver = Value::object(object);
             let original = receiver.as_raw_gc().unwrap().0;
             let mut roots = otter_gc::RootScope::new(&mut vm.gc_heap);
@@ -76,7 +78,9 @@ fn string_tag_builder_keeps_receiver_current_at_strides_1_to_16() {
 fn string_tag_builder_reports_non_extensible_rejection() {
     let mut vm = crate::Interpreter::new().expect("fixture interpreter bootstrap");
     vm.with_runtime_roots(|vm| {
-        let mut object = vm.alloc_runtime_rooted_object_with_roots(&[], &[]).unwrap();
+        let mut object = vm
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
+            .unwrap();
         object::prevent_extensions(&mut object, &mut vm.gc_heap).unwrap();
         let mut builder = ObjectBuilder::from_object(&mut vm.gc_heap, object);
         assert!(matches!(

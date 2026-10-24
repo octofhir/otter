@@ -350,7 +350,7 @@ impl Interpreter {
             if produced.is_generator()
                 && (primordial || interp.proven_generator_next(interp.escape_scoped(produced_root)))
             {
-                let produced = interp.escape_scoped(produced_root);
+                let mut produced = interp.escape_scoped(produced_root);
                 let handle = produced
                     .as_generator()
                     .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
@@ -358,8 +358,8 @@ impl Interpreter {
                     .alloc_stack_rooted_iterator_state(
                         stack,
                         IteratorState::Generator { handle },
-                        &[&produced],
-                        &[],
+                        &mut [&mut produced],
+                        &mut [],
                     )
                     .map_err(CommittedValueError::JavaScript)?;
                 return Ok(Value::iterator(iter));
@@ -415,8 +415,8 @@ impl Interpreter {
                 .alloc_stack_rooted_iterator_state(
                     stack,
                     iter_state,
-                    &[&interp.escape_scoped(produced_root)],
-                    &[],
+                    &mut [&mut interp.escape_scoped(produced_root)],
+                    &mut [],
                 )
                 .map_err(CommittedValueError::JavaScript)?;
             Ok(Value::iterator(iter))
@@ -647,7 +647,7 @@ impl Interpreter {
                         | IteratorState::ArrayEntry { index, .. } => *index += 1,
                         _ => {}
                     });
-                let value = self.load_property_value(
+                let mut value = self.load_property_value(
                     context,
                     stack,
                     Value::array(array),
@@ -656,7 +656,11 @@ impl Interpreter {
                 if entry {
                     let idx_value = Value::number_f64(index as f64);
                     let pair = self
-                        .alloc_runtime_rooted_array_from_values([idx_value, value], &[&value], &[])
+                        .alloc_runtime_rooted_array_from_values(
+                            [idx_value, value],
+                            &mut [&mut value],
+                            &mut [],
+                        )
                         .map_err(CommittedValueError::JavaScript)?;
                     return Ok((Value::array(pair), false));
                 }
@@ -704,10 +708,15 @@ impl Interpreter {
                 return Ok((index_value, false));
             }
             let receiver = interp.iteration_anchor(anchor);
-            let value = interp.load_property_value(context, stack, receiver, &index.to_string())?;
+            let mut value =
+                interp.load_property_value(context, stack, receiver, &index.to_string())?;
             if matches!(kind, ArrayIterKind::Entry) {
                 let pair = interp
-                    .alloc_runtime_rooted_array_from_values([index_value, value], &[&value], &[])
+                    .alloc_runtime_rooted_array_from_values(
+                        [index_value, value],
+                        &mut [&mut value],
+                        &mut [],
+                    )
                     .map_err(CommittedValueError::JavaScript)?;
                 return Ok((Value::array(pair), false));
             }
@@ -1477,17 +1486,18 @@ impl Interpreter {
                             ),
                         ));
                     };
-                    let iter_root = Value::iterator(*iter);
-                    let source_root = Value::iterator(source);
-                    let mapper_root = self.gc_heap.read_payload(*iter, |state| match &**state {
-                        IteratorState::FlatMap { mapper, .. } => *mapper,
-                        _ => Value::undefined(),
-                    });
+                    let mut iter_root = Value::iterator(*iter);
+                    let mut source_root = Value::iterator(source);
+                    let mut mapper_root =
+                        self.gc_heap.read_payload(*iter, |state| match &**state {
+                            IteratorState::FlatMap { mapper, .. } => *mapper,
+                            _ => Value::undefined(),
+                        });
                     let new_inner = self
                         .alloc_runtime_rooted_iterator_state(
                             inner_state,
-                            &[&iter_root, &source_root, &mapper_root],
-                            &[],
+                            &mut [&mut iter_root, &mut source_root, &mut mapper_root],
+                            &mut [],
                         )
                         .map_err(CommittedValueError::JavaScript)?;
                     self.gc_heap.with_payload(*iter, |state| {
@@ -1568,9 +1578,13 @@ impl Interpreter {
                 };
                 // Hand the buffer out as-is and start collecting into a
                 // fresh array, so every yielded chunk is distinct.
-                let yielded = Value::array(buffer);
+                let mut yielded = Value::array(buffer);
                 let fresh = self
-                    .alloc_runtime_rooted_array_from_values(std::iter::empty(), &[&yielded], &[])
+                    .alloc_runtime_rooted_array_from_values(
+                        std::iter::empty(),
+                        &mut [&mut yielded],
+                        &mut [],
+                    )
                     .map_err(CommittedValueError::JavaScript)?;
                 self.gc_heap.with_payload(*iter, |state| {
                     if let IteratorState::Chunks { buffer: slot, .. } = &mut **state {
@@ -1741,7 +1755,7 @@ impl Interpreter {
                         // §7.4.4 GetIteratorDirect — `next` is cached
                         // once per opened iterator.
                         let key = VmPropertyKey::String("next");
-                        let (opened, next_method) = self.with_handle_scope(
+                        let (mut opened, mut next_method) = self.with_handle_scope(
                             |interp, scope| -> Result<_, CommittedValueError> {
                                 let opened = interp.scoped_value(scope, opened);
                                 let outcome = interp.ordinary_get_value(
@@ -1770,15 +1784,15 @@ impl Interpreter {
                                 ))
                             },
                         )?;
-                        let iter_root = Value::iterator(*iter);
+                        let mut iter_root = Value::iterator(*iter);
                         let new_inner = self
                             .alloc_runtime_rooted_iterator_state(
                                 IteratorState::User {
                                     iterator: opened,
                                     next_method: Some(next_method),
                                 },
-                                &[&iter_root, &opened, &next_method],
-                                &[],
+                                &mut [&mut iter_root, &mut opened, &mut next_method],
+                                &mut [],
                             )
                             .map_err(CommittedValueError::JavaScript)?;
                         self.gc_heap.with_payload(*iter, |state| {
@@ -2250,8 +2264,8 @@ impl Interpreter {
         if !keyed {
             let array = self.alloc_runtime_rooted_array_from_values(
                 results.iter().copied(),
-                &[],
-                &[results],
+                &mut [],
+                &mut [],
             )?;
             return Ok(Value::array(array));
         }
@@ -2273,7 +2287,7 @@ impl Interpreter {
                 .iter()
                 .map(|value| interp.scoped_value(scope, *value))
                 .collect::<Vec<_>>();
-            let object = interp.alloc_runtime_rooted_object_with_roots(&[], &[])?;
+            let object = interp.alloc_runtime_rooted_object_with_roots(&mut [], &mut [])?;
             let object = interp.scoped_value(scope, Value::object(object));
             for (key, value) in keys.iter().zip(&results) {
                 let key = interp.escape_scoped(*key);
@@ -2350,11 +2364,11 @@ impl Interpreter {
         let elements: Vec<Value> = (0..len)
             .map(|index| array::get(buffer, &self.gc_heap, index))
             .collect();
-        let buffer_root = Value::array(buffer);
+        let mut buffer_root = Value::array(buffer);
         let copy = self.alloc_runtime_rooted_array_from_values(
-            elements.iter().copied(),
-            &[&buffer_root],
-            &[&elements],
+            elements,
+            &mut [&mut buffer_root],
+            &mut [],
         )?;
         Ok(Value::array(copy))
     }
@@ -3069,7 +3083,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         iterable: &Value,
     ) -> Result<Vec<Value>, CommittedValueError> {
-        let (iterable, proven, self_iterator) = self.with_handle_scope(|interp, scope| {
+        let (mut iterable, proven, self_iterator) = self.with_handle_scope(|interp, scope| {
             let root = interp.scoped_value(scope, *iterable);
             let proven = interp.intrinsic_iterable(context, stack, *iterable);
             let self_iterator = !proven && interp.proven_self_iterator(interp.escape_scoped(root));
@@ -3095,7 +3109,7 @@ impl Interpreter {
             if let Some(m) = iterable.as_map() {
                 // Every pending key and value stays traced while the entry
                 // arrays allocate.
-                let pending: Vec<Value> = crate::collections::map_entries(m, &self.gc_heap)
+                let mut pending: Vec<Value> = crate::collections::map_entries(m, &self.gc_heap)
                     .into_iter()
                     .flat_map(|(key, value)| [key, value])
                     .collect();
@@ -3105,8 +3119,8 @@ impl Interpreter {
                     let entry = self
                         .alloc_runtime_rooted_array_from_values(
                             [key, value],
-                            &[&iterable],
-                            &[out.as_slice(), &pending[2 * index..]],
+                            &mut [&mut iterable],
+                            &mut [out.as_mut_slice(), &mut pending[2 * index..]],
                         )
                         .map_err(CommittedValueError::JavaScript)?;
                     out.push(Value::array(entry));
@@ -3164,7 +3178,7 @@ impl Interpreter {
             }
         }
         // Proving the generator above may have moved the iterable.
-        let iterable = self.iteration_anchor(base);
+        let mut iterable = self.iteration_anchor(base);
         // A built-in state whose stepping is the built-in `next` runs
         // directly: a proven iterable's fresh state, a proven iterator itself,
         // or the record GetIterator produced with the built-in `next`.
@@ -3172,7 +3186,7 @@ impl Interpreter {
             let state = crate::iteration_protocol::proven_iterator_state(iterable, &self.gc_heap)
                 .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
             let handle = self
-                .alloc_stack_rooted_iterator_state(stack, state, &[&iterable], &[])
+                .alloc_stack_rooted_iterator_state(stack, state, &mut [&mut iterable], &mut [])
                 .map_err(CommittedValueError::JavaScript)?;
             self.push_iteration_anchor(Value::iterator(handle));
             true
@@ -3411,7 +3425,7 @@ impl Interpreter {
             let rejected_root = vm.scoped_value(scope, on_rejected);
             let capability =
                 crate::promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                    .capability_stack_rooted(vm, stack, &[], &[])
+                    .capability_stack_rooted(vm, stack, &mut [], &mut [])
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let inner = vm
                 .escape_scoped(inner_root)
@@ -3652,7 +3666,7 @@ impl Interpreter {
             let rejected_root = vm.scoped_value(scope, on_rejected);
             let capability =
                 crate::promise_dispatch::PromiseBuilder::with_context(context.cloned())
-                    .capability_stack_rooted(vm, stack, &[], &[])
+                    .capability_stack_rooted(vm, stack, &mut [], &mut [])
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let inner = vm
                 .escape_scoped(inner_root)
@@ -3734,7 +3748,8 @@ impl Interpreter {
             }
             let jobs = match completion {
                 Ok(value) => {
-                    let record = interp.make_runtime_rooted_iter_result(value, done, &[], &[])?;
+                    let record =
+                        interp.make_runtime_rooted_iter_result(value, done, &mut [], &mut [])?;
                     interp
                         .escape_scoped(promise)
                         .as_promise()
@@ -3842,10 +3857,10 @@ impl Interpreter {
             // `return` echoes its argument, `throw` re-raises.
             return match kind {
                 GeneratorResumeKind::Next(_) => self
-                    .make_runtime_rooted_iter_result(Value::undefined(), true, &[], &[])
+                    .make_runtime_rooted_iter_result(Value::undefined(), true, &mut [], &mut [])
                     .map_err(CommittedValueError::JavaScript),
                 GeneratorResumeKind::Return(arg) => self
-                    .make_runtime_rooted_iter_result(arg, true, &[], &[])
+                    .make_runtime_rooted_iter_result(arg, true, &mut [], &mut [])
                     .map_err(CommittedValueError::JavaScript),
                 GeneratorResumeKind::Throw(reason) => {
                     self.set_pending_uncaught_throw(reason);
@@ -3863,7 +3878,7 @@ impl Interpreter {
             Some(pair) => pair,
             None => {
                 return self
-                    .make_runtime_rooted_iter_result(Value::undefined(), true, &[], &[])
+                    .make_runtime_rooted_iter_result(Value::undefined(), true, &mut [], &mut [])
                     .map_err(CommittedValueError::JavaScript);
             }
         };
@@ -3925,7 +3940,7 @@ impl Interpreter {
                     return Ok(Value::undefined());
                 }
                 return self
-                    .make_runtime_rooted_iter_result(*arg, true, &[], &[])
+                    .make_runtime_rooted_iter_result(*arg, true, &mut [], &mut [])
                     .map_err(CommittedValueError::JavaScript);
             }
             GeneratorResumeKind::Throw(reason) => {
@@ -3973,7 +3988,7 @@ impl Interpreter {
                         return Ok(v);
                     }
                     return self
-                        .make_runtime_rooted_iter_result(v, false, &[], &[])
+                        .make_runtime_rooted_iter_result(v, false, &mut [], &mut [])
                         .map_err(CommittedValueError::JavaScript);
                 }
                 // Body ran to completion or `Op::Await` parked the
@@ -4001,7 +4016,7 @@ impl Interpreter {
                     self.async_generator_drain_done(stack, Some(context), handle)?;
                     return Ok(Value::undefined());
                 }
-                self.make_runtime_rooted_iter_result(value, true, &[], &[])
+                self.make_runtime_rooted_iter_result(value, true, &mut [], &mut [])
                     .map_err(CommittedValueError::JavaScript)
             }
             Err(err) => {

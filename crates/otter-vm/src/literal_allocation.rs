@@ -263,7 +263,8 @@ impl Interpreter {
     where
         I: IntoIterator<Item = Value>,
     {
-        let array = self.alloc_runtime_rooted_array_at_site(elements, placement, &[], &[])?;
+        let array =
+            self.alloc_runtime_rooted_array_at_site(elements, placement, &mut [], &mut [])?;
         Ok(Value::array(array))
     }
 }

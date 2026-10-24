@@ -795,8 +795,9 @@ fn wait_async_parked(
     let admission = sink
         .admit()
         .map_err(|reason| type_err(method_name, reason))?;
-    let promise = crate::promise_dispatch::pending_runtime_rooted(ctx.interp_mut(), &[], &[])
-        .map_err(NativeError::from)?;
+    let promise =
+        crate::promise_dispatch::pending_runtime_rooted(ctx.interp_mut(), &mut [], &mut [])
+            .map_err(NativeError::from)?;
     let promise_value = Value::promise(promise);
     let root = ctx.interp_mut().persistent_root_insert(promise_value);
     let timer_token: Arc<StdMutex<Option<u64>>> = Arc::new(StdMutex::new(None));
@@ -928,8 +929,9 @@ fn wait_async_parked_polled(
     idx: usize,
     timeout: f64,
 ) -> Result<Value, NativeError> {
-    let promise = crate::promise_dispatch::pending_runtime_rooted(ctx.interp_mut(), &[], &[])
-        .map_err(NativeError::from)?;
+    let promise =
+        crate::promise_dispatch::pending_runtime_rooted(ctx.interp_mut(), &mut [], &mut [])
+            .map_err(NativeError::from)?;
     let promise_value = Value::promise(promise);
     let root = ctx.interp_mut().persistent_root_insert(promise_value);
     let preparation = ctx.scope(|mut scope| {

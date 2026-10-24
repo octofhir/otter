@@ -221,7 +221,7 @@ impl Interpreter {
         record: u16,
         index: u32,
     ) -> Result<(), VmError> {
-        let source = *read_register(&stack[frame_index], record)?;
+        let mut source = *read_register(&stack[frame_index], record)?;
         let array = source.as_array().ok_or(VmError::InvalidOperand)?;
         let iterator = self.alloc_stack_rooted_iterator_state(
             stack,
@@ -230,8 +230,8 @@ impl Interpreter {
                 index: index as usize,
                 origin: BuiltinIteratorOrigin::Array,
             },
-            &[&source],
-            &[],
+            &mut [&mut source],
+            &mut [],
         )?;
         Self::write_iterator_record(&mut stack[frame_index], record, Value::iterator(iterator))
     }

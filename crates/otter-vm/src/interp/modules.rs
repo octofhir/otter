@@ -135,8 +135,8 @@ impl Interpreter {
             };
             let mut frame =
                 crate::PreparedCall::for_code_block(function, None, self_value, Value::undefined());
-            let env_value = interp.escape_scoped(env);
-            let import_meta_value = interp.escape_scoped(import_meta);
+            let mut env_value = interp.escape_scoped(env);
+            let mut import_meta_value = interp.escape_scoped(import_meta);
             let args: SmallVec<[Value; 8]> =
                 smallvec::smallvec![env_value, import_meta_value, Value::boolean(hoist_phase)];
             if let Err(error) = interp.bind_bytecode_call_arguments(function, &mut frame, args) {
@@ -146,7 +146,12 @@ impl Interpreter {
             stack.push(frame);
             let init_promise = if function.is_async {
                 let result = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                    .pending_stack_rooted(interp, stack, &[&env_value, &import_meta_value], &[])?;
+                    .pending_stack_rooted(
+                        interp,
+                        stack,
+                        &mut [&mut env_value, &mut import_meta_value],
+                        &mut [],
+                    )?;
                 let frame = stack.pending_mut().expect("init inputs were just queued");
                 interp.prepared_set_async_state(
                     frame,
@@ -232,7 +237,7 @@ impl Interpreter {
                 )?;
             let rejected_slot = this.push_iteration_anchor(on_rejected) - 1;
             let capability = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                .capability_runtime_rooted(this, &[], &[])?;
+                .capability_runtime_rooted(this, &mut [], &mut [])?;
             let gate = this
                 .iteration_anchor(gate_slot)
                 .as_promise()

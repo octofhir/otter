@@ -85,14 +85,14 @@ pub fn install_promise_well_knowns_post_bootstrap(
     else {
         return Ok(());
     };
-    let global_root = Value::object(global);
-    let ctor_root = Value::native_function(ctor);
+    let mut global_root = Value::object(global);
+    let mut ctor_root = Value::native_function(ctor);
     let species_getter = crate::bootstrap::native_static_with_value_roots(
         heap,
         "get [Symbol.species]",
         0,
         promise_species_get,
-        &[&global_root, &ctor_root],
+        &mut [&mut global_root, &mut ctor_root],
     )
     .map_err(JsSurfaceError::from)?;
     if !ctor.define_own_symbol_property(
@@ -157,10 +157,10 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
             });
         }
 
-        let executor_value = scope.raw(executor);
+        let mut executor_value = scope.raw(executor);
         let (handle, resolve_value, reject_value) =
             PromiseBuilder::with_context(Some(context.clone()))
-                .construct_native_rooted(scope.context(), &[&executor_value], &[args])
+                .construct_native_rooted(scope.context(), &mut [&mut executor_value], &mut [])
                 .map_err(|_| oom("Promise"))?;
         let promise = scope.value(Value::promise(handle));
         let resolve = scope.value(resolve_value);

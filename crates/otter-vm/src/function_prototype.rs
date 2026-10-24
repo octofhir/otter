@@ -51,7 +51,7 @@ pub(crate) fn install_symbol_has_instance(
     heap: &mut otter_gc::GcHeap,
     mut prototype: JsObject,
     well_known_has_instance: symbol::JsSymbol,
-    value_roots: &[&Value],
+    value_roots: &mut [&mut Value],
 ) -> Result<(), JsSurfaceError> {
     let mut value_root = Value::undefined();
     let mut scope = otter_gc::RootScope::new(heap);
@@ -61,11 +61,9 @@ pub(crate) fn install_symbol_has_instance(
         scope.add_object(&mut prototype);
         scope.add_value(&mut value_root);
     }
-    let mut roots = Vec::with_capacity(value_roots.len() + 1);
-    roots.extend_from_slice(value_roots);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for value in &roots {
-            value.trace_value_slots(visitor);
+        for value in value_roots.iter_mut() {
+            value.trace_value_slot_mut(visitor);
         }
     };
     value_root = Value::native_function(
@@ -105,7 +103,7 @@ const fn intrinsic_method(
 pub(crate) fn install_restricted_accessors(
     heap: &mut otter_gc::GcHeap,
     mut prototype: JsObject,
-    value_roots: &[&Value],
+    value_roots: &mut [&mut Value],
 ) -> Result<(), JsSurfaceError> {
     let mut thrower = Value::undefined();
     let mut scope = otter_gc::RootScope::new(heap);
@@ -116,11 +114,9 @@ pub(crate) fn install_restricted_accessors(
         scope.add_object(&mut prototype);
         scope.add_value(&mut thrower);
     }
-    let mut roots = Vec::with_capacity(value_roots.len() + 1);
-    roots.extend_from_slice(value_roots);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-        for value in &roots {
-            value.trace_value_slots(visitor);
+        for value in value_roots.iter_mut() {
+            value.trace_value_slot_mut(visitor);
         }
     };
     thrower = Value::native_function(NativeFunction::throw_type_error_with_roots(

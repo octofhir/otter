@@ -129,7 +129,7 @@ impl Interpreter {
             let outcome = (|this: &mut Self| -> Result<(), CommittedValueError> {
                 let capability =
                     promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                        .capability_stack_rooted(this, stack, &[], &[])
+                        .capability_stack_rooted(this, stack, &mut [], &mut [])
                         .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 let capability_promise = this.scoped_value(scope, capability.promise);
                 let capability_resolve = this.scoped_value(scope, capability.resolve);
@@ -200,7 +200,7 @@ impl Interpreter {
             let promise_slot = vm.push_iteration_anchor(Value::promise(promise)) - 1;
             let capability =
                 match promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                    .capability_stack_rooted(vm, stack, &[], &[])
+                    .capability_stack_rooted(vm, stack, &mut [], &mut [])
                 {
                     Ok(capability) => capability,
                     Err(err) => {
@@ -667,7 +667,7 @@ mod tests {
         Option<Box<crate::cold_frame::ColdFrame>>,
     ) {
         let result_promise = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-            .pending_runtime_rooted(interp, &[], &[])
+            .pending_runtime_rooted(interp, &mut [], &mut [])
             .unwrap();
         interp.frame_set_async_state(&mut frame, AsyncFrameState { result_promise });
         let cold = interp.frame_detach_cold(&mut frame);

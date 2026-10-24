@@ -42,10 +42,10 @@ fn default_species_length_growth_returns_current_body_and_preserves_actual_oom()
             (*vm.escape_scoped(child).as_object().unwrap().as_header_ptr()).is_young()
         });
         let before = vm.gc_heap.gc_cycle_counts();
-        let pending = [vm.escape_scoped(child)];
+        let mut pending = [vm.escape_scoped(child)];
         let source_value = vm.escape_scoped(source);
         vm.gc_heap.set_gc_stress(1, false);
-        let result = vm.array_create_with_length(source_value, 29, &[&pending]);
+        let result = vm.array_create_with_length(source_value, 29, &mut [&mut pending]);
         vm.gc_heap.set_gc_stress(0, false);
         let result = result.expect("default species length preparation");
         let result = vm.scoped_value(scope, result);
@@ -84,7 +84,7 @@ fn default_species_length_growth_returns_current_body_and_preserves_actual_oom()
     vm.force_gc().expect("settle cap ledger");
     let before_anchors = vm.iteration_anchors_for_trace().len();
     let error = vm
-        .array_create_with_length(Value::undefined(), 1 << 20, &[])
+        .array_create_with_length(Value::undefined(), 1 << 20, &mut [])
         .expect_err("physical slab is larger than the cap");
     match error {
         VmError::OutOfMemory {

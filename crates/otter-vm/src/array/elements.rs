@@ -832,11 +832,15 @@ mod tests {
     fn widened_slab_traces_a_cell_through_full_collection() {
         let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let array = interp
-            .array_from_elements_host_rooted([1.25, 2.5, 3.75].map(Value::number_f64), &[], &[])
+            .array_from_elements_host_rooted(
+                [1.25, 2.5, 3.75].map(Value::number_f64),
+                &mut [],
+                &mut [],
+            )
             .expect("numeric array");
         let root = interp.persistent_root_insert(Value::array(array));
         let mut child = interp
-            .alloc_host_object_with_roots(&[], &[])
+            .alloc_host_object_with_roots(&mut [], &mut [])
             .expect("child object");
         assert!(
             crate::object::define_own_property_in_place(

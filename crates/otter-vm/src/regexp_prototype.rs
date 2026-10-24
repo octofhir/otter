@@ -1801,8 +1801,8 @@ pub fn native_regexp_symbol_match_all(
             name,
         )?;
 
-        let matcher = ctx.interp_mut().iteration_anchor(anchor_base + MATCHER);
-        let input_root = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
+        let mut matcher = ctx.interp_mut().iteration_anchor(anchor_base + MATCHER);
+        let mut input_root = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
         let input =
             input_root
                 .as_string(ctx.heap())
@@ -1818,7 +1818,7 @@ pub fn native_regexp_symbol_match_all(
             done: false,
         };
         let handle = ctx
-            .alloc_iterator_state(iter_state, &[&matcher, &input_root], &[])
+            .alloc_iterator_state(iter_state, &mut [&mut matcher, &mut input_root], &mut [])
             .map_err(|_| crate::NativeError::TypeError {
                 name,
                 reason: "iterator allocation failed".to_string(),
@@ -1842,7 +1842,7 @@ fn array_from_iteration_anchor_indices(
         elements.push(ctx.interp_mut().iteration_anchor(index));
     }
     let arr = ctx
-        .array_from_elements_with_roots(elements.iter().copied(), &[], &[elements.as_slice()])
+        .array_from_elements_with_roots(elements, &mut [], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name,
             reason: "array allocation failed".to_string(),

@@ -94,8 +94,8 @@ impl Interpreter {
 
     pub(crate) fn alloc_runtime_rooted_object_with_roots(
         &mut self,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::object::JsObject, VmError> {
         let root = self.null_prototype_root();
         self.alloc_runtime_rooted_object_with_shape(root, value_roots, slice_roots)
@@ -106,18 +106,18 @@ impl Interpreter {
     pub(crate) fn alloc_runtime_rooted_object_with_shape(
         &mut self,
         root: crate::object::ShapeHandle,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::object::JsObject, VmError> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let shape_root = root;
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -136,18 +136,18 @@ impl Interpreter {
     /// when it creates JS objects outside a VM frame stack.
     pub fn alloc_host_object_with_roots(
         &mut self,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::object::JsObject, otter_gc::OutOfMemory> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let shape_root = self.null_prototype_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -263,17 +263,17 @@ impl Interpreter {
     pub(crate) fn alloc_runtime_rooted_object_with_proto(
         &mut self,
         proto: crate::object::JsObject,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::object::JsObject, VmError> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -292,8 +292,8 @@ impl Interpreter {
     pub(crate) fn alloc_runtime_rooted_array_from_values<I>(
         &mut self,
         elements: I,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::array::JsArray, VmError>
     where
         I: IntoIterator<Item = Value>,
@@ -313,8 +313,8 @@ impl Interpreter {
         &mut self,
         elements: I,
         placement: otter_gc::SitePlacement,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::array::JsArray, VmError>
     where
         I: IntoIterator<Item = Value>,
@@ -326,12 +326,12 @@ impl Interpreter {
             if let Some(prototype) = &prototype {
                 prototype.trace_value_slots(visitor);
             }
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -355,8 +355,8 @@ impl Interpreter {
     pub fn array_from_elements_host_rooted<I>(
         &mut self,
         elements: I,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::array::JsArray, otter_gc::OutOfMemory>
     where
         I: IntoIterator<Item = Value>,
@@ -368,12 +368,12 @@ impl Interpreter {
             if let Some(prototype) = &prototype {
                 prototype.trace_value_slots(visitor);
             }
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -394,17 +394,17 @@ impl Interpreter {
         name: &'static str,
         length: u8,
         call: NativeFastFn,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<Value, otter_gc::OutOfMemory> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -425,17 +425,17 @@ impl Interpreter {
         name: &'static str,
         length: u8,
         call: NativeCall,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<Value, otter_gc::OutOfMemory> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -478,17 +478,17 @@ impl Interpreter {
         name: &'static str,
         length: u8,
         call: NativeCall,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<Value, otter_gc::OutOfMemory> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -505,8 +505,8 @@ impl Interpreter {
     pub(crate) fn alloc_runtime_rooted_iterator_state(
         &mut self,
         state: IteratorState,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<IteratorHandle, VmError> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let prototype = self.iterator_prototype_override_for_state(&state);
@@ -514,12 +514,12 @@ impl Interpreter {
             if let Some(prototype) = &prototype {
                 prototype.trace_value_slots(visitor);
             }
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -541,16 +541,16 @@ impl Interpreter {
         &mut self,
         value: Value,
         done: bool,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<Value, VmError> {
         self.with_handle_scope(|interp, scope| {
             let value = interp.scoped_value(scope, value);
-            for root in value_roots {
+            for root in value_roots.iter_mut() {
                 let _ = interp.scoped_value(scope, **root);
             }
-            for slice in slice_roots {
-                for root in *slice {
+            for slice in slice_roots.iter_mut() {
+                for root in slice.iter_mut() {
                     let _ = interp.scoped_value(scope, *root);
                 }
             }
@@ -607,9 +607,9 @@ impl Interpreter {
     pub(crate) fn alloc_stack_rooted_object_with_extra_roots(
         &mut self,
         stack: &ActivationStack,
-        extra_roots: &[&Value],
+        extra_roots: &mut [&mut Value],
     ) -> Result<crate::object::JsObject, VmError> {
-        self.alloc_stack_rooted_object_with_value_roots(stack, extra_roots, &[])
+        self.alloc_stack_rooted_object_with_value_roots(stack, extra_roots, &mut [])
     }
 
     /// Allocate an ordinary object while forwarding caller-owned mutable
@@ -646,7 +646,7 @@ impl Interpreter {
     pub(crate) fn alloc_stack_rooted_object_with_prototype(
         &mut self,
         stack: &ActivationStack,
-        value_roots: &[&Value],
+        value_roots: &mut [&mut Value],
         prototype: Option<crate::object::JsObject>,
     ) -> Result<crate::object::JsObject, VmError> {
         let Some(prototype) = prototype else {
@@ -657,8 +657,8 @@ impl Interpreter {
             for &slot in &roots {
                 visitor(slot);
             }
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
         };
         let root = crate::object::heap_instance_root(
@@ -676,21 +676,21 @@ impl Interpreter {
     pub(crate) fn alloc_stack_rooted_object_with_value_roots(
         &mut self,
         stack: &ActivationStack,
-        value_roots: &[&Value],
-        slice_roots: &[Value],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [Value],
     ) -> Result<crate::object::JsObject, VmError> {
         self.alloc_stack_rooted_object_with_value_roots_and_slices(
             stack,
             value_roots,
-            &[slice_roots],
+            &mut [slice_roots],
         )
     }
 
     pub(crate) fn alloc_stack_rooted_object_with_value_roots_and_slices(
         &mut self,
         stack: &ActivationStack,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::object::JsObject, VmError> {
         let roots = self.collect_allocation_roots(stack);
         let shape_root = self.null_prototype_root();
@@ -698,12 +698,12 @@ impl Interpreter {
             for &slot in &roots {
                 visitor(slot);
             }
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -719,8 +719,8 @@ impl Interpreter {
         &mut self,
         stack: &ActivationStack,
         proto: crate::object::JsObject,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::object::JsObject, VmError> {
         let _runtime_roots_guard = self.scope_runtime_roots_guard();
         let roots = self.collect_allocation_roots(stack);
@@ -728,12 +728,12 @@ impl Interpreter {
             for &slot in &roots {
                 visitor(slot);
             }
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -753,8 +753,8 @@ impl Interpreter {
         &mut self,
         stack: &ActivationStack,
         elements: I,
-        value_roots: &[&Value],
-        slice_roots: &[Value],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [Value],
     ) -> Result<crate::array::JsArray, VmError>
     where
         I: IntoIterator<Item = Value>,
@@ -763,7 +763,7 @@ impl Interpreter {
             stack,
             elements,
             value_roots,
-            &[slice_roots],
+            &mut [slice_roots],
         )
     }
 
@@ -771,8 +771,8 @@ impl Interpreter {
         &mut self,
         stack: &ActivationStack,
         elements: I,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::array::JsArray, VmError>
     where
         I: IntoIterator<Item = Value>,
@@ -787,12 +787,12 @@ impl Interpreter {
             if let Some(prototype) = &prototype {
                 prototype.trace_value_slots(visitor);
             }
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };
@@ -811,8 +811,8 @@ impl Interpreter {
         &mut self,
         stack: &ActivationStack,
         state: IteratorState,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<IteratorHandle, VmError> {
         let roots = self.collect_allocation_roots(stack);
         let prototype = self.iterator_prototype_override_for_state(&state);
@@ -823,12 +823,12 @@ impl Interpreter {
             if let Some(prototype) = &prototype {
                 prototype.trace_value_slots(visitor);
             }
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
-            for slice in slice_roots {
-                for value in *slice {
-                    value.trace_value_slots(visitor);
+            for slice in slice_roots.iter_mut() {
+                for value in slice.iter_mut() {
+                    value.trace_value_slot_mut(visitor);
                 }
             }
         };

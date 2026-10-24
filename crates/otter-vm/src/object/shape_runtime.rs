@@ -285,7 +285,7 @@ mod tests {
         let kept_id = interp.gc_heap.read_payload(kept, ShapeBody::id);
         assert_ne!(kept_id, unused_id);
         let mut object = interp
-            .alloc_runtime_rooted_object_with_roots(&[], &[])
+            .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
             .expect("object");
         interp
             .create_data_property(&mut object, "kept", crate::Value::boolean(true))

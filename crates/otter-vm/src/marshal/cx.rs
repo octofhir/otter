@@ -176,14 +176,16 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         call: crate::NativeCall,
     ) -> Result<Local<'s>, JsError> {
         let scope = self.scope;
-        let value =
-            match self
-                .interp()
-                .native_function_from_call_host_rooted(name, length, call, &[], &[])
-            {
-                Ok(value) => value,
-                Err(error) => return Err(self.vm_err(VmError::from(error))),
-            };
+        let value = match self.interp().native_function_from_call_host_rooted(
+            name,
+            length,
+            call,
+            &mut [],
+            &mut [],
+        ) {
+            Ok(value) => value,
+            Err(error) => return Err(self.vm_err(VmError::from(error))),
+        };
         Ok(self.interp().scoped_value(scope, value))
     }
 

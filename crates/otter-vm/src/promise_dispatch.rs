@@ -320,8 +320,8 @@ impl PromiseBuilder {
     pub(crate) fn pending_runtime_rooted(
         &self,
         interp: &mut Interpreter,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
         let roots = interp.collect_runtime_roots();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -334,8 +334,8 @@ impl PromiseBuilder {
         &self,
         interp: &mut Interpreter,
         stack: &ActivationStack,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
         let roots = interp.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -349,8 +349,8 @@ impl PromiseBuilder {
         interp: &mut Interpreter,
         stack: &ActivationStack,
         value: Value,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
         let roots = interp.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -364,8 +364,8 @@ impl PromiseBuilder {
         interp: &mut Interpreter,
         stack: &ActivationStack,
         reason: Value,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
         let roots = interp.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -384,8 +384,8 @@ impl PromiseBuilder {
         &self,
         interp: &mut Interpreter,
         reason: Value,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
         let roots = interp.collect_runtime_roots();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -403,8 +403,8 @@ impl PromiseBuilder {
     pub(crate) fn pending_native_rooted(
         &self,
         ctx: &mut NativeCtx<'_>,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
         let roots = ctx.collect_native_roots();
         let this_value = *ctx.this_value();
@@ -425,8 +425,8 @@ impl PromiseBuilder {
     pub(crate) fn construct_runtime_rooted(
         &self,
         interp: &mut Interpreter,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
         let promise = self.pending_runtime_rooted(interp, value_roots, slice_roots)?;
         let root_base = interp.json_root_push(Value::promise(promise));
@@ -476,8 +476,8 @@ impl PromiseBuilder {
         &self,
         interp: &mut Interpreter,
         stack: &ActivationStack,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
         let promise = self.pending_stack_rooted(interp, stack, value_roots, slice_roots)?;
         let root_base = interp.json_root_push(Value::promise(promise));
@@ -528,8 +528,8 @@ impl PromiseBuilder {
     pub(crate) fn construct_native_rooted(
         &self,
         ctx: &mut NativeCtx<'_>,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<(JsPromiseHandle, Value, Value), otter_gc::OutOfMemory> {
         let promise = self.pending_native_rooted(ctx, value_roots, slice_roots)?;
         let root_base = ctx.interp_mut().json_root_push(Value::promise(promise));
@@ -580,8 +580,8 @@ impl PromiseBuilder {
     pub(crate) fn capability_runtime_rooted(
         &self,
         interp: &mut Interpreter,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<PromiseCapability, otter_gc::OutOfMemory> {
         let (handle, resolve, reject) =
             self.construct_runtime_rooted(interp, value_roots, slice_roots)?;
@@ -597,8 +597,8 @@ impl PromiseBuilder {
         &self,
         interp: &mut Interpreter,
         stack: &ActivationStack,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<PromiseCapability, otter_gc::OutOfMemory> {
         let (handle, resolve, reject) =
             self.construct_stack_rooted(interp, stack, value_roots, slice_roots)?;
@@ -685,7 +685,7 @@ impl Interpreter {
                 }
             }
             let capability = PromiseBuilder::with_context(context.cloned())
-                .capability_stack_rooted(interp, stack, &[], &[])
+                .capability_stack_rooted(interp, stack, &mut [], &mut [])
                 .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
             let promise = interp.scoped_value(scope, capability.promise);
             let resolve = interp.scoped_value(scope, capability.resolve);
@@ -707,8 +707,8 @@ impl Interpreter {
 /// caller-provided temporary roots.
 pub fn pending_runtime_rooted(
     interp: &mut Interpreter,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
     PromiseBuilder::new().pending_runtime_rooted(interp, value_roots, slice_roots)
 }
@@ -716,18 +716,18 @@ pub fn pending_runtime_rooted(
 fn visit_runtime_roots(
     visitor: &mut dyn FnMut(*mut RawGc),
     roots: &[*mut RawGc],
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) {
     for &slot in roots {
         visitor(slot);
     }
-    for value in value_roots {
-        value.trace_value_slots(visitor);
+    for value in value_roots.iter_mut() {
+        value.trace_value_slot_mut(visitor);
     }
-    for slice in slice_roots {
-        for value in *slice {
-            value.trace_value_slots(visitor);
+    for slice in slice_roots.iter_mut() {
+        for value in slice.iter_mut() {
+            value.trace_value_slot_mut(visitor);
         }
     }
 }
@@ -737,8 +737,8 @@ fn promise_native_runtime<F>(
     name: &'static str,
     length: u8,
     captures: smallvec::SmallVec<[Value; 4]>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
@@ -765,8 +765,8 @@ fn promise_native_stack<F>(
     name: &'static str,
     length: u8,
     captures: smallvec::SmallVec<[Value; 4]>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
@@ -792,8 +792,8 @@ fn promise_native_ctx<F>(
     name: &'static str,
     length: u8,
     captures: smallvec::SmallVec<[Value; 4]>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
@@ -1169,12 +1169,12 @@ fn make_then_finally(
 ) -> Result<Value, NativeError> {
     let captures: SmallVec<[Value; 4]> = smallvec![constructor, on_finally];
     let exec_for_call = exec.cloned();
-    let constructor_root = constructor;
-    let on_finally_root = on_finally;
+    let mut constructor_root = constructor;
+    let mut on_finally_root = on_finally;
     let runtime_roots = interp.collect_runtime_roots();
-    let value_roots: &[&Value] = &[&constructor_root, &on_finally_root];
+    let value_roots: &mut [&mut Value] = &mut [&mut constructor_root, &mut on_finally_root];
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
+        visit_runtime_roots(visitor, &runtime_roots, value_roots, &mut []);
     };
     let value = local_native_value_with_length(
         interp.gc_heap_mut(),
@@ -1217,12 +1217,12 @@ fn make_catch_finally(
 ) -> Result<Value, NativeError> {
     let captures: SmallVec<[Value; 4]> = smallvec![constructor, on_finally];
     let exec_for_call = exec.cloned();
-    let constructor_root = constructor;
-    let on_finally_root = on_finally;
+    let mut constructor_root = constructor;
+    let mut on_finally_root = on_finally;
     let runtime_roots = interp.collect_runtime_roots();
-    let value_roots: &[&Value] = &[&constructor_root, &on_finally_root];
+    let value_roots: &mut [&mut Value] = &mut [&mut constructor_root, &mut on_finally_root];
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
+        visit_runtime_roots(visitor, &runtime_roots, value_roots, &mut []);
     };
     let value = local_native_value_with_length(
         interp.gc_heap_mut(),
@@ -1259,12 +1259,12 @@ fn make_catch_finally(
 
 fn make_value_thunk(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, NativeError> {
     let captures: SmallVec<[Value; 4]> = smallvec![value];
-    let value_root = value;
+    let mut value_root = value;
     let (interp, _) = ctx.interp_mut_and_context();
     let runtime_roots = interp.collect_runtime_roots();
-    let value_roots: &[&Value] = &[&value_root];
+    let value_roots: &mut [&mut Value] = &mut [&mut value_root];
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
+        visit_runtime_roots(visitor, &runtime_roots, value_roots, &mut []);
     };
     let value = local_native_value_with_length(
         interp.gc_heap_mut(),
@@ -1279,12 +1279,12 @@ fn make_value_thunk(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, Nati
 
 fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeError> {
     let captures: SmallVec<[Value; 4]> = smallvec![reason];
-    let reason_root = reason;
+    let mut reason_root = reason;
     let (interp, _) = ctx.interp_mut_and_context();
     let runtime_roots = interp.collect_runtime_roots();
-    let value_roots: &[&Value] = &[&reason_root];
+    let value_roots: &mut [&mut Value] = &mut [&mut reason_root];
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &runtime_roots, value_roots, &[]);
+        visit_runtime_roots(visitor, &runtime_roots, value_roots, &mut []);
     };
     let value = local_native_value_with_length(
         interp.gc_heap_mut(),
@@ -1756,8 +1756,8 @@ fn static_resolve(
         // value is adopted instead of becoming the fulfillment value verbatim.
         let cap = PromiseBuilder::with_context(context.clone()).capability_runtime_rooted(
             interp,
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?;
         let cap_handles = CapabilityHandles::park(interp, scope, &cap);
         let value = interp.escape_scoped(value);
@@ -1777,8 +1777,8 @@ fn static_reject(
         PromiseBuilder::with_context(context).rejected_runtime_rooted(
             interp,
             reason,
-            &[],
-            &[args],
+            &mut [],
+            &mut [],
         )?,
     )
 }
@@ -2243,11 +2243,7 @@ fn settled_element_function(
             if fill_slot(&slots, ctx.heap_mut(), values, index, record) {
                 let values = capture_array(captures[3]);
                 let collected = collect_values(ctx.heap(), values);
-                let arr = ctx.array_from_elements_with_roots(
-                    collected.iter().cloned(),
-                    &[],
-                    &[collected.as_slice()],
-                )?;
+                let arr = ctx.array_from_elements_with_roots(collected, &mut [], &mut [])?;
                 let cap = capability_from_captures(captures, &cap);
                 call_capability_resolve_native(ctx, &cap, Value::array(arr))?;
             }
@@ -2447,11 +2443,8 @@ fn static_all_generic(
                         let v = args.first().cloned().unwrap_or(Value::undefined());
                         if fill_slot(&slots_for_fulfill, ctx.heap_mut(), values, i, v) {
                             let collected = collect_values(ctx.heap(), values);
-                            let arr = ctx.array_from_elements_with_roots(
-                                collected.iter().cloned(),
-                                &[],
-                                &[collected.as_slice()],
-                            )?;
+                            let arr =
+                                ctx.array_from_elements_with_roots(collected, &mut [], &mut [])?;
                             // The array build moved the young capability
                             // functions; the traced captures slab holds them.
                             let cap = capability_from_captures(captures, &cap_for_fulfill);
@@ -3074,7 +3067,11 @@ fn static_with_resolvers(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
 ) -> Result<Value, NativeError> {
-    let cap = PromiseBuilder::with_context(context).capability_runtime_rooted(interp, &[], &[])?;
+    let cap = PromiseBuilder::with_context(context).capability_runtime_rooted(
+        interp,
+        &mut [],
+        &mut [],
+    )?;
     capability_record_scoped(interp, &cap, "Promise.withResolvers")
 }
 
@@ -3139,7 +3136,7 @@ fn method_then(
         let c_raw = interp.escape_scoped(c);
         let capability = if is_builtin_promise_constructor(interp, &c_raw) {
             PromiseBuilder::with_context(context.clone())
-                .capability_runtime_rooted(interp, &[], &[])
+                .capability_runtime_rooted(interp, &mut [], &mut [])
                 .map_err(NativeError::from)?
         } else {
             let mut constructor = c_raw;
@@ -3199,8 +3196,8 @@ fn perform_then_with_handlers(
         let on_rejected = on_rejected.map(|value| interp.scoped_value(scope, value));
         let capability = PromiseBuilder::with_context(context.clone()).capability_runtime_rooted(
             interp,
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )?;
         let capability_handles = CapabilityHandles::park(interp, scope, &capability);
         let promise = interp
@@ -3323,8 +3320,8 @@ fn make_resolve_native_runtime_rooted(
     promise: JsPromiseHandle,
     already_resolved: Value,
     context: Option<ExecutionContext>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
     let captured_context = context;
     promise_native_runtime(
@@ -3344,8 +3341,8 @@ fn make_resolve_native_stack_rooted(
     promise: JsPromiseHandle,
     already_resolved: Value,
     context: Option<ExecutionContext>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
     let captured_context = context;
     promise_native_stack(
@@ -3365,8 +3362,8 @@ fn make_resolve_native_native_rooted(
     promise: JsPromiseHandle,
     already_resolved: Value,
     context: Option<ExecutionContext>,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
     let captured_context = context;
     promise_native_ctx(
@@ -3512,8 +3509,8 @@ fn resolve_native_body(
                     promise_handle,
                     already_resolved_raw,
                     context.clone(),
-                    &[],
-                    &[],
+                    &mut [],
+                    &mut [],
                 )?;
                 let on_fulfill = scope.value(on_fulfill);
                 let promise_handle = scope
@@ -3525,8 +3522,8 @@ fn resolve_native_body(
                     scope.context(),
                     promise_handle,
                     already_resolved_raw,
-                    &[],
-                    &[],
+                    &mut [],
+                    &mut [],
                 )?;
                 let on_reject = scope.value(on_reject);
                 let value_raw = scope.raw(value);
@@ -3674,8 +3671,8 @@ pub(crate) fn resolve_promise_from_interpreter(
                     promise_handle,
                     already_resolved_raw,
                     context.clone(),
-                    &[],
-                    &[],
+                    &mut [],
+                    &mut [],
                 )
                 .map_err(crate::oom_to_vm)?;
                 let on_fulfill = interp.scoped_value(scope, on_fulfill);
@@ -3688,8 +3685,8 @@ pub(crate) fn resolve_promise_from_interpreter(
                     interp,
                     promise_handle,
                     already_resolved_raw,
-                    &[],
-                    &[],
+                    &mut [],
+                    &mut [],
                 )
                 .map_err(crate::oom_to_vm)?;
                 let on_reject = interp.scoped_value(scope, on_reject);
@@ -3839,8 +3836,8 @@ fn make_resolve_thenable_job_runtime_rooted(
         "PromiseResolveThenableJob",
         0,
         smallvec![thenable, then, on_fulfill, on_reject],
-        &[],
-        &[],
+        &mut [],
+        &mut [],
         move |ctx, _args, captures| resolve_thenable_job_body(ctx, captures, exec.as_ref()),
     )
     .map_err(crate::VmError::from)
@@ -3850,8 +3847,8 @@ fn make_reject_native_runtime_rooted(
     interp: &mut Interpreter,
     promise: JsPromiseHandle,
     already_resolved: Value,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
     promise_native_runtime(
         interp,
@@ -3869,8 +3866,8 @@ fn make_reject_native_stack_rooted(
     stack: &ActivationStack,
     promise: JsPromiseHandle,
     already_resolved: Value,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
     promise_native_stack(
         interp,
@@ -3888,8 +3885,8 @@ fn make_reject_native_native_rooted(
     ctx: &mut NativeCtx<'_>,
     promise: JsPromiseHandle,
     already_resolved: Value,
-    value_roots: &[&Value],
-    slice_roots: &[&[Value]],
+    value_roots: &mut [&mut Value],
+    slice_roots: &mut [&mut [Value]],
 ) -> Result<Value, otter_gc::OutOfMemory> {
     promise_native_ctx(
         ctx,
@@ -4041,7 +4038,7 @@ mod tests {
         let before = interp.gc_heap().stats().new_allocated_bytes;
 
         let cap = PromiseBuilder::new()
-            .capability_runtime_rooted(&mut interp, &[], &[])
+            .capability_runtime_rooted(&mut interp, &mut [], &mut [])
             .expect("capability");
 
         let after = interp.gc_heap().stats().new_allocated_bytes;
@@ -4064,8 +4061,8 @@ mod tests {
     fn promise_constructor_builder_uses_native_rooted_young_allocation() {
         let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let before = interp.gc_heap().stats().new_allocated_bytes;
-        let executor = Value::number_i32(17);
-        let args = vec![executor];
+        let mut executor = Value::number_i32(17);
+        let mut args = vec![executor];
 
         let (handle, resolve, reject) = NativeCtx::with_host_context(
             &mut interp,
@@ -4076,7 +4073,7 @@ mod tests {
             None,
             |ctx| {
                 PromiseBuilder::new()
-                    .construct_native_rooted(ctx, &[&executor], &[args.as_slice()])
+                    .construct_native_rooted(ctx, &mut [&mut executor], &mut [args.as_mut_slice()])
                     .expect("native-rooted promise constructor plumbing")
             },
         );

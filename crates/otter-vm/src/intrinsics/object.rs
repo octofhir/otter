@@ -77,7 +77,7 @@ fn install_proto_proto_accessor(
             "get __proto__",
             0,
             object_statics::native_prototype_proto_get,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );
@@ -87,7 +87,7 @@ fn install_proto_proto_accessor(
             "set __proto__",
             1,
             object_statics::native_prototype_proto_set,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );

@@ -138,7 +138,7 @@ fn context_root_survives_force_gc() {
     )
     .expect("outer context");
     let payload = interp
-        .alloc_host_object_with_roots(&[], &[])
+        .alloc_host_object_with_roots(&mut [], &mut [])
         .expect("slot payload");
     assert!(context::write_slot(
         interp.gc_heap_mut(),

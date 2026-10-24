@@ -1495,7 +1495,7 @@ impl Interpreter {
         &mut self,
         stack: Option<&ActivationStack>,
         closure: &mut Value,
-        value_roots: &[&Value],
+        value_roots: &mut [&mut Value],
     ) -> Result<(), VmError> {
         let owner = closure
             .as_closure(&self.gc_heap)
@@ -1514,8 +1514,8 @@ impl Interpreter {
             }
             // SAFETY: the caller's slot outlives the allocation.
             unsafe { (*closure_slot).trace_value_slot_mut(visitor) };
-            for value in value_roots {
-                value.trace_value_slots(visitor);
+            for value in value_roots.iter_mut() {
+                value.trace_value_slot_mut(visitor);
             }
         };
         let rare =
@@ -1533,12 +1533,12 @@ impl Interpreter {
         stack: &mut ActivationStack,
         owner: Option<crate::closure::JsClosure>,
         function_id: u32,
-        value_roots: &[&Value],
+        value_roots: &mut [&mut Value],
     ) -> Result<JsObject, VmError> {
         self.with_handle_scope(|interp, scope| {
             // Park every transient descriptor input in the handle arena instead
             // of materialising another roots snapshot for this allocation.
-            for value in value_roots {
+            for value in value_roots.iter_mut() {
                 let _ = interp.scoped_value(scope, **value);
             }
             let owner = owner.map(|owner| interp.scoped_value(scope, Value::closure(owner)));
@@ -1551,13 +1551,14 @@ impl Interpreter {
                     return Ok(bag);
                 }
                 let mut closure_value = Value::closure(closure);
-                interp.ensure_closure_rare(Some(stack), &mut closure_value, &[])?;
+                interp.ensure_closure_rare(Some(stack), &mut closure_value, &mut [])?;
                 // The bag inherits the closure's own `[[Prototype]]`, so its
                 // shape fixes the function's ordinary lookup for every key the
                 // closure does not synthesize: property ICs use it as the
                 // function's map.
                 let prototype = interp.get_prototype_for_op(&closure_value)?.as_object();
-                let bag = interp.alloc_stack_rooted_object_with_prototype(stack, &[], prototype)?;
+                let bag =
+                    interp.alloc_stack_rooted_object_with_prototype(stack, &mut [], prototype)?;
                 let closure = interp
                     .escape_scoped(owner)
                     .as_closure(&interp.gc_heap)
@@ -1569,7 +1570,7 @@ impl Interpreter {
             match interp.function_user_props.get(&function_id).copied() {
                 Some(bag) => Ok(bag),
                 None => {
-                    let bag = interp.alloc_stack_rooted_object_with_extra_roots(stack, &[])?;
+                    let bag = interp.alloc_stack_rooted_object_with_extra_roots(stack, &mut [])?;
                     interp.function_user_props.insert(function_id, bag);
                     Ok(bag)
                 }
@@ -1965,7 +1966,7 @@ impl Interpreter {
             // the bag allocation so the closure→bag edge is installed on the
             // live body, not on a vacated nursery copy.
             let owner = this.iteration_anchor(owner_slot).as_closure(&this.gc_heap);
-            let mut bag = this.function_user_bag(stack, owner, function_id, &[])?;
+            let mut bag = this.function_user_bag(stack, owner, function_id, &mut [])?;
             let kind = match (value_slot, getter_slot, setter_slot) {
                 (Some(value_slot), _, _) => object::DescriptorKind::Data {
                     value: this.iteration_anchor(value_slot),
@@ -2148,8 +2149,13 @@ impl Interpreter {
                     .filter(|v| v.is_string())
                     .collect();
                 return Ok(Some(Value::array(
-                    self.function_static_array_from_values(&*stack, values, &[&target], &[args])
-                        .map_err(CommittedValueError::JavaScript)?,
+                    self.function_static_array_from_values(
+                        &*stack,
+                        values,
+                        &mut [&mut target],
+                        &mut [],
+                    )
+                    .map_err(CommittedValueError::JavaScript)?,
                 )));
             }
             if matches!(method, M::Keys) {
@@ -2202,7 +2208,7 @@ impl Interpreter {
             }
             return match desc {
                 Some(desc) => Ok(Some(Value::object(
-                    self.function_static_descriptor_to_object(&desc, &[&target], args)
+                    self.function_static_descriptor_to_object(&desc, &mut [&mut target], &mut [])
                         .map_err(CommittedValueError::JavaScript)?,
                 ))),
                 None => Ok(Some(Value::undefined())),
@@ -2252,7 +2258,7 @@ impl Interpreter {
                                 return Err(CommittedValueError::JavaScript(VmError::TypeMismatch));
                             }
                             let mut bag = this
-                                .function_user_bag(stack, owner, function_id, &[])
+                                .function_user_bag(stack, owner, function_id, &mut [])
                                 .map_err(CommittedValueError::JavaScript)?;
                             // Creating the bag allocates, which can move the
                             // descriptor's values: coerce it again from the
@@ -2410,8 +2416,12 @@ impl Interpreter {
                 };
                 match desc {
                     Some(desc) => Ok(Some(Value::object(
-                        self.function_static_descriptor_to_object(&desc, &[&target], args)
-                            .map_err(CommittedValueError::JavaScript)?,
+                        self.function_static_descriptor_to_object(
+                            &desc,
+                            &mut [&mut target],
+                            &mut [],
+                        )
+                        .map_err(CommittedValueError::JavaScript)?,
                     ))),
                     None => Ok(Some(Value::undefined())),
                 }
@@ -2526,8 +2536,8 @@ impl Interpreter {
         &mut self,
         stack: &ActivationStack,
         values: Vec<Value>,
-        value_roots: &[&Value],
-        slice_roots: &[&[Value]],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [&mut [Value]],
     ) -> Result<array::JsArray, VmError> {
         self.alloc_stack_rooted_array_from_values_with_root_slices(
             stack,
@@ -2540,8 +2550,8 @@ impl Interpreter {
     fn function_static_descriptor_to_object(
         &mut self,
         desc: &object::PropertyDescriptor,
-        value_roots: &[&Value],
-        slice_roots: &[Value],
+        value_roots: &mut [&mut Value],
+        slice_roots: &mut [Value],
     ) -> Result<JsObject, VmError> {
         self.with_handle_scope(|interp, scope| {
             // Keep the caller-supplied boundary values in the same canonical
@@ -2549,10 +2559,10 @@ impl Interpreter {
             // parks its result before the first property write and resolves
             // that slot again for every later write, so a shape/slab
             // allocation cannot strand a copied `JsObject`.
-            for value in value_roots {
+            for value in value_roots.iter_mut() {
                 let _ = interp.scoped_value(scope, **value);
             }
-            for value in slice_roots {
+            for value in slice_roots.iter_mut() {
                 let _ = interp.scoped_value(scope, *value);
             }
             let result = interp.scoped_descriptor_object(scope, desc)?;
@@ -2713,14 +2723,10 @@ impl Interpreter {
             return Ok(Value::null());
         };
         let mut callee_root = callee;
-        let roots: Vec<&Value> = Vec::new();
-        let _ = roots;
-        let mut extra: Vec<&Value> = Vec::with_capacity(args.len() + 1);
-        extra.push(&callee_root);
-        for value in &args {
-            extra.push(value);
-        }
-        let obj = self.alloc_stack_rooted_object_with_extra_roots(stack, &extra)?;
+        let mut extra: Vec<&mut Value> = Vec::with_capacity(args.len() + 1);
+        extra.push(&mut callee_root);
+        extra.extend(args.iter_mut());
+        let obj = self.alloc_stack_rooted_object_with_extra_roots(stack, &mut extra)?;
         drop(extra);
         // The object handle and argument values stay valid: the
         // property defines below only allocate property storage, and

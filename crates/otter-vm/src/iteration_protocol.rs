@@ -201,11 +201,15 @@ impl Interpreter {
             if let Some(kind) = interp.plain_iterable(value)
                 && (primordial || interp.iterable_proven(kind))
             {
-                let value = interp.escape_scoped(root);
+                let mut value = interp.escape_scoped(root);
                 let state = proven_iterator_state(value, &interp.gc_heap)
                     .ok_or(crate::VmError::InvalidOperand)?;
-                let iterator =
-                    interp.alloc_stack_rooted_iterator_state(stack, state, &[&value], &[])?;
+                let iterator = interp.alloc_stack_rooted_iterator_state(
+                    stack,
+                    state,
+                    &mut [&mut value],
+                    &mut [],
+                )?;
                 return Ok(Some(Value::iterator(iterator)));
             }
             let value = interp.escape_scoped(root);
@@ -218,15 +222,15 @@ impl Interpreter {
             if !value.is_generator() || !(primordial || interp.proven_generator_iterable(value)) {
                 return Ok(None);
             }
-            let value = interp.escape_scoped(root);
+            let mut value = interp.escape_scoped(root);
             let Some(handle) = value.as_generator() else {
                 return Ok(None);
             };
             let iterator = interp.alloc_stack_rooted_iterator_state(
                 stack,
                 IteratorState::Generator { handle },
-                &[&value],
-                &[],
+                &mut [&mut value],
+                &mut [],
             )?;
             Ok(Some(Value::iterator(iterator)))
         })

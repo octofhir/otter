@@ -77,15 +77,15 @@ pub fn install_date_well_knowns_post_bootstrap(
         return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
     };
 
-    let global_root = Value::object(global);
-    let date_ctor_root = date_ctor_value;
-    let prototype_root = Value::object(prototype);
+    let mut global_root = Value::object(global);
+    let mut date_ctor_root = date_ctor_value;
+    let mut prototype_root = Value::object(prototype);
     let to_prim_fn = native_static_with_value_roots(
         heap,
         "[Symbol.toPrimitive]",
         1,
         date_proto_to_primitive,
-        &[&global_root, &date_ctor_root, &prototype_root],
+        &mut [&mut global_root, &mut date_ctor_root, &mut prototype_root],
     )
     .map_err(JsSurfaceError::from)?;
 

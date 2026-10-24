@@ -177,17 +177,11 @@ impl Interpreter {
                     // allocation roots the closure and the new prototype.
                     let mut closure_value = Value::closure(closure);
                     let mut proto = proto;
-                    let proto_slot: *mut Value = &mut proto;
-                    let rooted = {
-                        // SAFETY: the local outlives the call.
-                        let proto_ref = unsafe { &*proto_slot };
-                        self.ensure_closure_rare(None, &mut closure_value, &[proto_ref])
-                    };
+                    let rooted =
+                        self.ensure_closure_rare(None, &mut closure_value, &mut [&mut proto]);
                     if rooted.is_err() {
                         return;
                     }
-                    // SAFETY: an initialized local the collector rewrote.
-                    let proto = unsafe { std::ptr::read_volatile(proto_slot) };
                     if let Some(closure) = closure_value.as_closure(&self.gc_heap) {
                         closure.set_proto_override(&mut self.gc_heap, proto);
                     }

@@ -41,6 +41,7 @@ mod array_expando;
 #[path = "support/native_code.rs"]
 mod native_code;
 
+use otter_runtime::ValueWindow;
 #[cfg(target_arch = "x86_64")]
 use yaxpeax_arch::LengthedInstruction;
 #[cfg(target_arch = "x86_64")]
@@ -90,8 +91,8 @@ fn collection_installer(
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      _args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      _args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     invocations.fetch_add(1, Ordering::Relaxed);
                     if collecting {
                         let vm = ctx.interp_mut();

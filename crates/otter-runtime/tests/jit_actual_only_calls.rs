@@ -21,6 +21,7 @@
 
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
+use otter_runtime::ValueWindow;
 use std::collections::BTreeMap;
 use std::sync::{
     Arc, Mutex,
@@ -263,8 +264,8 @@ impl Fixture {
                         1,
                         RuntimeNativeCall::Dynamic(Arc::new(
                             |ctx: &mut RuntimeNativeCtx<'_>,
-                             args: &[RuntimeValue],
-                             _state: &[RuntimeValue]| {
+                             args: ValueWindow<'_>,
+                             _state: ValueWindow<'_>| {
                                 ctx.scope(|mut scope| {
                                     let payload = scope.argument(args, 0);
                                     let marker = scope.get(payload, "marker")?;
@@ -281,8 +282,8 @@ impl Fixture {
                         1,
                         RuntimeNativeCall::Dynamic(Arc::new(
                             move |ctx: &mut RuntimeNativeCtx<'_>,
-                                  args: &[RuntimeValue],
-                                  _state: &[RuntimeValue]| {
+                                  args: ValueWindow<'_>,
+                                  _state: ValueWindow<'_>| {
                                 if collect.load(Ordering::Relaxed) {
                                     let before = ctx
                                         .execution_context()

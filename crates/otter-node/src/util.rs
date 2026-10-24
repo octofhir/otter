@@ -13,6 +13,7 @@
 //! # See also
 //! - [`otter_vm::runtime_cx`] — runtime-turn and rooted native APIs.
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
 };
@@ -24,7 +25,10 @@ use otter_vm::{Attr, NativeCtx, NativeError, Value};
 /// of frames to skip from the top (the JS `getCallSites` wrapper passes
 /// `1` to hide its own frame); `args[1]` is the requested frame count.
 /// Returns a JSON string the shim `JSON.parse`s into plain objects.
-fn capture_call_sites(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn capture_call_sites(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let skip = args
         .first()
         .and_then(|v| v.as_f64())
@@ -52,7 +56,7 @@ fn capture_call_sites(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
 /// `proxyDetails(value)` — `[target, handler]` for a live Proxy, or
 /// `undefined` for anything else (revoked proxies read as null slots).
-fn proxy_details(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn proxy_details(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let Some(proxy) = args.first().and_then(|value| value.as_proxy()) else {
         return Ok(Value::undefined());
     };
@@ -75,7 +79,10 @@ fn proxy_details(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 /// keys were set on it. Asking the ordinary reflection surface for them
 /// materialises one string per element, which for a megabyte-sized buffer
 /// is a million strings the caller then throws away.
-fn own_non_index_keys(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn own_non_index_keys(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let heap = ctx.heap();
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     let expando = if let Some(view) = value.as_typed_array(heap) {
@@ -101,7 +108,10 @@ fn own_non_index_keys(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     })
 }
 
-fn typed_arrays_equal(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn typed_arrays_equal(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let heap = ctx.heap();
     let Some(left) = args.first().and_then(|value| value.as_typed_array(heap)) else {
         return Ok(Value::number_i32(0));

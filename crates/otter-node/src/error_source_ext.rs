@@ -21,6 +21,7 @@
 //! # See also
 //! - `nodelib/internal/errors/error_source.js` — the vendored consumer.
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
     RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
@@ -31,7 +32,7 @@ use otter_runtime::{
 /// points, as `{ sourceLine, scriptResourceName, lineNumber, startColumn }`.
 fn get_error_source_positions(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let error = args.first().copied().unwrap_or_else(Value::undefined);
     let position = ctx.error_source_position(&error)?;
@@ -79,7 +80,7 @@ pub fn error_source_cjs_value<'scope>(
         "getErrorSourcePositions",
         1,
         &[],
-        |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+        |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
             get_error_source_positions(ctx, args)
         },
     )?;

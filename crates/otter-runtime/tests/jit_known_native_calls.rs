@@ -14,6 +14,7 @@
 //! - Only explicitly requested inspection reads static code byte sizes.
 
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     JitArtifactBundle, JitArtifactFileName, JitDebugEvent, JitDebugRequest, JitDebugTarget,
     JitDebugTier, JitSelection, Runtime, RuntimeExtensionInstaller, RuntimeNativeCall,
@@ -110,8 +111,8 @@ fn installer(
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     let count = args.len();
                     if collect.load(Ordering::Relaxed) && count == 3 {
                         let before = ctx
@@ -150,8 +151,8 @@ fn installer(
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 |_ctx: &mut RuntimeNativeCtx<'_>,
-                 _args: &[RuntimeValue],
-                 _state: &[RuntimeValue]| {
+                 _args: ValueWindow<'_>,
+                 _state: ValueWindow<'_>| {
                     Err(RuntimeNativeError::TypeError {
                         name: "nativeKindThrow",
                         reason: "native-kind-throw".into(),
@@ -163,7 +164,7 @@ fn installer(
             "nativeKindRenew",
             1,
             RuntimeNativeCall::Dynamic(Arc::new(
-                |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _state: &[RuntimeValue]| {
+                |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _state: ValueWindow<'_>| {
                     ctx.scope(|mut scope| {
                         let marker = scope.argument(args, 0);
                         let layout = scope.object_layout(&["marker"])?;

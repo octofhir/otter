@@ -49,6 +49,7 @@
 //! - <https://tc39.es/ecma262/#sec-error-message>
 //! - <https://tc39.es/ecma262/#sec-error.prototype.tostring>
 
+use crate::ValueWindow;
 use crate::gc_trace::GcRootVisitor;
 use crate::native_abi::CommittedValueError;
 use crate::native_function::NativeFunction;
@@ -638,7 +639,7 @@ impl ErrorClassRegistry {
         // single source-of-truth body lives in `error_prototype_to_string`.
         fn error_prototype_to_string(
             ctx: &mut NativeCtx<'_>,
-            _args: &[Value],
+            _args: ValueWindow<'_>,
         ) -> Result<Value, NativeError> {
             let receiver = *ctx.this_value();
             // §20.5.3.4 step 2 — Type(O) is not Object → TypeError.
@@ -690,7 +691,10 @@ impl ErrorClassRegistry {
         // in the chain) and `undefined` otherwise; the setter installs an
         // own data property on the receiver via
         // SetterThatIgnoresPrototypeProperties.
-        fn error_stack_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn error_stack_get(
+            ctx: &mut NativeCtx<'_>,
+            _args: ValueWindow<'_>,
+        ) -> Result<Value, NativeError> {
             let receiver = *ctx.this_value();
             // step 2 — E is not an Object → TypeError. A Proxy is an
             // Object even though it is not an ordinary `JsObject`.
@@ -738,7 +742,10 @@ impl ErrorClassRegistry {
             }
             Ok(Value::string(s))
         }
-        fn error_stack_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        fn error_stack_set(
+            ctx: &mut NativeCtx<'_>,
+            args: ValueWindow<'_>,
+        ) -> Result<Value, NativeError> {
             let receiver = *ctx.this_value();
             let value = args.first().copied().unwrap_or_else(Value::undefined);
             // step 2 — E is not an Object → TypeError.
@@ -927,7 +934,7 @@ impl ErrorClassRegistry {
         fn make_instance_native(
             ctx: &mut NativeCtx<'_>,
             kind: ErrorKind,
-            args: &[Value],
+            args: ValueWindow<'_>,
         ) -> Result<Value, NativeError> {
             let context =
                 ctx.execution_context()
@@ -1055,34 +1062,40 @@ impl ErrorClassRegistry {
             }
         }
 
-        fn ctor_error(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+        fn ctor_error(c: &mut NativeCtx<'_>, a: ValueWindow<'_>) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::Error, a)
         }
-        fn ctor_type(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+        fn ctor_type(c: &mut NativeCtx<'_>, a: ValueWindow<'_>) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::TypeError, a)
         }
-        fn ctor_range(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+        fn ctor_range(c: &mut NativeCtx<'_>, a: ValueWindow<'_>) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::RangeError, a)
         }
-        fn ctor_syntax(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+        fn ctor_syntax(c: &mut NativeCtx<'_>, a: ValueWindow<'_>) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::SyntaxError, a)
         }
-        fn ctor_reference(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+        fn ctor_reference(c: &mut NativeCtx<'_>, a: ValueWindow<'_>) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::ReferenceError, a)
         }
-        fn ctor_uri(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+        fn ctor_uri(c: &mut NativeCtx<'_>, a: ValueWindow<'_>) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::URIError, a)
         }
-        fn ctor_eval(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+        fn ctor_eval(c: &mut NativeCtx<'_>, a: ValueWindow<'_>) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::EvalError, a)
         }
-        fn ctor_wasm_compile(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+        fn ctor_wasm_compile(
+            c: &mut NativeCtx<'_>,
+            a: ValueWindow<'_>,
+        ) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::WasmCompileError, a)
         }
-        fn ctor_wasm_link(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+        fn ctor_wasm_link(c: &mut NativeCtx<'_>, a: ValueWindow<'_>) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::WasmLinkError, a)
         }
-        fn ctor_wasm_runtime(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+        fn ctor_wasm_runtime(
+            c: &mut NativeCtx<'_>,
+            a: ValueWindow<'_>,
+        ) -> Result<Value, NativeError> {
             make_instance_native(c, ErrorKind::WasmRuntimeError, a)
         }
         /// §20.5.7.1 AggregateError(errors, message [, options]).
@@ -1091,7 +1104,7 @@ impl ErrorClassRegistry {
         ///     writable, non-enumerable, configurable `errors` own property,
         ///   - `message` is arg 1,
         ///   - `options.cause` lives at arg 2.
-        fn ctor_aggregate(c: &mut NativeCtx<'_>, a: &[Value]) -> Result<Value, NativeError> {
+        fn ctor_aggregate(c: &mut NativeCtx<'_>, a: ValueWindow<'_>) -> Result<Value, NativeError> {
             let context = c
                 .execution_context()
                 .cloned()
@@ -1276,7 +1289,10 @@ impl ErrorClassRegistry {
         // Object carrying the `[[ErrorData]]` internal slot. Proxies and
         // plain objects shaped like errors return `false`; the marker is
         // per-instance, set only by an error constructor.
-        fn error_is_error(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        fn error_is_error(
+            ctx: &mut NativeCtx<'_>,
+            args: ValueWindow<'_>,
+        ) -> Result<Value, NativeError> {
             let arg = args.first().copied().unwrap_or_else(Value::undefined);
             let is_error = arg
                 .as_object()
@@ -1318,7 +1334,7 @@ impl ErrorClassRegistry {
 
         fn error_capture_stack_trace(
             ctx: &mut NativeCtx<'_>,
-            args: &[Value],
+            args: ValueWindow<'_>,
         ) -> Result<Value, NativeError> {
             let target = args.first().copied().unwrap_or_else(Value::undefined);
             let Some(mut target_obj) = target.as_object() else {

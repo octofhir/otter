@@ -395,7 +395,7 @@ mod tests {
     fn general_native_kind_is_one_target_across_live_static_and_dynamic_bodies() {
         fn static_body(
             _ctx: &mut crate::NativeCtx<'_>,
-            _args: &[crate::Value],
+            _args: crate::ValueWindow<'_>,
         ) -> Result<crate::Value, crate::NativeError> {
             Ok(crate::Value::number_i32(1))
         }

@@ -25,6 +25,7 @@
 //! - <https://tc39.es/ecma262/#sec-weak-ref-constructor>
 //! - <https://tc39.es/ecma262/#sec-finalization-registry-constructor>
 
+use crate::ValueWindow;
 use crate::weak_refs::{self, JsFinalizationRegistry, JsWeakRef};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -64,7 +65,10 @@ otter_macros::couch! {
 // Constructor bodies
 // ---------------------------------------------------------------
 
-fn weak_ref_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn weak_ref_ctor_call(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(NativeError::TypeError {
             name: "WeakRef",
@@ -87,7 +91,7 @@ fn weak_ref_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     Ok(Value::weak_ref(weak_ref))
 }
 
-fn fr_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn fr_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(NativeError::TypeError {
             name: "FinalizationRegistry",
@@ -120,12 +124,15 @@ fn fr_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 // Prototype method bodies
 // ---------------------------------------------------------------
 
-fn weak_ref_proto_deref(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn weak_ref_proto_deref(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let weak_ref = receiver_weak_ref(ctx, "WeakRef.prototype.deref")?;
     Ok(weak_refs::weak_ref_deref(weak_ref, ctx.heap()))
 }
 
-fn fr_proto_register(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn fr_proto_register(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let registry = receiver_finalization_registry(ctx, "FinalizationRegistry.prototype.register")?;
     let target = args.first().cloned().unwrap_or(Value::undefined());
     let held_value = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -164,7 +171,10 @@ fn fr_proto_register(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     Ok(Value::undefined())
 }
 
-fn fr_proto_unregister(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn fr_proto_unregister(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let registry =
         receiver_finalization_registry(ctx, "FinalizationRegistry.prototype.unregister")?;
     let token = args.first().cloned().unwrap_or(Value::undefined());

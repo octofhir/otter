@@ -7,13 +7,14 @@
 
 #![allow(missing_docs)]
 
+use crate::ValueWindow;
 use crate::object::JsObject;
 use crate::string::JsString;
 use crate::temporal::payload::{JsTemporal, TemporalPayload};
 use crate::{NativeCtx, NativeError, Value};
 
 #[must_use]
-pub fn arg_or_undef(args: &[Value], index: usize) -> Value {
+pub fn arg_or_undef(args: ValueWindow<'_>, index: usize) -> Value {
     args.get(index).copied().unwrap_or(Value::undefined())
 }
 
@@ -177,7 +178,7 @@ pub fn to_integer_if_integral(
 
 pub fn opt_integer_with_truncation(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     class: &'static str,
     field: &str,
@@ -327,7 +328,7 @@ fn read_month_code(
 
 pub fn parse_overflow(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
 ) -> Result<Option<temporal_rs::options::Overflow>, NativeError> {
     use core::str::FromStr;
@@ -406,7 +407,7 @@ pub fn get_option_value(
 
 pub fn opt_integer_if_integral(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     class: &'static str,
     field: &str,
@@ -419,7 +420,7 @@ pub fn opt_integer_if_integral(
 }
 
 pub fn arg_to_calendar(
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     heap: &otter_gc::GcHeap,
     class: &'static str,
@@ -584,7 +585,7 @@ pub fn require_zoned_date_time(
 /// `"later"`/`"reject"`) from an options argument, defaulting to
 /// `Compatible`.
 pub fn parse_disambiguation(
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     ctx: &mut NativeCtx<'_>,
     class: &'static str,
@@ -644,7 +645,7 @@ pub fn parse_time_zone(
 /// [`temporal_rs::options::ToStringRoundingOptions`]. Absent options
 /// keep `Precision::Auto` / no unit / default mode.
 pub fn parse_to_string_rounding_options(
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     ctx: &mut NativeCtx<'_>,
     class: &'static str,
@@ -765,7 +766,7 @@ pub fn read_smallest_unit_option(
 /// [`temporal_rs::options::DisplayCalendar`]. Absent options or an
 /// absent `calendarName` default to `Auto`.
 pub fn parse_display_calendar(
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     ctx: &mut NativeCtx<'_>,
     class: &'static str,
@@ -806,7 +807,7 @@ pub fn read_display_calendar_name(
 /// `toString` options argument into a [`temporal_rs::options::DisplayOffset`].
 /// Absent options or an absent `offset` default to `Auto`.
 pub fn parse_display_offset(
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     ctx: &mut NativeCtx<'_>,
     class: &'static str,
@@ -848,7 +849,7 @@ pub fn read_display_offset(
 /// [`temporal_rs::options::DisplayTimeZone`]. Absent options or an absent
 /// `timeZoneName` default to `Auto`.
 pub fn parse_display_time_zone(
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     ctx: &mut NativeCtx<'_>,
     class: &'static str,
@@ -912,7 +913,7 @@ pub(crate) fn read_partial_integer(
 }
 
 pub fn parse_difference_settings(
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     ctx: &mut NativeCtx<'_>,
     class: &'static str,
@@ -971,7 +972,7 @@ pub fn parse_difference_settings(
 }
 
 pub fn parse_rounding_options(
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     ctx: &mut NativeCtx<'_>,
     class: &'static str,

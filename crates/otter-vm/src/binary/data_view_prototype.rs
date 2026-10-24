@@ -10,6 +10,7 @@
 //! - <https://tc39.es/ecma262/#sec-setviewvalue>
 
 use crate::Value;
+use crate::ValueWindow;
 use crate::bigint::BigIntValue;
 use crate::number::NumberValue;
 use crate::{NativeCtx, NativeError};
@@ -129,7 +130,7 @@ fn convert_set_value(
 
 fn read_view<F>(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     byte_count: usize,
     le_arg: usize,
     f: F,
@@ -156,7 +157,7 @@ where
 
 fn write_view<F>(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     byte_count: usize,
     is_bigint: bool,
     f: F,
@@ -188,17 +189,26 @@ where
 
 // ---- getX --------------------------------------------------------------
 
-pub(crate) fn dv_get_int8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_get_int8(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     read_view(ctx, args, 1, 1, |s, _, _| {
         Ok(smi(i8::from_le_bytes([s[0]]) as i32))
     })
 }
 
-pub(crate) fn dv_get_uint8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_get_uint8(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     read_view(ctx, args, 1, 1, |s, _, _| Ok(smi(s[0] as i32)))
 }
 
-pub(crate) fn dv_get_int16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_get_int16(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     read_view(ctx, args, 2, 1, |s, le, _| {
         let v = if le {
             i16::from_le_bytes([s[0], s[1]])
@@ -209,7 +219,10 @@ pub(crate) fn dv_get_int16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     })
 }
 
-pub(crate) fn dv_get_uint16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_get_uint16(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     read_view(ctx, args, 2, 1, |s, le, _| {
         let v = if le {
             u16::from_le_bytes([s[0], s[1]])
@@ -220,7 +233,10 @@ pub(crate) fn dv_get_uint16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
     })
 }
 
-pub(crate) fn dv_get_int32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_get_int32(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     read_view(ctx, args, 4, 1, |s, le, _| {
         let buf = [s[0], s[1], s[2], s[3]];
         let v = if le {
@@ -232,7 +248,10 @@ pub(crate) fn dv_get_int32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     })
 }
 
-pub(crate) fn dv_get_uint32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_get_uint32(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     read_view(ctx, args, 4, 1, |s, le, _| {
         let buf = [s[0], s[1], s[2], s[3]];
         let v = if le {
@@ -246,7 +265,7 @@ pub(crate) fn dv_get_uint32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
 
 pub(crate) fn dv_get_float32(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     read_view(ctx, args, 4, 1, |s, le, _| {
         let buf = [s[0], s[1], s[2], s[3]];
@@ -261,7 +280,7 @@ pub(crate) fn dv_get_float32(
 
 pub(crate) fn dv_get_float64(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     read_view(ctx, args, 8, 1, |s, le, _| {
         let mut buf = [0u8; 8];
@@ -277,7 +296,7 @@ pub(crate) fn dv_get_float64(
 
 pub(crate) fn dv_get_float16(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     read_view(ctx, args, 2, 1, |s, le, _| {
         let buf = [s[0], s[1]];
@@ -294,7 +313,7 @@ pub(crate) fn dv_get_float16(
 
 pub(crate) fn dv_get_bigint64(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     read_view(ctx, args, 8, 1, |s, le, heap| {
         let mut buf = [0u8; 8];
@@ -311,7 +330,7 @@ pub(crate) fn dv_get_bigint64(
 
 pub(crate) fn dv_get_biguint64(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     read_view(ctx, args, 8, 1, |s, le, heap| {
         let mut buf = [0u8; 8];
@@ -361,19 +380,28 @@ fn coerce_biguint64(value: &Value, heap: &otter_gc::GcHeap) -> u64 {
     value.as_big_int().map_or(0, |b| b.to_u64_wrapping(heap))
 }
 
-pub(crate) fn dv_set_int8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_set_int8(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     write_view(ctx, args, 1, false, |b, v, _, heap| {
         b[0] = coerce_int(v, heap) as i8 as u8;
     })
 }
 
-pub(crate) fn dv_set_uint8(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_set_uint8(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     write_view(ctx, args, 1, false, |b, v, _, heap| {
         b[0] = coerce_int(v, heap) as u8;
     })
 }
 
-pub(crate) fn dv_set_int16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_set_int16(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     write_view(ctx, args, 2, false, |b, v, le, heap| {
         let n = coerce_int(v, heap) as i16;
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
@@ -381,7 +409,10 @@ pub(crate) fn dv_set_int16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     })
 }
 
-pub(crate) fn dv_set_uint16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_set_uint16(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     write_view(ctx, args, 2, false, |b, v, le, heap| {
         let n = coerce_int(v, heap) as u16;
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
@@ -389,7 +420,10 @@ pub(crate) fn dv_set_uint16(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
     })
 }
 
-pub(crate) fn dv_set_int32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_set_int32(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     write_view(ctx, args, 4, false, |b, v, le, heap| {
         let n = crate::number::bitwise::to_int32(coerce_number(v, heap));
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
@@ -397,7 +431,10 @@ pub(crate) fn dv_set_int32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     })
 }
 
-pub(crate) fn dv_set_uint32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn dv_set_uint32(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     write_view(ctx, args, 4, false, |b, v, le, heap| {
         let n = crate::number::bitwise::to_uint32(coerce_number(v, heap));
         let bytes = if le { n.to_le_bytes() } else { n.to_be_bytes() };
@@ -407,7 +444,7 @@ pub(crate) fn dv_set_uint32(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
 
 pub(crate) fn dv_set_float32(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     write_view(ctx, args, 4, false, |b, v, le, heap| {
         let n = coerce_number(v, heap).as_f64() as f32;
@@ -418,7 +455,7 @@ pub(crate) fn dv_set_float32(
 
 pub(crate) fn dv_set_float64(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     write_view(ctx, args, 8, false, |b, v, le, heap| {
         let n = coerce_number(v, heap).as_f64();
@@ -429,7 +466,7 @@ pub(crate) fn dv_set_float64(
 
 pub(crate) fn dv_set_float16(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     write_view(ctx, args, 2, false, |b, v, le, heap| {
         let n = coerce_number(v, heap).as_f64();
@@ -445,7 +482,7 @@ pub(crate) fn dv_set_float16(
 
 pub(crate) fn dv_set_bigint64(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     write_view(ctx, args, 8, true, |b, v, le, heap| {
         let n = coerce_bigint64(v, heap);
@@ -456,7 +493,7 @@ pub(crate) fn dv_set_bigint64(
 
 pub(crate) fn dv_set_biguint64(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     write_view(ctx, args, 8, true, |b, v, le, heap| {
         let n = coerce_biguint64(v, heap);

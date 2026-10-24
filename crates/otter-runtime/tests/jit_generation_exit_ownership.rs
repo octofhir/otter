@@ -18,6 +18,7 @@
 
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
+use otter_runtime::ValueWindow;
 use std::sync::{Arc, Mutex};
 
 use otter_bytecode::Op;
@@ -210,8 +211,8 @@ fn old_graph_guard_exit_preserves_the_reentrant_current_replacement() {
                     0,
                     RuntimeNativeCall::Dynamic(Arc::new(
                         move |ctx: &mut RuntimeNativeCtx<'_>,
-                              _args: &[RuntimeValue],
-                              _state: &[RuntimeValue]| {
+                              _args: ValueWindow<'_>,
+                              _state: ValueWindow<'_>| {
                             ctx.interp_mut().set_jit_compiler(Some(compiler.clone()));
                             Ok(RuntimeValue::undefined())
                         },
@@ -223,8 +224,8 @@ fn old_graph_guard_exit_preserves_the_reentrant_current_replacement() {
                     0,
                     RuntimeNativeCall::Dynamic(Arc::new(
                         move |ctx: &mut RuntimeNativeCtx<'_>,
-                              _args: &[RuntimeValue],
-                              _state: &[RuntimeValue]| {
+                              _args: ValueWindow<'_>,
+                              _state: ValueWindow<'_>| {
                             let observed = ready.lock().unwrap();
                             let fid = observed.source.as_ref().unwrap().id;
                             let ready = ctx.interp_mut().jit_code_generation_snapshot().iter().any(
@@ -246,8 +247,8 @@ fn old_graph_guard_exit_preserves_the_reentrant_current_replacement() {
                     1,
                     RuntimeNativeCall::Dynamic(Arc::new(
                         move |ctx: &mut RuntimeNativeCtx<'_>,
-                              args: &[RuntimeValue],
-                              _state: &[RuntimeValue]| {
+                              args: ValueWindow<'_>,
+                              _state: ValueWindow<'_>| {
                             let mut observed = checkpoint.lock().unwrap();
                             let source = observed.source.as_ref().unwrap();
                             let fid = source.id;

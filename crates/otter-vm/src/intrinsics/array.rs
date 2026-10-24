@@ -20,6 +20,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-array-constructor>
 
+use crate::ValueWindow;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, PropertyDescriptor};
 use crate::{NativeCtx, NativeError, Value, descriptor_value};
@@ -68,7 +69,7 @@ fn install_array_prototype_length(
 /// array stay rooted across every allocation.
 ///
 /// <https://tc39.es/ecma262/#sec-array>
-fn array_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn array_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         let elements: smallvec::SmallVec<[_; 8]> = (0..args.len())
             .map(|index| scope.argument(args, index))

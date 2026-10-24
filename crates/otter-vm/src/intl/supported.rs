@@ -20,6 +20,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-supportedlocales>
 
+use crate::ValueWindow;
 use icu_locale::{Locale, LocaleCanonicalizer, LocaleExpander};
 
 use crate::intl::payload::IntlPayload;
@@ -272,7 +273,7 @@ where
 /// returned as a fresh, mutable `Array`.
 pub(crate) fn get_canonical_locales(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let locales = args.first().copied().unwrap_or_else(Value::undefined);
     let list = canonicalize_locale_list(ctx, locales)?;
@@ -283,7 +284,7 @@ pub(crate) fn get_canonical_locales(
 /// every service constructor.
 pub(crate) fn supported_locales_of(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let locales = args.first().copied().unwrap_or_else(Value::undefined);
     let requested = canonicalize_locale_list(ctx, locales)?;
@@ -580,7 +581,7 @@ pub(crate) fn is_supported_numbering_system(code: &str) -> bool {
 /// `RangeError`.
 pub(crate) fn supported_values_of(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // §6.2.4 step 1 — `key = ? ToString(key)`: a full ToString ladder
     // (undefined / null / boolean / number / bigint stringify; only a

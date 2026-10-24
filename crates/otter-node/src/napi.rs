@@ -45,6 +45,7 @@
 // addresses must remain stable when the owning Vec grows.
 #![allow(clippy::missing_safety_doc, clippy::vec_box)]
 
+use otter_runtime::ValueWindow;
 use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::path::Path;
@@ -210,7 +211,7 @@ impl RuntimeTask for NapiThreadsafeFunctionCallTask {
                     .and_then(|root| ctx.persistent_root_get(root));
                 if function.call_js_callback == 0 {
                     if let Some(callback) = callback_value {
-                        ctx.call(callback, Value::undefined(), &[])?;
+                        ctx.call(callback, Value::undefined(), ValueWindow::from(&[]))?;
                     }
                     return Ok(Value::undefined());
                 }
@@ -558,7 +559,7 @@ fn invoke_addon_callback(
     ctx: &mut NativeCtx<'_>,
     callback_addr: usize,
     data_addr: usize,
-    args: &[Value],
+    args: ValueWindow<'_>,
     state: Arc<NapiState>,
 ) -> Result<Value, NativeError> {
     let callback: unsafe extern "C" fn(napi_env, napi_callback_info) -> napi_value =
@@ -1533,7 +1534,7 @@ pub unsafe extern "C" fn napi_call_function(
         };
         args.push(value);
     }
-    match unsafe { env.ctx() }.call(function, receiver, &args) {
+    match unsafe { env.ctx() }.call(function, receiver, ValueWindow::from(&args)) {
         Ok(value) => {
             if !result.is_null() {
                 unsafe { *result = env.root(value) };
@@ -1566,7 +1567,7 @@ pub unsafe extern "C" fn napi_new_instance(
         };
         args.push(value);
     }
-    match unsafe { env.ctx() }.construct(constructor, &args) {
+    match unsafe { env.ctx() }.construct(constructor, ValueWindow::from(&args)) {
         Ok(value) => {
             unsafe { *result = env.root(value) };
             NAPI_OK
@@ -2123,7 +2124,8 @@ unsafe fn settle_deferred(
     let Some(value) = (unsafe { env.value(value) }) else {
         return NAPI_INVALID_ARG;
     };
-    let outcome = unsafe { env.ctx() }.call(settler, Value::undefined(), &[value]);
+    let outcome =
+        unsafe { env.ctx() }.call(settler, Value::undefined(), ValueWindow::from(&[value]));
     let _ = unsafe { env.ctx() }.persistent_root_remove(deferred.resolve);
     let _ = unsafe { env.ctx() }.persistent_root_remove(deferred.reject);
     match outcome {

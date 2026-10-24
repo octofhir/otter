@@ -16,6 +16,7 @@
 //! - `crate::NativeCtx::scope` — the shared moving-GC handle contract.
 
 use super::MathError;
+use crate::ValueWindow;
 use crate::{Local, NativeCtx, NativeError, Value, number::NumberValue};
 use otter_bytecode::method_id::MathMethod;
 use smallvec::SmallVec;
@@ -24,7 +25,7 @@ use smallvec::SmallVec;
 /// calls fit inline.
 pub(super) type MathNumbers = SmallVec<[NumberValue; 4]>;
 
-pub(super) fn arguments_for(method: MathMethod, args: &[Value]) -> &[Value] {
+pub(super) fn arguments_for(method: MathMethod, args: ValueWindow<'_>) -> ValueWindow<'_> {
     use MathMethod::*;
     let count = match method {
         Max | Min | Hypot => args.len(),
@@ -34,13 +35,13 @@ pub(super) fn arguments_for(method: MathMethod, args: &[Value]) -> &[Value] {
         | Exp | Expm1 | Floor | Fround | Log | Log10 | Log1p | Log2 | Round | Sign | Sin | Sinh
         | Sqrt | Tan | Tanh | Trunc => 1,
     };
-    &args[..args.len().min(count)]
+    args.prefix(count)
 }
 
 pub(super) fn coerce_math_args(
     ctx: &mut NativeCtx<'_>,
     name: &'static str,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<MathNumbers, NativeError> {
     if !args.iter().any(needs_to_primitive) {
         return coerce_all(name, args, ctx.heap()).map_err(native_error);
@@ -87,7 +88,7 @@ pub(super) fn coerce_math_args(
 
 pub(super) fn coerce_all(
     name: &'static str,
-    args: &[Value],
+    args: ValueWindow<'_>,
     heap: &otter_gc::GcHeap,
 ) -> Result<MathNumbers, MathError> {
     args.iter()

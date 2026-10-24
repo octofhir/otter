@@ -401,7 +401,7 @@ pub(crate) unsafe fn write_register_unchecked(frame: &mut Frame, idx: u16, value
 /// §22.1.3.34.
 pub(crate) fn string_proto_iterator(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     const NAME: &str = "String.prototype[Symbol.iterator]";
     let this = *ctx.this_value();
@@ -527,8 +527,8 @@ pub(crate) fn make_array_iterator_factory(
 #[cfg(test)]
 pub(crate) fn array_iterator_factory_call(
     ctx: &mut NativeCtx<'_>,
-    _: &[Value],
-    captures: &[Value],
+    _: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let Some(array) = captures.first().and_then(|v| v.as_array()) else {
         return Err(NativeError::TypeError {

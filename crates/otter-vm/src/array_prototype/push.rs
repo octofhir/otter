@@ -16,6 +16,7 @@
 //! - [`crate::handles`] for collector-rewritten local handles.
 //! - [`crate::array`] for the dense slab reservation and write barriers.
 
+use crate::ValueWindow;
 use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
 
@@ -26,7 +27,10 @@ use crate::{
 
 use super::{format_index_key, length_of_array_like};
 
-pub(super) fn native_push(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(super) fn native_push(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     if ctx.this_value().is_null() || ctx.this_value().is_undefined() {
         return Err(NativeError::TypeError {
             name: "push",
@@ -59,7 +63,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
         _roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {

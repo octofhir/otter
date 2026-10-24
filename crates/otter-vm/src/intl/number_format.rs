@@ -20,6 +20,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-numberformat-objects>
 
+use crate::ValueWindow;
 use std::str::FromStr;
 
 use fixed_decimal::Decimal;
@@ -698,7 +699,7 @@ fn coerce_format_arg_numeric(
 /// its identity, only that it formats against the originating instance.
 pub(crate) fn number_format_format_getter(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // Brand check: the receiver must be a NumberFormat instance.
     let _ = require_number_format(ctx, "format")?;
@@ -719,8 +720,8 @@ pub(crate) fn number_format_format_getter(
 /// bound-function semantics of §11.3.3.
 fn bound_format_call(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    captures: &[Value],
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let bad = || NativeError::TypeError {
         name: "format",
@@ -785,7 +786,7 @@ pub(crate) fn to_locale_string_exact(
 /// §11.1.6 `Intl.NumberFormat.prototype.formatToParts(value)`.
 pub(crate) fn number_format_format_to_parts(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_number_format(ctx, "formatToParts")?;
     let arg = coerce_format_arg_numeric(ctx, args.first())?;
@@ -931,7 +932,7 @@ fn range_collapse<'a>(start: &'a str, end: &'a str) -> (String, &'a str, &'a str
 /// `RangeError` (step 1).
 fn range_args(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<(NumericArg, NumericArg), NativeError> {
     let undef = |v: Option<&Value>| v.is_none() || v.is_some_and(|x| x.is_undefined());
@@ -961,7 +962,7 @@ fn range_args(
 /// non-digit character would touch it.
 pub(crate) fn number_format_format_range(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_number_format(ctx, "formatRange")?;
     let (x, y) = range_args(ctx, args, "formatRange")?;
@@ -988,7 +989,7 @@ pub(crate) fn number_format_format_range(
 /// `"shared"`; identical-rendering endpoints collapse to all-`"shared"`.
 pub(crate) fn number_format_format_range_to_parts(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_number_format(ctx, "formatRangeToParts")?;
     let (x, y) = range_args(ctx, args, "formatRangeToParts")?;
@@ -1468,7 +1469,7 @@ fn locale_separators(locale: &str) -> (char, char) {
 /// §11.1.7 `Intl.NumberFormat.prototype.resolvedOptions()`.
 pub(crate) fn number_format_resolved_options(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_number_format(ctx, "resolvedOptions")?;
     ctx.scope(|mut scope| {

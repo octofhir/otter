@@ -16,6 +16,7 @@
 //! - `jit_actual_only_calls` covers children reached through actual bound payloads.
 //! - `jit_persistent_inline_fields` covers resident and overflow bank children.
 
+use otter_runtime::ValueWindow;
 use std::sync::Arc;
 
 use otter_runtime::{
@@ -39,7 +40,7 @@ pub(super) fn install(realm: &mut RuntimeExtensionContext<'_>) -> Result<(), Ott
         OBSERVE,
         1,
         RuntimeNativeCall::Dynamic(Arc::new(
-            |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _state: &[RuntimeValue]| {
+            |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _state: ValueWindow<'_>| {
                 let child = args
                     .first()
                     .copied()
@@ -55,7 +56,7 @@ pub(super) fn install(realm: &mut RuntimeExtensionContext<'_>) -> Result<(), Ott
         COLLECT,
         0,
         RuntimeNativeCall::Dynamic(Arc::new(
-            |ctx: &mut RuntimeNativeCtx<'_>, _args: &[RuntimeValue], _state: &[RuntimeValue]| {
+            |ctx: &mut RuntimeNativeCtx<'_>, _args: ValueWindow<'_>, _state: ValueWindow<'_>| {
                 ctx.interp_mut()
                     .force_gc()
                     .map_err(|error| RuntimeNativeError::Error {
@@ -69,7 +70,7 @@ pub(super) fn install(realm: &mut RuntimeExtensionContext<'_>) -> Result<(), Ott
 
 pub(super) fn observe_and_collect(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
 ) -> Result<Vec<ChildMotion>, RuntimeNativeError> {
     ctx.scope(|mut scope| {
         let children: Vec<_> = (0..args.len())
@@ -116,7 +117,7 @@ pub(super) fn observe_and_collect(
 #[allow(dead_code)]
 pub(super) fn collect_and_prove(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
 ) -> Result<(), RuntimeNativeError> {
     let observations = observe_and_collect(ctx, args)?;
     assert!(

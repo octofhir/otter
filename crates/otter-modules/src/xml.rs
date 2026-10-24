@@ -34,6 +34,7 @@
 //! - [Handle scopes](../../../docs/site/src/content/docs/extensions/handle-scopes.md)
 //! - `otter_xml::sink` — the events consumed here.
 
+use otter_runtime::ValueWindow;
 use std::borrow::Cow;
 
 use rustc_hash::FxHashMap;
@@ -75,7 +76,7 @@ enum Shape {
 /// # Errors
 /// A document that is not well-formed raises a `SyntaxError`; a first argument
 /// that is neither text nor bytes raises a `TypeError`.
-pub fn parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn parse(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         let input = scope.argument(args, 0);
         let shape = read_shape(&mut scope, args)?;
@@ -123,7 +124,10 @@ pub fn parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     })
 }
 
-fn read_shape(scope: &mut NativeScope<'_, '_>, args: &[Value]) -> Result<Shape, NativeError> {
+fn read_shape(
+    scope: &mut NativeScope<'_, '_>,
+    args: ValueWindow<'_>,
+) -> Result<Shape, NativeError> {
     let options = scope.argument(args, 1);
     if !scope.is_object(options) {
         return Ok(Shape::Compact);
@@ -599,7 +603,7 @@ impl<E: Encoding> Sink<E::Unit> for Builder<'_, '_, '_, E> {
 /// # Errors
 /// A value that is not a document, or a name XML cannot spell, raises a
 /// `TypeError`.
-pub fn stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn stringify(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         let input = scope.argument(args, 0);
         let replacer = scope.argument(args, 1);

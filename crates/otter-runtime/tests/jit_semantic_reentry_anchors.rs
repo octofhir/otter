@@ -17,6 +17,7 @@
 
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     JitDebugRequest, JitDebugTier, JitSelection, Runtime, RuntimeExtensionInstaller,
     RuntimeNativeCall, RuntimeNativeCtx, RuntimeNativeError, RuntimeValue, SourceInput,
@@ -140,8 +141,8 @@ fn installer(records: Arc<Mutex<Vec<Result<Motion, String>>>>) -> RuntimeExtensi
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 |ctx: &mut RuntimeNativeCtx<'_>,
-                 _args: &[RuntimeValue],
-                 _state: &[RuntimeValue]| {
+                 _args: ValueWindow<'_>,
+                 _state: ValueWindow<'_>| {
                     ctx.interp_mut().gc_heap_mut().set_gc_stress(0, false);
                     ctx.interp_mut().force_gc().map_err(|error| {
                         otter_vm::native_function::vm_to_native_error(
@@ -160,8 +161,8 @@ fn installer(records: Arc<Mutex<Vec<Result<Motion, String>>>>) -> RuntimeExtensi
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      _args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      _args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     let observed = (|| {
                         let before = roots(ctx)?;
                         let source = ctx

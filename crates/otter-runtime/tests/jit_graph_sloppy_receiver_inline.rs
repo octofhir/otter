@@ -18,6 +18,7 @@
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
 use otter_bytecode::Op;
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     JitArtifactFileName, JitDebugEvent, JitDebugRequest, JitDebugTier, JitSelection, Runtime,
     RuntimeExtensionInstaller, RuntimeNativeCall, RuntimeNativeCtx, RuntimeNativeError,
@@ -188,7 +189,7 @@ fn installer(
             "receiverStress",
             1,
             RuntimeNativeCall::Dynamic(Arc::new(
-                |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _state: &[RuntimeValue]| {
+                |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _state: ValueWindow<'_>| {
                     let stride = args
                         .first()
                         .and_then(|value| value.as_number())
@@ -204,8 +205,8 @@ fn installer(
             1,
             RuntimeNativeCall::Dynamic(Arc::new(
                 |_ctx: &mut RuntimeNativeCtx<'_>,
-                 args: &[RuntimeValue],
-                 _state: &[RuntimeValue]| {
+                 args: ValueWindow<'_>,
+                 _state: ValueWindow<'_>| {
                     let object = args
                         .first()
                         .and_then(|value| value.as_object())
@@ -219,8 +220,8 @@ fn installer(
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 |ctx: &mut RuntimeNativeCtx<'_>,
-                 _args: &[RuntimeValue],
-                 _state: &[RuntimeValue]| {
+                 _args: ValueWindow<'_>,
+                 _state: ValueWindow<'_>| {
                     ctx.interp_mut()
                         .force_gc()
                         .map_err(RuntimeNativeError::from)?;
@@ -237,8 +238,8 @@ fn installer(
             2,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     if active.load(Ordering::Relaxed) {
                         evaluations
                             .lock()
@@ -324,8 +325,8 @@ fn installer(
             2,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     if active.load(Ordering::Relaxed) {
                         let observation = (|| -> Result<Observed, String> {
                             let receiver = args

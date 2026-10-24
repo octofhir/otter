@@ -13,6 +13,7 @@
 //! - <https://tc39.es/ecma262/#sec-tobigint>
 
 use super::{BigIntValue, ops};
+use crate::ValueWindow;
 use crate::{Value, VmError, oom_to_vm};
 use num_bigint::BigInt;
 
@@ -26,7 +27,7 @@ use num_bigint::BigInt;
 pub fn call(
     interp: &mut crate::Interpreter,
     method: otter_bytecode::method_id::BigIntMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::BigIntMethod as M;
     let value = match method {

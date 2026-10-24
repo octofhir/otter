@@ -12,6 +12,7 @@
 //! - <https://tc39.es/ecma262/#sec-dataview-constructor>
 //! - <https://tc39.es/ecma262/#sec-typedarray-constructors>
 
+use crate::ValueWindow;
 use crate::{Value, VmError};
 
 use super::array_buffer::JsArrayBuffer;
@@ -44,7 +45,7 @@ fn to_index_error(interp: &crate::Interpreter, value: &Value, what: &str) -> VmE
 /// - <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
 pub fn array_buffer_call(
     method: otter_bytecode::method_id::ArrayBufferMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     interp: &crate::Interpreter,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::ArrayBufferMethod as M;
@@ -64,7 +65,7 @@ pub fn array_buffer_call(
 /// that can expose live roots while reserving off-heap backing storage.
 pub fn array_buffer_call_with_roots(
     method: otter_bytecode::method_id::ArrayBufferMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
@@ -154,7 +155,7 @@ pub fn array_buffer_call_with_roots(
 /// - <https://tc39.es/ecma262/#sec-sharedarraybuffer-constructor>
 pub fn shared_array_buffer_call_with_roots(
     method: otter_bytecode::method_id::SharedArrayBufferMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
@@ -243,7 +244,7 @@ pub fn shared_array_buffer_call_with_roots(
 /// - <https://tc39.es/ecma262/#sec-dataview-buffer-byteoffset-bytelength>
 pub fn data_view_call(
     method: otter_bytecode::method_id::DataViewMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::DataViewMethod as M;
@@ -300,7 +301,7 @@ pub fn data_view_call(
 pub fn typed_array_call_with_roots(
     kind: TypedArrayKind,
     method: otter_bytecode::method_id::TypedArrayMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
@@ -398,7 +399,7 @@ fn new_zeroed_typed_array_with_roots(
 
 fn construct_typed_array_with_roots(
     kind: TypedArrayKind,
-    args: &[Value],
+    args: ValueWindow<'_>,
     interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
@@ -531,7 +532,7 @@ fn construct_typed_array_with_roots(
 
 fn from_static_with_roots(
     kind: TypedArrayKind,
-    args: &[Value],
+    args: ValueWindow<'_>,
     interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
@@ -590,7 +591,7 @@ fn from_static_with_roots(
 
 fn of_static_with_roots(
     kind: TypedArrayKind,
-    args: &[Value],
+    args: ValueWindow<'_>,
     interp: &mut crate::Interpreter,
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
@@ -682,7 +683,7 @@ mod tests {
         let before = interp.gc_heap().tracked_bytes();
         let value = array_buffer_call_with_roots(
             ArrayBufferMethod::Construct,
-            &args,
+            ValueWindow::from(&args),
             &mut interp,
             &mut external_visit,
         )
@@ -717,7 +718,7 @@ mod tests {
         let value = typed_array_call_with_roots(
             TypedArrayKind::Int16,
             TypedArrayMethod::Construct,
-            &args,
+            ValueWindow::from(&args),
             &mut interp,
             &mut external_visit,
         )
@@ -747,7 +748,7 @@ mod tests {
 
         let value = shared_array_buffer_call_with_roots(
             SharedArrayBufferMethod::Construct,
-            &args,
+            ValueWindow::from(&args),
             &mut interp,
             &mut external_visit,
         )
@@ -803,7 +804,7 @@ mod tests {
         let before = interp.gc_heap().tracked_bytes();
         let value = shared_array_buffer_call_with_roots(
             SharedArrayBufferMethod::Construct,
-            &args,
+            ValueWindow::from(&args),
             &mut interp,
             &mut external_visit,
         )

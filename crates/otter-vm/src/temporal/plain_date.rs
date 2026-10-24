@@ -5,6 +5,7 @@
 
 #![allow(missing_docs)]
 
+use crate::ValueWindow;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
@@ -19,7 +20,7 @@ use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "Temporal.PlainDate";
 
-pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
     let year = to_integer_with_truncation(ctx, &arg_or_undef(args, 0), CLASS, "isoYear")? as i32;
     let month_f = to_integer_with_truncation(ctx, &arg_or_undef(args, 1), CLASS, "isoMonth")?;
@@ -32,12 +33,12 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     make_temporal(ctx, TemporalPayload::PlainDate(pd))
 }
 
-fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn from(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pd = parse_plain_date_arg_with_overflow(ctx, &arg_or_undef(args, 0), Some(args))?;
     make_temporal(ctx, TemporalPayload::PlainDate(pd))
 }
 
-fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn compare(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let a = parse_plain_date_arg(ctx, &arg_or_undef(args, 0))?;
     let b = parse_plain_date_arg(ctx, &arg_or_undef(args, 1))?;
     let n = match a.compare_iso(&b) {
@@ -65,7 +66,7 @@ pub(crate) fn parse_plain_date_arg(
 pub(crate) fn parse_plain_date_arg_with_overflow(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
-    overflow_opts: Option<&[Value]>,
+    overflow_opts: Option<ValueWindow<'_>>,
 ) -> Result<temporal_rs::PlainDate, NativeError> {
     // A Temporal instance with date slots converts directly
     // (PlainDateTime / ZonedDateTime project onto their calendar
@@ -169,25 +170,25 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
     }
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let display = parse_display_calendar(args, 0, ctx, CLASS)?;
     let s = pd.to_ixdtf_string(display);
     js_string_value(s, ctx)
 }
 
-fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, &[])
+fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
+    impl_to_string(ctx, ValueWindow::from(&[]))
 }
 
-fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Err(NativeError::TypeError {
         name: CLASS,
         reason: "Temporal.PlainDate has no `.valueOf` — use `compare` or `equals`".to_string(),
     })
 }
 
-fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_add(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let overflow = parse_overflow(ctx, args, 1)?;
@@ -195,7 +196,7 @@ fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
     make_temporal(ctx, TemporalPayload::PlainDate(result))
 }
 
-fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_subtract(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let overflow = parse_overflow(ctx, args, 1)?;
@@ -205,7 +206,7 @@ fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     make_temporal(ctx, TemporalPayload::PlainDate(result))
 }
 
-fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_equals(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let other = parse_plain_date_arg(ctx, &arg_or_undef(args, 0))?;
     // §3.5.14 — equal ISO dates with different calendars are not equal.
@@ -215,7 +216,7 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     ))
 }
 
-fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_until(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let other = parse_plain_date_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
@@ -227,7 +228,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_since(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let other = parse_plain_date_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
@@ -239,7 +240,7 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_with(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let arg = arg_or_undef(args, 0);
     // §RejectObjectWithCalendarOrTimeZone: the argument must be a plain
@@ -275,7 +276,10 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     make_temporal(ctx, TemporalPayload::PlainDate(result))
 }
 
-fn impl_with_calendar(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_with_calendar(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let calendar =
         crate::temporal::helpers::to_calendar_slot_value(ctx, &arg_or_undef(args, 0), CLASS)?;
@@ -283,7 +287,10 @@ fn impl_with_calendar(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     make_temporal(ctx, TemporalPayload::PlainDate(result))
 }
 
-fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_plain_date_time(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let v = arg_or_undef(args, 0);
     let time = if v.is_undefined() {
@@ -324,7 +331,10 @@ fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     make_temporal(ctx, TemporalPayload::PlainDateTime(pdt))
 }
 
-fn impl_to_zoned_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_zoned_date_time(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let item = arg_or_undef(args, 0);
     // §ToZonedDateTime: an object with a `timeZone` property supplies
@@ -359,7 +369,7 @@ fn impl_to_zoned_date_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 
 fn impl_to_plain_year_month(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let pym = pd
@@ -368,7 +378,10 @@ fn impl_to_plain_year_month(
     make_temporal(ctx, TemporalPayload::PlainYearMonth(pym))
 }
 
-fn impl_to_plain_month_day(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_plain_month_day(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let pd = require_plain_date(ctx)?;
     let pmd = pd
         .to_plain_month_day()
@@ -381,13 +394,13 @@ fn impl_to_plain_month_day(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<V
 /// `TypeError`). The heap arm exposes `&mut GcHeap` for string fields.
 macro_rules! plain_date_getter {
     ($fn:ident, $pd:ident => $val:expr) => {
-        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
             let $pd = require_plain_date(ctx)?;
             Ok($val)
         }
     };
     ($fn:ident, $pd:ident, $heap:ident => $val:expr) => {
-        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
             let $pd = require_plain_date(ctx)?;
             let $heap = ctx.heap_mut();
             Ok($val)
@@ -421,7 +434,7 @@ plain_date_getter!(get_calendar_id, pd, heap => str_or_undef(pd.calendar().ident
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,
@@ -486,7 +499,10 @@ otter_macros::couch! {
 /// §sec-temporal.*.prototype.tolocalestring — brand-checks the receiver,
 /// then (absent the Intl formatting data path) renders the same canonical
 /// string as `toString`.
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §Temporal.*.prototype.toLocaleString renders through a freshly
     // constructed DateTimeFormat so the output matches
     // `new Intl.DateTimeFormat(locales, options).format(this)`.

@@ -23,6 +23,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#locale-objects>
 
+use crate::ValueWindow;
 use icu_locale::extensions::unicode::{Key, Value as UValue};
 use icu_locale::subtags::{Language, Region, Script, Variant, Variants};
 use icu_locale::{Locale, LocaleCanonicalizer, LocaleExpander};
@@ -182,7 +183,10 @@ fn is_type_value(s: &str) -> bool {
 // Constructor
 // ---------------------------------------------------------------------------
 
-pub(crate) fn locale_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn locale_ctor(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(type_err("constructor Intl.Locale requires 'new'"));
     }
@@ -488,13 +492,19 @@ fn str_value(ctx: &mut NativeCtx<'_>, s: &str) -> Result<Value, NativeError> {
 // Accessor getters
 // ---------------------------------------------------------------------------
 
-pub(crate) fn get_base_name(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_base_name(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     let base = loc.id.to_string();
     str_value(ctx, &base)
 }
 
-pub(crate) fn get_language(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_language(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let payload = require_locale(ctx)?;
     // A 5-8-alpha language subtag lives outside the ICU model; report
     // the stored subtag rather than the `und` placeholder.
@@ -506,7 +516,10 @@ pub(crate) fn get_language(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Valu
     str_value(ctx, &lang)
 }
 
-pub(crate) fn get_script(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_script(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     match loc.id.script {
         Some(s) => str_value(ctx, s.as_str()),
@@ -514,7 +527,10 @@ pub(crate) fn get_script(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value,
     }
 }
 
-pub(crate) fn get_region(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_region(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     match loc.id.region {
         Some(r) => str_value(ctx, r.as_str()),
@@ -522,7 +538,10 @@ pub(crate) fn get_region(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value,
     }
 }
 
-pub(crate) fn get_variants(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_variants(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     if loc.id.variants.is_empty() {
         return Ok(Value::undefined());
@@ -537,21 +556,33 @@ pub(crate) fn get_variants(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Valu
     str_value(ctx, &joined)
 }
 
-pub(crate) fn get_calendar(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_calendar(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     keyword_getter(ctx, "ca")
 }
-pub(crate) fn get_collation(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_collation(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     keyword_getter(ctx, "co")
 }
-pub(crate) fn get_hour_cycle(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_hour_cycle(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     keyword_getter(ctx, "hc")
 }
-pub(crate) fn get_case_first(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_case_first(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     keyword_getter(ctx, "kf")
 }
 pub(crate) fn get_numbering_system(
     ctx: &mut NativeCtx<'_>,
-    _a: &[Value],
+    _a: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     keyword_getter(ctx, "nu")
 }
@@ -566,12 +597,15 @@ fn keyword_getter(ctx: &mut NativeCtx<'_>, key: &str) -> Result<Value, NativeErr
 
 pub(crate) fn get_first_day_of_week(
     ctx: &mut NativeCtx<'_>,
-    _a: &[Value],
+    _a: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     keyword_getter(ctx, "fw")
 }
 
-pub(crate) fn get_numeric(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_numeric(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     let numeric = match keyword_str(&loc, "kn") {
         Some(v) => v.is_empty() || v == "true",
@@ -584,7 +618,10 @@ pub(crate) fn get_numeric(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value
 // Methods
 // ---------------------------------------------------------------------------
 
-pub(crate) fn to_string(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn to_string(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let payload = require_locale(ctx)?;
     str_value(ctx, &payload.locale)
 }
@@ -809,7 +846,10 @@ fn weekend_for_region(region: &str) -> Vec<u8> {
     }
 }
 
-pub(crate) fn get_calendars(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_calendars(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     let list = match keyword_str(&loc, "ca") {
         Some(c) => vec![c],
@@ -821,7 +861,10 @@ pub(crate) fn get_calendars(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Val
     string_array(ctx, &list)
 }
 
-pub(crate) fn get_collations(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_collations(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     // §the result never contains the implicit "standard" / "search"
     // collations.
@@ -833,7 +876,10 @@ pub(crate) fn get_collations(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Va
     string_array(ctx, &list)
 }
 
-pub(crate) fn get_hour_cycles(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_hour_cycles(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     let list = match keyword_str(&loc, "hc") {
         Some(c) if ["h11", "h12", "h23", "h24"].contains(&c.as_str()) => vec![c],
@@ -859,7 +905,7 @@ pub(crate) fn get_hour_cycles(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<V
 
 pub(crate) fn get_numbering_systems(
     ctx: &mut NativeCtx<'_>,
-    _a: &[Value],
+    _a: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     let list = match keyword_str(&loc, "nu") {
@@ -869,7 +915,10 @@ pub(crate) fn get_numbering_systems(
     string_array(ctx, &list)
 }
 
-pub(crate) fn get_time_zones(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_time_zones(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     // §returns undefined when the locale carries no region subtag.
     if loc.id.region.is_none() {
@@ -878,7 +927,10 @@ pub(crate) fn get_time_zones(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Va
     string_array(ctx, &["UTC".to_string()])
 }
 
-pub(crate) fn get_text_info(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_text_info(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     let mut id = loc.id.clone();
     LocaleExpander::new_extended().maximize(&mut id);
@@ -891,7 +943,10 @@ pub(crate) fn get_text_info(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Val
     })
 }
 
-pub(crate) fn get_week_info(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn get_week_info(
+    ctx: &mut NativeCtx<'_>,
+    _a: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let loc = parse_payload(&require_locale(ctx)?);
     let region = lookup_region(&loc);
     let first_day = match keyword_str(&loc, "fw").as_deref() {
@@ -952,7 +1007,7 @@ fn is_rtl_script(s: &str) -> bool {
     )
 }
 
-pub(crate) fn maximize(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn maximize(ctx: &mut NativeCtx<'_>, _a: ValueWindow<'_>) -> Result<Value, NativeError> {
     let payload = require_locale(ctx)?;
     if split_long_language(&payload.locale).is_some() {
         let tag = payload.locale.clone();
@@ -965,7 +1020,7 @@ pub(crate) fn maximize(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, N
     make_locale(ctx, loc.to_string())
 }
 
-pub(crate) fn minimize(ctx: &mut NativeCtx<'_>, _a: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn minimize(ctx: &mut NativeCtx<'_>, _a: ValueWindow<'_>) -> Result<Value, NativeError> {
     let payload = require_locale(ctx)?;
     if split_long_language(&payload.locale).is_some() {
         let tag = payload.locale.clone();

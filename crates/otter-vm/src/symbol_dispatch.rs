@@ -27,6 +27,7 @@
 //! - <https://tc39.es/ecma262/#sec-symbol.for>
 //! - <https://tc39.es/ecma262/#sec-symbol.keyfor>
 
+use crate::ValueWindow;
 use crate::string::JsString;
 use crate::symbol::WellKnown;
 use crate::{Interpreter, JsSymbol, Value};
@@ -124,7 +125,7 @@ pub const CONSTRUCTOR_SENTINEL: &str = "";
 pub fn call(
     interp: &mut Interpreter,
     method: otter_bytecode::method_id::SymbolMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, SymbolError> {
     use otter_bytecode::method_id::SymbolMethod as M;
     match method {
@@ -140,7 +141,7 @@ pub fn call(
 /// `new Symbol(desc)`). Returns a fresh primitive symbol; spec
 /// rejects the `new` form (TypeError) but the foundation has no
 /// dedicated path for that today.
-fn construct_symbol(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
+fn construct_symbol(interp: &mut Interpreter, args: ValueWindow<'_>) -> Result<Value, SymbolError> {
     let description = if let Some(first) = args.first() {
         if first.is_undefined() {
             None
@@ -169,14 +170,14 @@ fn construct_symbol(interp: &mut Interpreter, args: &[Value]) -> Result<Value, S
 
 /// `Symbol.for(key)` — Spec §20.4.2.4. Coerces `key` to a string
 /// (spec uses `ToString`) and looks up / inserts in the registry.
-fn symbol_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
+fn symbol_for(interp: &mut Interpreter, args: ValueWindow<'_>) -> Result<Value, SymbolError> {
     let key = key_argument(args, &interp.gc_heap, "for")?;
     let sym = interp.symbol_for_key(&key)?;
     Ok(Value::symbol(sym))
 }
 
 /// `Symbol.keyFor(sym)` — Spec §20.4.2.6.
-fn symbol_key_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, SymbolError> {
+fn symbol_key_for(interp: &mut Interpreter, args: ValueWindow<'_>) -> Result<Value, SymbolError> {
     let sym = args
         .first()
         .and_then(|v| v.as_symbol(&interp.gc_heap))
@@ -198,7 +199,7 @@ fn symbol_key_for(interp: &mut Interpreter, args: &[Value]) -> Result<Value, Sym
 /// Spec invokes ToString; foundation accepts strings and
 /// non-`Symbol` primitives directly.
 fn key_argument(
-    args: &[Value],
+    args: ValueWindow<'_>,
     heap: &otter_gc::GcHeap,
     name: &'static str,
 ) -> Result<String, SymbolError> {

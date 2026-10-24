@@ -22,6 +22,7 @@
 //! - [JS surface builders](../../../docs/book/src/extensions/js-surface-builders.md)
 //! - [Native bindings](../../../docs/book/src/extensions/native-bindings.md)
 
+use otter_vm::ValueWindow;
 use std::sync::Arc;
 
 pub use otter_vm::HostAtomInterner;
@@ -109,7 +110,7 @@ pub fn runtime_type_error(name: &'static str, reason: impl Into<String>) -> Runt
 /// Coerce one argument to a display string, treating missing/undefined as `""`.
 #[must_use]
 pub fn runtime_arg_to_string(
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     index: usize,
     heap: &otter_gc::GcHeap,
 ) -> String {
@@ -130,7 +131,7 @@ pub fn runtime_arg_to_string(
 /// Coerce one optional argument to a display string.
 #[must_use]
 pub fn runtime_optional_arg_to_string(
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     index: usize,
     heap: &otter_gc::GcHeap,
 ) -> Option<String> {

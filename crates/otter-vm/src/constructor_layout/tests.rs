@@ -14,6 +14,7 @@
 //! - `otter-runtime/tests/jit_stack_owned_array_construct` owns native call fits.
 
 use super::*;
+use crate::ValueWindow;
 use crate::native_abi::{Frame, VmFrameHeader};
 use crate::{Interpreter, Value, object};
 
@@ -397,7 +398,7 @@ fn original_receiver_is_rewritten_through_published_frame_ticket() {
 fn proxy_bound_and_native_actual_targets_trace_distinct_family_heads() {
     fn native_constructor(
         _: &mut crate::NativeCtx<'_>,
-        _: &[Value],
+        _: ValueWindow<'_>,
     ) -> Result<Value, crate::native_function::NativeError> {
         Ok(Value::UNDEFINED)
     }
@@ -411,7 +412,7 @@ fn proxy_bound_and_native_actual_targets_trace_distinct_family_heads() {
             vm,
             vm.escape_scoped(target),
             Value::UNDEFINED,
-            &[],
+            ValueWindow::from(&[]),
         )
         .unwrap();
         let bound = vm.scoped_value(scope, Value::bound_function(bound));

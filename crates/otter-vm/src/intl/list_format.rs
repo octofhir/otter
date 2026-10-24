@@ -18,6 +18,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#listformat-objects>
 
+use crate::ValueWindow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -110,7 +111,7 @@ pub(crate) fn join(items: &[String], payload: &ListFormatPayload) -> String {
 /// §13.5.3 `Intl.ListFormat.prototype.format(list)`.
 pub(crate) fn list_format_format(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "format")?;
     let items = crate::intl::helpers::string_list_from_iterable(ctx, args.first(), "format")?;
@@ -124,7 +125,7 @@ pub(crate) fn list_format_format(
 /// §13.5.4 `Intl.ListFormat.prototype.formatToParts(list)`.
 pub(crate) fn list_format_format_to_parts(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "formatToParts")?;
     let items =
@@ -228,7 +229,7 @@ impl PartsWrite for ListPartsCollector {
 /// §13.5.5 `Intl.ListFormat.prototype.resolvedOptions()`.
 pub(crate) fn list_format_resolved_options(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "resolvedOptions")?;
     ctx.scope(|mut scope| {

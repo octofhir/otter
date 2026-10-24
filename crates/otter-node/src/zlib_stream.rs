@@ -25,6 +25,7 @@
 //! # See also
 //! - `nodelib/compat/internal_zlib_handle.js`
 
+use otter_vm::ValueWindow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -178,7 +179,7 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
         "create",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let mode = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
             let id = create_ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let dictionary = RetainedBytes::new(&create_budget, MAX_DICTIONARY_BYTES)
@@ -211,7 +212,7 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
         "init",
         6,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             init_stream(ctx, args, &init_table)
         },
     )?;
@@ -222,7 +223,7 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
         "process",
         8,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             process_chunk(ctx, args, &process_table)
         },
     )?;
@@ -233,7 +234,7 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
         "reset",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
             let mut table = reset_table
                 .lock()
@@ -273,7 +274,7 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
         "params",
         3,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
             let level = args.get(1).and_then(|v| v.as_f64()).unwrap_or(-1.0) as i32;
             let strategy = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as i32;
@@ -328,7 +329,7 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
         "close",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
             close_table
                 .lock()
@@ -343,7 +344,7 @@ pub fn zlib_stream_binding_cjs_value<'scope>(
         "crc32",
         2,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let seed = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
             // `zlib.crc32` takes a string as readily as a view; a string is
             // hashed as its UTF-8 bytes, the way Node hashes it.
@@ -438,7 +439,7 @@ fn install_dictionary(handle: &mut Handle) {
 /// Start the stream for the handle's mode.
 fn init_stream(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let id = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
@@ -533,7 +534,7 @@ fn init_stream(
 /// report what is left of each side.
 fn process_chunk(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let id = args.first().and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;

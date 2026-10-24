@@ -21,6 +21,7 @@
 //!   receiver through canonical preparation, frame completion and moving GC.
 
 use super::*;
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     RuntimeExtensionInstaller, RuntimeNativeCall, RuntimeNativeCtx, RuntimeNativeError,
     RuntimeValue,
@@ -130,8 +131,8 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
                 1,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     |ctx: &mut RuntimeNativeCtx<'_>,
-                     args: &[RuntimeValue],
-                     _state: &[RuntimeValue]| {
+                     args: ValueWindow<'_>,
+                     _state: ValueWindow<'_>| {
                         let stride = args
                             .first()
                             .and_then(|value| value.as_number())
@@ -149,8 +150,8 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
                 3,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     move |_ctx: &mut RuntimeNativeCtx<'_>,
-                          args: &[RuntimeValue],
-                          _state: &[RuntimeValue]|
+                          args: ValueWindow<'_>,
+                          _state: ValueWindow<'_>|
                           -> Result<RuntimeValue, RuntimeNativeError> {
                         if recording.load(Ordering::Relaxed) {
                             let phase = args

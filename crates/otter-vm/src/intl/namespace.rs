@@ -8,6 +8,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#intl-object>
 
+use crate::ValueWindow;
 use crate::js_surface::{Attr, JsSurfaceError, MethodSpec, ObjectBuilder};
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
@@ -17,7 +18,7 @@ use crate::{NativeCtx, NativeError, Value};
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,

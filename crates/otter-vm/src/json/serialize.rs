@@ -28,6 +28,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-json.stringify>
 
+use crate::ValueWindow;
 use crate::native_abi::CommittedValueError;
 use smallvec::{SmallVec, smallvec};
 
@@ -122,7 +123,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         let value = args.first().copied().unwrap_or_else(Value::undefined);
         let replacer = args.get(1).copied().unwrap_or_else(Value::undefined);

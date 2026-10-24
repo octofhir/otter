@@ -28,6 +28,7 @@
 
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
+use otter_runtime::ValueWindow;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -302,8 +303,8 @@ for (let i = 0; i < 5000; i++) persistentMoveFields(persistentChildren);
                         1,
                         RuntimeNativeCall::Dynamic(Arc::new(
                             |ctx: &mut RuntimeNativeCtx<'_>,
-                             args: &[RuntimeValue],
-                             _state: &[RuntimeValue]| {
+                             args: ValueWindow<'_>,
+                             _state: ValueWindow<'_>| {
                                 ctx.scope(|mut scope| {
                                     let receiver = scope.argument(args, 0);
                                     let layout = scope.object_layout(&["marker"])?;
@@ -328,8 +329,8 @@ for (let i = 0; i < 5000; i++) persistentMoveFields(persistentChildren);
                         2,
                         RuntimeNativeCall::Dynamic(Arc::new(
                             move |ctx: &mut RuntimeNativeCtx<'_>,
-                                  args: &[RuntimeValue],
-                                  _state: &[RuntimeValue]| {
+                                  args: ValueWindow<'_>,
+                                  _state: ValueWindow<'_>| {
                                 if collect.load(Ordering::Relaxed) {
                                     let before = published_collecting_caller(ctx);
                                     let children = moving_children::observe_and_collect(ctx, args)
@@ -441,8 +442,8 @@ for (let i = 0; i < 5000; i++) persistentMoveFields(persistentChildren);
                     0,
                     RuntimeNativeCall::Dynamic(Arc::new(
                         |_ctx: &mut RuntimeNativeCtx<'_>,
-                         _args: &[RuntimeValue],
-                         _state: &[RuntimeValue]| {
+                         _args: ValueWindow<'_>,
+                         _state: ValueWindow<'_>| {
                             Ok(RuntimeValue::undefined())
                         },
                     )),

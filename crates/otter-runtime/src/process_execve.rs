@@ -14,6 +14,7 @@
 //! # See also
 //! - [`crate::process_control`]
 
+use otter_vm::ValueWindow;
 use std::ffi::CString;
 
 use otter_vm::{ErrorKind, Local, NativeCall, NativeCtx, NativeError, NativeScope, Value};
@@ -34,7 +35,7 @@ pub(crate) fn install(
     )
 }
 
-fn process_execve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_execve(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let capabilities = crate::process::process_host(ctx)?.capabilities;
     let exec_path = args.first().copied().unwrap_or_else(Value::undefined);
     let Some(exec_path) = exec_path.as_string(ctx.heap()) else {

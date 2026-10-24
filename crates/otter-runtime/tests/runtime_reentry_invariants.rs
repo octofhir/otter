@@ -17,11 +17,15 @@
 //! - Promise construction catches on the same turn and roots the abrupt value
 //!   before invoking the captured reject function.
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     JitSelection, NativeCtx, NativeError, Runtime, RuntimeExecutionStats, SourceInput, Value,
 };
 
-fn invoke_rooted_callback(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn invoke_rooted_callback(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         let callback = scope.argument(args, 0);
         let argument = scope.argument(args, 1);

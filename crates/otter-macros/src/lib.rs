@@ -54,10 +54,10 @@
 //!     },
 //! }
 //!
-//! fn native_abs(_ctx: &mut NativeCtx<'_>, args: &[Value])
+//! fn native_abs(_ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>)
 //!     -> Result<Value, NativeError> { /* … */ Ok(Value::undefined()) }
-//! # fn native_ceil(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> { Ok(Value::undefined()) }
-//! # fn native_pow(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> { Ok(Value::undefined()) }
+//! # fn native_ceil(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> { Ok(Value::undefined()) }
+//! # fn native_pow(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> { Ok(Value::undefined()) }
 //! ```
 //!
 //! Class intrinsic — `Proxy` in the abstract:
@@ -80,7 +80,7 @@
 //!
 //! ```rust,ignore
 //! #[dive(name = "fromEpochMilliseconds", length = 1)]
-//! pub fn from_epoch_ms(ctx: &mut NativeCtx<'_>, args: &[Value])
+//! pub fn from_epoch_ms(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>)
 //!     -> Result<Value, NativeError> { /* … */ }
 //! ```
 //!

@@ -26,6 +26,7 @@
 
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
+use otter_runtime::ValueWindow;
 use std::collections::BTreeMap;
 use std::sync::{
     Arc, Mutex,
@@ -172,8 +173,8 @@ fn installer(
             1,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     match args
                         .first()
                         .and_then(|value| value.as_f64())
@@ -203,8 +204,8 @@ fn installer(
             5,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _state: &[RuntimeValue]|
+                      args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>|
                       -> Result<RuntimeValue, RuntimeNativeError> {
                     if recording.load(Ordering::Relaxed) {
                         // Native callbacks cannot unwind through generated frames.

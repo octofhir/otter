@@ -21,6 +21,7 @@
 //! - `nodelib/internal/fs/cp/cp.js` — the asynchronous twin, whose error
 //!   shapes these mirror.
 
+use otter_vm::ValueWindow;
 use std::fs::Metadata;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -101,7 +102,7 @@ struct CopyOptions {
     preserve_timestamps: bool,
 }
 
-fn flag(args: &[RuntimeValue], index: usize) -> bool {
+fn flag(args: ValueWindow<'_>, index: usize) -> bool {
     args.get(index)
         .and_then(|value| value.as_boolean())
         .unwrap_or(false)
@@ -117,7 +118,7 @@ fn flag(args: &[RuntimeValue], index: usize) -> bool {
 /// behind a stat that could not be taken.
 pub(crate) fn check_paths(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let src = path_of(ctx, args, 0)?;
@@ -254,7 +255,7 @@ fn check_parent_paths(
 /// Returns the platform error behind the replacement.
 pub(crate) fn override_file(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let src = path_of(ctx, args, 0)?;
@@ -325,7 +326,7 @@ fn set_timestamps(src_stat: &Metadata, dest: &Path) -> Result<(), RuntimeNativeE
 /// Returns the first failure the walk meets.
 pub(crate) fn copy_dir(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let src = path_of(ctx, args, 0)?;

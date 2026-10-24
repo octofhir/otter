@@ -11,6 +11,7 @@
 //! command releases its host: the final handle drop detaches an isolate that
 //! is still inside non-polling native code instead of blocking on it.
 
+use otter_runtime::ValueWindow;
 use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 
@@ -92,7 +93,7 @@ impl MathModule {
     #[export(name = "rawEcho", length = 1, raw)]
     fn raw_echo(
         _ctx: &mut NativeCtx<'_>,
-        args: &[Value],
+        args: ValueWindow<'_>,
         _caps: &CapabilitySet,
     ) -> Result<Value, NativeError> {
         Ok(args.first().copied().unwrap_or_else(Value::undefined))

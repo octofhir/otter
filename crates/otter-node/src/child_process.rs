@@ -22,6 +22,7 @@
 //!   retaining the read that crossed the limit.
 //! - No VM state is retained across the spawn.
 
+use otter_runtime::ValueWindow;
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -61,7 +62,7 @@ fn native_value<'scope>(
         "spawnSyncRaw",
         3,
         &[],
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+        move |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
             spawn_sync_raw(ctx, args, &caps)
         },
     )?;
@@ -81,7 +82,7 @@ fn native_value<'scope>(
         "spawnStart",
         3,
         &[],
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+        move |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
             spawn_start(
                 ctx,
                 args,
@@ -99,7 +100,7 @@ fn native_value<'scope>(
         "ipcSend",
         4,
         &[],
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+        move |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             let payload = runtime_arg_to_string(args, 1, ctx.heap());
             // What the caller calls this message. A message that leaves
@@ -146,7 +147,7 @@ fn native_value<'scope>(
         "ipcDisconnect",
         1,
         &[],
-        move |_ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+        move |_ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             if let Some(channel) = lookup_channel(&disconnect_table, id) {
                 channel.disconnect();
@@ -158,7 +159,7 @@ fn native_value<'scope>(
     Ok(object)
 }
 
-fn handle_arg(args: &[Value], index: usize) -> u32 {
+fn handle_arg(args: ValueWindow<'_>, index: usize) -> u32 {
     args.get(index)
         .and_then(|value| value.as_f64())
         .unwrap_or(0.0) as u32
@@ -308,7 +309,7 @@ impl RuntimeTask for ChildExit {
 /// from it.
 fn spawn_start(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
     children: &ChildTable,
     next_id: &Arc<AtomicU32>,
@@ -836,7 +837,7 @@ fn grant(cmd: &mut Command, caps: &CapabilitySet) {
 
 fn spawn_sync_raw(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let command = runtime_arg_to_string(args, 0, ctx.heap());

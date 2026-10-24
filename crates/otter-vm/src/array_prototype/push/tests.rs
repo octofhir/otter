@@ -28,7 +28,7 @@ impl otter_gc::SafeTraceable for StressPrime {
     fn trace_slots_safe(&mut self, _visitor: &mut otter_gc::raw::SlotVisitor<'_>) {}
 }
 
-fn collecting_setter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn collecting_setter(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         let receiver = scope.this();
         let argument = scope.argument(args, 0);
@@ -226,7 +226,8 @@ fn moving_push_case(
         Some(&context),
         |ctx| {
             let before = ctx.with_turn_parts(|interp, _| interp.gc_heap_mut().gc_stats().clone());
-            let result = native_push(ctx, &arguments).expect("native scoped push");
+            let result =
+                native_push(ctx, ValueWindow::from(&arguments)).expect("native scoped push");
             let after = ctx.with_turn_parts(|interp, _| interp.gc_heap_mut().gc_stats().clone());
             assert_eq!(result.as_f64(), Some((CHILDREN + 1) as f64));
             assert!(

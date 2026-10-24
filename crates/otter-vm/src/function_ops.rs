@@ -32,6 +32,7 @@
 //! - [`crate::executable`]
 //! - [`crate::Frame`]
 
+use crate::ValueWindow;
 use crate::activation_stack::ActivationStack;
 use crate::runtime_activation::CommittedValueError;
 use otter_bytecode::Operand;
@@ -2049,7 +2050,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: Option<&ExecutionContext>,
         method: otter_bytecode::method_id::ObjectMethod,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Option<Value>, CommittedValueError> {
         use otter_bytecode::method_id::ObjectMethod as M;
         let Some(mut target) = args.first().cloned() else {

@@ -29,6 +29,7 @@
 //! - <https://tc39.es/ecma262/#sec-topropertydescriptor>
 //! - <https://tc39.es/ecma262/#sec-setintegritylevel>
 
+use crate::ValueWindow;
 use crate::rooting::RootScopeExt;
 
 use crate::js_surface::{Attr, MethodSpec, NamespaceSpec};
@@ -130,7 +131,7 @@ pub static OBJECT_PROTOTYPE_METHODS: &[MethodSpec] = &[
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,
@@ -143,7 +144,7 @@ const fn method(
 fn native_call(
     method: otter_bytecode::method_id::ObjectMethod,
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let context = ctx.execution_context().cloned();
 
@@ -231,7 +232,9 @@ fn native_call(
     } else {
         None
     };
-    let args: &[Value] = coerced_args.as_deref().unwrap_or(args);
+    let args = coerced_args
+        .as_deref()
+        .map_or(args, ValueWindow::from_slice);
 
     // Function / Proxy spec ladders go first so they observe the
     // canonical descriptor / trap behaviour.
@@ -409,7 +412,7 @@ fn object_native_error(
 
 macro_rules! native_object_static {
     ($fn_name:ident, $variant:ident) => {
-        fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn_name(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
             native_call(otter_bytecode::method_id::ObjectMethod::$variant, ctx, args)
         }
     };
@@ -445,7 +448,7 @@ native_object_static!(native_group_by, GroupBy);
 /// read the property as a value (e.g.
 /// `Object.getOwnPropertyDescriptor(Object, "is").value`) and then
 /// invoke it through `.call` / `Reflect.apply` see the spec result.
-fn native_is(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_is(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let a = args.first().cloned().unwrap_or(Value::undefined());
     let b = args.get(1).cloned().unwrap_or(Value::undefined());
     Ok(Value::boolean(crate::abstract_ops::same_value(
@@ -458,7 +461,10 @@ fn native_is(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 /// §20.1.2.12 `Object.getPrototypeOf(O)` — `[[Prototype]]` of `O`
 /// after ToObject coercion. Primitive operands resolve to their
 /// respective `%X.prototype%` per §7.1.18.
-fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_get_prototype_of(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let target = args.first().cloned().unwrap_or(Value::undefined());
     if target.is_nullish() {
         return Err(NativeError::TypeError {
@@ -509,7 +515,10 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 /// §20.1.2.21 `Object.setPrototypeOf(O, proto)` — assigns the
 /// `[[Prototype]]` of `O` to `proto` (which must be Object or Null)
 /// and returns `O` after ToObject coercion checks.
-fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_set_prototype_of(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let target = args.first().cloned().unwrap_or(Value::undefined());
     let proto = args.get(1).cloned().unwrap_or(Value::undefined());
     if target.is_nullish() {
@@ -557,7 +566,7 @@ fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 
 pub(crate) fn native_prototype_to_string(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let exec_ctx = ctx
         .execution_context()
@@ -575,7 +584,7 @@ pub(crate) fn native_prototype_to_string(
 
 pub(crate) fn native_prototype_value_of(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     object_prototype_to_object(ctx, "valueOf")
 }
@@ -663,7 +672,7 @@ fn set_primitive_wrapper_data(
 /// - <https://tc39.es/ecma262/#sec-object.prototype.tolocalestring>
 fn native_prototype_to_locale_string(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     if let Some(context) = ctx.execution_context().cloned() {
@@ -673,7 +682,7 @@ fn native_prototype_to_locale_string(
         let callee =
             callee_result.map_err(|err| err.into_native(ctx.cx.interp, "toLocaleString"))?;
         if crate::is_callable_value(&callee) {
-            return ctx.call(callee, this_value, &[]);
+            return ctx.call(callee, this_value, ValueWindow::from(&[]));
         }
         // §20.1.3.5 — `toLocaleString` is `Invoke(O, "toString")`; a
         // non-callable `toString` is a TypeError, not a fall-back to the
@@ -688,7 +697,7 @@ fn native_prototype_to_locale_string(
 
 fn native_prototype_has_own_property(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     // A string or symbol key on an object whose own lookup is its named
@@ -779,7 +788,7 @@ fn native_prototype_has_own_property(
 
 fn native_prototype_property_is_enumerable(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     if let Some(context) = ctx.execution_context().cloned() {
@@ -877,7 +886,7 @@ fn native_prototype_property_is_enumerable(
 
 fn native_prototype_is_prototype_of(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let target = args.first().cloned().unwrap_or(Value::undefined());
@@ -927,7 +936,7 @@ fn native_prototype_is_prototype_of(
 /// - <https://tc39.es/ecma262/#sec-get-object.prototype.__proto__>
 pub fn native_prototype_proto_get(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     if this_value.is_nullish() {
@@ -986,7 +995,7 @@ pub fn native_prototype_proto_get(
 /// - <https://tc39.es/ecma262/#sec-set-object.prototype.__proto__>
 pub fn native_prototype_proto_set(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     if this_value.is_nullish() {
@@ -1060,7 +1069,7 @@ pub fn native_prototype_proto_set(
 /// - <https://tc39.es/ecma262/#sec-object.prototype.__defineGetter__>
 fn native_prototype_define_getter(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     define_accessor_helper(ctx, args, /* is_setter */ false, "__defineGetter__")
 }
@@ -1073,14 +1082,14 @@ fn native_prototype_define_getter(
 /// - <https://tc39.es/ecma262/#sec-object.prototype.__defineSetter__>
 fn native_prototype_define_setter(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     define_accessor_helper(ctx, args, /* is_setter */ true, "__defineSetter__")
 }
 
 fn define_accessor_helper(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     is_setter: bool,
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
@@ -1172,7 +1181,7 @@ fn define_accessor_helper(
 /// - <https://tc39.es/ecma262/#sec-object.prototype.__lookupGetter__>
 fn native_prototype_lookup_getter(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     lookup_accessor_helper(
         ctx,
@@ -1188,14 +1197,14 @@ fn native_prototype_lookup_getter(
 /// - <https://tc39.es/ecma262/#sec-object.prototype.__lookupSetter__>
 fn native_prototype_lookup_setter(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     lookup_accessor_helper(ctx, args, /* lookup_setter */ true, "__lookupSetter__")
 }
 
 fn lookup_accessor_helper(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     lookup_setter: bool,
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
@@ -1413,7 +1422,7 @@ fn bound_function_has_own(
 fn call(
     interp: &mut crate::Interpreter,
     method: otter_bytecode::method_id::ObjectMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::ObjectMethod as M;
     let _runtime_roots = interp.scope_runtime_roots_guard();

@@ -10,6 +10,7 @@
 //! for `crypto` (see [`crate::crypto`]) are implemented. `fetch()` is a JS
 //! shim over the private `__nativeFetch` transport (see [`crate::fetch_ext`]).
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     OtterError, RuntimeExtensionContext, RuntimeExtensionInstaller, RuntimeNativeCall,
     RuntimeNativeCtx as NativeCtx, RuntimeNativeError as NativeError,
@@ -180,7 +181,7 @@ fn b64_value(c: u8) -> Option<u8> {
 }
 
 /// `btoa(data)` — base64-encode a binary (latin1) string. §8.3 HTML.
-fn btoa(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn btoa(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let input = runtime_arg_to_string(args, 0, ctx.heap());
     let mut bytes = Vec::with_capacity(input.len());
     for ch in input.chars() {
@@ -215,7 +216,7 @@ fn btoa(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
 }
 
 /// `atob(data)` — base64-decode to a binary (latin1) string. §8.3 HTML.
-fn atob(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn atob(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let input = runtime_arg_to_string(args, 0, ctx.heap());
     let filtered: Vec<u8> = input
         .bytes()
@@ -242,13 +243,13 @@ fn atob(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
 /// compile to the VM microtask opcode; this native body serves indirect
 /// calls (an aliased or reflected `queueMicrotask`) by enqueueing on the
 /// same per-isolate queue. Throws `TypeError` for non-callable arguments.
-fn queue_microtask(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn queue_microtask(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let callback = args.first().copied().unwrap_or_else(Value::undefined);
     ctx.queue_microtask(callback, [])?;
     Ok(Value::undefined())
 }
 
-fn structured_clone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn structured_clone(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     let options = args.get(1).copied().unwrap_or_else(Value::undefined);
     otter_runtime::web_structured_clone::structured_clone_with_options(ctx, value, options)
@@ -257,7 +258,7 @@ fn structured_clone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 /// Native deflate/gzip codec backing `CompressionStream`/`DecompressionStream`.
 /// Args: `(format: string, data: Uint8Array|ArrayBuffer, decompress: boolean)`;
 /// returns a `Uint8Array`.
-fn stream_codec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn stream_codec(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     use std::io::{Read, Write};
 
     let format = runtime_arg_to_string(args, 0, ctx.heap());
@@ -324,11 +325,11 @@ fn stream_codec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     let ctor = ctx
         .global_value("Uint8Array")
         .ok_or_else(|| runtime_type_error("CompressionStream", "Uint8Array is unavailable"))?;
-    ctx.construct(ctor, &[Value::array_buffer(buffer)])
+    ctx.construct(ctor, ValueWindow::from(&[Value::array_buffer(buffer)]))
 }
 
 /// `__nativeFetch` over this run's capability-bound transport.
-fn native_fetch(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_fetch(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let transport = ctx
         .host_service::<otter_runtime::web_fetch_host::FetchTransport>()
         .ok_or_else(|| NativeError::TypeError {
@@ -364,7 +365,7 @@ fn performance_clock(ctx: &NativeCtx<'_>) -> Result<PerformanceClock, NativeErro
 }
 
 /// `performance.now()`: milliseconds since this run's origin.
-fn performance_now(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn performance_now(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let clock = performance_clock(ctx)?;
     Ok(Value::number(NumberValue::from_f64(
         clock.origin.elapsed().as_secs_f64() * 1000.0,
@@ -372,7 +373,10 @@ fn performance_now(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
 }
 
 /// `performance.timeOrigin`: this run's origin in milliseconds since the epoch.
-fn performance_time_origin(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn performance_time_origin(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let clock = performance_clock(ctx)?;
     Ok(Value::number(NumberValue::from_f64(clock.origin_epoch_ms)))
 }

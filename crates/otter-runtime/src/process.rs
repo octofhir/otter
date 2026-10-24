@@ -52,6 +52,7 @@
 //! # See also
 //! - [`crate::RuntimeBuilder::process_argv`]
 
+use otter_vm::ValueWindow;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -537,7 +538,7 @@ fn process_bootstrap_error(error: NativeError) -> OtterError {
 /// integer or an octal string, exactly Node's `validateMode` contract.
 fn process_umask(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     if value.is_undefined() {
@@ -641,7 +642,10 @@ fn install_get_builtin_module(
     )
 }
 
-fn get_builtin_module(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn get_builtin_module(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let cfg = process_host(ctx)?.cjs;
     let id = args.first().copied().unwrap_or_else(Value::undefined);
     if !id.is_string() {
@@ -701,7 +705,7 @@ fn install_stdin(scope: &mut NativeScope<'_, '_>, process: Local<'_>) -> Result<
 }
 
 /// `process.stdin`: the stream standard input deserves, built on first look.
-fn stdin_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn stdin_getter(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let cfg = process_host(ctx)?.cjs;
     let this_value = *ctx.this_value();
     ctx.scope(|mut scope| {
@@ -733,7 +737,7 @@ const STDIO_MODULE: &str = "internal/otter/stdio";
 /// with that stream from then on.
 fn stdin_setter(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let stream = args.first().copied().unwrap_or_else(Value::undefined);
     let this_value = *ctx.this_value();
@@ -751,7 +755,7 @@ struct StdioStream {
     name: &'static str,
     slot: &'static str,
     fd: i32,
-    write: fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>,
+    write: fn(&mut NativeCtx<'_>, ValueWindow<'_>) -> Result<Value, NativeError>,
 }
 
 const STDOUT: StdioStream = StdioStream {
@@ -802,19 +806,19 @@ fn install_one_stdio(
     )
 }
 
-fn stdout_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn stdout_getter(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     open_stdio(ctx, &STDOUT)
 }
 
-fn stderr_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn stderr_getter(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     open_stdio(ctx, &STDERR)
 }
 
-fn stdout_setter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn stdout_setter(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     replace_stdio(ctx, args, &STDOUT)
 }
 
-fn stderr_setter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn stderr_setter(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     replace_stdio(ctx, args, &STDERR)
 }
 
@@ -850,7 +854,7 @@ fn open_stdio(ctx: &mut NativeCtx<'_>, stream: &StdioStream) -> Result<Value, Na
 /// A program's own stream in place of `process.<name>`.
 fn replace_stdio(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     stream: &StdioStream,
 ) -> Result<Value, NativeError> {
     let replacement = args.first().copied().unwrap_or_else(Value::undefined);
@@ -880,7 +884,7 @@ fn define_method_on(
 /// source — reaches the descriptor exactly as it was written, because what is
 /// on the other end may be a program reading a binary protocol rather than a
 /// terminal. Anything else is the UTF-8 of its string.
-fn write_chunk_bytes(ctx: &mut NativeCtx<'_>, args: &[otter_vm::Value]) -> Vec<u8> {
+fn write_chunk_bytes(ctx: &mut NativeCtx<'_>, args: otter_vm::ValueWindow<'_>) -> Vec<u8> {
     if let Some(value) = args.first().copied() {
         if let Some(view) = value.as_typed_array(ctx.heap()) {
             let heap = ctx.heap();
@@ -908,7 +912,7 @@ fn write_chunk_bytes(ctx: &mut NativeCtx<'_>, args: &[otter_vm::Value]) -> Vec<u
 
 fn stdout_write(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let bytes = write_chunk_bytes(ctx, args);
     write_standard(&mut std::io::stdout().lock(), &bytes).map_err(write_failure)?;
@@ -917,7 +921,7 @@ fn stdout_write(
 
 fn stderr_write(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let bytes = write_chunk_bytes(ctx, args);
     write_standard(&mut std::io::stderr().lock(), &bytes).map_err(write_failure)?;
@@ -1025,7 +1029,7 @@ fn stdio_slot(fd: Option<f64>) -> Option<(&'static str, i32)> {
 
 fn stdio_holds_accessor(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let arg = |index: usize| args.get(index).copied().unwrap_or_else(Value::undefined);
     let heap = ctx.heap();
@@ -1047,7 +1051,7 @@ fn stdio_holds_accessor(
 
 fn stdio_stream_unset(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let (Some(process), Some((slot, _))) = (
         args.first().and_then(|process| process.as_object()),
@@ -1064,7 +1068,7 @@ fn stdio_stream_unset(
 
 fn stdio_isatty(
     _ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     use std::io::IsTerminal;
     let terminal = match stdio_slot(args.first().and_then(|fd| fd.as_f64())) {
@@ -1077,11 +1081,11 @@ fn stdio_isatty(
 
 fn stdio_write(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     match stdio_slot(args.first().and_then(|fd| fd.as_f64())) {
-        Some((_, 1)) => stdout_write(ctx, args.get(1..).unwrap_or_default()),
-        Some((_, 2)) => stderr_write(ctx, args.get(1..).unwrap_or_default()),
+        Some((_, 1)) => stdout_write(ctx, ValueWindow::from(args.get(1..).unwrap_or_default())),
+        Some((_, 2)) => stderr_write(ctx, ValueWindow::from(args.get(1..).unwrap_or_default())),
         _ => Ok(Value::boolean(false)),
     }
 }
@@ -1113,7 +1117,7 @@ pub(crate) fn exit_code(interp: &Interpreter) -> u8 {
 /// visible to the very next call.
 fn process_working_directory(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let cwd = process_host(ctx)?.cwd;
     let current = cwd.get();
@@ -1133,7 +1137,7 @@ fn process_working_directory(
 /// replaced, the call returns and execution continues, exactly as in Node.
 fn process_exit(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let this_value = *ctx.this_value();
     // `process.exit()` with no argument leaves with whatever
@@ -1169,7 +1173,7 @@ fn process_exit(
 /// to report from contexts where `console.error` is hijacked.
 fn process_raw_debug(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     use std::io::Write;
     let rendered: Vec<String> = args
@@ -1219,7 +1223,7 @@ fn process_raw_debug(
 /// the setter only stores the observable state.
 fn process_set_source_maps_enabled(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     if value.as_boolean().is_none() {
@@ -1257,7 +1261,7 @@ fn process_set_source_maps_enabled(
 /// `process.exit` into an observable no-op.
 fn process_really_exit(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     let code = normalize_exit_code(&value, ctx.heap()).unwrap_or(0);
@@ -1273,7 +1277,7 @@ const EXIT_CODE_SLOT: &str = "__otter_exit_code__";
 
 fn exit_code_getter(
     ctx: &mut NativeCtx<'_>,
-    _args: &[otter_vm::Value],
+    _args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let this_value = *ctx.this_value();
     ctx.scope(|mut scope| {
@@ -1288,7 +1292,7 @@ fn exit_code_getter(
 /// `ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`.
 fn exit_code_setter(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     if !(value.is_undefined() || value.is_null()) {
@@ -1348,7 +1352,7 @@ fn exit_code_setter(
 /// is.
 fn process_emit_exit(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let emitted = emit_exit_once(ctx, args);
     #[cfg(unix)]
@@ -1358,7 +1362,7 @@ fn process_emit_exit(
 
 fn emit_exit_once(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     let code = normalize_exit_code(&value, ctx.heap()).unwrap_or(0);
@@ -1414,7 +1418,7 @@ fn emit_exit_once(
 
 fn process_next_tick(
     ctx: &mut NativeCtx<'_>,
-    args: &[otter_vm::Value],
+    args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let Some(callee) = args.first().cloned() else {
         return Err(NativeError::Coded {
@@ -1442,7 +1446,7 @@ fn process_next_tick(
     Ok(Value::undefined())
 }
 
-fn process_uptime(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn process_uptime(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let start = process_host(ctx)?.start;
     let seconds = start.elapsed().as_secs_f64();
     Ok(Value::number(NumberValue::from_f64(seconds)))
@@ -1450,7 +1454,7 @@ fn process_uptime(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
 
 fn process_memory_usage(
     ctx: &mut NativeCtx<'_>,
-    _args: &[otter_vm::Value],
+    _args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let rss = crate::process_info::resident_bytes().unwrap_or(0) as f64;
     let heap_used = ctx.interp_mut().gc_heap_mut().gc_stats().live_bytes as f64;
@@ -1471,7 +1475,7 @@ fn process_memory_usage(
     })
 }
 
-fn process_binding(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_binding(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let name = args.first().copied().unwrap_or_else(Value::undefined);
     if !name.is_string() {
         return Err(NativeError::Coded {
@@ -1488,7 +1492,7 @@ fn process_binding(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     })
 }
 
-fn process_cpu_usage(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_cpu_usage(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let previous = match args.first() {
         None => None,
         Some(value) => {
@@ -1533,7 +1537,10 @@ fn process_cpu_usage(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
 /// itself (`RUSAGE_THREAD`); platforms without a per-thread getrusage answer
 /// the process-wide numbers, which satisfy the same finite-and-monotonic
 /// contract the callers rely on.
-fn process_thread_cpu_usage(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_thread_cpu_usage(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let previous = match args.first() {
         None => None,
         Some(value) if value.is_undefined() => None,
@@ -1579,7 +1586,10 @@ fn process_thread_cpu_usage(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
 /// (Node's `--env-file` precedence). The default path is `./.env` under the
 /// process working directory. Reading the file takes the `read` capability
 /// for it, checked and refused the way `fs` refuses an open.
-fn process_load_env_file(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_load_env_file(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let ProcessHost {
         cwd, capabilities, ..
     } = process_host(ctx)?;
@@ -1810,7 +1820,7 @@ fn process_cpu_times_micros() -> (f64, f64) {
 
 fn process_available_memory(
     _ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     Ok(Value::number_f64(
         crate::process_info::available_memory().unwrap_or(0) as f64,
@@ -1819,7 +1829,7 @@ fn process_available_memory(
 
 fn process_constrained_memory(
     _ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // Zero is Node's documented sentinel when no cgroup/job-object limit is
     // visible to the runtime.
@@ -1871,7 +1881,7 @@ fn hrtime_value<'s>(
     Ok(object)
 }
 
-fn process_hrtime(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_hrtime(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let start = process_host(ctx)?.start;
     let elapsed = start.elapsed();
     let mut seconds = elapsed.as_secs() as i64;
@@ -1917,7 +1927,10 @@ fn process_hrtime(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     Ok(Value::array(array))
 }
 
-fn process_hrtime_bigint(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn process_hrtime_bigint(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let start = process_host(ctx)?.start;
     let nanos = start.elapsed().as_nanos().min(i128::MAX as u128) as i128;
     ctx.scope(|mut scope| {

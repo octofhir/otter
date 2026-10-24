@@ -7,6 +7,7 @@
 
 #![allow(missing_docs)]
 
+use crate::ValueWindow;
 use std::str::FromStr;
 
 use crate::js_surface::{Attr, MethodSpec};
@@ -23,7 +24,7 @@ const CLASS: &str = "Temporal.Duration";
 
 /// §7.1.1 `Temporal.Duration(years, months, weeks, days, hours,
 /// minutes, seconds, milliseconds, microseconds, nanoseconds)`.
-pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
     let years = opt_integer_if_integral(ctx, args, 0, CLASS, "years")? as i64;
     let months = opt_integer_if_integral(ctx, args, 1, CLASS, "months")? as i64;
@@ -42,13 +43,13 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     make_temporal(ctx, TemporalPayload::Duration(dur))
 }
 
-fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn from(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let first = arg_or_undef(args, 0);
     let dur = parse_duration_arg(ctx, &first)?;
     make_temporal(ctx, TemporalPayload::Duration(dur))
 }
 
-fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn compare(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let a = parse_duration_arg(ctx, &arg_or_undef(args, 0))?;
     let b = parse_duration_arg(ctx, &arg_or_undef(args, 1))?;
     // §7.3.34: GetOptionsObject(options) — a non-object, non-undefined
@@ -177,7 +178,7 @@ pub fn load_property(temporal: JsTemporal, heap: &otter_gc::GcHeap, name: &str) 
     }
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
     let rounding = parse_to_string_rounding_options(args, 0, ctx, CLASS)?;
     let s = dur
@@ -186,14 +187,17 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     js_string_value(s, ctx)
 }
 
-fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, &[])
+fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
+    impl_to_string(ctx, ValueWindow::from(&[]))
 }
 
 /// §sec-temporal.duration.prototype.tolocalestring — brand-checks the
 /// receiver, then (absent the Intl `DurationFormat` data path) renders
 /// the same canonical string as `toString`.
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
     // Brand check before any option processing (§ step 1).
     let is_duration = receiver
@@ -210,14 +214,14 @@ fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     crate::intl::duration_format::duration_to_locale_string(ctx, receiver, locales, options)
 }
 
-fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Err(NativeError::TypeError {
         name: CLASS,
         reason: "Temporal.Duration has no `.valueOf` — use `compare`".to_string(),
     })
 }
 
-fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_add(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let lhs = require_duration(ctx)?;
     let rhs = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = lhs.add(&rhs).map_err(|e| temporal_err(e, CLASS))?;
@@ -225,7 +229,7 @@ fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_subtract(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let lhs = require_duration(ctx)?;
     let rhs = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = lhs.subtract(&rhs).map_err(|e| temporal_err(e, CLASS))?;
@@ -254,17 +258,17 @@ pub(crate) fn fp_normalize(
     )
 }
 
-fn impl_negated(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_negated(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
     make_temporal(ctx, TemporalPayload::Duration(dur.negated()))
 }
 
-fn impl_abs(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_abs(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
     make_temporal(ctx, TemporalPayload::Duration(dur.abs()))
 }
 
-fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_total(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
     // §7.3.23 totalOf: a string is the `unit` shorthand; an object
     // supplies `{ unit }`.
@@ -298,7 +302,7 @@ fn impl_total(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     Ok(Value::number_f64(total.as_inner()))
 }
 
-fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_with(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
     let arg = arg_or_undef(args, 0);
     if !arg.is_object_type() {
@@ -382,7 +386,7 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 /// string, or a property bag (`timeZone` present → zoned).
 fn parse_relative_to(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
 ) -> Result<Option<temporal_rs::options::RelativeTo>, NativeError> {
     let v = arg_or_undef(args, index);
@@ -470,7 +474,7 @@ fn parse_relative_to_value(
 /// rounding options together with the parsed `relativeTo`.
 fn parse_duration_round_options(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
 ) -> Result<
     (
@@ -546,7 +550,7 @@ fn parse_duration_round_options(
     Ok((options, relative_to))
 }
 
-fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_round(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let dur = require_duration(ctx)?;
     let (options, relative_to) = parse_duration_round_options(ctx, args, 0)?;
     let result = dur
@@ -584,7 +588,7 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
 /// returns the corresponding field as a [`Value`].
 macro_rules! duration_getter {
     ($fn:ident, $d:ident => $val:expr) => {
-        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
             let $d = require_duration(ctx)?;
             Ok($val)
         }
@@ -607,7 +611,7 @@ duration_getter!(get_blank, d => Value::boolean(d.is_zero()));
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,

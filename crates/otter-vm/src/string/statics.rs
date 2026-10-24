@@ -48,6 +48,7 @@
 //! - <https://tc39.es/ecma262/#sec-string.fromcodepoint>
 //! - <https://tc39.es/ecma262/#sec-touint16>
 
+use crate::ValueWindow;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::string::JsString;
@@ -94,7 +95,7 @@ pub static STRING_STATIC_METHODS: &[MethodSpec] = &[
 /// accessor `raw` segments observe user getters, and every `ToString`
 /// re-enters `@@toPrimitive` / `toString` / `valueOf` on object
 /// operands.
-fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn string_raw(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let context = ctx
         .execution_context()
         .cloned()
@@ -205,7 +206,10 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 /// `BigInt` (which throws — see [`crate::number::parse::to_number_value`]
 /// for the exact contract), or a wrapper object via
 /// `@@toPrimitive` → `valueOf` → `toString`.
-fn string_from_char_code(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn string_from_char_code(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §22.1.2.1 — each argument is `ToUint16(? ToNumber(next))`, so an
     // object's `valueOf` runs and a Symbol / BigInt argument throws,
     // rather than being silently coerced to 0.
@@ -253,7 +257,10 @@ fn string_from_char_code(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 ///   greater than `0x10FFFF`, or has a non-zero fractional part.
 /// - [`NativeError::TypeError`] — string heap exhausted while
 ///   materialising the final `JsString`.
-fn string_from_code_point(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn string_from_code_point(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §22.1.2.2 — each argument is `? ToNumber(next)` (an object's
     // `valueOf` runs, a Symbol / BigInt throws), then validated as an
     // integer code point in `[0, 0x10FFFF]` (otherwise RangeError).

@@ -6,6 +6,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-date-objects>
 
+use crate::ValueWindow;
 use smallvec::SmallVec;
 
 use crate::Value;
@@ -17,15 +18,20 @@ use crate::{JsString, NativeCtx, NativeError};
 // dispatcher with no `this`. The constructor's `[[Construct]]` /
 // `[[Call]]` slot still handles the `Date(...)` and `new Date(...)`
 // shapes via `date_ctor_call`.
-fn date_now_call(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn date_now_call(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
-    crate::date::dispatch::call_static(zone, otter_bytecode::method_id::DateMethod::Now, &[], heap)
-        .map_err(|err| NativeError::TypeError {
-            name: "Date.now",
-            reason: err.to_string(),
-        })
+    crate::date::dispatch::call_static(
+        zone,
+        otter_bytecode::method_id::DateMethod::Now,
+        ValueWindow::from(&[]),
+        heap,
+    )
+    .map_err(|err| NativeError::TypeError {
+        name: "Date.now",
+        reason: err.to_string(),
+    })
 }
-fn date_parse_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn date_parse_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
     crate::date::dispatch::call_static(
         zone,
@@ -38,13 +44,13 @@ fn date_parse_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
         reason: err.to_string(),
     })
 }
-fn date_utc_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn date_utc_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let coerced;
     let date_args = if args.is_empty() {
         args
     } else {
         coerced = coerce_number_args(ctx, "Date.UTC", args)?;
-        &coerced
+        ValueWindow::from(&coerced)
     };
     let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
     crate::date::dispatch::call_static(
@@ -59,7 +65,7 @@ fn date_utc_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     })
 }
 
-fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         // §21.4.2.1 — `Date(...)` as a function ignores its arguments
         // and returns the current time rendered as a string.
@@ -90,7 +96,10 @@ fn date_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     })
 }
 
-fn date_construct_time_value(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<f64, NativeError> {
+fn date_construct_time_value(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<f64, NativeError> {
     if args.is_empty() {
         let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
         return Ok(crate::date::dispatch::construct_time_value(
@@ -102,7 +111,9 @@ fn date_construct_time_value(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<
         let coerced = coerce_number_args(ctx, "Date", args)?;
         let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
         return Ok(crate::date::dispatch::construct_time_value(
-            zone, &coerced, heap,
+            zone,
+            ValueWindow::from(&coerced),
+            heap,
         ));
     }
 
@@ -136,7 +147,7 @@ fn date_construct_time_value(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<
         let (zone, heap) = ctx.interp_mut().local_time_zone_and_heap();
         return Ok(crate::date::dispatch::construct_time_value(
             zone,
-            &[primitive],
+            ValueWindow::from(&[primitive]),
             heap,
         ));
     }
@@ -159,7 +170,7 @@ fn date_construct_time_value(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<
 fn coerce_number_args(
     ctx: &mut NativeCtx<'_>,
     name: &'static str,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<SmallVec<[Value; 8]>, NativeError> {
     let context = ctx
         .execution_context()

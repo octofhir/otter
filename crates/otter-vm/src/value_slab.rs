@@ -274,18 +274,22 @@ pub fn slab_from_values(
     Ok(slab)
 }
 
-/// The initialised values of `slab` as a slice, empty for a null handle.
+/// The initialised values of `slab` as a window, empty for a null handle.
+///
+/// The window aliases the slab's live storage: a collection rewrites its
+/// slots in place and every read through the window sees the result.
 ///
 /// # Safety
 /// The caller must keep the slab reachable for `'a` — in practice, the
 /// owner naming it must be rooted for the duration.
-pub unsafe fn live_slice<'a>(slab: ValueSlabHandle) -> &'a [Value] {
+pub unsafe fn live_window<'a>(slab: ValueSlabHandle) -> crate::ValueWindow<'a> {
     let Some(body) = body_of(slab) else {
-        return &[];
+        return crate::ValueWindow::EMPTY;
     };
     // SAFETY: caller keeps the slab live; the first `len` values were
-    // initialised before the slab became reachable.
-    unsafe { std::slice::from_raw_parts((*body).values_ptr().cast_const(), (*body).len()) }
+    // initialised before the slab became reachable, and old-space slabs
+    // do not move.
+    unsafe { crate::ValueWindow::from_raw_parts((*body).values_ptr().cast_const(), (*body).len()) }
 }
 
 #[cfg(test)]

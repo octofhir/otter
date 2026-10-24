@@ -14,6 +14,7 @@
 //! # See also
 //! - `crates/otter-node/src/buffer.js` — the shim that calls this.
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{CapabilitySet, RuntimeNativeError as NativeError, RuntimeTaskSpawner};
 use otter_vm::{Local, NativeCtx, NativeScope, Value};
 
@@ -42,7 +43,7 @@ pub fn decode_native_cjs_value<'scope>(
             name,
             3,
             &[],
-            move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+            move |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
                 slice(ctx, args, encoding)
             },
         )?;
@@ -65,7 +66,7 @@ enum Encoding {
 
 fn slice(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     encoding: Encoding,
 ) -> Result<Value, NativeError> {
     let offset = |index: usize| {

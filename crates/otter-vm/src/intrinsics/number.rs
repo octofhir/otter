@@ -17,6 +17,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-number-objects>
 
+use crate::ValueWindow;
 use crate::js_surface::{Attr, JsSurfaceError, ObjectBuilder};
 use crate::native_function::NativeCall;
 use crate::object::{self, JsObject};
@@ -129,7 +130,7 @@ fn pin_number_data_and_globals(
 // Constructor body — §21.1.1.1.
 // ---------------------------------------------------------------
 
-fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let value = if args.is_empty() {
         crate::number::NumberValue::from_i32(0)
     } else {
@@ -165,7 +166,10 @@ fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 // Static predicates / parsers — §21.1.2.{3-9}.
 // ---------------------------------------------------------------
 
-fn number_is_nan_native(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn number_is_nan_native(
+    _ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let result = args
         .first()
         .and_then(|v| v.as_number())
@@ -173,7 +177,10 @@ fn number_is_nan_native(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     Ok(Value::boolean(result))
 }
 
-fn number_is_finite_native(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn number_is_finite_native(
+    _ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let result = args
         .first()
         .and_then(|v| v.as_number())
@@ -183,7 +190,7 @@ fn number_is_finite_native(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
 
 fn number_is_integer_native(
     _ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let v = args.first().cloned().unwrap_or(Value::undefined());
     Ok(Value::boolean(crate::number::parse::is_integer(&v)))
@@ -191,7 +198,7 @@ fn number_is_integer_native(
 
 fn number_is_safe_integer_native(
     _ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let v = args.first().cloned().unwrap_or(Value::undefined());
     Ok(Value::boolean(crate::number::parse::is_safe_integer(&v)))
@@ -199,7 +206,7 @@ fn number_is_safe_integer_native(
 
 pub(crate) fn number_parse_int_native(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // §19.2.5 step 1: `inputString = ? ToString(string)` runs first
     // and is observable through a user `toString`/`valueOf`/
@@ -230,7 +237,7 @@ pub(crate) fn number_parse_int_native(
 
 fn number_parse_float_native(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // §19.2.4 step 1: `inputString = ? ToString(string)` — observable.
     let arg = args.first().cloned().unwrap_or(Value::undefined());
@@ -272,7 +279,7 @@ fn native_context(
 /// A Symbol operand raises the spec `TypeError`.
 fn coerce_first_to_string_value(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let arg = args.first().cloned().unwrap_or(Value::undefined());
@@ -313,11 +320,11 @@ fn uri_malformed(name: &'static str) -> NativeError {
     }
 }
 
-fn global_encode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn global_encode_uri(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "encodeURI")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::EncodeURI,
-        &[coerced],
+        ValueWindow::from(&[coerced]),
         ctx.heap_mut(),
     )
     .map_err(|_| uri_malformed("encodeURI"))
@@ -325,22 +332,22 @@ fn global_encode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
 
 fn global_encode_uri_component(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "encodeURIComponent")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::EncodeURIComponent,
-        &[coerced],
+        ValueWindow::from(&[coerced]),
         ctx.heap_mut(),
     )
     .map_err(|_| uri_malformed("encodeURIComponent"))
 }
 
-fn global_decode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn global_decode_uri(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "decodeURI")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::DecodeURI,
-        &[coerced],
+        ValueWindow::from(&[coerced]),
         ctx.heap_mut(),
     )
     .map_err(|_| uri_malformed("decodeURI"))
@@ -348,22 +355,22 @@ fn global_decode_uri(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
 
 fn global_decode_uri_component(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "decodeURIComponent")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::DecodeURIComponent,
-        &[coerced],
+        ValueWindow::from(&[coerced]),
         ctx.heap_mut(),
     )
     .map_err(|_| uri_malformed("decodeURIComponent"))
 }
 
-fn global_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn global_escape(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "escape")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::Escape,
-        &[coerced],
+        ValueWindow::from(&[coerced]),
         ctx.heap_mut(),
     )
     .map_err(|err| NativeError::TypeError {
@@ -372,11 +379,11 @@ fn global_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     })
 }
 
-fn global_unescape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn global_unescape(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let coerced = coerce_first_to_string_value(ctx, args, "unescape")?;
     crate::global_functions::call(
         otter_bytecode::method_id::GlobalMethod::Unescape,
-        &[coerced],
+        ValueWindow::from(&[coerced]),
         ctx.heap_mut(),
     )
     .map_err(|err| NativeError::TypeError {
@@ -389,7 +396,7 @@ fn global_unescape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 /// argument via `? ToNumber(number)` (firing user `valueOf` /
 /// `@@toPrimitive`) before the strict NaN test, unlike the strict
 /// `Number.isNaN` (§21.1.2.3) which performs no coercion.
-fn global_is_nan(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn global_is_nan(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let num = argument_to_number(ctx, args.first(), "isNaN")?;
     Ok(Value::boolean(num.as_f64().is_nan()))
 }
@@ -397,7 +404,7 @@ fn global_is_nan(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 /// §19.2.2 `isFinite(number)` — the **global** function coerces via
 /// `? ToNumber(number)` before the strict finiteness test, unlike the
 /// strict `Number.isFinite` (§21.1.2.2).
-fn global_is_finite(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn global_is_finite(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let num = argument_to_number(ctx, args.first(), "isFinite")?;
     Ok(Value::boolean(num.as_f64().is_finite()))
 }
@@ -425,7 +432,10 @@ fn argument_to_number(
     })
 }
 
-pub(crate) fn global_eval(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn global_eval(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let arg = args.first().cloned().unwrap_or(Value::undefined());
     // §19.2.1.1 indirect eval: sloppy, global variable environment —
     // no caller-scope restrictions apply. Errors keep their spec

@@ -28,6 +28,7 @@ pub mod serve;
 pub mod sql;
 pub mod xml;
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     HostedModule, OtterBuilder, RuntimeBuilder, RuntimeNativeCtx as NativeCtx,
     RuntimeNativeError as NativeError, RuntimeNumberValue as NumberValue, RuntimeValue as Value,
@@ -78,7 +79,7 @@ fn type_error(name: &'static str, reason: impl Into<String>) -> NativeError {
 
 fn arg_string(
     ctx: &NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     _name: &'static str,
 ) -> Result<String, NativeError> {

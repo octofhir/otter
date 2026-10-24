@@ -59,6 +59,7 @@ pub mod util;
 pub mod zlib_stream;
 
 use otter_runtime::{HostedModule, OtterBuilder, RuntimeBuilder};
+use otter_vm::ValueWindow;
 
 /// The file watcher `fs.watch` and `otter watch` use on this platform.
 #[cfg(target_os = "macos")]
@@ -615,7 +616,7 @@ pub(crate) fn arg_string(
     _name: &'static str,
 ) -> Result<String, otter_runtime::RuntimeNativeError> {
     Ok(otter_runtime::runtime_arg_to_string(
-        args,
+        ValueWindow::from(args),
         index,
         ctx.heap(),
     ))

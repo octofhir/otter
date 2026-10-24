@@ -42,6 +42,7 @@
 
 mod call_header;
 
+use crate::ValueWindow;
 use call_header::NativeCallHeader;
 pub use call_header::NativeEntryKind;
 
@@ -70,12 +71,15 @@ pub const NATIVE_FUNCTION_BODY_TYPE_TAG: u8 = 0x1d;
 /// expansion). Implementations return `Ok(value)` to write into
 /// the call-site destination register, or `Err` to surface as a
 /// runtime error.
-pub type NativeFn = dyn for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+pub type NativeFn = dyn for<'rt> Fn(&mut NativeCtx<'rt>, ValueWindow<'_>, ValueWindow<'_>) -> Result<Value, NativeError>
     + Send
     + Sync;
 
-pub(crate) type LocalNativeFn =
-    dyn for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>;
+pub(crate) type LocalNativeFn = dyn for<'rt> Fn(
+    &mut NativeCtx<'rt>,
+    ValueWindow<'_>,
+    ValueWindow<'_>,
+) -> Result<Value, NativeError>;
 
 #[derive(Debug, Clone)]
 enum NativeOwnProperty {
@@ -128,14 +132,18 @@ impl NativeFunctionMetadata {
 /// Production fast path for spec-declared builtins and macro-generated
 /// surfaces: no closure allocation, no capture clone, no dynamic
 /// dispatch.
-pub type NativeFastFn = for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>;
+pub type NativeFastFn =
+    for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>;
 
 /// Plain function pointer for a static native that reads traced captures.
 /// Same process-local snapshot identity as [`NativeFastFn`] — the entry has a
 /// dense external-reference id — with the capture-slab slice the dynamic ABI
 /// passes.
-pub type NativeCapturesFn =
-    for<'rt> fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>;
+pub type NativeCapturesFn = for<'rt> fn(
+    &mut NativeCtx<'rt>,
+    ValueWindow<'_>,
+    ValueWindow<'_>,
+) -> Result<Value, NativeError>;
 
 /// VM-owned intrinsic callable.
 ///
@@ -325,7 +333,7 @@ impl NativeFunctionBody {
             native_ref: self.call_header.native_ref,
             // SAFETY: `self` is a live payload borrow, which keeps the
             // slab it names reachable.
-            capture_count: unsafe { crate::value_slab::live_slice(self.captures).len() },
+            capture_count: unsafe { crate::value_slab::live_window(self.captures).len() },
         }
     }
 }
@@ -351,11 +359,15 @@ pub(crate) fn clone_host_refs_for_restore(
 /// heap-held closure and stays a static entry a startup image carries.
 fn zero_sized_entry<F>(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    captures: &[Value],
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
 ) -> Result<Value, NativeError>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>,
+    F: for<'rt> Fn(
+        &mut NativeCtx<'rt>,
+        ValueWindow<'_>,
+        ValueWindow<'_>,
+    ) -> Result<Value, NativeError>,
 {
     // SAFETY: only the closure storage constructors take this entry, and
     // only for a zero-sized `F`: an aligned dangling pointer is then a valid
@@ -368,7 +380,11 @@ where
 /// nothing, a shared closure otherwise.
 fn shared_closure_storage<F>(call: F) -> NativeCallStorage
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+    F: for<'rt> Fn(
+            &mut NativeCtx<'rt>,
+            ValueWindow<'_>,
+            ValueWindow<'_>,
+        ) -> Result<Value, NativeError>
         + Send
         + Sync
         + 'static,
@@ -383,7 +399,12 @@ where
 /// [`shared_closure_storage`] for an isolate-local closure.
 fn local_closure_storage<F>(call: F) -> NativeCallStorage
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+    F: for<'rt> Fn(
+            &mut NativeCtx<'rt>,
+            ValueWindow<'_>,
+            ValueWindow<'_>,
+        ) -> Result<Value, NativeError>
+        + 'static,
 {
     if std::mem::size_of::<F>() == 0 {
         std::mem::forget(call);
@@ -681,7 +702,11 @@ impl NativeFunction {
         call: F,
     ) -> Result<Self, otter_gc::OutOfMemory>
     where
-        F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+        F: for<'rt> Fn(
+                &mut NativeCtx<'rt>,
+                ValueWindow<'_>,
+                ValueWindow<'_>,
+            ) -> Result<Value, NativeError>
             + Send
             + Sync
             + 'static,
@@ -876,7 +901,11 @@ impl NativeFunction {
         captures: SmallVec<[Value; 4]>,
     ) -> Result<Self, otter_gc::OutOfMemory>
     where
-        F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+        F: for<'rt> Fn(
+                &mut NativeCtx<'rt>,
+                ValueWindow<'_>,
+                ValueWindow<'_>,
+            ) -> Result<Value, NativeError>
             + Send
             + Sync
             + 'static,
@@ -920,7 +949,11 @@ impl NativeFunction {
         captures: SmallVec<[Value; 4]>,
     ) -> Result<Self, otter_gc::OutOfMemory>
     where
-        F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+        F: for<'rt> Fn(
+                &mut NativeCtx<'rt>,
+                ValueWindow<'_>,
+                ValueWindow<'_>,
+            ) -> Result<Value, NativeError>
             + Send
             + Sync
             + 'static,
@@ -1452,14 +1485,14 @@ impl NativeCallTarget {
     pub(crate) fn invoke(
         self,
         ctx: &mut NativeCtx<'_>,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, NativeError> {
         match self {
             Self::Static(call) => call(ctx, args),
             // SAFETY: see the doc above — the callee roots the slab
             // across the call.
             Self::StaticWithCaptures { call, captures } => call(ctx, args, unsafe {
-                crate::value_slab::live_slice(captures)
+                crate::value_slab::live_window(captures)
             }),
             Self::VmIntrinsic(intrinsic) => Err(NativeError::TypeError {
                 name: intrinsic.name(),
@@ -1468,10 +1501,10 @@ impl NativeCallTarget {
             // SAFETY: see the doc above — the callee roots the slab
             // across the call.
             Self::Dynamic { call, captures } => call(ctx, args, unsafe {
-                crate::value_slab::live_slice(captures)
+                crate::value_slab::live_window(captures)
             }),
             Self::LocalDynamic { call, captures } => call(ctx, args, unsafe {
-                crate::value_slab::live_slice(captures)
+                crate::value_slab::live_window(captures)
             }),
         }
     }
@@ -1498,7 +1531,11 @@ pub fn native_value<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+    F: for<'rt> Fn(
+            &mut NativeCtx<'rt>,
+            ValueWindow<'_>,
+            ValueWindow<'_>,
+        ) -> Result<Value, NativeError>
         + Send
         + Sync
         + 'static,
@@ -1529,7 +1566,11 @@ pub fn native_value_with_captures<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+    F: for<'rt> Fn(
+            &mut NativeCtx<'rt>,
+            ValueWindow<'_>,
+            ValueWindow<'_>,
+        ) -> Result<Value, NativeError>
         + Send
         + Sync
         + 'static,
@@ -1554,7 +1595,11 @@ pub(crate) fn native_value_with_captures_and_roots<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError>
+    F: for<'rt> Fn(
+            &mut NativeCtx<'rt>,
+            ValueWindow<'_>,
+            ValueWindow<'_>,
+        ) -> Result<Value, NativeError>
         + Send
         + Sync
         + 'static,
@@ -1578,7 +1623,12 @@ pub(crate) fn native_value_with_captures_unchecked_with_roots<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+    F: for<'rt> Fn(
+            &mut NativeCtx<'rt>,
+            ValueWindow<'_>,
+            ValueWindow<'_>,
+        ) -> Result<Value, NativeError>
+        + 'static,
 {
     Ok(Value::native_function(NativeFunction::allocate_with_roots(
         heap,
@@ -1600,7 +1650,12 @@ pub(crate) fn local_native_value_with_length<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+    F: for<'rt> Fn(
+            &mut NativeCtx<'rt>,
+            ValueWindow<'_>,
+            ValueWindow<'_>,
+        ) -> Result<Value, NativeError>
+        + 'static,
 {
     Ok(Value::native_function(NativeFunction::allocate_with_roots(
         heap,
@@ -2058,13 +2113,13 @@ mod tests {
 
     #[test]
     fn c_header_selects_every_native_payload_and_preserves_callable_policy() {
-        fn plain(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        fn plain(_: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
             Ok(args[0])
         }
         fn captured(
             _: &mut NativeCtx<'_>,
-            _: &[Value],
-            captures: &[Value],
+            _: ValueWindow<'_>,
+            captures: ValueWindow<'_>,
         ) -> Result<Value, NativeError> {
             Ok(captures[0])
         }
@@ -2150,7 +2205,9 @@ mod tests {
                     NativeCallInfo::call(Value::UNDEFINED),
                     None,
                     |ctx| {
-                        let result = call.invoke(ctx, &[Value::number_i32(7)]).unwrap();
+                        let result = call
+                            .invoke(ctx, ValueWindow::from(&[Value::number_i32(7)]))
+                            .unwrap();
                         assert_eq!(
                             result,
                             Value::number_i32(if kind == NativeEntryKind::Static {
@@ -2173,7 +2230,7 @@ mod tests {
 
     #[test]
     fn restricted_native_header_preserves_metadata_descriptor_rules() {
-        fn entry(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+        fn entry(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
             Ok(Value::UNDEFINED)
         }
         let mut interp = crate::Interpreter::new().expect("fixture interpreter bootstrap");
@@ -2283,7 +2340,9 @@ mod tests {
             NativeCallInfo::call(Value::undefined()),
             None,
             |ctx| {
-                let r = call.invoke(ctx, &[Value::number_i32(7)]).unwrap();
+                let r = call
+                    .invoke(ctx, ValueWindow::from(&[Value::number_i32(7)]))
+                    .unwrap();
                 assert_eq!(r.display_string(ctx.heap()), "7");
             },
         );
@@ -2313,7 +2372,7 @@ mod tests {
             NativeCallInfo::call(Value::undefined()),
             None,
             |ctx| {
-                let err = call.invoke(ctx, &[]).unwrap_err();
+                let err = call.invoke(ctx, ValueWindow::from(&[])).unwrap_err();
                 assert!(matches!(err, NativeError::TypeError { .. }));
             },
         );
@@ -2321,7 +2380,7 @@ mod tests {
 
     #[test]
     fn static_native_value_uses_fast_path_and_length() {
-        fn id(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        fn id(_: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
             Ok(args.first().cloned().unwrap_or(Value::undefined()))
         }
 

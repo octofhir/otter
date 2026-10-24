@@ -25,6 +25,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/>
 
+use crate::ValueWindow;
 use crate::intl::payload::IntlKind;
 use crate::js_surface::{Attr, JsSurfaceError, NamespaceBuilder, NamespaceSpec};
 use crate::object::{self, JsObject};
@@ -125,7 +126,7 @@ fn intl_construct(
     kind: IntlKind,
     requires_new: bool,
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let class = kind.class_name();
     if requires_new && !ctx.is_construct_call() {
@@ -324,31 +325,40 @@ fn receiver_inherits_class_prototype(
     false
 }
 
-fn collator_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn collator_ctor(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     intl_construct(IntlKind::Collator, false, ctx, args)
 }
-fn number_format_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn number_format_ctor(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     intl_construct(IntlKind::NumberFormat, false, ctx, args)
 }
-fn date_time_format_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn date_time_format_ctor(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     intl_construct(IntlKind::DateTimeFormat, false, ctx, args)
 }
-fn plural_rules_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn plural_rules_ctor(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     intl_construct(IntlKind::PluralRules, true, ctx, args)
 }
 fn relative_time_format_ctor(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     intl_construct(IntlKind::RelativeTimeFormat, true, ctx, args)
 }
-fn list_format_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn list_format_ctor(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     intl_construct(IntlKind::ListFormat, true, ctx, args)
 }
-fn display_names_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn display_names_ctor(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     intl_construct(IntlKind::DisplayNames, true, ctx, args)
 }
-fn segmenter_ctor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn segmenter_ctor(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     intl_construct(IntlKind::Segmenter, true, ctx, args)
 }
 

@@ -20,6 +20,7 @@
 //! # See also
 //! - <https://tc39.es/proposal-intl-duration-format/>
 
+use crate::ValueWindow;
 use std::str::FromStr;
 
 use crate::intl::payload::{DurationFormatPayload, IntlPayload, JsIntl, NumberFormatPayload};
@@ -185,7 +186,7 @@ fn prev_in_numeric_chain(prev: &Option<String>) -> bool {
 
 pub(crate) fn duration_format_ctor(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(type_err("constructor Intl.DurationFormat requires 'new'"));
@@ -675,7 +676,7 @@ fn partition(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<String> {
     result
 }
 
-pub(crate) fn format(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn format(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let payload = require_payload(ctx)?;
     let arg = args.first().copied().unwrap_or_else(Value::undefined);
     format_with_payload(ctx, &payload, arg)
@@ -879,7 +880,7 @@ fn partition_parts(payload: &DurationFormatPayload, d: &[f64; 10]) -> Vec<Vec<Du
 
 pub(crate) fn format_to_parts(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx)?;
     let arg = args.first().copied().unwrap_or_else(Value::undefined);
@@ -930,7 +931,7 @@ fn require_payload(ctx: &NativeCtx<'_>) -> Result<DurationFormatPayload, NativeE
 
 pub(crate) fn resolved_options(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let p = require_payload(ctx)?;
     ctx.scope(|mut scope| {

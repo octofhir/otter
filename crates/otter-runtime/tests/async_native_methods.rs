@@ -20,6 +20,7 @@
 //! # See also
 //! - `otter_vm::host_completion` and `otter_vm::marshal::PromiseCompleter`.
 
+use otter_runtime::ValueWindow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -174,7 +175,10 @@ impl IntoJs for StructuralConversionFailure {
 static ADMISSION_PROBE_POLLED: AtomicBool = AtomicBool::new(false);
 static HOSTLESS_FACTORY_CALLED: AtomicBool = AtomicBool::new(false);
 
-fn hostless_factory_probe(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn hostless_factory_probe(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     ctx.scope(|scope| {
         let mut cx = MarshalCx::new(scope);
         let promise = cx
@@ -187,7 +191,10 @@ fn hostless_factory_probe(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Va
     })
 }
 
-fn hostless_ready_probe(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn hostless_ready_probe(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     ctx.scope(|scope| {
         let mut cx = MarshalCx::new(scope);
         let promise = cx

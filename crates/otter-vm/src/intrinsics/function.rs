@@ -22,6 +22,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-function-objects>
 
+use crate::ValueWindow;
 use crate::function_prototype;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PropertyDescriptor};
@@ -40,7 +41,7 @@ otter_macros::couch! {
 /// `Function(...)` / `new Function(...)` — ECMA-262 §20.2.1.1.
 pub(crate) fn function_ctor_call(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     dynamic_function_ctor_call(ctx, args, crate::eval_ops::DynamicFunctionKind::Normal)
 }
@@ -48,7 +49,7 @@ pub(crate) fn function_ctor_call(
 /// `%GeneratorFunction%(...)` — ECMA-262 §27.3.1.1.
 pub(crate) fn generator_function_ctor_call(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     dynamic_function_ctor_call(ctx, args, crate::eval_ops::DynamicFunctionKind::Generator)
 }
@@ -56,7 +57,7 @@ pub(crate) fn generator_function_ctor_call(
 /// `%AsyncFunction%(...)` — ECMA-262 §27.7.1.1.
 pub(crate) fn async_function_ctor_call(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     dynamic_function_ctor_call(ctx, args, crate::eval_ops::DynamicFunctionKind::Async)
 }
@@ -64,7 +65,7 @@ pub(crate) fn async_function_ctor_call(
 /// `%AsyncGeneratorFunction%(...)` — ECMA-262 §27.4.1.1.
 pub(crate) fn async_generator_function_ctor_call(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     dynamic_function_ctor_call(
         ctx,
@@ -77,7 +78,7 @@ pub(crate) fn async_generator_function_ctor_call(
 /// dynamic-function constructors.
 fn dynamic_function_ctor_call(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     kind: crate::eval_ops::DynamicFunctionKind,
 ) -> Result<Value, NativeError> {
     let Some(context) = ctx.execution_context().cloned() else {
@@ -192,7 +193,7 @@ fn install_function_prototype_callable_and_accessors(
 /// `Function.prototype()` — returns `undefined` per §20.2.3.
 fn function_prototype_call(
     _ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     Ok(Value::undefined())
 }

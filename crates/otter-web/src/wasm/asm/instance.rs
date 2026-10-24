@@ -29,6 +29,7 @@
 //! - `super::translate` — the module this links.
 //! - `super::super::run_import` — the general WebAssembly import bridge.
 
+use otter_runtime::ValueWindow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -558,7 +559,7 @@ fn export_function<'s>(
         )
     };
     let instance = instance.clone();
-    let call = move |ctx: &mut NativeCtx<'_>, args: &[Value], captures: &[Value]| {
+    let call = move |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, captures: ValueWindow<'_>| {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let captures: Vec<JsValue<'_>> = captures.iter().map(|value| cx.park(*value)).collect();
@@ -649,7 +650,10 @@ fn from_wasmtime(error: wasmtime::Error) -> JsError {
 }
 
 /// The bare-function linker hook installed as the realm's `__otterAsmLink`.
-pub(crate) fn link_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn link_native(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let arg = |index: usize| args.get(index).copied().unwrap_or_else(Value::undefined);
     ctx.scope(|scope| {
         let mut cx = MarshalCx::new(scope);

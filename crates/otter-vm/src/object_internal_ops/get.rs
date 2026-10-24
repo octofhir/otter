@@ -24,6 +24,7 @@
 //! - `super::descriptors` owns prototypes and extensibility.
 
 use super::*;
+use crate::ValueWindow;
 use crate::activation_stack::ActivationStack;
 use crate::native_abi::CommittedValueError;
 use crate::{
@@ -1714,7 +1715,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         method: otter_bytecode::method_id::ObjectMethod,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Option<Value>, CommittedValueError> {
         use otter_bytecode::method_id::ObjectMethod as M;
         let Some(target) = args.first() else {

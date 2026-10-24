@@ -15,6 +15,7 @@
 //! - `otter-difftest/corpus/physical_body_proofs.js` covers receiver replacements.
 
 use super::*;
+use otter_runtime::ValueWindow;
 use std::sync::atomic::AtomicUsize;
 
 const SOURCE: &str = r#"
@@ -40,8 +41,8 @@ fn extension(phase: Arc<AtomicUsize>, calls: Arc<AtomicUsize>) -> RuntimeExtensi
             2,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     calls.fetch_add(1, Ordering::Relaxed);
                     let phase = phase.load(Ordering::Relaxed);
                     if phase != 0 {

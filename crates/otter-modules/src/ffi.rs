@@ -4,6 +4,7 @@
 //! type/signature parsing and permission-checked library loading metadata. It
 //! intentionally does not store VM callbacks or values in native state.
 
+use otter_runtime::ValueWindow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -205,7 +206,7 @@ otter_macros::lodge! {
 
 fn open_library(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = crate::arg_string(ctx, args, 0, "dlopen")?;

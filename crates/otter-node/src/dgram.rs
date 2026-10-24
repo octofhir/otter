@@ -20,6 +20,7 @@
 //! # See also
 //! - `nodelib/compat/internal_udp_wrap.js`
 
+use otter_vm::ValueWindow;
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -122,7 +123,7 @@ fn build_native<'scope>(
         "bind",
         3,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             bind_socket(
                 ctx,
                 args,
@@ -141,7 +142,7 @@ fn build_native<'scope>(
         "send",
         4,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             send_datagram(ctx, args, &send_caps, &send_sockets)
         },
     )?;
@@ -152,7 +153,7 @@ fn build_native<'scope>(
         "address",
         1,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             socket_address(ctx, args, &address_sockets)
         },
     )?;
@@ -163,7 +164,7 @@ fn build_native<'scope>(
         "close",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             close_sockets
                 .lock()
@@ -179,7 +180,7 @@ fn build_native<'scope>(
         "setOption",
         3,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             set_option(ctx, args, &option_sockets)
         },
     )?;
@@ -190,7 +191,7 @@ fn build_native<'scope>(
         "membership",
         4,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             change_membership(ctx, args, &membership_sockets)
         },
     )?;
@@ -203,7 +204,7 @@ fn build_native<'scope>(
         "hold",
         2,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             let referenced = args
                 .get(1)
@@ -231,7 +232,7 @@ fn build_native<'scope>(
         "resolve",
         3,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             resolve_peer(ctx, args, &resolve_caps)
         },
     )?;
@@ -244,7 +245,7 @@ fn build_native<'scope>(
         "dupFd",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             use std::os::fd::AsRawFd;
             let id = handle_arg(args, 0);
             let raw = dup_sockets
@@ -270,7 +271,7 @@ fn build_native<'scope>(
         "setReading",
         2,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             let wanted = args
                 .get(1)
@@ -300,7 +301,7 @@ fn build_native<'scope>(
         "adoptFd",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let raw = args
                 .first()
                 .and_then(|value| value.as_f64())
@@ -426,7 +427,7 @@ fn adopt_udp(
 /// makes `setTTL(1000)` fail with `EINVAL` the way Node's does.
 fn set_option(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     sockets: &SocketTable,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let id = handle_arg(args, 0);
@@ -555,7 +556,7 @@ fn buffer_size(
 /// Join or leave a multicast group.
 fn change_membership(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     sockets: &SocketTable,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let id = handle_arg(args, 0);
@@ -591,7 +592,7 @@ fn change_membership(
 /// needs the resolved address before it can report `remoteAddress()`.
 fn resolve_peer(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let port = args.first().and_then(|value| value.as_f64()).unwrap_or(0.0) as u16;
@@ -671,7 +672,7 @@ fn io_code(error: &std::io::Error) -> &'static str {
 /// Bind a socket and start delivering what arrives on it.
 fn bind_socket(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     sockets: &SocketTable,
     next_id: &Arc<AtomicU32>,
@@ -1003,7 +1004,7 @@ fn deliver(
 
 fn send_datagram(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     sockets: &SocketTable,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -1053,7 +1054,7 @@ fn send_datagram(
 
 fn socket_address(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     sockets: &SocketTable,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let id = handle_arg(args, 0);
@@ -1083,7 +1084,7 @@ fn socket_address(
     })
 }
 
-fn handle_arg(args: &[RuntimeValue], index: usize) -> u32 {
+fn handle_arg(args: ValueWindow<'_>, index: usize) -> u32 {
     args.get(index)
         .and_then(|value| value.as_f64())
         .unwrap_or(0.0) as u32
@@ -1091,7 +1092,7 @@ fn handle_arg(args: &[RuntimeValue], index: usize) -> u32 {
 
 fn string_arg(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     index: usize,
 ) -> Option<String> {
     args.get(index)

@@ -12,9 +12,9 @@
 
 use super::*;
 use crate::WebApiBuilderExt;
+use otter_runtime::ValueWindow;
 use otter_runtime::{
-    Runtime, RuntimeExtensionInstaller, RuntimeNativeCall, RuntimeNativeCtx, RuntimeValue,
-    SourceInput,
+    Runtime, RuntimeExtensionInstaller, RuntimeNativeCall, RuntimeNativeCtx, SourceInput,
 };
 
 struct Observation {
@@ -32,8 +32,8 @@ fn runtime(observations: Arc<Mutex<Vec<Observation>>>) -> Runtime {
                 0,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     move |ctx: &mut RuntimeNativeCtx<'_>,
-                          _args: &[RuntimeValue],
-                          _captures: &[RuntimeValue]| {
+                          _args: ValueWindow<'_>,
+                          _captures: ValueWindow<'_>| {
                         ctx.scope(|scope| {
                             let mut cx = MarshalCx::new(scope);
                             let global = cx.global_this();

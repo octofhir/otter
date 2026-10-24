@@ -50,6 +50,7 @@
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 //! - [Runtime architecture](../../../docs/book/src/engine/architecture.md)
 
+use otter_vm::ValueWindow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -377,7 +378,10 @@ struct MainWorkerHost {
     parent_spawner: Option<RuntimeTaskSpawner>,
 }
 
-fn worker_constructor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn worker_constructor(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let MainWorkerHost {
         host,
         parent_spawner,

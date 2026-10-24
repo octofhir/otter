@@ -30,6 +30,7 @@
 //! - [`crate::native_abi::call_trampoline`] for classification and linkage.
 //! - [`super::call_dispatch`] for the interpreter entry on the same stack.
 
+use crate::ValueWindow;
 use crate::native_abi::CommittedValueError;
 use crate::{
     ActivationStack, ExecutionContext, Interpreter, Value, VmError,
@@ -104,14 +105,15 @@ impl HostTurn<'_> {
 
     /// The frame's actuals in place. The published frame traces them, so a
     /// collection rewrites them where this slice reads them.
-    fn frame_actuals<'s>(&self) -> &'s [Value] {
+    fn frame_actuals<'s>(&self) -> ValueWindow<'s> {
         let count = self.frame().argument_count as usize;
         if count == 0 {
-            return &[];
+            return ValueWindow::EMPTY;
         }
         // SAFETY: the trampoline initialized `argument_count` actual slots,
-        // which stay in this frame's window while the host body runs.
-        unsafe { std::slice::from_raw_parts(self.actuals_ptr(), count) }
+        // which stay in this frame's window while the host body runs; the
+        // frame traces them in place.
+        unsafe { ValueWindow::from_raw_parts(self.actuals_ptr(), count) }
     }
 
     fn actuals(&self) -> SmallVec<[Value; 8]> {
@@ -592,7 +594,7 @@ fn native_construct_with(
             &Value::UNDEFINED,
             &new_target,
             false,
-            args.as_slice(),
+            ValueWindow::from(args.as_slice()),
         )
         .map_err(CommittedValueError::Fatal);
     }
@@ -649,7 +651,7 @@ fn native_construct_with(
         &this_value,
         &new_target,
         used_object_prototype_fallback,
-        args.as_slice(),
+        ValueWindow::from(args.as_slice()),
     )
     .map_err(CommittedValueError::Fatal)
 }
@@ -663,7 +665,7 @@ fn invoke_native_construct(
     this_value: &Value,
     new_target: &Value,
     used_object_prototype_fallback: bool,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<HostStep, VmError> {
     turn.vm.record_runtime_native_call()?;
     let realm_global = turn.vm.native_target_realm_global(&native);

@@ -25,6 +25,7 @@
 //! # See also
 //! - <https://w3c.github.io/webcrypto/>
 
+use otter_runtime::ValueWindow;
 use std::fmt::Write as _;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -285,7 +286,10 @@ impl WebCrypto {
     /// member is consumed and deleted by the glue. `raw` because it
     /// mutates the argument's backing store in place.
     #[method(name = "__nativeRandomFill", length = 1, raw)]
-    fn native_random_fill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn native_random_fill(
+        ctx: &mut NativeCtx<'_>,
+        args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         let value = args.first().copied().unwrap_or_else(Value::undefined);
         let Some(view) = value.as_typed_array(ctx.heap()) else {
             return Err(runtime_type_error(

@@ -5,6 +5,7 @@
 //! cross the native/JS boundary as latin1 strings (the same bridge `fs` uses).
 //! The CommonJS namespace is assembled inside one rooted native scope.
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
     RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
@@ -54,7 +55,7 @@ fn normalize_algo(algo: &str) -> String {
 }
 
 /// `randomBytes(size)` — cryptographically secure random bytes as latin1.
-fn random_bytes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn random_bytes(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let size = args
         .first()
         .and_then(|v| v.as_f64())
@@ -73,7 +74,7 @@ fn random_bytes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 }
 
 /// `hashDigest(algorithm, dataLatin1)` — one-shot digest as latin1.
-fn hash_digest(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn hash_digest(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let algo = normalize_algo(&runtime_arg_to_string(args, 0, ctx.heap()));
     let data = latin1_to_bytes(&runtime_arg_to_string(args, 1, ctx.heap()));
     let digest = match algo.as_str() {
@@ -96,7 +97,7 @@ fn hash_digest(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 
 /// `hmacDigest(algorithm, keyLatin1, dataLatin1)` — HMAC as latin1. Implemented
 /// directly (RFC 2104) over the SHA-2 family so no extra crate is needed.
-fn hmac_digest(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn hmac_digest(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let algo = normalize_algo(&runtime_arg_to_string(args, 0, ctx.heap()));
     let key = latin1_to_bytes(&runtime_arg_to_string(args, 1, ctx.heap()));
     let data = latin1_to_bytes(&runtime_arg_to_string(args, 2, ctx.heap()));
@@ -146,7 +147,7 @@ type Mac<'a> = &'a dyn Fn(&[u8], &[u8], usize) -> Vec<u8>;
 /// `pbkdf2(password, salt, iterations, keylen, digest)` — RFC 2898 PBKDF2 over
 /// the same HMAC this module already builds, so every digest it supports is
 /// available here too.
-fn pbkdf2_digest(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn pbkdf2_digest(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let algo = normalize_algo(&runtime_arg_to_string(args, 0, ctx.heap()));
     let password = latin1_to_bytes(&runtime_arg_to_string(args, 1, ctx.heap()));
     let salt = latin1_to_bytes(&runtime_arg_to_string(args, 2, ctx.heap()));
@@ -160,7 +161,7 @@ fn pbkdf2_digest(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 /// `hkdf(digest, ikm, salt, info, keylen)` — RFC 5869 extract-then-expand.
-fn hkdf_derive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn hkdf_derive(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let algo = normalize_algo(&runtime_arg_to_string(args, 0, ctx.heap()));
     let ikm = latin1_to_bytes(&runtime_arg_to_string(args, 1, ctx.heap()));
     let salt = latin1_to_bytes(&runtime_arg_to_string(args, 2, ctx.heap()));
@@ -210,7 +211,7 @@ fn with_digest<R>(algo: &str, body: impl FnOnce(usize, Mac<'_>) -> R) -> Result<
     }
 }
 
-fn number_arg(args: &[Value], index: usize) -> f64 {
+fn number_arg(args: ValueWindow<'_>, index: usize) -> f64 {
     args.get(index)
         .and_then(|value| value.as_f64())
         .unwrap_or(0.0)

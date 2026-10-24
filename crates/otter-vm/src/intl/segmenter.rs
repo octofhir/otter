@@ -16,6 +16,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#segmenter-objects>
 
+use crate::ValueWindow;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::intl::helpers::{DEFAULT_LOCALE, get_string_option, require_options_object};
@@ -195,7 +196,7 @@ fn push_utf8_segment(
 /// iterable through the existing iterator-protocol path.
 pub(crate) fn segmenter_segment(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "segment")?;
     let exec = ctx
@@ -251,7 +252,7 @@ pub(crate) fn segmenter_segment(
 
 fn segments_symbol_iterator(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
     let (interp, context) = ctx.interp_mut_and_context();
@@ -266,7 +267,10 @@ fn segments_symbol_iterator(
         .map_err(|err| crate::native_function::vm_to_native_error(interp, err, "[Symbol.iterator]"))
 }
 
-fn segments_containing(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn segments_containing(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     if ctx.this_value().as_array().is_none() {
         return Err(NativeError::TypeError {
             name: "containing",
@@ -356,7 +360,7 @@ fn segment_record_input_len(record: Value, ctx: &NativeCtx<'_>) -> usize {
 /// §18.3.4 `Intl.Segmenter.prototype.resolvedOptions()`.
 pub(crate) fn segmenter_resolved_options(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "resolvedOptions")?;
     ctx.scope(|mut scope| {

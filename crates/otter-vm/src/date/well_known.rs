@@ -26,6 +26,7 @@
 //! - <https://tc39.es/ecma262/#sec-date.prototype-@@toprimitive>
 //! - <https://tc39.es/ecma262/#sec-ordinarytoprimitive>
 
+use crate::ValueWindow;
 use crate::abstract_ops::ToPrimitiveHint;
 use crate::bootstrap::native_static_with_value_roots;
 use crate::js_surface::JsSurfaceError;
@@ -116,7 +117,10 @@ pub fn install_date_well_knowns_post_bootstrap(
 /// 4. Else if `hint` is `"number"`, let `tryFirst` be `"number"`.
 /// 5. Else throw **TypeError**.
 /// 6. Return `? OrdinaryToPrimitive(O, tryFirst)`.
-fn date_proto_to_primitive(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn date_proto_to_primitive(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     const NAME: &str = "Date.prototype[Symbol.toPrimitive]";
     let receiver = *ctx.this_value();
     if !receiver.is_object() {

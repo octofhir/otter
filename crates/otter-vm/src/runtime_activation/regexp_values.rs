@@ -24,6 +24,7 @@
 //! - [`crate::bootstrap_regexp`] owns the method bodies.
 //! - [`crate::call_ops::invoke_frame_native_call`] roots the call.
 
+use crate::ValueWindow;
 use crate::{CommittedValueError, Value};
 
 use super::RuntimeCall;
@@ -163,7 +164,7 @@ impl RuntimeCall<'_> {
             crate::runtime_cx::NativeContext::Exact(Some(context)),
             crate::native_function::NativeCallTarget::Static(body),
             receiver,
-            &[argument],
+            ValueWindow::from(&[argument]),
         );
         result.map_err(|error| {
             crate::error_ops::native_error_to_committed_with_stack(vm, stack, Some(context), error)

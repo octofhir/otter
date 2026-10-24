@@ -1,5 +1,6 @@
 //! Bound/native function and RegExp GC invariants.
 
+use crate::ValueWindow;
 use smallvec::smallvec;
 
 use crate::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG;
@@ -38,8 +39,13 @@ fn bound_function_roots_target_this_and_args_when_rooted() {
         Value::object(crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("this"));
     arg = Value::object(crate::test_support::alloc_old_object(interp.gc_heap_mut()).expect("arg"));
     bound = Value::bound_function(
-        crate::test_support::alloc_bound_function(&mut interp, target, bound_this, &[arg])
-            .expect("bound function"),
+        crate::test_support::alloc_bound_function(
+            &mut interp,
+            target,
+            bound_this,
+            ValueWindow::from(&[arg]),
+        )
+        .expect("bound function"),
     );
 
     assert!(
@@ -169,7 +175,7 @@ fn bound_native_and_regexp_unrooted_graphs_are_reclaimed() {
         &mut interp,
         Value::object(bound_object),
         Value::object(bound_object),
-        &[Value::object(bound_object)],
+        ValueWindow::from(&[Value::object(bound_object)]),
     )
     .expect("bound");
     assert!(

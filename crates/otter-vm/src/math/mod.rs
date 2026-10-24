@@ -24,6 +24,7 @@
 //! - <https://tc39.es/ecma262/#sec-math-object>
 //! - [`crate::jit_static_native`] for guarded static-native leaf declarations.
 
+use crate::ValueWindow;
 use crate::number::{NumberValue, bitwise};
 use crate::{NativeCtx, NativeError, Value};
 
@@ -131,7 +132,7 @@ pub enum MathError {
 /// Dispatch the resolved Math native entry by its typed method id.
 pub fn call(
     method: otter_bytecode::method_id::MathMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     heap: &otter_gc::GcHeap,
 ) -> Result<Value, MathError> {
     let args = coercion::arguments_for(method, args);
@@ -206,7 +207,7 @@ fn numbers(method: otter_bytecode::method_id::MathMethod, nums: &[NumberValue]) 
 fn native_call(
     ctx: &mut NativeCtx<'_>,
     method: otter_bytecode::method_id::MathMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let args = coercion::arguments_for(method, args);
     let numbers = coerce_math_args(ctx, method.name(), args)?;
@@ -217,7 +218,7 @@ macro_rules! native_math {
     ($fn_name:ident, $variant:ident) => {
         pub(crate) fn $fn_name(
             ctx: &mut NativeCtx<'_>,
-            args: &[Value],
+            args: ValueWindow<'_>,
         ) -> Result<Value, NativeError> {
             native_call(ctx, otter_bytecode::method_id::MathMethod::$variant, args)
         }
@@ -605,7 +606,10 @@ enum SumState {
 /// scaled by `2^1074`. The final magnitude is rounded once,
 /// round-half-to-even, back to an `f64`. Non-finite values and signed
 /// zero are tracked by the state machine, never by the accumulator.
-fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_sum_precise(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let items = args.first().copied().unwrap_or_else(Value::undefined);
     let exec = ctx
         .execution_context()
@@ -696,8 +700,12 @@ fn native_sum_precise(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 
 /// §21.3.2.16 `Math.f16round(x)` — round `x` to the nearest IEEE-754
 /// half (binary16) and return it back as a `Number`.
-fn native_f16round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
-    let nums = coerce_math_args(ctx, "Math.f16round", &args[..args.len().min(1)])?;
+fn native_f16round(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
+    let nums = coerce_math_args(
+        ctx,
+        "Math.f16round",
+        ValueWindow::from(&args[..args.len().min(1)]),
+    )?;
     let x = first_or_nan(&nums).as_f64();
     let bits = crate::binary::typed_array::f64_to_f16_bits(x);
     let rounded = crate::binary::typed_array::f16_bits_to_f64(bits);
@@ -788,13 +796,23 @@ mod tests {
     fn min_and_max_handle_nan() {
         use otter_bytecode::method_id::MathMethod;
         let heap = otter_gc::GcHeap::new().expect("heap");
-        let r = call(MathMethod::Min, &[n(1), n(2), n(3)], &heap).unwrap();
+        let r = call(
+            MathMethod::Min,
+            ValueWindow::from(&[n(1), n(2), n(3)]),
+            &heap,
+        )
+        .unwrap();
         assert_eq!(r.as_number().unwrap().as_smi(), Some(1));
-        let r = call(MathMethod::Max, &[n(1), n(2), n(3)], &heap).unwrap();
+        let r = call(
+            MathMethod::Max,
+            ValueWindow::from(&[n(1), n(2), n(3)]),
+            &heap,
+        )
+        .unwrap();
         assert_eq!(r.as_number().unwrap().as_smi(), Some(3));
         let nan_r = call(
             MathMethod::Max,
-            &[n(1), Value::number(NumberValue::Double(f64::NAN))],
+            ValueWindow::from(&[n(1), Value::number(NumberValue::Double(f64::NAN))]),
             &heap,
         )
         .unwrap();
@@ -805,7 +823,7 @@ mod tests {
     fn pow_routes_to_bitwise_pow() {
         use otter_bytecode::method_id::MathMethod;
         let heap = otter_gc::GcHeap::new().expect("heap");
-        let r = call(MathMethod::Pow, &[n(2), n(10)], &heap).unwrap();
+        let r = call(MathMethod::Pow, ValueWindow::from(&[n(2), n(10)]), &heap).unwrap();
         assert_eq!(r.as_number().unwrap().as_smi(), Some(1024));
     }
 }

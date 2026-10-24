@@ -16,6 +16,7 @@
 //! - support/return_sites joins source roots to actual machine call returns.
 
 use super::*;
+use otter_runtime::ValueWindow;
 use otter_vm::PersistentRootId;
 
 // This fixture consumes the complete table validator; Known-call helpers
@@ -82,7 +83,7 @@ fn installer(exchange: Arc<Exchange>) -> RuntimeExtensionInstaller {
             "realmSave",
             1,
             RuntimeNativeCall::Dynamic(Arc::new(
-                move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _: &[RuntimeValue]| {
+                move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _: ValueWindow<'_>| {
                     ctx.scope(|mut scope| {
                         let callable = scope.argument(args, 0);
                         let mut retained = saved
@@ -103,7 +104,7 @@ fn installer(exchange: Arc<Exchange>) -> RuntimeExtensionInstaller {
             "realmLoad",
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
-                move |ctx: &mut RuntimeNativeCtx<'_>, _: &[RuntimeValue], _: &[RuntimeValue]| {
+                move |ctx: &mut RuntimeNativeCtx<'_>, _: ValueWindow<'_>, _: ValueWindow<'_>| {
                     let id = loaded
                         .retained
                         .lock()
@@ -124,7 +125,7 @@ fn installer(exchange: Arc<Exchange>) -> RuntimeExtensionInstaller {
             "realmObserve",
             1,
             RuntimeNativeCall::Dynamic(Arc::new(
-                move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _: &[RuntimeValue]| {
+                move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _: ValueWindow<'_>| {
                     if observed.recording.load(Ordering::Relaxed) {
                         let before = ctx
                             .execution_context()

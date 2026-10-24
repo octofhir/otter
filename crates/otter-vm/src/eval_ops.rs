@@ -40,6 +40,7 @@
 //! - [`crate::code_space`]
 //! - [`crate::ExecutionContext`]
 
+use crate::ValueWindow;
 use crate::activation_stack::ActivationStack;
 use crate::runtime_activation::CommittedValueError;
 use otter_bytecode::{BytecodeModule, Operand};
@@ -378,7 +379,7 @@ impl Interpreter {
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        args: &[Value],
+        args: ValueWindow<'_>,
         kind: DynamicFunctionKind,
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {

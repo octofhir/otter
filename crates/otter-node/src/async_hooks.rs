@@ -17,6 +17,7 @@
 use otter_runtime::{
     RuntimeLocal, RuntimeNativeCtx, RuntimeNativeError, RuntimeNativeScope, RuntimeValue,
 };
+use otter_vm::ValueWindow;
 
 /// Build the CommonJS export of `node:async_hooks`.
 ///
@@ -68,14 +69,14 @@ fn build_native<'scope>(
 
 fn get_context(
     ctx: &mut RuntimeNativeCtx<'_>,
-    _args: &[RuntimeValue],
+    _args: ValueWindow<'_>,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     Ok(ctx.async_context())
 }
 
 fn set_context(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let value = args
         .first()

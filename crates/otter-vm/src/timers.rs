@@ -43,6 +43,7 @@
 //! - [HTML setTimeout](https://html.spec.whatwg.org/multipage/timers-and-user-prompts.html#dom-settimeout)
 //! - [Microtask queue](crate::microtask)
 
+use crate::ValueWindow;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -390,7 +391,7 @@ pub(crate) fn schedule_timer_entry(
     callback: Value,
     delay_ms: u64,
     repeat_ms: Option<u64>,
-    extra_args: &[Value],
+    extra_args: ValueWindow<'_>,
     kind: TimerKind,
     native_name: &'static str,
 ) -> Result<u64, NativeError> {
@@ -449,7 +450,7 @@ pub(crate) fn schedule_interval_rooted(
         callback,
         delay_ms,
         Some(delay_ms),
-        &[],
+        ValueWindow::EMPTY,
         TimerKind::Timeout,
         "NativeScope::schedule_interval",
     )
@@ -457,7 +458,7 @@ pub(crate) fn schedule_interval_rooted(
 
 fn schedule_timer_common(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     repeat: bool,
     native_name: &'static str,
 ) -> Result<Value, NativeError> {
@@ -468,7 +469,7 @@ fn schedule_timer_common(
         callback,
         delay_ms,
         repeat.then_some(delay_ms),
-        args.get(2..).unwrap_or(&[]),
+        ValueWindow::from(args.get(2..).unwrap_or(&[])),
         TimerKind::Timeout,
         native_name,
     )?;
@@ -477,7 +478,7 @@ fn schedule_timer_common(
 
 fn cancel_timer_common(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     _native_name: &'static str,
 ) -> Result<Value, NativeError> {
     let token = match args.first().and_then(|v| v.as_number()) {
@@ -496,47 +497,68 @@ fn cancel_timer_common(
     Ok(Value::undefined())
 }
 
-fn set_timeout_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_timeout_native(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     schedule_timer_common(ctx, args, false, "setTimeout")
 }
 
-fn set_interval_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_interval_native(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     schedule_timer_common(ctx, args, true, "setInterval")
 }
 
-fn clear_timeout_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn clear_timeout_native(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     cancel_timer_common(ctx, args, "clearTimeout")
 }
 
-fn clear_interval_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn clear_interval_native(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     cancel_timer_common(ctx, args, "clearInterval")
 }
 
 /// `setImmediate(callback, ...args)` — schedule a zero-delay one-shot timer.
 /// Unlike `setTimeout`, the first argument after the callback is already an
 /// extra callback argument (there is no delay parameter).
-fn set_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_immediate_native(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let callback = args.first().cloned().unwrap_or(Value::undefined());
     let token = schedule_timer_entry(
         ctx,
         callback,
         0,
         None,
-        args.get(1..).unwrap_or(&[]),
+        ValueWindow::from(args.get(1..).unwrap_or(&[])),
         TimerKind::Immediate,
         "setImmediate",
     )?;
     Ok(Value::number_f64(token as f64))
 }
 
-fn clear_immediate_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn clear_immediate_native(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     cancel_timer_common(ctx, args, "clearImmediate")
 }
 
 /// `__otterTimerSetRef(token, refed)` — move a pending timer between the
 /// ref/unref liveness classes on the host scheduler. Node's `Timeout`
 /// wrapper drives this from `ref()`/`unref()`.
-fn timer_set_ref_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn timer_set_ref_native(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let token = match args.first().and_then(|v| v.as_number()) {
         Some(n) => {
             let raw = n.as_f64();

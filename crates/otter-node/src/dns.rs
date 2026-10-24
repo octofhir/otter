@@ -17,6 +17,7 @@
 //! # See also
 //! - `dns.js`
 
+use otter_vm::ValueWindow;
 use std::net::ToSocketAddrs;
 
 use otter_runtime::{
@@ -64,7 +65,7 @@ fn build_native<'scope>(
         "lookupHost",
         2,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _captures: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
             lookup_host(ctx, args, &lookup_caps)
         },
     )?;
@@ -75,7 +76,7 @@ fn build_native<'scope>(
         "lookupService",
         2,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _captures: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
             lookup_service(ctx, args, &service_caps)
         },
     )?;
@@ -94,7 +95,7 @@ fn build_native<'scope>(
 /// the host resolver returns them.
 fn lookup_host(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let hostname = string_arg(ctx, args, 0)?;
@@ -158,7 +159,7 @@ fn lookup_host(
 /// PTR record answers anyway.
 fn lookup_service(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let address = string_arg(ctx, args, 0)?;
@@ -200,7 +201,7 @@ fn lookup_service(
 
 fn string_arg(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     index: usize,
 ) -> Result<String, RuntimeNativeError> {
     args.get(index)

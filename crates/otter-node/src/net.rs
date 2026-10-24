@@ -23,6 +23,7 @@
 //! # See also
 //! - `nodelib/compat/internal_otter_stream_handle.js`
 
+use otter_vm::ValueWindow;
 use std::collections::HashMap;
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -348,7 +349,7 @@ fn build_native<'scope>(
         "listen",
         3,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             listen(
                 ctx,
                 args,
@@ -369,7 +370,7 @@ fn build_native<'scope>(
         "connect",
         3,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             connect(
                 ctx,
                 args,
@@ -390,7 +391,7 @@ fn build_native<'scope>(
         "listenPath",
         1,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             listen_unix(
                 ctx,
                 args,
@@ -411,7 +412,7 @@ fn build_native<'scope>(
         "connectPath",
         2,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             connect_unix(
                 ctx,
                 args,
@@ -429,7 +430,7 @@ fn build_native<'scope>(
         "write",
         2,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             let token = args.get(2).and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
             // A typed-array payload crosses as raw bytes; only string
@@ -456,7 +457,7 @@ fn build_native<'scope>(
         "tryWrite",
         2,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             let written = if let Some(view) = args.get(1).and_then(|v| v.as_typed_array(ctx.heap()))
             {
@@ -482,7 +483,7 @@ fn build_native<'scope>(
         "close",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             close_entry(&close_table, handle_arg(args, 0));
             Ok(RuntimeValue::undefined())
         },
@@ -496,7 +497,7 @@ fn build_native<'scope>(
         "end",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             let token = args.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
             let mut table = end_table
@@ -523,7 +524,7 @@ fn build_native<'scope>(
         "address",
         2,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             let want_remote = string_arg(ctx, args, 1).as_deref() == Some("remote");
             let found = {
@@ -556,7 +557,7 @@ fn build_native<'scope>(
         "setReading",
         2,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             let flowing = args
                 .get(1)
@@ -582,7 +583,7 @@ fn build_native<'scope>(
         "setOption",
         3,
         &[],
-        move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             set_option(ctx, args, &option_table)
         },
     )?;
@@ -595,7 +596,7 @@ fn build_native<'scope>(
         "hold",
         2,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             let referenced = args
                 .get(1)
@@ -623,7 +624,7 @@ fn build_native<'scope>(
         "reset",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             {
                 let table = reset_table
@@ -658,7 +659,7 @@ fn build_native<'scope>(
         "dupFd",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let id = handle_arg(args, 0);
             let raw = {
                 let table = dup_table
@@ -698,7 +699,7 @@ fn build_native<'scope>(
         "closeFd",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let raw = args
                 .first()
                 .and_then(|value| value.as_f64())
@@ -718,7 +719,7 @@ fn build_native<'scope>(
         "adoptFd",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let raw = args
                 .first()
                 .and_then(|value| value.as_f64())
@@ -779,7 +780,7 @@ fn build_native<'scope>(
         "adoptListenerFd",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let raw = args
                 .first()
                 .and_then(|value| value.as_f64())
@@ -831,7 +832,7 @@ fn build_native<'scope>(
         "openFd",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let raw = args
                 .first()
                 .and_then(|value| value.as_f64())
@@ -876,7 +877,7 @@ fn build_native<'scope>(
         "guessHandleType",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let raw = args
                 .first()
                 .and_then(|value| value.as_f64())
@@ -893,7 +894,7 @@ fn build_native<'scope>(
         "socketKind",
         1,
         &[],
-        move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+        move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             use std::os::fd::{AsRawFd, BorrowedFd};
             let raw = args
                 .first()
@@ -927,7 +928,7 @@ fn build_native<'scope>(
 /// so a value it refuses is refused here too.
 fn set_option(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let id = handle_arg(args, 0);
@@ -962,7 +963,7 @@ fn set_option(
 /// Start listening, and deliver each connection as it arrives.
 fn listen(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     table: &Table,
     next_id: &Arc<AtomicU32>,
@@ -1295,7 +1296,7 @@ fn adopt(
 /// Mirrors [`listen`], with the socket path standing in for host+port.
 fn listen_unix(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     table: &Table,
     next_id: &Arc<AtomicU32>,
@@ -1401,7 +1402,7 @@ fn listen_unix(
 /// Connect to a Unix domain socket. Mirrors [`connect`].
 fn connect_unix(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     table: &Table,
     next_id: &Arc<AtomicU32>,
@@ -1478,7 +1479,7 @@ fn connect_unix(
 /// Open a connection, and report whether it was made.
 fn connect(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     table: &Table,
     next_id: &Arc<AtomicU32>,
@@ -2057,7 +2058,7 @@ fn resolve(host: &str, port: u16) -> Option<std::net::SocketAddr> {
     (host, port).to_socket_addrs().ok()?.next()
 }
 
-fn handle_arg(args: &[RuntimeValue], index: usize) -> u32 {
+fn handle_arg(args: ValueWindow<'_>, index: usize) -> u32 {
     args.get(index)
         .and_then(|value| value.as_f64())
         .unwrap_or(0.0) as u32
@@ -2065,7 +2066,7 @@ fn handle_arg(args: &[RuntimeValue], index: usize) -> u32 {
 
 fn string_arg(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     index: usize,
 ) -> Option<String> {
     args.get(index)

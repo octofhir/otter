@@ -16,6 +16,7 @@
 //! - `crate::object_internal_ops::prototype_set` owns value-level semantics.
 //! - `crate::array::set_prototype_override` reserves the indexed sidecar.
 
+use crate::ValueWindow;
 use crate::{Interpreter, NativeCallInfo, NativeCtx, NativeError, Value, array};
 use otter_gc::SafeTraceable;
 
@@ -99,7 +100,8 @@ fn set_prototype_returns_current_array_after_collecting_sidecar_birth() {
                     assert!(cap - pressure.tracked_bytes < sidecar_bytes);
                     let before = heap.gc_stats().clone();
                     let args = [scope.raw(receiver), scope.raw(prototype)];
-                    let result = super::native_set_prototype_of(scope.context(), &args)?;
+                    let result =
+                        super::native_set_prototype_of(scope.context(), ValueWindow::from(&args))?;
                     let result = scope.value(result);
                     let after = scope.context().heap_mut().gc_stats().clone();
                     assert!(after.minor_gc_cycles > before.minor_gc_cycles);

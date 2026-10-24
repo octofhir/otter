@@ -9,6 +9,7 @@
 //! - <https://tc39.es/ecma262/#sec-string.fromcharcode>
 //! - <https://tc39.es/ecma262/#sec-string.fromcodepoint>
 
+use crate::ValueWindow;
 use crate::string::JsString;
 use crate::{Value, VmError};
 
@@ -20,7 +21,7 @@ use crate::{Value, VmError};
 /// - [`VmError::TypeMismatch`] for malformed inputs.
 pub fn call(
     method: otter_bytecode::method_id::StringMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::StringMethod as M;

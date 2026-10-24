@@ -18,6 +18,7 @@
 //! - <https://tc39.es/ecma262/#sec-date.parse>
 //! - <https://tc39.es/ecma262/#sec-date.utc>
 
+use crate::ValueWindow;
 use otter_gc::GcHeap;
 use otter_gc::heap::RootSlotVisitor;
 
@@ -44,7 +45,7 @@ use crate::{Value, VmError};
 pub fn call(
     zone: &mut crate::date::LocalTimeZone,
     method: otter_bytecode::method_id::DateMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     heap: &mut GcHeap,
     prototype: Option<JsObject>,
     external_visit: &mut RootSlotVisitor<'_>,
@@ -92,7 +93,7 @@ pub fn call(
 pub fn call_static(
     zone: &mut crate::date::LocalTimeZone,
     method: otter_bytecode::method_id::DateMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     heap: &otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::DateMethod as M;
@@ -139,7 +140,7 @@ pub fn call_static(
 /// - <https://tc39.es/ecma262/#sec-date>
 pub fn construct_time_value(
     zone: &mut crate::date::LocalTimeZone,
-    args: &[Value],
+    args: ValueWindow<'_>,
     heap: &GcHeap,
 ) -> f64 {
     match args.len() {
@@ -193,7 +194,7 @@ fn year_with_two_digit_rule(year: f64) -> f64 {
     }
 }
 
-fn number_arg(args: &[Value], idx: usize) -> f64 {
+fn number_arg(args: ValueWindow<'_>, idx: usize) -> f64 {
     let v = args.get(idx);
     if let Some(n) = v.and_then(|v| v.as_number()) {
         n.as_f64()
@@ -206,7 +207,7 @@ fn number_arg(args: &[Value], idx: usize) -> f64 {
     }
 }
 
-fn number_or(args: &[Value], idx: usize, default: f64) -> f64 {
+fn number_or(args: ValueWindow<'_>, idx: usize, default: f64) -> f64 {
     if idx >= args.len() {
         return default;
     }

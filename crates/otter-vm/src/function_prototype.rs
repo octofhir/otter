@@ -21,6 +21,7 @@
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-function-prototype-object>
 //! - [JS surface builders](../../../docs/book/src/extensions/js-surface-builders.md)
 
+use crate::ValueWindow;
 use crate::js_surface::{Attr, JsSurfaceError, MethodSpec};
 use crate::native_function::NativeFunction;
 use crate::object::{self, JsObject, PropertyDescriptor};
@@ -135,7 +136,7 @@ pub(crate) fn install_restricted_accessors(
 
 fn throw_restricted_function_property(
     ctx: &mut NativeCtx<'_>,
-    _: &[Value],
+    _: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // ES legacy `caller` is normative-optional. Otter does not expose
     // a stack-sensitive caller object yet; return `undefined` for

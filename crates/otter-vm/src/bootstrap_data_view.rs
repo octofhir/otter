@@ -18,6 +18,7 @@
 //! - <https://tc39.es/ecma262/#sec-dataview-constructor>
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-dataview-prototype-object>
 
+use crate::ValueWindow;
 use crate::binary::data_view_prototype;
 use crate::{NativeCtx, NativeError, Value};
 
@@ -97,7 +98,10 @@ fn ctor_to_index(ctx: &mut NativeCtx<'_>, value: Option<&Value>) -> Result<usize
     Ok(integer as usize)
 }
 
-fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn data_view_ctor_call(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(NativeError::TypeError {
             name: "DataView",
@@ -246,12 +250,15 @@ fn data_view_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 // Accessors
 // ---------------------------------------------------------------
 
-fn dv_get_buffer(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn dv_get_buffer(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.buffer")?;
     Ok(Value::array_buffer(view.buffer(ctx.heap())))
 }
 
-fn dv_get_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn dv_get_byte_length(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.byteLength")?;
     // §25.3.4.1 — a detached or out-of-bounds view (fixed view past a
     // shrunk resizable buffer) has no byte length; the getter throws a
@@ -267,7 +274,10 @@ fn dv_get_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value,
     )))
 }
 
-fn dv_get_byte_offset(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn dv_get_byte_offset(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let view = receiver_dv(ctx, "get DataView.prototype.byteOffset")?;
     // §25.3.4.2 — likewise a detached or out-of-bounds view's
     // byteOffset getter throws.

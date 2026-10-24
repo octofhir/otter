@@ -23,6 +23,7 @@
 //! - `jit_artifacts` joins symbolic binding cells to exact code offsets.
 //! - `support/moving_children` owns panic-free child motion observations.
 
+use otter_runtime::ValueWindow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc, Mutex,
@@ -544,8 +545,8 @@ fn integrity_installer(observer: Arc<BindingObserver>) -> RuntimeExtensionInstal
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      _args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      _args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     if observer.recording.load(Ordering::Relaxed) {
                         let frames = ctx
                             .execution_context()
@@ -1243,8 +1244,8 @@ fn native_binding_writes_keep_exact_young_children_through_moving_collection() {
                 1,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     |ctx: &mut RuntimeNativeCtx<'_>,
-                     args: &[RuntimeValue],
-                     _state: &[RuntimeValue]| {
+                     args: ValueWindow<'_>,
+                     _state: ValueWindow<'_>| {
                         let stride = args
                             .first()
                             .and_then(|value| value.as_number())
@@ -1265,8 +1266,8 @@ fn native_binding_writes_keep_exact_young_children_through_moving_collection() {
                 1,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     move |ctx: &mut RuntimeNativeCtx<'_>,
-                          args: &[RuntimeValue],
-                          _state: &[RuntimeValue]| {
+                          args: ValueWindow<'_>,
+                          _state: ValueWindow<'_>| {
                         let motion = moving_children::observe_and_collect(ctx, args)
                             .map_err(|error| format!("{error:?}"));
                         observations.lock().unwrap().push(motion);

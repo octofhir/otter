@@ -9,6 +9,7 @@
 
 #![allow(missing_docs)]
 
+use crate::ValueWindow;
 use crate::bigint::BigIntValue;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
@@ -25,7 +26,7 @@ use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "Temporal.ZonedDateTime";
 
-pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
     let bi = crate::temporal::helpers::to_big_int_field(ctx, &arg_or_undef(args, 0), CLASS)?;
     let nanos = bi
@@ -52,12 +53,12 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     make_temporal(ctx, TemporalPayload::ZonedDateTime(zdt))
 }
 
-fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn from(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let zdt = parse_zdt_arg_with_options(ctx, &arg_or_undef(args, 0), Some(args))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(zdt))
 }
 
-fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn compare(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let a = parse_zdt_arg(ctx, &arg_or_undef(args, 0))?;
     let b = parse_zdt_arg(ctx, &arg_or_undef(args, 1))?;
     let n = match a.compare_instant(&b) {
@@ -83,7 +84,7 @@ pub(crate) fn parse_zdt_arg(
 pub(crate) fn parse_zdt_arg_with_options(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
-    options_args: Option<&[Value]>,
+    options_args: Option<ValueWindow<'_>>,
 ) -> Result<temporal_rs::ZonedDateTime, NativeError> {
     if let Some(t) = v.as_temporal(ctx.heap()) {
         let zdt = match t.payload_clone(ctx.heap()) {
@@ -166,7 +167,7 @@ pub(crate) fn parse_zdt_arg_with_options(
 #[allow(clippy::type_complexity)]
 fn read_zdt_options(
     ctx: &mut NativeCtx<'_>,
-    options_args: Option<&[Value]>,
+    options_args: Option<ValueWindow<'_>>,
 ) -> Result<
     (
         Option<temporal_rs::options::Overflow>,
@@ -304,7 +305,7 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
     }
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     use crate::temporal::helpers::{
         read_display_calendar_name, read_display_offset, read_display_time_zone_name,
         read_fractional_second_digits, read_rounding_mode_option, read_smallest_unit_option,
@@ -338,18 +339,18 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     js_string_value(s, ctx)
 }
 
-fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, &[])
+fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
+    impl_to_string(ctx, ValueWindow::from(&[]))
 }
 
-fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Err(NativeError::TypeError {
         name: CLASS,
         reason: "Temporal.ZonedDateTime has no `.valueOf` — use `compare` or `equals`".to_string(),
     })
 }
 
-fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_add(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let overflow = parse_overflow(ctx, args, 1)?;
@@ -359,7 +360,7 @@ fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
-fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_subtract(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let overflow = parse_overflow(ctx, args, 1)?;
@@ -369,7 +370,7 @@ fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
-fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_equals(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let other = parse_zdt_arg(ctx, &arg_or_undef(args, 0))?;
     Ok(Value::boolean(
@@ -377,7 +378,7 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     ))
 }
 
-fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_until(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let other = parse_zdt_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
@@ -389,7 +390,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_since(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let other = parse_zdt_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
@@ -401,20 +402,26 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_round(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let options = parse_rounding_options(args, 0, ctx, CLASS)?;
     let result = zdt.round(options).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
-fn impl_start_of_day(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_start_of_day(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let result = zdt.start_of_day().map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
-fn impl_with_calendar(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_with_calendar(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let calendar =
         crate::temporal::helpers::to_calendar_slot_value(ctx, &arg_or_undef(args, 0), CLASS)?;
@@ -422,7 +429,10 @@ fn impl_with_calendar(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
-fn impl_with_time_zone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_with_time_zone(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let Some(js) = arg_or_undef(args, 0).as_string(ctx.heap()) else {
         return Err(NativeError::TypeError {
@@ -436,7 +446,7 @@ fn impl_with_time_zone(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
-fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_with(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let arg = arg_or_undef(args, 0);
     if !arg.is_object_type() || arg.as_temporal(ctx.heap()).is_some() {
@@ -471,7 +481,10 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
-fn impl_with_plain_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_with_plain_time(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     let v = arg_or_undef(args, 0);
     let time = if v.is_undefined() {
@@ -485,22 +498,31 @@ fn impl_with_plain_time(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
     make_temporal(ctx, TemporalPayload::ZonedDateTime(result))
 }
 
-fn impl_to_instant(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_instant(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     make_temporal(ctx, TemporalPayload::Instant(zdt.to_instant()))
 }
 
-fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_plain_date(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     make_temporal(ctx, TemporalPayload::PlainDate(zdt.to_plain_date()))
 }
 
-fn impl_to_plain_time(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_plain_time(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     make_temporal(ctx, TemporalPayload::PlainTime(zdt.to_plain_time()))
 }
 
-fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_plain_date_time(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     make_temporal(
         ctx,
@@ -516,7 +538,7 @@ fn impl_to_plain_date_time(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<V
 /// (e.g. an offset or transition-free zone).
 fn impl_get_time_zone_transition(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     use core::str::FromStr;
     let zdt = require_zoned_date_time(ctx)?;
@@ -568,13 +590,13 @@ fn impl_get_time_zone_transition(
 /// string- and BigInt-valued fields.
 macro_rules! zoned_date_time_getter {
     ($fn:ident, $zdt:ident => $val:expr) => {
-        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
             let $zdt = require_zoned_date_time(ctx)?;
             Ok($val)
         }
     };
     ($fn:ident, $zdt:ident, $heap:ident => $val:expr) => {
-        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
             let $zdt = require_zoned_date_time(ctx)?;
             let $heap = ctx.heap_mut();
             Ok($val)
@@ -605,7 +627,7 @@ zoned_date_time_getter!(get_days_in_month, zdt => Value::number_i32(zdt.days_in_
 zoned_date_time_getter!(get_days_in_year, zdt => Value::number_i32(zdt.days_in_year() as i32));
 zoned_date_time_getter!(get_months_in_year, zdt => Value::number_i32(zdt.months_in_year() as i32));
 zoned_date_time_getter!(get_in_leap_year, zdt => Value::boolean(zdt.in_leap_year()));
-fn get_hours_in_day(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn get_hours_in_day(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let zdt = require_zoned_date_time(ctx)?;
     zdt.hours_in_day()
         .map(Value::number_f64)
@@ -642,7 +664,7 @@ zoned_date_time_getter!(get_calendar_id, zdt, heap => str_or_undef(zdt.calendar(
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,
@@ -724,7 +746,10 @@ otter_macros::couch! {
 /// §sec-temporal.*.prototype.tolocalestring — brand-checks the receiver,
 /// then (absent the Intl formatting data path) renders the same canonical
 /// string as `toString`.
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §Temporal.*.prototype.toLocaleString renders through a freshly
     // constructed DateTimeFormat so the output matches
     // `new Intl.DateTimeFormat(locales, options).format(this)`.

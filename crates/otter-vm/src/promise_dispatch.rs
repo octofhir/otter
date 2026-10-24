@@ -35,6 +35,7 @@
 //! - <https://tc39.es/ecma262/#sec-promise-objects>
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
+use crate::ValueWindow;
 use crate::activation_stack::ActivationStack;
 use crate::error_classes::{ErrorClassRegistry, ErrorKind};
 use crate::execution_context::ExecutionContext;
@@ -105,6 +106,7 @@ impl<'scope> CapabilityHandles<'scope> {
 /// object express the same thing.
 mod capability_executor_state {
     use super::{NativeCtx, NativeError, Value};
+    use crate::ValueWindow;
 
     pub(super) const RESOLVE: &str = "resolve";
     pub(super) const REJECT: &str = "reject";
@@ -113,8 +115,8 @@ mod capability_executor_state {
     /// object in `captures[0]`.
     pub(super) fn call(
         ctx: &mut NativeCtx<'_>,
-        args: &[Value],
-        captures: &[Value],
+        args: ValueWindow<'_>,
+        captures: ValueWindow<'_>,
     ) -> Result<Value, NativeError> {
         let state = captures[0]
             .as_object()
@@ -742,7 +744,12 @@ fn promise_native_runtime<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+    F: for<'rt> Fn(
+            &mut NativeCtx<'rt>,
+            ValueWindow<'_>,
+            ValueWindow<'_>,
+        ) -> Result<Value, NativeError>
+        + 'static,
 {
     let roots = interp.collect_runtime_roots();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -770,7 +777,12 @@ fn promise_native_stack<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+    F: for<'rt> Fn(
+            &mut NativeCtx<'rt>,
+            ValueWindow<'_>,
+            ValueWindow<'_>,
+        ) -> Result<Value, NativeError>
+        + 'static,
 {
     let roots = interp.collect_allocation_roots(stack);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -797,7 +809,12 @@ fn promise_native_ctx<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+    F: for<'rt> Fn(
+            &mut NativeCtx<'rt>,
+            ValueWindow<'_>,
+            ValueWindow<'_>,
+        ) -> Result<Value, NativeError>
+        + 'static,
 {
     let roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
@@ -832,7 +849,10 @@ where
 /// The capability an element function captured, read from the traced
 /// captures slab. The collector rewrites the slab in place when it moves the
 /// capability's cells, so callers read it after their last allocation.
-fn capability_from_captures(captures: &[Value], template: &PromiseCapability) -> PromiseCapability {
+fn capability_from_captures(
+    captures: ValueWindow<'_>,
+    template: &PromiseCapability,
+) -> PromiseCapability {
     // SAFETY: each index is in bounds of the live slab; the volatile reads
     // keep a pre-allocation load of the shared slice from being reused.
     let read = |index: usize, fallback: Value| {
@@ -858,7 +878,12 @@ fn promise_element_function<F>(
     call: F,
 ) -> Result<Value, otter_gc::OutOfMemory>
 where
-    F: for<'rt> Fn(&mut NativeCtx<'rt>, &[Value], &[Value]) -> Result<Value, NativeError> + 'static,
+    F: for<'rt> Fn(
+            &mut NativeCtx<'rt>,
+            ValueWindow<'_>,
+            ValueWindow<'_>,
+        ) -> Result<Value, NativeError>
+        + 'static,
 {
     let mut no_extra_roots = |_visitor: &mut dyn FnMut(*mut RawGc)| {};
     let value = local_native_value_with_length(
@@ -880,7 +905,7 @@ pub fn statics_call(
     context: Option<ExecutionContext>,
     constructor: Option<Value>,
     method: otter_bytecode::method_id::PromiseMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     use otter_bytecode::method_id::PromiseMethod as M;
     let constructor = match constructor {
@@ -947,7 +972,7 @@ pub fn prototype_call(
     context: Option<ExecutionContext>,
     promise: &JsPromiseHandle,
     name: &str,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     match name {
         "then" => method_then(interp, stack, context, promise, args),
@@ -979,7 +1004,7 @@ pub fn prototype_call(
 pub fn invoke_then(
     ctx: &mut NativeCtx<'_>,
     receiver: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     const NAME: &str = "Promise.prototype";
     let exec = ctx.execution_context().cloned();
@@ -1200,7 +1225,11 @@ fn make_then_finally(
                 let value_thunk = scope.value(value_thunk);
                 let resolved_raw = scope.raw(resolved);
                 let value_thunk_raw = scope.raw(value_thunk);
-                let result = invoke_then(scope.context(), resolved_raw, &[value_thunk_raw])?;
+                let result = invoke_then(
+                    scope.context(),
+                    resolved_raw,
+                    ValueWindow::from(&[value_thunk_raw]),
+                )?;
                 let result = scope.value(result);
                 Ok(scope.finish(result))
             })
@@ -1248,7 +1277,11 @@ fn make_catch_finally(
                 let thrower = scope.value(thrower);
                 let resolved_raw = scope.raw(resolved);
                 let thrower_raw = scope.raw(thrower);
-                let result = invoke_then(scope.context(), resolved_raw, &[thrower_raw])?;
+                let result = invoke_then(
+                    scope.context(),
+                    resolved_raw,
+                    ValueWindow::from(&[thrower_raw]),
+                )?;
                 let result = scope.value(result);
                 Ok(scope.finish(result))
             })
@@ -1726,7 +1759,7 @@ fn static_resolve(
     stack: &mut ActivationStack,
     context: Option<ExecutionContext>,
     constructor: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let value = args.first().cloned().unwrap_or(Value::undefined());
     interp.with_handle_scope(|interp, scope| {
@@ -1770,7 +1803,7 @@ fn static_resolve(
 fn static_reject(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<JsPromiseHandle, NativeError> {
     let reason = args.first().cloned().unwrap_or(Value::undefined());
     Ok(
@@ -1788,7 +1821,7 @@ fn static_resolve_generic(
     stack: &mut ActivationStack,
     context: Option<ExecutionContext>,
     mut constructor: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let value = args.first().cloned().unwrap_or(Value::undefined());
     // §27.2.4.7 step 1 — a non-object receiver throws before the
@@ -1839,7 +1872,7 @@ fn static_reject_generic(
     stack: &mut ActivationStack,
     context: Option<ExecutionContext>,
     mut constructor: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let reason = args.first().cloned().unwrap_or(Value::undefined());
     interp.with_handle_scope(|interp, scope| {
@@ -1873,7 +1906,7 @@ fn static_try_generic(
     stack: &mut ActivationStack,
     context: Option<ExecutionContext>,
     mut constructor: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     const NAME: &str = "Promise.try";
     if !constructor.is_object_type() {
@@ -1959,7 +1992,7 @@ fn static_all_keyed_generic(
     stack: &mut ActivationStack,
     context: Option<ExecutionContext>,
     constructor: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
     variant: KeyedVariant,
 ) -> Result<Value, NativeError> {
     let name = variant.name();
@@ -2341,7 +2374,7 @@ fn static_all_generic(
     stack: &mut ActivationStack,
     context: Option<ExecutionContext>,
     constructor: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let exec = context.clone().ok_or(NativeError::InvalidOperand)?;
     let iterable = args.first().cloned().unwrap_or(Value::undefined());
@@ -2497,7 +2530,7 @@ fn static_race_generic(
     stack: &mut ActivationStack,
     context: Option<ExecutionContext>,
     constructor: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let exec = context.clone().ok_or(NativeError::InvalidOperand)?;
     let iterable = args.first().cloned().unwrap_or(Value::undefined());
@@ -2610,7 +2643,7 @@ fn static_all_settled_generic(
     stack: &mut ActivationStack,
     context: Option<ExecutionContext>,
     constructor: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let exec = context.clone().ok_or(NativeError::InvalidOperand)?;
     let iterable = args.first().cloned().unwrap_or(Value::undefined());
@@ -2901,7 +2934,7 @@ fn static_any_generic(
     stack: &mut ActivationStack,
     context: Option<ExecutionContext>,
     constructor: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let exec = context.clone().ok_or(NativeError::InvalidOperand)?;
     let iterable = args.first().cloned().unwrap_or(Value::undefined());
@@ -3103,7 +3136,7 @@ fn method_then(
     stack: &mut ActivationStack,
     context: Option<ExecutionContext>,
     promise: &JsPromiseHandle,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     const NAME: &str = "Promise.prototype.then";
     let exec = context.clone();
@@ -3172,7 +3205,7 @@ fn method_catch(
     interp: &mut Interpreter,
     context: Option<ExecutionContext>,
     promise: &JsPromiseHandle,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let on_rejected = match args.first() {
         Some(v) if crate::is_callable_value(v) => Some(*v),
@@ -3275,7 +3308,7 @@ fn attach_then_value(
 /// be left pointing at the body's pre-move slot — since reused by another young
 /// object — so settling it would fault on a foreign payload. Reading the handle
 /// back from the traced capture keeps it current.
-fn settle_native_promise(captures: &[Value]) -> JsPromiseHandle {
+fn settle_native_promise(captures: ValueWindow<'_>) -> JsPromiseHandle {
     captures
         .first()
         .copied()
@@ -3299,7 +3332,7 @@ fn alloc_already_resolved_cell(
 /// Returns `true` exactly once per cell — the call that flips it — so a
 /// resolve or reject function whose pair already ran becomes a no-op even
 /// while the promise is still pending on an in-flight thenable job.
-fn consume_already_resolved(interp: &mut Interpreter, captures: &[Value]) -> bool {
+fn consume_already_resolved(interp: &mut Interpreter, captures: ValueWindow<'_>) -> bool {
     let cell = captures
         .get(1)
         .and_then(|flag| flag.as_raw_gc())
@@ -3383,8 +3416,8 @@ fn make_resolve_native_native_rooted(
 /// first resolution is still in flight.
 fn resolve_native_body(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    captures: &[Value],
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
     captured_context: &Option<ExecutionContext>,
 ) -> Result<Value, NativeError> {
     let promise = settle_native_promise(captures);
@@ -3750,7 +3783,7 @@ fn make_resolve_thenable_job(
 /// Every capture and the original rejection are scoped across collecting calls.
 fn resolve_thenable_job_body(
     ctx: &mut NativeCtx<'_>,
-    captures: &[Value],
+    captures: ValueWindow<'_>,
     exec: Option<&ExecutionContext>,
 ) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
@@ -3901,7 +3934,11 @@ fn make_reject_native_native_rooted(
 
 /// §27.2.1.3.1 Promise Reject Functions — consume the pair's
 /// `[[AlreadyResolved]]` flag, then reject the captured promise.
-fn reject_native_body(ctx: &mut NativeCtx<'_>, args: &[Value], captures: &[Value]) -> Value {
+fn reject_native_body(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
+) -> Value {
     let context = ctx.execution_context().cloned();
     let promise = settle_native_promise(captures);
     if !consume_already_resolved(ctx.interp_mut(), captures) {
@@ -4010,7 +4047,13 @@ mod tests {
         let promise_value = interp
             .with_runtime_turn(&mut stack, |mut turn| {
                 turn.with_parts(|interp, stack| {
-                    static_resolve(interp, stack, Some(empty_context()), constructor, &args)
+                    static_resolve(
+                        interp,
+                        stack,
+                        Some(empty_context()),
+                        constructor,
+                        ValueWindow::from(&args),
+                    )
                 })
             })
             .expect("Promise.resolve");

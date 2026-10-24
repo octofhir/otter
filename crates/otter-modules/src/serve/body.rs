@@ -23,6 +23,7 @@
 //! # See also
 //! - [`crate::serve`]
 
+use otter_runtime::ValueWindow;
 use std::collections::TryReserveError;
 
 use otter_runtime::{
@@ -424,7 +425,7 @@ fn bytes_to_uint8_array(
     let ctor = ctx
         .global_value("Uint8Array")
         .ok_or_else(|| runtime_type_error(name, "Uint8Array is unavailable"))?;
-    ctx.construct(ctor, &[Value::array_buffer(buffer)])
+    ctx.construct(ctor, ValueWindow::from(&[Value::array_buffer(buffer)]))
 }
 
 #[cfg(test)]

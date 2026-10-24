@@ -21,6 +21,7 @@
 //! # See also
 //! - <https://fetch.spec.whatwg.org/#fetch-method>
 
+use otter_runtime::ValueWindow;
 use std::sync::Arc;
 
 use otter_runtime::marshal::{IntoJs, JsError, MarshalCx};
@@ -113,7 +114,7 @@ impl IntoJs for StreamingHead {
 /// `abort` against an `AbortSignal` to implement `fetch`'s cancellation.
 pub fn native_fetch(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     transport: &FetchTransport,
 ) -> Result<Value, NativeError> {
     let arg = |index: usize| args.get(index).copied().unwrap_or_else(Value::undefined);

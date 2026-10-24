@@ -30,6 +30,7 @@
 
 use super::NumberValue;
 use crate::Value;
+use crate::ValueWindow;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::string::JsString;
 use crate::{NativeCall, NativeCtx, NativeError};
@@ -59,7 +60,7 @@ fn this_number_value(ctx: &NativeCtx<'_>, name: &'static str) -> Result<NumberVa
 fn coerce_numeric_args(
     ctx: &mut NativeCtx<'_>,
     name: &'static str,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
     ctx.scope(|mut scope| {
         let exec = scope.context().execution_context().cloned();
@@ -135,7 +136,7 @@ fn coerce_digits_arg(
 /// `Number.prototype.toLocaleString` (locale-agnostic) share this body.
 fn to_string_radix(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let recv = this_number_value(ctx, name)?;
@@ -204,7 +205,7 @@ fn to_string_radix(
     )?))
 }
 
-fn number_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn number_to_string(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     to_string_radix(ctx, args, "Number.prototype.toString")
 }
 
@@ -221,7 +222,7 @@ pub(crate) fn is_to_string_builtin(value: Value, heap: &otter_gc::GcHeap) -> boo
 
 pub(crate) fn fast_primitive_to_string(
     receiver: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
     heap: &mut otter_gc::GcHeap,
 ) -> Option<Value> {
     let recv = receiver.as_number()?;
@@ -236,7 +237,10 @@ pub(crate) fn fast_primitive_to_string(
     ))
 }
 
-fn number_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn number_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §19.3.1 — brand-check `this`, then format through a freshly
     // constructed Intl.NumberFormat so the output matches
     // `new Intl.NumberFormat(locales, options).format(this)`.
@@ -247,7 +251,7 @@ fn number_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 }
 
 /// §21.1.3.3 `Number.prototype.toFixed(digits = 0)`.
-fn number_to_fixed(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn number_to_fixed(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     const NAME: &str = "Number.prototype.toFixed";
     let coerced = coerce_numeric_args(ctx, NAME, args)?;
     let recv = this_number_value(ctx, NAME)?;
@@ -270,7 +274,10 @@ fn number_to_fixed(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 }
 
 /// §21.1.3.2 `Number.prototype.toExponential(fractionDigits?)`.
-fn number_to_exponential(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn number_to_exponential(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     const NAME: &str = "Number.prototype.toExponential";
     let coerced = coerce_numeric_args(ctx, NAME, args)?;
     let recv = this_number_value(ctx, NAME)?;
@@ -315,7 +322,10 @@ fn number_to_exponential(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 }
 
 /// §21.1.3.5 `Number.prototype.toPrecision(precision?)`.
-fn number_to_precision(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn number_to_precision(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     const NAME: &str = "Number.prototype.toPrecision";
     let coerced = coerce_numeric_args(ctx, NAME, args)?;
     let recv = this_number_value(ctx, NAME)?;
@@ -354,7 +364,7 @@ fn number_to_precision(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 }
 
 /// §21.1.3.7 `Number.prototype.valueOf()` — returns the receiver.
-fn number_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn number_value_of(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(Value::number(this_number_value(
         ctx,
         "Number.prototype.valueOf",
@@ -381,7 +391,7 @@ pub fn is_builtin_method(name: &str) -> bool {
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,

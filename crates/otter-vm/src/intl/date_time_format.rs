@@ -20,6 +20,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-datetimeformat-objects>
 
+use crate::ValueWindow;
 use crate::intl::payload::{
     DateTimeFormatPayload, DtHourCycle, DtMonthWidth, DtNumWidth, DtStyle, DtTextWidth, DtZoneName,
     IntlPayload,
@@ -811,7 +812,7 @@ fn require_date_time(
 /// it formats against the originating instance regardless of `this`.
 pub(crate) fn date_time_format_format_getter(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // Brand check: the receiver must be a DateTimeFormat instance.
     let _ = require_date_time(ctx, "format")?;
@@ -832,8 +833,8 @@ pub(crate) fn date_time_format_format_getter(
 /// bound-function semantics of §12.4.3.
 fn bound_format_call(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    captures: &[Value],
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let bad = || NativeError::TypeError {
         name: "format",
@@ -866,7 +867,7 @@ fn bound_format_call(
 pub(crate) fn date_to_locale_string(
     ctx: &mut NativeCtx<'_>,
     epoch_millis: f64,
-    args: &[Value],
+    args: ValueWindow<'_>,
     mode: DateTimeOptionsMode,
 ) -> Result<Value, NativeError> {
     if epoch_millis.is_nan() {
@@ -1199,7 +1200,7 @@ fn arg_to_civil_inner(
 /// `{ type, value }` records from ICU4X part-aware output.
 pub(crate) fn date_time_format_format_to_parts(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let mut payload = require_date_time(ctx, "formatToParts")?;
     if let Some(arg) = args.first() {
@@ -1233,7 +1234,7 @@ const RANGE_SEPARATOR: &str = "\u{2009}\u{2013}\u{2009}";
 /// `TimeClip` path as `format`.
 fn range_civil(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
     payload: &DateTimeFormatPayload,
 ) -> Result<(Civil, Civil), NativeError> {
@@ -1248,7 +1249,7 @@ fn range_civil(
 /// BEFORE the same-type and calendar checks — but its TimeClip does not).
 fn range_formattable(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<(Value, Value), NativeError> {
     let undef = |v: Option<&Value>| v.is_none() || v.is_some_and(|x| x.is_undefined());
@@ -1301,7 +1302,7 @@ fn temporal_calendar_id(value: &Value, heap: &otter_gc::GcHeap) -> Option<&'stat
 
 fn range_payload(
     payload: &DateTimeFormatPayload,
-    args: &[Value],
+    args: ValueWindow<'_>,
     heap: &otter_gc::GcHeap,
     name: &'static str,
 ) -> Result<DateTimeFormatPayload, NativeError> {
@@ -1382,13 +1383,18 @@ fn range_shared_prefix_len(
 /// `Jan 3 – 5, 2019`) is not reproduced.
 pub(crate) fn date_time_format_format_range(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "formatRange")?;
     let (x, y) = range_formattable(ctx, args, "formatRange")?;
     let converted = [x, y];
-    let payload = range_payload(&payload, &converted, ctx.heap(), "formatRange")?;
-    let (s, e) = range_civil(ctx, &converted, "formatRange", &payload)?;
+    let payload = range_payload(
+        &payload,
+        ValueWindow::from(&converted),
+        ctx.heap(),
+        "formatRange",
+    )?;
+    let (s, e) = range_civil(ctx, ValueWindow::from(&converted), "formatRange", &payload)?;
     let start_str = format_components(s, &payload);
     let end_str = format_components(e, &payload);
     let combined = if start_str == end_str {
@@ -1429,13 +1435,23 @@ pub(crate) fn date_time_format_format_range(
 /// literal, and the end parts are `"endRange"`.
 pub(crate) fn date_time_format_format_range_to_parts(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "formatRangeToParts")?;
     let (x, y) = range_formattable(ctx, args, "formatRangeToParts")?;
     let converted = [x, y];
-    let payload = range_payload(&payload, &converted, ctx.heap(), "formatRangeToParts")?;
-    let (s, e) = range_civil(ctx, &converted, "formatRangeToParts", &payload)?;
+    let payload = range_payload(
+        &payload,
+        ValueWindow::from(&converted),
+        ctx.heap(),
+        "formatRangeToParts",
+    )?;
+    let (s, e) = range_civil(
+        ctx,
+        ValueWindow::from(&converted),
+        "formatRangeToParts",
+        &payload,
+    )?;
     let start_parts =
         icu_format_segments(s, &payload).unwrap_or_else(|| manual_format_segments(s, &payload));
     let end_parts =
@@ -1491,7 +1507,7 @@ pub(crate) fn date_time_format_format_range_to_parts(
 /// §12.1.6 `Intl.DateTimeFormat.prototype.resolvedOptions()`.
 pub(crate) fn date_time_format_resolved_options(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_date_time(ctx, "resolvedOptions")?;
     let tz = payload

@@ -18,6 +18,7 @@
 //! - [`crate::array_statics`]
 //! - [`crate::executable`]
 
+use crate::ValueWindow;
 use crate::runtime_activation::CommittedValueError;
 use smallvec::SmallVec;
 
@@ -75,7 +76,7 @@ impl Interpreter {
         stack: &mut crate::ActivationStack,
         context: &ExecutionContext,
         constructor: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         let items = args.first().copied().unwrap_or_else(Value::undefined);
         let map_fn = args.get(1).copied().unwrap_or_else(Value::undefined);
@@ -699,7 +700,7 @@ mod tests {
                 &mut stack,
                 &context,
                 Value::undefined(),
-                &[Value::array(source)],
+                ValueWindow::from(&[Value::array(source)]),
             )
             .expect("Array.from");
 

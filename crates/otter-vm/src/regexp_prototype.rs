@@ -31,6 +31,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-regexp.prototype.exec>
 
+use crate::ValueWindow;
 use crate::object_layout_cache::RegExpRecordLayout;
 use crate::regexp::JsRegExp;
 use crate::runtime_cx::{NativeCtx, NativeScope};
@@ -351,7 +352,7 @@ fn pair_array_native<'scope>(
 /// - <https://tc39.es/ecma262/#sec-regexp.prototype-@@match>
 pub fn native_regexp_symbol_match(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     const NAME: &str = "RegExp.prototype[@@match]";
     ctx.scope(|mut scope| {
@@ -534,7 +535,7 @@ pub fn native_regexp_symbol_match(
 /// - <https://tc39.es/ecma262/#sec-regexp.prototype-@@search>
 pub fn native_regexp_symbol_search(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     const NAME: &str = "RegExp.prototype[@@search]";
     ctx.scope(|mut scope| {
@@ -711,7 +712,7 @@ pub(crate) fn get_property_runtime(
                     .set_iteration_anchor(anchor_base + RESULT, getter);
                 let getter = ctx.interp_mut().iteration_anchor(anchor_base + RESULT);
                 let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
-                let value = ctx.call(getter, receiver, &[])?;
+                let value = ctx.call(getter, receiver, ValueWindow::from(&[]))?;
                 ctx.interp_mut()
                     .set_iteration_anchor(anchor_base + RESULT, value);
             }
@@ -756,7 +757,7 @@ fn set_property_runtime(
                     let setter = ctx.interp_mut().iteration_anchor(anchor_base + SETTER);
                     let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
                     let value = ctx.interp_mut().iteration_anchor(anchor_base + VALUE);
-                    ctx.call(setter, receiver, &[value])?;
+                    ctx.call(setter, receiver, ValueWindow::from(&[value]))?;
                     return Ok(());
                 }
                 crate::object::SetOutcome::Reject { .. } => {
@@ -1012,7 +1013,7 @@ pub(crate) fn regexp_exec_runtime(
         if ctx.interp_mut().is_callable_runtime(&exec_fn) {
             let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
             let input = ctx.interp_mut().iteration_anchor(anchor_base + INPUT);
-            let result = ctx.call(exec_fn, receiver, &[input])?;
+            let result = ctx.call(exec_fn, receiver, ValueWindow::from(&[input]))?;
             ctx.interp_mut()
                 .set_iteration_anchor(anchor_base + RESULT, result);
             let result = ctx.interp_mut().iteration_anchor(anchor_base + RESULT);
@@ -1083,7 +1084,7 @@ pub(crate) fn regexp_string_iterator_next_runtime(
     let outcome = {
         let rooted_matcher = interp.iteration_anchor(anchor_base + MATCHER);
         let call_info = crate::NativeCallInfo::call(rooted_matcher);
-        let roots = crate::runtime_cx::NativeCallRoots::new(&call_info, &[], &[]);
+        let roots = crate::runtime_cx::NativeCallRoots::new(&call_info, &[]);
         let _call_roots = interp
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
@@ -1233,7 +1234,7 @@ const MAX_STRING_UNITS: usize = 1 << 29;
 /// - <https://tc39.es/ecma262/#sec-getsubstitution>
 pub fn native_regexp_symbol_replace(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let receiver = *ctx.this_value();
     regexp_symbol_replace(ctx, receiver, args)
@@ -1245,7 +1246,7 @@ pub fn native_regexp_symbol_replace(
 pub(crate) fn regexp_symbol_replace(
     ctx: &mut NativeCtx<'_>,
     receiver: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@replace]";
     if !receiver.is_object_type() {
@@ -1480,7 +1481,11 @@ pub(crate) fn regexp_symbol_replace(
                     replacer_args.push(ctx.interp_mut().iteration_anchor(index));
                 }
                 let replacer = ctx.interp_mut().iteration_anchor(anchor_base + REPLACER);
-                let raw = ctx.call(replacer, Value::undefined(), &replacer_args)?;
+                let raw = ctx.call(
+                    replacer,
+                    Value::undefined(),
+                    ValueWindow::from(&replacer_args),
+                )?;
                 ctx.interp_mut()
                     .set_iteration_anchor(anchor_base + TEMP, raw);
                 let raw = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
@@ -1611,7 +1616,7 @@ pub(crate) fn get_symbol_property_runtime(
                     .set_iteration_anchor(anchor_base + RESULT, getter);
                 let getter = ctx.interp_mut().iteration_anchor(anchor_base + RESULT);
                 let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
-                let value = ctx.call(getter, receiver, &[])?;
+                let value = ctx.call(getter, receiver, ValueWindow::from(&[]))?;
                 ctx.interp_mut()
                     .set_iteration_anchor(anchor_base + RESULT, value);
             }
@@ -1713,7 +1718,7 @@ pub(crate) fn species_constructor_runtime(
 /// - <https://tc39.es/ecma262/#sec-createregexpstringiterator>
 pub fn native_regexp_symbol_match_all(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@matchAll]";
     let receiver = *ctx.this_value();
@@ -1781,7 +1786,7 @@ pub fn native_regexp_symbol_match_all(
         let constructor = ctx.interp_mut().iteration_anchor(anchor_base + CONSTRUCTOR);
         let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
         let flags = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
-        let matcher = ctx.construct(constructor, &[receiver, flags])?;
+        let matcher = ctx.construct(constructor, ValueWindow::from(&[receiver, flags]))?;
         ctx.interp_mut()
             .set_iteration_anchor(anchor_base + MATCHER, matcher);
 
@@ -1864,7 +1869,7 @@ fn array_from_iteration_anchor_indices(
 /// - <https://tc39.es/ecma262/#sec-regexp.prototype-@@split>
 pub fn native_regexp_symbol_split(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExp.prototype[@@split]";
     let receiver = *ctx.this_value();
@@ -1970,7 +1975,7 @@ pub fn native_regexp_symbol_split(
         let constructor = ctx.interp_mut().iteration_anchor(anchor_base + CONSTRUCTOR);
         let receiver = ctx.interp_mut().iteration_anchor(anchor_base + RECEIVER);
         let flags = ctx.interp_mut().iteration_anchor(anchor_base + TEMP);
-        let splitter = ctx.construct(constructor, &[receiver, flags])?;
+        let splitter = ctx.construct(constructor, ValueWindow::from(&[receiver, flags]))?;
         ctx.interp_mut()
             .set_iteration_anchor(anchor_base + SPLITTER, splitter);
 
@@ -2484,7 +2489,7 @@ mod tests {
         .expect("valid bytecode fixture")
     }
 
-    fn call(method: &str, recv: &Value, args: &[Value], interp: &mut Interpreter) -> Value {
+    fn call(method: &str, recv: &Value, args: ValueWindow<'_>, interp: &mut Interpreter) -> Value {
         let mut recv_root = *recv;
         let mut args_root = args.to_vec();
         let mut roots = otter_gc::RootScope::new(interp.gc_heap_mut());
@@ -2501,7 +2506,8 @@ mod tests {
             NativeCallInfo::call(recv_root),
             Some(&context),
             |ctx| {
-                let text = string_arg_to_jsstring_for_test(&args_root, 0, ctx).unwrap();
+                let text =
+                    string_arg_to_jsstring_for_test(ValueWindow::from(&args_root), 0, ctx).unwrap();
                 match method {
                     "exec" => exec_once_native(&recv_root, text, ctx).unwrap(),
                     "test" => {
@@ -2514,7 +2520,7 @@ mod tests {
     }
 
     fn string_arg_to_jsstring_for_test(
-        args: &[Value],
+        args: ValueWindow<'_>,
         index: usize,
         ctx: &mut NativeCtx<'_>,
     ) -> Result<JsString, NativeError> {
@@ -2542,11 +2548,14 @@ mod tests {
         }
         text = Value::string(JsString::from_str("abbbc", interp.gc_heap_mut()).unwrap());
         assert_eq!(
-            call("test", &re, &[text], &mut interp),
+            call("test", &re, ValueWindow::from(&[text]), &mut interp),
             Value::boolean(true)
         );
         let no = Value::string(JsString::from_str("xy", interp.gc_heap_mut()).unwrap());
-        assert_eq!(call("test", &re, &[no], &mut interp), Value::boolean(false));
+        assert_eq!(
+            call("test", &re, ValueWindow::from(&[no]), &mut interp),
+            Value::boolean(false)
+        );
     }
 
     #[test]
@@ -2562,7 +2571,7 @@ mod tests {
             roots.add_value(&mut text);
         }
         text = Value::string(JsString::from_str("ab", interp.gc_heap_mut()).unwrap());
-        let r = call("exec", &re, &[text], &mut interp);
+        let r = call("exec", &re, ValueWindow::from(&[text]), &mut interp);
         let Some(arr) = r.as_array() else {
             panic!("expected array");
         };
@@ -2582,9 +2591,9 @@ mod tests {
         let miss = call(
             "exec",
             &re,
-            &[Value::string(
+            ValueWindow::from(&[Value::string(
                 JsString::from_str("zz", interp.gc_heap_mut()).unwrap(),
-            )],
+            )]),
             &mut interp,
         );
         assert!(miss.is_null());
@@ -2604,7 +2613,12 @@ mod tests {
         }
         text = Value::string(JsString::from_str("ab", interp.gc_heap_mut()).unwrap());
         let before = interp.gc_heap_mut().gc_stats().alloc_bytes_total;
-        let result = call("exec", &re, std::slice::from_ref(&text), &mut interp);
+        let result = call(
+            "exec",
+            &re,
+            ValueWindow::from(std::slice::from_ref(&text)),
+            &mut interp,
+        );
         let after = interp.gc_heap_mut().gc_stats().alloc_bytes_total;
 
         assert!(
@@ -2647,7 +2661,12 @@ mod tests {
         }
         text = Value::string(JsString::from_str("abab", interp.gc_heap_mut()).unwrap());
         // First call → match at 0, lastIndex moves to 1.
-        let r1 = call("exec", &re, std::slice::from_ref(&text), &mut interp);
+        let r1 = call(
+            "exec",
+            &re,
+            ValueWindow::from(std::slice::from_ref(&text)),
+            &mut interp,
+        );
         let (Some(arr), Some(rx)) = (r1.as_array(), re.as_regexp()) else {
             panic!();
         };
@@ -2657,12 +2676,17 @@ mod tests {
         );
         assert_eq!(rx.last_index(interp.gc_heap()), 1);
         // Second call → match at 2, lastIndex → 3.
-        call("exec", &re, std::slice::from_ref(&text), &mut interp);
+        call(
+            "exec",
+            &re,
+            ValueWindow::from(std::slice::from_ref(&text)),
+            &mut interp,
+        );
         if let Some(rx) = re.as_regexp() {
             assert_eq!(rx.last_index(interp.gc_heap()), 3);
         }
         // Third call → no match, lastIndex → 0.
-        let r3 = call("exec", &re, &[text], &mut interp);
+        let r3 = call("exec", &re, ValueWindow::from(&[text]), &mut interp);
         assert!(r3.is_null());
         if let Some(rx) = re.as_regexp() {
             assert_eq!(rx.last_index(interp.gc_heap()), 0);

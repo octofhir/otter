@@ -23,6 +23,7 @@
 
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
+use otter_runtime::ValueWindow;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -88,8 +89,8 @@ fn observer(records: Arc<Mutex<Vec<Result<Observation, String>>>>) -> RuntimeExt
             1,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     // The hook is reached only in the probe's allocating branch.
                     // No raw value, borrowed source, or context escapes this call.
                     let phase =

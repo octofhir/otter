@@ -13,6 +13,7 @@
 //! # See also
 //! - <https://tc39.es/proposal-arraybuffer-base64/spec/>
 
+use crate::ValueWindow;
 use crate::binary::typed_array::{JsTypedArray, TypedArrayKind};
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PropertyDescriptor};
@@ -375,7 +376,7 @@ fn fresh_uint8array(ctx: &mut NativeCtx<'_>, bytes: &[u8]) -> Result<Value, Nati
 // Native methods
 // ---------------------------------------------------------------
 
-fn u8_from_base64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn u8_from_base64(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let units = string_units(ctx, args.first())?;
     options_must_be_object(ctx, args.get(1))?;
     let url =
@@ -393,7 +394,7 @@ fn u8_from_base64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     fresh_uint8array(ctx, &bytes)
 }
 
-fn u8_from_hex(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn u8_from_hex(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let units = string_units(ctx, args.first())?;
     let (bytes, _read, err) = decode_hex(&units, usize::MAX);
     if let Some(e) = err {
@@ -434,7 +435,7 @@ fn receiver_bytes(ctx: &mut NativeCtx<'_>, t: &JsTypedArray) -> Result<Vec<u8>, 
     Ok(out)
 }
 
-fn u8_to_base64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn u8_to_base64(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver_uint8(ctx, "Uint8Array.prototype.toBase64")?;
     options_must_be_object(ctx, args.first())?;
     let url =
@@ -446,7 +447,7 @@ fn u8_to_base64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     Ok(Value::string(js))
 }
 
-fn u8_to_hex(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn u8_to_hex(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver_uint8(ctx, "Uint8Array.prototype.toHex")?;
     let bytes = receiver_bytes(ctx, &t)?;
     let s = encode_hex(&bytes);
@@ -483,7 +484,10 @@ fn write_into(ctx: &mut NativeCtx<'_>, t: &JsTypedArray, bytes: &[u8]) {
     }
 }
 
-fn u8_set_from_base64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn u8_set_from_base64(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let t = receiver_uint8(ctx, "Uint8Array.prototype.setFromBase64")?;
     let units = string_units(ctx, args.first())?;
     options_must_be_object(ctx, args.get(1))?;
@@ -508,7 +512,7 @@ fn u8_set_from_base64(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     set_result(ctx, read, bytes.len())
 }
 
-fn u8_set_from_hex(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn u8_set_from_hex(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver_uint8(ctx, "Uint8Array.prototype.setFromHex")?;
     let units = string_units(ctx, args.first())?;
     if t.is_out_of_bounds(ctx.heap()) {

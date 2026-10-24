@@ -14,6 +14,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-boolean-prototype-object>
 use crate::Value;
+use crate::ValueWindow;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::string::JsString;
 use crate::{NativeCall, NativeCtx, NativeError};
@@ -37,7 +38,10 @@ fn this_boolean_value(ctx: &NativeCtx<'_>, name: &'static str) -> Result<bool, N
 }
 
 /// §20.3.3.2 `Boolean.prototype.toString()` — `"true"` / `"false"`.
-fn boolean_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn boolean_to_string(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let s = if this_boolean_value(ctx, "Boolean.prototype.toString")? {
         "true"
     } else {
@@ -47,7 +51,7 @@ fn boolean_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, 
 }
 
 /// §20.3.3.3 `Boolean.prototype.valueOf()` — the unwrapped boolean.
-fn boolean_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn boolean_value_of(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(Value::boolean(this_boolean_value(
         ctx,
         "Boolean.prototype.valueOf",
@@ -70,7 +74,7 @@ pub fn is_builtin_method(name: &str) -> bool {
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,

@@ -544,7 +544,10 @@ mod tests {
                 .create_data_property(&mut target, "value", Value::number_f64(3.5))
                 .unwrap();
             assert!(category.is_set());
-            assert_eq!(object::field_type::snapshot(shape), object::field_type::TOP);
+            assert_eq!(
+                object::field_type::snapshot(shape),
+                object::field_type::INT32 | object::field_type::DOUBLE
+            );
             for flag in [&exact, &category, &stable] {
                 subscriptions.unwatch(shape, flag);
             }

@@ -30,7 +30,7 @@ use super::{
 use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Interpreter, Value, VmGetOutcome, VmPropertyKey, abstract_ops, binary,
-    function_metadata, object, property_atom::AtomizedPropertyKey, read_register, symbol_prototype,
+    function_metadata, object, property_atom::AtomizedPropertyKey, read_register,
     temporal, value_kind_name, write_register,
 };
 
@@ -440,8 +440,34 @@ impl Interpreter {
                         )
                         .map_err(CommittedValueError::completed_call)?,
                 }
-            } else if let Some(s) = receiver.as_symbol(&interp.gc_heap) {
-                symbol_prototype::load_property(s, name)
+            } else if receiver.is_symbol() {
+                // §7.3.2 GetV: a symbol owns no properties, so the lookup
+                // starts at %Symbol.prototype% with the primitive as the
+                // receiver; its methods, the `description` getter and any
+                // user property all resolve there.
+                let proto = interp
+                    .primitive_wrapper_prototype(crate::realm_intrinsics::Intrinsic::SymbolPrototype)
+                    .map_err(CommittedValueError::JavaScript)?;
+                let key = VmPropertyKey::String(name);
+                match interp.ordinary_get_value(
+                    stack,
+                    Some(context),
+                    Value::object(proto),
+                    receiver,
+                    &key,
+                    0,
+                )? {
+                    VmGetOutcome::Value(value) => value,
+                    VmGetOutcome::InvokeGetter { getter } => interp
+                        .run_callable_sync_rooted(
+                            stack,
+                            Some(context),
+                            &getter,
+                            interp.escape_scoped(receiver_root),
+                            SmallVec::new(),
+                        )
+                        .map_err(CommittedValueError::completed_call)?,
+                }
             } else if let Some(t) = receiver.as_temporal(&interp.gc_heap) {
                 // An ordinary own property (installed via defineProperty /
                 // assignment) lives in the expando and shadows the prototype

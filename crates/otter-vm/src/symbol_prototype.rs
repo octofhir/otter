@@ -9,7 +9,6 @@
 //! # Contents
 //! - [`SYMBOL_PROTOTYPE_METHODS`] — native method specs installed on
 //!   the global `Symbol.prototype`.
-//! - [`load_property`] — accessor reads (`description`).
 //!
 //! # Invariants
 //! - Receivers must be primitive symbols or Symbol wrapper objects.
@@ -82,41 +81,4 @@ fn symbol_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 fn symbol_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let sym = this_symbol_value(ctx, "Symbol.prototype.valueOf")?;
     Ok(Value::symbol(sym))
-}
-
-/// Read a non-method property off `Symbol.prototype`-bearing
-/// receivers. Foundation exposes only the `description` accessor;
-/// other names fall back to `Value::Undefined` per the spec's
-/// `[[Get]]` semantics for primitives without ordinary properties.
-///
-/// Reads come from the wrapper-side description cache; no heap touch.
-///
-/// # See also
-/// - <https://tc39.es/ecma262/#sec-symbol.prototype.description>
-#[must_use]
-pub fn load_property(sym: JsSymbol, name: &str) -> Value {
-    if name == "description" {
-        match sym.description() {
-            Some(s) => Value::string(*s),
-            None => Value::undefined(),
-        }
-    } else {
-        Value::undefined()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn description_accessor() {
-        let mut gc_heap = otter_gc::GcHeap::new().expect("gc heap");
-        let s = JsString::from_str("ok", &mut gc_heap).unwrap();
-        let sym = JsSymbol::new(&mut gc_heap, Some(s)).unwrap();
-        let value = load_property(sym, "description");
-        assert_eq!(value.display_string(&gc_heap), "ok");
-        let no_desc = JsSymbol::new(&mut gc_heap, None).unwrap();
-        assert!(load_property(no_desc, "description").is_undefined());
-    }
 }

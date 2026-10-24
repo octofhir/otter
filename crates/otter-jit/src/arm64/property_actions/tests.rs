@@ -541,7 +541,7 @@ fn shape_directory_reads_live_banks_and_rejects_accessor_and_shared_suffix() {
         let packed = u64::from(atom) << 32;
         put(&mut arena, bucket_byte, packed | 2);
         assert_eq!(probe(), inline_value);
-        put(&mut arena, bucket_byte, packed | 2 | 0);
+        put(&mut arena, bucket_byte, packed | 2);
         put(
             &mut arena,
             RECEIVER + view.field_layout.inline_values_byte as usize + 8,

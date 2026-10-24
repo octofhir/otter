@@ -321,7 +321,11 @@ fn float64_mul_boxes_canonically() {
             Value::number_f64(3.0).to_bits(),
         ],
     );
-    assert_eq!(returned(result), int(6), "integral results box as int32");
+    assert_eq!(
+        returned(result),
+        Value::double(6.0).to_bits(),
+        "an integral float64 result stays a Double"
+    );
 }
 
 /// `s = 0; i = 0; while (i < n) { s = s + i; i = i + 1 } return s`.

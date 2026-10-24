@@ -22,6 +22,8 @@
 //! - [`keys_for_child`] — the table a new child shape names.
 //! - [`ShapeKeysBody::slot_of_atom`] / [`ShapeKeysBody::slot_of_str`] /
 //!   [`ShapeKeysBody::entry`] — reads bounded by a shape's key count.
+//! - [`set_last_owner`] / [`owner_of`] — the shape that added each slot, so
+//!   a write finds the slot's field summary without walking the chain.
 //!
 //! # Invariants
 //! - Entry `i` is the key of logical slot `i`; a table holds each atom at
@@ -35,6 +37,11 @@
 //!   appending parent's key count and the capacity has room; the key store
 //!   is write-barriered.
 //! - Old space: a table lives as long as the shapes naming it.
+//! - Entry `i`'s owner is the shape whose transition added slot `i`: an
+//!   ancestor of, or the same as, every shape that reads entry `i`, since a
+//!   reader's first `count` entries were appended along its own chain or
+//!   copied from it. It is traced, and set right after that shape is
+//!   allocated; a null owner is one not yet set, and readers walk instead.
 //!
 //! # See also
 //! - [`super::shape_body`] — the chain the table flattens.
@@ -69,6 +76,8 @@ pub(crate) struct KeyEntry {
     pub(crate) hash: u32,
     pub(crate) flags: PropertyFlags,
     pub(crate) is_accessor: bool,
+    /// The shape that added this slot; null until that shape exists.
+    pub(crate) owner: super::shape_body::ShapeHandle,
 }
 
 /// Empty atom/data-slot bucket.
@@ -205,9 +214,12 @@ impl otter_gc::SafeTraceable for ShapeKeysBody {
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         for slot in 0..self.len as usize {
             // SAFETY: entries `0..len` are initialized and live with the body.
-            let key = unsafe { &mut (*self.entries_ptr().add(slot)).key };
-            if !key.is_null() {
-                visitor((key as *mut JsStringHandle).cast::<RawGc>());
+            let entry = unsafe { &mut *self.entries_ptr().add(slot) };
+            if !entry.key.is_null() {
+                visitor((&mut entry.key as *mut JsStringHandle).cast::<RawGc>());
+            }
+            if !entry.owner.is_null() {
+                visitor((&mut entry.owner as *mut super::shape_body::ShapeHandle).cast::<RawGc>());
             }
         }
     }
@@ -261,9 +273,14 @@ pub(crate) fn keys_for_child(
         // handles are rewritten in place by a collection it runs.
         unsafe {
             for slot in 0..len {
-                let key = &mut (*base.add(slot)).key;
-                if !key.is_null() {
-                    visitor((key as *mut JsStringHandle).cast::<RawGc>());
+                let entry = &mut *base.add(slot);
+                if !entry.key.is_null() {
+                    visitor((&mut entry.key as *mut JsStringHandle).cast::<RawGc>());
+                }
+                if !entry.owner.is_null() {
+                    visitor(
+                        (&mut entry.owner as *mut super::shape_body::ShapeHandle).cast::<RawGc>(),
+                    );
                 }
             }
             if !(*entry_key).is_null() {
@@ -282,6 +299,38 @@ pub(crate) fn keys_for_child(
             table.push(entry);
         },
     )
+}
+
+/// Record `owner`, just allocated, as the shape that added the last entry
+/// of `keys`, which it names with exactly that many keys.
+pub(crate) fn set_last_owner(
+    heap: &mut GcHeap,
+    keys: ShapeKeysHandle,
+    owner: super::shape_body::ShapeHandle,
+) {
+    heap.with_payload(keys, |table| {
+        let slot = table.len - 1;
+        // SAFETY: `slot < len`; the entry is initialized.
+        unsafe { (*table.entries_ptr().add(slot as usize)).owner = owner };
+    });
+    heap.record_write_edge(keys, owner.raw());
+}
+
+/// The owner of slot `slot` of a live table and whether that slot is an
+/// accessor. `slot` must be below the reading shape's key count.
+pub(crate) fn owner_of(keys: ShapeKeysHandle, slot: u32) -> (super::shape_body::ShapeHandle, bool) {
+    // SAFETY: a non-null table handle decompresses to a live ShapeKeysBody
+    // cell in non-moving old space, whose entries `0..len` are initialized;
+    // the caller's shape reads only entries below its key count.
+    unsafe {
+        let table = &*(keys
+            .as_header_ptr()
+            .cast::<u8>()
+            .add(otter_gc::header::HEADER_SIZE)
+            .cast::<ShapeKeysBody>());
+        let entry = table.entry(slot);
+        (entry.owner, entry.is_accessor)
+    }
 }
 
 /// Physical layout of the shape-owned lookup directory for native probes.
@@ -338,6 +387,7 @@ mod tests {
             hash: atom,
             flags: PropertyFlags::data_default(),
             is_accessor: false,
+            owner: super::super::shape_body::ShapeHandle::null(),
         }
     }
 

@@ -173,6 +173,10 @@ impl Interpreter {
                 VmGetOutcome::InvokeGetter { getter } => {
                     if abstract_ops::is_callable(&getter) {
                         let args: SmallVec<[Value; 8]> = SmallVec::new();
+                        // The lookup may have run a proxy trap that collected;
+                        // the receiver's register is the root.
+                        let receiver = *read_register(&stack[top_idx], obj_reg)
+                            .map_err(CommittedValueError::Fatal)?;
                         self.invoke(stack, context, &getter, receiver, args, dst)
                             .map_err(CommittedValueError::JavaScript)?;
                     } else {
@@ -822,6 +826,33 @@ impl Interpreter {
         value: Value,
         scratch_reg: u16,
     ) -> Result<bool, CommittedValueError> {
+        // The wrapper, the key string, traps and setters can all collect:
+        // the receiver and the stored value are anchored for the whole store
+        // and read back at each use.
+        let receiver_anchor = self.push_iteration_anchor(receiver) - 1;
+        let value_anchor = self.push_iteration_anchor(value) - 1;
+        let result = self.store_to_primitive_base_anchored(
+            stack,
+            context,
+            receiver_anchor,
+            key,
+            value_anchor,
+            scratch_reg,
+        );
+        self.pop_iteration_anchors_to(receiver_anchor);
+        result
+    }
+
+    fn store_to_primitive_base_anchored(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        receiver_anchor: usize,
+        key: VmPropertyKey,
+        value_anchor: usize,
+        scratch_reg: u16,
+    ) -> Result<bool, CommittedValueError> {
+        let receiver = self.iteration_anchor(receiver_anchor);
         let Some(base_object) = self
             .object_for_primitive_property_base_stack_rooted(stack, &receiver)
             .map_err(CommittedValueError::JavaScript)?
@@ -892,7 +923,8 @@ impl Interpreter {
                                 .advance_pc()
                                 .map_err(CommittedValueError::Fatal)?;
                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                            args.push(value);
+                            args.push(self.iteration_anchor(value_anchor));
+                            let receiver = self.iteration_anchor(receiver_anchor);
                             self.invoke(stack, context, &setter, receiver, args, scratch_reg)
                                 .map_err(CommittedValueError::JavaScript)?;
                             return Ok(true);
@@ -910,8 +942,8 @@ impl Interpreter {
                     let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                         proxy.target(&self.gc_heap),
                         key_value,
-                        value,
-                        receiver
+                        self.iteration_anchor(value_anchor),
+                        self.iteration_anchor(receiver_anchor)
                     ];
                     let top_idx = stack.len() - 1;
                     stack[top_idx]
@@ -931,7 +963,8 @@ impl Interpreter {
                                         object::SetOutcome::AssignData => {}
                                         object::SetOutcome::InvokeSetter { setter } => {
                                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                                            args.push(value);
+                                            args.push(self.iteration_anchor(value_anchor));
+                                            let receiver = self.iteration_anchor(receiver_anchor);
                                             self.invoke(
                                                 stack,
                                                 context,
@@ -950,6 +983,7 @@ impl Interpreter {
                                             .map_err(CommittedValueError::JavaScript)?;
                                         }
                                         object::SetOutcome::ExoticParent { parent } => {
+                                            let (value, receiver) = (self.iteration_anchor(value_anchor), self.iteration_anchor(receiver_anchor));
                                             if !self.ordinary_set_data_value(
                                                 stack,
                                                 context,
@@ -978,7 +1012,8 @@ impl Interpreter {
                                         object::SetOutcome::AssignData => {}
                                         object::SetOutcome::InvokeSetter { setter } => {
                                             let mut args: SmallVec<[Value; 8]> = SmallVec::new();
-                                            args.push(value);
+                                            args.push(self.iteration_anchor(value_anchor));
+                                            let receiver = self.iteration_anchor(receiver_anchor);
                                             self.invoke(
                                                 stack,
                                                 context,
@@ -997,6 +1032,7 @@ impl Interpreter {
                                             .map_err(CommittedValueError::JavaScript)?;
                                         }
                                         object::SetOutcome::ExoticParent { parent } => {
+                                            let (value, receiver) = (self.iteration_anchor(value_anchor), self.iteration_anchor(receiver_anchor));
                                             if !self.ordinary_set_data_value(
                                                 stack,
                                                 context,
@@ -1125,6 +1161,10 @@ impl Interpreter {
             }
             let key_str = JsString::from_key_spelling(name, self.gc_heap_mut())
                 .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            // The key string's allocation may have collected; the stored
+            // value's register is its root, and the trap and the descriptor
+            // reads below run code, so every later use reads it again.
+            value = *read_register(&stack[top_idx], src_reg).map_err(CommittedValueError::Fatal)?;
             let key_vm = VmPropertyKey::atom(atomized_key);
             let trap_args: SmallVec<[Value; 8]> = smallvec::smallvec![
                 proxy.target(&self.gc_heap),
@@ -1157,6 +1197,8 @@ impl Interpreter {
                         &key_vm,
                         0,
                     )?;
+                    let value = *read_register(&stack[top_idx], src_reg)
+                        .map_err(CommittedValueError::Fatal)?;
                     if let Some(desc) = target_desc.as_ref()
                         && !desc.configurable()
                     {
@@ -1195,6 +1237,8 @@ impl Interpreter {
                     // through the value-level funnel rather than a
                     // receiver-blind fast path.
                     let target_value = fallthrough_target;
+                    let value = *read_register(&stack[top_idx], src_reg)
+                        .map_err(CommittedValueError::Fatal)?;
                     if !self.ordinary_set_data_value(
                         stack,
                         context,

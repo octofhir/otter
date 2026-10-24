@@ -833,7 +833,35 @@ impl Interpreter {
         value: Value,
         strict: bool,
     ) -> Result<(), CommittedValueError> {
-        let actual_this = stack[top_idx].this_value;
+        // A computed key's coercion, a deferred namespace's evaluation and
+        // setters run code that can collect: the base, the value and `this`
+        // are anchored for the whole store and read back after each.
+        let base_anchor = self.push_iteration_anchor(base) - 1;
+        let value_anchor = self.push_iteration_anchor(value) - 1;
+        let this_anchor = self.push_iteration_anchor(stack[top_idx].this_value) - 1;
+        let result = self.run_store_super_property_anchored(
+            context,
+            stack,
+            top_idx,
+            [base_anchor, value_anchor, this_anchor],
+            key,
+            strict,
+        );
+        self.pop_iteration_anchors_to(base_anchor);
+        result
+    }
+
+    fn run_store_super_property_anchored(
+        &mut self,
+        context: &ExecutionContext,
+        stack: &mut ActivationStack,
+        top_idx: usize,
+        [base_anchor, value_anchor, this_anchor]: [usize; 3],
+        key: SuperReadKey<'_>,
+        strict: bool,
+    ) -> Result<(), CommittedValueError> {
+        let base = self.iteration_anchor(base_anchor);
+        let actual_this = self.iteration_anchor(this_anchor);
         if actual_this.is_hole() {
             return Err(CommittedValueError::JavaScript(self.err_this_uninit(( "must call super constructor in derived class before accessing 'this' or returning from derived constructor".to_string()).into())));
         }
@@ -854,6 +882,9 @@ impl Interpreter {
             },
             SuperReadKey::Computed(raw) => {
                 let coerced = self.coerce_property_key_value(stack, context, raw)?;
+                let base = self.iteration_anchor(base_anchor);
+                let value = self.iteration_anchor(value_anchor);
+                let actual_this = self.iteration_anchor(this_anchor);
                 if let Some(sym) = coerced.as_symbol(&self.gc_heap) {
                     // §6.2.5.5 step 6.b with a symbol key: a setter on
                     // the super base runs with the frame's `this`;
@@ -923,13 +954,16 @@ impl Interpreter {
                 }
             }
         };
-        let base_obj = base.as_object();
+        let base = self.iteration_anchor(base_anchor);
         self.ensure_deferred_namespace_ready(
             stack,
             context,
             &base,
             !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
         )?;
+        let base_obj = self.iteration_anchor(base_anchor).as_object();
+        let value = self.iteration_anchor(value_anchor);
+        let actual_this = self.iteration_anchor(this_anchor);
         let outcome = match base_obj {
             Some(obj) => crate::object::resolve_set(obj, &self.gc_heap, &key),
             None => object::SetOutcome::AssignData,
@@ -971,6 +1005,7 @@ impl Interpreter {
                     &actual_this,
                     !Self::deferred_key_is_symbol_like(&VmPropertyKey::String(&key)),
                 )?;
+                let actual_this = self.iteration_anchor(this_anchor);
                 if let Some(this_obj) = actual_this.as_object() {
                     // §10.1.9.2 OrdinarySetWithOwnDescriptor step 2.c —
                     // the data write consults `Receiver.[[GetOwnProperty]]`.
@@ -987,6 +1022,11 @@ impl Interpreter {
                             0,
                         )?;
                     }
+                    let this_obj = self
+                        .iteration_anchor(this_anchor)
+                        .as_object()
+                        .unwrap_or(this_obj);
+                    let value = self.iteration_anchor(value_anchor);
                     if !self
                         .ordinary_set_data_property(this_obj, &key, value)
                         .map_err(CommittedValueError::JavaScript)?

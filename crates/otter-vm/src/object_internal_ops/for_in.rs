@@ -57,19 +57,28 @@ impl Interpreter {
         } else {
             shape_body::prototype_of(shape)
         };
-        if !self.prototypes_enumerate_nothing(prototype)? {
-            return Ok(None);
-        }
-        if dictionary {
-            // A dictionary's keys change without a shape change: read them
-            // each time, in own-key order, without the general walk's
-            // per-key descriptor reads and shadowing set.
-            let names: Vec<String> = object::with_properties(receiver, &self.gc_heap, |p| {
-                p.enumerable_keys().map(str::to_string).collect()
-            });
-            return self.scoped_key_strings(&names).map(Some);
-        }
-        Ok(Some(Value::array(self.shape_for_in_keys(shape)?)))
+        // Proving the prototypes may build their key arrays and collect: the
+        // receiver is read back from a handle afterwards.
+        self.with_handle_scope(|interp, scope| {
+            let receiver_root = interp.scoped_value(scope, target);
+            if !interp.prototypes_enumerate_nothing(prototype)? {
+                return Ok(None);
+            }
+            if dictionary {
+                // A dictionary's keys change without a shape change: read them
+                // each time, in own-key order, without the general walk's
+                // per-key descriptor reads and shadowing set.
+                let receiver = interp
+                    .escape_scoped(receiver_root)
+                    .as_object()
+                    .expect("for-in receiver stays an object");
+                let names: Vec<String> = object::with_properties(receiver, &interp.gc_heap, |p| {
+                    p.enumerable_keys().map(str::to_string).collect()
+                });
+                return interp.scoped_key_strings(&names).map(Some);
+            }
+            Ok(Some(Value::array(interp.shape_for_in_keys(shape)?)))
+        })
     }
 
     /// Whether the chain from `prototype` holds only shaped ordinary

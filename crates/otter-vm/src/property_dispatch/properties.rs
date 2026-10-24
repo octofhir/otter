@@ -817,6 +817,13 @@ impl Interpreter {
             && object::deferred_namespace_target(o, &self.gc_heap).is_some()
         {
             self.ensure_deferred_namespace_ready(stack, context, &receiver, true)?;
+            // Evaluating the module may have collected: the registers are the
+            // roots of the target and the stored value.
+            let o = read_register(&stack[top_idx], obj_reg)
+                .map_err(CommittedValueError::Fatal)?
+                .as_object()
+                .unwrap_or(o);
+            let value = *read_register(&stack[top_idx], src).map_err(CommittedValueError::Fatal)?;
             if !self
                 .ordinary_set_data_property(o, name, value)
                 .map_err(CommittedValueError::JavaScript)?
@@ -998,6 +1005,11 @@ impl Interpreter {
                     context, owner, fid, name,
                 )
                 .map_err(CommittedValueError::JavaScript)?;
+            // Answering `name` may allocate its string and collect: the
+            // register is the closure's root.
+            let receiver =
+                *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
+            let owner = receiver.as_closure(&self.gc_heap);
 
             // §10.2.5 — the implicit `prototype` is an own data property from
             // creation; an assignment writes its slot, never the bag.

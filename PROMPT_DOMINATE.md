@@ -39,17 +39,14 @@ memory notes.
 4. Port it fully, delete what it replaces.
 5. Gates (below), one GPG-signed commit, memory note, next gap.
 
-## Standings (2026-10-20)
+## Standings (2026-10-25)
 
-Matrix m3, × node / × bun: regexp 3.35/3.99 (now ~3.0 after 4c66b5289),
-ts 2.78/3.22, deltablue 2.27/1.66, box2d 2.27/2.51, gbemu 2.09/–,
-splay 2.00/2.41, raytrace 1.55/2.92, mandreel 1.53/2.14, earley 1.42/1.37,
-crypto 1.32/–, richards 1.29/1.52, navier 1.25/–, zlib 1.09/–.
-Geomean 1.76 node / 2.28 bun. RSS over node: regexp 148/76, box2d 145/98,
-gbemu 161/121, mandreel 263/132, zlib 124/83, ts 632/504.
-Startup (with image, load ~7): `--version` 4.2 ms (bun 4.1), empty.js
-7.6 (bun 6.8), hello.js 10.6 (bun 6.8), `process.stdout` touch ~19
-(bun 13.7, node ~29).
+Matrix (HEAD e2fe4329f plus the pending slice below), × node / × bun:
+regexp 3.08/3.63, ts 2.58/3.02, deltablue 2.17/1.51, splay 2.13/3.52,
+gbemu 1.92/–, richards 1.66/1.98, earley 1.40/1.34, raytrace 1.38/2.50.
+Older m1 (35747b87f): geomean 1.73 node / 2.29 bun. Absolute ms
+(otter/node): ts 3120/1211, regexp 1271/413, richards 1065/643,
+gbemu 916/476, deltablue 613/282, splay 670/315.
 
 ## Slice queue, biggest first
 
@@ -123,122 +120,116 @@ Startup (with image, load ~7): `--version` 4.2 ms (bun 4.1), empty.js
   `--target x86_64-apple-darwin`), crate tests of every touched crate.
 - `cargo run --release -q -p otter-difftest`, and with
   `OTTER_GC_STRESS=300full OTTER_GC_VERIFY=1` and
-  `OTTER_GC_STRESS=7 OTTER_GC_VERIFY=1`: 186/0 each, on `just release`.
+  `OTTER_GC_STRESS=7 OTTER_GC_VERIFY=1`: all pass (197/0 today), on
+  `just release`.
 - `cargo clippy -p <touched crates> --all-targets -- -D warnings`, host
   and x86.
 - `bash scripts/test262-full-run.sh > test262_results/full-run-<date><n>.log`
   (background, long timeout), then
-  `python3 scripts/dev/t262_failset.py test262_results/latest.json benchmarks/results/parity-2026-10-19/t262-fail-base.txt`
-  must print "new 0".
+  `python3 scripts/dev/t262_failset.py test262_results/latest.json benchmarks/results/dominate-1024/t262-fail-base.txt`
+  must print "new 0" (base: 15 failing).
+- Never edit sources or rebuild `target/release` while a background gate
+  runs: the gates execute that binary.
 - Commit message: before/after wall-clock and instructions per affected
   fixture, load average, the gate results.
 
-## State 2026-10-21
+## State 2026-10-25
 
-Later commits (2026-10-21..23) may already cover some items below; check
-`git log` before taking one.
+### Landed since 2026-10-21 (all `G`, no trailer)
 
-### Landed 2026-10-21 (all `G`, no trailer)
+- 3adf18741 named loads on a symbol walk Symbol.prototype.
+- c5719b074 GC helpers join a parallel job only while it is open.
+- 9baef67c7 absent array element reads complete in generated code.
+- 35747b87f Array push/pop trust the %Array.prototype% chain proof
+  (deltablue −5%).
+- 77aef68c0 slot write finds its field summary in one read (gbemu −9%).
+- 210af4283, 0c8c52f47 operands held across allocation/user code are
+  re-read from roots.
+- bf00202c2 numeric appends stay in generated code; storage grows by half.
+- cf97b53bd every GC root list (`value_roots`/`slice_roots`) is
+  `&mut [&mut Value]`: a root passed as `&Value` let release builds fold the
+  caller's re-read to the pre-move address (stale String-wrapper data).
+- e2fe4329f natives take `args`/captures as `ValueWindow<'_>` (raw start +
+  length, `Deref<Target=[Value]>`), not `&[Value]`: the same miscompile at
+  native-ABI scale. Natives, helpers, macros and `NativeCallRoots` use it.
 
-- b78119439 fix(vm): a baseline poll hand-off through a generated entry is
-  no deopt.
-- f705ee8dd perf(jit): `Math` methods as `Float64Math` (a `BranchKind::Native`
-  diamond: the native arm computes inline, the other arm calls the replaced
-  method, no deopt), int32 `/` and `%` by a constant (`graph/division.rs`),
-  boolean `==` as `===`. box2d 658 → 597 ms, raytrace 830 → 783 ms.
-- 7864e3077 perf(jit): a keyed store at an Array's length appends inline.
-  gbemu 963 → 941 ms.
-- 71bb068ed perf(jit): fold decides a branch below one edge of a dominating
-  branch on the same test. No fixture moved.
-- 3f49211f0 perf(jit): diamonds that only pick a value become selects
-  (`graph/select.rs`, csel/fcsel). No fixture moved.
+### Pending slice (uncommitted in the tree when this prompt was written)
 
-The standings above predate these commits.
+Graph generic keyed access plus constructor feedback, files:
+`crates/otter-jit/src/graph/{arm64,x86_64}/keyed_{load,store}.rs`,
+`graph/ir.rs`, `crates/otter-vm/src/call_ops/constructor.rs`,
+`crates/otter-difftest/corpus/keyed_store_appends.js` (generic-site block),
+`scripts/dev/jit_callees.py`, `scripts/dev/jit_self_by_fn.py`.
+- `LoadKeyedCached` reads a hole or an index past the length as
+  `undefined` inline while the array-index protector holds and the array
+  has no sidecar.
+- `StoreKeyedCached` grows a full array on append through
+  `ARRAY_PUSH_ALLOC` at a safepoint (refusal → runtime with parked
+  operands, OOM → resume exit).
+- `note_published_constructor_receiver` skips construct-family feedback
+  when the caller frame is `Optimizing`.
+Effect: optimized-frame keyed stub calls on ts −60% (holes 158k → 5k,
+appends 300k → 28k), megamorphic-constructor probe 1333 → 1105 ms; ts
+wall within noise. Gates were running at handoff: if the tree still holds
+these files uncommitted, run the full gates, then commit them as one slice.
 
-### Order of work
+### Findings that order the next work
 
-1. **Verify x86.** `just release` first: `target/release/otter` is an
-   ungated experiment build, not HEAD. x86 test binaries hung under Rosetta
-   all night (even `--list` timed out after 30 s, processes stuck in state
-   U), so the five commits above passed x86 clippy but never ran x86 tests,
-   and they all emit x86 code (Select, Float64Math, the Native branch,
-   keyed append, constant division). Run
-   `cargo test -q -p otter-jit --lib --target x86_64-apple-darwin` and the
-   otter-vm `jit_registry` tests on x86. If Rosetta still hangs, run them
-   under Docker + qemu (memory `x86_kernels_run_under_docker_qemu`). Any
-   failure is a bug in those commits: fix it forward.
-2. **Correctness before speed.**
-   - Difftest under `OTTER_GC_STRESS=300full`, `fresh_receiver_appends.js`,
-     diverges now and then: the optimizing tier once kept appending its own
-     `y` after a setter appeared on `Point.prototype`. Suspected cause: a
-     background compile installed after its dependency was invalidated.
-     Read the install path and make it re-check dependencies at install;
-     do not loop reruns.
-   - `require("internal/otter/net")` and the other `internal/otter/*`
-     bindings load from user code; node refuses `internal/*`. Close this,
-     and check that every such native enforces its capability at the Rust
-     boundary.
-   - `otter -p … | head` panics on EPIPE; node exits quietly.
-3. **Fix the tty port** (0c56affaa, pushed on request before its full
-   gates ran):
-   - Its natives in otter-node `src/tty.rs` take any descriptor and check
-     no capability (`_caps` is unused). User code can reach them through
-     `require("internal/otter/tty")`, so it can write to, and switch the
-     blocking flag of, any descriptor the process holds. Accept only the
-     standard streams and descriptors the run opened through its
-     capability-checked fs, enforced at the Rust boundary, with a test.
-   - `process.rs` resets terminals on every exit through a hidden
-     `__otter_reset_terminals__` property on `process`, which user code can
-     see. Move it to an internal slot or a host service; the abort path in
-     `process_control.rs` uses the same property.
-   - Every program takes this exit path, so measure `hello.js` and the
-     `process.stdout` startup case against
-     `benchmarks/results/slice4/otter-select-v1`.
-   - Gates it has not run yet: `cargo test -p otter-cli --test node_util`
-     (debug build), the otter-node crate tests, and clippy on otter-node
-     and otter-runtime, on the host and on x86.
-4. **Re-measure.** Run the matrix against node and bun
-   (`scripts/dev/wallclock_matrix.sh … 5`) and the startup set with
-   hyperfine. `benchmarks/results/slice4/otter-select-v1` is HEAD's release
-   binary, startup image included; use it as the A/B base. Record the
-   standings in memory.
-5. **Slice 5: optimizing-tier code quality** (queue item 1). Gaps from the
-   box2d analysis, as shares of optimized time, still open:
-   - no double field representation: `CheckedTaggedToFloat64` costs
-     9 instructions per field read (11%);
-   - property-adding stores (10%);
-   - static function properties read through a 26-instruction
-     `LoadFunctionBag` (5.5%);
-   - block layout (4.5%);
-   - register allocation (3%).
+- ts profile (isolate self): generated code 58% (flat over hundreds of
+  functions, optimized 46% / template 9.5%), interpreter entry 6.4%,
+  keyed load stub 4.2%, keyed store stub 3.5%, host native calls 3.7%,
+  `promote_entered_function` 3.4%, `alloc_group_ensure` 1.9%,
+  constructor receiver commit 1.4%, GC ~7%, compile on isolate ~8%.
+- Remaining keyed traffic on ts, nearly all from optimized frames:
+  - shaped receivers with atom keys: 322k loads, 106k stores; all cold
+    `(shape, atom)` pairs, from small fast-mode objects used as symbol
+    tables (60% absent or inherited);
+  - arrays with index-like string keys (`"37"`): 175k loads. The graph
+    keyed load sends any non-number key on an array straight to the
+    runtime;
+  - dictionary objects with int keys: 76k loads.
+  The no-allocation leaf `keyed_named_load_leaf` refuses shaped receivers
+  on purpose (the runtime miss fills the shared table; skipping that fill
+  once measured slower for hot pairs). Count distinct pairs first: unique
+  pairs want a leaf answer (generic keyed loads in the reference engine do
+  not fill the stub cache); repeating pairs want eviction fixed.
+- Megamorphic store (`StorePropertyCached`) is the top optimized node kind
+  on ts: ~40 ns per store, the shared-table probe plus the field-type
+  observer branches. Constructor receivers come from the callee prologue
+  (two calls: probe leaf + commit), so `this` has no proved shape and
+  stores cannot lower to transitions. Tried and dropped: baking shared-table
+  store programs per (site, receiver shape). It costs 50–100 ms of bake on ts
+  (scans all 8192 ways per site) and never fires without a `this` shape
+  proof. Needs a per-atom index and a constructor `this` shape proof first.
+  Probe: `scripts/dev/probe_megamorphic_ctor*.js` (otter ~290 ns per
+  construction, node ~60, bun ~21).
+- regexp per op vs node: exec miss 43/13.5 ns, test 29/11.5, url-groups
+  299/112, trim replace 313/174; Rust layering, not the matcher.
+- Open in the same miscompile class: `GcTrace::trace_gc_roots(&self)` and
+  other callee-side traces write through shared references (low risk:
+  nothing re-reads across them).
+- Do not redo: numeric field representation via migrations / read
+  canonicalization / universal Double (rejected by whole-run CPU,
+  `benchmarks/measurements/2026-10-22-engine-architecture-audit.md`).
 
-   The largest structural item is field representation:
-   - each field has a representation in its map (none → smi → double →
-     heap object → tagged);
-   - generalizing a field deprecates the map and migrates instances;
-   - double fields are stored unboxed, as the reference does;
-   - optimized loads and stores trust the representation under a map
-     dependency.
+### Tools
 
-   Read the reference's field-representation and map-update code end to
-   end before porting it.
-
-   The select pass does not fire on deltablue's hot loop (12.15G retired
-   instructions, unchanged by the pass). Before changing the select rules,
-   dump the graphs with
-   `target/release/otter --jit-artifacts=benchmarks/results/<slice>/artifacts benchmarks/fixtures/fixed-work/deltablue.js`
-   and read what the `direction` diamonds of `input()`, `output()` and
-   `Plan.execute` actually hold.
-6. **Remaining gaps:** `Blob.prototype.stream` is missing; web
-   `performance` lacks `mark` and `measure`;
-   `runtime_handle_bounded_queue_reports_backpressure` is flaky under load
-   (100 ms timeout).
+- `scripts/dev/jit_callees.py <sample.txt>`: isolate self samples by the
+  first native callee below generated code.
+- `scripts/dev/jit_self_by_fn.py <sample.txt> <perf.map>`: generated-code
+  self samples per compiled function and tier (`--perf-basic-prof`).
+- `scripts/dev/sample_kind_prof.py`: per graph node kind (artifact writing
+  distorts absolute shares on big fixtures; rankings hold).
+- `sample <pid> <secs> 1 -file f.txt` sometimes attaches before the isolate
+  thread exists: retry until the isolate sample count is large.
+- `OTTER_STATS=1` prints `jitReentrantStubTransitions` and friends.
+- Rewrite scripts driven by rustc JSON diagnostics must restrict edits to
+  repository paths (one run once edited `~/.cargo/registry` smallvec; fix:
+  delete the extracted registry dir and rebuild).
 
 ### Measurement and housekeeping
 
-- Retired-instruction counts vary about 3% from run to run (background
-  compile timing). Compare medians of five runs:
-  `RUNS=5 benchmarks/results/slice1/measure.sh <base> <new> [fixtures]`.
-  Move the script to `scripts/dev/` in the next commit that uses it.
-- Disk: 21 GiB free; `target/debug` is 34 GB. The 1.8 GB of comparison
-  traces in `benchmarks/results/slice1-cmp/` can be deleted.
+- Retired-instruction counts vary about 3% run to run; compare medians of
+  five. `/usr/bin/time -l` prints instructions retired.
+- Disk: ~47 GiB free; `cargo clean` after commits when target exceeds
+  ~40 GB.

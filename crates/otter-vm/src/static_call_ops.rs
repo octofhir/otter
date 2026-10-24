@@ -205,12 +205,12 @@ impl Interpreter {
         operands: impl crate::executable::OperandSource,
     ) -> Result<(), CommittedValueError> {
         let top_idx = stack.len() - 1;
-        let (dst, target) = {
+        let (dst, src, target) = {
             let frame = &stack[top_idx];
             let dst = register_operand(operands.first()).map_err(CommittedValueError::Fatal)?;
             let src = register_operand(operands.get(1)).map_err(CommittedValueError::Fatal)?;
             let target = *read_register(frame, src).map_err(CommittedValueError::Fatal)?;
-            (dst, target)
+            (dst, src, target)
         };
         if let Some(keys) = self
             .for_in_cached_keys(target)
@@ -219,6 +219,9 @@ impl Interpreter {
             return finish_static_call(&mut stack[top_idx], dst, keys)
                 .map_err(CommittedValueError::Fatal);
         }
+        // Proving the cache declined may have built a prototype's key array
+        // and collected: the frame's register holds the moved target.
+        let target = *read_register(&stack[top_idx], src).map_err(CommittedValueError::Fatal)?;
         let keys = self.enumerable_for_in_string_keys_for_value(stack, context, target)?;
         let names = self
             .scoped_key_strings(&keys)

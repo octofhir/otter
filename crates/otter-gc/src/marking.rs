@@ -323,7 +323,7 @@ impl MarkingState {
         let job = ParallelMark {
             trace_table,
             initial: Mutex::new(self.worklist.drain(..).map(|h| h as usize).collect()),
-            pool: WorkPool::new(workers),
+            pool: WorkPool::new(),
             live_bytes: AtomicUsize::new(0),
         };
         // SAFETY: `mark_worker` keeps workers apart through the pool and the
@@ -634,6 +634,7 @@ unsafe fn mark_worker(context: *const (), index: usize) {
             .map(|h| h as *mut GcHeader)
             .collect()
     } else {
+        job.pool.join();
         Vec::new()
     };
     let mut live = 0usize;

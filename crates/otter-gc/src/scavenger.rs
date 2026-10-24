@@ -11,13 +11,14 @@
 //!
 //! 1. The collecting thread evacuates every root slot's target. Root
 //!    visitors run exactly as they always did, one slot at a time.
-//! 2. Every worker — the collecting thread and the heap's helpers — claims
-//!    chunks of the remembered old parents (the old/large objects the write
-//!    barrier recorded as holding an old→young edge) and re-traces them,
-//!    then drains worklists of freshly copied bodies, tracing each and
-//!    evacuating its from-space children. A worker with a long worklist hands
-//!    half to idle workers; the phase ends when every worker is idle and no
-//!    work is shared.
+//! 2. Every worker — the collecting thread and each helper that joins while
+//!    it still works — claims chunks of the remembered old parents (the
+//!    old/large objects the write barrier recorded as holding an old→young
+//!    edge) and re-traces them, then drains worklists of freshly copied
+//!    bodies, tracing each and evacuating its from-space children. A worker
+//!    with a long worklist hands half to idle workers; the phase ends when
+//!    every joined worker is idle and no work is shared, without waiting for
+//!    a helper that has not started.
 //! 3. The collecting thread runs the ephemeron fixpoint and rewrites weak
 //!    registry slots and owner-held weak observations.
 //! 4. Finalize and drop the unforwarded bodies the new space tracks for
@@ -288,7 +289,7 @@ pub unsafe fn scavenge(
     external_visit: &mut RootSlotVisitor<'_>,
     ephemeron_registry_slots: &[*mut RawGc],
     weak_registry_slots: &[*mut RawGc],
-    process_weak: &mut dyn FnMut(&mut dyn FnMut(RawGc) -> Option<RawGc>),
+    process_weak: &mut crate::heap::WeakRefProcessor<'_>,
     remembered_parents: &mut Vec<RawGc>,
     host_refs: &mut crate::host_refs::HostRefTable,
     sites: &mut crate::pretenuring::AllocationSites,
@@ -363,7 +364,7 @@ pub unsafe fn scavenge(
         remembered: snapshot_remembered,
         next_remembered: AtomicUsize::new(0),
         sites: sites.found_counters(),
-        pool: WorkPool::new(workers),
+        pool: WorkPool::new(),
         finished: Mutex::new(Vec::new()),
     };
     let mut main = Worker::new(&shared);
@@ -421,16 +422,16 @@ pub unsafe fn scavenge(
         (!raw.is_null()).then_some(raw)
     });
 
+    let main_output = main.finish();
+    let helper_outputs = shared
+        .finished
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
     let mut stats = ScavengeStats {
-        workers,
+        workers: 1 + helper_outputs.len(),
         ..ScavengeStats::default()
     };
-    for output in std::iter::once(main.finish()).chain(
-        shared
-            .finished
-            .into_inner()
-            .unwrap_or_else(PoisonError::into_inner),
-    ) {
+    for output in std::iter::once(main_output).chain(helper_outputs) {
         remembered_parents.extend(output.remembered);
         if let Some(promoted_gray) = promoted_gray.as_deref_mut() {
             promoted_gray.extend(output.promoted_gray);
@@ -482,6 +483,7 @@ unsafe fn trace_phase(context: *const (), index: usize) {
         if index == 0 {
             (*phase.main).drain();
         } else {
+            phase.shared.pool.join();
             let mut worker = Worker::new(phase.shared);
             worker.drain();
             let output = worker.finish();

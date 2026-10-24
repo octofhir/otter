@@ -264,7 +264,7 @@ impl<'rt, 'cx, 's> MarshalCx<'rt, 'cx, 's> {
         let context = self.ctx().context_ref().cloned();
         let interp = self.ctx().interp_mut();
         let realm_id = interp.active_host_realm_id();
-        let handle = crate::promise_dispatch::pending_runtime_rooted(interp, &[], &[])
+        let handle = crate::promise_dispatch::pending_runtime_rooted(interp, &mut [], &mut [])
             .map_err(|error| JsError::from_native(crate::NativeError::from(error)))?;
         let promise_value = Value::promise(handle);
         let root = interp.persistent_root_insert(promise_value);

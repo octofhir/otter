@@ -780,7 +780,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     method_spec.name,
                     method_spec.length,
                     call_target,
-                    &[&global_root, &ctor_value],
+                    &mut [&mut global_root, &mut ctor_value],
                 )
                 .map_err(::otter_vm::__macro_support::JsSurfaceError::from)?;
                 let desc = ::otter_vm::__macro_support::object::PropertyDescriptor::data(
@@ -813,7 +813,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     method_spec.name,
                     method_spec.length,
                     method_spec.call.clone(),
-                    &[&global_root, &ctor_value, &prototype_value],
+                    &mut [&mut global_root, &mut ctor_value, &mut prototype_value],
                 )
                 .map_err(::otter_vm::__macro_support::JsSurfaceError::from)?;
                 let desc = ::otter_vm::__macro_support::object::PropertyDescriptor::data(
@@ -1092,7 +1092,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     #spec_ident.name,
                     #spec_ident.length,
                     ctor_call,
-                    &[&global_root],
+                    &mut [&mut global_root],
                 )
                 .map_err(::otter_vm::__macro_support::JsSurfaceError::from)?;
                 // `ctor_value` is the single source of truth for the (possibly
@@ -1127,7 +1127,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                         method_spec.name,
                         method_spec.length,
                         call_target,
-                        &[&global_root, &ctor_value],
+                        &mut [&mut global_root, &mut ctor_value],
                     )
                     .map_err(::otter_vm::__macro_support::JsSurfaceError::from)?;
                     let desc = ::otter_vm::__macro_support::object::PropertyDescriptor::data(
@@ -1194,7 +1194,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 if #prototype_block_needed {
                     let mut prototype = ::otter_vm::__macro_support::bootstrap::alloc_object_with_value_roots_pub(
                         heap,
-                        &[&global_root, &ctor_value],
+                        &mut [&mut global_root, &mut ctor_value],
                     )
                     .map_err(::otter_vm::__macro_support::JsSurfaceError::from)?;
                     let global = global_root.as_object().expect("couch!: global for prototype parent");
@@ -1216,7 +1216,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                             method_spec.name,
                             method_spec.length,
                             method_spec.call.clone(),
-                            &[&global_root, &ctor_value, &prototype_value],
+                            &mut [&mut global_root, &mut ctor_value, &mut prototype_value],
                         )
                         .map_err(::otter_vm::__macro_support::JsSurfaceError::from)?;
                         let desc = ::otter_vm::__macro_support::object::PropertyDescriptor::data(
@@ -1249,7 +1249,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                                         accessor_spec.get_name,
                                         0,
                                         call.clone(),
-                                        &[&global_root, &ctor_value, &prototype_value],
+                                        &mut [&mut global_root, &mut ctor_value, &mut prototype_value],
                                     )
                                     .map_err(::otter_vm::__macro_support::JsSurfaceError::from)?,
                                 ))
@@ -1258,7 +1258,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                         };
                         // The getter is live across the setter allocation; thread
                         // it as an extra root so `getter_root` tracks any move.
-                        let getter_root = getter.unwrap_or_else(::otter_vm::__macro_support::Value::undefined);
+                        let mut getter_root = getter.unwrap_or_else(::otter_vm::__macro_support::Value::undefined);
                         let setter = match &accessor_spec.set {
                             ::core::option::Option::Some(call) => {
                                 ::core::option::Option::Some(::otter_vm::__macro_support::Value::native_function(
@@ -1267,11 +1267,11 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                                         accessor_spec.set_name,
                                         1,
                                         call.clone(),
-                                        &[
-                                            &global_root,
-                                            &ctor_value,
-                                            &prototype_value,
-                                            &getter_root,
+                                        &mut [
+                                            &mut global_root,
+                                            &mut ctor_value,
+                                            &mut prototype_value,
+                                            &mut getter_root,
                                         ],
                                     )
                                     .map_err(::otter_vm::__macro_support::JsSurfaceError::from)?,

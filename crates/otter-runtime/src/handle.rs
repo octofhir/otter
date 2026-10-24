@@ -4676,8 +4676,8 @@ mod inbox_tests {
             .expect("establish dynamic-import context");
         let load_promise = otter_vm::promise_dispatch::pending_runtime_rooted(
             &mut runner.runtime.interp,
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )
         .expect("load promise");
         let load_token = runner.runtime.interp.dynamic_import_registry_mut().insert(
@@ -4687,8 +4687,8 @@ mod inbox_tests {
         );
         let prepared_promise = otter_vm::promise_dispatch::pending_runtime_rooted(
             &mut runner.runtime.interp,
-            &[],
-            &[],
+            &mut [],
+            &mut [],
         )
         .expect("prepared promise");
         let prepared_token = runner.runtime.interp.dynamic_import_registry_mut().insert(

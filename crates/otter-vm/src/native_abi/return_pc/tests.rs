@@ -154,7 +154,7 @@ fn pending_and_published_host_edges_trace_real_moving_homes_without_pc_stamps() 
     let mut stack = ActivationStack::new();
     vm.with_runtime_turn(&mut stack, |turn| {
         let (vm, _) = turn.into_parts();
-        let object = vm.alloc_host_object_with_roots(&[], &[]).unwrap();
+        let object = vm.alloc_host_object_with_roots(&mut [], &mut []).unwrap();
         let value = Value::object(object);
         let before = value.to_bits();
         let mut home = [value];
@@ -252,7 +252,7 @@ fn pending_and_published_host_edges_trace_real_moving_homes_without_pc_stamps() 
                 .call_pc,
             7
         );
-        let young = vm.alloc_host_object_with_roots(&[], &[]).unwrap();
+        let young = vm.alloc_host_object_with_roots(&mut [], &mut []).unwrap();
         home[0] = Value::object(young);
         let before = home[0].to_bits();
         vm.force_gc().unwrap();

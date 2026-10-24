@@ -338,7 +338,7 @@ pub fn install_iterator_well_knowns_post_bootstrap(
             "[Symbol.iterator]",
             0,
             iterator_proto_symbol_iterator,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );
@@ -352,7 +352,7 @@ pub fn install_iterator_well_knowns_post_bootstrap(
             "get [Symbol.toStringTag]",
             0,
             iterator_proto_to_string_tag_get,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );
@@ -362,7 +362,7 @@ pub fn install_iterator_well_knowns_post_bootstrap(
             "set [Symbol.toStringTag]",
             1,
             iterator_proto_to_string_tag_set,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );
@@ -372,7 +372,7 @@ pub fn install_iterator_well_knowns_post_bootstrap(
             "get constructor",
             0,
             iterator_proto_constructor_get,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );
@@ -382,7 +382,7 @@ pub fn install_iterator_well_knowns_post_bootstrap(
             "set constructor",
             1,
             iterator_proto_constructor_set,
-            &[],
+            &mut [],
         )
         .map_err(JsSurfaceError::from)?,
     );
@@ -568,7 +568,7 @@ pub fn build_builtin_iterator_prototypes_post_bootstrap(
             scope.add_value(&mut function_root);
         }
         function_root = Value::native_function(
-            native_static_with_value_roots(heap, name, length, call, &[])
+            native_static_with_value_roots(heap, name, length, call, &mut [])
                 .map_err(JsSurfaceError::from)?,
         );
         let proto = proto_root
@@ -713,10 +713,10 @@ fn iterator_receiver(
         return Ok(h);
     }
     if let Some(g) = this_value.as_generator() {
-        let gen_value = Value::generator(g);
+        let mut gen_value = Value::generator(g);
         let state = crate::IteratorState::Generator { handle: g };
         return ctx
-            .alloc_iterator_state(state, &[&gen_value], &[])
+            .alloc_iterator_state(state, &mut [&mut gen_value], &mut [])
             .map_err(|error| crate::NativeError::OutOfMemory {
                 name,
                 requested_bytes: error.requested_bytes(),
@@ -741,7 +741,7 @@ fn iterator_receiver(
                 .ordinary_get_value(stack, Some(&exec_ctx), this_value, this_value, &next_key, 0)
                 .map_err(|e| e.into_native(interp, name))
         })?;
-        let next_method = match outcome {
+        let mut next_method = match outcome {
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
                 ctx.call(getter, *ctx.this_value(), &[])?
@@ -753,13 +753,13 @@ fn iterator_receiver(
         // then, and baking it into the iterator state would hand every
         // later step and close a dead object.
         let this_value = *ctx.this_value();
-        let this_root = this_value;
+        let mut this_root = this_value;
         let state = crate::IteratorState::User {
             iterator: this_value,
             next_method: Some(next_method),
         };
         return ctx
-            .alloc_iterator_state(state, &[&this_root, &next_method], &[])
+            .alloc_iterator_state(state, &mut [&mut this_root, &mut next_method], &mut [])
             .map_err(|error| crate::NativeError::OutOfMemory {
                 name,
                 requested_bytes: error.requested_bytes(),
@@ -826,10 +826,10 @@ fn iterator_receiver_builtin(
         return Ok(h);
     }
     if let Some(g) = this_value.as_generator() {
-        let gen_value = Value::generator(g);
+        let mut gen_value = Value::generator(g);
         let state = crate::IteratorState::Generator { handle: g };
         return ctx
-            .alloc_iterator_state(state, &[&gen_value], &[])
+            .alloc_iterator_state(state, &mut [&mut gen_value], &mut [])
             .map_err(|_| crate::NativeError::TypeError {
                 name,
                 reason: "iterator allocation failed".to_string(),
@@ -882,8 +882,8 @@ fn iterator_proto_map(
     }
     let source = iterator_receiver(ctx, "Iterator.prototype.map")?;
     // GetIteratorDirect can run a user `next` getter; re-read the callback.
-    let mapper = rooted_arg(args, 0);
-    let source_value = Value::iterator(source);
+    let mut mapper = rooted_arg(args, 0);
+    let mut source_value = Value::iterator(source);
     let state = crate::IteratorState::Map {
         source,
         mapper,
@@ -891,7 +891,7 @@ fn iterator_proto_map(
         counter: 0,
     };
     let handle = ctx
-        .alloc_iterator_state(state, &[&source_value, &mapper], &[])
+        .alloc_iterator_state(state, &mut [&mut source_value, &mut mapper], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.prototype.map",
             reason: "iterator allocation failed".to_string(),
@@ -910,8 +910,8 @@ fn iterator_proto_filter(
     }
     let source = iterator_receiver(ctx, "Iterator.prototype.filter")?;
     // GetIteratorDirect can run a user `next` getter; re-read the callback.
-    let predicate = rooted_arg(args, 0);
-    let source_value = Value::iterator(source);
+    let mut predicate = rooted_arg(args, 0);
+    let mut source_value = Value::iterator(source);
     let state = crate::IteratorState::Filter {
         source,
         predicate,
@@ -919,7 +919,7 @@ fn iterator_proto_filter(
         counter: 0,
     };
     let handle = ctx
-        .alloc_iterator_state(state, &[&source_value, &predicate], &[])
+        .alloc_iterator_state(state, &mut [&mut source_value, &mut predicate], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.prototype.filter",
             reason: "iterator allocation failed".to_string(),
@@ -938,14 +938,14 @@ fn iterator_proto_take(
         Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
     };
     let source = iterator_receiver(ctx, "Iterator.prototype.take")?;
-    let source_value = Value::iterator(source);
+    let mut source_value = Value::iterator(source);
     let state = crate::IteratorState::Take {
         source,
         remaining: n,
         running: false,
     };
     let handle = ctx
-        .alloc_iterator_state(state, &[&source_value], &[])
+        .alloc_iterator_state(state, &mut [&mut source_value], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.prototype.take",
             reason: "iterator allocation failed".to_string(),
@@ -964,14 +964,14 @@ fn iterator_proto_drop(
         Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
     };
     let source = iterator_receiver(ctx, "Iterator.prototype.drop")?;
-    let source_value = Value::iterator(source);
+    let mut source_value = Value::iterator(source);
     let state = crate::IteratorState::Drop {
         source,
         to_drop: n,
         running: false,
     };
     let handle = ctx
-        .alloc_iterator_state(state, &[&source_value], &[])
+        .alloc_iterator_state(state, &mut [&mut source_value], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.prototype.drop",
             reason: "iterator allocation failed".to_string(),
@@ -990,8 +990,8 @@ fn iterator_proto_flat_map(
     }
     let source = iterator_receiver(ctx, "Iterator.prototype.flatMap")?;
     // GetIteratorDirect can run a user `next` getter; re-read the callback.
-    let mapper = rooted_arg(args, 0);
-    let source_value = Value::iterator(source);
+    let mut mapper = rooted_arg(args, 0);
+    let mut source_value = Value::iterator(source);
     let state = crate::IteratorState::FlatMap {
         source,
         mapper,
@@ -1000,7 +1000,7 @@ fn iterator_proto_flat_map(
         counter: 0,
     };
     let handle = ctx
-        .alloc_iterator_state(state, &[&source_value, &mapper], &[])
+        .alloc_iterator_state(state, &mut [&mut source_value, &mut mapper], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.prototype.flatMap",
             reason: "iterator allocation failed".to_string(),
@@ -1048,10 +1048,10 @@ fn iterator_span_size_arg(args: &[Value], name: &'static str) -> Result<u32, cra
 /// rooted across the allocation.
 fn iterator_span_buffer(
     ctx: &mut crate::NativeCtx<'_>,
-    source_value: &Value,
+    source_value: &mut Value,
     name: &'static str,
 ) -> Result<crate::array::JsArray, crate::NativeError> {
-    ctx.array_from_elements_with_roots(std::iter::empty::<Value>(), &[source_value], &[])
+    ctx.array_from_elements_with_roots(std::iter::empty::<Value>(), &mut [source_value], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name,
             reason: "buffer allocation failed".to_string(),
@@ -1074,9 +1074,9 @@ fn iterator_proto_chunks(
         Err(err) => return Err(close_receiver_on_validation_failure(ctx, this_value, err)),
     };
     let source = iterator_receiver(ctx, "Iterator.prototype.chunks")?;
-    let source_value = Value::iterator(source);
-    let buffer = iterator_span_buffer(ctx, &source_value, "Iterator.prototype.chunks")?;
-    let buffer_value = Value::array(buffer);
+    let mut source_value = Value::iterator(source);
+    let buffer = iterator_span_buffer(ctx, &mut source_value, "Iterator.prototype.chunks")?;
+    let mut buffer_value = Value::array(buffer);
     let state = crate::IteratorState::Chunks {
         source,
         buffer,
@@ -1084,7 +1084,7 @@ fn iterator_proto_chunks(
         running: false,
     };
     let handle = ctx
-        .alloc_iterator_state(state, &[&source_value, &buffer_value], &[])
+        .alloc_iterator_state(state, &mut [&mut source_value, &mut buffer_value], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.prototype.chunks",
             reason: "iterator allocation failed".to_string(),
@@ -1138,9 +1138,9 @@ fn iterator_proto_windows(
         }
     };
     let source = iterator_receiver(ctx, "Iterator.prototype.windows")?;
-    let source_value = Value::iterator(source);
-    let buffer = iterator_span_buffer(ctx, &source_value, "Iterator.prototype.windows")?;
-    let buffer_value = Value::array(buffer);
+    let mut source_value = Value::iterator(source);
+    let buffer = iterator_span_buffer(ctx, &mut source_value, "Iterator.prototype.windows")?;
+    let mut buffer_value = Value::array(buffer);
     let state = crate::IteratorState::Windows {
         source,
         buffer,
@@ -1149,7 +1149,7 @@ fn iterator_proto_windows(
         running: false,
     };
     let handle = ctx
-        .alloc_iterator_state(state, &[&source_value, &buffer_value], &[])
+        .alloc_iterator_state(state, &mut [&mut source_value, &mut buffer_value], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.prototype.windows",
             reason: "iterator allocation failed".to_string(),
@@ -1256,13 +1256,9 @@ fn iterator_proto_to_array(
         }
         collected.push(v);
     }
-    let iter_value = Value::iterator(handle);
+    let mut iter_value = Value::iterator(handle);
     let arr = ctx
-        .array_from_elements_with_roots(
-            collected.iter().cloned(),
-            &[&iter_value],
-            &[collected.as_slice()],
-        )
+        .array_from_elements_with_roots(collected, &mut [&mut iter_value], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.prototype.toArray",
             reason: "array allocation failed".to_string(),
@@ -2217,12 +2213,12 @@ fn iterator_concat_native(
         .collect();
     ctx.cx.interp.pop_iteration_anchors_to(base);
     let sources = ctx
-        .array_from_elements_with_roots(pairs.iter().copied(), &[], &[pairs.as_slice()])
+        .array_from_elements_with_roots(pairs, &mut [], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.concat",
             reason: "source list allocation failed".to_string(),
         })?;
-    let sources_value = Value::array(sources);
+    let mut sources_value = Value::array(sources);
     let state = crate::IteratorState::Concat {
         sources,
         inner: None,
@@ -2230,7 +2226,7 @@ fn iterator_concat_native(
         running: false,
     };
     let handle = ctx
-        .alloc_iterator_state(state, &[&sources_value], &[])
+        .alloc_iterator_state(state, &mut [&mut sources_value], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.concat",
             reason: "iterator allocation failed".to_string(),
@@ -2485,21 +2481,21 @@ fn zip_iterator_direct(
                 .ordinary_get_value(stack, Some(exec_ctx), iterator, iterator, &next_key, 0)
                 .map_err(|e| e.into_native(interp, name))
         })?;
-        let next_method = match outcome {
+        let mut next_method = match outcome {
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
                 let iterator = zip_value(ctx, iterator_slot);
                 ctx.call(getter, iterator, &[])?
             }
         };
-        let iterator = zip_value(ctx, iterator_slot);
+        let mut iterator = zip_value(ctx, iterator_slot);
         ctx.alloc_iterator_state(
             crate::IteratorState::User {
                 iterator,
                 next_method: Some(next_method),
             },
-            &[&iterator, &next_method],
-            &[],
+            &mut [&mut iterator, &mut next_method],
+            &mut [],
         )
         .map_err(|_| crate::NativeError::TypeError {
             name,
@@ -2564,29 +2560,33 @@ fn zip_new_state(
         reason: "iterator allocation failed".to_string(),
     };
     let iters = ctx
-        .array_from_elements_with_roots(std::iter::empty::<Value>(), &[], &[])
+        .array_from_elements_with_roots(std::iter::empty::<Value>(), &mut [], &mut [])
         .map_err(oom)?;
-    let iters_value = Value::array(iters);
+    let mut iters_value = Value::array(iters);
     let padding = ctx
-        .array_from_elements_with_roots(std::iter::empty::<Value>(), &[&iters_value], &[])
+        .array_from_elements_with_roots(
+            std::iter::empty::<Value>(),
+            &mut [&mut iters_value],
+            &mut [],
+        )
         .map_err(oom)?;
-    let padding_value = Value::array(padding);
+    let mut padding_value = Value::array(padding);
     let keys = ctx
         .array_from_elements_with_roots(
             std::iter::empty::<Value>(),
-            &[&iters_value, &padding_value],
-            &[],
+            &mut [&mut iters_value, &mut padding_value],
+            &mut [],
         )
         .map_err(oom)?;
-    let keys_value = Value::array(keys);
+    let mut keys_value = Value::array(keys);
     let results = ctx
         .array_from_elements_with_roots(
             std::iter::empty::<Value>(),
-            &[&iters_value, &padding_value, &keys_value],
-            &[],
+            &mut [&mut iters_value, &mut padding_value, &mut keys_value],
+            &mut [],
         )
         .map_err(oom)?;
-    let results_value = Value::array(results);
+    let mut results_value = Value::array(results);
     // Each allocation above can relocate the arrays built before it;
     // only the rooted `Value` locals were rewritten.
     let stale = || crate::NativeError::TypeError {
@@ -2606,8 +2606,13 @@ fn zip_new_state(
     let handle = ctx
         .alloc_iterator_state(
             state,
-            &[&iters_value, &padding_value, &keys_value, &results_value],
-            &[],
+            &mut [
+                &mut iters_value,
+                &mut padding_value,
+                &mut keys_value,
+                &mut results_value,
+            ],
+            &mut [],
         )
         .map_err(oom)?;
     // The body was copied in before the allocation settled; re-point it
@@ -3188,8 +3193,8 @@ fn iterator_from_native(
         Err(e) => return finish(ctx, iter_slot, Err(e)),
     };
     // `@@hasInstance` can run user code — re-read both anchors.
-    let iter_value = ctx.cx.interp.iteration_anchor(iter_slot);
-    let next_method = ctx.cx.interp.iteration_anchor(next_slot);
+    let mut iter_value = ctx.cx.interp.iteration_anchor(iter_slot);
+    let mut next_method = ctx.cx.interp.iteration_anchor(next_slot);
     if is_iterator_instance {
         return finish(ctx, iter_slot, Ok(iter_value));
     }
@@ -3198,7 +3203,7 @@ fn iterator_from_native(
         next_method: Some(next_method),
     };
     let handle = ctx
-        .alloc_iterator_state(state, &[&iter_value, &next_method], &[])
+        .alloc_iterator_state(state, &mut [&mut iter_value, &mut next_method], &mut [])
         .map_err(|_| crate::NativeError::TypeError {
             name: "Iterator.from",
             reason: "iterator allocation failed".to_string(),
@@ -3320,7 +3325,7 @@ fn async_generator_validate(
         let reason = scope.raw(reason);
         let promise = scope.with_turn_parts(|interp, stack| {
             crate::promise_dispatch::PromiseBuilder::with_context(exec_ctx)
-                .rejected_stack_rooted(interp, stack, reason, &[], &[])
+                .rejected_stack_rooted(interp, stack, reason, &mut [], &mut [])
                 .map_err(crate::NativeError::from)
         })?;
         Ok(Some(Value::promise(promise)))
@@ -3379,7 +3384,7 @@ fn async_generator_resumption(
             let reason = scope.raw(reason);
             let promise = scope.with_turn_parts(|interp, stack| {
                 crate::promise_dispatch::PromiseBuilder::with_context(exec_ctx)
-                    .rejected_stack_rooted(interp, stack, reason, &[], &[])
+                    .rejected_stack_rooted(interp, stack, reason, &mut [], &mut [])
                     .map_err(crate::NativeError::from)
             })?;
             Ok(Value::promise(promise))

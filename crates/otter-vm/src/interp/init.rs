@@ -140,12 +140,12 @@ impl Interpreter {
             resolve_ctor_prototype(&mut gc_heap, global_this, "Function")
         {
             let has_instance = well_known_symbols.get(symbol::WellKnown::HasInstance);
-            let global_root = Value::object(global_this);
+            let mut global_root = Value::object(global_this);
             function_prototype::install_symbol_has_instance(
                 &mut gc_heap,
                 function_proto,
                 has_instance,
-                &[&global_root],
+                &mut [&mut global_root],
             )?;
             // The installer can allocate and relocate the young prototype.
             // Resolve it again through the rooted global graph instead of
@@ -615,12 +615,12 @@ impl Interpreter {
             let has_instance = self
                 .well_known_symbols
                 .get(crate::symbol::WellKnown::HasInstance);
-            let global_root = Value::object(global_this);
+            let mut global_root = Value::object(global_this);
             function_prototype::install_symbol_has_instance(
                 &mut self.gc_heap,
                 function_prototype,
                 has_instance,
-                &[&global_root],
+                &mut [&mut global_root],
             )
             .map_err(|err| self.bootstrap_surface_error(err, "Function"))?;
             // The installer above allocates. Re-read both objects from the

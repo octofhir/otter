@@ -907,7 +907,7 @@ impl Interpreter {
         // resolved value once microtasks drain.
         let entry_promise = if entry_is_async {
             let result = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                .pending_stack_rooted(self, &stack, &[], &[])
+                .pending_stack_rooted(self, &stack, &mut [], &mut [])
                 .map_err(|oom| (VmError::from(oom), Vec::new()))?;
             let frame = stack.pending_mut().expect("entry inputs were just queued");
             self.prepared_set_async_state(

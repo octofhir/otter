@@ -264,7 +264,7 @@ fn moving_collection_rewrites_the_entire_native_call_chain() {
     let mut stack = crate::ActivationStack::new();
     vm.with_runtime_turn(&mut stack, |turn| {
         let (vm, _) = turn.into_parts();
-        let object = vm.alloc_host_object_with_roots(&[], &[]).unwrap();
+        let object = vm.alloc_host_object_with_roots(&mut [], &mut []).unwrap();
         let args = [Value::number_i32(16), Value::object(object)];
         let mut harness = Harness {
             vm,

@@ -138,15 +138,15 @@ fn install_function_prototype_callable_and_accessors(
         None => return Ok(()),
     };
 
-    let global_root = Value::object(global);
-    let prototype_root = Value::object(prototype);
-    let ctor_root = Value::native_function(ctor);
+    let mut global_root = Value::object(global);
+    let mut prototype_root = Value::object(prototype);
+    let mut ctor_root = Value::native_function(ctor);
     let prototype_call = crate::bootstrap::native_static_with_value_roots(
         heap,
         "",
         0,
         function_prototype_call,
-        &[&global_root, &prototype_root, &ctor_root],
+        &mut [&mut global_root, &mut prototype_root, &mut ctor_root],
     )
     .map_err(JsSurfaceError::from)?;
     // `native_static_with_value_roots` may move every rooted bootstrap object.
@@ -182,7 +182,11 @@ fn install_function_prototype_callable_and_accessors(
         return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
     };
 
-    function_prototype::install_restricted_accessors(heap, prototype, &[&global_root, &ctor_root])
+    function_prototype::install_restricted_accessors(
+        heap,
+        prototype,
+        &mut [&mut global_root, &mut ctor_root],
+    )
 }
 
 /// `Function.prototype()` — returns `undefined` per §20.2.3.

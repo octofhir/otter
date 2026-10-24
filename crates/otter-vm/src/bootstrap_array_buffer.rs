@@ -859,7 +859,7 @@ fn ab_transfer_inner(
         } else {
             let result = scope
                 .context()
-                .array_buffer_resizable_rooted(new_len, max, &[], &[])?
+                .array_buffer_resizable_rooted(new_len, max, &mut [], &mut [])?
                 .ok_or_else(|| NativeError::TypeError {
                     name,
                     reason: "allocation failed".to_string(),

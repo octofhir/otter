@@ -1142,7 +1142,7 @@ pub(crate) fn set_proto_values(
     _args: &[Value],
 ) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.values")?;
-    let set_value = Value::set(s);
+    let mut set_value = Value::set(s);
     let iter = ctx
         .alloc_iterator_state(
             crate::IteratorState::SetCollection {
@@ -1150,8 +1150,8 @@ pub(crate) fn set_proto_values(
                 index: 0,
                 kind: crate::SetIteratorKind::Value,
             },
-            &[&set_value],
-            &[],
+            &mut [&mut set_value],
+            &mut [],
         )
         .map_err(NativeError::from)?;
     Ok(Value::iterator(iter))
@@ -1159,7 +1159,7 @@ pub(crate) fn set_proto_values(
 
 fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.entries")?;
-    let set_value = Value::set(s);
+    let mut set_value = Value::set(s);
     let iter = ctx
         .alloc_iterator_state(
             crate::IteratorState::SetCollection {
@@ -1167,8 +1167,8 @@ fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, 
                 index: 0,
                 kind: crate::SetIteratorKind::Entry,
             },
-            &[&set_value],
-            &[],
+            &mut [&mut set_value],
+            &mut [],
         )
         .map_err(NativeError::from)?;
     Ok(Value::iterator(iter))
@@ -1893,7 +1893,7 @@ fn make_map_iterator(
     m: crate::JsMap,
     kind: MapIterKind,
 ) -> Result<Value, NativeError> {
-    let map_value = Value::map(m);
+    let mut map_value = Value::map(m);
     let iter = ctx
         .alloc_iterator_state(
             crate::IteratorState::MapCollection {
@@ -1901,8 +1901,8 @@ fn make_map_iterator(
                 index: 0,
                 kind: kind.iterator_kind(),
             },
-            &[&map_value],
-            &[],
+            &mut [&mut map_value],
+            &mut [],
         )
         .map_err(NativeError::from)?;
     Ok(Value::iterator(iter))

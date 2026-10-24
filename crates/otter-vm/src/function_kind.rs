@@ -484,7 +484,7 @@ impl Interpreter {
                     name,
                     1,
                     call,
-                    &[],
+                    &mut [],
                 )?;
                 let shared = shared_value
                     .as_object()
@@ -583,7 +583,7 @@ impl Interpreter {
                 "[Symbol.asyncIterator]",
                 0,
                 crate::intrinsics::iterator::async_iterator_proto_symbol_async_iterator,
-                &[&proto_root],
+                &mut [&mut proto_root],
             )?);
         let async_iter_sym = self.well_known_symbols.get(WellKnown::AsyncIterator);
         let mut proto = proto_root

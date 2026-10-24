@@ -113,8 +113,8 @@ fn direct_regexp_and_promise_opcodes_never_rebuild_completed_materialization_oom
                             },
                         )?;
                         scope.set(source, "return", close)?;
-                        let source_value = scope.raw(source);
-                        let next_value = scope.raw(next);
+                        let mut source_value = scope.raw(source);
+                        let mut next_value = scope.raw(next);
                         let source = scope.with_turn_parts(|interp, _| {
                             interp
                                 .alloc_runtime_rooted_iterator_state(
@@ -122,8 +122,8 @@ fn direct_regexp_and_promise_opcodes_never_rebuild_completed_materialization_oom
                                         iterator: source_value,
                                         next_method: Some(next_value),
                                     },
-                                    &[&source_value, &next_value],
-                                    &[],
+                                    &mut [&mut source_value, &mut next_value],
+                                    &mut [],
                                 )
                                 .map_err(|error| {
                                     crate::native_function::vm_to_native_error(
@@ -133,7 +133,7 @@ fn direct_regexp_and_promise_opcodes_never_rebuild_completed_materialization_oom
                                     )
                                 })
                         })?;
-                        let mapper = scope.raw(callback);
+                        let mut mapper = scope.raw(callback);
                         let iterator = scope.with_turn_parts(|interp, _| {
                             interp
                                 .alloc_runtime_rooted_iterator_state(
@@ -143,8 +143,8 @@ fn direct_regexp_and_promise_opcodes_never_rebuild_completed_materialization_oom
                                         running: false,
                                         counter: 0,
                                     },
-                                    &[&mapper, &Value::iterator(source)],
-                                    &[],
+                                    &mut [&mut mapper, &mut Value::iterator(source)],
+                                    &mut [],
                                 )
                                 .map_err(|error| {
                                     crate::native_function::vm_to_native_error(
@@ -163,7 +163,7 @@ fn direct_regexp_and_promise_opcodes_never_rebuild_completed_materialization_oom
                         let matcher = scope.construct(constructor, &[pattern, flags])?;
                         scope.set(matcher, "exec", callback)?;
                         let input = scope.string("x")?;
-                        let matcher = scope.raw(matcher);
+                        let mut matcher = scope.raw(matcher);
                         let input = scope
                             .raw(input)
                             .as_string(scope.context().heap())
@@ -178,8 +178,8 @@ fn direct_regexp_and_promise_opcodes_never_rebuild_completed_materialization_oom
                                         full_unicode: false,
                                         done: false,
                                     },
-                                    &[&matcher, &Value::string(input)],
-                                    &[],
+                                    &mut [&mut matcher, &mut Value::string(input)],
+                                    &mut [],
                                 )
                                 .map_err(|error| {
                                     crate::native_function::vm_to_native_error(

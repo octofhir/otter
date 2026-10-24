@@ -447,7 +447,7 @@ pub(crate) fn string_proto_iterator(
         };
         let iterator = scope
             .context()
-            .alloc_iterator_state(state, &[], &[])
+            .alloc_iterator_state(state, &mut [], &mut [])
             .map_err(|_| NativeError::TypeError {
                 name: NAME,
                 reason: "out of memory".to_string(),
@@ -483,14 +483,14 @@ pub(crate) fn install_string_iterator_post_bootstrap(
     let Some(mut prototype) = prototype else {
         return Ok(());
     };
-    let global_root = Value::object(global);
-    let prototype_root = Value::object(prototype);
+    let mut global_root = Value::object(global);
+    let mut prototype_root = Value::object(prototype);
     let getter = crate::bootstrap::native_static_with_value_roots(
         heap,
         "[Symbol.iterator]",
         0,
         string_proto_iterator,
-        &[&global_root, &prototype_root],
+        &mut [&mut global_root, &mut prototype_root],
     )
     .map_err(crate::js_surface::JsSurfaceError::from)?;
     let sym = well_known.get(symbol::WellKnown::Iterator);
@@ -543,8 +543,8 @@ pub(crate) fn array_iterator_factory_call(
     };
     Ok(Value::iterator(ctx.alloc_iterator_state(
         state,
-        &[],
-        &[],
+        &mut [],
+        &mut [],
     )?))
 }
 

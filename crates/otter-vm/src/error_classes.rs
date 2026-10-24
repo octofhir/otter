@@ -203,15 +203,15 @@ unsafe fn trace_class_entries(slot: *mut (), visitor: &mut dyn FnMut(*mut RawGc)
     }
 }
 
-fn trace_value_roots(roots: &[&Value], visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
-    for value in roots {
-        value.trace_value_slots(visitor);
+fn trace_value_roots(roots: &mut [&mut Value], visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)) {
+    for value in roots.iter_mut() {
+        value.trace_value_slot_mut(visitor);
     }
 }
 
 fn alloc_registry_object(
     gc_heap: &mut otter_gc::GcHeap,
-    roots: &[&Value],
+    roots: &mut [&mut Value],
 ) -> Result<JsObject, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         trace_value_roots(roots, visitor);
@@ -228,7 +228,7 @@ fn alloc_registry_object(
 fn from_str_rooted(
     s: &str,
     gc_heap: &mut otter_gc::GcHeap,
-    roots: &[&Value],
+    roots: &mut [&mut Value],
 ) -> Result<JsString, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         trace_value_roots(roots, visitor);
@@ -241,7 +241,7 @@ fn native_static_with_roots(
     name: &'static str,
     length: u8,
     call: crate::native_function::NativeFastFn,
-    roots: &[&Value],
+    roots: &mut [&mut Value],
 ) -> Result<NativeFunction, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         trace_value_roots(roots, visitor);
@@ -254,7 +254,7 @@ fn native_constructor_static_with_roots(
     name: &'static str,
     length: u8,
     call: crate::native_function::NativeFastFn,
-    roots: &[&Value],
+    roots: &mut [&mut Value],
 ) -> Result<NativeFunction, otter_gc::OutOfMemory> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         trace_value_roots(roots, visitor);
@@ -593,18 +593,22 @@ impl ErrorClassRegistry {
             );
         }
 
-        error_proto_root = Value::object(alloc_registry_object(gc_heap, &[])?);
+        error_proto_root = Value::object(alloc_registry_object(gc_heap, &mut [])?);
         // §20.5.3.{4,5} — `Error.prototype.name = "Error"` and
         // `Error.prototype.message = ""` are data properties with
         // attributes `{ writable: true, enumerable: false,
         // configurable: true }`. The plain `set` path leaves
         // `enumerable: true` which fails every `name`/`message`
         // descriptor test in `built-ins/{Error,NativeErrors}/prototype/*`.
-        error_name_root = Value::string(from_str_rooted("Error", gc_heap, &[&error_proto_root])?);
+        error_name_root = Value::string(from_str_rooted(
+            "Error",
+            gc_heap,
+            &mut [&mut error_proto_root],
+        )?);
         empty_root = Value::string(from_str_rooted(
             "",
             gc_heap,
-            &[&error_proto_root, &error_name_root],
+            &mut [&mut error_proto_root, &mut error_name_root],
         )?);
         // The string allocations above may have relocated the young prototype;
         // take its current handle from the rooted Value, and write through
@@ -666,7 +670,7 @@ impl ErrorClassRegistry {
             "toString",
             0,
             error_prototype_to_string,
-            &[&error_proto_root],
+            &mut [&mut error_proto_root],
         )?);
         let mut error_proto = error_proto_root
             .as_object()
@@ -835,14 +839,14 @@ impl ErrorClassRegistry {
             "get stack",
             0,
             error_stack_get,
-            &[&error_proto_root],
+            &mut [&mut error_proto_root],
         )?);
         stack_set_root = Value::native_function(native_static_with_roots(
             gc_heap,
             "set stack",
             1,
             error_stack_set,
-            &[&error_proto_root],
+            &mut [&mut error_proto_root],
         )?);
         let mut error_proto = error_proto_root
             .as_object()
@@ -1226,7 +1230,7 @@ impl ErrorClassRegistry {
         // `[[Enumerable]]: false`.
         error_ctor_root = Value::object(alloc_registry_object(
             gc_heap,
-            &[&error_proto_root, &to_string_root],
+            &mut [&mut error_proto_root, &mut to_string_root],
         )?);
         // §20.5.2 — `Error.prototype` lives on the constructor as
         // `{ writable: false, enumerable: false, configurable: false }`.
@@ -1260,7 +1264,7 @@ impl ErrorClassRegistry {
             "Error",
             1,
             ctor_error,
-            &[&error_proto_root, &error_ctor_root],
+            &mut [&mut error_proto_root, &mut error_ctor_root],
         )?);
         error_ctor = error_ctor_root
             .as_object()
@@ -1284,7 +1288,7 @@ impl ErrorClassRegistry {
             "isError",
             1,
             error_is_error,
-            &[],
+            &mut [],
         )?);
         error_ctor = error_ctor_root
             .as_object()
@@ -1378,7 +1382,7 @@ impl ErrorClassRegistry {
             "captureStackTrace",
             2,
             error_capture_stack_trace,
-            &[],
+            &mut [],
         )?);
         error_ctor = error_ctor_root
             .as_object()
@@ -1432,7 +1436,7 @@ impl ErrorClassRegistry {
             ErrorKind::WasmLinkError,
             ErrorKind::WasmRuntimeError,
         ] {
-            proto_root = Value::object(alloc_registry_object(gc_heap, &[])?);
+            proto_root = Value::object(alloc_registry_object(gc_heap, &mut [])?);
             let mut proto = proto_root
                 .as_object()
                 .expect("native error prototype is an object");
@@ -1447,12 +1451,15 @@ impl ErrorClassRegistry {
             proto_root = Value::object(proto);
             // §20.5.6.3.{2,3} — `<NativeError>.prototype.{name,message}`
             // share the same descriptor shape as `Error.prototype`'s.
-            class_name_root =
-                Value::string(from_str_rooted(kind.class_name(), gc_heap, &[&proto_root])?);
+            class_name_root = Value::string(from_str_rooted(
+                kind.class_name(),
+                gc_heap,
+                &mut [&mut proto_root],
+            )?);
             empty_root = Value::string(from_str_rooted(
                 "",
                 gc_heap,
-                &[&proto_root, &class_name_root],
+                &mut [&mut proto_root, &mut class_name_root],
             )?);
             // The string allocations may have relocated the young prototype;
             // refresh it from the rooted Value and write through `_in_place`.
@@ -1473,7 +1480,7 @@ impl ErrorClassRegistry {
                 PropertyDescriptor::data(empty_root, true, false, true),
             )?;
             proto_root = Value::object(proto);
-            ctor_root = Value::object(alloc_registry_object(gc_heap, &[])?);
+            ctor_root = Value::object(alloc_registry_object(gc_heap, &mut [])?);
             // §20.5.6.{2,3} — same prototype/constructor shape.
             let mut ctor = ctor_root
                 .as_object()
@@ -1520,7 +1527,7 @@ impl ErrorClassRegistry {
                 kind.class_name(),
                 length as u8,
                 dispatcher,
-                &[],
+                &mut [],
             )?);
             ctor = ctor_root
                 .as_object()

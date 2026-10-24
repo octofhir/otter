@@ -41,7 +41,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let value = *read_register(&stack[top_idx], src)?;
         let promise = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-            .fulfilled_stack_rooted(self, stack, value, &[], &[])?;
+            .fulfilled_stack_rooted(self, stack, value, &mut [], &mut [])?;
         write_register(&mut stack[top_idx], dst, Value::promise(promise))?;
         stack[top_idx].advance_pc()?;
         Ok(())
@@ -57,13 +57,13 @@ impl Interpreter {
         let executor_reg = register_operand(operands.get(1))?;
         let scratch_dst = register_operand(operands.get(2))?;
         let top_idx = stack.len() - 1;
-        let executor = *read_register(&stack[top_idx], executor_reg)?;
+        let mut executor = *read_register(&stack[top_idx], executor_reg)?;
         if !self.is_callable_runtime(&executor) {
             return Err(VmError::NotCallable);
         }
         let (handle, resolve, reject) =
             promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                .construct_stack_rooted(self, stack, &[&executor], &[])?;
+                .construct_stack_rooted(self, stack, &mut [&mut executor], &mut [])?;
         write_register(&mut stack[top_idx], dst, Value::promise(handle))?;
         stack[top_idx].advance_pc()?;
         let mut args: SmallVec<[Value; 8]> = SmallVec::new();

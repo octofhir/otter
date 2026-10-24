@@ -270,11 +270,21 @@ fn build_new_typed_array(
         .len()
         .checked_mul(bpe)
         .ok_or_else(|| range_error("byte length overflow"))?;
+    // A BigInt element is a heap cell: the buffer and view allocations may
+    // move it, so the elements ride a mutable root buffer read after both.
+    let mut values = values.to_vec();
     let buf = ctx
-        .alloc_array_buffer_zeroed(byte_len, &[], &[values])
+        .alloc_array_buffer_zeroed(byte_len, &mut [], &mut [values.as_mut_slice()])
         .map_err(native_oom)?
         .ok_or_else(|| type_error("allocation failed"))?;
-    let view = JsTypedArray::new(ctx.heap_mut(), buf, kind, 0, values.len()).map_err(native_oom)?;
+    let view = {
+        use crate::rooting::RootScopeExt;
+        let mut scope = otter_gc::RootScope::new(ctx.heap_mut());
+        // SAFETY: `values` is declared before the scope and stays put until
+        // the scope drops.
+        unsafe { scope.add_value_vec(&mut values) };
+        JsTypedArray::new(ctx.heap_mut(), buf, kind, 0, values.len()).map_err(native_oom)?
+    };
     for (i, v) in values.iter().enumerate() {
         view.set(ctx.heap_mut(), i, v);
     }
@@ -326,7 +336,7 @@ fn impl_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
         .checked_mul(bpe)
         .ok_or_else(|| range_error("byte length overflow"))?;
     let new_buf = ctx
-        .alloc_array_buffer_zeroed(byte_len, &[], &[])
+        .alloc_array_buffer_zeroed(byte_len, &mut [], &mut [])
         .map_err(native_oom)?
         .ok_or_else(|| type_error("allocation failed"))?;
     {
@@ -1034,9 +1044,9 @@ fn live_typed_array_iterator(
         index: 0,
         kind,
     };
-    let root = *ctx.this_value();
+    let mut root = *ctx.this_value();
     Ok(Value::iterator(
-        ctx.alloc_iterator_state(state, &[&root], &[])
+        ctx.alloc_iterator_state(state, &mut [&mut root], &mut [])
             .map_err(native_oom)?,
     ))
 }

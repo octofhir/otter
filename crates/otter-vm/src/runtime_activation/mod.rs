@@ -350,7 +350,7 @@ mod tests {
     fn runtime_call_uses_the_physical_frame_without_writeback() {
         let (context, function) = bind_this_fixture();
         let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
-        let arguments = vm.alloc_host_object_with_roots(&[], &[]).unwrap();
+        let arguments = vm.alloc_host_object_with_roots(&mut [], &mut []).unwrap();
         let mut frame = vm.test_frame_for_function(&function).unwrap();
         frame.set_new_target(Value::function(99));
         frame.set_derived_constructor();

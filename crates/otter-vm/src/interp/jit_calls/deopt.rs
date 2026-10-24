@@ -436,8 +436,10 @@ mod tests {
             unsafe { vm.jit_push_native_frame(&mut native).unwrap() };
             vm.with_runtime_turn(&mut stack, |turn| {
                 let (vm, stack) = turn.into_parts();
-                let receiver =
-                    Value::object(vm.alloc_runtime_rooted_object_with_roots(&[], &[]).unwrap());
+                let receiver = Value::object(
+                    vm.alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
+                        .unwrap(),
+                );
                 let frames = [
                     crate::deopt::DeoptFrame::with_window(
                         0,

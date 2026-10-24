@@ -342,7 +342,7 @@ impl<'a> RuntimeExtensionContext<'a> {
         let value = self
             .realm
             .interp
-            .native_function_static_host_rooted(name, length, call, &[], &[])
+            .native_function_static_host_rooted(name, length, call, &mut [], &mut [])
             .map_err(|oom| OtterError::OutOfMemory {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),
@@ -367,7 +367,7 @@ impl<'a> RuntimeExtensionContext<'a> {
         let value = self
             .realm
             .interp
-            .native_function_from_call_host_rooted(name, length, call, &[], &[])
+            .native_function_from_call_host_rooted(name, length, call, &mut [], &mut [])
             .map_err(|oom| OtterError::OutOfMemory {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),

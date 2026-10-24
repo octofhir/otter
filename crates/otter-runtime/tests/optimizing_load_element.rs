@@ -287,8 +287,8 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, String, Vec<u32>
                     Value::number_i32(3),
                     Value::number_i32(4),
                 ],
-                &[],
-                &[],
+                &mut [],
+                &mut [],
             )
             .expect("array allocation"),
     );
@@ -302,8 +302,8 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, String, Vec<u32>
                     Value::number_f64(3.75),
                     Value::number_f64(5.0),
                 ],
-                &[],
-                &[],
+                &mut [],
+                &mut [],
             )
             .expect("float array allocation"),
     );
@@ -312,7 +312,11 @@ fn run(selection: JitSelection) -> (Value, Value, Value, Value, String, Vec<u32>
         [[1, 2, 3, 4], [10, 20, 30, 40], [2, 4, 6, 8], [1, 2, 3, 4]].map(|elements| {
             let array = Value::array(
                 interp
-                    .array_from_elements_host_rooted(elements.map(Value::number_i32), &[], &[])
+                    .array_from_elements_host_rooted(
+                        elements.map(Value::number_i32),
+                        &mut [],
+                        &mut [],
+                    )
                     .expect("many-array allocation"),
             );
             root(&mut interp, array)
@@ -447,8 +451,8 @@ fn float_array_loop_enters_optimized_code() {
                     Value::number_f64(3.75),
                     Value::number_f64(5.0),
                 ],
-                &[],
-                &[],
+                &mut [],
+                &mut [],
             )
             .expect("float array allocation"),
     );
@@ -483,7 +487,7 @@ fn several_live_arrays_enter_optimized_code() {
     let arrays = [[1, 2, 3, 4], [10, 20, 30, 40], [2, 4, 6, 8], [1, 2, 3, 4]].map(|elements| {
         let array = Value::array(
             interp
-                .array_from_elements_host_rooted(elements.map(Value::number_i32), &[], &[])
+                .array_from_elements_host_rooted(elements.map(Value::number_i32), &mut [], &mut [])
                 .expect("many-array allocation"),
         );
         root(&mut interp, array)

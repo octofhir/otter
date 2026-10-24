@@ -4853,7 +4853,7 @@ impl Runtime {
     ) -> Result<(), OtterError> {
         let value = self
             .interp
-            .native_function_static_host_rooted(name, length, call, &[], &[])
+            .native_function_static_host_rooted(name, length, call, &mut [], &mut [])
             .map_err(|oom| OtterError::OutOfMemory {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),
@@ -4881,7 +4881,7 @@ impl Runtime {
     ) -> Result<(), OtterError> {
         let value = self
             .interp
-            .native_function_from_call_host_rooted(name, length, call, &[], &[])
+            .native_function_from_call_host_rooted(name, length, call, &mut [], &mut [])
             .map_err(|oom| OtterError::OutOfMemory {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),
@@ -4898,7 +4898,7 @@ impl Runtime {
     ) -> Result<(), OtterError> {
         let value = self
             .interp
-            .native_constructor_from_call_host_rooted(name, length, call, &[], &[])
+            .native_constructor_from_call_host_rooted(name, length, call, &mut [], &mut [])
             .map_err(|oom| OtterError::OutOfMemory {
                 requested_bytes: oom.requested_bytes(),
                 heap_limit_bytes: oom.heap_limit_bytes(),
@@ -9982,17 +9982,23 @@ mod tests {
         let (_, context) = runtime
             .run_script_with_context(SourceInput::from_javascript("0"), "<dynamic-cleanup>")
             .expect("establish execution context");
-        let current_promise =
-            otter_vm::promise_dispatch::pending_runtime_rooted(&mut runtime.interp, &[], &[])
-                .expect("current pending promise");
+        let current_promise = otter_vm::promise_dispatch::pending_runtime_rooted(
+            &mut runtime.interp,
+            &mut [],
+            &mut [],
+        )
+        .expect("current pending promise");
         let current_token = runtime.interp.dynamic_import_registry_mut().insert(
             current_promise,
             context.clone(),
             0,
         );
-        let queued_promise =
-            otter_vm::promise_dispatch::pending_runtime_rooted(&mut runtime.interp, &[], &[])
-                .expect("queued pending promise");
+        let queued_promise = otter_vm::promise_dispatch::pending_runtime_rooted(
+            &mut runtime.interp,
+            &mut [],
+            &mut [],
+        )
+        .expect("queued pending promise");
         let queued_token =
             runtime
                 .interp

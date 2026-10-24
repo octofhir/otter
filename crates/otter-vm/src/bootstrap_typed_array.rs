@@ -70,18 +70,18 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     // `Function.prototype.call` / explicit-invoke fallback by
     // re-entering the same callback loop in the wrapper body.
     if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
-        let abstract_proto_root = Value::object(abstract_proto);
-        let install_method = |heap: &mut otter_gc::GcHeap,
-                              name: &'static str,
-                              length: u8,
-                              call: crate::native_function::NativeFastFn|
+        let mut abstract_proto_root = Value::object(abstract_proto);
+        let mut install_method = |heap: &mut otter_gc::GcHeap,
+                                  name: &'static str,
+                                  length: u8,
+                                  call: crate::native_function::NativeFastFn|
          -> Result<(), JsSurfaceError> {
             let f = crate::bootstrap::native_static_with_value_roots(
                 heap,
                 name,
                 length,
                 call,
-                &[&abstract_proto_root],
+                &mut [&mut abstract_proto_root],
             )
             .map_err(JsSurfaceError::from)?;
             if !object::define_own_property(
@@ -113,18 +113,18 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
     // internal slot and reads the corresponding field. The
     // setter side is undefined per spec.
     if let Some(abstract_proto) = get_abstract_typed_array_prototype(global, heap) {
-        let abstract_proto_root = Value::object(abstract_proto);
-        let install_accessor = |heap: &mut otter_gc::GcHeap,
-                                name: &'static str,
-                                getter_name: &'static str,
-                                getter: crate::native_function::NativeFastFn|
+        let mut abstract_proto_root = Value::object(abstract_proto);
+        let mut install_accessor = |heap: &mut otter_gc::GcHeap,
+                                    name: &'static str,
+                                    getter_name: &'static str,
+                                    getter: crate::native_function::NativeFastFn|
          -> Result<(), JsSurfaceError> {
             let f = crate::bootstrap::native_static_with_value_roots(
                 heap,
                 getter_name,
                 0,
                 getter,
-                &[&abstract_proto_root],
+                &mut [&mut abstract_proto_root],
             )
             .map_err(JsSurfaceError::from)?;
             if !object::define_own_property(
@@ -195,13 +195,13 @@ pub fn install_typed_array_well_knowns_post_bootstrap(
         {
             return Err(JsSurfaceError::DefinePropertyFailed("[[BuiltinProperty]]"));
         };
-        let abstract_proto_root = Value::object(abstract_proto);
+        let mut abstract_proto_root = Value::object(abstract_proto);
         let getter = crate::bootstrap::native_static_with_value_roots(
             heap,
             "get [Symbol.toStringTag]",
             0,
             tostring_tag_getter,
-            &[&abstract_proto_root],
+            &mut [&mut abstract_proto_root],
         )
         .map_err(JsSurfaceError::from)?;
         if !object::define_own_symbol_property_partial(

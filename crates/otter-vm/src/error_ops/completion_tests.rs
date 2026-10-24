@@ -57,8 +57,8 @@ fn synchronous_and_nested_call_construct_preserve_real_materialization_oom() {
                                 "CompletedConstructor",
                                 1,
                                 NativeCall::Static(oversized_error),
-                                &[],
-                                &[],
+                                &mut [],
+                                &mut [],
                             )
                             .expect("actual native constructor")
                     } else {

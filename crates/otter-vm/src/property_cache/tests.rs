@@ -397,9 +397,9 @@ fn allocating_shared_replay_preserves_cap_cause_and_does_not_commit_or_hold_proo
     let mut vm = Interpreter::with_string_heap_cap(limit).expect("fixture interpreter");
     vm.gc_heap.set_gc_stress(0, false);
     vm.with_handle_scope(|vm, scope| {
-        let first = vm.alloc_runtime_rooted_object_with_roots(&[], &[]).unwrap();
+        let first = vm.alloc_runtime_rooted_object_with_roots(&mut [], &mut []).unwrap();
         let first = vm.scoped_value(scope, Value::object(first));
-        let second = vm.alloc_runtime_rooted_object_with_roots(&[], &[]).unwrap();
+        let second = vm.alloc_runtime_rooted_object_with_roots(&mut [], &mut []).unwrap();
         let second = vm.scoped_value(scope, Value::object(second));
         let key = key(vm, "allocatingAppend");
         let transition = object::capture_store_property_transition(
@@ -422,7 +422,7 @@ fn allocating_shared_replay_preserves_cap_cause_and_does_not_commit_or_hold_proo
             if round > 0 && before == vm.gc_heap.stats().allocated_bytes { settled = true; break; }
         }
         assert!(settled, "cap premise uses a stable live set");
-        let payload = vm.alloc_runtime_rooted_object_with_roots(&[], &[]).unwrap();
+        let payload = vm.alloc_runtime_rooted_object_with_roots(&mut [], &mut []).unwrap();
         let payload = vm.scoped_value(scope, Value::object(payload));
         let alias = vm.scoped_value(scope, vm.escape_scoped(payload));
         let payload_before = vm.escape_scoped(payload).as_object().unwrap().offset();

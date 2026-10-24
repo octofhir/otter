@@ -2175,7 +2175,7 @@ fn call_method_promise_expando_non_callable_shadows_builtin() {
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
-    let promise = promise_dispatch::pending_runtime_rooted(&mut interp, &[], &[]).unwrap();
+    let promise = promise_dispatch::pending_runtime_rooted(&mut interp, &mut [], &mut []).unwrap();
     let mut bag = property_dispatch::promise_ensure_expando_pub(interp.gc_heap_mut(), &promise)
         .expect("promise expando");
     assert!(
@@ -2239,7 +2239,7 @@ fn call_method_promise_prototype_non_callable_shadows_builtin() {
         function_source: None,
     };
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
-    let promise = promise_dispatch::pending_runtime_rooted(&mut interp, &[], &[]).unwrap();
+    let promise = promise_dispatch::pending_runtime_rooted(&mut interp, &mut [], &mut []).unwrap();
     let mut proto = interp
         .constructor_prototype_value("Promise")
         .expect("Promise.prototype")
@@ -4052,7 +4052,7 @@ fn iterator_result_record_uses_runtime_rooted_young_allocation() {
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     let result = interp
-        .make_runtime_rooted_iter_result(value, true, &[], &[])
+        .make_runtime_rooted_iter_result(value, true, &mut [], &mut [])
         .unwrap();
 
     let after = interp.gc_heap_mut().stats().new_allocated_bytes;
@@ -4256,16 +4256,12 @@ fn host_rooted_object_and_array_helpers_use_young_allocation() {
     let before = interp.gc_heap_mut().stats().new_allocated_bytes;
 
     let mut host = interp
-        .alloc_host_object_with_roots(&[], &[])
+        .alloc_host_object_with_roots(&mut [], &mut [])
         .expect("host object allocation");
-    let host_root = Value::object(host);
+    let mut host_root = Value::object(host);
     let elements = [Value::number(NumberValue::from_i32(1))];
     let array = interp
-        .array_from_elements_host_rooted(
-            elements.iter().cloned(),
-            &[&host_root],
-            &[elements.as_slice()],
-        )
+        .array_from_elements_host_rooted(elements, &mut [&mut host_root], &mut [])
         .expect("host array allocation");
     assert!(
         object::define_own_property_in_place(
@@ -4537,13 +4533,13 @@ fn primitive_wrapper_boxing_uses_stack_rooted_young_allocation() {
             context.exec_function(1).expect("callee"),
             &stack,
             Value::number(NumberValue::from_i32(33)),
-            &[],
+            &mut [],
         )
         .expect("boxed this");
-    let primitive_string =
+    let mut primitive_string =
         Value::string(crate::JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
     let property_base = interp
-        .object_for_primitive_property_base_stack_rooted(&stack, &primitive_string)
+        .object_for_primitive_property_base_stack_rooted(&stack, &mut primitive_string)
         .expect("property base")
         .expect("primitive base");
 

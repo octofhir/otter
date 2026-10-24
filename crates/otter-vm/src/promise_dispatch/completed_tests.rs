@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 /// Allocate a pending Promise under the runtime roots and park it in `scope`.
 fn pending_promise<'s>(scope: &mut NativeScope<'s, '_>) -> Result<Local<'s>, NativeError> {
-    let handle = pending_runtime_rooted(scope.context().interp_mut(), &[], &[])?;
+    let handle = pending_runtime_rooted(scope.context().interp_mut(), &mut [], &mut [])?;
     Ok(scope.value(Value::promise(handle)))
 }
 

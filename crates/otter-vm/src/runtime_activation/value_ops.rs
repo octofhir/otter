@@ -1411,7 +1411,7 @@ mod tests {
             .expect("valid bytecode fixture");
         vm.ensure_method_feedback_context(&context);
         let mut prototype = Value::object(
-            vm.alloc_runtime_rooted_object_with_roots(&[], &[])
+            vm.alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
                 .expect("clean terminal prototype"),
         );
         let mut first = Value::undefined();

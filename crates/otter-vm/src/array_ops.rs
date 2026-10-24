@@ -462,7 +462,7 @@ impl Interpreter {
                 ));
             }
             Ok(Value::array(
-                self.alloc_runtime_rooted_array_from_values(Vec::new(), &[], &[])
+                self.alloc_runtime_rooted_array_from_values(Vec::new(), &mut [], &mut [])
                     .map_err(CommittedValueError::JavaScript)?,
             ))
         }

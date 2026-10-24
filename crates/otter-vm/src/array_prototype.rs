@@ -580,14 +580,14 @@ pub(crate) fn install_array_well_knowns_post_bootstrap(
     let Some(mut prototype) = value.as_object() else {
         return Ok(());
     };
-    let global_root = Value::object(global);
-    let prototype_root = Value::object(prototype);
+    let mut global_root = Value::object(global);
+    let mut prototype_root = Value::object(prototype);
     let values_fn = crate::bootstrap::native_static_with_value_roots(
         heap,
         "values",
         0,
         native_values_iter,
-        &[&global_root, &prototype_root],
+        &mut [&mut global_root, &mut prototype_root],
     )
     .map_err(JsSurfaceError::from)?;
     let values_value = Value::native_function(values_fn);
@@ -652,10 +652,12 @@ fn install_array_unscopables(
         "toSpliced",
         "values",
     ];
-    let prototype_root = Value::object(prototype);
-    let mut list =
-        crate::intrinsics::shared::alloc_object_with_value_roots_pub(heap, &[&prototype_root])
-            .map_err(JsSurfaceError::from)?;
+    let mut prototype_root = Value::object(prototype);
+    let mut list = crate::intrinsics::shared::alloc_object_with_value_roots_pub(
+        heap,
+        &mut [&mut prototype_root],
+    )
+    .map_err(JsSurfaceError::from)?;
     if !object::set_prototype(&mut list, heap, None)? {
         return Err(JsSurfaceError::DefinePropertyFailed(
             "@@unscopables.[[Prototype]]",
@@ -736,7 +738,7 @@ fn native_array_method(
     };
     ctx.with_turn_parts(|interp, stack| {
         interp
-            .array_live_method_dispatch(stack, &exec, tag, receiver, args, &[args])
+            .array_live_method_dispatch(stack, &exec, tag, receiver, args, &mut [])
             .map_err(|err| err.into_native(interp, name))
     })
 }
@@ -1227,7 +1229,7 @@ impl Interpreter {
         name: &str,
         search: Value,
         from_arg: Option<Value>,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -1252,7 +1254,7 @@ impl Interpreter {
         tag: ArrayMethodTag,
         receiver: Value,
         args: &[Value],
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         // A primitive receiver is boxed up front: every arm below copies
         // argument Values out of `args`, and boxing allocates — a copy taken
@@ -1353,7 +1355,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         index: Value,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -1398,7 +1400,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -1491,7 +1493,7 @@ impl Interpreter {
         receiver: Value,
         value: Value,
         args: &[Value],
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -1525,9 +1527,9 @@ impl Interpreter {
                     .expect("rooted fill receiver");
                 let value = interp.escape_scoped(value_root);
                 let mut external_visit = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                    for root in roots {
-                        for value in *root {
-                            value.trace_value_slots(visit);
+                    for root in roots.iter_mut() {
+                        for value in root.iter_mut() {
+                            value.trace_value_slot_mut(visit);
                         }
                     }
                 };
@@ -1607,13 +1609,13 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         depth_arg: Value,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let receiver = interp.scoped_value(scope, receiver);
             let depth_arg = interp.scoped_value(scope, depth_arg);
-            for values in roots {
-                for value in *values {
+            for values in roots.iter_mut() {
+                for value in values.iter_mut() {
                     let _argument = interp.scoped_value(scope, *value);
                 }
             }
@@ -1625,7 +1627,7 @@ impl Interpreter {
                 current_receiver
             } else {
                 interp
-                    .box_sloppy_this_primitive_runtime_rooted(current_receiver, &[])
+                    .box_sloppy_this_primitive_runtime_rooted(current_receiver, &mut [])
                     .map_err(CommittedValueError::JavaScript)?
             };
             let o = interp.scoped_value(scope, o);
@@ -1648,7 +1650,7 @@ impl Interpreter {
                 }
             };
             let source = interp.escape_scoped(o);
-            let target = interp.array_species_create(stack, context, source, 0, &[])?;
+            let target = interp.array_species_create(stack, context, source, 0, &mut [])?;
             let target = interp.scoped_value(scope, target);
             let current_target = interp.escape_scoped(target);
             let current_source = interp.escape_scoped(o);
@@ -1794,9 +1796,9 @@ impl Interpreter {
         _context: &ExecutionContext,
         receiver: Value,
         kind: &str,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, VmError> {
-        let o = if receiver.is_object_type() {
+        let mut o = if receiver.is_object_type() {
             receiver
         } else {
             self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)?
@@ -1859,7 +1861,7 @@ impl Interpreter {
                 }
             }
         };
-        self.alloc_runtime_rooted_iterator_state(state, &[&o], roots)
+        self.alloc_runtime_rooted_iterator_state(state, &mut [&mut o], roots)
             .map(Value::iterator)
             .map_err(|_| self.err_type(("iterator allocation failed".to_string()).into()))
     }
@@ -1871,7 +1873,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         separator_arg: Option<Value>,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         // §23.1.3.16 step 1 — O = ToObject(this value).
         let mut o = if receiver.is_object_type() {
@@ -2009,7 +2011,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let receiver_root = interp.scoped_value(scope, receiver);
@@ -2049,7 +2051,7 @@ impl Interpreter {
                 input
             } else {
                 interp
-                    .box_sloppy_this_primitive_runtime_rooted(input, &[])
+                    .box_sloppy_this_primitive_runtime_rooted(input, &mut [])
                     .map_err(CommittedValueError::JavaScript)?
             };
             let receiver_root = interp.scoped_value(scope, receiver);
@@ -2104,7 +2106,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let receiver_root = interp.scoped_value(scope, receiver);
@@ -2324,7 +2326,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let receiver = interp.scoped_value(scope, receiver);
@@ -2332,8 +2334,8 @@ impl Interpreter {
                 .iter()
                 .map(|value| interp.scoped_value(scope, *value))
                 .collect();
-            for values in roots {
-                for value in *values {
+            for values in roots.iter_mut() {
+                for value in values.iter_mut() {
                     let _argument = interp.scoped_value(scope, *value);
                 }
             }
@@ -2342,7 +2344,7 @@ impl Interpreter {
                 current_receiver
             } else {
                 interp
-                    .box_sloppy_this_primitive_runtime_rooted(current_receiver, &[])
+                    .box_sloppy_this_primitive_runtime_rooted(current_receiver, &mut [])
                     .map_err(CommittedValueError::JavaScript)?
             };
             // The established concat loop consumes anchor indices. Keep its
@@ -2354,7 +2356,8 @@ impl Interpreter {
             }
             let result = (|| {
                 let current_receiver = interp.iteration_anchor(o_anchor);
-                let a = interp.array_species_create(stack, context, current_receiver, 0, &[])?;
+                let a =
+                    interp.array_species_create(stack, context, current_receiver, 0, &mut [])?;
                 let a_anchor = interp.push_iteration_anchor(a) - 1;
                 let mut n = interp.concat_append_to(stack, context, o_anchor, a_anchor, 0)?;
                 for index in 0..arguments.len() {
@@ -2572,7 +2575,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         comparefn: Value,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         // §23.1.3.30 step 1 — comparefn must be undefined or callable.
         if !comparefn.is_undefined() && !self.is_callable_runtime(&comparefn) {
@@ -2858,7 +2861,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -2931,7 +2934,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -3009,7 +3012,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -3044,9 +3047,9 @@ impl Interpreter {
                     let arr = array_root.as_array().expect("unshift receiver is an Array");
                     let mut visit = |v: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                         array_root.trace_value_slots(v);
-                        for slice in roots {
-                            for val in *slice {
-                                val.trace_value_slots(v);
+                        for slice in roots.iter_mut() {
+                            for val in slice.iter_mut() {
+                                val.trace_value_slot_mut(v);
                             }
                         }
                         for val in rest {
@@ -3166,7 +3169,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -3335,7 +3338,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -3424,12 +3427,12 @@ impl Interpreter {
         context: &ExecutionContext,
         original: Value,
         length: usize,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let original_root = interp.scoped_value(scope, original);
-            for values in roots {
-                for value in *values {
+            for values in roots.iter_mut() {
+                for value in values.iter_mut() {
                     let _argument = interp.scoped_value(scope, *value);
                 }
             }
@@ -3439,7 +3442,7 @@ impl Interpreter {
                 .map_err(CommittedValueError::JavaScript)?
             {
                 return interp
-                    .array_create_with_length(interp.escape_scoped(original_root), length, &[])
+                    .array_create_with_length(interp.escape_scoped(original_root), length, &mut [])
                     .map_err(CommittedValueError::JavaScript);
             }
             let default_ctor = crate::object::get(interp.global_this, &interp.gc_heap, "Array")
@@ -3465,7 +3468,7 @@ impl Interpreter {
                 })
             {
                 return interp
-                    .array_create_with_length(interp.escape_scoped(original_root), length, &[])
+                    .array_create_with_length(interp.escape_scoped(original_root), length, &mut [])
                     .map_err(CommittedValueError::JavaScript);
             }
             let constructor = if c.is_undefined() {
@@ -3514,7 +3517,7 @@ impl Interpreter {
                 &interp.gc_heap,
             ) {
                 return interp
-                    .array_create_with_length(interp.escape_scoped(original_root), length, &[])
+                    .array_create_with_length(interp.escape_scoped(original_root), length, &mut [])
                     .map_err(CommittedValueError::JavaScript);
             }
             let argv: SmallVec<[Value; 8]> =
@@ -3533,15 +3536,15 @@ impl Interpreter {
         &mut self,
         receiver_root: Value,
         length: usize,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, VmError> {
         if length > u32::MAX as usize {
             return Err(self.err_range(("Invalid array length".to_string()).into()));
         }
         self.with_handle_scope(|interp, scope| {
             let _receiver = interp.scoped_value(scope, receiver_root);
-            for values in roots {
-                for value in *values {
+            for values in roots.iter_mut() {
+                for value in values.iter_mut() {
                     let _argument = interp.scoped_value(scope, *value);
                 }
             }
@@ -3657,7 +3660,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let original_receiver = interp.scoped_value(scope, receiver);
@@ -3665,8 +3668,8 @@ impl Interpreter {
                 .iter()
                 .map(|value| interp.scoped_value(scope, *value))
                 .collect();
-            for values in roots {
-                for value in *values {
+            for values in roots.iter_mut() {
+                for value in values.iter_mut() {
                     let _argument = interp.scoped_value(scope, *value);
                 }
             }
@@ -3678,7 +3681,7 @@ impl Interpreter {
                 current_receiver
             } else {
                 interp
-                    .box_sloppy_this_primitive_runtime_rooted(current_receiver, &[])
+                    .box_sloppy_this_primitive_runtime_rooted(current_receiver, &mut [])
                     .map_err(CommittedValueError::JavaScript)?
             };
             let receiver = interp.scoped_value(scope, o);
@@ -3722,7 +3725,7 @@ impl Interpreter {
                 context,
                 current_receiver,
                 actual_delete_count,
-                &[],
+                &mut [],
             )?;
             let removed = interp.scoped_value(scope, removed);
             if actual_delete_count <= MAX_ARRAY_LIKE_PROBE_LEN
@@ -4071,7 +4074,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -4112,7 +4115,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         args: &[Value],
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -4186,7 +4189,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         comparefn: Value,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         if !comparefn.is_undefined() && !self.is_callable_runtime(&comparefn) {
             return Err(CommittedValueError::JavaScript(self.err_type(
@@ -4248,7 +4251,7 @@ impl Interpreter {
         receiver: Value,
         index: Value,
         value: Value,
-        roots: &[&[Value]],
+        roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
             receiver
@@ -4337,7 +4340,7 @@ impl Interpreter {
         if values.len() > u32::MAX as usize {
             return Err(self.err_range(("Invalid array length".to_string()).into()));
         }
-        let array = self.alloc_runtime_rooted_array_from_values(values, &[], &[])?;
+        let array = self.alloc_runtime_rooted_array_from_values(values, &mut [], &mut [])?;
         Ok(Value::array(array))
     }
 }
@@ -4514,7 +4517,7 @@ pub(crate) fn array_callback_native_dispatch(
         let receiver = if raw_receiver.is_object_type() {
             raw_receiver
         } else {
-            let boxed = interp.box_sloppy_this_primitive_runtime_rooted(raw_receiver, &[args]);
+            let boxed = interp.box_sloppy_this_primitive_runtime_rooted(raw_receiver, &mut []);
             boxed.map_err(|err| {
                 crate::native_function::vm_to_native_error(interp, err, "Array.prototype callback")
             })?
@@ -4574,7 +4577,7 @@ pub(crate) fn array_callback_native_dispatch(
                     0
                 };
                 let created =
-                    interp.array_species_create(stack, &context, receiver, species_len, &[args]);
+                    interp.array_species_create(stack, &context, receiver, species_len, &mut []);
                 match created {
                     Ok(created) => Some(created),
                     Err(err) => {

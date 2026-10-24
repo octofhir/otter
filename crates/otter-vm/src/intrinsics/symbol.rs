@@ -253,7 +253,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         Some(p) => p,
         None => return Ok(()),
     };
-    let symbol_ctor_root = Value::native_function(symbol_ctor);
+    let mut symbol_ctor_root = Value::native_function(symbol_ctor);
     let mut prototype_root = Value::object(prototype);
     let mut roots = otter_gc::RootScope::new(heap);
     // SAFETY: the canonical prototype slot stays stationary until the entire
@@ -264,7 +264,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
         "[Symbol.toPrimitive]",
         1,
         symbol_proto_to_primitive,
-        &[&symbol_ctor_root, &prototype_root],
+        &mut [&mut symbol_ctor_root, &mut prototype_root],
     )
     .map_err(JsSurfaceError::from)?;
     prototype = prototype_root
@@ -394,14 +394,14 @@ fn install_constructor_species_accessor(
     let Some(ctor_value) = object::get(global, heap, ctor_name) else {
         return Ok(());
     };
-    let global_root = Value::object(global);
-    let ctor_root = ctor_value;
+    let mut global_root = Value::object(global);
+    let mut ctor_root = ctor_value;
     let species_getter = native_static_with_value_roots(
         heap,
         "get [Symbol.species]",
         0,
         constructor_species_get,
-        &[&global_root, &ctor_root],
+        &mut [&mut global_root, &mut ctor_root],
     )
     .map_err(JsSurfaceError::from)?;
     let species_sym = well_known.get(WellKnown::Species);

@@ -443,7 +443,7 @@ impl Interpreter {
             // order. The per-module gate promise generalises the
             // spec's capability-on-cycle-root.
             let gate = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                .pending_stack_rooted(self, stack, &[], &[])?;
+                .pending_stack_rooted(self, stack, &mut [], &mut [])?;
             let order = self.next_module_async_order;
             self.next_module_async_order += 1;
             {
@@ -775,7 +775,7 @@ impl Interpreter {
                 .map_err(VmError::from)?;
             let rejected_slot = this.push_iteration_anchor(on_rejected) - 1;
             let capability = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                .capability_stack_rooted(this, stack, &[], &[])?;
+                .capability_stack_rooted(this, stack, &mut [], &mut [])?;
             let init = this
                 .iteration_anchor(init_slot)
                 .as_promise()
@@ -1166,7 +1166,7 @@ impl Interpreter {
                 .map_err(VmError::from)?;
             let rejected_slot = this.push_iteration_anchor(on_rejected) - 1;
             let capability = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                .capability_stack_rooted(this, stack, &[], &[])?;
+                .capability_stack_rooted(this, stack, &mut [], &mut [])?;
             let init = this
                 .iteration_anchor(init_slot)
                 .as_promise()
@@ -1538,7 +1538,7 @@ impl Interpreter {
                             let promise = promise_dispatch::PromiseBuilder::with_context(Some(
                                 import_context.clone(),
                             ))
-                            .rejected_stack_rooted(self, stack, reason, &[], &[])
+                            .rejected_stack_rooted(self, stack, reason, &mut [], &mut [])
                             .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             let frame = &mut stack[top_idx];
                             write_register(frame, dst, Value::promise(promise))
@@ -1563,7 +1563,7 @@ impl Interpreter {
                         let pending = promise_dispatch::PromiseBuilder::with_context(Some(
                             import_context.clone(),
                         ))
-                        .pending_stack_rooted(self, stack, &[], &[])
+                        .pending_stack_rooted(self, stack, &mut [], &mut [])
                         .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         self.defer_dynamic_import_evaluation(
                             context,
@@ -1591,7 +1591,7 @@ impl Interpreter {
                             let pending = promise_dispatch::PromiseBuilder::with_context(Some(
                                 import_context.clone(),
                             ))
-                            .pending_stack_rooted(self, stack, &[], &[])
+                            .pending_stack_rooted(self, stack, &mut [], &mut [])
                             .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             self.settle_promise_on_module_evaluation(
                                 stack,
@@ -1616,7 +1616,7 @@ impl Interpreter {
                             promise_dispatch::PromiseBuilder::with_context(Some(
                                 import_context.clone(),
                             ))
-                            .fulfilled_stack_rooted(self, stack, namespace_value, &[], &[])
+                            .fulfilled_stack_rooted(self, stack, namespace_value, &mut [], &mut [])
                             .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         }
                         Err(error @ CommittedValueError::Fatal(_)) => return Err(error),
@@ -1627,7 +1627,7 @@ impl Interpreter {
                             promise_dispatch::PromiseBuilder::with_context(Some(
                                 import_context.clone(),
                             ))
-                            .rejected_stack_rooted(self, stack, reason, &[], &[])
+                            .rejected_stack_rooted(self, stack, reason, &mut [], &mut [])
                             .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         }
                     }
@@ -1643,14 +1643,14 @@ impl Interpreter {
                             promise_dispatch::PromiseBuilder::with_context(Some(
                                 import_context.clone(),
                             ))
-                            .rejected_stack_rooted(self, stack, reason, &[], &[])
+                            .rejected_stack_rooted(self, stack, reason, &mut [], &mut [])
                             .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                         }
                         Ok(admission) => {
                             let pending = promise_dispatch::PromiseBuilder::with_context(Some(
                                 import_context.clone(),
                             ))
-                            .pending_stack_rooted(self, stack, &[], &[])
+                            .pending_stack_rooted(self, stack, &mut [], &mut [])
                             .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             let token = self.dynamic_import_registry.insert(
                                 pending,
@@ -1686,7 +1686,7 @@ impl Interpreter {
                         )
                         .map_err(CommittedValueError::Fatal)?;
                     promise_dispatch::PromiseBuilder::with_context(Some(import_context.clone()))
-                        .rejected_stack_rooted(self, stack, reason, &[], &[])
+                        .rejected_stack_rooted(self, stack, reason, &mut [], &mut [])
                         .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 }
             }
@@ -1696,7 +1696,7 @@ impl Interpreter {
                     .vm_error_to_throwable_with_stack_roots(Some(context), stack, &err)
                     .map_err(CommittedValueError::Fatal)?;
                 promise_dispatch::PromiseBuilder::with_context(Some(import_context))
-                    .rejected_stack_rooted(self, stack, reason, &[], &[])
+                    .rejected_stack_rooted(self, stack, reason, &mut [], &mut [])
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             }
         };

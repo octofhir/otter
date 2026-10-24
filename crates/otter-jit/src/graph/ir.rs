@@ -1265,6 +1265,7 @@ impl Kind {
             Self::StoreKeyedCached { .. } => &[
                 abi::STUB_JIT_STORE_ELEMENT,
                 abi::STUB_ARRAY_PUSH_LEAF,
+                abi::STUB_ARRAY_PUSH_ALLOC,
                 abi::STUB_ELEMENT_WRITE_BARRIER,
                 abi::STUB_STRING_KEY_ATOM_LEAF,
                 abi::STUB_FIELD_TYPE_OBSERVE,

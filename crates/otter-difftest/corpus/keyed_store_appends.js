@@ -3,7 +3,9 @@
 // turn holey, frozen or sealed arrays, an indexed setter on the prototype,
 // and numeric storage appended to, popped, truncated, grown past its
 // capacity and turned tagged by a later value must answer exactly what the
-// interpreter answers.
+// interpreter answers. Generic sites that also see plain objects append
+// past a full storage, read holes and indices past the length, and read
+// through an array whose own prototype supplies the indices.
 'use strict';
 function fill(count, make) {
   const out = [];
@@ -34,6 +36,30 @@ for (let round = 0; round < 60; round++) {
   const kept = appendTo([], 1000, 0);
   for (let i = 0; i < 50; i++) kept[kept.length] = { round, i };
   checksum = (checksum + kept[kept.length - 1].i + kept.length) % 1000003;
+}
+// Generic keyed sites: arrays and plain objects through the same access.
+function genericGet(container, key) { return container[key]; }
+function genericPut(container, key, value) { container[key] = value; }
+const inherited = Object.create(Array.prototype);
+inherited[3] = 'inherited';
+for (let round = 0; round < 40; round++) {
+  const grown = [];
+  const bag = {};
+  for (let i = 0; i < 70; i++) {
+    genericPut(grown, i, { i, round });
+    genericPut(bag, 'k' + i, i);
+  }
+  const holey = [1, , 3, , 5];
+  holey.length = 9;
+  let absent = 0;
+  for (let i = 0; i < 12; i++) {
+    if (genericGet(holey, i) === undefined) absent++;
+    if (genericGet(bag, 'k' + i) === undefined) absent += 100;
+  }
+  const shadowed = [0, , 2, , 4];
+  Object.setPrototypeOf(shadowed, inherited);
+  checksum = (checksum + grown.length + grown[69].i + absent +
+    (genericGet(shadowed, 3) === 'inherited' ? 7 : 0) + (genericGet(shadowed, 1) === undefined ? 1 : 0)) % 1000003;
 }
 const frozen = Object.freeze([1, 2, 3]);
 try { appendTo(frozen, 1, 0); log.push('frozen appended'); } catch (e) { log.push(e.constructor.name); }

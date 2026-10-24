@@ -19,13 +19,13 @@
 //!   cleared and counted, and the last one makes the storage packed. A
 //!   tagged cell value takes the element write barrier.
 //! - An append is an ordinary own addition under the same permit as a
-//!   hole store, and never allocates: inline only into tagged or packed
+//!   hole store. It completes without allocating inline only into tagged or packed
 //!   numeric storage whose dense prefix is the whole length and below its
 //!   capacity, a tagged value taking the element write barrier and a numeric
 //!   one stored as its double over a clear hole bit, before the Array's dense
 //!   length, its slab's length and its `length` move together; the push leaf completes
-//!   any other append only within the storage's capacity and its own
-//!   dense-range guards.
+//!   any other append within the storage's capacity and its own dense-range
+//!   guards, and the allocating push grows a full storage at a safepoint.
 //! - A typed view is stored into inline only through its cached element
 //!   base while the detach protector holds, at an int32 index below its
 //!   length, and with a value that is already a Number: the conversion to
@@ -43,10 +43,15 @@ use super::{
     emit_load_symbol_u64,
 };
 use crate::Unsupported;
-use crate::entry::VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET;
+use crate::entry::{
+    ALLOC_CTX_SAFEPOINT_ID_OFFSET, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET, ALLOC_CTX_SPILL_SLOTS_OFFSET,
+    ALLOC_CTX_STACK_SIZE, ALLOC_CTX_THREAD_OFFSET, VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET,
+};
+use crate::graph::regalloc::Location;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::binary::TypedArrayKind;
 use otter_vm::jit::{JitArrayStorage, JitHoleBitmap, JitTypedArrayStorage};
+use otter_vm::native_abi::{ExitAction, ExitReason};
 
 /// Bytes the slow path parks the three operands in.
 const PARKED_BYTES: u32 = 32;
@@ -133,7 +138,10 @@ impl Codegen<'_> {
             ; b =>done
             ; =>leaf
         );
-        self.emit_array_push_leaf(node, [receiver, key, value], runtime, done);
+        let grow = self.ops.new_dynamic_label();
+        self.emit_array_push_leaf(node, [receiver, key, value], grow, done);
+        dynasm!(self.ops ; .arch aarch64 ; =>grow);
+        self.emit_array_push_grow(node, [receiver, key, value], runtime, done)?;
         dynasm!(self.ops
             ; .arch aarch64
             ; =>in_bounds
@@ -418,6 +426,101 @@ impl Codegen<'_> {
             ; cbz x17, =>stored
             ; b =>missed
         );
+    }
+
+    /// The append the push leaf refused for want of room: the allocating
+    /// push grows the dense storage and appends. A refusal (a sidecar, a
+    /// non-dense tail, the protector) precedes every effect and reaches
+    /// `missed` with the operands as they were. Running out of memory may
+    /// follow a collection, so it resumes the store in the lower tier, which
+    /// reads its operands from the frame.
+    fn emit_array_push_grow(
+        &mut self,
+        node: NodeId,
+        [receiver, key, value]: [u8; 3],
+        missed: DynamicLabel,
+        stored: DynamicLabel,
+    ) -> Result<(), Unsupported> {
+        let stub = otter_vm::runtime_stubs::ARRAY_PUSH_ALLOC;
+        let entry = stub
+            .entry_addr()
+            .ok_or(Unsupported::OperandShape("keyed append growth entry"))?;
+        let oom = self.typed_exit(node, ExitReason::AllocationMiss, ExitAction::Resume);
+        let live = self.allocation.node(node).live_homes.clone();
+        for &(location, home) in &live {
+            if !matches!(home, Location::Constant(_)) {
+                self.emit_move(location, home);
+            }
+        }
+        let safepoint = self.stamp_node_safepoint(node)?;
+        self.load_word32(16, self.graph.outer_pc(node));
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; str w16, [x21, crate::entry::NATIVE_FRAME_PC_OFFSET]
+            ; sub sp, sp, PARKED_BYTES
+            ; str X(receiver), [sp]
+            ; str X(key), [sp, #8]
+            ; str X(value), [sp, #16]
+        );
+        self.sp_delta += PARKED_BYTES;
+        let bytes = ALLOC_CTX_STACK_SIZE + 16;
+        dynasm!(self.ops ; .arch aarch64 ; sub sp, sp, bytes);
+        self.sp_delta += bytes;
+        self.load_word32(1, safepoint);
+        self.load_word32(9, self.slots.tagged);
+        self.load_immediate(4, otter_vm::value::tag::VALUE_UNDEFINED);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x10, [x20, THREAD_OFFSET] ; str x10, [sp, ALLOC_CTX_THREAD_OFFSET]
+            ; ldr x10, [x21, abi::NATIVE_FRAME_MACHINE_ROOTS_OFFSET]
+            ; str x10, [sp, ALLOC_CTX_SPILL_SLOTS_OFFSET]
+            ; str w1, [sp, ALLOC_CTX_SAFEPOINT_ID_OFFSET]
+            ; strh w9, [sp, ALLOC_CTX_SPILL_SLOT_COUNT_OFFSET]
+            ; ldr x2, [sp, bytes]
+            ; ldr x3, [sp, bytes + 16]
+            ; mov x0, sp
+        );
+        crate::template::arm64::values::emit_load_runtime_stub(
+            &mut self.ops,
+            &mut self.relocations,
+            16,
+            entry as u64,
+            stub.descriptor,
+        );
+        dynasm!(self.ops ; .arch aarch64 ; blr x16 ; stp x0, x1, [sp, ALLOC_CTX_STACK_SIZE as i32]);
+        for &(location, home) in &live {
+            self.emit_move(home, location);
+        }
+        let refused = self.ops.new_dynamic_label();
+        let not_refused = self.ops.new_dynamic_label();
+        let success = self.ops.new_dynamic_label();
+        let oom = self.cond_target(oom);
+        let fatal = self.cond_target(self.fatal);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldp x16, x17, [sp, ALLOC_CTX_STACK_SIZE as i32]
+            ; add sp, sp, bytes
+            ; cbz x17, =>success
+            ; cmp x17, abi::NativeResultStatus::SideExit as u32
+            ; b.ne =>not_refused
+            ; =>refused
+            // Refused before any effect: the parked operands are current.
+            ; ldr X(receiver), [sp]
+            ; ldr X(key), [sp, #8]
+            ; ldr X(value), [sp, #16]
+            ; add sp, sp, PARKED_BYTES
+            ; b =>missed
+            ; =>not_refused
+            ; add sp, sp, PARKED_BYTES
+            ; cmp x17, abi::NativeResultStatus::OutOfMemory as u32
+            ; b.eq =>oom
+            ; b =>fatal
+            ; =>success
+            ; add sp, sp, PARKED_BYTES
+            ; b =>stored
+        );
+        self.sp_delta -= bytes + PARKED_BYTES;
+        Ok(())
     }
 
     /// Branch to `refused` unless a store into a hole of the Array in

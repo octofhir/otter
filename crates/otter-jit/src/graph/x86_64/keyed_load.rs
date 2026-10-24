@@ -9,8 +9,10 @@
 //! # Invariants
 //! - Inline paths read only: an element present in dense storage is an own
 //!   data property while the array's own-state guard byte reads zero.
-//! - A hole, an index past the dense length, a non-Array receiver with a
-//!   non-string key, and a table miss complete in the runtime.
+//! - A hole or an index past the dense length reads `undefined` inline
+//!   only while the realm's array-index protector holds and the array has
+//!   no sidecar. Otherwise it, a non-Array receiver with a non-string key,
+//!   and a table miss complete in the runtime.
 //! - Both operands stay intact until the result is written; the keyed table
 //!   routine neither allocates nor collects.
 //!
@@ -53,6 +55,7 @@ impl Codegen<'_> {
         let tagged = self.ops.new_dynamic_label();
         let holey = self.ops.new_dynamic_label();
         let boxed = self.ops.new_dynamic_label();
+        let absent = self.ops.new_dynamic_label();
         self.load_immediate(10, tag::NOT_CELL_MASK);
         dynasm!(self.ops ; .arch x64
             ; test Rq(receiver), r10 ; jnz =>other
@@ -62,7 +65,7 @@ impl Codegen<'_> {
         crate::x86_64::index::emit_number_index(&mut self.ops, key, index, double, runtime);
         dynasm!(self.ops ; .arch x64
             ; mov Rd(length), [Rq(receiver) + storage.length_byte as i32]
-            ; cmp Rd(length), Rd(index) ; jbe =>runtime
+            ; cmp Rd(length), Rd(index) ; jbe =>absent
             ; mov Rq(base), [Rq(receiver) + storage.base_byte as i32]
             ; movzx r10d, BYTE [Rq(receiver) + numeric.kind_byte as i32]
             ; cmp r10d, i32::from(storage.tagged_kind) ; je =>tagged
@@ -75,7 +78,7 @@ impl Codegen<'_> {
         );
         self.emit_hole_bit(numeric, base, index);
         dynasm!(self.ops ; .arch x64
-            ; jc =>runtime
+            ; jc =>absent
             ; mov r10d, Rd(index) ; movsd Rx(double), [Rq(base) + r10 * 8]
             ; =>boxed
         );
@@ -87,8 +90,20 @@ impl Codegen<'_> {
         );
         self.load_immediate(11, tag::VALUE_HOLE);
         dynasm!(self.ops ; .arch x64
-            ; cmp r10, r11 ; je =>runtime
+            ; cmp r10, r11 ; je =>absent
             ; mov Rq(destination), r10 ; jmp =>done
+            // No own element at the index: with no index key anywhere on the
+            // realm's default chain and no sidecar to replace the array's
+            // prototype, the ordinary [[Get]] answers `undefined`.
+            ; =>absent
+            ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
+            ; mov r10, [r10 + crate::entry::VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET as i32]
+            ; cmp BYTE [r10], 0 ; jne =>runtime
+            ; cmp DWORD [Rq(receiver) + storage.exotic_byte as i32], 0 ; jne =>runtime
+        );
+        self.load_immediate(destination, tag::VALUE_UNDEFINED);
+        dynasm!(self.ops ; .arch x64
+            ; jmp =>done
             ; =>other
         );
         self.emit_keyed_table_load(node, [receiver, key], destination, runtime, done);

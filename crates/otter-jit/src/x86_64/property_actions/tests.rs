@@ -652,7 +652,7 @@ fn shape_directory_reads_banks_and_refuses_shared_suffix_and_accessors() {
         let packed = u64::from(atom) << 32;
         f.cells[bucket_byte / 8] = packed | 2;
         assert_eq!(call(receiver), inline);
-        f.cells[bucket_byte / 8] = packed | 2 | 0;
+        f.cells[bucket_byte / 8] = packed | 2;
         f.cells[inline_byte / 8] = otter_vm::Value::double(41.0).to_bits();
         assert_eq!(
             call(receiver),

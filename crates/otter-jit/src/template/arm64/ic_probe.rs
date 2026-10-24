@@ -581,6 +581,21 @@ pub(crate) fn emit_element_address_from_dense_view<I>(
 where
     I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
 {
+    emit_dense_index_address(ops, access, load_index, miss, miss)
+}
+
+/// [`emit_element_address_from_dense_view`], branching to `past_end` instead
+/// of `miss` for an exact nonnegative index at or past the length.
+fn emit_dense_index_address<I>(
+    ops: &mut Assembler,
+    access: &JitElementAccess,
+    load_index: I,
+    miss: DynamicLabel,
+    past_end: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
     load_index(ops, 15)?;
     // Projection uses x16/x17 as reserved scratches. Keep the already
     // validated base separately, and never decode over the original key.
@@ -590,12 +605,12 @@ where
         JitGuardWidth::Byte | JitGuardWidth::Word32 => dynasm!(ops
             ; .arch aarch64
             ; cmp w12, w14
-            ; b.hs =>miss
+            ; b.hs =>past_end
         ),
         JitGuardWidth::Word64 => dynasm!(ops
             ; .arch aarch64
             ; cmp x12, x14
-            ; b.hs =>miss
+            ; b.hs =>past_end
         ),
     }
     match access.element.stride_shift() {
@@ -640,6 +655,37 @@ where
     // The template tier keeps its runtime context in x20.
     emit_element_view(ops, relocations, view, access, 20, load_receiver, miss)?;
     emit_element_address_from_dense_view(ops, access, load_index, miss)
+}
+
+/// Read one element of an access that [`JitElementAccess::reads_absent`] into
+/// `x9`: the element, or `undefined` for a hole or an exact nonnegative index
+/// past the length while the array-index protector holds. Any other key, a
+/// receiver outside the family or a set protector branches to `miss` with
+/// nothing written. Clobbers as [`emit_element_address`].
+pub(crate) fn emit_element_read_or_undefined<R, I>(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    access: &JitElementAccess,
+    load_receiver: R,
+    load_index: I,
+    miss: DynamicLabel,
+) -> Result<(), Unsupported>
+where
+    R: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+    I: FnOnce(&mut Assembler, u8) -> Result<(), Unsupported>,
+{
+    debug_assert!(access.reads_absent && access.element == JitElementRepr::Boxed);
+    let absent = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    emit_element_view(ops, relocations, view, access, 20, load_receiver, miss)?;
+    emit_dense_index_address(ops, access, load_index, miss, absent)?;
+    emit_element_read(ops, access.element, absent);
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>absent);
+    emit_array_index_protector_guard(ops, miss);
+    emit_load_u64(ops, 9, VALUE_UNDEFINED);
+    dynasm!(ops ; .arch aarch64 ; =>done);
+    Ok(())
 }
 
 /// Read the element whose address [`emit_element_address`] left in `x16` into

@@ -529,6 +529,14 @@ pub(crate) enum Kind {
     /// The boxed element at `input0 + input1 * 8`; eager deopt if it is a
     /// hole, which only the committed prototype lookup may answer.
     LoadPresentElement,
+    /// The boxed element at `input0 + input1 * 8` when the int32 `input1` is
+    /// below the element count `input2` and the slot holds a value; for a
+    /// hole or a non-negative index at or past the count, `undefined` while
+    /// the array-index protector holds. A negative index or a set protector
+    /// deopts eagerly. The receiver's element check proved a plain Array
+    /// without exotic state ([`otter_vm::jit::JitElementAccess::reads_absent`]),
+    /// so the realm element prototypes alone answer an absent index.
+    LoadElementOrUndefined,
     /// Eager deopt if the hole bitmap of numeric storage with element base
     /// input0 marks index input1.
     CheckHoleyElementPresent(JitHoleBitmap),
@@ -1076,6 +1084,7 @@ impl Kind {
             | Self::CheckElements { .. }
             | Self::CheckElementPresent
             | Self::LoadPresentElement
+            | Self::LoadElementOrUndefined
             | Self::CheckHoleyElementPresent(_)
             | Self::LoadHoleyFloat64Element(_)
             | Self::LoadArrayLength { .. }
@@ -1468,6 +1477,7 @@ impl Kind {
             | Self::LoadElement(_)
             | Self::LoadPresentElement
             | Self::LoadElementUint32ToFloat64 => simple(2, ResultPolicy::Register),
+            Self::LoadElementOrUndefined => simple(3, ResultPolicy::Register),
             Self::LoadHoleyFloat64Element(_) => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::Register,

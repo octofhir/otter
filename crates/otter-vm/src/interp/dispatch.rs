@@ -1515,6 +1515,17 @@ impl Interpreter {
                                 instr.instruction_pc,
                                 recv,
                             );
+                            if let Some(key_reg) = function.register(instr, 2)
+                                && let Ok(key) = read_register(&(*top_frame!()), key_reg)
+                            {
+                                let key = *key;
+                                self.record_element_bounds_feedback(
+                                    function,
+                                    instr.instruction_pc,
+                                    recv,
+                                    key,
+                                );
+                            }
                         }
                         if match self.drive_load_element(stack, context, operands) {
                             Ok(value) => value,

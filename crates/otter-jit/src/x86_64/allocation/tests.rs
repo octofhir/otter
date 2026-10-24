@@ -146,7 +146,7 @@ fn execute(
             }
         })
         .collect::<Vec<_>>();
-    let mut view = otter_vm::JitCompileSnapshot::without_feedback(0, 0, 0, vec![]);
+    let view = otter_vm::JitCompileSnapshot::without_feedback(0, 0, 0, vec![]);
     let mut relocations = RelocationCapture::default();
     match layout {
         Layout::Empty(plan) => emit_empty_literal(&mut ops, 15, expected_realm, *plan, regs, slow),
@@ -453,7 +453,7 @@ fn zero_records_emit_no_observation_and_keep_the_buffer_live() {
         dynasm!(ops ; .arch x64 ; mov Rq(regs.buffer), [Rq(context) + crate::entry::ALLOC_WINDOW_LAB_OFFSET as i32]);
         ops.finalize().unwrap().to_vec()
     };
-    let mut view = otter_vm::JitCompileSnapshot::without_feedback(0, 0, 0, vec![]);
+    let view = otter_vm::JitCompileSnapshot::without_feedback(0, 0, 0, vec![]);
 
     for observed in [false, true] {
         let records: Vec<_> = (0..2)

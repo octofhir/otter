@@ -46,6 +46,18 @@ impl Interpreter {
         }
     }
 
+    /// Whether `key` is an array index naming no own element of `recv`, a
+    /// plain Array with no exotic state: a hole, or an index past its dense
+    /// elements.
+    pub(crate) fn plain_array_index_absent(&self, recv: Value, key: Value) -> bool {
+        let Some(index) = key.as_number().and_then(crate::array::index_from_number) else {
+            return false;
+        };
+        recv.as_array().is_some_and(|array| {
+            crate::array::is_plain_dense_absent(array, &self.gc_heap, index)
+        })
+    }
+
     /// Whether an indexed store to `recv` at `key` reaches past the
     /// receiver's dense elements: an append or a gap. Only Array and
     /// typed-array receivers under a numeric array index qualify; every other store

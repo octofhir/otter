@@ -75,6 +75,7 @@ fn loads_stored_value(kind: &Kind) -> bool {
             | Kind::LoadArrayExpando(_)
             | Kind::LoadFunctionBag
             | Kind::LoadPresentElement
+            | Kind::LoadElementOrUndefined
             | Kind::LoadElement(_)
             | Kind::LoadElementUint32ToFloat64
             | Kind::LoadHoleyFloat64Element(_)

@@ -98,8 +98,9 @@ const CONSTRUCT_FAMILY_UNPREPARED: u64 = u64::MAX;
 const CALL_ATTEMPTED_SEEN: u8 = 1 << 4;
 const BRANCH_TAKEN_SEEN: u8 = 1 << 5;
 const BRANCH_NOT_TAKEN_SEEN: u8 = 1 << 6;
-/// An indexed store at this site reached past its receiver's dense elements:
-/// an append or a gap.
+/// An indexed access at this site named an index its receiver's dense
+/// elements do not hold: a store's append or gap, a load's hole or index past
+/// a plain Array's elements.
 const ELEMENT_OUT_OF_BOUNDS_SEEN: u8 = 1 << 7;
 
 /// Material transition made while recording an ordinary call target.
@@ -916,8 +917,8 @@ impl InstructionFeedback {
         }
     }
 
-    /// Record that an indexed store here reached past its receiver's dense
-    /// elements. Returns `true` exactly once for the cell.
+    /// Record that an indexed access here named an index its receiver's dense
+    /// elements do not hold. Returns `true` exactly once for the cell.
     pub fn record_element_out_of_bounds(&self) -> bool {
         self.states
             .fetch_or(ELEMENT_OUT_OF_BOUNDS_SEEN, Ordering::Relaxed)
@@ -925,8 +926,9 @@ impl InstructionFeedback {
             == 0
     }
 
-    /// Whether an indexed store here ever reached past its receiver's dense
-    /// elements, so an in-bounds speculation would leave generated code.
+    /// Whether an indexed access here ever named an index its receiver's
+    /// dense elements do not hold, so an in-bounds speculation would leave
+    /// generated code.
     #[must_use]
     pub fn element_out_of_bounds(&self) -> bool {
         self.states.load(Ordering::Relaxed) & ELEMENT_OUT_OF_BOUNDS_SEEN != 0
@@ -1285,8 +1287,8 @@ impl<'a> InstructionFeedbackRecorder<'a> {
         self.note_transition(self.cell.record_element_family(observed))
     }
 
-    /// Record an out-of-bounds indexed store and advance the epoch the first
-    /// time.
+    /// Record an indexed access past its receiver's dense elements and
+    /// advance the epoch the first time.
     pub(crate) fn record_element_out_of_bounds(self) -> bool {
         self.note_transition(self.cell.record_element_out_of_bounds())
     }

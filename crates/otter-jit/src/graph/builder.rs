@@ -4776,9 +4776,11 @@ impl<'a> Builder<'a> {
         let Some(&access) = self.view.element_accesses.get(&byte_pc) else {
             return Err(false);
         };
+        // A load whose absent indices read `undefined` in place keeps its
+        // specialized access; any other site that met them stays generic.
         if access.type_tag == 0
             || matches!(access.base, JitElementBase::None)
-            || self.view.out_of_bounds_element_sites.contains(&byte_pc)
+            || (self.view.out_of_bounds_element_sites.contains(&byte_pc) && !access.reads_absent)
             || self.exited_for(ExitReason::ShapeGuard)
             || self.exited_for(ExitReason::BoundsGuard)
             || self.exited_for(ExitReason::InvalidElementIndex)
@@ -4955,6 +4957,9 @@ impl<'a> Builder<'a> {
         };
         let receiver = self.read(instruction.reads[0]);
         let receiver = self.tagged(receiver);
+        if access.reads_absent {
+            return self.load_element_or_undefined(instruction, receiver, access);
+        }
         let (fact, index) = self.element_address(receiver, instruction.reads[1], access);
         // A boxed read proves an own slot as it reads: the descriptor admits
         // a prototype-only sidecar, so a hole must use committed prototype
@@ -5000,6 +5005,36 @@ impl<'a> Builder<'a> {
             ),
             element => self.add(Kind::LoadElement(element), &[fact.base, index], Repr::Int32),
         };
+        self.known
+            .elements_read
+            .insert((fact.base, index), (kind, value));
+        self.write(instruction.writes[0], value);
+    }
+
+    /// A read of a plain Array whose site met holes or indices past the
+    /// elements: no bounds check, the element or `undefined` from one node.
+    fn load_element_or_undefined(
+        &mut self,
+        instruction: &Instruction,
+        receiver: NodeId,
+        access: JitElementAccess,
+    ) {
+        let index = self.read(instruction.reads[1]);
+        let index = self.element_index(index);
+        let fact = self.elements_of(receiver, access);
+        let kind = Kind::LoadElementOrUndefined;
+        if let Some((read, value)) = self.known.elements_read.get(&(fact.base, index))
+            && *read == kind
+        {
+            let value = *value;
+            self.write(instruction.writes[0], value);
+            return;
+        }
+        let value = self.add(
+            Kind::LoadElementOrUndefined,
+            &[fact.base, index, fact.length],
+            Repr::Tagged,
+        );
         self.known
             .elements_read
             .insert((fact.base, index), (kind, value));

@@ -91,6 +91,7 @@ fn identifies_zeros(graph: &Graph, user: NodeId, index: usize) -> Option<bool> {
         | Kind::LoadElementUint32ToFloat64
         | Kind::CheckElementPresent
         | Kind::LoadPresentElement
+        | Kind::LoadElementOrUndefined
         | Kind::CheckHoleyElementPresent(_)
         | Kind::StoreElement(_)
         | Kind::ElementWriteBarrier => Some(index == 1),

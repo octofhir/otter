@@ -2,11 +2,13 @@
 //!
 //! # Contents
 //! - Width-correct boxed, integer and floating element loads and stores.
-//! - Numeric hole bitmaps and the array-index protector's undefined result.
+//! - Numeric hole bitmaps and the array-index protector's undefined result,
+//!   also for a plain Array's hole or index past its elements.
 //! - SSE2 ToUint8Clamp with explicit ties-to-even rounding.
 //!
 //! # Invariants
-//! - Bounds and storage guards precede access; index high words are discarded.
+//! - Bounds and storage guards, or an element-or-undefined read's own count
+//!   compare, precede access; index high words are discarded.
 //! - No derived base survives a collecting or reentrant operation.
 //! - Clamping does not depend on MXCSR rounding or an untracked constant pool.
 //! - Only results, declared FP temporaries and r10/r11/xmm15 are clobbered.
@@ -79,6 +81,36 @@ impl Codegen<'_> {
                 dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>hole);
                 self.emit_hole_undefined(node, result);
                 dynasm!(self.ops ; .arch x64 ; =>done);
+            }
+            Kind::LoadElementOrUndefined => {
+                let (base, index, length, result) = (
+                    Self::gp(input(0)),
+                    Self::gp(input(1)),
+                    Self::gp(input(2)),
+                    Self::gp(assigned.result.expect("element result")),
+                );
+                let absent = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
+                // Unsigned, so a negative index takes the absent path too and
+                // leaves there; the element is read only below the count.
+                self.load_immediate(11, tag::VALUE_HOLE);
+                dynasm!(self.ops ; .arch x64
+                    ; cmp Rd(index), Rd(length) ; jae =>absent
+                    ; mov r10d, Rd(index) ; mov r10, [Rq(base) + r10 * 8]
+                    ; cmp r10, r11 ; je =>absent
+                    ; mov Rq(result), r10
+                    ; =>done);
+                self.deferred.push(Box::new(move |codegen| {
+                    dynasm!(codegen.ops ; .arch x64
+                        ; =>absent
+                        ; test Rd(index), Rd(index) ; js =>exit
+                        ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
+                        ; mov r10, [r10 + crate::entry::VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET as i32]
+                        ; cmp BYTE [r10], 0 ; jne =>exit);
+                    codegen.load_immediate(result, tag::VALUE_UNDEFINED);
+                    dynasm!(codegen.ops ; .arch x64 ; jmp =>done);
+                }));
             }
             Kind::StoreElement(element) => {
                 self.emit_store_element(element, Self::gp(input(0)), Self::gp(input(1)), input(2))?

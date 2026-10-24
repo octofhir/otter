@@ -8,9 +8,12 @@
 //! # Invariants
 //! - Inline paths read only: an element present in dense storage is an own
 //!   data property while the array's own-state guard byte reads zero.
-//! - A hole, an index past the dense length, a non-Array receiver with a
-//!   non-string key, and a table miss complete in the runtime, which walks
-//!   the prototype chain, runs accessors and records the site's feedback.
+//! - A hole or an index past the dense length reads `undefined` inline
+//!   only while the realm's array-index protector holds and the array has
+//!   no sidecar: no index key then exists on the default prototype chain.
+//!   Otherwise it, a non-Array receiver with a non-string key, and a table
+//!   miss complete in the runtime, which walks the prototype chain, runs
+//!   accessors and records the site's feedback.
 //! - Both operands stay intact until the result is written; the keyed table
 //!   routine neither allocates nor collects.
 //!
@@ -18,8 +21,12 @@
 //! - [`super::keyed_store`] for the generic keyed store.
 //! - `otter_vm::jit::JitArrayStorage` for the storage this reads.
 
-use super::{Codegen, CommittedArgument, DynamicLabel, NodeId, VALUE_HOLE, abi};
+use super::{
+    Codegen, CommittedArgument, DynamicLabel, NodeId, THREAD_OFFSET, VALUE_HOLE, VALUE_UNDEFINED,
+    abi,
+};
 use crate::Unsupported;
+use crate::entry::VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::jit::JitArrayStorage;
 
@@ -45,6 +52,7 @@ impl Codegen<'_> {
         let tagged = self.ops.new_dynamic_label();
         let holey = self.ops.new_dynamic_label();
         let boxed = self.ops.new_dynamic_label();
+        let absent = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
             ; tst X(receiver), #0xfffe_0000_0000_0007
@@ -60,7 +68,7 @@ impl Codegen<'_> {
             ; .arch aarch64
             ; ldr W(length), [X(receiver), storage.length_byte]
             ; cmp W(length), W(index)
-            ; b.ls =>runtime
+            ; b.ls =>absent
             ; ldr X(base), [X(receiver), storage.base_byte]
             ; ldrb w17, [X(receiver), numeric.kind_byte]
             ; cmp w17, u32::from(storage.tagged_kind)
@@ -77,7 +85,7 @@ impl Codegen<'_> {
         self.emit_hole_bit(numeric, base, index);
         dynasm!(self.ops
             ; .arch aarch64
-            ; b.ne =>runtime
+            ; b.ne =>absent
             ; ldr D(double), [X(base), W(index), uxtw #3]
             ; =>boxed
         );
@@ -92,8 +100,23 @@ impl Codegen<'_> {
         dynasm!(self.ops
             ; .arch aarch64
             ; cmp x16, x17
-            ; b.eq =>runtime
+            ; b.eq =>absent
             ; mov X(destination), x16
+            ; b =>done
+            // No own element at the index: with no index key anywhere on the
+            // realm's default chain and no sidecar to replace the array's
+            // prototype, the ordinary [[Get]] answers `undefined`.
+            ; =>absent
+            ; ldr x16, [x20, THREAD_OFFSET]
+            ; ldr x16, [x16, VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET]
+            ; ldrb w16, [x16]
+            ; cbnz w16, =>runtime
+            ; ldr w16, [X(receiver), storage.exotic_byte]
+            ; cbnz w16, =>runtime
+        );
+        self.load_immediate(destination, VALUE_UNDEFINED);
+        dynasm!(self.ops
+            ; .arch aarch64
             ; b =>done
             ; =>other
         );

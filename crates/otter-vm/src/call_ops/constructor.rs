@@ -175,7 +175,11 @@ impl Interpreter {
         }
         // SELF/caller/ticket are already traced. Scalar feedback is written
         // only after complete receiver publication and retains no GC value.
-        if let Some(caller) = unsafe { frame.caller_frame().as_ref() } {
+        // Optimized code has consumed its sites' feedback; a deopt resumes
+        // collection in the lower tier that reads it.
+        if let Some(caller) = unsafe { frame.caller_frame().as_ref() }
+            && caller.header.kind != crate::native_abi::NativeFrameKind::Optimizing
+        {
             self.record_prepared_construct_family(context, caller, frame.construct_layout)?;
         }
         Ok(())

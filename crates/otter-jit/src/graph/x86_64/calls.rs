@@ -56,12 +56,24 @@ impl Codegen<'_> {
         destination: Option<u8>,
         span_bytes: u32,
     ) -> Result<(), Unsupported> {
-        assert!(arguments.len() <= 3);
+        assert!(arguments.len() <= 4);
         self.save_live_homes(node);
         self.stamp_node_safepoint(node)?;
         self.stamp_pc(node);
         // Values may sit in any argument register: stage the first two in the
-        // scratch pair and a third on the stack before any is overwritten.
+        // scratch pair and the rest on the stack before any is overwritten.
+        let values = arguments
+            .iter()
+            .filter(|argument| matches!(argument, CommittedArgument::Value(_)))
+            .count();
+        let pushed = values.saturating_sub(2) as i32;
+        debug_assert!(
+            pushed == 0
+                || !arguments
+                    .iter()
+                    .any(|argument| matches!(argument, CommittedArgument::StackAddress(_))),
+            "stack-staged values would move a stack-address argument"
+        );
         let mut staged = 0;
         for argument in arguments {
             if let CommittedArgument::Value(value) = *argument {
@@ -76,13 +88,15 @@ impl Codegen<'_> {
         dynasm!(self.ops ; .arch x64 ; mov rdi, r15);
         staged = 0;
         for (index, argument) in arguments.iter().enumerate() {
-            let register = [6, 2, 1][index];
+            let register = [6, 2, 1, 8][index];
             match argument {
                 CommittedArgument::Value(_) => {
                     if staged < 2 {
                         dynasm!(self.ops ; .arch x64 ; mov Rq(register), Rq(10 + staged));
                     } else {
-                        dynasm!(self.ops ; .arch x64 ; pop Rq(register));
+                        // The last value pushed sits lowest.
+                        let offset = (pushed - 1 - (i32::from(staged) - 2)) * 8;
+                        dynasm!(self.ops ; .arch x64 ; mov Rq(register), [rsp + offset]);
                     }
                     staged += 1;
                 }
@@ -98,6 +112,9 @@ impl Codegen<'_> {
                     dynasm!(self.ops ; .arch x64 ; lea Rq(register), [rsp + *offset as i32])
                 }
             }
+        }
+        if pushed != 0 {
+            dynasm!(self.ops ; .arch x64 ; add rsp, pushed * 8);
         }
         let (_, committed_throw) = self.throw_targets(node);
         let fatal = self.fatal;

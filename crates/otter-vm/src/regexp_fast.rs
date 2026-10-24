@@ -8,13 +8,16 @@
 //!
 //! # Contents
 //! - [`RegExpProtocolProof`] — per-realm record that the prototype is built-in.
-//! - [`Interpreter::is_pristine_regexp`] — a receiver qualifies.
+//! - [`Interpreter::is_pristine_regexp`] — a receiver qualifies;
+//!   [`Interpreter::is_pristine_regexp_proved`] without taking the proof.
 //! - [`Interpreter::regexp_species_is_builtin`] — `@@split`'s species read.
 //! - [`exec_without_result`] — `RegExpBuiltinExec` reporting only success.
 //! - [`exec_direct`] — `RegExpBuiltinExec` of a directly called original
 //!   `exec` or `test`, without a frame, allocating nothing before a hit.
 //! - [`split`] — `@@split` with the receiver's own matcher as the splitter.
-//! - [`replace()`] — `@@replace` over match records, substituting by range.
+//! - [`replace()`] — `@@replace` as one splice of subject and template runs.
+//! - [`match_pristine`] / [`search`] — `@@match` and `@@search`, matched
+//!   in place.
 //!
 //! # Invariants
 //! - The proof is the prototype-chain validity cell of `%RegExp.prototype%`,
@@ -32,11 +35,15 @@
 //! # See also
 //! - [`crate::regexp_prototype`] — the general spec ladders.
 
+mod matching;
 mod replace;
 
-pub(crate) use replace::replace;
+pub(crate) use matching::{match_pristine, search};
+pub(crate) use replace::{replace, replace_direct};
 
 use std::sync::Arc;
+
+use smallvec::SmallVec;
 
 use crate::object::prototype_validity::PrototypeValidity;
 use crate::object::{self, ShapeState};
@@ -66,6 +73,28 @@ impl Interpreter {
                 .as_i32()
                 .is_some_and(|index| index >= 0);
         plain && self.regexp_prototype_is_builtin()
+    }
+
+    /// [`Self::is_pristine_regexp`] against the realm's current proof only:
+    /// never allocates or collects, and answers `false` when the proof must
+    /// first be taken.
+    pub(crate) fn is_pristine_regexp_proved(&self, receiver: Value) -> bool {
+        let Some(regexp) = receiver.as_regexp() else {
+            return false;
+        };
+        let heap = &self.gc_heap;
+        regexp.expando(heap).is_none()
+            && regexp.prototype_override(heap).is_none()
+            && regexp.last_index_writable(heap)
+            && regexp
+                .last_index_value(heap)
+                .as_i32()
+                .is_some_and(|index| index >= 0)
+            && self
+                .realm_intrinsics
+                .regexp_protocol
+                .as_ref()
+                .is_some_and(|proof| proof.builtin && proof.validity.is_valid())
     }
 
     /// Whether `%RegExp%[@@species]` is still the built-in accessor, so
@@ -332,100 +361,115 @@ pub(crate) fn split(
     input: Value,
     limit: u32,
 ) -> Result<Value, NativeError> {
+    use crate::regexp::engine::NO_OFFSET;
     ctx.scope(|mut scope| {
         let receiver = scope.value(receiver);
         let input = scope.value(input);
-        let regexp = scope.raw(receiver).as_regexp().expect("pristine RegExp");
-        let subject = scope.raw(input);
-        let heap = scope.context().heap();
-        let flags = regexp.flags(heap);
-        let unicode = flags.unicode || flags.unicode_sets;
-        let units = subject
-            .as_string(heap)
+        scope
+            .raw(input)
+            .as_string(scope.context().heap())
             .expect("split subject is a string")
-            .to_utf16_vec(heap);
-        let size = units.len();
-        let mut pieces: Vec<Local<'_>> = Vec::new();
-        let mut last_match = None;
-        let search = |scope: &mut NativeScope<'_, '_>, at: usize| {
-            let regexp = scope.raw(receiver).as_regexp().expect("pristine RegExp");
-            let context = scope.context();
-            let search = context.regex_search();
-            let execution = regexp.find_one(
-                context.heap(),
-                crate::string::CodeUnits::Utf16(&units),
-                at,
-                &search,
-            );
-            crate::regexp::finish_execution(scope.context(), execution)
-        };
-        if limit > 0 && size == 0 {
-            let matched = search(&mut scope, 0)?.filter(|m| m.range.start == 0);
-            if matched.is_none() {
-                pieces.push(input);
-            }
-            last_match = matched;
-        } else if limit > 0 {
-            let mut p = 0;
-            let mut q = 0;
-            'pieces: while q < size {
-                let Some(matched) = search(&mut scope, q)? else {
-                    if flags.sticky {
-                        q = crate::regexp_prototype::advance_string_index(&units, q, unicode);
-                        continue;
-                    }
-                    break;
+            .flatten_in_place(scope.context().heap_mut())?;
+        let regexp = scope.raw(receiver).as_regexp().expect("pristine RegExp");
+        let subject = scope
+            .raw(input)
+            .as_string(scope.context().heap())
+            .expect("split subject is a string");
+        let flags = regexp.flags(scope.context().heap());
+        let unicode = flags.unicode || flags.unicode_sets;
+        let size = subject.len() as usize;
+        // Every piece is found before any exists: a piece is a subject range,
+        // or `None` for a capture that did not participate.
+        let mut pieces: SmallVec<[Option<(u32, u32)>; 16]> = SmallVec::new();
+        let mut offsets = std::mem::take(&mut scope.context().interp_mut().regexp_offsets);
+        let mut last: Vec<u32> = Vec::new();
+        let context = scope.context();
+        let search = context.regex_search();
+        let heap = context.heap();
+        let mut steps = 0u64;
+        let outcome: Result<(), crate::regexp::engine::ExecError> =
+            subject.with_code_units(heap, |units| {
+                let mut find = |at: usize, offsets: &mut Vec<u32>| {
+                    let execution = regexp.find_first_offsets(heap, units, at, &search, offsets);
+                    steps += execution.steps;
+                    execution.result
                 };
-                if matched.range.start >= size {
-                    break;
+                // §22.2.7.3 AdvanceStringIndex over the subject's stored units.
+                let advance = |at: usize| {
+                    let pair = unicode
+                        && units
+                            .get(at)
+                            .is_some_and(|unit| (0xD800..0xDC00).contains(&unit))
+                        && units
+                            .get(at + 1)
+                            .is_some_and(|unit| (0xDC00..0xE000).contains(&unit));
+                    at + if pair { 2 } else { 1 }
+                };
+                if limit == 0 {
+                    return Ok(());
                 }
-                q = matched.range.start;
-                let end = matched.range.end.min(size);
-                if end == p {
-                    last_match = Some(matched);
-                    q = crate::regexp_prototype::advance_string_index(&units, q, unicode);
-                    continue;
+                if size == 0 {
+                    if find(0, &mut offsets)? && offsets[0] == 0 {
+                        last.clone_from(&offsets);
+                    } else {
+                        pieces.push(Some((0, 0)));
+                    }
+                    return Ok(());
                 }
-                pieces.push(slice(&mut scope, input, p..q)?);
-                if pieces.len() as u32 == limit {
-                    last_match = Some(matched);
-                    break 'pieces;
-                }
-                p = end;
-                for capture in matched.captures().iter() {
-                    let piece = match capture {
-                        Some(range) => slice(&mut scope, input, range.clone())?,
-                        None => scope.undefined(),
-                    };
-                    pieces.push(piece);
-                    if pieces.len() as u32 == limit {
+                let full =
+                    |pieces: &SmallVec<[Option<(u32, u32)>; 16]>| pieces.len() as u32 == limit;
+                let (mut p, mut q) = (0usize, 0usize);
+                while q < size {
+                    if !find(q, &mut offsets)? {
+                        if flags.sticky {
+                            q = advance(q);
+                            continue;
+                        }
                         break;
                     }
+                    let start = offsets[0] as usize;
+                    if start >= size {
+                        break;
+                    }
+                    q = start;
+                    let end = (offsets[1] as usize).min(size);
+                    last.clone_from(&offsets);
+                    if end == p {
+                        q = advance(q);
+                        continue;
+                    }
+                    pieces.push(Some((p as u32, q as u32)));
+                    if full(&pieces) {
+                        return Ok(());
+                    }
+                    p = end;
+                    for capture in offsets[2..].as_chunks::<2>().0 {
+                        pieces.push((capture[0] != NO_OFFSET).then_some((capture[0], capture[1])));
+                        if full(&pieces) {
+                            return Ok(());
+                        }
+                    }
+                    q = p;
                 }
-                last_match = Some(matched);
-                if pieces.len() as u32 == limit {
-                    break 'pieces;
-                }
-                q = p;
-            }
-            if (pieces.len() as u32) < limit {
-                pieces.push(slice(&mut scope, input, p..size)?);
-            }
+                pieces.push(Some((p as u32, size as u32)));
+                Ok(())
+            });
+        scope.context().interp_mut().regexp_offsets = offsets;
+        scope.context().charge_regex_backtrack_steps(steps)?;
+        outcome.map_err(|_| NativeError::BudgetExceeded {
+            reason: "work budget exceeded in a regular expression search".to_string(),
+        })?;
+        if !last.is_empty() {
+            matching::record_legacy(&mut scope, receiver, input, last);
         }
-        if let Some(matched) = last_match {
-            let subject = scope.raw(input);
-            scope.with_turn_parts(|interp, _| {
-                interp.regexp_legacy.record_match(
-                    subject,
-                    matched.range.clone(),
-                    matched.captures().iter(),
-                );
+        let mut locals = SmallVec::<[Local<'_>; 16]>::with_capacity(pieces.len());
+        for piece in pieces {
+            locals.push(match piece {
+                Some((start, end)) => slice(&mut scope, input, start as usize..end as usize)?,
+                None => scope.undefined(),
             });
         }
-        let array = scope.array(pieces.len())?;
-        for (index, piece) in pieces.into_iter().enumerate() {
-            scope.set_index(array, index, piece)?;
-        }
+        let array = scope.array_from(&locals)?;
         Ok(scope.finish(array))
     })
 }

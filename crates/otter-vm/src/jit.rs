@@ -123,6 +123,7 @@ mod string_layout;
 pub use string_layout::JitStringLayout;
 
 mod intrinsic_calls;
+pub(crate) use intrinsic_calls::MethodHome;
 pub use intrinsic_calls::{IntrinsicCallKind, JitIntrinsicCallProof, JitNativeCall};
 
 mod native_callable;

@@ -753,8 +753,8 @@ fn every_kind() -> Vec<super::ir::Kind> {
         },
         Kind::StoreKeyedCached { pc: 0 },
         Kind::LoadKeyedCached { pc: 0 },
-        Kind::RegExpMethod { test: true },
-        Kind::RegExpMethod { test: false },
+        Kind::BuiltinMethod(crate::intrinsic_calls::IntrinsicMethodForm::RegExpTest),
+        Kind::BuiltinMethod(crate::intrinsic_calls::IntrinsicMethodForm::StringReplace),
         Kind::LoadTaggedField(8),
         Kind::StoreTaggedField(8),
         Kind::WriteBarrier,
@@ -964,7 +964,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::StorePropertyCached { .. }
         | K::StoreKeyedCached { .. }
         | K::LoadKeyedCached { .. }
-        | K::RegExpMethod { .. }
+        | K::BuiltinMethod(_)
         | K::LoadTaggedField(_)
         | K::StoreTaggedField(_)
         | K::WriteBarrier

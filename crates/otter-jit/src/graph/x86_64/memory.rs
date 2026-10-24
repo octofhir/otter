@@ -41,21 +41,23 @@ impl Codegen<'_> {
         let input = |index| allocation.inputs[index];
         let output = || Self::gp(allocation.result.expect("memory result"));
         match self.graph.node(node).kind.clone() {
-            Kind::RegExpMethod { test } => {
-                let stub = if test {
-                    abi::STUB_JIT_REGEXP_TEST
-                } else {
-                    abi::STUB_JIT_REGEXP_EXEC
-                };
-                self.emit_committed_call(
-                    node,
-                    stub,
-                    &[
-                        CommittedArgument::Value(Self::gp(input(0))),
-                        CommittedArgument::Value(Self::gp(input(1))),
-                    ],
-                    Some(output()),
-                )?;
+            Kind::BuiltinMethod(form) => {
+                let mut arguments: smallvec::SmallVec<[CommittedArgument; 4]> = (0..=form.arity())
+                    .map(|index| CommittedArgument::Value(Self::gp(input(index))))
+                    .collect();
+                let stub = form.stub();
+                if stub.id == abi::STUB_JIT_STRING_METHOD.id {
+                    // The entry reads two arguments and the kind.
+                    while arguments.len() < 3 {
+                        arguments.push(CommittedArgument::Scalar(
+                            otter_vm::value::tag::VALUE_UNDEFINED,
+                        ));
+                    }
+                    arguments.push(CommittedArgument::Scalar(u64::from(
+                        form.kind().feedback_payload(),
+                    )));
+                }
+                self.emit_committed_call(node, stub, &arguments, Some(output()))?;
             }
             Kind::LoadOwnField { field, .. } => {
                 crate::x86_64::fields::emit_own_field(

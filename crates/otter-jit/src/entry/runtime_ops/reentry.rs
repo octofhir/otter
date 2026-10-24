@@ -760,6 +760,28 @@ pub(crate) extern "C" fn jit_regexp_test_stub(
     committed_value_result(ctx, result)
 }
 
+/// `receiver.<method>(argument0, argument1)` of the realm's original
+/// `String.prototype` method the intrinsic kind payload names.
+pub(crate) extern "C" fn jit_string_method_stub(
+    ctx: *mut JitCtx,
+    receiver_bits: u64,
+    argument0_bits: u64,
+    argument1_bits: u64,
+    kind: u64,
+) -> NativeResultPair {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let result = ctx.string_method(
+        kind,
+        Value::from_bits(receiver_bits),
+        [
+            Value::from_bits(argument0_bits),
+            Value::from_bits(argument1_bits),
+        ],
+    );
+    committed_value_result(ctx, result)
+}
+
 /// Complete one object-property `delete` opcode (`DeleteProperty` or
 /// `DeleteElement`). Binding deletion uses [`jit_binding_value_stub`].
 pub(crate) extern "C" fn jit_delete_op_stub(

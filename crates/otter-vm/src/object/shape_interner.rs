@@ -23,7 +23,7 @@ use super::shape_body::{self, ShapeBody, ShapeHandle};
 use super::{ShapeId, ShapeState};
 use crate::isolate_names::IsolateNames;
 use crate::property_atom::AtomId;
-use crate::string::{JsStringHandle, gc_body::alloc_old_flat_string_body_with_roots};
+use crate::string::{JsStringHandle, gc_body::alloc_old_string_body_with_roots};
 use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 use otter_gc::{GcHeap, HandleScope};
@@ -287,7 +287,7 @@ impl ShapeInterner {
             }
         }
         let units: Vec<u16> = crate::wtf16_escape::units(key).collect();
-        let handle = alloc_old_flat_string_body_with_roots(heap, &units, external_visit)?;
+        let handle = alloc_old_string_body_with_roots(heap, &units, external_visit)?;
         let atom = {
             let isolate = IsolateNames::of_mut(heap);
             let atom = isolate.names_mut().intern(key);

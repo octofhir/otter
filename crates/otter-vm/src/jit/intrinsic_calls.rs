@@ -33,38 +33,45 @@ pub enum IntrinsicCallKind {
     RegExpExec,
     /// The realm's original `%RegExp.prototype.test%`, called as a method.
     RegExpTest,
+    /// The realm's original `%String.prototype.replace%`, called as a method.
+    StringReplace,
+    /// The realm's original `%String.prototype.split%`, called as a method.
+    StringSplit,
+    /// The realm's original `%String.prototype.match%`, called as a method.
+    StringMatch,
+    /// The realm's original `%String.prototype.search%`, called as a method.
+    StringSearch,
 }
 
 impl IntrinsicCallKind {
-    pub(crate) const ALL: [Self; 6] = [
+    /// Number of kinds.
+    pub const COUNT: usize = 10;
+
+    /// Every kind, in feedback-payload order.
+    pub const ALL: [Self; Self::COUNT] = [
         Self::Array,
         Self::Boolean,
         Self::Number,
         Self::Object,
         Self::RegExpExec,
         Self::RegExpTest,
+        Self::StringReplace,
+        Self::StringSplit,
+        Self::StringMatch,
+        Self::StringSearch,
     ];
 
-    pub(crate) const fn feedback_payload(self) -> u32 {
-        match self {
-            Self::Array => 0,
-            Self::Boolean => 1,
-            Self::Number => 2,
-            Self::Object => 3,
-            Self::RegExpExec => 4,
-            Self::RegExpTest => 5,
-        }
+    /// The scalar code feedback and runtime entries name this kind by.
+    #[must_use]
+    pub const fn feedback_payload(self) -> u32 {
+        self as u32
     }
 
     pub(crate) const fn from_feedback_payload(payload: u32) -> Option<Self> {
-        match payload {
-            0 => Some(Self::Array),
-            1 => Some(Self::Boolean),
-            2 => Some(Self::Number),
-            3 => Some(Self::Object),
-            4 => Some(Self::RegExpExec),
-            5 => Some(Self::RegExpTest),
-            _ => None,
+        if (payload as usize) < Self::COUNT {
+            Some(Self::ALL[payload as usize])
+        } else {
+            None
         }
     }
 
@@ -72,8 +79,37 @@ impl IntrinsicCallKind {
     /// specialized form, rather than a plain call or construction.
     #[must_use]
     pub const fn is_method(self) -> bool {
-        matches!(self, Self::RegExpExec | Self::RegExpTest)
+        matches!(
+            self,
+            Self::RegExpExec
+                | Self::RegExpTest
+                | Self::StringReplace
+                | Self::StringSplit
+                | Self::StringMatch
+                | Self::StringSearch
+        )
     }
+
+    /// The prototype a method kind's original callable lives on, and its
+    /// property name there.
+    pub(crate) const fn method_home(self) -> Option<(MethodHome, &'static str)> {
+        Some(match self {
+            Self::RegExpExec => (MethodHome::RegExpPrototype, "exec"),
+            Self::RegExpTest => (MethodHome::RegExpPrototype, "test"),
+            Self::StringReplace => (MethodHome::StringPrototype, "replace"),
+            Self::StringSplit => (MethodHome::StringPrototype, "split"),
+            Self::StringMatch => (MethodHome::StringPrototype, "match"),
+            Self::StringSearch => (MethodHome::StringPrototype, "search"),
+            Self::Array | Self::Boolean | Self::Number | Self::Object => return None,
+        })
+    }
+}
+
+/// The intrinsic prototype a method kind's original callable is read from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MethodHome {
+    RegExpPrototype,
+    StringPrototype,
 }
 
 /// Exact canonical callable identity retained by one compiled generation.
@@ -121,7 +157,7 @@ mod tests {
                 Some(kind)
             );
         }
-        for invalid in [6, 256, u32::MAX] {
+        for invalid in [IntrinsicCallKind::COUNT as u32, 256, u32::MAX] {
             assert_eq!(IntrinsicCallKind::from_feedback_payload(invalid), None);
         }
     }

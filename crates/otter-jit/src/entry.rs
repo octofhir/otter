@@ -345,6 +345,16 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_global_declaration_value_stub
         ),
         {
+            const _: () = assert!(abi::STUB_JIT_STRING_METHOD.argument_count == 4);
+            const _: () = assert!(matches!(
+                abi::STUB_JIT_STRING_METHOD.signature,
+                abi::RuntimeStubSignature::ContextWords
+            ));
+            let entry: extern "C" fn(*mut JitCtx, u64, u64, u64, u64) -> abi::NativeResultPair =
+                jit_string_method_stub;
+            binding(abi::STUB_JIT_STRING_METHOD, entry as *const () as usize)
+        },
+        {
             const _: () = assert!(abi::STUB_JIT_OBJECT_PROTOCOL_VALUE.argument_count == 3);
             const _: () = assert!(matches!(
                 abi::STUB_JIT_OBJECT_PROTOCOL_VALUE.signature,

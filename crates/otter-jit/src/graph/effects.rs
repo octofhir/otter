@@ -454,7 +454,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::StorePropertyCached { .. }
         | Kind::StoreKeyedCached { .. }
         | Kind::LoadKeyedCached { .. }
-        | Kind::RegExpMethod { .. }
+        | Kind::BuiltinMethod(_)
         | Kind::Instanceof
         | Kind::ArrayPush(_)
         | Kind::ArrayPop(_)

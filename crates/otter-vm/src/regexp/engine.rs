@@ -5,6 +5,8 @@
 //! - [`MatchOffsets`] — one match's group offsets in the interpreter's
 //!   reused buffer, for the direct `exec`/`test` path.
 //! - Sticky searches anchored at their start, one candidate per match.
+//! - [`for_each_match`] — successive matches visited in place, without
+//!   owning any capture storage.
 //! - Scratch handoff and backtrack work transferred to the VM ledger.
 //!
 //! # Invariants
@@ -118,6 +120,73 @@ fn collect_batch<U: otter_regex::Unit>(
     let steps = matches.steps_executed();
     search.scratch.set(matches.into_scratch());
     Execution { result, steps }
+}
+
+/// Visit at most `max_matches` successive matches from `start`, in order,
+/// with exact work accounting; `visit` returns whether to continue. Each
+/// match borrows the matcher's scratch until `visit` returns, so nothing is
+/// collected: a caller keeps only the ranges it needs. The result counts the
+/// visited matches.
+pub(crate) fn for_each_match(
+    re: &Regex,
+    text: crate::string::CodeUnits<'_>,
+    start: usize,
+    sticky: bool,
+    max_matches: usize,
+    search: &super::RegexSearch<'_>,
+    visit: impl FnMut(&Match<'_>) -> bool,
+) -> Execution<usize> {
+    let config = otter_regex::ExecConfig {
+        step_limit: search.step_limit,
+    };
+    let scratch = search.scratch.take();
+    match text {
+        crate::string::CodeUnits::Latin1(bytes) => visit_matches(
+            re.find_latin1_with(bytes, start, config, scratch)
+                .anchored(sticky),
+            max_matches,
+            search,
+            visit,
+        ),
+        crate::string::CodeUnits::Utf16(units) => visit_matches(
+            re.find_utf16_with(units, start, config, scratch)
+                .anchored(sticky),
+            max_matches,
+            search,
+            visit,
+        ),
+    }
+}
+
+fn visit_matches<U: otter_regex::Unit>(
+    mut matches: otter_regex::Matches<'_, '_, U>,
+    max_matches: usize,
+    search: &super::RegexSearch<'_>,
+    mut visit: impl FnMut(&Match<'_>) -> bool,
+) -> Execution<usize> {
+    let mut visited = 0;
+    let mut result = Ok(());
+    while visited < max_matches {
+        match matches.next() {
+            None => break,
+            Some(Err(error)) => {
+                result = Err(error);
+                break;
+            }
+            Some(Ok(found)) => {
+                visited += 1;
+                if !visit(&found) {
+                    break;
+                }
+            }
+        }
+    }
+    let steps = matches.steps_executed();
+    search.scratch.set(matches.into_scratch());
+    Execution {
+        result: result.map(|()| visited),
+        steps,
+    }
 }
 
 /// Find only the first match from `start` — the single-match path for

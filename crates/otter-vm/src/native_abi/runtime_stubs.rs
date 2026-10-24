@@ -1910,6 +1910,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_JIT_REGEXP_TEST.id => "jit_regexp_test",
         id if id == STUB_CONTEXT_SLOT_WRITTEN.id => "context_slot_written",
         id if id == STUB_MATH_F64_LEAF.id => "math_f64_leaf",
+        id if id == STUB_JIT_STRING_METHOD.id => "jit_string_method",
 
         _ => "unknown_runtime_stub",
     }
@@ -2153,6 +2154,23 @@ pub const STUB_MATH_F64_LEAF: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::None,
 );
 
+/// The realm's original `String.prototype` regexp-facing method selected by
+/// the intrinsic kind payload `(receiver, argument0, argument1, kind)`,
+/// whose identity generated code proved: the method's complete semantics
+/// without a native call frame. Coercions and a non-pristine RegExp argument
+/// may run JavaScript; once entered it completes or returns a pure
+/// exception value.
+pub const STUB_JIT_STRING_METHOD: RuntimeStubDescriptor = descriptor(
+    119,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::ContextWords,
+    4,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2273,6 +2291,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_REGEXP_TEST,
     STUB_CONTEXT_SLOT_WRITTEN,
     STUB_MATH_F64_LEAF,
+    STUB_JIT_STRING_METHOD,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

@@ -22,6 +22,7 @@
 //! - [`crate::process::install_global`]
 //! - Node.js `lib/events.js` and `lib/internal/process/warning.js`.
 
+use otter_vm::ValueWindow;
 use smallvec::smallvec;
 
 use otter_vm::{Attr, ErrorKind, Local, NativeCall, NativeCtx, NativeError, NativeScope, Value};
@@ -247,7 +248,7 @@ fn apply_channel_interest(
 
 fn add_listener(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     prepend: bool,
     once: bool,
 ) -> Result<Value, NativeError> {
@@ -299,23 +300,29 @@ fn add_listener(
     })
 }
 
-fn process_on(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_on(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     add_listener(ctx, args, false, false)
 }
 
-fn process_once(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_once(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     add_listener(ctx, args, false, true)
 }
 
-fn process_prepend(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_prepend(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     add_listener(ctx, args, true, false)
 }
 
-fn process_prepend_once(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_prepend_once(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     add_listener(ctx, args, true, true)
 }
 
-fn process_remove_listener(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_remove_listener(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let event = validate_event(args.first().copied().unwrap_or_else(Value::undefined))?;
     let listener = validate_listener(args.get(1).copied().unwrap_or_else(Value::undefined))?;
     let process = *ctx.this_value();
@@ -349,7 +356,7 @@ fn process_remove_listener(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 
 fn process_remove_all_listeners(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let selected = args.first().copied().map(validate_event).transpose()?;
     let process = *ctx.this_value();
@@ -378,7 +385,7 @@ fn emit_values(
     ctx: &mut NativeCtx<'_>,
     process: Value,
     event: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let event = validate_event(event)?;
     ctx.scope(|mut scope| {
@@ -427,13 +434,13 @@ fn emit_values(
     })
 }
 
-fn process_emit(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_emit(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let event = args.first().copied().unwrap_or_else(Value::undefined);
     emit_values(
         ctx,
         *ctx.this_value(),
         event,
-        args.get(1..).unwrap_or_default(),
+        ValueWindow::from(args.get(1..).unwrap_or_default()),
     )
 }
 
@@ -477,7 +484,10 @@ fn listener_values(
     })
 }
 
-fn process_listener_count(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_listener_count(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     listener_values(
         ctx,
         args.first().copied().unwrap_or_else(Value::undefined),
@@ -486,7 +496,7 @@ fn process_listener_count(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     )
 }
 
-fn process_listeners(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_listeners(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     listener_values(
         ctx,
         args.first().copied().unwrap_or_else(Value::undefined),
@@ -495,7 +505,10 @@ fn process_listeners(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     )
 }
 
-fn process_event_names(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn process_event_names(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let process = *ctx.this_value();
     ctx.scope(|mut scope| {
         let process = scope.value(process);
@@ -521,7 +534,7 @@ fn process_event_names(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value
 
 fn process_set_max_listeners(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let value = args
         .first()
@@ -539,7 +552,7 @@ fn process_set_max_listeners(
 
 fn process_get_max_listeners(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let process = *ctx.this_value();
     ctx.scope(|mut scope| {
@@ -556,7 +569,10 @@ fn value_string(scope: &NativeScope<'_, '_>, value: Local<'_>) -> Option<String>
         .flatten()
 }
 
-fn process_emit_warning(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_emit_warning(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let input = args.first().copied().unwrap_or_else(Value::undefined);
     // Node's emitWarning works detached (`const w = process.emitWarning;
     // w(...)`) — its own lib passes it around unbound, so the receiver falls
@@ -703,7 +719,7 @@ fn process_emit_warning(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
                 let event = scope.string("warning")?;
                 Ok::<Value, NativeError>(scope.finish(event))
             })?;
-            emit_values(ctx, process, event, &[warning])?;
+            emit_values(ctx, process, event, ValueWindow::from(&[warning]))?;
             print_warning_default(ctx, process, warning)?;
             Ok(Value::undefined())
         },

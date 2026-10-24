@@ -4,6 +4,7 @@
 //! to evaluate at load time. Behaviour is intentionally partial — full
 //! implementations land per-module as conformance needs them.
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     CapabilitySet, RuntimeLocal as Local, RuntimeNativeCtx as NativeCtx,
     RuntimeNativeError as NativeError, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
@@ -14,7 +15,7 @@ use crate::type_error;
 
 /// Native stub that throws when invoked (the symbol exists for destructuring /
 /// feature checks, but the operation is not implemented yet).
-fn not_implemented(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn not_implemented(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Err(type_error("stub", "not implemented"))
 }
 

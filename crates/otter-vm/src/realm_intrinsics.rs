@@ -638,7 +638,7 @@ mod tests {
     fn canonical_callable_roots_are_actual_slots_rewritten_by_moving_collection() {
         fn native(
             _ctx: &mut crate::NativeCtx<'_>,
-            _args: &[crate::Value],
+            _args: crate::ValueWindow<'_>,
         ) -> Result<crate::Value, crate::NativeError> {
             Ok(crate::Value::undefined())
         }

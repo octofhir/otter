@@ -37,6 +37,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-reflect-object>
 
+use crate::ValueWindow;
 use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
 
@@ -58,7 +59,7 @@ pub fn call(
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     method: otter_bytecode::method_id::ReflectMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, CommittedValueError> {
     use otter_bytecode::method_id::ReflectMethod as M;
     match method {
@@ -494,11 +495,11 @@ otter_macros::holt! {
     },
 }
 
-fn native_apply(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_apply(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     invoke(ctx, otter_bytecode::method_id::ReflectMethod::Apply, args)
 }
 
-fn native_construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     invoke(
         ctx,
         otter_bytecode::method_id::ReflectMethod::Construct,
@@ -506,7 +507,10 @@ fn native_construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     )
 }
 
-fn native_define_property(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_define_property(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke(
         ctx,
         otter_bytecode::method_id::ReflectMethod::DefineProperty,
@@ -514,7 +518,10 @@ fn native_define_property(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     )
 }
 
-fn native_delete_property(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_delete_property(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke(
         ctx,
         otter_bytecode::method_id::ReflectMethod::DeleteProperty,
@@ -522,13 +529,13 @@ fn native_delete_property(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     )
 }
 
-fn native_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_get(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     invoke(ctx, otter_bytecode::method_id::ReflectMethod::Get, args)
 }
 
 fn native_get_own_property_descriptor(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     invoke(
         ctx,
@@ -537,7 +544,10 @@ fn native_get_own_property_descriptor(
     )
 }
 
-fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_get_prototype_of(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke(
         ctx,
         otter_bytecode::method_id::ReflectMethod::GetPrototypeOf,
@@ -545,11 +555,14 @@ fn native_get_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     )
 }
 
-fn native_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_has(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     invoke(ctx, otter_bytecode::method_id::ReflectMethod::Has, args)
 }
 
-fn native_is_extensible(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_is_extensible(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke(
         ctx,
         otter_bytecode::method_id::ReflectMethod::IsExtensible,
@@ -557,13 +570,13 @@ fn native_is_extensible(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
     )
 }
 
-fn native_own_keys(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_own_keys(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     invoke(ctx, otter_bytecode::method_id::ReflectMethod::OwnKeys, args)
 }
 
 fn native_prevent_extensions(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     invoke(
         ctx,
@@ -572,11 +585,14 @@ fn native_prevent_extensions(
     )
 }
 
-fn native_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_set(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     invoke(ctx, otter_bytecode::method_id::ReflectMethod::Set, args)
 }
 
-fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_set_prototype_of(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke(
         ctx,
         otter_bytecode::method_id::ReflectMethod::SetPrototypeOf,
@@ -587,7 +603,7 @@ fn native_set_prototype_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 fn invoke(
     ctx: &mut NativeCtx<'_>,
     method: otter_bytecode::method_id::ReflectMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let context = ctx
         .execution_context()
@@ -716,7 +732,7 @@ mod tests {
             &mut stack,
             &context,
             ReflectMethod::GetOwnPropertyDescriptor,
-            &[Value::object(target), key],
+            ValueWindow::from(&[Value::object(target), key]),
         )
         .expect("descriptor");
 
@@ -751,7 +767,7 @@ mod tests {
             &mut stack,
             &context,
             ReflectMethod::OwnKeys,
-            &[Value::object(target)],
+            ValueWindow::from(&[Value::object(target)]),
         )
         .expect("ownKeys");
 

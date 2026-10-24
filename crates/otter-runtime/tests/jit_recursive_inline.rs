@@ -18,6 +18,7 @@
 
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
+use otter_runtime::ValueWindow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
@@ -60,7 +61,7 @@ fn installer(observations: Arc<Mutex<Vec<Movement>>>) -> RuntimeExtensionInstall
             "recursiveStress",
             1,
             RuntimeNativeCall::Dynamic(Arc::new(
-                |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _state: &[RuntimeValue]| {
+                |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _state: ValueWindow<'_>| {
                     let stride = args
                         .first()
                         .and_then(|value| value.as_number())
@@ -79,8 +80,8 @@ fn installer(observations: Arc<Mutex<Vec<Movement>>>) -> RuntimeExtensionInstall
             2,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     let offset = args
                         .first()
                         .copied()

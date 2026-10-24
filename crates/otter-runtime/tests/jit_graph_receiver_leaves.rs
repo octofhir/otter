@@ -19,6 +19,7 @@
 #![cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 
 use otter_bytecode::Op;
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     JitArtifactBatch, JitArtifactBundle, JitArtifactFileName, JitDebugEvent, JitDebugRequest,
     JitDebugTarget, JitDebugTier, JitSelection, Runtime, RuntimeExtensionInstaller,
@@ -153,8 +154,8 @@ fn installer(
             1,
             RuntimeNativeCall::Dynamic(Arc::new(
                 |_ctx: &mut RuntimeNativeCtx<'_>,
-                 args: &[RuntimeValue],
-                 _state: &[RuntimeValue]| {
+                 args: ValueWindow<'_>,
+                 _state: ValueWindow<'_>| {
                     let value = args
                         .first()
                         .copied()
@@ -173,8 +174,8 @@ fn installer(
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 |ctx: &mut RuntimeNativeCtx<'_>,
-                 _args: &[RuntimeValue],
-                 _state: &[RuntimeValue]| {
+                 _args: ValueWindow<'_>,
+                 _state: ValueWindow<'_>| {
                     ctx.interp_mut()
                         .force_gc()
                         .map_err(RuntimeNativeError::from)?;
@@ -190,8 +191,8 @@ fn installer(
             3,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     if record.load(Ordering::Relaxed) {
                         evaluations.lock().unwrap().evaluations += 1;
                     }
@@ -271,8 +272,8 @@ fn installer(
             4,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     if record.load(Ordering::Relaxed) {
                         let observed = (|| -> Result<Observation, String> {
                             let generations = ctx.interp_mut().jit_code_generation_snapshot();
@@ -323,8 +324,8 @@ fn installer(
             1,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     let motion = ctx.scope(|mut scope| -> Result<_, RuntimeNativeError> {
                         let value = scope.argument(args, 0);
                         let undefined = scope.undefined();

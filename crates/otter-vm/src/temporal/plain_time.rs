@@ -5,6 +5,7 @@
 
 #![allow(missing_docs)]
 
+use crate::ValueWindow;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
@@ -20,7 +21,7 @@ use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "Temporal.PlainTime";
 
-pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
     let hour = clamp_to_u8(
         opt_integer_with_truncation(ctx, args, 0, CLASS, "hour")?,
@@ -58,7 +59,7 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     make_temporal(ctx, TemporalPayload::PlainTime(pt))
 }
 
-fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn from(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let arg = arg_or_undef(args, 0);
     // §ToTemporalTime orders the parse of the primary argument before
     // GetTemporalOverflowOption: an ISO-invalid string must reject
@@ -93,7 +94,7 @@ fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
     make_temporal(ctx, TemporalPayload::PlainTime(pt))
 }
 
-fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn compare(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let a = parse_plain_time_arg(ctx, &arg_or_undef(args, 0))?;
     let b = parse_plain_time_arg(ctx, &arg_or_undef(args, 1))?;
     let key = |t: &temporal_rs::PlainTime| {
@@ -197,7 +198,7 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
     }
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
     let rounding = parse_to_string_rounding_options(args, 0, ctx, CLASS)?;
     let s = pt
@@ -206,38 +207,38 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     js_string_value(s, ctx)
 }
 
-fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, &[])
+fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
+    impl_to_string(ctx, ValueWindow::from(&[]))
 }
 
-fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Err(NativeError::TypeError {
         name: CLASS,
         reason: "Temporal.PlainTime has no `.valueOf` — use `compare` or `equals`".to_string(),
     })
 }
 
-fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_add(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = pt.add(&dur).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainTime(result))
 }
 
-fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_subtract(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let result = pt.subtract(&dur).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainTime(result))
 }
 
-fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_equals(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
     let other = parse_plain_time_arg(ctx, &arg_or_undef(args, 0))?;
     Ok(Value::boolean(pt == other))
 }
 
-fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_until(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
     let other = parse_plain_time_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
@@ -249,7 +250,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_since(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
     let other = parse_plain_time_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
@@ -261,14 +262,14 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_round(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
     let options = parse_rounding_options(args, 0, ctx, CLASS)?;
     let result = pt.round(options).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::PlainTime(result))
 }
 
-fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_with(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pt = require_plain_time(ctx)?;
     let arg = arg_or_undef(args, 0);
     if !arg.is_object_type() {
@@ -313,7 +314,7 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 /// `TypeError`) before returning its field.
 macro_rules! plain_time_getter {
     ($fn:ident, $pt:ident => $val:expr) => {
-        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
             let $pt = require_plain_time(ctx)?;
             Ok($val)
         }
@@ -330,7 +331,7 @@ plain_time_getter!(get_nanosecond, pt => Value::number_i32(pt.nanosecond() as i3
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,
@@ -381,7 +382,10 @@ otter_macros::couch! {
 /// §sec-temporal.*.prototype.tolocalestring — brand-checks the receiver,
 /// then (absent the Intl formatting data path) renders the same canonical
 /// string as `toString`.
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §Temporal.*.prototype.toLocaleString renders through a freshly
     // constructed DateTimeFormat so the output matches
     // `new Intl.DateTimeFormat(locales, options).format(this)`.

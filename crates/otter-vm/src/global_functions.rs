@@ -24,6 +24,7 @@
 //! - <https://tc39.es/ecma262/#sec-function-properties-of-the-global-object>
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-number-constructor>
 
+use crate::ValueWindow;
 use crate::number;
 use crate::string::JsString;
 use crate::{Value, VmError};
@@ -36,7 +37,7 @@ use crate::{Value, VmError};
 /// - [`VmError::TypeMismatch`] for malformed inputs to `decodeURI*`.
 pub fn call(
     method: otter_bytecode::method_id::GlobalMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::GlobalMethod as M;

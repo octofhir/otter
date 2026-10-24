@@ -14,6 +14,7 @@
 //! - Views that shared one source buffer share one cloned buffer.
 //! - No raw moving value is retained across allocation, re-entry, or full GC.
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     JitSelection, OtterError, Runtime, RuntimeExecutionStats, RuntimeExtensionContext,
     RuntimeExtensionInstaller, RuntimeNativeCtx, RuntimeNativeError, RuntimeValue, SourceInput,
@@ -21,7 +22,7 @@ use otter_runtime::{
 
 fn structured_clone_native(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let value = args
         .first()

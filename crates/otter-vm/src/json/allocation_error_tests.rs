@@ -72,9 +72,9 @@ fn actual_cap_refusals_remain_native_oom_for_parse_raw_and_stringify() {
                     let before = scope.context().heap().gc_cycle_counts();
                     let args = [scope.raw(input)];
                     let result = if let Some(method) = method {
-                        native_json_call(scope.context(), method, &args, None)
+                        native_json_call(scope.context(), method, ValueWindow::from(&args), None)
                     } else {
-                        native_raw_json(scope.context(), &args)
+                        native_raw_json(scope.context(), ValueWindow::from(&args))
                     };
                     scope.context().heap_mut().release_bytes(reserve);
                     assert!(scope.context().heap().gc_cycle_counts().1 > before.1);
@@ -134,7 +134,7 @@ fn malformed_source_at_full_cap_remains_syntax_without_an_allocation_pause() {
                 let result = native_json_call(
                     scope.context(),
                     otter_bytecode::method_id::JsonMethod::Parse,
-                    &args,
+                    ValueWindow::from(&args),
                     None,
                 );
                 scope.context().heap_mut().release_bytes(reserve);

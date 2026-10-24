@@ -16,6 +16,7 @@
 //! # See also
 //! - <https://nodejs.org/api/process.html#processallowednodeenvironmentflags>
 
+use otter_vm::ValueWindow;
 use otter_vm::{Attr, Local, NativeCall, NativeCtx, NativeError, NativeScope, Value};
 
 const ALLOWED_NODE_ENVIRONMENT_FLAGS: &[&str] = &[
@@ -226,7 +227,7 @@ pub(crate) fn build<'s>(scope: &mut NativeScope<'s, '_>) -> Result<Local<'s>, Na
     Ok(flags)
 }
 
-fn allowed_flags_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn allowed_flags_has(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let Some(flag) = args.first().and_then(|value| value.as_string(ctx.heap())) else {
         return Ok(Value::boolean(false));
     };

@@ -19,6 +19,7 @@
 //! - <https://tc39.es/ecma262/#sec-symbol-constructor>
 
 use crate::Value;
+use crate::ValueWindow;
 use crate::bootstrap::{
     install_iterator_well_knowns_post_bootstrap, native_static_with_value_roots,
 };
@@ -47,7 +48,7 @@ otter_macros::couch! {
 // Constructor body
 // ---------------------------------------------------------------
 
-fn symbol_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn symbol_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     if ctx.is_construct_call() {
         return Err(NativeError::TypeError {
             name: "Symbol",
@@ -82,7 +83,7 @@ fn symbol_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 // Statics
 // ---------------------------------------------------------------
 
-fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let key = match args.first() {
         None => "undefined".to_string(),
         Some(v) if v.is_undefined() => "undefined".to_string(),
@@ -112,7 +113,10 @@ fn symbol_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     Ok(Value::symbol(sym))
 }
 
-fn symbol_key_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn symbol_key_for_call(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let Some(sym) = args.first().and_then(|v| v.as_symbol(ctx.heap())) else {
         return Err(NativeError::TypeError {
             name: "Symbol.keyFor",
@@ -137,7 +141,7 @@ fn symbol_key_for_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 
 fn symbol_proto_description_get(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this = *ctx.this_value();
     if let Some(sym) = this.as_symbol(ctx.heap()) {
@@ -189,7 +193,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
 
     fn symbol_proto_to_primitive(
         ctx: &mut crate::NativeCtx<'_>,
-        _args: &[Value],
+        _args: ValueWindow<'_>,
     ) -> Result<Value, crate::NativeError> {
         let this = *ctx.this_value();
         if let Some(sym) = this.as_symbol(ctx.heap()) {
@@ -370,7 +374,7 @@ pub fn install_symbol_well_knowns_post_bootstrap(
 /// accessors of Array, Map, Set, RegExp and the buffer constructors).
 pub(crate) fn constructor_species_get(
     ctx: &mut crate::NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     Ok(*ctx.this_value())
 }

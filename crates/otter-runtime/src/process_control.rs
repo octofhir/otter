@@ -22,6 +22,7 @@
 //! # See also
 //! - [`crate::process`]
 
+use otter_vm::ValueWindow;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -121,7 +122,7 @@ pub(crate) fn install(
 /// share the process's last line of defence.
 fn set_uncaught_exception_capture_callback(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let candidate = args.first().copied().unwrap_or_else(Value::undefined);
     // Rendered from the raw argument before the scope allocates: a handle
@@ -165,7 +166,7 @@ fn set_uncaught_exception_capture_callback(
 /// `process.hasUncaughtExceptionCaptureCallback()`.
 fn has_uncaught_exception_capture_callback(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     ctx.scope(|mut scope| {
@@ -178,7 +179,7 @@ fn has_uncaught_exception_capture_callback(
 /// `process.chdir(directory)` — move the host process and record where it
 /// landed. A relative argument resolves against the current directory, which is
 /// what makes repeated relative `chdir` calls compose.
-fn process_chdir(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn process_chdir(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let host = crate::process::process_host(ctx)?;
     let (capabilities, cwd) = (host.capabilities, host.cwd);
     let directory = match args.first().copied() {
@@ -262,7 +263,7 @@ fn access_denied_errno() -> i32 {
 /// the pair to `process._kill`. Reading `_kill` off the receiver on every call
 /// is deliberate: it is the documented seam a caller replaces to observe the
 /// arguments without signalling anything.
-fn kill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn kill(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pid_value = args.first().copied().unwrap_or_else(Value::undefined);
     let Some(pid) = kill_pid(ctx, pid_value) else {
         return Err(invalid_arg_type(ctx, "pid", "number", pid_value));
@@ -299,7 +300,7 @@ fn kill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
 
 /// `process._kill(pid, signal)` — the syscall itself. Returns `0` on success
 /// and a negative errno on failure so `kill` can shape the error.
-fn raw_kill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn raw_kill(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pid = args
         .first()
         .copied()
@@ -347,7 +348,7 @@ fn raw_kill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 /// `process.abort()` — terminate immediately with `SIGABRT`, the way Node's
 /// own `abort` does, handing back the terminal modes the run changed first.
 /// There is no return path.
-fn abort(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn abort(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     #[cfg(unix)]
     crate::terminal::restore_run_terminals(ctx);
     #[cfg(not(unix))]
@@ -591,7 +592,7 @@ fn errno_description(error: &std::io::Error) -> &'static str {
 /// `setInterval` `"Timeout"` and a pending `setImmediate` `"Immediate"`.
 fn get_active_resources_info(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let kinds = ctx.interp_mut().timer_callbacks().active_kinds();
     ctx.scope(|mut scope| {
@@ -664,27 +665,27 @@ fn install_credentials(
 }
 
 #[cfg(unix)]
-fn get_uid(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn get_uid(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(Value::number_i32(nix::unistd::getuid().as_raw() as i32))
 }
 
 #[cfg(unix)]
-fn get_euid(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn get_euid(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(Value::number_i32(nix::unistd::geteuid().as_raw() as i32))
 }
 
 #[cfg(unix)]
-fn get_gid(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn get_gid(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(Value::number_i32(nix::unistd::getgid().as_raw() as i32))
 }
 
 #[cfg(unix)]
-fn get_egid(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn get_egid(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(Value::number_i32(nix::unistd::getegid().as_raw() as i32))
 }
 
 #[cfg(unix)]
-fn set_uid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_uid(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let id = credential_id(ctx, args, Credential::User)?;
     nix::unistd::setuid(nix::unistd::Uid::from_raw(id))
         .map_err(|errno| credential_failure("setuid", errno))?;
@@ -692,7 +693,7 @@ fn set_uid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
 }
 
 #[cfg(unix)]
-fn set_euid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_euid(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let id = credential_id(ctx, args, Credential::User)?;
     nix::unistd::seteuid(nix::unistd::Uid::from_raw(id))
         .map_err(|errno| credential_failure("seteuid", errno))?;
@@ -700,7 +701,7 @@ fn set_euid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 }
 
 #[cfg(unix)]
-fn set_gid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_gid(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let id = credential_id(ctx, args, Credential::Group)?;
     nix::unistd::setgid(nix::unistd::Gid::from_raw(id))
         .map_err(|errno| credential_failure("setgid", errno))?;
@@ -708,7 +709,7 @@ fn set_gid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
 }
 
 #[cfg(unix)]
-fn set_egid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_egid(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let id = credential_id(ctx, args, Credential::Group)?;
     nix::unistd::setegid(nix::unistd::Gid::from_raw(id))
         .map_err(|errno| credential_failure("setegid", errno))?;
@@ -720,7 +721,7 @@ fn set_egid(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
 /// `nix` withholds this family on Apple targets, so the ids are asked for
 /// through `rustix`, which answers with the same syscall everywhere.
 #[cfg(unix)]
-fn get_groups(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn get_groups(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let groups = rustix::process::getgroups().map_err(|errno| {
         credential_failure(
             "getgroups",
@@ -741,7 +742,7 @@ fn get_groups(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeE
 /// number in id range or a resolvable group name), then hand the ids to the
 /// syscall, which refuses unprivileged callers with `EPERM`.
 #[cfg(unix)]
-fn set_groups(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_groups(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     if !ctx.is_array(value).unwrap_or(false) {
         let suffix = received_suffix(ctx, value);
@@ -822,7 +823,7 @@ fn apply_set_groups(_ids: &[libc::gid_t]) -> Result<(), NativeError> {
 /// the group first (Node reports the unknown group before touching the user
 /// table), then initialize the supplementary group list.
 #[cfg(unix)]
-fn init_groups(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn init_groups(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let user = args.first().copied().unwrap_or_else(Value::undefined);
     let extra_group = args.get(1).copied().unwrap_or_else(Value::undefined);
     for (name, value) in [("user", user), ("extraGroup", extra_group)] {
@@ -901,7 +902,7 @@ impl Credential {
 #[cfg(unix)]
 fn credential_id(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     credential: Credential,
 ) -> Result<u32, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);

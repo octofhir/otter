@@ -18,6 +18,7 @@
 //! - `otter_vm::constructor_layout::completion` owns terminal ticket sampling.
 //! - `jit_stack_owned_array_construct` owns strict generated receiver LAB fits.
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     JitSelection, Runtime, RuntimeExtensionInstaller, RuntimeNativeCall, RuntimeNativeCtx,
     RuntimeNativeError, RuntimeValue, SourceInput,
@@ -48,8 +49,8 @@ fn mixed_native_or_proxy_super_samples_rejected_receiver_before_escaped_mutation
                             1,
                             RuntimeNativeCall::Dynamic(Arc::new(
                                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                                      args: &[RuntimeValue],
-                                      _state: &[RuntimeValue]| {
+                                      args: ValueWindow<'_>,
+                                      _state: ValueWindow<'_>| {
                                     let observation = args
                                         .first()
                                         .and_then(|value| value.as_object())
@@ -178,8 +179,8 @@ fn arrow_and_eval_super_keep_ticket_until_the_actual_outer_construct_terminal() 
                         1,
                         RuntimeNativeCall::Dynamic(Arc::new(
                             move |ctx: &mut RuntimeNativeCtx<'_>,
-                                  args: &[RuntimeValue],
-                                  _state: &[RuntimeValue]| {
+                                  args: ValueWindow<'_>,
+                                  _state: ValueWindow<'_>| {
                                 let observation = args
                                     .first()
                                     .and_then(|value| value.as_object())

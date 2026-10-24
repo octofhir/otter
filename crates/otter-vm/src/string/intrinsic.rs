@@ -21,6 +21,7 @@
 //! - <https://tc39.es/ecma262/#sec-string-constructor>
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-string-prototype-object>
 
+use crate::ValueWindow;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject};
 use crate::{NativeCtx, NativeError, Value};
@@ -82,7 +83,7 @@ fn pin_string_data_and_aliases(
 }
 
 /// `String(...)` / `new String(...)` native — ECMA-262 §22.1.1.
-fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let raw = match args.first() {
         Some(value) => *value,
         None => {
@@ -155,7 +156,7 @@ fn string_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     };
     let value = crate::string::dispatch::call(
         otter_bytecode::method_id::StringMethod::Construct,
-        std::slice::from_ref(&primitive),
+        ValueWindow::from(std::slice::from_ref(&primitive)),
         ctx.heap_mut(),
     )
     .map_err(|err| NativeError::TypeError {

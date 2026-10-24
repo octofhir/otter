@@ -24,6 +24,7 @@
 
 #[cfg(test)]
 mod native_frames;
+use crate::ValueWindow;
 #[cfg(test)]
 pub(crate) use native_frames::{
     FrameChainFixture, FrameFixture, complete_staged_call, resume_prepared_frame,
@@ -140,7 +141,7 @@ pub fn native_function_captures(native: NativeFunction, heap: &otter_gc::GcHeap)
         | NativeCallTarget::LocalDynamic { captures, .. } => {
             // SAFETY: `native` is live for the duration of this call and
             // names the slab.
-            unsafe { crate::value_slab::live_slice(captures) }.to_vec()
+            unsafe { crate::value_slab::live_window(captures) }.to_vec()
         }
         NativeCallTarget::Static(_) | NativeCallTarget::VmIntrinsic(_) => Vec::new(),
     }
@@ -151,12 +152,12 @@ pub fn alloc_bound_function(
     interp: &mut crate::Interpreter,
     target: Value,
     receiver: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<crate::BoundFunction, VmError> {
     interp.alloc_bound_function(
         target,
         receiver,
-        args,
+        &args,
         crate::function_metadata::BoundFunctionCreateMetadata {
             name: "bound ".to_owned(),
             length: crate::number::NumberValue::from_i32(0),

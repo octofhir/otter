@@ -15,6 +15,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarrayprototype%25-object>
 
+use crate::ValueWindow;
 use crate::string::JsString;
 use crate::{NativeCtx, NativeError, Value};
 
@@ -263,7 +264,7 @@ fn build_subarray(
 fn build_new_typed_array(
     ctx: &mut NativeCtx<'_>,
     kind: TypedArrayKind,
-    values: &[Value],
+    values: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let bpe = kind.bytes_per_element();
     let byte_len = values
@@ -293,7 +294,7 @@ fn build_new_typed_array(
 
 // ---- pure-functional methods --------------------------------------------
 
-fn impl_at(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_at(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     // §23.2.3.1 — ValidateTypedArray (step 2) and the length read
     // (step 3) precede ToIntegerOrInfinity(index) (step 4), whose
@@ -311,7 +312,7 @@ fn impl_at(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
     t.get(ctx.heap_mut(), resolved as usize).map_err(native_oom)
 }
 
-fn impl_subarray(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_subarray(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     let len = t.length(ctx.heap_mut()) as i64;
     let start = relative_index(args.first(), 0, len);
@@ -322,7 +323,7 @@ fn impl_subarray(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     build_subarray(&t, ctx.heap_mut(), final_start, new_len)
 }
 
-fn impl_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_slice(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
@@ -352,7 +353,7 @@ fn impl_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     Ok(Value::typed_array(view))
 }
 
-fn impl_fill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_fill(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let name = "TypedArray.prototype.fill";
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
@@ -381,7 +382,7 @@ fn impl_fill(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     Ok(Value::typed_array(t))
 }
 
-fn impl_copy_within(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_copy_within(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let name = "TypedArray.prototype.copyWithin";
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
@@ -421,7 +422,7 @@ fn impl_copy_within(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     Ok(Value::typed_array(t))
 }
 
-fn impl_reverse(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_reverse(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut());
@@ -440,7 +441,7 @@ fn impl_reverse(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
     Ok(Value::typed_array(t))
 }
 
-fn impl_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_index_of(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     // §23.2.3.16 — ValidateTypedArray and the length read precede
     // ToIntegerOrInfinity(fromIndex), so `len` is captured before the
@@ -465,7 +466,10 @@ fn impl_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(smi(-1))
 }
 
-fn impl_last_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_last_index_of(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
@@ -500,7 +504,7 @@ fn impl_last_index_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     Ok(smi(-1))
 }
 
-fn impl_includes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_includes(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
@@ -522,7 +526,7 @@ fn impl_includes(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(Value::boolean(false))
 }
 
-fn impl_join(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_join(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     // §23.2.3.18 step 2 — the length is captured BEFORE
@@ -577,14 +581,17 @@ fn join_into_string(
     Ok(Value::string(JsString::from_str(&out, gc_heap)?))
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut());
     join_into_string(&t, len, ",", ctx.heap_mut())
 }
 
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §23.2.3.32 — join each element's `Invoke(element,
     // "toLocaleString")` (not a raw numeric render) with "," so a
     // user-overridden `Number.prototype.toLocaleString` runs and its
@@ -609,7 +616,7 @@ fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
         }
         // ECMA-402 §18.5.1 — forward the locales and options arguments.
         let forwarded: Vec<Value> = args.iter().take(2).copied().collect();
-        let rendered = ctx.call(method, element, &forwarded)?;
+        let rendered = ctx.call(method, element, ValueWindow::from(&forwarded))?;
         let s = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_string_or_throw(interp, stack, &exec, &rendered)
                 .map_err(|e| e.into_native(interp, NAME))
@@ -635,7 +642,7 @@ fn ta_set_target_offset(
     Ok(offset_f as usize)
 }
 
-fn impl_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_set(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     // §23.2.3.26 step 5 — `targetOffset = ToIntegerOrInfinity(offset)`
     // runs before the detached / range checks, so its `valueOf` fires
@@ -828,15 +835,18 @@ fn ta_coerce_value(
         .map_err(|_| type_error("element type mismatch"))
 }
 
-fn impl_to_reversed(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_reversed(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
     snapshot.reverse();
-    build_new_typed_array(ctx, t.kind(), &snapshot)
+    build_new_typed_array(ctx, t.kind(), ValueWindow::from(&snapshot))
 }
 
-fn impl_to_sorted_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_sorted_default(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §23.2.3.32 step 1 — comparator must be undefined or callable,
     // checked before ValidateTypedArray.
     let comparefn = args.first().copied().filter(|v| !v.is_undefined());
@@ -857,10 +867,10 @@ fn impl_to_sorted_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     }
     // A comparator may have moved the receiver; re-read it.
     let t = receiver(ctx)?;
-    build_new_typed_array(ctx, t.kind(), &snapshot)
+    build_new_typed_array(ctx, t.kind(), ValueWindow::from(&snapshot))
 }
 
-fn impl_sort_default(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_sort_default(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // §23.2.3.29 step 1 — comparator must be undefined or callable,
     // checked before ValidateTypedArray.
     let comparefn = args.first().copied().filter(|v| !v.is_undefined());
@@ -931,7 +941,7 @@ fn sort_with_comparefn(
                 while i < mid && j < hi {
                     let comparator = ctx.cx.interp.iteration_anchor(base);
                     let pair = [element(ctx, order[i]), element(ctx, order[j])];
-                    let raw = ctx.call(comparator, Value::undefined(), &pair)?;
+                    let raw = ctx.call(comparator, Value::undefined(), ValueWindow::from(&pair))?;
                     let v = ctx
                         .with_turn_parts(|interp, stack| {
                             interp
@@ -980,7 +990,7 @@ fn sort_with_comparefn(
     result
 }
 
-fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_with(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
@@ -1027,7 +1037,7 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             out.push(Value::undefined());
         }
     }
-    build_new_typed_array(ctx, t.kind(), &out)
+    build_new_typed_array(ctx, t.kind(), ValueWindow::from(&out))
 }
 
 /// §23.2.5.1 CreateArrayIterator — a *live* TypedArray iterator whose
@@ -1051,19 +1061,19 @@ fn live_typed_array_iterator(
     ))
 }
 
-fn impl_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_keys(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     live_typed_array_iterator(ctx, t, crate::iterator_state::ArrayIterKind::Key)
 }
 
-fn impl_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_values(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     live_typed_array_iterator(ctx, t, crate::iterator_state::ArrayIterKind::Value)
 }
 
-fn impl_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_entries(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     live_typed_array_iterator(ctx, t, crate::iterator_state::ArrayIterKind::Entry)
@@ -1137,7 +1147,7 @@ fn sort_default(values: &mut [Value], bigint_kind: bool, heap: &otter_gc::GcHeap
 
 // ---- native dispatch ----------------------------------------------------
 
-type TypedArrayNativeFn = fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>;
+type TypedArrayNativeFn = fn(&mut NativeCtx<'_>, ValueWindow<'_>) -> Result<Value, NativeError>;
 
 /// Resolve a `%TypedArray%.prototype` method implemented in this
 /// module. Callback-driven methods live in `bootstrap_typed_array`.
@@ -1215,7 +1225,7 @@ mod tests {
             &mut interp,
             NativeCallInfo::call(receiver),
             None,
-            |ctx| impl_entries(ctx, &[]).expect("entries"),
+            |ctx| impl_entries(ctx, ValueWindow::from(&[])).expect("entries"),
         );
 
         let after = interp.gc_heap().stats().old_allocated_bytes;
@@ -1243,7 +1253,7 @@ mod tests {
             &mut interp,
             NativeCallInfo::call(receiver),
             None,
-            |ctx| impl_slice(ctx, &[]).expect("slice"),
+            |ctx| impl_slice(ctx, ValueWindow::from(&[])).expect("slice"),
         );
 
         assert!(result.is_typed_array());

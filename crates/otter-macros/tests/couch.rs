@@ -1,35 +1,48 @@
 //! Integration coverage for the `couch!` class-intrinsic macro.
 
 use otter_macros::couch;
+use otter_vm::ValueWindow;
 use otter_vm::{NativeCtx, NativeError, Value, bootstrap, intrinsic_install};
 
-fn macro_couch_ctor(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn macro_couch_ctor(
+    _ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     Ok(Value::undefined())
 }
 
 fn macro_couch_static_from(
     _ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     Ok(Value::number_i32(1))
 }
 
-fn macro_couch_static_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn macro_couch_static_of(
+    _ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     Ok(Value::number_i32(2))
 }
 
 fn macro_couch_proto_method(
     _ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     Ok(Value::number_i32(3))
 }
 
-fn macro_couch_proto_get(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn macro_couch_proto_get(
+    _ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     Ok(Value::number_i32(4))
 }
 
-fn macro_couch_proto_set(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn macro_couch_proto_set(
+    _ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     Ok(Value::undefined())
 }
 

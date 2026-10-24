@@ -39,6 +39,7 @@
 //! - <https://tc39.es/ecma262/#sec-typedarray-constructors>
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarrayprototype%25-object>
 
+use crate::ValueWindow;
 use otter_bytecode::method_id::TypedArrayMethod;
 use smallvec::SmallVec;
 
@@ -458,54 +459,66 @@ fn read_array_like_coerced<'scope>(
     Ok(out)
 }
 
-fn ta_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_proto_for_each(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ta_callback_dispatch(ctx, args, "forEach")
 }
 
-fn ta_proto_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_proto_map(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ta_callback_dispatch(ctx, args, "map")
 }
 
-fn ta_proto_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_proto_filter(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ta_callback_dispatch(ctx, args, "filter")
 }
 
-fn ta_proto_find(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_proto_find(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ta_callback_dispatch(ctx, args, "find")
 }
 
-fn ta_proto_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_proto_find_index(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     ta_callback_dispatch(ctx, args, "findIndex")
 }
 
-fn ta_proto_find_last(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_proto_find_last(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     ta_callback_dispatch(ctx, args, "findLast")
 }
 
-fn ta_proto_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_proto_find_last_index(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     ta_callback_dispatch(ctx, args, "findLastIndex")
 }
 
-fn ta_proto_every(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_proto_every(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ta_callback_dispatch(ctx, args, "every")
 }
 
-fn ta_proto_some(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_proto_some(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ta_callback_dispatch(ctx, args, "some")
 }
 
-fn ta_proto_reduce(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_proto_reduce(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ta_callback_dispatch(ctx, args, "reduce")
 }
 
-fn ta_proto_reduce_right(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_proto_reduce_right(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     ta_callback_dispatch(ctx, args, "reduceRight")
 }
 
 /// §22.2.6.1 `get %TypedArray%.prototype.buffer` — return the
 /// receiver's [[ViewedArrayBuffer]] or raise TypeError on
 /// non-TypedArray receivers.
-fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = ctx
         .this_value()
         .as_typed_array(ctx.heap())
@@ -517,7 +530,10 @@ fn ta_buffer_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 }
 
 /// §22.2.6.2 `get %TypedArray%.prototype.byteLength`.
-fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn ta_byte_length_getter(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let t = ctx
         .this_value()
         .as_typed_array(ctx.heap())
@@ -532,7 +548,10 @@ fn ta_byte_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
 }
 
 /// §22.2.6.3 `get %TypedArray%.prototype.byteOffset`.
-fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn ta_byte_offset_getter(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let t = ctx
         .this_value()
         .as_typed_array(ctx.heap())
@@ -552,7 +571,7 @@ fn ta_byte_offset_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
 }
 
 /// §22.2.6.18 `get %TypedArray%.prototype.length`.
-fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = ctx
         .this_value()
         .as_typed_array(ctx.heap())
@@ -571,7 +590,10 @@ fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 /// if the receiver is not a TypedArray.
 ///
 /// <https://tc39.es/ecma262/#sec-get-%typedarray%.prototype-%symbol.tostringtag%>
-fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn tostring_tag_getter(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let Some(t) = this_value.as_typed_array(ctx.heap()) else {
         return Ok(Value::undefined());
@@ -594,7 +616,10 @@ fn tostring_tag_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value
 
 macro_rules! ta_ctor {
     ($name:ident, $kind:expr) => {
-        pub(crate) fn $name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        pub(crate) fn $name(
+            ctx: &mut NativeCtx<'_>,
+            args: ValueWindow<'_>,
+        ) -> Result<Value, NativeError> {
             ta_ctor_dispatch(ctx, args, $kind)
         }
     };
@@ -619,7 +644,7 @@ ta_ctor!(ctor_float16, TypedArrayKind::Float16);
 /// custom constructors observe spec ordering (create AFTER the
 /// source is materialized, element writes through detach-safe
 /// IntegerIndexedElementSet).
-fn ta_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_from(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let name = "TypedArray.from";
     let exec = ctx
         .execution_context()
@@ -717,7 +742,7 @@ fn ta_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
 }
 
 /// §23.2.2.2 `%TypedArray%.of(...items)` — generic over `this`.
-fn ta_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_of(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let name = "TypedArray.of";
     let exec = ctx
         .execution_context()
@@ -849,7 +874,7 @@ fn ta_from_store<'scope>(
 }
 fn ta_ctor_dispatch(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     kind: TypedArrayKind,
 ) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
@@ -1014,7 +1039,7 @@ fn ta_ctor_dispatch(
         let value = dispatch::typed_array_call_with_roots(
             kind,
             TypedArrayMethod::Construct,
-            coerced_slice,
+            ValueWindow::from(coerced_slice),
             scope.context().interp_mut(),
             &mut external_visit,
         )
@@ -1096,7 +1121,7 @@ const fn typed_array_name(kind: TypedArrayKind) -> &'static str {
 
 macro_rules! ta_proto_method {
     ($name:ident, $method:expr) => {
-        fn $name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        fn $name(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
             ta_proto_dispatch(ctx, args, $method)
         }
     };
@@ -1123,7 +1148,7 @@ ta_proto_method!(ta_entries, "entries");
 
 fn ta_proto_dispatch(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     method_name: &str,
 ) -> Result<Value, NativeError> {
     const NAME: &str = "TypedArray.prototype";
@@ -1199,7 +1224,7 @@ fn ta_proto_dispatch(
 
         let current_args: SmallVec<[Value; 4]> =
             arg_handles.iter().map(|value| scope.raw(*value)).collect();
-        let result = impl_fn(scope.context(), &current_args)?;
+        let result = impl_fn(scope.context(), ValueWindow::from(&current_args))?;
         let result = scope.value(result);
         Ok(scope.finish(result))
     })
@@ -1210,7 +1235,7 @@ fn ta_proto_dispatch(
 
 macro_rules! ta_cb_method {
     ($name:ident, $method:expr) => {
-        fn $name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        fn $name(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
             ta_callback_dispatch(ctx, args, $method)
         }
     };
@@ -1230,17 +1255,17 @@ ta_cb_method!(ta_reduce_right, "reduceRight");
 
 /// §23.2.3.26 / §23.2.3.27 `slice` / `subarray` — both run
 /// `TypedArraySpeciesCreate` and `ToIntegerOrInfinity` operand coercion.
-fn ta_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_slice(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ta_species_dispatch(ctx, args, "slice")
 }
 
-fn ta_subarray(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ta_subarray(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ta_species_dispatch(ctx, args, "subarray")
 }
 
 fn ta_species_dispatch(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
@@ -1269,7 +1294,7 @@ fn ta_species_dispatch(
 
 fn ta_callback_dispatch(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     method_name: &'static str,
 ) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
@@ -1323,7 +1348,7 @@ const ABSTRACT_CTOR_SLOT: &str = "@@%TypedArray%";
 /// instantiated.
 fn abstract_typed_array_call(
     _ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     Err(NativeError::TypeError {
         name: "TypedArray",

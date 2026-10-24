@@ -1045,13 +1045,14 @@ fn define_data_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ValueWindow;
     use crate::{NativeError, native_function::NativeCallTarget};
 
-    fn one(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn one(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::number(NumberValue::from_i32(1)))
     }
 
-    fn construct(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn construct(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::undefined())
     }
 

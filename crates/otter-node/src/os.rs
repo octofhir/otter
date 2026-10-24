@@ -18,6 +18,7 @@
 //!   `process.env` proxy; they never read the host environment directly.
 //! - No VM values are retained across the FFI calls; results are copied out.
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     CapabilitySet, RuntimeLocal as Local, RuntimeNativeScope as NativeScope, RuntimeTaskSpawner,
 };
@@ -57,7 +58,7 @@ static CURRENT_PROCESS_PRIORITY: AtomicI32 = AtomicI32::new(0);
 type Method = (
     &'static str,
     u8,
-    fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>,
+    fn(&mut NativeCtx<'_>, ValueWindow<'_>) -> Result<Value, NativeError>,
 );
 
 const OS_METHODS: &[Method] = &[
@@ -248,35 +249,35 @@ fn dev_null() -> &'static str {
 
 // ---- simple string/number queries ----
 
-fn os_arch(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_arch(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     string_value(ctx, node_arch())
 }
 
-fn os_platform(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_platform(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     string_value(ctx, node_platform())
 }
 
-fn os_machine(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_machine(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let m = uname_field(UnameField::Machine).unwrap_or_else(|| node_arch().to_string());
     string_value(ctx, &m)
 }
 
-fn os_type(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_type(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = uname_field(UnameField::Sysname).unwrap_or_else(|| default_os_type().to_string());
     string_value(ctx, &t)
 }
 
-fn os_release(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_release(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let r = uname_field(UnameField::Release).unwrap_or_else(|| "0.0.0".to_string());
     string_value(ctx, &r)
 }
 
-fn os_version(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_version(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let v = uname_field(UnameField::Version).unwrap_or_else(|| "unknown".to_string());
     string_value(ctx, &v)
 }
 
-fn os_endianness(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_endianness(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let e = if cfg!(target_endian = "big") {
         "BE"
     } else {
@@ -285,12 +286,12 @@ fn os_endianness(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nati
     string_value(ctx, e)
 }
 
-fn os_hostname(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_hostname(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let h = hostname().unwrap_or_else(|| "localhost".to_string());
     string_value(ctx, &h)
 }
 
-fn os_homedir(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_homedir(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     if let Some((syscall, code, message)) = internal_test_home_dir_error(ctx) {
         return Err(system_error(&syscall, &code, &message));
     }
@@ -310,59 +311,62 @@ fn internal_test_home_dir_error(ctx: &mut NativeCtx<'_>) -> Option<(String, Stri
     Some((syscall, code, message))
 }
 
-fn os_tmpdir(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_tmpdir(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = tmp_dir(ctx);
     string_value(ctx, &t)
 }
 
-fn os_method_to_primitive(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_method_to_primitive(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let this = *ctx.this_value();
     let Some(native) = this.as_native_function() else {
         return string_value(ctx, "");
     };
     match native.name_string(ctx.heap()).as_str() {
-        "arch" => os_arch(ctx, &[]),
-        "platform" => os_platform(ctx, &[]),
-        "machine" => os_machine(ctx, &[]),
-        "type" => os_type(ctx, &[]),
-        "release" => os_release(ctx, &[]),
-        "version" => os_version(ctx, &[]),
-        "endianness" => os_endianness(ctx, &[]),
-        "hostname" => os_hostname(ctx, &[]),
-        "homedir" => os_homedir(ctx, &[]),
-        "tmpdir" => os_tmpdir(ctx, &[]),
-        "totalmem" => os_totalmem(ctx, &[]),
-        "freemem" => os_freemem(ctx, &[]),
-        "uptime" => os_uptime(ctx, &[]),
-        "availableParallelism" => os_available_parallelism(ctx, &[]),
+        "arch" => os_arch(ctx, ValueWindow::EMPTY),
+        "platform" => os_platform(ctx, ValueWindow::EMPTY),
+        "machine" => os_machine(ctx, ValueWindow::EMPTY),
+        "type" => os_type(ctx, ValueWindow::EMPTY),
+        "release" => os_release(ctx, ValueWindow::EMPTY),
+        "version" => os_version(ctx, ValueWindow::EMPTY),
+        "endianness" => os_endianness(ctx, ValueWindow::EMPTY),
+        "hostname" => os_hostname(ctx, ValueWindow::EMPTY),
+        "homedir" => os_homedir(ctx, ValueWindow::EMPTY),
+        "tmpdir" => os_tmpdir(ctx, ValueWindow::EMPTY),
+        "totalmem" => os_totalmem(ctx, ValueWindow::EMPTY),
+        "freemem" => os_freemem(ctx, ValueWindow::EMPTY),
+        "uptime" => os_uptime(ctx, ValueWindow::EMPTY),
+        "availableParallelism" => os_available_parallelism(ctx, ValueWindow::EMPTY),
         _ => string_value(ctx, ""),
     }
 }
 
 // ---- numeric queries ----
 
-fn os_totalmem(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_totalmem(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     number_value(ctx, total_mem() as f64)
 }
 
-fn os_freemem(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_freemem(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     number_value(ctx, free_mem() as f64)
 }
 
-fn os_uptime(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_uptime(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     number_value(ctx, uptime_secs())
 }
 
 fn os_available_parallelism(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     number_value(ctx, num_cpus().max(1) as f64)
 }
 
 // ---- arrays / objects ----
 
-fn os_loadavg(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_loadavg(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let avg = load_avg();
     ctx.scope(|mut scope| {
         let array = scope.array(avg.len())?;
@@ -374,7 +378,7 @@ fn os_loadavg(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeE
     })
 }
 
-fn os_cpus(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_cpus(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let count = num_cpus().max(1);
     let model = cpu_model();
     let speed = cpu_speed_mhz();
@@ -400,7 +404,10 @@ fn os_cpus(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeErro
     })
 }
 
-fn os_network_interfaces(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn os_network_interfaces(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let interfaces = host_network_interfaces();
     ctx.scope(|mut scope| {
         let object = scope.object()?;
@@ -616,7 +623,7 @@ fn netmask_prefix_length(addr: *const libc::sockaddr, family: i32) -> Option<u32
     }
 }
 
-fn os_user_info(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn os_user_info(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // Node reads `encoding` off the options before it asks the platform who
     // the user is, so a getter that throws is the caller's error and reaches
     // them instead of being swallowed. Anything that is not an object is no
@@ -645,13 +652,13 @@ fn os_user_info(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 
 // ---- priority ----
 
-fn os_get_priority(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn os_get_priority(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pid = validate_pid(args.first())?;
     let prio = get_priority(pid)?;
     number_value(ctx, prio as f64)
 }
 
-fn os_set_priority(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn os_set_priority(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // setPriority(priority) | setPriority(pid, priority)
     let (pid, priority) = if args.len() >= 2 {
         (validate_pid(args.first())?, args.get(1).copied())

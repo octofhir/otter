@@ -38,6 +38,7 @@ pub mod scan;
 mod serialize;
 mod stringify;
 
+use crate::ValueWindow;
 pub use parse::{ParseError, parse};
 pub use stringify::{StringifyOptions, stringify, stringify_with_options};
 
@@ -147,7 +148,7 @@ fn native_json_error(error: JsonError, name: &'static str) -> NativeError {
 /// indirection or per-call name match.
 pub fn call(
     method: otter_bytecode::method_id::JsonMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, JsonError> {
     use otter_bytecode::method_id::JsonMethod;
@@ -161,7 +162,7 @@ pub fn call(
 /// that have a live VM stack or native root set.
 pub(crate) fn call_with_roots(
     method: otter_bytecode::method_id::JsonMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
     object_proto: Option<Value>,
@@ -173,7 +174,7 @@ pub(crate) fn call_with_roots(
     }
 }
 
-fn native_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_parse(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // One native handle scope owns the observable coercion input, the reviver,
     // the resulting source string and parsed result through Internalize. A
     // ToString hook can collect before parsing has even started.
@@ -194,7 +195,7 @@ fn native_parse(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
         let unfiltered = native_json_call(
             scope.context(),
             otter_bytecode::method_id::JsonMethod::Parse,
-            &source,
+            ValueWindow::from(&source),
             object_proto,
         )?;
         let unfiltered = scope.value(unfiltered);
@@ -256,7 +257,7 @@ fn coerce_text_to_string(
 }
 
 /// §25.5.3 `JSON.rawJSON(text)`.
-fn native_raw_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_raw_json(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     let json_string = coerce_text_to_string(ctx, value, "rawJSON")?;
     let text = json_string.to_lossy_string(ctx.heap());
@@ -308,7 +309,10 @@ fn native_raw_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 }
 
 /// §25.5.4 `JSON.isRawJSON(O)`.
-fn native_is_raw_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_is_raw_json(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let is_raw = args
         .first()
         .and_then(|v| v.as_object())
@@ -316,7 +320,7 @@ fn native_is_raw_json(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     Ok(Value::boolean(is_raw))
 }
 
-fn native_stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_stringify(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // §25.5.2.1 — the full algorithm needs a live execution context so
     // `toJSON`, the replacer, and accessor `[[Get]]` are observable.
     let context = match ctx.execution_context().cloned() {
@@ -340,7 +344,7 @@ fn native_stringify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
 fn native_json_call(
     ctx: &mut NativeCtx<'_>,
     method: otter_bytecode::method_id::JsonMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
     object_proto: Option<Value>,
 ) -> Result<Value, NativeError> {
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
@@ -361,7 +365,10 @@ fn native_json_call(
     .map_err(|error| native_json_error(error, method.name()))
 }
 
-fn json_stringify(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, JsonError> {
+fn json_stringify(
+    args: ValueWindow<'_>,
+    gc_heap: &mut otter_gc::GcHeap,
+) -> Result<Value, JsonError> {
     let value = args.first().cloned().unwrap_or(Value::undefined());
     let space = args.get(2).cloned().unwrap_or(Value::undefined());
     let opts = StringifyOptions::from_space_with_heap(&space, Some(gc_heap))?;
@@ -371,7 +378,7 @@ fn json_stringify(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Valu
     }
 }
 
-fn json_parse(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, JsonError> {
+fn json_parse(args: ValueWindow<'_>, gc_heap: &mut otter_gc::GcHeap) -> Result<Value, JsonError> {
     let Some(s) = args.first().and_then(|v| v.as_string(gc_heap)) else {
         return Err(JsonError::BadArgument {
             name: "parse",
@@ -385,7 +392,7 @@ fn json_parse(args: &[Value], gc_heap: &mut otter_gc::GcHeap) -> Result<Value, J
 }
 
 fn json_parse_with_roots(
-    args: &[Value],
+    args: ValueWindow<'_>,
     gc_heap: &mut otter_gc::GcHeap,
     external_visit: &mut RootSlotVisitor<'_>,
     object_proto: Option<Value>,

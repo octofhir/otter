@@ -29,6 +29,7 @@
 
 mod define_properties;
 
+use crate::ValueWindow;
 use crate::activation_stack::ActivationStack;
 use crate::runtime_activation::CommittedValueError;
 use otter_bytecode::{Op, Operand, method_id};
@@ -114,7 +115,7 @@ impl Interpreter {
                         )?);
                     }
                 }
-                let result = bigint::dispatch::call(self, method, &coerced)?;
+                let result = bigint::dispatch::call(self, method, ValueWindow::from(&coerced))?;
                 finish_static_call(frame, dst, result)
             }
             Op::ArrayBufferCall => unreachable!("ArrayBufferCall requires stack-rooted dispatch"),
@@ -122,7 +123,11 @@ impl Interpreter {
                 let (dst, method_idx, args) = decode_static_call(frame, operands, 1, 2, 3)?;
                 let method = method_id::DataViewMethod::from_u32(method_idx)
                     .ok_or(VmError::InvalidOperand)?;
-                let result = binary::dispatch::data_view_call(method, &args, &mut self.gc_heap)?;
+                let result = binary::dispatch::data_view_call(
+                    method,
+                    ValueWindow::from(&args),
+                    &mut self.gc_heap,
+                )?;
                 finish_static_call(frame, dst, result)
             }
             Op::SharedArrayBufferCall => {
@@ -155,7 +160,7 @@ impl Interpreter {
         };
         let result = binary::dispatch::array_buffer_call_with_roots(
             method,
-            &args,
+            ValueWindow::from(&args),
             self,
             &mut external_visit,
         )?;
@@ -185,7 +190,7 @@ impl Interpreter {
         };
         let result = binary::dispatch::shared_array_buffer_call_with_roots(
             method,
-            &args,
+            ValueWindow::from(&args),
             self,
             &mut external_visit,
         )?;
@@ -265,7 +270,8 @@ impl Interpreter {
             None => Vec::new(),
         };
         let args = [target, src];
-        let _ = self.do_object_assign_excluding(context, stack, &args, &excluded)?;
+        let _ =
+            self.do_object_assign_excluding(context, stack, ValueWindow::from(&args), &excluded)?;
         let frame = &mut stack[top_idx];
         frame.advance_pc().map_err(CommittedValueError::Fatal)?;
         Ok(())
@@ -551,7 +557,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         let mut proto = args.first().cloned().unwrap_or(Value::undefined());
         // Validate the argument type up front, but DO NOT snapshot the
@@ -619,7 +625,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         let target_value = args.first().cloned().unwrap_or(Value::undefined());
         // §20.1.2.3 step 1 — `Type(O)` must be Object.
@@ -680,7 +686,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         self.do_object_assign_excluding(context, stack, args, &[])
     }
@@ -691,7 +697,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
-        args: &[Value],
+        args: ValueWindow<'_>,
         excluded: &[Value],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
@@ -772,7 +778,7 @@ impl Interpreter {
         context: &ExecutionContext,
         stack: &mut ActivationStack,
         method: method_id::ObjectMethod,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Option<Value>, CommittedValueError> {
         // M::Create needs an `ExecutionContext` to run accessor-aware
         // ToPropertyDescriptor in `run_object_static_call_operands`;
@@ -1513,7 +1519,7 @@ impl Interpreter {
         &mut self,
         context: &ExecutionContext,
         stack: &mut ActivationStack,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         let items = args.first().cloned().unwrap_or(Value::undefined());
         let callback = args.get(1).cloned().unwrap_or(Value::undefined());

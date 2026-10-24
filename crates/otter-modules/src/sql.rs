@@ -3,6 +3,7 @@
 //! This slice keeps SQLite state as owned Rust data and checks filesystem
 //! capabilities before opening a database path.
 
+use otter_runtime::ValueWindow;
 use std::path::{Path, PathBuf};
 
 use otter_runtime::CapabilitySet;
@@ -197,7 +198,7 @@ otter_macros::lodge! {
 
 fn open_sql(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = crate::arg_string(ctx, args, 0, "openSql")?;
@@ -242,11 +243,11 @@ fn host_error(name: &'static str, err: RuntimeHostObjectError) -> NativeError {
     crate::type_error(name, err.to_string())
 }
 
-fn rest_args(args: &[Value]) -> &[Value] {
-    args.get(1..).unwrap_or(&[])
+fn rest_args(args: ValueWindow<'_>) -> ValueWindow<'_> {
+    args.tail(1)
 }
 
-fn method_execute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn method_execute(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let object = database_receiver(ctx, "SqlDatabase.execute")?;
     let sql = crate::arg_string(ctx, args, 0, "SqlDatabase.execute")?;
     let params = js_params(ctx, rest_args(args))?;
@@ -258,7 +259,7 @@ fn method_execute(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     Ok(Value::number_f64(affected as f64))
 }
 
-fn method_query(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn method_query(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let object = database_receiver(ctx, "SqlDatabase.query")?;
     let sql = crate::arg_string(ctx, args, 0, "SqlDatabase.query")?;
     let params = js_params(ctx, rest_args(args))?;
@@ -269,7 +270,7 @@ fn method_query(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     json_rows_to_array(ctx, rows)
 }
 
-fn method_query_one(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn method_query_one(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let object = database_receiver(ctx, "SqlDatabase.queryOne")?;
     let sql = crate::arg_string(ctx, args, 0, "SqlDatabase.queryOne")?;
     let params = js_params(ctx, rest_args(args))?;
@@ -285,7 +286,7 @@ fn method_query_one(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     }
 }
 
-fn js_params(ctx: &NativeCtx<'_>, values: &[Value]) -> Result<Vec<JsonValue>, NativeError> {
+fn js_params(ctx: &NativeCtx<'_>, values: ValueWindow<'_>) -> Result<Vec<JsonValue>, NativeError> {
     values
         .iter()
         .map(|v| crate::value_to_json(ctx, v))

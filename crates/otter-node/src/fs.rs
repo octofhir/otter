@@ -15,6 +15,7 @@
 //!   before touching the host filesystem.
 //! - No VM state is retained across host I/O.
 
+use otter_runtime::ValueWindow;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -60,7 +61,7 @@ pub fn install_fs_module<'scope>(
         "readFileSync",
         2,
         &[],
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
+        move |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let path = path_arg(ctx, args, 0, "fs.readFileSync")?;
             require_read(&path, &read_caps).map_err(fs_error)?;
             let encoding = runtime_optional_arg_to_string(args, 1, ctx.heap());
@@ -79,7 +80,7 @@ pub fn install_fs_module<'scope>(
         "writeFileSync",
         3,
         &[],
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
+        move |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let path = path_arg(ctx, args, 0, "fs.writeFileSync")?;
             require_write(&path, &write_caps).map_err(fs_error)?;
             let data = runtime_arg_to_string(args, 1, ctx.heap());
@@ -94,7 +95,7 @@ pub fn install_fs_module<'scope>(
         "existsSync",
         1,
         &[],
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
+        move |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let path = path_arg(ctx, args, 0, "fs.existsSync")?;
             Ok(Value::boolean(
                 exists_caps.read.matches_path(&path) && path.exists(),
@@ -108,7 +109,7 @@ pub fn install_fs_module<'scope>(
         "mkdirSync",
         2,
         &[],
-        move |ctx: &mut NativeCtx<'_>, args: &[Value], _c: &[Value]| {
+        move |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
             let path = path_arg(ctx, args, 0, "fs.mkdirSync")?;
             require_write(&path, &mkdir_caps).map_err(fs_error)?;
             let recursive = args.get(1).is_some_and(truthy);
@@ -150,9 +151,9 @@ pub fn fs_native_value<'scope>(
                 $name,
                 $len,
                 &[],
-                move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
-                    $f(ctx, args, &caps)
-                },
+                move |ctx: &mut NativeCtx<'_>,
+                      args: ValueWindow<'_>,
+                      _captures: ValueWindow<'_>| { $f(ctx, args, &caps) },
             )?;
             scope.set(object, $name, method)?;
         }};
@@ -220,7 +221,7 @@ fn open_options_for_flags(flags: &str) -> std::fs::OpenOptions {
 
 fn fs_open_fd(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.open")?;
@@ -249,7 +250,7 @@ fn fs_open_fd(
 
 fn fs_read_fd(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     _caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     use std::io::{Read, Seek, SeekFrom};
@@ -276,7 +277,7 @@ fn fs_read_fd(
 
 fn fs_write_fd(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     _caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     use std::io::{Seek, SeekFrom, Write};
@@ -303,7 +304,7 @@ fn fs_write_fd(
 
 fn fs_close_fd(
     _ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     _caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let fd = args.first().and_then(|v| v.as_f64()).unwrap_or(-1.0) as i32;
@@ -313,7 +314,7 @@ fn fs_close_fd(
 
 fn fs_fstat_fd(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     _caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let fd = args.first().and_then(|v| v.as_f64()).unwrap_or(-1.0) as i32;
@@ -347,7 +348,7 @@ fn latin1_to_bytes(s: &str) -> Vec<u8> {
 
 fn fs_read_raw(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.readFile")?;
@@ -358,7 +359,7 @@ fn fs_read_raw(
 
 fn fs_write_raw(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.writeFile")?;
@@ -382,7 +383,7 @@ fn fs_write_raw(
 
 fn fs_exists(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.exists")?;
@@ -394,7 +395,7 @@ fn fs_exists(
 
 fn fs_stat_raw(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.stat")?;
@@ -448,7 +449,7 @@ fn stat_object(ctx: &mut NativeCtx<'_>, meta: &std::fs::Metadata) -> Result<Valu
 
 fn fs_readdir_raw(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.readdir")?;
@@ -468,7 +469,7 @@ fn fs_readdir_raw(
 
 fn fs_readdir_types(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.readdir")?;
@@ -504,7 +505,7 @@ fn fs_readdir_types(
 
 fn fs_mkdir(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.mkdir")?;
@@ -521,7 +522,7 @@ fn fs_mkdir(
 
 fn fs_rm(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.rm")?;
@@ -546,7 +547,7 @@ fn fs_rm(
 
 fn fs_rmdir(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.rmdir")?;
@@ -563,7 +564,7 @@ fn fs_rmdir(
 
 fn fs_unlink(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.unlink")?;
@@ -574,7 +575,7 @@ fn fs_unlink(
 
 fn fs_realpath(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.realpath")?;
@@ -585,7 +586,7 @@ fn fs_realpath(
 
 fn fs_copy_file(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let src = path_arg(ctx, args, 0, "fs.copyFile")?;
@@ -598,7 +599,7 @@ fn fs_copy_file(
 
 fn fs_access(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.access")?;
@@ -619,7 +620,7 @@ fn fs_access(
 
 fn fs_rename(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let from = path_arg(ctx, args, 0, "fs.rename")?;
@@ -632,7 +633,7 @@ fn fs_rename(
 
 fn fs_readlink(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.readlink")?;
@@ -643,7 +644,7 @@ fn fs_readlink(
 
 fn fs_chmod(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.chmod")?;
@@ -660,7 +661,7 @@ fn fs_chmod(
 
 fn fs_truncate(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = path_arg(ctx, args, 0, "fs.truncate")?;
@@ -741,11 +742,11 @@ fn stat_extra(_meta: &std::fs::Metadata) -> (f64, f64, f64, f64, f64, f64, f64, 
 
 fn path_arg(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     name: &'static str,
 ) -> Result<PathBuf, NativeError> {
-    let path = crate::arg_string(ctx, args, index, name)?;
+    let path = crate::arg_string(ctx, &args, index, name)?;
     if path.is_empty() {
         return Err(crate::type_error(name, "path is required"));
     }
@@ -802,7 +803,7 @@ fn fs_error(err: FsError) -> NativeError {
 /// both ends are write operations.
 fn fs_link(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let existing = path_arg(ctx, args, 0, "fs.link")?;
@@ -817,7 +818,7 @@ fn fs_link(
 /// resolved, so only the link itself is a filesystem write.
 fn fs_symlink(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let target = path_arg(ctx, args, 0, "fs.symlink")?;
@@ -842,7 +843,7 @@ fn fs_symlink(
 /// files, so two concurrent callers cannot collide.
 fn fs_mkdtemp(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let prefix = path_arg(ctx, args, 0, "fs.mkdtemp")?;
@@ -893,7 +894,7 @@ fn temp_suffix(attempt: u32) -> String {
 
 fn fs_chown(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     change_owner(ctx, args, caps, "fs.chown", true)
@@ -901,7 +902,7 @@ fn fs_chown(
 
 fn fs_lchown(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     change_owner(ctx, args, caps, "fs.lchown", false)
@@ -910,7 +911,7 @@ fn fs_lchown(
 /// `chown` follows a symbolic link; `lchown` changes the link itself.
 fn change_owner(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
     name: &'static str,
     follow: bool,
@@ -948,7 +949,7 @@ fn change_owner(
 
 fn fs_utimes(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     change_times(ctx, args, caps, "fs.utimes", true)
@@ -956,7 +957,7 @@ fn fs_utimes(
 
 fn fs_lutimes(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     change_times(ctx, args, caps, "fs.lutimes", false)
@@ -966,7 +967,7 @@ fn fs_lutimes(
 /// whole seconds and nanoseconds the syscall takes.
 fn change_times(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
     name: &'static str,
     follow: bool,
@@ -1004,7 +1005,7 @@ fn change_times(
 
 fn fs_fsync_fd(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     sync_descriptor(ctx, args, caps, false)
@@ -1012,7 +1013,7 @@ fn fs_fsync_fd(
 
 fn fs_fdatasync_fd(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     sync_descriptor(ctx, args, caps, true)
@@ -1020,7 +1021,7 @@ fn fs_fdatasync_fd(
 
 fn sync_descriptor(
     _ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     _caps: &CapabilitySet,
     data_only: bool,
 ) -> Result<Value, NativeError> {
@@ -1045,7 +1046,7 @@ fn sync_descriptor(
 
 fn fs_ftruncate_fd(
     _ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     _caps: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let fd = args

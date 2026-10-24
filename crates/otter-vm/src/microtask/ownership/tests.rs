@@ -16,6 +16,7 @@
 //! - `crate::interp::exec` owns the single drain and reporting extent.
 
 use super::*;
+use crate::ValueWindow;
 use crate::marshal::MarshalCx;
 use crate::promise::JsPromise;
 use crate::{Local, NativeCallInfo, NativeCtx, NativeError, NativeScope};
@@ -284,7 +285,7 @@ fn direct_bound_and_proxy_native_jobs_use_creation_realm_and_disposed_jobs_do_no
                         scope.context().interp_mut(),
                         current,
                         Value::undefined(),
-                        &[],
+                        ValueWindow::from(&[]),
                     )
                     .map_err(|error| {
                         crate::native_function::vm_to_native_error(

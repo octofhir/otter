@@ -14,6 +14,7 @@
 //! - `super` implements lifecycle delivery.
 //! - Existing `process_timer_teardown` and `fatal_checkpoints` cover teardown.
 
+use otter_vm::ValueWindow;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
@@ -52,8 +53,8 @@ async fn collecting_before_exit_listener_retains_current_children_and_revives_a_
                 1,
                 NativeCall::Dynamic(Arc::new(
                     move |_ctx: &mut NativeCtx<'_>,
-                          args: &[Value],
-                          _captures: &[Value]|
+                          args: ValueWindow<'_>,
+                          _captures: ValueWindow<'_>|
                           -> Result<Value, NativeError> {
                         let child = args
                             .first()
@@ -77,8 +78,8 @@ async fn collecting_before_exit_listener_retains_current_children_and_revives_a_
                 0,
                 NativeCall::Dynamic(Arc::new(
                     move |ctx: &mut NativeCtx<'_>,
-                          _args: &[Value],
-                          _captures: &[Value]|
+                          _args: ValueWindow<'_>,
+                          _captures: ValueWindow<'_>|
                           -> Result<Value, NativeError> {
                         ctx.interp_mut().force_gc().map_err(NativeError::from)?;
                         collected.fetch_add(1, Ordering::SeqCst);

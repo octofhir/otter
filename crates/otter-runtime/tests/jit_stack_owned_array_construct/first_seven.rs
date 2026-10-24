@@ -13,6 +13,7 @@
 //!   generations.
 
 use super::*;
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     RuntimeExtensionInstaller, RuntimeNativeCall, RuntimeNativeCtx, RuntimeNativeError,
     RuntimeValue,
@@ -81,8 +82,8 @@ fn retained_first_seven_cells_keep_geometry_while_current_native_calls_use_final
                 1,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     move |ctx: &mut RuntimeNativeCtx<'_>,
-                          args: &[RuntimeValue],
-                          _state: &[RuntimeValue]|
+                          args: ValueWindow<'_>,
+                          _state: ValueWindow<'_>|
                           -> Result<RuntimeValue, RuntimeNativeError> {
                         if recording.load(Ordering::Relaxed) {
                             let sample = args

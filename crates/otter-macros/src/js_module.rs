@@ -24,7 +24,7 @@
 //!     async fn fetch_rows(query: USVString) -> Result<Vec<Row>, JsError> { … }
 //!
 //!     #[export(name = "fastPath", length = 1, raw)]
-//!     fn fast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> { … }
+//!     fn fast(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> { … }
 //! }
 //! ```
 //!
@@ -392,7 +392,7 @@ fn expand_inner(args: &ModuleArgs, module_impl: &mut ItemImpl) -> Result<proc_ma
             quote! {
                 fn #glue_ident(
                     ctx: &mut ::otter_runtime::__macro_support::NativeCtx<'_>,
-                    args: &[::otter_runtime::__macro_support::Value],
+                    args: ::otter_runtime::__macro_support::ValueWindow<'_>,
                     caps: &::otter_runtime::__macro_support::CapabilitySet,
                 ) -> ::core::result::Result<::otter_runtime::__macro_support::Value, ::otter_runtime::__macro_support::NativeError>
             }
@@ -400,7 +400,7 @@ fn expand_inner(args: &ModuleArgs, module_impl: &mut ItemImpl) -> Result<proc_ma
             quote! {
                 fn #glue_ident(
                     ctx: &mut ::otter_runtime::__macro_support::NativeCtx<'_>,
-                    args: &[::otter_runtime::__macro_support::Value],
+                    args: ::otter_runtime::__macro_support::ValueWindow<'_>,
                 ) -> ::core::result::Result<::otter_runtime::__macro_support::Value, ::otter_runtime::__macro_support::NativeError>
             }
         };

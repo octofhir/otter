@@ -20,6 +20,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#pluralrules-objects>
 
+use crate::ValueWindow;
 use crate::intl::helpers::{
     DEFAULT_LOCALE, get_number_option, get_string_option, require_options_object,
 };
@@ -362,7 +363,7 @@ fn operands_category(payload: &PluralRulesPayload, n: f64) -> &'static str {
 /// §16.3.2 `Intl.PluralRules.prototype.select(value)`.
 pub(crate) fn plural_rules_select(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "select")?;
     let first = args.first();
@@ -401,7 +402,7 @@ pub(crate) fn plural_rules_select(
 /// `ToNumber` (a Symbol throws), and a `NaN` endpoint is a `RangeError`.
 pub(crate) fn plural_rules_select_range(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "selectRange")?;
     let start = args.first().copied().unwrap_or_else(Value::undefined);
@@ -486,7 +487,7 @@ fn icu_ranges(
 /// §16.3.4 `Intl.PluralRules.prototype.resolvedOptions()`.
 pub(crate) fn plural_rules_resolved_options(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "resolvedOptions")?;
     let categories: Vec<&'static str> = if payload.kind == "cardinal"

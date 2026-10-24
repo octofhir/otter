@@ -40,6 +40,7 @@
 //! - <https://tc39.es/ecma262/#sec-validateintegertypedarray>
 //! - <https://tc39.es/ecma262/#sec-validateatomicaccess>
 
+use crate::ValueWindow;
 use crate::abstract_ops::{self, ToPrimitiveHint};
 use crate::atomics_wait::{self, WaitOutcome};
 use crate::bigint::BigIntValue;
@@ -320,7 +321,7 @@ fn range_err(name: &'static str, reason: String) -> NativeError {
 // lookup path resolves `Atomics.<method>` to a native function.
 // =====================================================================
 
-fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_load(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let ta = validate_integer_typed_array(
         args.first().unwrap_or(&Value::UNDEFINED),
         ctx.heap(),
@@ -339,7 +340,7 @@ fn native_load(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     ta.get(heap, idx).map_err(NativeError::from)
 }
 
-fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_store(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let ta = validate_integer_typed_array(
         args.first().unwrap_or(&Value::UNDEFINED),
         ctx.heap(),
@@ -366,7 +367,7 @@ fn native_store(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 
 fn modify_op(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     method_name: &'static str,
     op: fn(i64, i64) -> i64,
     op_big: fn(&num_bigint::BigInt, &num_bigint::BigInt) -> num_bigint::BigInt,
@@ -425,7 +426,7 @@ fn modify_op(
     Ok(prev)
 }
 
-fn native_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_add(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     modify_op(
         ctx,
         args,
@@ -435,7 +436,7 @@ fn native_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     )
 }
 
-fn native_sub(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_sub(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     modify_op(
         ctx,
         args,
@@ -445,19 +446,19 @@ fn native_sub(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     )
 }
 
-fn native_and(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_and(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     modify_op(ctx, args, "Atomics.and", |a, b| a & b, |a, b| a & b)
 }
 
-fn native_or(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_or(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     modify_op(ctx, args, "Atomics.or", |a, b| a | b, |a, b| a | b)
 }
 
-fn native_xor(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_xor(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     modify_op(ctx, args, "Atomics.xor", |a, b| a ^ b, |a, b| a ^ b)
 }
 
-fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_exchange(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let ta = validate_integer_typed_array(
         args.first().unwrap_or(&Value::UNDEFINED),
         ctx.heap(),
@@ -487,7 +488,10 @@ fn native_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     Ok(prev)
 }
 
-fn native_compare_exchange(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_compare_exchange(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let ta = validate_integer_typed_array(
         args.first().unwrap_or(&Value::UNDEFINED),
         ctx.heap(),
@@ -546,7 +550,10 @@ fn narrow_through_kind(
     kind.read(heap, &scratch, 0)
 }
 
-fn native_is_lock_free(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_is_lock_free(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // Spec §25.4.13 — argument is coerced via ToIntegerOrInfinity
     // (no ToIndex), so negative / non-integer / NaN map to `false`
     // by failing the `matches!(.., 1|2|4|8)` filter.
@@ -563,7 +570,7 @@ fn native_is_lock_free(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
     Ok(Value::boolean(supported))
 }
 
-fn native_pause(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_pause(_ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // §25.4.14 Atomics.pause ( iterationNumber )
     // <https://tc39.es/ecma262/#sec-atomics.pause>
     //
@@ -592,15 +599,19 @@ fn native_pause(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(Value::undefined())
 }
 
-fn native_wait(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_wait(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     do_wait(ctx, args, /* is_async */ false)
 }
 
-fn native_wait_async(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_wait_async(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     do_wait(ctx, args, /* is_async */ true)
 }
 
-fn do_wait(ctx: &mut NativeCtx<'_>, args: &[Value], is_async: bool) -> Result<Value, NativeError> {
+fn do_wait(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+    is_async: bool,
+) -> Result<Value, NativeError> {
     let method_name = if is_async {
         "Atomics.waitAsync"
     } else {
@@ -892,7 +903,7 @@ fn wait_async_parked(
                 callback,
                 ms,
                 None,
-                &[],
+                ValueWindow::EMPTY,
                 crate::timers::TimerKind::Timeout,
                 method_name,
             )?;
@@ -1069,7 +1080,7 @@ fn string_value(ctx: &mut NativeCtx<'_>, value: &str) -> Result<Value, NativeErr
     })
 }
 
-fn native_notify(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_notify(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // §25.4.3.12 Atomics.notify ( typedArray, index, count ).
     // Allows Int32Array / BigInt64Array; no SharedArrayBuffer
     // requirement — the spec returns 0 for a non-shared buffer

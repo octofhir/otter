@@ -19,6 +19,7 @@
 //! - `otter_vm::jit::intrinsic_calls` owns the callable proof.
 
 use super::*;
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     RuntimeExtensionInstaller, RuntimeNativeCall, RuntimeNativeCtx, RuntimeNativeError,
     RuntimeValue,
@@ -161,7 +162,7 @@ fn ordinary_intrinsics_keep_held_identity_and_additional_source_realm() {
 
 fn clone_intrinsic_value(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let value = args
         .first()
@@ -178,7 +179,7 @@ fn exchange_installer(slot: Arc<Mutex<Option<PersistentRootId>>>) -> RuntimeExte
             "saveIntrinsicBundle",
             1,
             RuntimeNativeCall::Dynamic(Arc::new(
-                move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _: &[RuntimeValue]| {
+                move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _: ValueWindow<'_>| {
                     ctx.scope(|mut scope| {
                         let value = scope.argument(args, 0);
                         let mut slot = saved
@@ -198,7 +199,7 @@ fn exchange_installer(slot: Arc<Mutex<Option<PersistentRootId>>>) -> RuntimeExte
             "loadIntrinsicBundle",
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
-                move |ctx: &mut RuntimeNativeCtx<'_>, _: &[RuntimeValue], _: &[RuntimeValue]| {
+                move |ctx: &mut RuntimeNativeCtx<'_>, _: ValueWindow<'_>, _: ValueWindow<'_>| {
                     let id = loaded
                         .lock()
                         .map_err(|_| RuntimeNativeError::InvalidOperand)?

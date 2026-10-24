@@ -16,6 +16,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-collator-objects>
 
+use crate::ValueWindow;
 use std::cmp::Ordering;
 use std::str::FromStr;
 
@@ -281,7 +282,7 @@ fn coerce_compare_arg(value: Option<&Value>, heap: &otter_gc::GcHeap) -> Option<
 /// length 2).
 pub(crate) fn collator_compare_getter(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let _ = require_collator(ctx, "compare")?;
     let this = *ctx.this_value();
@@ -300,8 +301,8 @@ pub(crate) fn collator_compare_getter(
 /// `[[Collator]]` is `captures[0]`.
 fn bound_compare_call(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    captures: &[Value],
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let bad = || NativeError::TypeError {
         name: "compare",
@@ -328,7 +329,7 @@ fn bound_compare_call(
 /// §10.3.5 `Intl.Collator.prototype.resolvedOptions()`.
 pub(crate) fn collator_resolved_options(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_collator(ctx, "resolvedOptions")?;
     ctx.scope(|mut scope| {

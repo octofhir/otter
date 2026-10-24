@@ -51,7 +51,7 @@
 //!
 //! fn open_kv(
 //!     ctx: &mut NativeCtx<'_>,
-//!     args: &[Value],
+//!     args: ValueWindow<'_>,
 //!     caps: &CapabilitySet,
 //! ) -> Result<Value, NativeError> { ... }
 //! ```

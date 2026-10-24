@@ -19,6 +19,7 @@
 
 use super::moving_children::ChildMotion;
 use super::*;
+use otter_runtime::ValueWindow;
 
 #[derive(Clone, Copy, Debug)]
 enum Route {
@@ -85,8 +86,8 @@ fn transparent_proxy_and_bound_super_transfer_successfully_from_exact_lexical_so
                                 0,
                                 RuntimeNativeCall::Dynamic(Arc::new(
                                     |ctx: &mut RuntimeNativeCtx<'_>,
-                                     _args: &[RuntimeValue],
-                                     _state: &[RuntimeValue]| {
+                                     _args: ValueWindow<'_>,
+                                     _state: ValueWindow<'_>| {
                                         // Exact evacuation needs fresh young arguments. This
                                         // fixture controls collection explicitly for every
                                         // base call; it never lowers tier admission policy.
@@ -101,8 +102,8 @@ fn transparent_proxy_and_bound_super_transfer_successfully_from_exact_lexical_so
                             3,
                             RuntimeNativeCall::Dynamic(Arc::new(
                                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                                      args: &[RuntimeValue],
-                                      _state: &[RuntimeValue]| {
+                                      args: ValueWindow<'_>,
+                                      _state: ValueWindow<'_>| {
                                     let observation = if args.len() == 3 {
                                         super::moving_children::observe_and_collect(ctx, args)
                                             .map_err(|error| error.to_string())
@@ -125,8 +126,8 @@ fn transparent_proxy_and_bound_super_transfer_successfully_from_exact_lexical_so
                             1,
                             RuntimeNativeCall::Dynamic(Arc::new(
                                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                                      args: &[RuntimeValue],
-                                      _state: &[RuntimeValue]| {
+                                      args: ValueWindow<'_>,
+                                      _state: ValueWindow<'_>| {
                                     let observation = args
                                         .first()
                                         .and_then(|value| value.as_object())

@@ -36,6 +36,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-string-prototype-object>
 
+use crate::ValueWindow;
 use smallvec::SmallVec;
 
 use crate::Value;
@@ -175,7 +176,7 @@ fn receiver_string(ctx: &mut NativeCtx<'_>, receiver: &Value) -> Result<JsString
 /// (`ToString(undefined) = "undefined"`).
 fn arg_to_string(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: u16,
 ) -> Result<JsString, NativeError> {
     let Some(arg) = args.get(index as usize) else {
@@ -224,7 +225,7 @@ fn arg_to_string(
 /// collapse to `default`.
 fn arg_u32_or(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: u16,
     default: u32,
 ) -> Result<u32, NativeError> {
@@ -281,7 +282,7 @@ fn parse_index(s: JsString, heap: &otter_gc::GcHeap) -> Option<u32> {
 /// zero.
 fn arg_int_or(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: u16,
     default: i64,
 ) -> Result<i64, NativeError> {
@@ -460,7 +461,7 @@ fn find_substr(haystack: &[u16], needle: &[u16], from: usize) -> Option<usize> {
 fn impl_length(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     Ok(Value::number_u32(recv.len()))
@@ -469,7 +470,7 @@ fn impl_length(
 fn impl_char_code_at(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     // §22.1.3.4 — position is `ToIntegerOrInfinity(pos)` (signed): a
@@ -521,7 +522,8 @@ pub(crate) fn is_prototype_builtin(
 }
 
 /// Native trampoline shape every `String.prototype` method is installed under.
-pub(crate) type StringNativeBridge = fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>;
+pub(crate) type StringNativeBridge =
+    fn(&mut NativeCtx<'_>, ValueWindow<'_>) -> Result<Value, NativeError>;
 
 /// The trampoline backing one JIT-recognized `String.prototype` method.
 #[must_use]
@@ -543,7 +545,7 @@ pub(crate) fn is_char_code_at_builtin(value: Value, heap: &otter_gc::GcHeap) -> 
 
 pub(crate) fn fast_primitive_char_code_at(
     receiver: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
     heap: &mut otter_gc::GcHeap,
 ) -> Option<Value> {
     let recv = receiver.as_string(heap)?;
@@ -571,7 +573,7 @@ pub(crate) fn fast_primitive_char_code_at(
 fn impl_char_at(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     // §22.1.3.1 — position is `ToIntegerOrInfinity(pos)` (signed): a
@@ -594,7 +596,7 @@ fn impl_char_at(
 fn impl_slice(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // §22.1.3.20 — `intStart` / `intEnd` are ToIntegerOrInfinity, so a
     // negative index counts from the end (`max(len + n, 0)`) rather than
@@ -621,7 +623,7 @@ fn impl_slice(
 fn impl_substring(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let total = recv.len();
@@ -650,7 +652,7 @@ fn impl_substring(
 fn flat_search_operands(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<(JsString, JsString), NativeError> {
     // Two already-contiguous strings need no rendering or flattening, so
     // nothing can allocate and no operand needs a rooted slot.
@@ -669,7 +671,11 @@ fn flat_search_operands(
         let recv = receiver_string(scope.context(), &receiver_value)?;
         let recv = scope.value(Value::string(recv));
         let search_value = scope.raw(search);
-        let needle = arg_to_string(scope.context(), std::slice::from_ref(&search_value), 0)?;
+        let needle = arg_to_string(
+            scope.context(),
+            ValueWindow::from(std::slice::from_ref(&search_value)),
+            0,
+        )?;
         let needle = scope.value(Value::string(needle));
         for operand in [recv, needle] {
             scope
@@ -691,7 +697,7 @@ fn flat_search_operands(
 fn impl_index_of(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let from = arg_u32_or(ctx, args, 1, 0)?;
     let (recv, needle) = flat_search_operands(ctx, receiver, args)?;
@@ -708,7 +714,7 @@ fn impl_index_of(
 fn impl_starts_with(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let search = args.first().copied().unwrap_or(Value::undefined());
@@ -731,7 +737,7 @@ fn impl_starts_with(
 fn impl_ends_with(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let search = args.first().copied().unwrap_or(Value::undefined());
@@ -754,7 +760,7 @@ fn impl_ends_with(
 fn impl_includes(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let heap = ctx.heap();
     if let (Some(recv), Some(needle)) = (
@@ -788,7 +794,12 @@ fn impl_includes(
         let needle = value_to_string(scope.context(), search_value, "String.prototype.includes")?;
         let needle = scope.value(Value::string(needle));
         let position_value = scope.raw(position);
-        let from = arg_u32_or(scope.context(), std::slice::from_ref(&position_value), 0, 0)?;
+        let from = arg_u32_or(
+            scope.context(),
+            ValueWindow::from(std::slice::from_ref(&position_value)),
+            0,
+            0,
+        )?;
         for operand in [recv, needle] {
             scope
                 .raw(operand)
@@ -809,7 +820,7 @@ fn impl_includes(
 fn impl_concat(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // §22.1.3.5 — `for each next of arguments: nextString = ?
     // ToString(next)`. Coerce every operand via the shared
@@ -843,7 +854,7 @@ fn impl_concat(
 fn impl_repeat(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     // §22.1.3.18 steps 3-4 — n = ToIntegerOrInfinity(count); a negative
@@ -903,7 +914,7 @@ enum PadSide {
 fn pad_impl(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
     side: PadSide,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
@@ -949,7 +960,7 @@ fn pad_impl(
 fn impl_pad_start(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     pad_impl(ctx, receiver, args, PadSide::Start)
 }
@@ -957,7 +968,7 @@ fn impl_pad_start(
 fn impl_pad_end(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     pad_impl(ctx, receiver, args, PadSide::End)
 }
@@ -973,7 +984,7 @@ enum TrimSide {
 fn trim_impl(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     side: TrimSide,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
@@ -1027,7 +1038,7 @@ fn trim_impl(
 fn impl_trim(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     trim_impl(ctx, receiver, args, TrimSide::Both)
 }
@@ -1042,7 +1053,7 @@ fn impl_trim(
 fn create_html(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
     tag: &str,
     attribute: Option<&str>,
 ) -> Result<Value, NativeError> {
@@ -1101,7 +1112,7 @@ fn create_html(
 fn impl_is_well_formed(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let units = recv.to_utf16_vec(ctx.heap_mut());
@@ -1127,7 +1138,7 @@ fn impl_is_well_formed(
 fn impl_to_well_formed(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let units = recv.to_utf16_vec(ctx.heap_mut());
@@ -1159,7 +1170,7 @@ fn impl_to_well_formed(
 fn impl_substr(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let size = recv.len() as i64;
@@ -1192,91 +1203,91 @@ fn impl_substr(
 fn impl_anchor(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "a", Some("name"))
 }
 fn impl_big(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "big", None)
 }
 fn impl_blink(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "blink", None)
 }
 fn impl_bold(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "b", None)
 }
 fn impl_fixed(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "tt", None)
 }
 fn impl_fontcolor(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "font", Some("color"))
 }
 fn impl_fontsize(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "font", Some("size"))
 }
 fn impl_italics(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "i", None)
 }
 fn impl_link(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "a", Some("href"))
 }
 fn impl_small(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "small", None)
 }
 fn impl_strike(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "strike", None)
 }
 fn impl_sub(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "sub", None)
 }
 fn impl_sup(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     create_html(ctx, receiver, args, "sup", None)
 }
@@ -1284,7 +1295,7 @@ fn impl_sup(
 fn impl_trim_start(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     trim_impl(ctx, receiver, args, TrimSide::Start)
 }
@@ -1292,7 +1303,7 @@ fn impl_trim_start(
 fn impl_trim_end(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     trim_impl(ctx, receiver, args, TrimSide::End)
 }
@@ -1300,7 +1311,7 @@ fn impl_trim_end(
 fn impl_at(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let raw = arg_int_or(ctx, args, 0, 0)?;
@@ -1325,7 +1336,7 @@ fn impl_at(
 fn impl_code_point_at(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let raw = arg_int_or(ctx, args, 0, 0)?;
@@ -1560,7 +1571,7 @@ fn unicode_case_map(units: &[u16], upper: bool) -> Vec<u16> {
 
 fn locale_language_tag(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Option<String>, NativeError> {
     let locales = args.first().copied().unwrap_or_else(Value::undefined);
     let requested = crate::intl::supported::canonicalize_locale_list(ctx, locales)?;
@@ -1676,7 +1687,7 @@ fn ascii_case_mapped_bytes(
 fn impl_to_lower_case(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     if let Some(bytes) = ascii_case_mapped_bytes(recv, false, ctx.heap()) {
@@ -1696,7 +1707,7 @@ fn impl_to_lower_case(
 fn impl_to_upper_case(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     if let Some(bytes) = ascii_case_mapped_bytes(recv, true, ctx.heap()) {
@@ -1716,7 +1727,7 @@ fn impl_to_upper_case(
 fn impl_to_locale_lower_case(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let language = locale_language_tag(ctx, args)?;
@@ -1731,7 +1742,7 @@ fn impl_to_locale_lower_case(
 fn impl_to_locale_upper_case(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let language = locale_language_tag(ctx, args)?;
@@ -1919,7 +1930,7 @@ fn get_substitution(
 fn string_replace_spec(
     replace_all: bool,
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let name: &'static str = if replace_all { "replaceAll" } else { "replace" };
     ctx.scope(|mut scope| {
@@ -1974,7 +1985,7 @@ fn string_replace_spec(
                 let result = crate::regexp_prototype::regexp_symbol_replace(
                     scope.context(),
                     search_value,
-                    &call_args,
+                    ValueWindow::from(&call_args),
                 )?;
                 let result = scope.value(result);
                 return Ok(scope.finish(result));
@@ -2102,7 +2113,7 @@ fn string_replace_spec(
 fn impl_replace(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let recv_units = recv.to_utf16_vec(ctx.heap());
@@ -2152,7 +2163,7 @@ fn impl_replace(
 fn impl_replace_all(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     let recv_units = recv.to_utf16_vec(ctx.heap());
@@ -2225,7 +2236,7 @@ fn impl_replace_all(
 fn impl_split(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
 
@@ -2341,7 +2352,7 @@ fn impl_split(
 
 /// Common limit-arg parser shared by string-separator and
 /// regex-separator `split` paths.
-fn parse_split_limit(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<u32, NativeError> {
+fn parse_split_limit(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<u32, NativeError> {
     // §22.1.3.23 step 6: `limit` defaults to 2^32 - 1 and is
     // ToUint32-coerced. Foundation accepts the spec set
     // (`Number` / `Boolean` / `null` / `String` — strings parsed as
@@ -2540,7 +2551,7 @@ fn coerce_pattern_to_regexp(
 fn impl_match(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // §22.1.3.13 fallback (steps 4-7): a non-`@@match` argument (the
     // upstream symbol-method block already delegated a regexp / object
@@ -2562,7 +2573,7 @@ fn impl_match(
 fn impl_match_all(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // The receiver is already `S = ToString(O)` (coerced uniformly by
     // `native_string_method`), and `native_string_method`'s symbol-method
@@ -2586,7 +2597,7 @@ fn impl_match_all(
 fn impl_search(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // §22.1.3.15 fallback (steps 4-7): a non-`@@search` argument becomes
     // `RegExpCreate(regexp, undefined)`, then `Invoke(rx, @@search, « S »)`,
@@ -2606,7 +2617,7 @@ fn impl_search(
 fn invoke_regexp_string_fallback(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
     flags: &str,
     method_symbol: WellKnown,
     name: &'static str,
@@ -2636,7 +2647,7 @@ fn invoke_regexp_string_fallback(
     })
 }
 
-type StringNativeFn = fn(&mut NativeCtx<'_>, &Value, &[Value]) -> Result<Value, NativeError>;
+type StringNativeFn = fn(&mut NativeCtx<'_>, &Value, ValueWindow<'_>) -> Result<Value, NativeError>;
 
 fn intrinsic_impl(name: &str) -> Option<StringNativeFn> {
     Some(match name {
@@ -2696,7 +2707,7 @@ fn intrinsic_impl(name: &str) -> Option<StringNativeFn> {
 fn impl_last_index_of(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let (recv, needle) = flat_search_operands(ctx, receiver, args)?;
     // §22.1.3.9 step 5 — `numPos = ToNumber(position)`; if it is NaN the
@@ -2734,7 +2745,7 @@ fn impl_last_index_of(
 fn impl_locale_compare(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     // §22.1.3.10 step 3 — `That = ? ToString(that)`. Object operands
@@ -2763,7 +2774,7 @@ fn impl_locale_compare(
 fn impl_normalize(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let recv = receiver_string(ctx, receiver)?;
     // §22.1.3.13 step 3 — `f = ? ToString(form)` unless undefined.
@@ -2813,7 +2824,7 @@ fn impl_normalize(
 fn impl_to_string(
     ctx: &mut NativeCtx<'_>,
     receiver: &Value,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     if let Some(s) = receiver.as_string(ctx.heap_mut()) {
         return Ok(Value::string(s));
@@ -2848,7 +2859,7 @@ pub fn is_builtin_method(name: &str) -> bool {
 fn native_string_method(
     name: &'static str,
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     // §22.1.3.19 `replace` / §22.1.3.20 `replaceAll` run the full spec
     // ladder (`@@replace` dispatch, `ToString` coercion, functional and
@@ -3051,7 +3062,11 @@ fn native_string_method(
             reason: "unknown String.prototype method".to_string(),
         })?;
         let receiver_value = scope.raw(receiver);
-        impl_fn(scope.context(), &receiver_value, &coerced_args)
+        impl_fn(
+            scope.context(),
+            &receiver_value,
+            ValueWindow::from(&coerced_args),
+        )
     })
 }
 
@@ -3061,7 +3076,7 @@ fn native_string_method(
 macro_rules! string_prototype_methods {
     ($($bridge:ident => $name:literal, $length:literal;)*) => {
         $(
-            pub(crate) fn $bridge(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            pub(crate) fn $bridge(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
                 native_string_method($name, ctx, args)
             }
         )*
@@ -3168,7 +3183,7 @@ mod tests {
         let impl_fn = intrinsic_impl(method).unwrap();
         let result =
             NativeCtx::with_host_context(&mut interp, NativeCallInfo::call(recv_v), None, |ctx| {
-                impl_fn(ctx, &recv_v, &arg_vs).unwrap()
+                impl_fn(ctx, &recv_v, ValueWindow::from(&arg_vs)).unwrap()
             });
         result.display_string(interp.gc_heap())
     }
@@ -3176,7 +3191,7 @@ mod tests {
     fn invoke_raw(
         method: &str,
         receiver: &Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
         interp: &mut Interpreter,
     ) -> Result<Value, NativeError> {
         let impl_fn = intrinsic_impl(method).unwrap();
@@ -3190,7 +3205,7 @@ mod tests {
             roots.add_value_vec(&mut args_root);
         }
         NativeCtx::with_host_context(interp, NativeCallInfo::call(receiver_root), None, |ctx| {
-            impl_fn(ctx, &receiver_root, &args_root)
+            impl_fn(ctx, &receiver_root, ValueWindow::from(&args_root))
         })
     }
 
@@ -3240,7 +3255,13 @@ mod tests {
     #[test]
     fn bad_receiver_rejects() {
         let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
-        let err = invoke_raw("length", &Value::undefined(), &[], &mut interp).unwrap_err();
+        let err = invoke_raw(
+            "length",
+            &Value::undefined(),
+            ValueWindow::from(&[]),
+            &mut interp,
+        )
+        .unwrap_err();
         assert!(matches!(err, NativeError::TypeError { .. }));
     }
 
@@ -3275,7 +3296,7 @@ mod tests {
                 A::S(s) => Value::string(JsString::from_str(s, interp.gc_heap_mut()).unwrap()),
             });
         }
-        invoke_raw(method, &recv_v, &arg_vs, interp).unwrap()
+        invoke_raw(method, &recv_v, ValueWindow::from(&arg_vs), interp).unwrap()
     }
 
     fn call_s(method: &str, recv: &str, args: &[A]) -> String {
@@ -3316,7 +3337,7 @@ mod tests {
         let result = invoke_raw(
             "concat",
             &recv,
-            &[Value::number(NumberValue::from_i32(3))],
+            ValueWindow::from(&[Value::number(NumberValue::from_i32(3))]),
             &mut interp,
         )
         .unwrap();
@@ -3340,7 +3361,7 @@ mod tests {
         let err = invoke_raw(
             "repeat",
             &recv,
-            &[Value::number(NumberValue::from_i32(-1))],
+            ValueWindow::from(&[Value::number(NumberValue::from_i32(-1))]),
             &mut interp,
         )
         .unwrap_err();
@@ -3407,7 +3428,7 @@ mod tests {
         let r = invoke_raw(
             "codePointAt",
             &recv,
-            &[Value::number(NumberValue::from_i32(0))],
+            ValueWindow::from(&[Value::number(NumberValue::from_i32(0))]),
             &mut interp,
         )
         .unwrap();
@@ -3416,7 +3437,7 @@ mod tests {
         let r2 = invoke_raw(
             "codePointAt",
             &recv,
-            &[Value::number(NumberValue::from_i32(1))],
+            ValueWindow::from(&[Value::number(NumberValue::from_i32(1))]),
             &mut interp,
         )
         .unwrap();
@@ -3432,7 +3453,7 @@ mod tests {
         let units: [u16; 3] = [0x00C9, b'a' as u16, b'b' as u16]; // 'É' + "ab"
         let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let recv = Value::string(JsString::from_utf16_units(&units, interp.gc_heap_mut()).unwrap());
-        let r = invoke_raw("toLowerCase", &recv, &[], &mut interp).unwrap();
+        let r = invoke_raw("toLowerCase", &recv, ValueWindow::from(&[]), &mut interp).unwrap();
         let Some(s) = r.as_string(interp.gc_heap()) else {
             panic!("expected string");
         };
@@ -3597,7 +3618,7 @@ mod tests {
         // "abc".split() === ["abc"]
         let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         let recv = Value::string(JsString::from_str("abc", interp.gc_heap_mut()).unwrap());
-        let r = invoke_raw("split", &recv, &[], &mut interp).unwrap();
+        let r = invoke_raw("split", &recv, ValueWindow::from(&[]), &mut interp).unwrap();
         let Some(a) = r.as_array() else {
             panic!("expected array");
         };

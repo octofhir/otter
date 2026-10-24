@@ -22,6 +22,7 @@
 //! - <https://tc39.es/ecma262/#sec-array.fromasync>
 //! - <https://tc39.es/ecma262/#sec-array.of>
 
+use crate::ValueWindow;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::{NativeCtx, NativeError, Value};
@@ -54,7 +55,7 @@ pub static ARRAY_STATIC_METHODS: &[MethodSpec] = &[
     },
 ];
 
-fn native_is_array(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_is_array(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     // §7.2.2 IsArray includes Proxy recursion and revoked-Proxy TypeError.
     let result = ctx.cx.interp.is_array(&value).map_err(|err| {
@@ -67,7 +68,7 @@ fn native_is_array(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 /// through `Interpreter::array_of_sync` so `Array.of.call(C, …)`
 /// observes the `this` constructor `C` (`Construct(C, «len»)` plus the
 /// spec `CreateDataPropertyOrThrow` / `Set(A, "length", …)` protocol).
-fn native_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_of(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let exec = ctx
         .execution_context()
@@ -77,7 +78,7 @@ fn native_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
             reason: "missing execution context".to_string(),
         })?;
     ctx.with_turn_parts(|interp, stack| {
-        let result = interp.array_of_sync(stack, &exec, this_value, args);
+        let result = interp.array_of_sync(stack, &exec, this_value, &args);
         result.map_err(|e| e.into_native(interp, "Array.of"))
     })
 }
@@ -86,7 +87,7 @@ fn native_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 /// NativeFunction. Routes through
 /// `Interpreter::array_from_sync` so the iterable / array-like
 /// ladder observes user `@@iterator` / `mapFn` / `thisArg`.
-fn native_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_from(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let exec = ctx
         .execution_context()
@@ -104,6 +105,6 @@ fn native_from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 /// §23.1.2.1 `Array.fromAsync(items, mapFn?, thisArg?)` — collect an async
 /// iterable, a sync iterable, or an array-like of promises into a new array,
 /// answering with the promise for it.
-fn native_from_async(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_from_async(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     crate::array_from_async::native_from_async(ctx, args)
 }

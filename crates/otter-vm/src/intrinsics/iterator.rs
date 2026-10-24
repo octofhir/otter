@@ -17,6 +17,7 @@
 //! - <https://tc39.es/proposal-iterator-join/>
 
 use crate::Value;
+use crate::ValueWindow;
 use crate::bootstrap::native_static_with_value_roots;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject};
@@ -28,7 +29,7 @@ use crate::rooting::RootScopeExt;
 /// ordinary object inheriting from the new-target's `.prototype`.
 fn iterator_ctor_call(
     ctx: &mut crate::NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let new_target = ctx.new_target().cloned();
     let Some(new_target) = new_target else {
@@ -135,7 +136,7 @@ otter_macros::couch! {
 /// <https://tc39.es/ecma262/#sec-iteratorprototype-%symbol.iterator%>
 pub(crate) fn iterator_proto_symbol_iterator(
     ctx: &mut crate::NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     Ok(*ctx.this_value())
 }
@@ -143,7 +144,7 @@ pub(crate) fn iterator_proto_symbol_iterator(
 /// §27.1.2.2 `get %Iterator.prototype%.constructor` — `%Iterator%`.
 fn iterator_proto_constructor_get(
     ctx: &mut crate::NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let interp = ctx.interp_mut();
     let global = *interp.global_this();
@@ -153,7 +154,7 @@ fn iterator_proto_constructor_get(
 /// §27.1.2.4 `get %Iterator.prototype%[@@toStringTag]` — `"Iterator"`.
 fn iterator_proto_to_string_tag_get(
     ctx: &mut crate::NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let tag = crate::string::JsString::from_str("Iterator", ctx.heap_mut()).map_err(|_| {
         crate::NativeError::TypeError {
@@ -169,7 +170,7 @@ fn iterator_proto_to_string_tag_get(
 /// receiver; assignments against the home prototype itself throw.
 fn setter_ignoring_prototype_properties(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     key: crate::VmPropertyKey,
     name: &'static str,
 ) -> Result<Value, crate::NativeError> {
@@ -259,7 +260,7 @@ fn setter_ignoring_prototype_properties(
 /// §27.1.2.2 `set %Iterator.prototype%.constructor`.
 fn iterator_proto_constructor_set(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     setter_ignoring_prototype_properties(
         ctx,
@@ -272,7 +273,7 @@ fn iterator_proto_constructor_set(
 /// §27.1.2.4 `set %Iterator.prototype%[@@toStringTag]`.
 fn iterator_proto_to_string_tag_set(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let sym = ctx
         .cx
@@ -744,7 +745,7 @@ fn iterator_receiver(
         let mut next_method = match outcome {
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
-                ctx.call(getter, *ctx.this_value(), &[])?
+                ctx.call(getter, *ctx.this_value(), ValueWindow::from(&[]))?
             }
         };
         // Re-read `this` from the rooted call info: the `next` read can
@@ -844,7 +845,7 @@ fn iterator_receiver_builtin(
 /// Re-read argument `index` after an allocating step. The argument slice is
 /// a traced root the collector rewrites in place, so a copy taken before user
 /// code ran (a `next` getter in `GetIteratorDirect`) may be stale.
-fn rooted_arg(args: &[Value], index: usize) -> Value {
+fn rooted_arg(args: ValueWindow<'_>, index: usize) -> Value {
     if index < args.len() {
         // SAFETY: `index` is in bounds; the volatile read keeps an earlier
         // load of the shared slice from being reused.
@@ -856,7 +857,7 @@ fn rooted_arg(args: &[Value], index: usize) -> Value {
 
 fn require_callable_arg(
     ctx: &crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
     index: usize,
 ) -> Result<Value, crate::NativeError> {
@@ -873,7 +874,7 @@ fn require_callable_arg(
 
 fn iterator_proto_map(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.map")?;
@@ -901,7 +902,7 @@ fn iterator_proto_map(
 
 fn iterator_proto_filter(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.filter")?;
@@ -929,7 +930,7 @@ fn iterator_proto_filter(
 
 fn iterator_proto_take(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.take")?;
@@ -955,7 +956,7 @@ fn iterator_proto_take(
 
 fn iterator_proto_drop(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.drop")?;
@@ -981,7 +982,7 @@ fn iterator_proto_drop(
 
 fn iterator_proto_flat_map(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.flatMap")?;
@@ -1013,7 +1014,10 @@ fn iterator_proto_flat_map(
 /// argument must already be an integral Number in `1..=2**32 - 1`.
 /// Nothing is coerced, so a non-Number throws before any user-visible
 /// `valueOf` / `toString` hook can run.
-fn iterator_span_size_arg(args: &[Value], name: &'static str) -> Result<u32, crate::NativeError> {
+fn iterator_span_size_arg(
+    args: ValueWindow<'_>,
+    name: &'static str,
+) -> Result<u32, crate::NativeError> {
     let arg = args.first().copied().unwrap_or(Value::undefined());
     let Some(number) = arg.as_number() else {
         return Err(crate::NativeError::TypeError {
@@ -1065,7 +1069,7 @@ fn iterator_span_buffer(
 /// <https://tc39.es/proposal-iterator-chunking/>
 fn iterator_proto_chunks(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.chunks")?;
@@ -1101,7 +1105,7 @@ fn iterator_proto_chunks(
 /// <https://tc39.es/proposal-iterator-chunking/>
 fn iterator_proto_windows(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.windows")?;
@@ -1159,7 +1163,7 @@ fn iterator_proto_windows(
 
 fn iterator_arg_count_native(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<u64, crate::NativeError> {
     let arg = args.first().cloned().unwrap_or(Value::undefined());
@@ -1234,7 +1238,7 @@ fn iterator_arg_count_native(
 
 fn iterator_proto_to_array(
     ctx: &mut crate::NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let handle = iterator_receiver(ctx, "Iterator.prototype.toArray")?;
     let exec_ctx =
@@ -1268,7 +1272,7 @@ fn iterator_proto_to_array(
 
 fn iterator_proto_for_each(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.forEach")?;
@@ -1337,7 +1341,7 @@ fn iterator_proto_for_each(
 
 fn iterator_proto_reduce(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.reduce")?;
@@ -1463,21 +1467,21 @@ fn iterator_proto_reduce(
 
 fn iterator_proto_some(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     iterator_predicate_drain(ctx, args, "Iterator.prototype.some", true, false)
 }
 
 fn iterator_proto_every(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     iterator_predicate_drain(ctx, args, "Iterator.prototype.every", false, true)
 }
 
 fn iterator_proto_find(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.find")?;
@@ -1567,7 +1571,7 @@ fn iterator_proto_find(
 /// Number that is `±Infinity` or integral throws a `TypeError`; a
 /// negative or above-2**53-1 count throws a `RangeError`.
 fn iterator_skipped_elements_arg(
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<f64, crate::NativeError> {
     let arg = args.get(1).copied().unwrap_or(Value::undefined());
@@ -1612,7 +1616,7 @@ fn iterator_skipped_elements_arg(
 /// <https://tc39.es/proposal-iterator-includes/>
 fn iterator_proto_includes(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.includes")?;
@@ -1662,7 +1666,7 @@ fn iterator_proto_includes(
 /// <https://tc39.es/proposal-iterator-join/>
 fn iterator_proto_join(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     require_object_receiver(&this_value, "Iterator.prototype.join")?;
@@ -1746,7 +1750,7 @@ fn iterator_proto_join(
 /// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.next>
 pub(crate) fn iterator_proto_next(
     ctx: &mut crate::NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let handle = iterator_receiver_builtin(ctx, "Iterator.prototype.next")?;
     let exec_ctx =
@@ -1805,7 +1809,7 @@ fn require_iterator_helper(
 
 pub(crate) fn iterator_helper_proto_next(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     require_iterator_helper(ctx, "IteratorHelperPrototype.next")?;
     iterator_proto_next(ctx, args)
@@ -1813,7 +1817,7 @@ pub(crate) fn iterator_helper_proto_next(
 
 pub(crate) fn iterator_helper_proto_return(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     require_iterator_helper(ctx, "IteratorHelperPrototype.return")?;
     iterator_proto_return(ctx, args)
@@ -1827,7 +1831,7 @@ pub(crate) fn iterator_helper_proto_return(
 /// whatever that `next` returns, including a non-object.
 pub(crate) fn wrap_for_valid_iterator_next(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     const NAME: &str = "WrapForValidIteratorPrototype.next";
     let handle = iterator_receiver_builtin(ctx, NAME)?;
@@ -1896,7 +1900,7 @@ pub(crate) fn wrap_for_valid_iterator_next(
 /// internal state.
 pub(crate) fn regexp_string_iterator_proto_next(
     ctx: &mut crate::NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let name = "RegExpStringIteratorPrototype.next";
     let this_value = *ctx.this_value();
@@ -1942,7 +1946,7 @@ pub(crate) fn regexp_string_iterator_proto_next(
 /// - <https://tc39.es/ecma262/#sec-%25iteratorprototype%25.return>
 pub(crate) fn iterator_proto_return(
     ctx: &mut crate::NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let this_value = *ctx.this_value();
     let handle = iterator_receiver_builtin(ctx, "Iterator.prototype.return")?;
@@ -2051,7 +2055,7 @@ fn create_owned_iterator_result(
 
 fn iterator_predicate_drain(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
     short_on_truthy: bool,
     initial: bool,
@@ -2152,7 +2156,7 @@ fn iterator_predicate_drain(
 /// <https://tc39.es/proposal-iterator-sequencing/>
 fn iterator_concat_native(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let exec_ctx =
         ctx.execution_context()
@@ -2188,7 +2192,7 @@ fn iterator_concat_native(
             let method = match outcome {
                 crate::VmGetOutcome::Value(v) => v,
                 crate::VmGetOutcome::InvokeGetter { getter } => {
-                    ctx.call(getter, rooted_arg(args, index), &[])?
+                    ctx.call(getter, rooted_arg(args, index), ValueWindow::from(&[]))?
                 }
             };
             // §7.3.11 GetMethod — nullish is "absent", anything else must
@@ -2331,7 +2335,7 @@ fn zip_get(
         Ok(crate::VmGetOutcome::Value(v)) => Ok(v),
         Ok(crate::VmGetOutcome::InvokeGetter { getter }) => {
             let receiver = zip_value(ctx, receiver_slot);
-            ctx.call(getter, receiver, &[])
+            ctx.call(getter, receiver, ValueWindow::from(&[]))
         }
         Err(err) => Err(err),
     };
@@ -2372,14 +2376,14 @@ fn zip_iterator_flattenable(
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
                 let input = zip_value(ctx, input_slot);
-                ctx.call(getter, input, &[])?
+                ctx.call(getter, input, ValueWindow::from(&[]))?
             }
         };
         let iterator = if method.is_nullish() {
             zip_value(ctx, input_slot)
         } else if ctx.interp_mut().is_callable_runtime(&method) {
             let input = zip_value(ctx, input_slot);
-            ctx.call(method, input, &[])?
+            ctx.call(method, input, ValueWindow::from(&[]))?
         } else {
             return Err(crate::NativeError::TypeError {
                 name,
@@ -2430,7 +2434,7 @@ fn zip_strict_iterator(
         crate::VmGetOutcome::Value(v) => v,
         crate::VmGetOutcome::InvokeGetter { getter } => {
             let input = zip_value(ctx, input_slot);
-            match ctx.call(getter, input, &[]) {
+            match ctx.call(getter, input, ValueWindow::from(&[])) {
                 Ok(value) => value,
                 Err(err) => {
                     zip_anchor_pop(ctx, input_slot);
@@ -2447,7 +2451,7 @@ fn zip_strict_iterator(
         });
     }
     let input = zip_value(ctx, input_slot);
-    let iterator = match ctx.call(method, input, &[]) {
+    let iterator = match ctx.call(method, input, ValueWindow::from(&[])) {
         Ok(value) => value,
         Err(err) => {
             zip_anchor_pop(ctx, input_slot);
@@ -2485,7 +2489,7 @@ fn zip_iterator_direct(
             crate::VmGetOutcome::Value(v) => v,
             crate::VmGetOutcome::InvokeGetter { getter } => {
                 let iterator = zip_value(ctx, iterator_slot);
-                ctx.call(getter, iterator, &[])?
+                ctx.call(getter, iterator, ValueWindow::from(&[]))?
             }
         };
         let mut iterator = zip_value(ctx, iterator_slot);
@@ -2736,7 +2740,7 @@ fn zip_padding_list(
 /// <https://tc39.es/proposal-joint-iteration/>
 fn iterator_zip_native(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     const NAME: &str = "Iterator.zip";
     let iterables = args.first().copied().unwrap_or(Value::undefined());
@@ -2861,7 +2865,7 @@ fn iterator_zip_collect(
 /// <https://tc39.es/proposal-joint-iteration/>
 fn iterator_zip_keyed_native(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     const NAME: &str = "Iterator.zipKeyed";
     let iterables = args.first().copied().unwrap_or(Value::undefined());
@@ -2962,7 +2966,7 @@ fn iterator_zip_keyed_collect(
         let value = match outcome {
             Ok(crate::VmGetOutcome::Value(v)) => v,
             Ok(crate::VmGetOutcome::InvokeGetter { getter }) => {
-                match ctx.call(getter, iterables, &[]) {
+                match ctx.call(getter, iterables, ValueWindow::from(&[])) {
                     Ok(value) => value,
                     Err(err) => {
                         zip_close_collected(ctx, exec_ctx, slot)?;
@@ -3051,7 +3055,7 @@ fn zip_keyed_padding_list(
             match outcome {
                 crate::VmGetOutcome::Value(v) => v,
                 crate::VmGetOutcome::InvokeGetter { getter } => {
-                    ctx.call(getter, padding_option, &[])?
+                    ctx.call(getter, padding_option, ValueWindow::from(&[]))?
                 }
             }
         };
@@ -3078,7 +3082,7 @@ fn zip_property_key(key: &Value, heap: &otter_gc::GcHeap) -> Option<crate::VmPro
 
 fn iterator_from_native(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     let input = args.first().cloned().unwrap_or(Value::undefined());
     let receiver_ctor = *ctx.this_value();
@@ -3110,12 +3114,14 @@ fn iterator_from_native(
     })?;
     let iter_method = match outcome {
         crate::VmGetOutcome::Value(v) => v,
-        crate::VmGetOutcome::InvokeGetter { getter } => ctx.call(getter, input, &[])?,
+        crate::VmGetOutcome::InvokeGetter { getter } => {
+            ctx.call(getter, input, ValueWindow::from(&[]))?
+        }
     };
     let iter_value = if iter_method.is_nullish() {
         input
     } else if ctx.interp_mut().is_callable_runtime(&iter_method) {
-        ctx.call(iter_method, input, &[])?
+        ctx.call(iter_method, input, ValueWindow::from(&[]))?
     } else {
         return Err(crate::NativeError::TypeError {
             name: "Iterator.from",
@@ -3157,7 +3163,7 @@ fn iterator_from_native(
         crate::VmGetOutcome::Value(v) => v,
         crate::VmGetOutcome::InvokeGetter { getter } => {
             let receiver = ctx.cx.interp.iteration_anchor(iter_slot);
-            match ctx.call(getter, receiver, &[]) {
+            match ctx.call(getter, receiver, ValueWindow::from(&[])) {
                 Ok(v) => v,
                 Err(e) => return finish(ctx, iter_slot, Err(e)),
             }
@@ -3257,7 +3263,7 @@ fn generator_proto_resume(
 /// §27.5.1.2 `%GeneratorPrototype%.next(value)`.
 pub(crate) fn generator_proto_next(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     require_sync_generator(ctx, "Generator.prototype.next")?;
     let arg = args.first().cloned().unwrap_or(Value::undefined());
@@ -3271,7 +3277,7 @@ pub(crate) fn generator_proto_next(
 /// §27.5.1.4 `%GeneratorPrototype%.return(value)`.
 pub(crate) fn generator_proto_return(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     require_sync_generator(ctx, "Generator.prototype.return")?;
     let arg = args.first().cloned().unwrap_or(Value::undefined());
@@ -3285,7 +3291,7 @@ pub(crate) fn generator_proto_return(
 /// §27.5.1.5 `%GeneratorPrototype%.throw(exception)`.
 pub(crate) fn generator_proto_throw(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     require_sync_generator(ctx, "Generator.prototype.throw")?;
     let arg = args.first().cloned().unwrap_or(Value::undefined());
@@ -3339,7 +3345,7 @@ fn async_generator_validate(
 /// throw.
 fn async_generator_resumption(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
     resume: fn(Value) -> crate::GeneratorResumeKind,
 ) -> Result<Value, crate::NativeError> {
@@ -3395,7 +3401,7 @@ fn async_generator_resumption(
 /// §27.6.1.2 `%AsyncGeneratorPrototype%.next(value)`.
 pub(crate) fn async_generator_proto_next(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     async_generator_resumption(ctx, args, "AsyncGenerator.prototype.next", |value| {
         crate::GeneratorResumeKind::Next(value)
@@ -3405,7 +3411,7 @@ pub(crate) fn async_generator_proto_next(
 /// §27.6.1.3 `%AsyncGeneratorPrototype%.return(value)`.
 pub(crate) fn async_generator_proto_return(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     async_generator_resumption(ctx, args, "AsyncGenerator.prototype.return", |value| {
         crate::GeneratorResumeKind::Return(value)
@@ -3415,7 +3421,7 @@ pub(crate) fn async_generator_proto_return(
 /// §27.6.1.4 `%AsyncGeneratorPrototype%.throw(exception)`.
 pub(crate) fn async_generator_proto_throw(
     ctx: &mut crate::NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     async_generator_resumption(ctx, args, "AsyncGenerator.prototype.throw", |value| {
         crate::GeneratorResumeKind::Throw(value)
@@ -3426,7 +3432,7 @@ pub(crate) fn async_generator_proto_throw(
 /// the receiver unchanged.
 pub(crate) fn async_iterator_proto_symbol_async_iterator(
     ctx: &mut crate::NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     Ok(*ctx.this_value())
 }

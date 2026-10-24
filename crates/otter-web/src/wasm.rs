@@ -81,6 +81,7 @@ mod realm;
 mod references;
 
 use boundary::{catchable_value, from_wasmtime, intrinsic, throw_value};
+use otter_runtime::ValueWindow;
 pub(crate) use realm::restore_run_state;
 use realm::{WasmRealm, realm, realm_handle};
 use references::{
@@ -382,7 +383,7 @@ fn make_export_function<'s>(
     };
     let arity = u8::try_from(params.len()).unwrap_or(u8::MAX);
     let store = store.clone();
-    let call = move |ctx: &mut NativeCtx<'_>, args: &[Value], _captures: &[Value]| {
+    let call = move |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let mut inputs: Vec<Val> = Vec::with_capacity(params.len());
@@ -712,7 +713,7 @@ pub struct WebAssembly;
 impl WebAssembly {
     /// `WebAssembly.validate(bytes)` — true when `bytes` is a valid module.
     #[method(name = "validate", length = 1, raw)]
-    fn validate(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn validate(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
@@ -737,7 +738,7 @@ impl WebAssembly {
 
     /// `WebAssembly.compile(bytes)` — a promise of a `Module`.
     #[method(name = "compile", length = 1, raw)]
-    fn compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn compile(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
@@ -748,7 +749,7 @@ impl WebAssembly {
 
     /// `WebAssembly.instantiate(bytesOrModule, importObject?)`.
     #[method(name = "instantiate", length = 1, raw)]
-    fn instantiate(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn instantiate(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let source = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
@@ -760,7 +761,10 @@ impl WebAssembly {
 
     /// Synchronous instantiation backing `new WebAssembly.Instance(...)`.
     #[method(name = "__buildInstance", length = 2, raw)]
-    fn build_instance(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn build_instance(
+        ctx: &mut NativeCtx<'_>,
+        args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let module_handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
@@ -780,7 +784,10 @@ impl WebAssembly {
     /// Expose original pinned constructors through the static namespace
     /// bootstrap. This hook is moved into the private factory bag by the macro.
     #[method(name = "__errorClasses", length = 0, raw)]
-    fn error_classes(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    fn error_classes(
+        ctx: &mut NativeCtx<'_>,
+        _args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         ctx.scope(|mut scope| {
             let classes = scope.object()?;
             for kind in [
@@ -804,7 +811,7 @@ impl WebAssembly {
     /// The `wasm.ns.js` glue installs the result as the readonly
     /// `WebAssembly.JSTag`.
     #[method(name = "__jsTag", length = 0, raw)]
-    fn js_tag(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    fn js_tag(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let realm =
@@ -850,7 +857,7 @@ pub struct WasmModule {
 #[js_class(name = "WebAssembly.Module", feature = WEB)]
 impl WasmModule {
     #[constructor(raw)]
-    fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
@@ -888,7 +895,7 @@ pub struct WasmMemory {
 #[js_class(name = "WebAssembly.Memory", feature = WEB)]
 impl WasmMemory {
     #[constructor(raw)]
-    fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
@@ -957,7 +964,7 @@ pub struct WasmGlobal {
 #[js_class(name = "WebAssembly.Global", feature = WEB)]
 impl WasmGlobal {
     #[constructor(raw)]
-    fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let desc_handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
@@ -1007,7 +1014,11 @@ impl WasmGlobal {
     }
 
     #[getter(name = "value", raw)]
-    fn get_value(&self, ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    fn get_value(
+        &self,
+        ctx: &mut NativeCtx<'_>,
+        _args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         let store = self.store.clone();
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
@@ -1022,7 +1033,11 @@ impl WasmGlobal {
     }
 
     #[setter(name = "value", raw)]
-    fn set_value(&self, ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn set_value(
+        &self,
+        ctx: &mut NativeCtx<'_>,
+        args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         let store = self.store.clone();
         let content = self.content.clone();
         ctx.scope(|scope| {
@@ -1057,7 +1072,7 @@ pub struct WasmTable {
 #[js_class(name = "WebAssembly.Table", feature = WEB)]
 impl WasmTable {
     #[constructor(raw)]
-    fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
@@ -1109,7 +1124,7 @@ impl WasmTable {
     }
 
     #[method(name = "get", length = 1, raw)]
-    fn get(&self, ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn get(&self, ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         let store = self.store.clone();
         let table = self.table;
         ctx.scope(|scope| {
@@ -1136,7 +1151,7 @@ impl WasmTable {
     }
 
     #[method(name = "set", length = 2, raw)]
-    fn set(&self, ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn set(&self, ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         let store = self.store.clone();
         let table = self.table;
         ctx.scope(|scope| {
@@ -1252,7 +1267,7 @@ impl WasmTag {
 #[js_class(name = "WebAssembly.Tag", feature = WEB)]
 impl WasmTag {
     #[constructor(raw)]
-    fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let descriptor = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
@@ -1272,7 +1287,11 @@ impl WasmTag {
     /// `tag.type()` — the descriptor `{ parameters: [...] }` this tag was built
     /// from.
     #[method(name = "type", length = 0, raw)]
-    fn type_of(&self, ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    fn type_of(
+        &self,
+        ctx: &mut NativeCtx<'_>,
+        _args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         let (store, tag) = self
             .resolve()
             .map_err(|error| error.into_native("WebAssembly.Tag"))?;
@@ -1326,7 +1345,7 @@ pub struct WasmException {
 #[js_class(name = "WebAssembly.Exception", feature = WEB)]
 impl WasmException {
     #[constructor(raw)]
-    fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         ctx.scope(|scope| {
             let mut cx = MarshalCx::new(scope);
             let tag_handle = cx.park(args.first().copied().unwrap_or_else(Value::undefined));
@@ -1379,7 +1398,7 @@ impl WasmException {
 
     /// `exception.is(tag)` — whether this exception carries `tag` (identity).
     #[method(name = "is", length = 1, raw)]
-    fn is(&self, ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn is(&self, ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         let store = self.store.clone();
         let exn = self.exn;
         ctx.scope(|scope| {
@@ -1403,7 +1422,11 @@ impl WasmException {
     /// back to JS. Throws `TypeError` on tag mismatch and `RangeError` when
     /// `index` is out of range.
     #[method(name = "getArg", length = 2, raw)]
-    fn get_arg(&self, ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn get_arg(
+        &self,
+        ctx: &mut NativeCtx<'_>,
+        args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         let store = self.store.clone();
         let exn = self.exn;
         ctx.scope(|scope| {

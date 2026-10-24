@@ -19,6 +19,7 @@
 //! - [`crate::CapabilitySet::env_allows`]
 //! - [`crate::hooks::check_capability_with_hooks`]
 
+use otter_vm::ValueWindow;
 use otter_vm::{Attr, ErrorKind, Local, NativeCall, NativeCtx, NativeError, NativeScope, Value};
 
 use crate::{CapabilityRequest, CapabilitySet, RuntimeCapability, RuntimeHooks};
@@ -142,7 +143,7 @@ fn store_env_value(
     scope.set(target, name, converted)
 }
 
-fn env_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn env_set(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let target = args.first().copied().unwrap_or_else(Value::undefined);
     let key = args.get(1).copied().unwrap_or_else(Value::undefined);
     let value = args.get(2).copied().unwrap_or_else(Value::undefined);
@@ -185,7 +186,10 @@ fn env_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError
     })
 }
 
-fn env_define_property(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn env_define_property(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let target = args.first().copied().unwrap_or_else(Value::undefined);
     let key = args.get(1).copied().unwrap_or_else(Value::undefined);
     let descriptor = args.get(2).copied().unwrap_or_else(Value::undefined);

@@ -23,6 +23,7 @@ use otter_runtime::{
     DiagnosticCode, OtterError, RuntimeExtensionInstaller, RuntimeNativeCall, RuntimeNativeCtx,
     RuntimeNativeError, RuntimeValue,
 };
+use otter_vm::ValueWindow;
 use std::sync::{Arc, Mutex};
 
 fn bytes(wat: &str) -> String {
@@ -74,8 +75,8 @@ fn runtime(records: Arc<Mutex<Records>>) -> Runtime {
                 1,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     |_ctx: &mut RuntimeNativeCtx<'_>,
-                     args: &[RuntimeValue],
-                     _state: &[RuntimeValue]| {
+                     args: ValueWindow<'_>,
+                     _state: ValueWindow<'_>| {
                         Err(fail(args.first().and_then(|v| v.as_f64()).unwrap_or(0.0)))
                     },
                 )),
@@ -85,8 +86,8 @@ fn runtime(records: Arc<Mutex<Records>>) -> Runtime {
                 0,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     |ctx: &mut RuntimeNativeCtx<'_>,
-                     _args: &[RuntimeValue],
-                     _state: &[RuntimeValue]| {
+                     _args: ValueWindow<'_>,
+                     _state: ValueWindow<'_>| {
                         ctx.interp_mut().gc_heap_mut().set_gc_stress(0, false);
                         Ok(RuntimeValue::undefined())
                     },
@@ -98,8 +99,8 @@ fn runtime(records: Arc<Mutex<Records>>) -> Runtime {
                 1,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     move |ctx: &mut RuntimeNativeCtx<'_>,
-                          args: &[RuntimeValue],
-                          _state: &[RuntimeValue]| {
+                          args: ValueWindow<'_>,
+                          _state: ValueWindow<'_>| {
                         ctx.scope(|mut scope| {
                             let value = scope.argument(args, 0);
                             let root = scope.persistent_root_insert(value);
@@ -162,8 +163,8 @@ fn runtime(records: Arc<Mutex<Records>>) -> Runtime {
                 0,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     move |ctx: &mut RuntimeNativeCtx<'_>,
-                          _args: &[RuntimeValue],
-                          _state: &[RuntimeValue]| {
+                          _args: ValueWindow<'_>,
+                          _state: ValueWindow<'_>| {
                         // Enter a real completed native call. Building its
                         // oversized SyntaxError fails the actual VM cap; the
                         // existing Host completion imports that exact failure.
@@ -197,8 +198,8 @@ fn runtime(records: Arc<Mutex<Records>>) -> Runtime {
                 0,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     |_ctx: &mut RuntimeNativeCtx<'_>,
-                     _args: &[RuntimeValue],
-                     _state: &[RuntimeValue]| {
+                     _args: ValueWindow<'_>,
+                     _state: ValueWindow<'_>| {
                         Err(RuntimeNativeError::SyntaxError {
                             name: "wasmHugeError",
                             reason: "s".repeat(16 * 1024 * 1024),

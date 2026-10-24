@@ -16,6 +16,7 @@
 //! - `otter_runtime::Runtime::run_host_completion` returns the actual turn failure.
 
 use super::*;
+use otter_runtime::ValueWindow;
 use otter_runtime::{DiagnosticCode, DiagnosticKind};
 
 fn assert_structural(error: &OtterError) {
@@ -367,8 +368,8 @@ fn from_async_return_get_and_call_gc_do_not_leak_cleanup_diagnostics_into_fatal_
                             let calls = calls.clone();
                             let observations = observations.clone();
                             move |ctx: &mut RuntimeNativeCtx<'_>,
-                                  args: &[RuntimeValue],
-                                  _captures: &[RuntimeValue]| {
+                                  args: ValueWindow<'_>,
+                                  _captures: ValueWindow<'_>| {
                                 calls.fetch_add(1, Ordering::SeqCst);
                                 let before = ctx.interp_mut().gc_heap().gc_cycle_counts();
                                 let children = close_motion::observe_and_collect(ctx, args);

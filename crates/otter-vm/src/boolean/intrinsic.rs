@@ -12,6 +12,7 @@
 //! - <https://tc39.es/ecma262/#sec-boolean-objects>
 //! - <https://tc39.es/ecma262/#sec-boolean-constructor>
 
+use crate::ValueWindow;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject};
 use crate::{NativeCtx, NativeError, Value};
@@ -50,7 +51,7 @@ fn pin_boolean_data(
 }
 
 /// `Boolean(value)` / `new Boolean(value)` — §20.3.1.
-fn boolean_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn boolean_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let value = args.first().is_some_and(|v| v.to_boolean(ctx.heap()));
     if ctx.is_construct_call() {
         let this = *ctx.this_value();

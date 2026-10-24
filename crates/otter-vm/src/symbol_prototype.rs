@@ -17,6 +17,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-symbol-prototype-object>
 
+use crate::ValueWindow;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::string::JsString;
 use crate::{JsSymbol, NativeCall, NativeCtx, NativeError, Value};
@@ -30,7 +31,7 @@ pub static SYMBOL_PROTOTYPE_METHODS: &[MethodSpec] = &[
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,
@@ -65,7 +66,7 @@ fn this_symbol_value(ctx: &NativeCtx<'_>, name: &'static str) -> Result<JsSymbol
 }
 
 /// §20.4.3.3 `Symbol.prototype.toString`.
-fn symbol_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn symbol_to_string(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let sym = this_symbol_value(ctx, "Symbol.prototype.toString")?;
     let s =
         JsString::from_str(&sym.descriptive_string(ctx.heap()), ctx.heap_mut()).map_err(|_| {
@@ -78,7 +79,7 @@ fn symbol_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 }
 
 /// §20.4.3.4 `Symbol.prototype.valueOf`.
-fn symbol_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn symbol_value_of(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let sym = this_symbol_value(ctx, "Symbol.prototype.valueOf")?;
     Ok(Value::symbol(sym))
 }

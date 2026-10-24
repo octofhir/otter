@@ -37,6 +37,7 @@ mod completion_tests;
 mod semantic_completion_tests;
 mod throwable;
 
+use crate::ValueWindow;
 use crate::activation_stack::ActivationStack;
 use crate::native_abi::CommittedValueError;
 use crate::rooting::RootScopeExt;
@@ -224,7 +225,7 @@ impl Interpreter {
 /// same way `Error.prototype.toString` does when parts are absent.
 fn coded_error_to_string(
     ctx: &mut crate::NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this = *ctx.this_value();
     let read = |ctx: &crate::NativeCtx<'_>, key: &str| -> Option<String> {

@@ -29,6 +29,7 @@
 #[path = "support/native_code.rs"]
 mod native_code;
 
+use otter_runtime::ValueWindow;
 #[cfg(target_arch = "x86_64")]
 use yaxpeax_x86::amd64::{Opcode, Operand, RegSpec};
 
@@ -482,8 +483,8 @@ fn measure(last_length: usize) -> Vec<Sample> {
                     1,
                     RuntimeNativeCall::Dynamic(Arc::new(
                         move |ctx: &mut RuntimeNativeCtx<'_>,
-                              args: &[RuntimeValue],
-                              _state: &[RuntimeValue]| {
+                              args: ValueWindow<'_>,
+                              _state: ValueWindow<'_>| {
                             let length = args[0].as_f64().expect("numeric length") as usize;
                             assert!(length == SMALL || length == LARGE);
                             if length == LARGE {
@@ -512,8 +513,8 @@ fn measure(last_length: usize) -> Vec<Sample> {
                     1,
                     RuntimeNativeCall::Dynamic(Arc::new(
                         move |ctx: &mut RuntimeNativeCtx<'_>,
-                              args: &[RuntimeValue],
-                              _state: &[RuntimeValue]| {
+                              args: ValueWindow<'_>,
+                              _state: ValueWindow<'_>| {
                             let phase = match args[0].as_f64().expect("sample phase") as u32 {
                                 1 => "live",
                                 2 => "dead",

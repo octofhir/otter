@@ -13,6 +13,7 @@
 //! - <https://tc39.es/ecma262/#sec-arraybuffer-constructor>
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-arraybuffer-prototype-object>
 
+use crate::ValueWindow;
 use otter_bytecode::method_id::{ArrayBufferMethod, SharedArrayBufferMethod};
 
 use crate::abstract_ops::{self, ToPrimitiveHint};
@@ -133,7 +134,7 @@ otter_macros::couch! {
     },
 }
 
-fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(NativeError::TypeError {
             name: "SharedArrayBuffer",
@@ -174,7 +175,7 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
             let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
             dispatch::shared_array_buffer_call_with_roots(
                 SharedArrayBufferMethod::Construct,
-                &coerced_args,
+                ValueWindow::from(&coerced_args),
                 interp,
                 &mut external_visit,
             )
@@ -193,7 +194,7 @@ fn sab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 }
 
 /// §25.2.5.4 — `SharedArrayBuffer.prototype.grow(newByteLength)`.
-fn sab_grow(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn sab_grow(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     const NAME: &str = "SharedArrayBuffer.prototype.grow";
     let context = ctx
         .execution_context()
@@ -251,14 +252,17 @@ fn sab_grow(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
     })
 }
 
-fn sab_growable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn sab_growable(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let b = receiver_sab(ctx, "get SharedArrayBuffer.prototype.growable")?;
     Ok(Value::boolean(b.is_growable(ctx.heap())))
 }
 
 /// §25.2.4.x `get SharedArrayBuffer.prototype.maxByteLength` — shared
 /// receiver brand check (the `ArrayBuffer` accessor rejects shared).
-fn sab_max_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn sab_max_byte_length(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let b = receiver_sab(ctx, "get SharedArrayBuffer.prototype.maxByteLength")?;
     Ok(Value::number_i32(b.max_byte_length(ctx.heap()) as i32))
 }
@@ -382,7 +386,7 @@ fn array_buffer_new_target_prototype_before_allocation<'scope>(
         .map(|prototype| scope.value(prototype)))
 }
 
-fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(NativeError::TypeError {
             name: "ArrayBuffer",
@@ -415,7 +419,7 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
             let mut external_visit = |_visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {};
             dispatch::array_buffer_call_with_roots(
                 ArrayBufferMethod::Construct,
-                &coerced_args,
+                ValueWindow::from(&coerced_args),
                 interp,
                 &mut external_visit,
             )
@@ -433,7 +437,7 @@ fn ab_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
     })
 }
 
-fn ab_is_view(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ab_is_view(_ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     dispatch::array_buffer_call(ArrayBufferMethod::IsView, args, _ctx.interp_mut())
         .map_err(|e| vm_to_native(_ctx.cx.interp, e, "ArrayBuffer.isView"))
 }
@@ -444,7 +448,7 @@ fn ab_is_view(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 
 /// §25.1.5.4 `slice(start, end)` — half-open range, clamps to
 /// `[0, byteLength]`, returns a fresh fixed-length buffer.
-fn ab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ab_slice(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     const NAME: &str = "ArrayBuffer.prototype.slice";
     let context = ctx
         .execution_context()
@@ -592,7 +596,7 @@ fn relative_clamp_f(n: f64, len: i64) -> i64 {
 
 /// §25.2.5.6 SharedArrayBuffer.prototype.slice — shared-brand
 /// receiver, plain copy (species kept default).
-fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn sab_slice(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     const NAME: &str = "SharedArrayBuffer.prototype.slice";
     let context = ctx
         .execution_context()
@@ -698,14 +702,14 @@ fn sab_slice(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 }
 
 /// §25.2.4.2 — shared-brand byteLength getter.
-fn sab_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn sab_byte_length(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let b = receiver_sab(ctx, "get SharedArrayBuffer.prototype.byteLength")?;
     Ok(Value::number_i32(b.byte_length(ctx.heap()) as i32))
 }
 
 /// §25.1.5.6 `resize(newByteLength)` — only valid for resizable,
 /// non-detached buffers.
-fn ab_resize(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ab_resize(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     const NAME: &str = "ArrayBuffer.prototype.resize";
     let context = ctx
         .execution_context()
@@ -771,7 +775,7 @@ fn ab_resize(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
 
 /// §25.1.5.8 `transfer(newLength?)` — copy + detach; the new buffer is
 /// resizable iff this one was.
-fn ab_transfer(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn ab_transfer(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ab_transfer_inner(ctx, args, false, "ArrayBuffer.prototype.transfer")
 }
 
@@ -779,7 +783,7 @@ fn ab_transfer(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 /// result is fixed-length.
 fn ab_transfer_to_fixed_length(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     ab_transfer_inner(
         ctx,
@@ -791,7 +795,7 @@ fn ab_transfer_to_fixed_length(
 
 fn ab_transfer_inner(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     fixed: bool,
     name: &'static str,
 ) -> Result<Value, NativeError> {
@@ -886,7 +890,7 @@ fn ab_transfer_inner(
 // Accessors
 // ---------------------------------------------------------------
 
-fn ab_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn ab_byte_length(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.byteLength")?;
     if b.is_detached(ctx.heap()) {
         return Ok(Value::number_i32(0));
@@ -894,17 +898,20 @@ fn ab_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
     Ok(Value::number_i32(b.byte_length(ctx.heap()) as i32))
 }
 
-fn ab_max_byte_length(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn ab_max_byte_length(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.maxByteLength")?;
     Ok(Value::number_i32(b.max_byte_length(ctx.heap()) as i32))
 }
 
-fn ab_resizable(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn ab_resizable(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.resizable")?;
     Ok(Value::boolean(b.is_resizable(ctx.heap())))
 }
 
-fn ab_detached(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn ab_detached(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let b = receiver_ab(ctx, "get ArrayBuffer.prototype.detached")?;
     Ok(Value::boolean(b.is_detached(ctx.heap())))
 }

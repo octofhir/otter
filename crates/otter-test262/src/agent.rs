@@ -42,6 +42,7 @@
 //! - <https://github.com/tc39/test262/blob/main/INTERPRETING.md#host-defined-functions>
 //! - `docs/workers-262-plan.md` — slice 19c plan.
 
+use otter_runtime::ValueWindow;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::thread;
@@ -169,7 +170,7 @@ fn type_err(reason: impl Into<String>) -> NativeError {
     }
 }
 
-fn is_html_dda(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn is_html_dda(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(Value::null())
 }
 
@@ -229,7 +230,7 @@ fn map_eval_script_result(
 /// `$262.evalScript(source)` — INTERPRETING.md host API: parse
 /// `source` as an ECMAScript Script and run it in the current realm
 /// with §16.1.7 GlobalDeclarationInstantiation semantics.
-fn eval_script(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn eval_script(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let arg = args.first().cloned().unwrap_or(Value::undefined());
     let result = ctx.interp_mut().run_host_script(&arg);
     map_eval_script_result(ctx, result, "evalScript")
@@ -237,24 +238,24 @@ fn eval_script(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
 
 fn realm_eval_script(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    captures: &[Value],
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     run_realm_script_capture(ctx, args, captures, "evalScript")
 }
 
 fn realm_global_eval(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    captures: &[Value],
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     run_realm_script_capture(ctx, args, captures, "eval")
 }
 
 fn run_realm_script_capture(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    captures: &[Value],
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let Some(global) = captures.first().and_then(|value| value.as_object()) else {
@@ -267,7 +268,7 @@ fn run_realm_script_capture(
     map_eval_script_result(ctx, result, name)
 }
 
-fn create_realm(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn create_realm(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let global =
         ctx.interp_mut()
             .create_host_realm_global()
@@ -382,7 +383,7 @@ fn arg_to_string(ctx: &mut NativeCtx<'_>, value: &Value) -> Result<String, Nativ
 // $262.agent.start(source)
 // =====================================================================
 
-fn agent_start(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn agent_start(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let source = arg_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
     let (tx, rx) = mpsc::channel::<BroadcastMessage>();
 
@@ -496,7 +497,7 @@ fn run_agent_thread(
 // $262.agent.broadcast(sab, num?)
 // =====================================================================
 
-fn agent_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn agent_broadcast(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let sab_value = args.first().copied().unwrap_or(Value::undefined());
     let Some(buf) = sab_value.as_array_buffer() else {
         return Err(type_err("first argument must be a SharedArrayBuffer"));
@@ -529,7 +530,10 @@ fn agent_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 // $262.agent.receiveBroadcast(handler)
 // =====================================================================
 
-fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn agent_receive_broadcast(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let handler = args.first().copied().unwrap_or(Value::undefined());
     if !handler.is_callable() {
         return Err(type_err("receiveBroadcast handler must be a function"));
@@ -608,7 +612,7 @@ fn agent_receive_broadcast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 // $262.agent.sleep(ms) / monotonicNow()
 // =====================================================================
 
-fn agent_sleep(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn agent_sleep(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let ms = match args.first() {
         None => 0.0,
         Some(v) if v.is_undefined() => 0.0,
@@ -637,7 +641,10 @@ fn agent_sleep(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     Ok(Value::undefined())
 }
 
-fn agent_monotonic_now(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn agent_monotonic_now(
+    _ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let base = *MONOTONIC_BASE;
     let elapsed_ms = base.elapsed().as_secs_f64() * 1000.0;
     Ok(Value::number_f64(elapsed_ms))
@@ -647,14 +654,14 @@ fn agent_monotonic_now(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Valu
 // $262.agent.report(msg) / getReport()
 // =====================================================================
 
-fn agent_report(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn agent_report(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let msg = arg_to_string(ctx, args.first().unwrap_or(&Value::undefined()))?;
     let mut reg = AGENTS.lock().expect("agent registry poisoned");
     reg.reports.push_back(msg);
     Ok(Value::undefined())
 }
 
-fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let mut reg = AGENTS.lock().expect("agent registry poisoned");
     let msg = reg.reports.pop_front();
     drop(reg);
@@ -673,7 +680,7 @@ fn agent_get_report(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
 // $262.agent.leaving()
 // =====================================================================
 
-fn agent_leaving(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn agent_leaving(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(Value::undefined())
 }
 

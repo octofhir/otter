@@ -2,6 +2,7 @@
 
 #![allow(missing_docs)]
 
+use crate::ValueWindow;
 use crate::bootstrap::BootstrapFeatures;
 use crate::intrinsic_install::BuiltinIntrinsic;
 use crate::js_surface::{
@@ -172,7 +173,7 @@ const TEMPORAL_SPEC: NamespaceSpec = NamespaceSpec {
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,

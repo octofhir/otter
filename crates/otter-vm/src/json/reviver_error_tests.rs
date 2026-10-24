@@ -35,7 +35,10 @@ fn callback_error(reason: &str) -> NativeError {
     }
 }
 
-fn snapshot(ctx: &NativeCtx<'_>, args: &[Value]) -> Result<(String, Option<String>), NativeError> {
+fn snapshot(
+    ctx: &NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<(String, Option<String>), NativeError> {
     let key = args
         .first()
         .copied()

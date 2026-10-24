@@ -5,6 +5,7 @@
 
 #![allow(missing_docs)]
 
+use crate::ValueWindow;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::duration::partial_from_object;
@@ -20,7 +21,7 @@ use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "Temporal.PlainYearMonth";
 
-pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
     let year = to_integer_with_truncation(ctx, &arg_or_undef(args, 0), CLASS, "isoYear")? as i32;
     let month_f = to_integer_with_truncation(ctx, &arg_or_undef(args, 1), CLASS, "isoMonth")?;
@@ -38,12 +39,12 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     make_temporal(ctx, TemporalPayload::PlainYearMonth(pym))
 }
 
-fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn from(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pym = parse_pym_arg_with_overflow(ctx, &arg_or_undef(args, 0), Some(args))?;
     make_temporal(ctx, TemporalPayload::PlainYearMonth(pym))
 }
 
-fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn compare(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let a = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
     let b = parse_pym_arg(ctx, &arg_or_undef(args, 1))?;
     let n = match a.compare_iso(&b) {
@@ -64,7 +65,7 @@ fn parse_pym_arg(
 fn parse_pym_arg_with_overflow(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
-    overflow_opts: Option<&[Value]>,
+    overflow_opts: Option<ValueWindow<'_>>,
 ) -> Result<temporal_rs::PlainYearMonth, NativeError> {
     if let Some(t) = v.as_temporal(ctx.heap()) {
         // A date-bearing Temporal instance re-resolves through its
@@ -181,25 +182,25 @@ fn duration_arg(ctx: &mut NativeCtx<'_>, v: &Value) -> Result<temporal_rs::Durat
     }
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let display = parse_display_calendar(args, 0, ctx, CLASS)?;
     let s = pym.to_ixdtf_string(display);
     js_string_value(s, ctx)
 }
 
-fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, &[])
+fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
+    impl_to_string(ctx, ValueWindow::from(&[]))
 }
 
-fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Err(NativeError::TypeError {
         name: CLASS,
         reason: "Temporal.PlainYearMonth has no `.valueOf` — use `compare` or `equals`".to_string(),
     })
 }
 
-fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_add(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let overflow =
@@ -210,7 +211,7 @@ fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErro
     make_temporal(ctx, TemporalPayload::PlainYearMonth(result))
 }
 
-fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_subtract(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let dur = duration_arg(ctx, &arg_or_undef(args, 0))?;
     let overflow =
@@ -221,7 +222,7 @@ fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     make_temporal(ctx, TemporalPayload::PlainYearMonth(result))
 }
 
-fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_equals(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let other = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
     Ok(Value::boolean(
@@ -230,7 +231,7 @@ fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeE
     ))
 }
 
-fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_until(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let other = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
@@ -242,7 +243,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_since(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let other = parse_pym_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
@@ -254,7 +255,7 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_with(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let arg = arg_or_undef(args, 0);
     // §RejectObjectWithCalendarOrTimeZone: a plain fields object, not a
@@ -284,7 +285,10 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     make_temporal(ctx, TemporalPayload::PlainYearMonth(result))
 }
 
-fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_plain_date(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let pym = require_plain_year_month(ctx)?;
     let arg = arg_or_undef(args, 0);
     if !arg.is_object_type() || arg.as_temporal(ctx.heap()).is_some() {
@@ -316,13 +320,13 @@ fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 /// (branding `TypeError`). The heap arm exposes `&mut GcHeap`.
 macro_rules! plain_year_month_getter {
     ($fn:ident, $pym:ident => $val:expr) => {
-        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
             let $pym = require_plain_year_month(ctx)?;
             Ok($val)
         }
     };
     ($fn:ident, $pym:ident, $heap:ident => $val:expr) => {
-        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
             let $pym = require_plain_year_month(ctx)?;
             let $heap = ctx.heap_mut();
             Ok($val)
@@ -348,7 +352,7 @@ plain_year_month_getter!(get_calendar_id, pym, heap => str_or_undef(pym.calendar
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,
@@ -403,7 +407,10 @@ otter_macros::couch! {
 /// §sec-temporal.*.prototype.tolocalestring — brand-checks the receiver,
 /// then (absent the Intl formatting data path) renders the same canonical
 /// string as `toString`.
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §Temporal.*.prototype.toLocaleString renders through a freshly
     // constructed DateTimeFormat so the output matches
     // `new Intl.DateTimeFormat(locales, options).format(this)`.

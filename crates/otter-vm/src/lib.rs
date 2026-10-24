@@ -47,7 +47,7 @@ pub mod __macro_support {
     pub use crate::{
         AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JsObject, JsSurfaceError,
         MethodSpec, NamespaceBuilder, NamespaceSpec, NativeCall, NativeCtx, NativeError,
-        ObjectBuilder, Value,
+        ObjectBuilder, Value, ValueWindow,
     };
     pub use crate::{bootstrap, groom, intrinsic_install, marshal, object, pelt, rooting, string};
 }
@@ -258,6 +258,7 @@ pub mod uint8_base64;
 pub mod upvalue;
 pub mod value;
 pub mod value_slab;
+pub mod value_window;
 pub mod weak_refs;
 pub mod work_budget;
 mod wtf16_escape;
@@ -366,6 +367,7 @@ pub use temporal::{JsTemporal, TemporalKind, TemporalPayload};
 pub use timers::{
     TimerAdmission, TimerCallbacks, TimerEntry, TimerKind, TimerScheduler, TimerSchedulerHandle,
 };
+pub use value_window::ValueWindow;
 pub use weak_refs::{JsFinalizationRegistry, JsWeakRef};
 
 // Eight-byte tagged value. Canonical `Value` export.

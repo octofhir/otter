@@ -5,6 +5,7 @@
 
 #![allow(missing_docs)]
 
+use crate::ValueWindow;
 use num_traits::ToPrimitive;
 
 use crate::js_surface::{Attr, MethodSpec};
@@ -19,7 +20,7 @@ use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "Temporal.Instant";
 
-pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
     let raw = arg_or_undef(args, 0);
     let ns = if let Some(b) = raw.as_big_int() {
@@ -61,12 +62,15 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 
-fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn from(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let inst = parse_instant_arg(ctx, &arg_or_undef(args, 0))?;
     make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 
-fn from_epoch_milliseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn from_epoch_milliseconds(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §ToNumber then NumberToBigInt: a non-integral / non-finite value
     // is a RangeError (NumberToBigInt). ToNumber fires a user valueOf.
     let v = arg_or_undef(args, 0);
@@ -84,7 +88,7 @@ fn from_epoch_milliseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 
 fn impl_to_zoned_date_time_iso(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let tz = parse_time_zone(&arg_or_undef(args, 0), ctx.heap(), CLASS)?;
@@ -94,7 +98,10 @@ fn impl_to_zoned_date_time_iso(
     make_temporal(ctx, TemporalPayload::ZonedDateTime(zdt))
 }
 
-fn from_epoch_nanoseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn from_epoch_nanoseconds(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let v = arg_or_undef(args, 0);
     let Some(bv) = v.as_big_int() else {
         return Err(NativeError::TypeError {
@@ -112,7 +119,7 @@ fn from_epoch_nanoseconds(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
     make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 
-fn compare(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn compare(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let a = parse_instant_arg(ctx, &arg_or_undef(args, 0))?;
     let b = parse_instant_arg(ctx, &arg_or_undef(args, 1))?;
     let n = match a.as_i128().cmp(&b.as_i128()) {
@@ -179,7 +186,7 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
     }
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let rounding = parse_to_string_rounding_options(args, 0, ctx, CLASS)?;
     // §sec-temporal.instant.prototype.tostring step 7 — `timeZone`
@@ -206,11 +213,11 @@ fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
     js_string_value(s, ctx)
 }
 
-fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, &[])
+fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
+    impl_to_string(ctx, ValueWindow::from(&[]))
 }
 
-fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Err(NativeError::TypeError {
         name: CLASS,
         reason: "Temporal.Instant has no `.valueOf` — use `compare` or `equals`".to_string(),
@@ -242,27 +249,27 @@ fn arg_as_duration(
     }
 }
 
-fn impl_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_add(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let dur = arg_as_duration(ctx, &arg_or_undef(args, 0))?;
     let result = inst.add(&dur).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(result))
 }
 
-fn impl_subtract(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_subtract(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let dur = arg_as_duration(ctx, &arg_or_undef(args, 0))?;
     let result = inst.subtract(&dur).map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(result))
 }
 
-fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_equals(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let other = parse_instant_arg(ctx, &arg_or_undef(args, 0))?;
     Ok(Value::boolean(inst.as_i128() == other.as_i128()))
 }
 
-fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_until(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let other = parse_instant_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
@@ -274,7 +281,7 @@ fn impl_until(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_since(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let other = parse_instant_arg(ctx, &arg_or_undef(args, 0))?;
     let settings = parse_difference_settings(args, 1, ctx, CLASS)?;
@@ -286,7 +293,7 @@ fn impl_since(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     make_temporal(ctx, TemporalPayload::Duration(result))
 }
 
-fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_round(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let options = parse_rounding_options(args, 0, ctx, CLASS)?;
     let result = inst.round(options).map_err(|e| temporal_err(e, CLASS))?;
@@ -295,12 +302,18 @@ fn impl_round(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
 
 /// `Temporal.Instant.prototype` accessor getters, re-validating the
 /// receiver via [`require_instant`] (branding `TypeError`).
-fn get_epoch_milliseconds(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn get_epoch_milliseconds(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     Ok(Value::number_f64(inst.epoch_milliseconds() as f64))
 }
 
-fn get_epoch_nanoseconds(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn get_epoch_nanoseconds(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let inst = require_instant(ctx)?;
     let nanos = inst.as_i128();
     match crate::bigint::BigIntValue::from_i128(ctx.heap_mut(), nanos) {
@@ -312,7 +325,7 @@ fn get_epoch_nanoseconds(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Val
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,
@@ -361,7 +374,10 @@ otter_macros::couch! {
 /// §sec-temporal.*.prototype.tolocalestring — brand-checks the receiver,
 /// then (absent the Intl formatting data path) renders the same canonical
 /// string as `toString`.
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §Temporal.*.prototype.toLocaleString renders through a freshly
     // constructed DateTimeFormat so the output matches
     // `new Intl.DateTimeFormat(locales, options).format(this)`.

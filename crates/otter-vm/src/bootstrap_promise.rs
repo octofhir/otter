@@ -30,6 +30,7 @@
 //! - <https://tc39.es/ecma262/#sec-promise-constructor>
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-promise-prototype-object>
 
+use crate::ValueWindow;
 use otter_bytecode::method_id::PromiseMethod;
 
 use crate::js_surface::JsSurfaceError;
@@ -117,7 +118,10 @@ pub fn install_promise_well_knowns_post_bootstrap(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-get-promise-@@species>
-fn promise_species_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn promise_species_get(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     Ok(*ctx.this_value())
 }
 
@@ -134,7 +138,7 @@ fn promise_species_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value
 ///    If the executor throws, settle the promise via the captured
 ///    `reject` (idempotent — if the executor already resolved
 ///    before throwing, the reject is a spec-mandated no-op).
-fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(NativeError::TypeError {
             name: "Promise",
@@ -197,59 +201,80 @@ fn promise_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
 // Static method bodies
 // ---------------------------------------------------------------
 
-fn promise_static_resolve(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn promise_static_resolve(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::Resolve, args)
 }
 
-fn promise_static_reject(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn promise_static_reject(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::Reject, args)
 }
 
-fn promise_static_all(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn promise_static_all(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::All, args)
 }
 
-fn promise_static_race(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn promise_static_race(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::Race, args)
 }
 
 fn promise_static_all_settled(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::AllSettled, args)
 }
 
-fn promise_static_all_keyed(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn promise_static_all_keyed(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::AllKeyed, args)
 }
 
 fn promise_static_all_settled_keyed(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::AllSettledKeyed, args)
 }
 
-fn promise_static_any(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn promise_static_any(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::Any, args)
 }
 
 fn promise_static_with_resolvers(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::WithResolvers, args)
 }
 
-fn promise_static_try(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn promise_static_try(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     invoke_static(ctx, PromiseMethod::Try, args)
 }
 
 fn invoke_static(
     ctx: &mut NativeCtx<'_>,
     method: PromiseMethod,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let context = ctx.execution_context().cloned();
     ctx.scope(|mut scope| {
@@ -267,7 +292,10 @@ fn invoke_static(
 // Prototype method bodies
 // ---------------------------------------------------------------
 
-fn promise_proto_then(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn promise_proto_then(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let context = ctx.execution_context().cloned();
     ctx.scope(|mut scope| {
         let receiver = scope.this();
@@ -296,13 +324,23 @@ fn promise_proto_then(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-promise.prototype.catch>
-fn promise_proto_catch(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn promise_proto_catch(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let on_rejected = args.first().cloned().unwrap_or(Value::undefined());
-    promise_dispatch::invoke_then(ctx, this_value, &[Value::undefined(), on_rejected])
+    promise_dispatch::invoke_then(
+        ctx,
+        this_value,
+        ValueWindow::from(&[Value::undefined(), on_rejected]),
+    )
 }
 
-fn promise_proto_finally(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn promise_proto_finally(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let on_finally = args.first().cloned().unwrap_or(Value::undefined());
     promise_dispatch::method_finally_invoke(ctx, this_value, on_finally)

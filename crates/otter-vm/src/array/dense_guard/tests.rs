@@ -17,6 +17,7 @@
 //! - [`crate::property_dispatch`] for committed element lookup.
 
 use super::*;
+use crate::ValueWindow;
 use crate::object::PartialPropertyDescriptor;
 use crate::{
     ExecutionContext, Interpreter, NativeCallInfo, NativeCtx, NativeError, Value, VmError,
@@ -447,7 +448,10 @@ fn shaped_expando_keeps_dense_eligibility() {
     .expect("named sidecar fixture");
 }
 
-fn collecting_hole_getter(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn collecting_hole_getter(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         let receiver = scope.this();
         let before = scope.with_turn_parts(|interp, _| interp.gc_heap().gc_cycle_counts().0);

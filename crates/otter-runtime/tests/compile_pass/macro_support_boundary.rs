@@ -20,7 +20,7 @@ impl ExternalClass {
     }
 
     #[method(name = "ping", raw)]
-    fn ping(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    fn ping(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::undefined())
     }
 }
@@ -30,7 +30,7 @@ struct ExternalNamespace;
 #[js_namespace(name = "external", feature = WEB)]
 impl ExternalNamespace {
     #[method(name = "ping", raw)]
-    fn ping(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+    fn ping(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::undefined())
     }
 }

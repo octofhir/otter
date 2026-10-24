@@ -5,6 +5,7 @@
 
 #![allow(missing_docs)]
 
+use crate::ValueWindow;
 use crate::temporal::helpers::{
     arg_or_undef, js_string_value, make_temporal, parse_time_zone, temporal_err,
 };
@@ -13,14 +14,14 @@ use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "Temporal.Now";
 
-pub fn instant(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+pub fn instant(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let inst = crate::temporal::host::now()
         .instant()
         .map_err(|e| temporal_err(e, CLASS))?;
     make_temporal(ctx, TemporalPayload::Instant(inst))
 }
 
-pub fn time_zone_id(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+pub fn time_zone_id(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let tz = crate::temporal::host::now()
         .time_zone()
         .map_err(|e| temporal_err(e, CLASS))?;
@@ -28,7 +29,10 @@ pub fn time_zone_id(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, N
     js_string_value(id, ctx)
 }
 
-pub fn zoned_date_time_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn zoned_date_time_iso(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let tz = optional_time_zone(ctx, args)?;
     let zdt = crate::temporal::host::now()
         .zoned_date_time_iso(tz)
@@ -43,7 +47,7 @@ pub fn zoned_date_time_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 /// `RangeError` before the host clock is read.
 fn optional_time_zone(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Option<temporal_rs::TimeZone>, NativeError> {
     let arg = arg_or_undef(args, 0);
     if arg.is_undefined() {
@@ -53,7 +57,10 @@ fn optional_time_zone(
     }
 }
 
-pub fn plain_date_time_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn plain_date_time_iso(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let tz = optional_time_zone(ctx, args)?;
     let pdt = crate::temporal::host::now()
         .plain_date_time_iso(tz)
@@ -61,7 +68,10 @@ pub fn plain_date_time_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
     make_temporal(ctx, TemporalPayload::PlainDateTime(pdt))
 }
 
-pub fn plain_date_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn plain_date_iso(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let tz = optional_time_zone(ctx, args)?;
     let pd = crate::temporal::host::now()
         .plain_date_iso(tz)
@@ -69,7 +79,10 @@ pub fn plain_date_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     make_temporal(ctx, TemporalPayload::PlainDate(pd))
 }
 
-pub fn plain_time_iso(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn plain_time_iso(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let tz = optional_time_zone(ctx, args)?;
     let pt = crate::temporal::host::now()
         .plain_time_iso(tz)

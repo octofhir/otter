@@ -14,6 +14,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-object-constructor>
 
+use crate::ValueWindow;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::rooting::RootScopeExt;
@@ -111,7 +112,7 @@ fn install_proto_proto_accessor(
 /// 3. Return `! ToObject(value)`.
 ///
 /// <https://tc39.es/ecma262/#sec-object-value>
-fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn object_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // §20.1.1.1 step 1 — when `NewTarget` is neither undefined nor
     // the active `Object` function (i.e. `class C extends Object {};
     // new C(...)`), the dispatcher has already produced `this` via

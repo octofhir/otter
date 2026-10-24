@@ -5,6 +5,7 @@
 
 #![allow(missing_docs)]
 
+use crate::ValueWindow;
 use crate::js_surface::{Attr, MethodSpec};
 use crate::native_function::NativeCall;
 use crate::temporal::helpers::parse_overflow;
@@ -18,7 +19,7 @@ use crate::{NativeCtx, NativeError, Value};
 
 const CLASS: &str = "Temporal.PlainMonthDay";
 
-pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     require_construct(ctx, CLASS)?;
     let month_f = to_integer_with_truncation(ctx, &arg_or_undef(args, 0), CLASS, "isoMonth")?;
     let day_f = to_integer_with_truncation(ctx, &arg_or_undef(args, 1), CLASS, "isoDay")?;
@@ -42,7 +43,7 @@ pub fn construct(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     make_temporal(ctx, TemporalPayload::PlainMonthDay(pmd))
 }
 
-fn from(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn from(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pmd = parse_pmd_arg_with_overflow(ctx, &arg_or_undef(args, 0), Some(args))?;
     make_temporal(ctx, TemporalPayload::PlainMonthDay(pmd))
 }
@@ -57,7 +58,7 @@ fn parse_pmd_arg(
 fn parse_pmd_arg_with_overflow(
     ctx: &mut NativeCtx<'_>,
     v: &Value,
-    overflow_opts: Option<&[Value]>,
+    overflow_opts: Option<ValueWindow<'_>>,
 ) -> Result<temporal_rs::PlainMonthDay, NativeError> {
     if let Some(t) = v.as_temporal(ctx.heap()) {
         // A date-bearing Temporal instance re-resolves through its
@@ -142,31 +143,31 @@ pub fn load_property(temporal: JsTemporal, heap: &mut otter_gc::GcHeap, name: &s
     }
 }
 
-fn impl_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_string(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pmd = require_plain_month_day(ctx)?;
     let display = parse_display_calendar(args, 0, ctx, CLASS)?;
     let s = pmd.to_ixdtf_string(display);
     js_string_value(s, ctx)
 }
 
-fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
-    impl_to_string(ctx, &[])
+fn impl_to_json(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
+    impl_to_string(ctx, ValueWindow::from(&[]))
 }
 
-fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn impl_value_of(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Err(NativeError::TypeError {
         name: CLASS,
         reason: "Temporal.PlainMonthDay has no `.valueOf` — use `equals`".to_string(),
     })
 }
 
-fn impl_equals(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_equals(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pmd = require_plain_month_day(ctx)?;
     let other = parse_pmd_arg(ctx, &arg_or_undef(args, 0))?;
     Ok(Value::boolean(pmd == other))
 }
 
-fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_with(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let pmd = require_plain_month_day(ctx)?;
     let arg = arg_or_undef(args, 0);
     if !arg.is_object_type() || arg.as_temporal(ctx.heap()).is_some() {
@@ -200,7 +201,10 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeErr
     make_temporal(ctx, TemporalPayload::PlainMonthDay(result))
 }
 
-fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_plain_date(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let pmd = require_plain_month_day(ctx)?;
     let arg = arg_or_undef(args, 0);
     if !arg.is_object_type() || arg.as_temporal(ctx.heap()).is_some() {
@@ -247,13 +251,13 @@ fn impl_to_plain_date(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
 /// string-valued fields.
 macro_rules! plain_month_day_getter {
     ($fn:ident, $pmd:ident => $val:expr) => {
-        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
             let $pmd = require_plain_month_day(ctx)?;
             Ok($val)
         }
     };
     ($fn:ident, $pmd:ident, $heap:ident => $val:expr) => {
-        fn $fn(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
             let $pmd = require_plain_month_day(ctx)?;
             let $heap = ctx.heap_mut();
             Ok($val)
@@ -268,7 +272,7 @@ plain_month_day_getter!(get_calendar_id, pmd, heap => str_or_undef(pmd.calendar(
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,
@@ -311,7 +315,10 @@ otter_macros::couch! {
 /// §sec-temporal.*.prototype.tolocalestring — brand-checks the receiver,
 /// then (absent the Intl formatting data path) renders the same canonical
 /// string as `toString`.
-fn impl_to_locale_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn impl_to_locale_string(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §Temporal.*.prototype.toLocaleString renders through a freshly
     // constructed DateTimeFormat so the output matches
     // `new Intl.DateTimeFormat(locales, options).format(this)`.

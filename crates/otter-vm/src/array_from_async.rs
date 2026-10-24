@@ -25,6 +25,7 @@
 //! - [`crate::async_from_sync_iterator`] — the adapter that awaits the
 //!   values of a synchronous iterable.
 
+use crate::ValueWindow;
 use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
 
@@ -60,7 +61,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         this_value: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         let items = args.first().copied().unwrap_or_else(Value::undefined);
         let mapfn = args.get(1).copied().unwrap_or_else(Value::undefined);
@@ -853,7 +854,7 @@ enum Step {
 /// `Array.fromAsync(items, mapfn?, thisArg?)`.
 pub(crate) fn native_from_async(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let context = match ctx.execution_context().cloned() {
@@ -866,10 +867,10 @@ pub(crate) fn native_from_async(
             ));
         }
     };
-    let args: SmallVec<[Value; 4]> = SmallVec::from_slice(args);
+    let args: SmallVec<[Value; 4]> = SmallVec::from_slice(&args);
     ctx.with_turn_parts(|interp, stack| {
         interp
-            .array_from_async(stack, &context, this_value, &args)
+            .array_from_async(stack, &context, this_value, ValueWindow::from(&args))
             .map_err(|err| err.into_native(interp, "Array.fromAsync"))
     })
 }

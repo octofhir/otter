@@ -30,6 +30,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse};
 use hyper_util::rt::TokioIo;
+use otter_runtime::ValueWindow;
 use otter_runtime::{
     CapabilitySet, HostedModule, OtterError, Runtime, RuntimeAttr as Attr, RuntimeExtensionContext,
     RuntimeExtensionInstaller, RuntimeKeepAlive, RuntimeLiveness, RuntimeLocal, RuntimeNativeCall,
@@ -200,7 +201,7 @@ struct ServeHost {
     task_spawner: Option<RuntimeTaskSpawner>,
 }
 
-fn serve_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn serve_native(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let host = ctx
         .host_service::<ServeHost>()
         .ok_or_else(|| NativeError::TypeError {
@@ -212,7 +213,7 @@ fn serve_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 
 pub(crate) fn serve(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     task_spawner: Option<RuntimeTaskSpawner>,
 ) -> Result<Value, NativeError> {
@@ -569,7 +570,7 @@ fn deliver_reply(
     registry: &ReplyRegistry,
     slots: ServeSlots,
     body_budget: &ServeBodyBudget,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let Some(token) = token_arg(args) else {
         return Ok(Value::undefined());
@@ -588,7 +589,7 @@ fn deliver_reply(
 fn deliver_error(
     _ctx: &mut NativeCtx<'_>,
     registry: &ReplyRegistry,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let Some(token) = token_arg(args) else {
         return Ok(Value::undefined());
@@ -599,7 +600,7 @@ fn deliver_error(
     Ok(Value::undefined())
 }
 
-fn token_arg(args: &[Value]) -> Option<u64> {
+fn token_arg(args: ValueWindow<'_>) -> Option<u64> {
     let token = args
         .first()
         .and_then(|value| value.as_number())
@@ -893,7 +894,7 @@ fn server_control(
         .map_err(|err| crate::type_error(name, err.to_string()))
 }
 
-fn server_stop(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn server_stop(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let control = server_control(ctx, "ServeServer.stop")?;
     control.shutdown.store(true, Ordering::Release);
     control.shutdown_signal.notify_waiters();
@@ -909,13 +910,13 @@ fn server_stop(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Native
     Ok(Value::undefined())
 }
 
-fn server_ref(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn server_ref(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let control = server_control(ctx, "ServeServer.ref")?;
     control.keep_alive.ref_();
     Ok(*ctx.this_value())
 }
 
-fn server_unref(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn server_unref(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let control = server_control(ctx, "ServeServer.unref")?;
     control.keep_alive.unref();
     Ok(*ctx.this_value())
@@ -923,7 +924,7 @@ fn server_unref(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 
 fn parse_options(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
 ) -> Result<ServeOptions, NativeError> {
     let options = args

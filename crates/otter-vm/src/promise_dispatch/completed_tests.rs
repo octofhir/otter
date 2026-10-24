@@ -76,7 +76,7 @@ fn promise_try_completed_actual_allocator_oom_never_becomes_capability_rejection
                         stack,
                         Some(source.clone()),
                         constructor,
-                        &[callback],
+                        ValueWindow::from(&[callback]),
                     )
                 })
             })

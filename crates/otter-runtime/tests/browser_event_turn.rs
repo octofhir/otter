@@ -1,15 +1,16 @@
 //! Host-driven browser events are synchronous tasks with one final checkpoint.
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{NativeCtx, NativeError, Runtime, SourceInput, Value};
 
 fn dispatch_nested_listener(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let listener = ctx
         .global_value("innerListener")
         .unwrap_or_else(Value::undefined);
-    ctx.call(listener, Value::undefined(), &[])
+    ctx.call(listener, Value::undefined(), ValueWindow::EMPTY)
 }
 
 #[test]
@@ -44,7 +45,7 @@ fn nested_dispatch_stays_synchronous_and_microtasks_wait_for_task_end() {
             let listener = ctx
                 .global_value("outerListener")
                 .unwrap_or_else(Value::undefined);
-            ctx.call(listener, Value::undefined(), &[])
+            ctx.call(listener, Value::undefined(), ValueWindow::EMPTY)
         })
         .expect("event task");
 

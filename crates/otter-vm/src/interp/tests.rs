@@ -1106,7 +1106,7 @@ fn new_function_links_eval_chunk_into_shared_code_space() {
             .build_dynamic_function(
                 stack,
                 &context,
-                args.as_slice(),
+                ValueWindow::from(args.as_slice()),
                 crate::eval_ops::DynamicFunctionKind::Normal,
             )
             .expect("Function constructor")
@@ -1228,7 +1228,7 @@ fn get_iterator_user_resume_uses_old_iterator_state_allocation_with_frame_roots(
 
 #[test]
 fn array_callback_map_uses_stack_rooted_result_allocation() {
-    fn identity_mapper(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn identity_mapper(_: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(args.first().cloned().unwrap_or(Value::undefined()))
     }
 
@@ -1497,7 +1497,7 @@ fn call_method_string_char_code_at_builtin_fast_path() {
 
 #[test]
 fn call_method_string_char_code_at_callable_shadow_falls_back() {
-    fn replacement(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn replacement(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::number_i32(777))
     }
 
@@ -1703,7 +1703,7 @@ fn call_method_number_to_string_builtin_fast_path() {
 
 #[test]
 fn call_method_number_to_string_callable_shadow_falls_back() {
-    fn replacement(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn replacement(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::number_i32(777))
     }
 
@@ -2087,7 +2087,7 @@ fn call_method_weak_ref_prototype_non_callable_shadows_builtin() {
 
 #[test]
 fn call_method_finalization_registry_prototype_non_callable_shadows_builtin() {
-    fn cleanup(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn cleanup(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::undefined())
     }
 
@@ -3728,7 +3728,7 @@ fn call_method_null_proto_object_missing_object_method_is_not_callable() {
 
 #[test]
 fn call_method_native_function_object_prototype_non_callable_shadows_builtin() {
-    fn noop(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn noop(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::undefined())
     }
 
@@ -3865,7 +3865,7 @@ fn call_method_primitive_object_prototype_non_callable_shadows_builtin() {
 
 #[test]
 fn call_method_string_wrapper_replace_own_non_callable_shadows_builtin() {
-    fn replacement(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn replacement(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::undefined())
     }
 
@@ -3984,7 +3984,8 @@ fn array_symbol_iterator_factory_uses_native_rooted_iterator_allocation() {
     let before = interp.gc_heap_mut().stats().old_allocated_bytes;
     let call_info = NativeCallInfo::call(Value::undefined());
     let result = NativeCtx::with_host_context(&mut interp, call_info, Some(&context), |ctx| {
-        call.invoke(ctx, &[]).expect("invoke iterator factory")
+        call.invoke(ctx, ValueWindow::from(&[]))
+            .expect("invoke iterator factory")
     });
 
     let after = interp.gc_heap_mut().stats().old_allocated_bytes;
@@ -4693,7 +4694,7 @@ fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
 
 #[test]
 fn promise_new_uses_stack_rooted_capability_allocation() {
-    fn executor(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn executor(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::undefined())
     }
 
@@ -5656,7 +5657,7 @@ fn is_callable_recognises_call_shapes() {
         &mut interp,
         Value::function(7),
         Value::undefined(),
-        &[],
+        ValueWindow::from(&[]),
     )
     .expect("bound");
     assert!(is_callable(&Value::bound_function(bound)));
@@ -5668,7 +5669,7 @@ fn is_callable_recognises_call_shapes() {
 
 #[test]
 fn native_call_context_receives_method_receiver() {
-    fn return_this(ctx: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn return_this(ctx: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(*ctx.this_value())
     }
 
@@ -5703,7 +5704,7 @@ fn native_call_context_receives_method_receiver() {
 
 #[test]
 fn native_construct_context_walks_the_live_caller_stack() {
-    fn record_depth(ctx: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn record_depth(ctx: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         let context = ctx
             .execution_context()
             .cloned()
@@ -5763,7 +5764,7 @@ fn native_construct_context_walks_the_live_caller_stack() {
 
 #[test]
 fn direct_native_call_uses_contiguous_argument_window() {
-    fn sum_smi_args(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn sum_smi_args(_: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
         let mut sum = 0;
         for arg in args {
             match arg.as_number().and_then(|n| n.as_smi()) {
@@ -5818,11 +5819,14 @@ fn direct_native_call_uses_contiguous_argument_window() {
 
 #[test]
 fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
-    fn return_argv_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn return_argv_array(
+        _: &mut NativeCtx<'_>,
+        args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         Ok(args.get(2).cloned().unwrap_or(Value::undefined()))
     }
 
-    fn target_noop(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn target_noop(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::undefined())
     }
 
@@ -5896,7 +5900,10 @@ fn proxy_call_argv_array_uses_young_allocation_with_frame_roots() {
 
 #[test]
 fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
-    fn return_proxy_arg(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn return_proxy_arg(
+        _: &mut NativeCtx<'_>,
+        args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         Ok(args.get(2).cloned().unwrap_or(Value::undefined()))
     }
 
@@ -5989,11 +5996,14 @@ fn proxy_construct_argv_array_uses_young_allocation_with_frame_roots() {
 
 #[test]
 fn run_callable_sync_proxy_argv_array_uses_runtime_rooted_young_allocation() {
-    fn return_argv_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn return_argv_array(
+        _: &mut NativeCtx<'_>,
+        args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         Ok(args.get(2).cloned().unwrap_or(Value::undefined()))
     }
 
-    fn target_noop(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+    fn target_noop(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
         Ok(Value::undefined())
     }
 
@@ -6099,7 +6109,10 @@ fn rooted_construct_receiver_uses_shared_turn_young_allocation() {
 
 #[test]
 fn rooted_construct_proxy_argv_array_uses_shared_turn_young_allocation() {
-    fn return_argv_array(_: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+    fn return_argv_array(
+        _: &mut NativeCtx<'_>,
+        args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         Ok(args.get(1).cloned().unwrap_or(Value::undefined()))
     }
 

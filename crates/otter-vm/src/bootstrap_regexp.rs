@@ -30,6 +30,7 @@
 //! - <https://tc39.es/ecma262/#sec-regexp-constructor>
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-regexp-prototype-object>
 
+use crate::ValueWindow;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PropertyDescriptor};
 use crate::regexp::{JsRegExp, RegExpFlags};
@@ -210,8 +211,8 @@ fn install_regexp_legacy_accessors(
 /// empty string (spec-permitted "no prior match" sentinel).
 fn legacy_accessor_getter(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
-    captures: &[Value],
+    _args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let ctor = captures.first().cloned().unwrap_or(Value::undefined());
@@ -281,8 +282,8 @@ fn empty_legacy_value(ctx: &mut NativeCtx<'_>) -> Result<Value, NativeError> {
 /// the prop-desc tests that observe the setter shape.
 fn legacy_accessor_setter(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
-    captures: &[Value],
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this_value = *ctx.this_value();
     let ctor = captures.first().cloned().unwrap_or(Value::undefined());
@@ -655,7 +656,7 @@ fn encode_for_regexp_escape(c: u32, out: &mut String) {
 
 /// §22.2.5.2 `RegExp.escape(S)` — escape `S` so it matches itself
 /// literally when used as a RegExp pattern.
-fn regexp_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn regexp_escape(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let arg = args.first().copied().unwrap_or_else(Value::undefined);
     // step 1 — S must be a String (no coercion).
     let Some(s) = (if arg.is_string() {
@@ -710,7 +711,7 @@ fn regexp_escape(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
 // ---------------------------------------------------------------
 
 /// §22.2.3.1 RegExp(pattern, flags).
-fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn regexp_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         let pattern = scope.argument(args, 0);
         let flags = scope.argument(args, 1);
@@ -924,7 +925,10 @@ fn regexp_constructor_matches(
 // Prototype method bodies (delegate to existing intrinsic impls)
 // ---------------------------------------------------------------
 
-pub(crate) fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn proto_exec(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // A RegExp receiver and a string subject need no coercion: the match
     // roots both before it allocates.
     let receiver = *ctx.this_value();
@@ -1010,7 +1014,10 @@ pub(crate) fn proto_exec(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
     })
 }
 
-pub(crate) fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn proto_test(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // §22.2.6.16 — `this` need only be an Object; the match runs through
     // the abstract RegExpExec, which dispatches on the `exec` property,
     // so a non-RegExp object carrying its own `exec` is honoured.
@@ -1053,7 +1060,7 @@ pub(crate) fn proto_test(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 /// §B.2.4.1 `RegExp.prototype.compile(pattern, flags)` — native
 /// surface shared by direct calls, `Function.prototype.call`, and
 /// property reads.
-fn proto_compile(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn proto_compile(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         const NAME: &str = "RegExp.prototype.compile";
         let receiver = scope.this();
@@ -1170,7 +1177,7 @@ fn regexp_error_to_syntax_error(err: crate::regexp::RegExpError) -> NativeError 
     }
 }
 
-fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // §22.2.6.13 — generic over any object receiver: read `source` and
     // `flags` through `[[Get]]` (firing accessors / Proxy traps) and
     // `ToString` each, rather than requiring a real RegExp. A real
@@ -1251,7 +1258,7 @@ fn proto_to_string(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
 /// returns the sentinel `"(?:)"`; non-RegExp non-prototype
 /// receivers throw `TypeError`. Otherwise emits the spec's
 /// `EscapeRegExpPattern(src, flags)`.
-fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn accessor_source(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
 
     let raw_units = if let Some(re) = receiver.as_regexp() {
@@ -1288,7 +1295,7 @@ fn accessor_source(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Na
 /// receiver: reads each flag property via `[[Get]]`, applies
 /// `ToBoolean`, and concatenates the flag letter when truthy.
 /// Spec order is `d g i m s u v y`.
-fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     const NAME: &str = "get RegExp.prototype.flags";
     ctx.scope(|mut scope| {
         let receiver = scope.this();
@@ -1327,35 +1334,47 @@ fn accessor_flags(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nat
     })
 }
 
-fn accessor_global(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn accessor_global(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     flag_bool(ctx, "get RegExp.prototype.global", |f| f.global)
 }
 
-fn accessor_ignore_case(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn accessor_ignore_case(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     flag_bool(ctx, "get RegExp.prototype.ignoreCase", |f| f.ignore_case)
 }
 
-fn accessor_multiline(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn accessor_multiline(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     flag_bool(ctx, "get RegExp.prototype.multiline", |f| f.multiline)
 }
 
-fn accessor_dot_all(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn accessor_dot_all(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     flag_bool(ctx, "get RegExp.prototype.dotAll", |f| f.dot_all)
 }
 
-fn accessor_unicode(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn accessor_unicode(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     flag_bool(ctx, "get RegExp.prototype.unicode", |f| f.unicode)
 }
 
-fn accessor_sticky(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn accessor_sticky(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     flag_bool(ctx, "get RegExp.prototype.sticky", |f| f.sticky)
 }
 
-fn accessor_has_indices(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn accessor_has_indices(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     flag_bool(ctx, "get RegExp.prototype.hasIndices", |f| f.has_indices)
 }
 
-fn accessor_unicode_sets(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn accessor_unicode_sets(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     flag_bool(ctx, "get RegExp.prototype.unicodeSets", |f| f.unicode_sets)
 }
 

@@ -19,6 +19,7 @@
 
 use super::*;
 use otter_gc::page::SpaceKind;
+use otter_runtime::ValueWindow;
 use std::sync::atomic::AtomicUsize;
 
 const SOURCE: &str = r#"
@@ -67,7 +68,7 @@ struct AppendObservation {
 
 fn observe(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     after_push: bool,
 ) -> Result<AppendObservation, String> {
     let input = |index: usize| {
@@ -151,8 +152,8 @@ fn case(extra: bool) {
                 3,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     move |ctx: &mut RuntimeNativeCtx<'_>,
-                          args: &[RuntimeValue],
-                          _: &[RuntimeValue]| {
+                          args: ValueWindow<'_>,
+                          _: ValueWindow<'_>| {
                         if prime_collecting.load(Ordering::Relaxed) {
                             ctx.interp_mut().gc_heap_mut().set_gc_stress(0, true);
                             let mut observed = prime_recording
@@ -185,8 +186,8 @@ fn case(extra: bool) {
                 3,
                 RuntimeNativeCall::Dynamic(Arc::new(
                     move |ctx: &mut RuntimeNativeCtx<'_>,
-                          args: &[RuntimeValue],
-                          _: &[RuntimeValue]| {
+                          args: ValueWindow<'_>,
+                          _: ValueWindow<'_>| {
                         calls.fetch_add(1, Ordering::Relaxed);
                         if recording.load(Ordering::Relaxed) {
                             // Assert owned failures after returning across the native boundary.

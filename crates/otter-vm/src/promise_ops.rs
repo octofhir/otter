@@ -20,6 +20,7 @@
 //! # See also
 //! - [`crate::promise_dispatch`]
 
+use crate::ValueWindow;
 use crate::activation_stack::ActivationStack;
 use otter_bytecode::Operand;
 use smallvec::SmallVec;
@@ -101,7 +102,7 @@ impl Interpreter {
             Some(context.clone()),
             None,
             method,
-            args.as_slice(),
+            ValueWindow::from(args.as_slice()),
         )
         .map_err(|error| {
             crate::error_ops::native_error_to_committed_with_stack(

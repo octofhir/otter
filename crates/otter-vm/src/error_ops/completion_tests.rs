@@ -14,6 +14,7 @@
 //! - `super::native_error_to_throwable_with_stack` owns the sole projection.
 //! - `crate::native_function::NativeError::ExecutionFailure` owns imported data.
 
+use crate::ValueWindow;
 use crate::{
     ActivationStack, ErrorDetail, Interpreter, NativeCall, NativeCallInfo, NativeCtx, NativeError,
     RunError, StackFrameSnapshot, Value, VmError,
@@ -21,7 +22,7 @@ use crate::{
 
 const CAP: u64 = 4 * 1024 * 1024;
 
-fn oversized_error(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn oversized_error(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Err(NativeError::SyntaxError {
         name: "completed native source",
         reason: "m".repeat(8 * 1024 * 1024),

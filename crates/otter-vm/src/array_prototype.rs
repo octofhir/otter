@@ -42,6 +42,7 @@ mod push;
 #[cfg(test)]
 mod species_rooting_tests;
 
+use crate::ValueWindow;
 use crate::native_abi::CommittedValueError;
 use push::native_push;
 use smallvec::SmallVec;
@@ -407,7 +408,7 @@ fn try_dense_array_callback_fast_path(
     len: usize,
     output_target: Option<Value>,
     callback_fast_path: Option<ArrayCallbackFastPath>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Option<Result<Value, NativeError>> {
     let arr = receiver.as_array()?;
     let values = crate::array::plain_dense_prefix_values(arr, interp.gc_heap(), len)?;
@@ -699,7 +700,7 @@ fn install_array_unscopables(
 const fn method(
     name: &'static str,
     length: u8,
-    call: for<'rt> fn(&mut NativeCtx<'rt>, &[Value]) -> Result<Value, NativeError>,
+    call: for<'rt> fn(&mut NativeCtx<'rt>, ValueWindow<'_>) -> Result<Value, NativeError>,
 ) -> MethodSpec {
     MethodSpec {
         name,
@@ -712,7 +713,7 @@ const fn method(
 fn native_array_method(
     name: &'static str,
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let receiver = *ctx.this_value();
     // §22.1.3 step 1 — every generic `Array.prototype.*` opens with
@@ -744,7 +745,7 @@ fn native_array_method(
 }
 macro_rules! native_array {
     ($fn_name:ident, $js_name:literal) => {
-        fn $fn_name(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+        fn $fn_name(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
             native_array_method($js_name, ctx, args)
         }
     };
@@ -1253,7 +1254,7 @@ impl Interpreter {
         context: &ExecutionContext,
         tag: ArrayMethodTag,
         receiver: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
         roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         // A primitive receiver is boxed up front: every arm below copies
@@ -1272,7 +1273,14 @@ impl Interpreter {
                     let args_now: SmallVec<[Value; 8]> = (0..args.len())
                         .map(|i| self.iteration_anchor(base + 1 + i))
                         .collect();
-                    self.array_live_method_dispatch(stack, context, tag, boxed, &args_now, roots)
+                    self.array_live_method_dispatch(
+                        stack,
+                        context,
+                        tag,
+                        boxed,
+                        ValueWindow::from(&args_now),
+                        roots,
+                    )
                 }
                 Err(err) => Err(CommittedValueError::JavaScript(err)),
             };
@@ -1492,7 +1500,7 @@ impl Interpreter {
         context: &ExecutionContext,
         receiver: Value,
         value: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
         roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
@@ -2105,7 +2113,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
         roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
@@ -2325,7 +2333,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
         roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
@@ -3011,7 +3019,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
         roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
@@ -3168,7 +3176,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
         roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
@@ -3337,7 +3345,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
         roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
@@ -3659,7 +3667,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
         roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
@@ -4114,7 +4122,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         receiver: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
         roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
         let o = if receiver.is_object_type() {
@@ -4489,7 +4497,7 @@ impl ArrayCallbackKind {
 pub(crate) fn array_callback_native_dispatch(
     name: &str,
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let kind = ArrayCallbackKind::from_name(name).ok_or_else(|| NativeError::TypeError {
         name: "Array.prototype callback",
@@ -4991,40 +4999,46 @@ pub(crate) fn array_callback_native_dispatch(
     })
 }
 
-fn native_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_for_each(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     array_callback_native_dispatch("forEach", ctx, args)
 }
-fn native_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_map(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     array_callback_native_dispatch("map", ctx, args)
 }
-fn native_filter(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_filter(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     array_callback_native_dispatch("filter", ctx, args)
 }
-fn native_some(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_some(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     array_callback_native_dispatch("some", ctx, args)
 }
-fn native_every(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_every(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     array_callback_native_dispatch("every", ctx, args)
 }
-fn native_find(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_find(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     array_callback_native_dispatch("find", ctx, args)
 }
-fn native_find_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_find_index(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     array_callback_native_dispatch("findIndex", ctx, args)
 }
-fn native_find_last(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_find_last(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     array_callback_native_dispatch("findLast", ctx, args)
 }
-fn native_find_last_index(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_find_last_index(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     array_callback_native_dispatch("findLastIndex", ctx, args)
 }
-fn native_reduce(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_reduce(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     array_callback_native_dispatch("reduce", ctx, args)
 }
-fn native_reduce_right(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_reduce_right(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     array_callback_native_dispatch("reduceRight", ctx, args)
 }
-fn native_flat_map(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn native_flat_map(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     array_callback_native_dispatch("flatMap", ctx, args)
 }
 

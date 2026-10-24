@@ -21,6 +21,7 @@
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-date-prototype-object>
 //! - <https://tc39.es/ecma262/#sec-thistimevalue>
 
+use crate::ValueWindow;
 use smallvec::SmallVec;
 
 use super::{
@@ -78,7 +79,7 @@ fn broken_down_for_method(
 /// §21.4.4.10 / §21.4.4.44 — `getTime()` / `valueOf()`.
 fn get_time_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     Ok(Value::number_f64(this_time(ctx, name)?))
@@ -86,7 +87,7 @@ fn get_time_impl(
 
 fn get_full_year_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -99,7 +100,7 @@ fn get_full_year_impl(
 
 fn get_month_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -112,7 +113,7 @@ fn get_month_impl(
 
 fn get_date_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -125,7 +126,7 @@ fn get_date_impl(
 
 fn get_day_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -138,7 +139,7 @@ fn get_day_impl(
 
 fn get_hours_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -151,7 +152,7 @@ fn get_hours_impl(
 
 fn get_minutes_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -164,7 +165,7 @@ fn get_minutes_impl(
 
 fn get_seconds_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -177,7 +178,7 @@ fn get_seconds_impl(
 
 fn get_milliseconds_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -191,7 +192,7 @@ fn get_milliseconds_impl(
 /// §21.4.4.21 — `getTimezoneOffset()`.
 fn get_timezone_offset_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -204,7 +205,7 @@ fn get_timezone_offset_impl(
 /// §B.2.4 (Temporal proposal) — `Date.prototype.toTemporalInstant()`.
 fn to_temporal_instant_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -230,7 +231,7 @@ fn to_temporal_instant_impl(
 /// §21.4.4.36 — `toISOString()`. `RangeError` on Invalid Date.
 fn to_iso_string_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -246,7 +247,7 @@ fn to_iso_string_impl(
 /// DateString / TimeString / TimeZoneString shapes.
 fn to_string_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -261,7 +262,7 @@ fn to_string_impl(
 /// §21.4.4.27 — `toDateString` / `toLocaleDateString`.
 fn to_date_string_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -273,7 +274,7 @@ fn to_date_string_impl(
 /// §21.4.4.43 — `toTimeString` / `toLocaleTimeString`.
 fn to_time_string_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -290,7 +291,7 @@ fn to_time_string_impl(
 /// `[[DateValue]]`.
 fn to_locale_string_impl(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     use crate::intl::date_time_format::DateTimeOptionsMode;
@@ -311,7 +312,7 @@ fn to_locale_string_impl(
 fn coerce_set_args(
     ctx: &mut NativeCtx<'_>,
     name: &'static str,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<SmallVec<[Value; 4]>, NativeError> {
     let exec = ctx
         .execution_context()
@@ -345,7 +346,7 @@ fn coerce_set_args(
 
 /// Read `coerced[idx]` as `f64`; a missing slot falls back to the
 /// component-from-time value (§21.4.4.x "if X is present" branch).
-fn read_arg_number(args: &[Value], idx: usize, fallback: f64) -> f64 {
+fn read_arg_number(args: ValueWindow<'_>, idx: usize, fallback: f64) -> f64 {
     let Some(v) = args.get(idx) else {
         return fallback;
     };
@@ -355,7 +356,7 @@ fn read_arg_number(args: &[Value], idx: usize, fallback: f64) -> f64 {
 /// First-arg helper. Spec treats the leading parameter as always
 /// present (`ToNumber(value)` always runs), so a missing arg becomes
 /// `ToNumber(undefined) = NaN` rather than the component fallback.
-fn read_primary_arg_number(args: &[Value]) -> f64 {
+fn read_primary_arg_number(args: ValueWindow<'_>) -> f64 {
     let Some(v) = args.first() else {
         return f64::NAN;
     };
@@ -508,12 +509,12 @@ fn finish_set(
 /// §21.4.4.27 — `setTime(ms)`. Direct write.
 fn set_time_impl(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let _ = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
-    let ms = read_primary_arg_number(&coerced);
+    let ms = read_primary_arg_number(ValueWindow::from(&coerced));
     let (mut obj, _) = this_handle(ctx, name)?;
     object::set_date_data(&mut obj, ctx.heap_mut(), ms);
     let written = object::date_data(obj, ctx.heap()).unwrap_or(f64::NAN);
@@ -524,19 +525,19 @@ fn set_time_impl(
 /// through; a NaN receiver rebases to the epoch (step 3).
 fn set_full_year_impl(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let (_, time) = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
     let use_utc = name.contains("UTC");
     let mut c = set_full_year_base_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
-    c.0 = read_primary_arg_number(&coerced);
+    c.0 = read_primary_arg_number(ValueWindow::from(&coerced));
     if coerced.len() >= 2 {
-        c.1 = read_arg_number(&coerced, 1, c.1);
+        c.1 = read_arg_number(ValueWindow::from(&coerced), 1, c.1);
     }
     if coerced.len() >= 3 {
-        c.2 = read_arg_number(&coerced, 2, c.2);
+        c.2 = read_arg_number(ValueWindow::from(&coerced), 2, c.2);
     }
     finish_set(ctx, name, c, use_utc)
 }
@@ -545,7 +546,7 @@ fn set_full_year_impl(
 /// 8 returns NaN without writing when the captured time was NaN.
 fn set_month_impl(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let (_, time) = this_handle(ctx, name)?;
@@ -555,16 +556,16 @@ fn set_month_impl(
     }
     let use_utc = name.contains("UTC");
     let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
-    c.1 = read_primary_arg_number(&coerced);
+    c.1 = read_primary_arg_number(ValueWindow::from(&coerced));
     if coerced.len() >= 2 {
-        c.2 = read_arg_number(&coerced, 1, c.2);
+        c.2 = read_arg_number(ValueWindow::from(&coerced), 1, c.2);
     }
     finish_set(ctx, name, c, use_utc)
 }
 
 fn set_date_impl(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let (_, time) = this_handle(ctx, name)?;
@@ -574,13 +575,13 @@ fn set_date_impl(
     }
     let use_utc = name.contains("UTC");
     let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
-    c.2 = read_primary_arg_number(&coerced);
+    c.2 = read_primary_arg_number(ValueWindow::from(&coerced));
     finish_set(ctx, name, c, use_utc)
 }
 
 fn set_hours_impl(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let (_, time) = this_handle(ctx, name)?;
@@ -590,22 +591,22 @@ fn set_hours_impl(
     }
     let use_utc = name.contains("UTC");
     let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
-    c.3 = read_primary_arg_number(&coerced);
+    c.3 = read_primary_arg_number(ValueWindow::from(&coerced));
     if coerced.len() >= 2 {
-        c.4 = read_arg_number(&coerced, 1, c.4);
+        c.4 = read_arg_number(ValueWindow::from(&coerced), 1, c.4);
     }
     if coerced.len() >= 3 {
-        c.5 = read_arg_number(&coerced, 2, c.5);
+        c.5 = read_arg_number(ValueWindow::from(&coerced), 2, c.5);
     }
     if coerced.len() >= 4 {
-        c.6 = read_arg_number(&coerced, 3, c.6);
+        c.6 = read_arg_number(ValueWindow::from(&coerced), 3, c.6);
     }
     finish_set(ctx, name, c, use_utc)
 }
 
 fn set_minutes_impl(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let (_, time) = this_handle(ctx, name)?;
@@ -615,19 +616,19 @@ fn set_minutes_impl(
     }
     let use_utc = name.contains("UTC");
     let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
-    c.4 = read_primary_arg_number(&coerced);
+    c.4 = read_primary_arg_number(ValueWindow::from(&coerced));
     if coerced.len() >= 2 {
-        c.5 = read_arg_number(&coerced, 1, c.5);
+        c.5 = read_arg_number(ValueWindow::from(&coerced), 1, c.5);
     }
     if coerced.len() >= 3 {
-        c.6 = read_arg_number(&coerced, 2, c.6);
+        c.6 = read_arg_number(ValueWindow::from(&coerced), 2, c.6);
     }
     finish_set(ctx, name, c, use_utc)
 }
 
 fn set_seconds_impl(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let (_, time) = this_handle(ctx, name)?;
@@ -637,16 +638,16 @@ fn set_seconds_impl(
     }
     let use_utc = name.contains("UTC");
     let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
-    c.5 = read_primary_arg_number(&coerced);
+    c.5 = read_primary_arg_number(ValueWindow::from(&coerced));
     if coerced.len() >= 2 {
-        c.6 = read_arg_number(&coerced, 1, c.6);
+        c.6 = read_arg_number(ValueWindow::from(&coerced), 1, c.6);
     }
     finish_set(ctx, name, c, use_utc)
 }
 
 fn set_milliseconds_impl(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let (_, time) = this_handle(ctx, name)?;
@@ -656,14 +657,14 @@ fn set_milliseconds_impl(
     }
     let use_utc = name.contains("UTC");
     let mut c = current_components(&mut ctx.interp_mut().local_time_zone, time, use_utc);
-    c.6 = read_primary_arg_number(&coerced);
+    c.6 = read_primary_arg_number(ValueWindow::from(&coerced));
     finish_set(ctx, name, c, use_utc)
 }
 
 /// §B.2.4.1 — `Date.prototype.getYear()` returns `year - 1900`.
 fn get_year_impl(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let time = this_time(ctx, name)?;
@@ -677,12 +678,12 @@ fn get_year_impl(
 /// §B.2.4.2 — `Date.prototype.setYear(year)`.
 fn set_year_impl(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<Value, NativeError> {
     let (_, time) = this_handle(ctx, name)?;
     let coerced = coerce_set_args(ctx, name, args)?;
-    let y = read_primary_arg_number(&coerced);
+    let y = read_primary_arg_number(ValueWindow::from(&coerced));
     if y.is_nan() {
         let (mut obj, _) = this_handle(ctx, name)?;
         object::set_date_data(&mut obj, ctx.heap_mut(), f64::NAN);
@@ -704,7 +705,7 @@ fn set_year_impl(
 macro_rules! date_prototype_methods {
     ($($bridge:ident => $imp:ident, $name:literal, $length:literal;)*) => {
         $(
-            fn $bridge(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+            fn $bridge(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
                 $imp(ctx, args, $name)
             }
         )*
@@ -786,7 +787,10 @@ date_prototype_methods!(
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-date.prototype.tojson>
 /// - <https://tc39.es/ecma262/#sec-invoke>
-fn date_prototype_to_json(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn date_prototype_to_json(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     const NAME: &str = "Date.prototype.toJSON";
     let exec = ctx
         .execution_context()

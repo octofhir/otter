@@ -28,6 +28,7 @@
 //! - GC architecture plan §4.2.
 
 use crate::Interpreter;
+use crate::ValueWindow;
 use crate::runtime_state::RuntimeState;
 
 /// Sanity check: the walker compiles and runs. A fresh interpreter
@@ -668,7 +669,7 @@ fn bound_function_root_survives_force_gc() {
         &mut interp,
         crate::Value::object(target),
         crate::Value::object(bound_this),
-        &[crate::Value::boolean(true)],
+        ValueWindow::from(&[crate::Value::boolean(true)]),
     )
     .expect("bound");
     let mut global_this = *interp.global_this();

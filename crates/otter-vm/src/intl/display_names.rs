@@ -18,6 +18,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#sec-intl-displaynames-objects>
 
+use crate::ValueWindow;
 use crate::intl::helpers::DEFAULT_LOCALE;
 use crate::intl::payload::{DisplayNamesPayload, IntlPayload};
 use crate::string::JsString;
@@ -343,7 +344,7 @@ fn validate_display_name_code(kind: &str, code: &str) -> Result<(), NativeError>
 /// §12.4.3 `Intl.DisplayNames.prototype.of(code)`.
 pub(crate) fn display_names_of(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "of")?;
     let code = if let Some(s) = args.first().and_then(|v| v.as_string(ctx.heap())) {
@@ -377,7 +378,7 @@ pub(crate) fn display_names_of(
 /// §12.4.4 `Intl.DisplayNames.prototype.resolvedOptions()`.
 pub(crate) fn display_names_resolved_options(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "resolvedOptions")?;
     ctx.scope(|mut scope| {

@@ -53,6 +53,7 @@
 
 mod constructor;
 
+use crate::ValueWindow;
 use std::cell::UnsafeCell;
 
 use crate::activation_stack::ActivationStack;
@@ -234,7 +235,7 @@ pub(crate) fn invoke_frame_native_call(
     context: crate::runtime_cx::NativeContext<'_>,
     call: crate::native_function::NativeCallTarget,
     this_value: Value,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, crate::NativeError> {
     with_frame_native_ctx(interp, stack, context, this_value, |ctx| {
         call.invoke(ctx, args)
@@ -251,7 +252,7 @@ pub(crate) fn with_frame_native_ctx<R>(
     body: impl FnOnce(&mut NativeCtx<'_>) -> R,
 ) -> R {
     let call_info = NativeCallInfo::call(this_value);
-    let roots = NativeCallRoots::new(&call_info, &[], &[]);
+    let roots = NativeCallRoots::new(&call_info, &[]);
     // Pushed (not installed) so any outer scope's value/slice roots
     // stay visible to scavenges triggered inside this native.
     let _roots_guard = interp
@@ -385,7 +386,7 @@ impl Interpreter {
         this_value: &Value,
         new_target: &Value,
         used_object_prototype_fallback: bool,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, crate::NativeError> {
         let call = native.call_target(&self.gc_heap);
         let call_info = NativeCallInfo::construct_with_receiver(
@@ -400,7 +401,7 @@ impl Interpreter {
         // scavenge the constructor triggers. Without this a native `new X(…)`
         // ran fully unrooted — e.g. `new Set([...])` stranded its iterable.
         let slice_roots = [args];
-        let roots = NativeCallRoots::new(&call_info, &[], &slice_roots);
+        let roots = NativeCallRoots::new(&call_info, &slice_roots);
         let _roots_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));

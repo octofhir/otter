@@ -19,6 +19,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-bigint-constructor>
 
+use crate::ValueWindow;
 use otter_bytecode::method_id::BigIntMethod;
 
 use crate::bigint;
@@ -53,7 +54,7 @@ otter_macros::couch! {
 // Constructor + statics
 // ---------------------------------------------------------------
 
-fn bigint_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn bigint_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     if ctx.is_construct_call() {
         return Err(NativeError::TypeError {
             name: "BigInt",
@@ -61,20 +62,38 @@ fn bigint_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
         });
     }
     let coerced = coerce_bigint_call_args(ctx, args, "BigInt")?;
-    bigint::dispatch::call(ctx.interp_mut(), BigIntMethod::Construct, &coerced)
-        .map_err(|e| vm_to_native(ctx.interp_mut(), e, "BigInt"))
+    bigint::dispatch::call(
+        ctx.interp_mut(),
+        BigIntMethod::Construct,
+        ValueWindow::from(&coerced),
+    )
+    .map_err(|e| vm_to_native(ctx.interp_mut(), e, "BigInt"))
 }
 
-fn bigint_static_as_int_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn bigint_static_as_int_n(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let coerced = coerce_bigint_call_args(ctx, args, "BigInt.asIntN")?;
-    bigint::dispatch::call(ctx.interp_mut(), BigIntMethod::AsIntN, &coerced)
-        .map_err(|e| vm_to_native(ctx.interp_mut(), e, "BigInt.asIntN"))
+    bigint::dispatch::call(
+        ctx.interp_mut(),
+        BigIntMethod::AsIntN,
+        ValueWindow::from(&coerced),
+    )
+    .map_err(|e| vm_to_native(ctx.interp_mut(), e, "BigInt.asIntN"))
 }
 
-fn bigint_static_as_uint_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn bigint_static_as_uint_n(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let coerced = coerce_bigint_call_args(ctx, args, "BigInt.asUintN")?;
-    bigint::dispatch::call(ctx.interp_mut(), BigIntMethod::AsUintN, &coerced)
-        .map_err(|e| vm_to_native(ctx.interp_mut(), e, "BigInt.asUintN"))
+    bigint::dispatch::call(
+        ctx.interp_mut(),
+        BigIntMethod::AsUintN,
+        ValueWindow::from(&coerced),
+    )
+    .map_err(|e| vm_to_native(ctx.interp_mut(), e, "BigInt.asUintN"))
 }
 
 /// §7.1.13 ToBigInt step 4 — Array operands flow through
@@ -84,7 +103,7 @@ fn bigint_static_as_uint_n(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 /// Array arguments to their joined-string form before dispatch.
 fn coerce_bigint_call_args(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     name: &'static str,
 ) -> Result<smallvec::SmallVec<[Value; 4]>, NativeError> {
     ctx.scope(|mut scope| {
@@ -159,7 +178,10 @@ fn coerce_bigint_call_args(
 // Prototype methods
 // ---------------------------------------------------------------
 
-fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn bigint_proto_to_string(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     ctx.scope(|mut scope| {
         let this = scope.this();
         let this_value = scope.raw(this);
@@ -240,7 +262,7 @@ fn bigint_proto_to_string(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 /// `new Intl.NumberFormat(locales, options).format(this)`.
 fn bigint_proto_to_locale_string(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let this = ctx.this_value();
     let name = "BigInt.prototype.toLocaleString";
@@ -263,7 +285,10 @@ fn bigint_proto_to_locale_string(
     crate::intl::number_format::to_locale_string_exact(ctx, &text, locales, options)
 }
 
-fn bigint_proto_value_of(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn bigint_proto_value_of(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let this = ctx.this_value();
     if let Some(b) = this.as_big_int() {
         Ok(Value::big_int(b))

@@ -28,6 +28,7 @@
 //! # See also
 //! - <https://console.spec.whatwg.org/>
 
+use crate::ValueWindow;
 use std::sync::Arc;
 
 use crate::{NativeCtx, NativeError, Value, error_classes, object};
@@ -121,32 +122,32 @@ pub fn default_console_sink() -> ConsoleSinkHandle {
     Arc::new(StdConsoleSink)
 }
 
-fn console_log(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_log(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     write(ctx, ConsoleLevel::Log, args);
     Ok(Value::undefined())
 }
 
-fn console_info(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_info(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     write(ctx, ConsoleLevel::Info, args);
     Ok(Value::undefined())
 }
 
-fn console_debug(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_debug(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     write(ctx, ConsoleLevel::Debug, args);
     Ok(Value::undefined())
 }
 
-fn console_warn(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_warn(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     write(ctx, ConsoleLevel::Warn, args);
     Ok(Value::undefined())
 }
 
-fn console_error(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_error(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     write(ctx, ConsoleLevel::Error, args);
     Ok(Value::undefined())
 }
 
-fn console_trace(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_trace(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let mut values = Vec::with_capacity(args.len() + 1);
     values.push("Trace".to_string());
     values.extend(format_args(ctx, args));
@@ -156,26 +157,29 @@ fn console_trace(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(Value::undefined())
 }
 
-fn console_assert(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn console_assert(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     if args.first().is_some_and(|v| v.to_boolean(ctx.heap())) {
         return Ok(Value::undefined());
     }
 
     let mut values = Vec::new();
     values.push("Assertion failed".to_string());
-    values.extend(format_args(ctx, args.get(1..).unwrap_or(&[])));
+    values.extend(format_args(
+        ctx,
+        ValueWindow::from(args.get(1..).unwrap_or(&[])),
+    ));
     ctx.interp_mut()
         .console_sink()
         .write(ConsoleLevel::Assert, &values);
     Ok(Value::undefined())
 }
 
-fn write(ctx: &mut NativeCtx<'_>, level: ConsoleLevel, args: &[Value]) {
+fn write(ctx: &mut NativeCtx<'_>, level: ConsoleLevel, args: ValueWindow<'_>) {
     let values = format_args(ctx, args);
     ctx.interp_mut().console_sink().write(level, &values);
 }
 
-fn format_args(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Vec<String> {
+fn format_args(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Vec<String> {
     // A real error prints its stack, as browser consoles and Node's inspector
     // do: the message alone does not say where it was thrown. Rendered first,
     // through the interpreter, which owns the frames captured at construction.

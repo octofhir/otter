@@ -18,6 +18,7 @@
 //! # See also
 //! - `nodelib/compat/internal_fs_binding.js`
 
+use otter_vm::ValueWindow;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -63,8 +64,8 @@ pub fn fs_binding_cjs_value<'scope>(
                 $arity,
                 &[],
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      args: &[RuntimeValue],
-                      _c: &[RuntimeValue]| {
+                      args: ValueWindow<'_>,
+                      _c: ValueWindow<'_>| {
                     #[allow(clippy::redundant_closure_call)]
                     ($body)(ctx, args, &caps, &table)
                 },
@@ -80,13 +81,13 @@ pub fn fs_binding_cjs_value<'scope>(
     method!("writeString", 4, write_string);
     method!("fstat", 2, fstat_file);
     method!("stat", 2, |ctx: &mut RuntimeNativeCtx<'_>,
-                        args: &[RuntimeValue],
+                        args: ValueWindow<'_>,
                         caps: &CapabilitySet,
                         _t: &Table| {
         stat_path(ctx, args, caps, false)
     });
     method!("lstat", 2, |ctx: &mut RuntimeNativeCtx<'_>,
-                         args: &[RuntimeValue],
+                         args: ValueWindow<'_>,
                          caps: &CapabilitySet,
                          _t: &Table| {
         stat_path(ctx, args, caps, true)
@@ -101,7 +102,7 @@ pub fn fs_binding_cjs_value<'scope>(
     method!("chown", 3, chown_path);
     method!("lchown", 3, chown_path);
     method!("fchown", 3, |_ctx: &mut RuntimeNativeCtx<'_>,
-                          _args: &[RuntimeValue],
+                          _args: ValueWindow<'_>,
                           _caps: &CapabilitySet,
                           _t: &Table| {
         Ok(RuntimeValue::undefined())
@@ -127,7 +128,7 @@ pub fn fs_binding_cjs_value<'scope>(
         "cpSyncCheckPaths",
         4,
         |ctx: &mut RuntimeNativeCtx<'_>,
-         args: &[RuntimeValue],
+         args: ValueWindow<'_>,
          caps: &CapabilitySet,
          _t: &Table| { crate::fs_cp::check_paths(ctx, args, caps) }
     );
@@ -135,7 +136,7 @@ pub fn fs_binding_cjs_value<'scope>(
         "cpSyncOverrideFile",
         4,
         |ctx: &mut RuntimeNativeCtx<'_>,
-         args: &[RuntimeValue],
+         args: ValueWindow<'_>,
          caps: &CapabilitySet,
          _t: &Table| { crate::fs_cp::override_file(ctx, args, caps) }
     );
@@ -143,7 +144,7 @@ pub fn fs_binding_cjs_value<'scope>(
         "cpSyncCopyDir",
         7,
         |ctx: &mut RuntimeNativeCtx<'_>,
-         args: &[RuntimeValue],
+         args: ValueWindow<'_>,
          caps: &CapabilitySet,
          _t: &Table| { crate::fs_cp::copy_dir(ctx, args, caps) }
     );
@@ -156,7 +157,7 @@ pub fn fs_binding_cjs_value<'scope>(
 /// The capability-checked path of an argument.
 pub(crate) fn path_of(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     index: usize,
 ) -> Result<PathBuf, RuntimeNativeError> {
     let text = runtime_arg_to_string(args, index, ctx.heap());
@@ -323,7 +324,7 @@ fn open_options(flags: i32) -> std::fs::OpenOptions {
 
 fn open_file(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -352,7 +353,7 @@ fn open_file(
 
 fn close_file(
     _ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     _capabilities: &CapabilitySet,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -416,7 +417,7 @@ fn view_buffer(
 
 fn read_file(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     _capabilities: &CapabilitySet,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -448,7 +449,7 @@ fn read_file(
 
 fn write_buffer(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     _capabilities: &CapabilitySet,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -477,7 +478,7 @@ fn write_buffer(
 
 fn write_string(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     _capabilities: &CapabilitySet,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -496,7 +497,7 @@ fn write_string(
 
 fn ftruncate_file(
     _ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     _capabilities: &CapabilitySet,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -508,7 +509,7 @@ fn ftruncate_file(
 
 fn fsync_file(
     _ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     _capabilities: &CapabilitySet,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -519,7 +520,7 @@ fn fsync_file(
 
 fn fdatasync_file(
     _ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     _capabilities: &CapabilitySet,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -530,7 +531,7 @@ fn fdatasync_file(
 
 fn futimes_file(
     _ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     _capabilities: &CapabilitySet,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -548,7 +549,7 @@ fn futimes_file(
 
 fn fchmod_file(
     _ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     _capabilities: &CapabilitySet,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -563,7 +564,7 @@ fn fchmod_file(
 
 fn fstat_file(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     _capabilities: &CapabilitySet,
     table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -574,7 +575,7 @@ fn fstat_file(
 
 fn stat_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     follow_symlink: bool,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -665,7 +666,7 @@ pub(crate) fn allow_write(
 
 fn access_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -686,7 +687,7 @@ fn access_path(
 
 fn chmod_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -701,7 +702,7 @@ fn chmod_path(
 
 fn chown_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -722,7 +723,7 @@ fn chown_path(
 
 fn copy_file(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -741,7 +742,7 @@ fn copy_file(
 
 fn rename_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -755,7 +756,7 @@ fn rename_path(
 
 fn unlink_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -767,7 +768,7 @@ fn unlink_path(
 
 fn rmdir_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -779,7 +780,7 @@ fn rmdir_path(
 
 fn rm_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -810,7 +811,7 @@ fn rm_path(
 
 fn mkdir_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -863,7 +864,7 @@ fn mkdir_path(
 
 fn mkdtemp_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -893,7 +894,7 @@ fn mkdtemp_path(
 
 fn readdir_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -946,7 +947,7 @@ fn readdir_path(
 
 fn readlink_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -962,7 +963,7 @@ fn readlink_path(
 
 fn realpath_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -978,7 +979,7 @@ fn realpath_path(
 
 fn symlink_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -992,7 +993,7 @@ fn symlink_path(
 
 fn link_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -1006,7 +1007,7 @@ fn link_path(
 
 fn utimes_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -1029,7 +1030,7 @@ fn utimes_path(
 
 fn statfs_path(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -1073,7 +1074,7 @@ fn statfs_path(
 
 fn exists_sync(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -1086,7 +1087,7 @@ fn exists_sync(
 
 fn internal_module_stat(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     _capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -1103,7 +1104,7 @@ fn internal_module_stat(
 
 fn read_file_utf8(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
@@ -1118,7 +1119,7 @@ fn read_file_utf8(
 
 fn write_file_utf8(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     _table: &Table,
 ) -> Result<RuntimeValue, RuntimeNativeError> {

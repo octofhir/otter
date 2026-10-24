@@ -20,6 +20,7 @@
 //! # See also
 //! - <https://tc39.es/ecma402/#relativetimeformat-objects>
 
+use crate::ValueWindow;
 use crate::intl::helpers::{
     DEFAULT_LOCALE, coerce_options_object, get_numbering_system_option, get_string_option,
 };
@@ -285,7 +286,7 @@ fn is_valid_unit(unit: &str) -> bool {
 /// §18.4.3 `Intl.RelativeTimeFormat.prototype.format(value, unit)`.
 pub(crate) fn relative_time_format_format(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "format")?;
     // §step 3 — `value = ? ToNumber(value)` (a Symbol / BigInt throws a
@@ -338,7 +339,7 @@ pub(crate) fn relative_time_format_format(
 /// surrounding pattern text surfaces as `literal` parts.
 pub(crate) fn relative_time_format_format_to_parts(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "formatToParts")?;
     let first = args.first().copied().unwrap_or_else(Value::undefined);
@@ -473,7 +474,7 @@ fn push_number_segments(
 /// §18.4.5 `Intl.RelativeTimeFormat.prototype.resolvedOptions()`.
 pub(crate) fn relative_time_format_resolved_options(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let payload = require_payload(ctx, "resolvedOptions")?;
     ctx.scope(|mut scope| {

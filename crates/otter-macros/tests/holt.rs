@@ -5,17 +5,21 @@
 //! against the production trait + helper paths.
 
 use otter_macros::holt;
+use otter_vm::ValueWindow;
 use otter_vm::{NativeCtx, NativeError, Value, bootstrap, intrinsic_install};
 
-fn macro_holt_abs(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn macro_holt_abs(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(Value::number_i32(42))
 }
 
-fn macro_holt_id(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn macro_holt_id(_ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(args.first().copied().unwrap_or(Value::undefined()))
 }
 
-fn macro_holt_get_kind(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn macro_holt_get_kind(
+    _ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     Ok(Value::number_i32(7))
 }
 

@@ -3,11 +3,12 @@
 //! DOM and other Web-IDL bindings need this for exception objects whose
 //! identity and custom fields must survive the Rust native-call boundary.
 
+use otter_runtime::ValueWindow;
 use otter_runtime::{Runtime, RuntimeNativeCtx, RuntimeNativeError, RuntimeValue, SourceInput};
 
 fn throw_argument(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
 ) -> Result<RuntimeValue, RuntimeNativeError> {
     let value = args
         .first()

@@ -69,6 +69,7 @@
 //! - [`crate::CommonJsAddonLoader`]
 //! - [`crate::RuntimeBuilder::commonjs_addon_loader`]
 
+use otter_vm::ValueWindow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -477,8 +478,8 @@ fn make_require<'scope>(
     let cfg_for_resolve = Arc::clone(&cfg);
     let referrer_for_resolve = referrer.clone();
     let closure = move |ctx: &mut NativeCtx<'_>,
-                        args: &[Value],
-                        captures: &[Value]|
+                        args: ValueWindow<'_>,
+                        captures: ValueWindow<'_>|
           -> Result<Value, NativeError> {
         let cache = captures
             .first()
@@ -894,7 +895,10 @@ fn load_builtin<'scope>(
 /// # Errors
 /// Returns a native error when the run has no CommonJS configuration or an
 /// allocation fails.
-pub fn create_require(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub fn create_require(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let CommonJsHost(cfg) = ctx
         .host_service::<CommonJsHost>()
         .ok_or_else(|| runtime_type_error("createRequire", "CommonJS is not enabled"))?;

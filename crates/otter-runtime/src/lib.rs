@@ -192,7 +192,7 @@ pub use otter_resource::{
 pub use otter_vm::ErrorKind as RuntimeErrorKind;
 pub use otter_vm::{CodeEvictionStats, CpuProfile};
 pub use otter_vm::{ConsoleLevel, ConsoleSink, ConsoleSinkHandle, StdConsoleSink};
-pub use otter_vm::{EmbeddedCommonJs, NativeCtx, NativeError, Value, marshal};
+pub use otter_vm::{EmbeddedCommonJs, NativeCtx, NativeError, Value, ValueWindow, marshal};
 pub use otter_vm::{
     ExecutionContext as RuntimeExecutionContext, PersistentRootId as RuntimePersistentRootId,
 };
@@ -8558,7 +8558,7 @@ fn install_expose_gc_global(interp: &mut Interpreter) -> Result<(), OtterError> 
 
 fn force_gc_native(
     ctx: &mut otter_vm::NativeCtx<'_>,
-    _args: &[otter_vm::Value],
+    _args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, otter_vm::NativeError> {
     let _ = ctx.interp_mut().force_gc();
     Ok(otter_vm::Value::undefined())

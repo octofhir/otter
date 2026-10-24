@@ -43,6 +43,7 @@
 //!   read a terminal's size here.
 //! - [`otter_runtime::terminal`] — the run's record of the modes it changed.
 
+use otter_runtime::ValueWindow;
 use std::mem::MaybeUninit;
 use std::ops::RangeInclusive;
 use std::os::fd::RawFd;
@@ -87,21 +88,24 @@ pub fn tty_binding_cjs_value<'scope>(
 
 /// `isatty(fd)` — whether `fd` is a descriptor the run may use, open on a
 /// terminal.
-fn tty_isatty(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn tty_isatty(_ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(Value::boolean(usable_fd(args, 0).is_some_and(is_terminal)))
 }
 
 /// `mayUse(fd)` — whether the run may use `fd` at all. A handle refuses any
 /// other descriptor the way the platform layer refuses one the process does
 /// not have.
-fn tty_may_use(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn tty_may_use(_ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     Ok(Value::boolean(usable_fd(args, 0).is_some()))
 }
 
 /// `getWindowSize(fd, size)` — store the terminal's columns and rows in
 /// `size[0]` and `size[1]`; answers 0, or a negative errno with `size`
 /// untouched.
-fn tty_get_window_size(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn tty_get_window_size(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let Some(fd) = usable_fd(args, 0) else {
         return Ok(errno_value(libc::EBADF));
     };
@@ -128,7 +132,7 @@ fn tty_get_window_size(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 
 /// `getMode(fd)` — the terminal's current mode as an `ArrayBuffer` to hand
 /// back to `setMode`, or a negative errno.
-fn tty_get_mode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn tty_get_mode(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let Some(fd) = usable_fd(args, 0) else {
         return Ok(errno_value(libc::EBADF));
     };
@@ -150,7 +154,7 @@ fn tty_get_mode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 /// # Errors
 /// A type error when the run keeps no record of terminal modes: a run without
 /// `process` has no end to hand a mode back at.
-fn tty_set_mode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn tty_set_mode(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let Some(fd) = usable_fd(args, 0) else {
         return Ok(errno_value(libc::EBADF));
     };
@@ -182,7 +186,7 @@ fn tty_set_mode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Native
 
 /// `setBlocking(fd, blocking)` — clear or set `O_NONBLOCK` on the open file
 /// description behind `fd`; answers 0 or a negative errno.
-fn tty_set_blocking(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn tty_set_blocking(_ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let Some(fd) = usable_fd(args, 0) else {
         return Ok(errno_value(libc::EBADF));
     };
@@ -198,7 +202,7 @@ fn tty_set_blocking(_ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
 
 /// `writeSync(fd, bytes)` — write every byte of a buffer source before
 /// returning; answers the count written or a negative errno.
-fn tty_write_sync(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn tty_write_sync(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let Some(fd) = usable_fd(args, 0) else {
         return Ok(errno_value(libc::EBADF));
     };
@@ -214,20 +218,20 @@ fn tty_write_sync(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nati
 /// The descriptor a JavaScript number names, when the run may use it: one
 /// of its standard streams. Anything else is a descriptor the program never
 /// opened (see the module's invariants), so it answers as none.
-fn usable_fd(args: &[Value], index: usize) -> Option<RawFd> {
+fn usable_fd(args: ValueWindow<'_>, index: usize) -> Option<RawFd> {
     fd_arg(args, index).filter(|fd| STANDARD_STREAMS.contains(fd))
 }
 
 /// The descriptor a JavaScript number names: an integer the platform can
 /// hold, or nothing.
-fn fd_arg(args: &[Value], index: usize) -> Option<RawFd> {
+fn fd_arg(args: ValueWindow<'_>, index: usize) -> Option<RawFd> {
     let number = args.get(index)?.as_f64()?;
     (number.fract() == 0.0 && (0.0..=f64::from(RawFd::MAX)).contains(&number))
         .then_some(number as RawFd)
 }
 
 /// The bytes of a buffer-source argument, copied out of the heap.
-fn bytes_arg(ctx: &mut NativeCtx<'_>, args: &[Value], index: usize) -> Option<Vec<u8>> {
+fn bytes_arg(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, index: usize) -> Option<Vec<u8>> {
     let value = args.get(index).copied()?;
     ctx.scope(|mut scope| {
         let value = scope.value(value);
@@ -578,7 +582,10 @@ mod tests {
     #[test]
     fn only_the_standard_streams_are_usable() {
         for fd in STANDARD_STREAMS {
-            assert_eq!(usable_fd(&[Value::number_i32(fd)], 0), Some(fd));
+            assert_eq!(
+                usable_fd(ValueWindow::from(&[Value::number_i32(fd)]), 0),
+                Some(fd)
+            );
         }
         // An open descriptor the program never opened answers as none, the
         // same as one that is not open or a number that names no descriptor.
@@ -590,9 +597,9 @@ mod tests {
             Value::number(NumberValue::from_f64(1.5)),
             Value::undefined(),
         ] {
-            assert_eq!(usable_fd(&[value], 0), None);
+            assert_eq!(usable_fd(ValueWindow::from(&[value]), 0), None);
         }
-        assert_eq!(usable_fd(&[], 0), None);
+        assert_eq!(usable_fd(ValueWindow::EMPTY, 0), None);
     }
 
     #[test]

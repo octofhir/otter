@@ -4,6 +4,7 @@
 //! for the hosted-module loader. File-backed stores persist a JSON object and
 //! enforce runtime read/write capabilities before opening or mutating paths.
 
+use otter_runtime::ValueWindow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -181,7 +182,7 @@ otter_macros::lodge! {
 
 fn open_kv(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
 ) -> Result<Value, NativeError> {
     let path = crate::arg_string(ctx, args, 0, "openKv")?;
@@ -225,7 +226,7 @@ fn host_error(name: &'static str, err: RuntimeHostObjectError) -> NativeError {
     crate::type_error(name, err.to_string())
 }
 
-fn method_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn method_set(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let object = store_receiver(ctx, "KvStore.set")?;
     let key = crate::arg_string(ctx, args, 0, "KvStore.set")?;
     let value = args
@@ -240,7 +241,7 @@ fn method_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     Ok(Value::undefined())
 }
 
-fn method_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn method_get(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let object = store_receiver(ctx, "KvStore.get")?;
     let key = crate::arg_string(ctx, args, 0, "KvStore.get")?;
     let value = runtime_with_host_data::<KvStore, _>(ctx, object, |store| {
@@ -250,7 +251,7 @@ fn method_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     crate::json_to_value(ctx, value)
 }
 
-fn method_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn method_has(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let object = store_receiver(ctx, "KvStore.has")?;
     let key = crate::arg_string(ctx, args, 0, "KvStore.has")?;
     let has = runtime_with_host_data::<KvStore, _>(ctx, object, |store| store.has(&key))
@@ -258,7 +259,7 @@ fn method_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeEr
     Ok(Value::boolean(has))
 }
 
-fn method_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn method_delete(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let object = store_receiver(ctx, "KvStore.delete")?;
     let key = crate::arg_string(ctx, args, 0, "KvStore.delete")?;
     let result = runtime_with_host_data_mut::<KvStore, _>(ctx, object, |store| store.delete(&key))
@@ -267,7 +268,7 @@ fn method_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(Value::boolean(deleted))
 }
 
-fn method_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn method_keys(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let object = store_receiver(ctx, "KvStore.keys")?;
     let keys = runtime_with_host_data::<KvStore, _>(ctx, object, KvStore::keys)
         .map_err(|err| host_error("KvStore.keys", err))?;
@@ -285,7 +286,7 @@ fn method_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Native
     })
 }
 
-fn method_clear(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn method_clear(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let object = store_receiver(ctx, "KvStore.clear")?;
     let result = runtime_with_host_data_mut::<KvStore, _>(ctx, object, KvStore::clear)
         .map_err(|err| host_error("KvStore.clear", err))?;

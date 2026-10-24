@@ -16,6 +16,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-proxy-objects>
 
+use crate::ValueWindow;
 use crate::{NativeCtx, NativeError, Value};
 
 fn proxy_target_is_object(value: &Value) -> bool {
@@ -26,7 +27,7 @@ fn proxy_target_is_object(value: &Value) -> bool {
     value.is_object_type()
 }
 
-fn proxy_target_arg(args: &[Value]) -> Result<Value, NativeError> {
+fn proxy_target_arg(args: ValueWindow<'_>) -> Result<Value, NativeError> {
     match args.first() {
         Some(value) if proxy_target_is_object(value) => Ok(*value),
         _ => Err(NativeError::TypeError {
@@ -36,7 +37,7 @@ fn proxy_target_arg(args: &[Value]) -> Result<Value, NativeError> {
     }
 }
 
-fn proxy_handler_arg(args: &[Value]) -> Result<Value, NativeError> {
+fn proxy_handler_arg(args: ValueWindow<'_>) -> Result<Value, NativeError> {
     match args.get(1) {
         Some(value) if proxy_target_is_object(value) => Ok(*value),
         _ => Err(NativeError::TypeError {
@@ -46,7 +47,7 @@ fn proxy_handler_arg(args: &[Value]) -> Result<Value, NativeError> {
     }
 }
 
-fn proxy_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn proxy_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     if !ctx.is_construct_call() {
         return Err(NativeError::TypeError {
             name: "Proxy",
@@ -63,7 +64,10 @@ fn proxy_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     })
 }
 
-fn proxy_revocable_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn proxy_revocable_call(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let target = proxy_target_arg(args)?;
     let handler = proxy_handler_arg(args)?;
     ctx.scope(|mut scope| {

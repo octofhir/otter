@@ -28,6 +28,7 @@
 //! - [`crate::call_ops`]
 //! - [`crate::executable`]
 
+use crate::ValueWindow;
 use crate::activation_stack::ActivationStack;
 use crate::runtime_activation::CommittedValueError;
 use smallvec::SmallVec;
@@ -54,7 +55,7 @@ use crate::{
 struct ArrayFastDispatchRoots<'a> {
     interp_roots: otter_gc::ExtraRoots,
     recv: Value,
-    args: &'a [Value],
+    args: ValueWindow<'a>,
 }
 
 impl otter_gc::ExtraRootSource for ArrayFastDispatchRoots<'_> {
@@ -79,9 +80,7 @@ impl otter_gc::ExtraRootSource for ArrayFastDispatchRoots<'_> {
     ) {
         self.interp_roots.visit(roots, visitor);
         self.recv.trace_value_slots(visitor);
-        for value in self.args {
-            value.trace_value_slots(visitor);
-        }
+        self.args.trace_slots(visitor);
     }
 }
 
@@ -93,7 +92,7 @@ impl otter_gc::ExtraRootSource for ArrayFastDispatchRoots<'_> {
 struct CollectionFastDispatchRoots<'a> {
     interp_roots: otter_gc::ExtraRoots,
     recv: Value,
-    args: &'a [Value],
+    args: ValueWindow<'a>,
 }
 
 impl otter_gc::ExtraRootSource for CollectionFastDispatchRoots<'_> {
@@ -118,9 +117,7 @@ impl otter_gc::ExtraRootSource for CollectionFastDispatchRoots<'_> {
     ) {
         self.interp_roots.visit(roots, visitor);
         self.recv.trace_value_slots(visitor);
-        for value in self.args {
-            value.trace_value_slots(visitor);
-        }
+        self.args.trace_slots(visitor);
     }
 }
 
@@ -625,7 +622,7 @@ impl Interpreter {
             context,
             method_site,
             recv_value,
-            arg_values.as_slice(),
+            ValueWindow::from(arg_values.as_slice()),
         ) {
             let value = result?;
             stack[top_idx]
@@ -634,9 +631,11 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, value).map_err(CommittedValueError::Fatal)?;
             return Ok(());
         }
-        if let Some(result) =
-            self.try_collection_method_call_ic(method_site, recv_value, arg_values.as_slice())
-        {
+        if let Some(result) = self.try_collection_method_call_ic(
+            method_site,
+            recv_value,
+            ValueWindow::from(arg_values.as_slice()),
+        ) {
             let value = result.map_err(CommittedValueError::JavaScript)?;
             stack[top_idx]
                 .advance_pc()
@@ -658,7 +657,7 @@ impl Interpreter {
             method_site,
             recv_value,
             name,
-            arg_values.as_slice(),
+            ValueWindow::from(arg_values.as_slice()),
         ) {
             let value = result?;
             stack[top_idx]
@@ -674,7 +673,7 @@ impl Interpreter {
             method_site,
             recv_value,
             name,
-            arg_values.as_slice(),
+            ValueWindow::from(arg_values.as_slice()),
         ) {
             let value = result.map_err(CommittedValueError::JavaScript)?;
             stack[top_idx]
@@ -848,7 +847,10 @@ impl Interpreter {
         if name == "charCodeAt"
             && recv_value.is_string()
             && let Some(result) = self
-                .try_fast_primitive_string_char_code_at(recv_value, arg_values.as_slice())
+                .try_fast_primitive_string_char_code_at(
+                    recv_value,
+                    ValueWindow::from(arg_values.as_slice()),
+                )
                 .map_err(CommittedValueError::JavaScript)?
         {
             stack[top_idx]
@@ -861,7 +863,10 @@ impl Interpreter {
         if name == "toString"
             && recv_value.is_number()
             && let Some(result) = self
-                .try_fast_primitive_number_to_string(recv_value, arg_values.as_slice())
+                .try_fast_primitive_number_to_string(
+                    recv_value,
+                    ValueWindow::from(arg_values.as_slice()),
+                )
                 .map_err(CommittedValueError::JavaScript)?
         {
             stack[top_idx]
@@ -1454,7 +1459,7 @@ impl Interpreter {
         site: usize,
         recv: Value,
         name: &str,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Option<Result<Value, CommittedValueError>> {
         let arr = recv.as_array()?;
         if !crate::array::is_ordinary_dense(arr, &self.gc_heap) {
@@ -1504,7 +1509,7 @@ impl Interpreter {
         context: &ExecutionContext,
         site: usize,
         recv: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Option<Result<Value, CommittedValueError>> {
         let ic = match self.method_feedback.method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
@@ -1545,7 +1550,7 @@ impl Interpreter {
         &mut self,
         site: usize,
         recv: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Option<Result<Value, VmError>> {
         let target = self.collection_method_call_ic_target(site, recv)?;
         Some(self.dispatch_collection_builtin(target, recv, args))
@@ -1625,7 +1630,7 @@ impl Interpreter {
         site: usize,
         recv: Value,
         name: &str,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Option<Result<Value, VmError>> {
         use crate::object::PropertyLookup;
         let (hit, op) = if let Some(map) = recv.as_map() {
@@ -1694,7 +1699,7 @@ impl Interpreter {
         &mut self,
         target: CollectionFastTarget,
         recv: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, VmError> {
         if let Some(stub_id) = target.leaf_stub_id {
             let result = self.dispatch_collection_builtin_leaf_no_alloc(stub_id, recv, args);
@@ -1734,7 +1739,7 @@ impl Interpreter {
         &self,
         stub_id: RuntimeStubId,
         recv: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> crate::native_abi::NativeResultPair {
         let key = args.first().copied().unwrap_or_else(Value::undefined);
         crate::runtime_stubs::invoke_leaf_no_alloc_stub2(&self.gc_heap, stub_id, recv, key)
@@ -1749,7 +1754,7 @@ impl Interpreter {
         &mut self,
         op: CollectionFastOp,
         recv: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, VmError> {
         let roots = CollectionFastDispatchRoots {
             interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(self),
@@ -1854,7 +1859,7 @@ impl Interpreter {
             context,
             crate::array_prototype::ArrayMethodTag::Push,
             recv,
-            &[value],
+            ValueWindow::from(&[value]),
         )?;
         write_register(&mut stack[frame_index], dst, result).map_err(CommittedValueError::Fatal)?;
         Ok(())
@@ -1866,7 +1871,7 @@ impl Interpreter {
         context: &ExecutionContext,
         tag: crate::array_prototype::ArrayMethodTag,
         recv: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         let roots = ArrayFastDispatchRoots {
             interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(self),
@@ -1882,7 +1887,7 @@ impl Interpreter {
     fn try_fast_primitive_string_char_code_at(
         &mut self,
         recv_value: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Option<Value>, VmError> {
         let Some(proto) = self.constructor_prototype_value("String")?.as_object() else {
             return Ok(None);
@@ -1907,7 +1912,7 @@ impl Interpreter {
     fn try_fast_primitive_number_to_string(
         &mut self,
         recv_value: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Option<Value>, VmError> {
         let Some(proto) = self.constructor_prototype_value("Number")?.as_object() else {
             return Ok(None);
@@ -2447,7 +2452,7 @@ impl Interpreter {
         context: &ExecutionContext,
         callee: Value,
         this_arg: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         let owned: SmallVec<[Value; 8]> = args.iter().copied().collect();
         self.run_callable_sync_rooted(stack, Some(context), &callee, this_arg, owned)
@@ -2460,7 +2465,7 @@ impl Interpreter {
         context: &ExecutionContext,
         t: &crate::binary::typed_array::JsTypedArray,
         name: &str,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         let ta_value = Value::typed_array(*t);
         // §23.2.4.4 ValidateTypedArray — a detached or out-of-bounds
@@ -2514,11 +2519,11 @@ impl Interpreter {
                             context,
                             interp.iteration_anchor(anchor_base + CALLEE),
                             interp.iteration_anchor(anchor_base + THIS_ARG),
-                            &[
+                            ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
                                 ta_value,
-                            ],
+                            ]),
                         )?;
                     }
                     Ok(Value::undefined())
@@ -2552,11 +2557,11 @@ impl Interpreter {
                             context,
                             interp.iteration_anchor(anchor_base + CALLEE),
                             interp.iteration_anchor(anchor_base + THIS_ARG),
-                            &[
+                            ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
                                 ta_value,
-                            ],
+                            ]),
                         )?;
                         interp.set_iteration_anchor(anchor_base + CARRIED, mapped);
                         let mapped = interp.iteration_anchor(anchor_base + CARRIED);
@@ -2600,11 +2605,11 @@ impl Interpreter {
                             context,
                             interp.iteration_anchor(anchor_base + CALLEE),
                             interp.iteration_anchor(anchor_base + THIS_ARG),
-                            &[
+                            ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
                                 ta_value,
-                            ],
+                            ]),
                         )?;
                         if selected.to_boolean(&interp.gc_heap) {
                             interp.push_iteration_anchor(
@@ -2657,11 +2662,11 @@ impl Interpreter {
                             context,
                             interp.iteration_anchor(anchor_base + CALLEE),
                             interp.iteration_anchor(anchor_base + THIS_ARG),
-                            &[
+                            ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
                                 ta_value,
-                            ],
+                            ]),
                         )?;
                         if hit.to_boolean(&interp.gc_heap) {
                             found = interp.iteration_anchor(anchor_base + ELEMENT);
@@ -2687,11 +2692,11 @@ impl Interpreter {
                             context,
                             interp.iteration_anchor(anchor_base + CALLEE),
                             interp.iteration_anchor(anchor_base + THIS_ARG),
-                            &[
+                            ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
                                 ta_value,
-                            ],
+                            ]),
                         )?;
                         if hit.to_boolean(&interp.gc_heap) {
                             idx = i as i32;
@@ -2717,11 +2722,11 @@ impl Interpreter {
                             context,
                             interp.iteration_anchor(anchor_base + CALLEE),
                             interp.iteration_anchor(anchor_base + THIS_ARG),
-                            &[
+                            ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
                                 ta_value,
-                            ],
+                            ]),
                         )?;
                         if hit.to_boolean(&interp.gc_heap) {
                             found = interp.iteration_anchor(anchor_base + ELEMENT);
@@ -2747,11 +2752,11 @@ impl Interpreter {
                             context,
                             interp.iteration_anchor(anchor_base + CALLEE),
                             interp.iteration_anchor(anchor_base + THIS_ARG),
-                            &[
+                            ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
                                 ta_value,
-                            ],
+                            ]),
                         )?;
                         if hit.to_boolean(&interp.gc_heap) {
                             idx = i as i32;
@@ -2777,11 +2782,11 @@ impl Interpreter {
                             context,
                             interp.iteration_anchor(anchor_base + CALLEE),
                             interp.iteration_anchor(anchor_base + THIS_ARG),
-                            &[
+                            ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
                                 ta_value,
-                            ],
+                            ]),
                         )?;
                         if !hit.to_boolean(&interp.gc_heap) {
                             all = false;
@@ -2807,11 +2812,11 @@ impl Interpreter {
                             context,
                             interp.iteration_anchor(anchor_base + CALLEE),
                             interp.iteration_anchor(anchor_base + THIS_ARG),
-                            &[
+                            ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
                                 ta_value,
-                            ],
+                            ]),
                         )?;
                         if hit.to_boolean(&interp.gc_heap) {
                             any = true;
@@ -2858,12 +2863,12 @@ impl Interpreter {
                             context,
                             interp.iteration_anchor(anchor_base + CALLEE),
                             Value::undefined(),
-                            &[
+                            ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + CARRIED),
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
                                 ta_value,
-                            ],
+                            ]),
                         )?;
                         interp.set_iteration_anchor(anchor_base + CARRIED, next_acc);
                         i += step;
@@ -3000,7 +3005,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         t: &crate::binary::typed_array::JsTypedArray,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let source_handle = interp.scoped_value(scope, Value::typed_array(*t));
@@ -3079,7 +3084,7 @@ impl Interpreter {
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         t: &crate::binary::typed_array::JsTypedArray,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
         self.with_handle_scope(|interp, scope| {
             let source_handle = interp.scoped_value(scope, Value::typed_array(*t));
@@ -3411,7 +3416,7 @@ fn string_method_coercion_order(name: &str) -> &'static [(usize, bool)] {
 /// Whether any argument of `name` needs a coercion that can run user code or
 /// convert a non-number primitive; a call without one reaches its body with
 /// the arguments as they are.
-pub(crate) fn string_method_args_need_coercion(name: &str, args: &[Value]) -> bool {
+pub(crate) fn string_method_args_need_coercion(name: &str, args: ValueWindow<'_>) -> bool {
     string_method_coercion_order(name)
         .iter()
         .any(|&(index, is_int)| {

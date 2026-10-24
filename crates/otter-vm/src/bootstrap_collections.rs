@@ -38,6 +38,7 @@
 
 mod iterator_close;
 
+use crate::ValueWindow;
 use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
 
@@ -295,7 +296,10 @@ fn ctor_prototype(
 /// §24.1.2.1 `Map.groupBy(items, callbackfn)` — drain `items`
 /// into groups keyed by callback return value, store result in
 /// a new Map.
-fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn map_group_by_native(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let items = args.first().cloned().unwrap_or(Value::undefined());
     let callback = args.get(1).cloned().unwrap_or(Value::undefined());
     if items.is_undefined() || items.is_null() {
@@ -388,25 +392,31 @@ fn map_group_by_native(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value,
 // Constructor bodies
 // ---------------------------------------------------------------
 
-fn map_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn map_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     construct_collection(ctx, args, CollectionKind::Map)
 }
 
-fn set_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     construct_collection(ctx, args, CollectionKind::Set)
 }
 
-fn weak_map_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn weak_map_ctor_call(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     construct_collection(ctx, args, CollectionKind::WeakMap)
 }
 
-fn weak_set_ctor_call(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn weak_set_ctor_call(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     construct_collection(ctx, args, CollectionKind::WeakSet)
 }
 
 fn construct_collection(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     kind: CollectionKind,
 ) -> Result<Value, NativeError> {
     let name = kind.name();
@@ -833,7 +843,7 @@ pub(crate) fn set_prototype_native(name: &str) -> Option<crate::native_function:
 /// while flattening is swallowed because the collection op itself will
 /// surface the real allocation failure.
 #[inline]
-fn flatten_key_argument(ctx: &mut NativeCtx<'_>, args: &[Value]) {
+fn flatten_key_argument(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) {
     if let Some(key) = args.first() {
         flatten_string_key(ctx, key);
     }
@@ -843,7 +853,7 @@ fn flatten_key_argument(ctx: &mut NativeCtx<'_>, args: &[Value]) {
 /// rooted argument slots in place through raw pointers, so the read must not
 /// be served from a load the compiler made before the allocation.
 #[inline]
-fn argument_after_allocation(args: &[Value], index: usize) -> Value {
+fn argument_after_allocation(args: ValueWindow<'_>, index: usize) -> Value {
     args.get(index).map_or(Value::undefined(), |slot| {
         // SAFETY: `slot` is an initialized `Value` in the live argument
         // window; a volatile read only forces a fresh load of it.
@@ -858,7 +868,10 @@ fn flatten_string_key(ctx: &mut NativeCtx<'_>, key: &Value) {
     }
 }
 
-pub(crate) fn map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn map_proto_get(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // Flattening allocates: flatten through the rooted argument slot first,
     // then read the receiver and the arguments.
     flatten_key_argument(ctx, args);
@@ -867,7 +880,10 @@ pub(crate) fn map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
     Ok(collections::map_get(m, ctx.heap(), &key).unwrap_or(Value::undefined()))
 }
 
-pub(crate) fn map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn map_proto_set(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // Flattening allocates: flatten through the rooted argument slot first,
     // then read the receiver and the arguments.
     flatten_key_argument(ctx, args);
@@ -878,7 +894,10 @@ pub(crate) fn map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
     Ok(Value::map(m))
 }
 
-pub(crate) fn map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn map_proto_has(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // Flattening allocates: flatten through the rooted argument slot first,
     // then read the receiver and the arguments.
     flatten_key_argument(ctx, args);
@@ -887,7 +906,7 @@ pub(crate) fn map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
     Ok(Value::boolean(collections::map_has(m, ctx.heap(), &key)))
 }
 
-fn map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn map_proto_delete(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // Flattening allocates: flatten through the rooted argument slot first,
     // then read the receiver and the arguments.
     flatten_key_argument(ctx, args);
@@ -900,25 +919,25 @@ fn map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     )))
 }
 
-fn map_proto_clear(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn map_proto_clear(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.clear")?;
     collections::map_clear(m, ctx.heap_mut());
     Ok(Value::undefined())
 }
 
-fn map_proto_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn map_proto_keys(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.keys")?;
     make_map_iterator(ctx, m, MapIterKind::Keys)
 }
 
-fn map_proto_values(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn map_proto_values(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.values")?;
     make_map_iterator(ctx, m, MapIterKind::Values)
 }
 
 pub(crate) fn map_proto_entries(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.entries")?;
     make_map_iterator(ctx, m, MapIterKind::Entries)
@@ -939,7 +958,10 @@ fn canonicalize_collection_key(key: Value) -> Value {
 /// Map.prototype.getOrInsert(key, value) — Map.prototype.upsert
 /// proposal. Returns the existing value for `key`, otherwise inserts
 /// `value` and returns it.
-fn map_proto_get_or_insert(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn map_proto_get_or_insert(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let mut m = receiver_map(ctx, "Map.prototype.getOrInsert")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     let value = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -957,7 +979,7 @@ fn map_proto_get_or_insert(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Va
 /// added (re-scan step), keeping the returned value authoritative.
 fn map_proto_get_or_insert_computed(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.getOrInsertComputed")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
@@ -988,7 +1010,11 @@ fn map_proto_get_or_insert_computed(
         let canonical =
             canonicalize_collection_key(ctx.interp_mut().iteration_anchor(anchor_base + KEY));
         let callback = ctx.interp_mut().iteration_anchor(anchor_base + CALLBACK);
-        let value = ctx.call(callback, Value::undefined(), &[canonical])?;
+        let value = ctx.call(
+            callback,
+            Value::undefined(),
+            ValueWindow::from(&[canonical]),
+        )?;
         ctx.interp_mut().push_iteration_anchor(value);
 
         let mut map = ctx
@@ -1012,7 +1038,10 @@ fn map_proto_get_or_insert_computed(
 }
 
 /// §24.1.3.5 Map.prototype.forEach.
-fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn map_proto_for_each(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "Map.prototype.forEach")?;
     let callback = args.first().cloned().unwrap_or(Value::undefined());
     if !ctx.interp_mut().is_callable_runtime(&callback) {
@@ -1084,7 +1113,7 @@ fn map_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     })
 }
 
-fn map_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn map_size_get(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let m = receiver_map(ctx, "get Map.prototype.size")?;
     Ok(Value::number(crate::number::NumberValue::from_i32(
         collections::map_len(m, ctx.heap()) as i32,
@@ -1095,7 +1124,7 @@ fn map_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 // Set prototype method bodies
 // ---------------------------------------------------------------
 
-fn set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_proto_add(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // Flattening allocates: flatten through the rooted argument slot first,
     // then read the receiver and the arguments.
     flatten_key_argument(ctx, args);
@@ -1105,7 +1134,10 @@ fn set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nativ
     Ok(Value::set(s))
 }
 
-pub(crate) fn set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+pub(crate) fn set_proto_has(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     // Flattening allocates: flatten through the rooted argument slot first,
     // then read the receiver and the arguments.
     flatten_key_argument(ctx, args);
@@ -1114,7 +1146,7 @@ pub(crate) fn set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
     Ok(Value::boolean(collections::set_has(s, ctx.heap(), &v)))
 }
 
-fn set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_proto_delete(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     // Flattening allocates: flatten through the rooted argument slot first,
     // then read the receiver and the arguments.
     flatten_key_argument(ctx, args);
@@ -1127,19 +1159,19 @@ fn set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     )))
 }
 
-fn set_proto_clear(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn set_proto_clear(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.clear")?;
     collections::set_clear(s, ctx.heap_mut());
     Ok(Value::undefined())
 }
 
-fn set_proto_keys(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn set_proto_keys(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     set_proto_values(ctx, _args)
 }
 
 pub(crate) fn set_proto_values(
     ctx: &mut NativeCtx<'_>,
-    _args: &[Value],
+    _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.values")?;
     let mut set_value = Value::set(s);
@@ -1157,7 +1189,10 @@ pub(crate) fn set_proto_values(
     Ok(Value::iterator(iter))
 }
 
-fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn set_proto_entries(
+    ctx: &mut NativeCtx<'_>,
+    _args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.entries")?;
     let mut set_value = Value::set(s);
     let iter = ctx
@@ -1175,7 +1210,10 @@ fn set_proto_entries(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, 
 }
 
 /// §24.2.3.6 Set.prototype.forEach.
-fn set_proto_for_each(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_proto_for_each(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "Set.prototype.forEach")?;
     let callback = args.first().cloned().unwrap_or(Value::undefined());
     if !ctx.interp_mut().is_callable_runtime(&callback) {
@@ -1270,7 +1308,7 @@ pub(crate) fn is_set_method_name(name: &str) -> bool {
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-set.prototype.union>
-fn set_proto_union(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_proto_union(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     const NAME: &str = "Set.prototype.union";
     let this = receiver_set(ctx, NAME)?;
     let base = push_anchored(ctx, Value::set(this));
@@ -1318,7 +1356,10 @@ fn set_proto_union(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-set.prototype.intersection>
-fn set_proto_intersection(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_proto_intersection(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     const NAME: &str = "Set.prototype.intersection";
     let this = receiver_set(ctx, NAME)?;
     let base = push_anchored(ctx, Value::set(this));
@@ -1374,7 +1415,10 @@ fn set_proto_intersection(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-set.prototype.difference>
-fn set_proto_difference(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_proto_difference(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     const NAME: &str = "Set.prototype.difference";
     let this = receiver_set(ctx, NAME)?;
     let base = push_anchored(ctx, Value::set(this));
@@ -1430,7 +1474,7 @@ fn set_proto_difference(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value
 /// - <https://tc39.es/ecma262/#sec-set.prototype.symmetricdifference>
 fn set_proto_symmetric_difference(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     const NAME: &str = "Set.prototype.symmetricDifference";
     let this = receiver_set(ctx, NAME)?;
@@ -1488,7 +1532,10 @@ fn set_proto_symmetric_difference(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-set.prototype.issubsetof>
-fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_proto_is_subset_of(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     const NAME: &str = "Set.prototype.isSubsetOf";
     let this = receiver_set(ctx, NAME)?;
     let base = push_anchored(ctx, Value::set(this));
@@ -1524,7 +1571,10 @@ fn set_proto_is_subset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Val
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-set.prototype.issupersetof>
-fn set_proto_is_superset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn set_proto_is_superset_of(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     const NAME: &str = "Set.prototype.isSupersetOf";
     let this = receiver_set(ctx, NAME)?;
     let base = push_anchored(ctx, Value::set(this));
@@ -1557,7 +1607,7 @@ fn set_proto_is_superset_of(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<V
 /// - <https://tc39.es/ecma262/#sec-set.prototype.isdisjointfrom>
 fn set_proto_is_disjoint_from(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     const NAME: &str = "Set.prototype.isDisjointFrom";
     let this = receiver_set(ctx, NAME)?;
@@ -1600,7 +1650,7 @@ fn set_proto_is_disjoint_from(
     outcome
 }
 
-fn set_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+fn set_size_get(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let s = receiver_set(ctx, "get Set.prototype.size")?;
     Ok(Value::number(crate::number::NumberValue::from_i32(
         collections::set_len(s, ctx.heap()) as i32,
@@ -1611,7 +1661,10 @@ fn set_size_get(ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, Nativ
 // WeakMap prototype method bodies
 // ---------------------------------------------------------------
 
-fn weak_map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn weak_map_proto_get(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let m = receiver_weak_map(ctx, "WeakMap.prototype.get")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_map_get(m, ctx.heap_mut(), &key) {
@@ -1620,7 +1673,10 @@ fn weak_map_proto_get(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     }
 }
 
-fn weak_map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn weak_map_proto_set(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let mut m = receiver_weak_map(ctx, "WeakMap.prototype.set")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     let value = args.get(1).cloned().unwrap_or(Value::undefined());
@@ -1629,7 +1685,10 @@ fn weak_map_proto_set(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     Ok(Value::weak_map(m))
 }
 
-fn weak_map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn weak_map_proto_has(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let m = receiver_weak_map(ctx, "WeakMap.prototype.has")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_map_has(m, ctx.heap_mut(), &key) {
@@ -1638,7 +1697,10 @@ fn weak_map_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     }
 }
 
-fn weak_map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn weak_map_proto_delete(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let m = receiver_weak_map(ctx, "WeakMap.prototype.delete")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_map_delete(m, ctx.heap_mut(), &key) {
@@ -1651,7 +1713,7 @@ fn weak_map_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Valu
 /// that cannot be held weakly throws (`weak_map_get` surfaces it).
 fn weak_map_proto_get_or_insert(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let mut m = receiver_weak_map(ctx, "WeakMap.prototype.getOrInsert")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
@@ -1670,7 +1732,7 @@ fn weak_map_proto_get_or_insert(
 /// value via the callback only when the key is absent (§ upsert).
 fn weak_map_proto_get_or_insert_computed(
     ctx: &mut NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
     let m = receiver_weak_map(ctx, "WeakMap.prototype.getOrInsertComputed")?;
     let key = args.first().cloned().unwrap_or(Value::undefined());
@@ -1718,7 +1780,10 @@ fn weak_map_proto_get_or_insert_computed(
 // WeakSet prototype method bodies
 // ---------------------------------------------------------------
 
-fn weak_set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn weak_set_proto_add(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let mut s = receiver_weak_set(ctx, "WeakSet.prototype.add")?;
     let v = args.first().cloned().unwrap_or(Value::undefined());
     ctx.weak_set_add(&mut s, v)
@@ -1726,7 +1791,10 @@ fn weak_set_proto_add(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     Ok(Value::weak_set(s))
 }
 
-fn weak_set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn weak_set_proto_has(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let s = receiver_weak_set(ctx, "WeakSet.prototype.has")?;
     let v = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_set_has(s, ctx.heap_mut(), &v) {
@@ -1735,7 +1803,10 @@ fn weak_set_proto_has(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, 
     }
 }
 
-fn weak_set_proto_delete(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn weak_set_proto_delete(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let s = receiver_weak_set(ctx, "WeakSet.prototype.delete")?;
     let v = args.first().cloned().unwrap_or(Value::undefined());
     match collections::weak_set_delete(s, ctx.heap_mut(), &v) {
@@ -2071,7 +2142,7 @@ fn set_record_keys(
         } => {
             let keys = anchored(ctx, *keys_slot);
             let set = anchored(ctx, *set_slot);
-            let iterator = ctx.call(keys, set, &[])?;
+            let iterator = ctx.call(keys, set, ValueWindow::from(&[]))?;
             if iterator.as_generator().is_some() {
                 let slot = push_anchored(ctx, iterator);
                 return Ok(SetRecordKeys::Generator { slot });
@@ -2325,7 +2396,7 @@ mod tests {
             &mut interp,
             NativeCallInfo::call(Value::set(set)),
             None,
-            |ctx| set_proto_values(ctx, &[]).expect("set values"),
+            |ctx| set_proto_values(ctx, ValueWindow::from(&[])).expect("set values"),
         );
 
         let after = interp.gc_heap().stats().old_allocated_bytes;

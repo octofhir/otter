@@ -57,6 +57,7 @@
 mod inspection;
 mod scoped_completion;
 
+use crate::ValueWindow;
 use std::marker::PhantomData;
 
 use otter_gc::raw::RawGc;
@@ -246,35 +247,21 @@ impl otter_gc::ExtraRootSource for NativeCallInfo {
 /// forwarded handles without a second snapshot or adapter buffer.
 pub(crate) struct NativeCallRoots<'a> {
     call_info: &'a NativeCallInfo,
-    value_roots: &'a [&'a Value],
-    slice_roots: &'a [&'a [Value]],
+    windows: &'a [ValueWindow<'a>],
 }
 
 impl<'a> NativeCallRoots<'a> {
     #[must_use]
-    pub(crate) fn new(
-        call_info: &'a NativeCallInfo,
-        value_roots: &'a [&'a Value],
-        slice_roots: &'a [&'a [Value]],
-    ) -> Self {
-        Self {
-            call_info,
-            value_roots,
-            slice_roots,
-        }
+    pub(crate) fn new(call_info: &'a NativeCallInfo, windows: &'a [ValueWindow<'a>]) -> Self {
+        Self { call_info, windows }
     }
 }
 
 impl otter_gc::ExtraRootSource for NativeCallRoots<'_> {
     fn visit_extra_roots(&self, roots: otter_gc::RootSet, visitor: &mut dyn FnMut(*mut RawGc)) {
         otter_gc::ExtraRootSource::visit_extra_roots(self.call_info, roots, visitor);
-        for value in self.value_roots {
-            value.trace_value_slots(visitor);
-        }
-        for slice in self.slice_roots {
-            for value in *slice {
-                value.trace_value_slots(visitor);
-            }
+        for window in self.windows {
+            window.trace_slots(visitor);
         }
     }
 }
@@ -394,7 +381,7 @@ impl<'rt> NativeCtx<'rt> {
     ) -> R {
         let mut activations = ActivationStack::new();
         interp.with_runtime_turn(&mut activations, |turn| {
-            let roots = NativeCallRoots::new(&call_info, &[], &[]);
+            let roots = NativeCallRoots::new(&call_info, &[]);
             let _call_roots = turn
                 .interp
                 .gc_heap
@@ -842,7 +829,11 @@ impl<'rt> NativeCtx<'rt> {
         call: F,
     ) -> Result<Value, otter_gc::OutOfMemory>
     where
-        F: for<'call> Fn(&mut NativeCtx<'call>, &[Value], &[Value]) -> Result<Value, NativeError>
+        F: for<'call> Fn(
+                &mut NativeCtx<'call>,
+                ValueWindow<'_>,
+                ValueWindow<'_>,
+            ) -> Result<Value, NativeError>
             + Send
             + Sync
             + 'static,
@@ -860,7 +851,11 @@ impl<'rt> NativeCtx<'rt> {
         call: F,
     ) -> Result<Value, otter_gc::OutOfMemory>
     where
-        F: for<'call> Fn(&mut NativeCtx<'call>, &[Value], &[Value]) -> Result<Value, NativeError>
+        F: for<'call> Fn(
+                &mut NativeCtx<'call>,
+                ValueWindow<'_>,
+                ValueWindow<'_>,
+            ) -> Result<Value, NativeError>
             + Send
             + Sync
             + 'static,
@@ -931,7 +926,11 @@ impl<'rt> NativeCtx<'rt> {
     /// activation floor; used by native code that needs to build platform
     /// objects through their real constructors (e.g. the structured-clone
     /// materializer rebuilding `Date`/`RegExp`/typed arrays).
-    pub fn construct(&mut self, target: Value, args: &[Value]) -> Result<Value, NativeError> {
+    pub fn construct(
+        &mut self,
+        target: Value,
+        args: ValueWindow<'_>,
+    ) -> Result<Value, NativeError> {
         self.construct_owned(target, args.iter().copied().collect())
     }
 
@@ -961,7 +960,7 @@ impl<'rt> NativeCtx<'rt> {
         &mut self,
         target: Value,
         this_value: Value,
-        args: &[Value],
+        args: ValueWindow<'_>,
     ) -> Result<Value, NativeError> {
         self.call_owned(target, this_value, args.iter().copied().collect())
     }
@@ -2030,7 +2029,7 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
     /// Root argument `index`; a missing argument becomes `undefined`.
     #[must_use]
     #[inline]
-    pub fn argument(&mut self, args: &[Value], index: usize) -> Local<'scope> {
+    pub fn argument(&mut self, args: ValueWindow<'_>, index: usize) -> Local<'scope> {
         self.value(args.get(index).copied().unwrap_or_else(Value::undefined))
     }
 
@@ -3391,7 +3390,11 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         call: F,
     ) -> Result<Local<'scope>, NativeError>
     where
-        F: for<'call> Fn(&mut NativeCtx<'call>, &[Value], &[Value]) -> Result<Value, NativeError>
+        F: for<'call> Fn(
+                &mut NativeCtx<'call>,
+                ValueWindow<'_>,
+                ValueWindow<'_>,
+            ) -> Result<Value, NativeError>
             + Send
             + Sync
             + 'static,
@@ -4060,6 +4063,7 @@ pub(crate) fn visit_native_roots(
 #[cfg(test)]
 mod tests {
     use super::{NativeCallInfo, NativeCtx};
+    use crate::ValueWindow;
     use crate::{Interpreter, NativeError, Value, native_value_static};
 
     fn with_ctx<R>(
@@ -4264,7 +4268,7 @@ mod tests {
 
     #[test]
     fn native_ctx_weak_ref_allocation_uses_young_space() {
-        fn cleanup(_: &mut NativeCtx<'_>, _: &[Value]) -> Result<Value, NativeError> {
+        fn cleanup(_: &mut NativeCtx<'_>, _: ValueWindow<'_>) -> Result<Value, NativeError> {
             Ok(Value::undefined())
         }
 
@@ -4493,7 +4497,7 @@ mod tests {
 
     #[test]
     fn native_scope_defines_and_gets_rooted_native_function_properties() {
-        fn noop(_ctx: &mut NativeCtx<'_>, _args: &[Value]) -> Result<Value, NativeError> {
+        fn noop(_ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
             Ok(Value::undefined())
         }
 

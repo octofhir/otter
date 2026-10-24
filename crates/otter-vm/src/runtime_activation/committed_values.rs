@@ -37,6 +37,7 @@
 //! - `crate::function_ops::Interpreter::instanceof_operator`
 //! - `crate::object_internal_ops::Interpreter::ordinary_has_property_value`
 
+use crate::ValueWindow;
 use otter_bytecode::Op;
 
 use crate::{
@@ -376,9 +377,13 @@ impl Interpreter {
                 Value::boolean(!self.loose_equal_with_context(stack, context, &value0, &value1)?)
             }
             ObjectProtocolValueOp::Binary(_) => unreachable!("binary operators return above"),
-            ObjectProtocolValueOp::ArrayPush => {
-                self.array_push(stack, context, value0, &[value1], &mut [])?
-            }
+            ObjectProtocolValueOp::ArrayPush => self.array_push(
+                stack,
+                context,
+                value0,
+                ValueWindow::from(&[value1]),
+                &mut [],
+            )?,
             ObjectProtocolValueOp::ArrayPop => self.array_pop(stack, context, value0, &mut [])?,
             ObjectProtocolValueOp::HasProperty => {
                 if !value1.is_object_type() {

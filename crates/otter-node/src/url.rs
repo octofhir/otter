@@ -20,6 +20,7 @@
 //! # See also
 //! - Node.js `lib/url.js` and `lib/internal/url.js`.
 
+use otter_runtime::ValueWindow;
 use std::path::{Path, PathBuf};
 
 use otter_runtime::{CapabilitySet, RuntimeTaskSpawner};
@@ -36,7 +37,8 @@ pub fn install_url_module<'scope>(
         (
             "pathToFileURL",
             1,
-            path_to_file_url as fn(&mut NativeCtx<'_>, &[Value]) -> Result<Value, NativeError>,
+            path_to_file_url
+                as fn(&mut NativeCtx<'_>, ValueWindow<'_>) -> Result<Value, NativeError>,
         ),
         ("fileURLToPath", 1, file_url_to_path),
         ("domainToASCII", 1, domain_to_ascii),
@@ -48,7 +50,7 @@ pub fn install_url_module<'scope>(
     Ok(namespace)
 }
 
-fn path_to_file_url(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn path_to_file_url(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let input = required_string(ctx, args, 0, "pathToFileURL", "path")?;
     let href = path_to_file_url_href(&input);
     let constructor = ctx
@@ -65,7 +67,7 @@ fn path_to_file_url(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     })
 }
 
-fn file_url_to_path(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn file_url_to_path(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let input = file_url_input(ctx, args)?;
     let path = file_url_to_path_string(&input)?;
     ctx.scope(|mut scope| {
@@ -74,7 +76,7 @@ fn file_url_to_path(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Na
     })
 }
 
-fn domain_to_ascii(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn domain_to_ascii(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let input = required_string(ctx, args, 0, "domainToASCII", "domain")?;
     let output = idna::domain_to_ascii(&input).unwrap_or_default();
     ctx.scope(|mut scope| {
@@ -83,7 +85,7 @@ fn domain_to_ascii(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, Nat
     })
 }
 
-fn domain_to_unicode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> {
+fn domain_to_unicode(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let input = required_string(ctx, args, 0, "domainToUnicode", "domain")?;
     let output = idna::domain_to_unicode(&input).0;
     ctx.scope(|mut scope| {
@@ -92,7 +94,7 @@ fn domain_to_unicode(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, N
     })
 }
 
-fn file_url_input(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<String, NativeError> {
+fn file_url_input(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<String, NativeError> {
     let Some(input) = args.first().copied() else {
         return Err(crate::invalid_arg_type(
             "The \"path\" argument must be of type string or URL. Received undefined",
@@ -146,7 +148,7 @@ fn file_url_input(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<String, Nat
 
 fn required_string(
     ctx: &NativeCtx<'_>,
-    args: &[Value],
+    args: ValueWindow<'_>,
     index: usize,
     function: &'static str,
     argument: &str,

@@ -22,6 +22,7 @@
 //! - `nodelib/compat/internal_fs_event_wrap.js`
 //! - `nodelib/compat/internal_fs_binding.js` — the `StatWatcher` half.
 
+use otter_vm::ValueWindow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -77,7 +78,7 @@ pub fn fs_watch_binding_cjs_value<'scope>(
             "watch",
             3,
             &[],
-            move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
                 start_watch(ctx, args, &caps, spawner.as_ref(), &table, &ids)
             },
         )?;
@@ -93,7 +94,7 @@ pub fn fs_watch_binding_cjs_value<'scope>(
             "watchFile",
             3,
             &[],
-            move |ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            move |ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
                 start_poll(ctx, args, &caps, spawner.as_ref(), &table, &ids)
             },
         )?;
@@ -106,7 +107,7 @@ pub fn fs_watch_binding_cjs_value<'scope>(
             "close",
             1,
             &[],
-            move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
                 let id = handle_arg(args, 0);
                 if let Some(entry) = table
                     .lock()
@@ -127,7 +128,7 @@ pub fn fs_watch_binding_cjs_value<'scope>(
             "hold",
             2,
             &[],
-            move |_ctx: &mut RuntimeNativeCtx<'_>, args: &[RuntimeValue], _c: &[RuntimeValue]| {
+            move |_ctx: &mut RuntimeNativeCtx<'_>, args: ValueWindow<'_>, _c: ValueWindow<'_>| {
                 let id = handle_arg(args, 0);
                 let referenced = args
                     .get(1)
@@ -154,7 +155,7 @@ pub fn fs_watch_binding_cjs_value<'scope>(
     Ok(object)
 }
 
-fn handle_arg(args: &[RuntimeValue], index: usize) -> u32 {
+fn handle_arg(args: ValueWindow<'_>, index: usize) -> u32 {
     args.get(index)
         .and_then(|value| value.as_f64())
         .unwrap_or(0.0) as u32
@@ -164,7 +165,7 @@ fn handle_arg(args: &[RuntimeValue], index: usize) -> u32 {
 /// uv error number the caller reports as a failed `start`.
 fn start_watch(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     spawner: Option<&RuntimeTaskSpawner>,
     watchers: &WatchTable,
@@ -297,7 +298,7 @@ fn notifications(id: u32, event: &notify::Event, root: Option<&Path>) -> Vec<Not
 /// `watchFile(path, intervalMs, persistent)` — answers the handle.
 fn start_poll(
     ctx: &mut RuntimeNativeCtx<'_>,
-    args: &[RuntimeValue],
+    args: ValueWindow<'_>,
     capabilities: &CapabilitySet,
     spawner: Option<&RuntimeTaskSpawner>,
     watchers: &WatchTable,

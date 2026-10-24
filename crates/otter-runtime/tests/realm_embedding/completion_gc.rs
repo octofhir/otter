@@ -17,6 +17,7 @@
 //! # See also
 //! - `otter_runtime::realm` releases the completion root on every checkpoint outcome.
 
+use otter_runtime::ValueWindow;
 use std::sync::{Arc, Mutex};
 
 use otter_runtime::{
@@ -123,8 +124,8 @@ fn installer(kind: CompletionKind, records: Arc<Mutex<Records>>) -> RuntimeExten
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 |ctx: &mut RuntimeNativeCtx<'_>,
-                 _args: &[RuntimeValue],
-                 _state: &[RuntimeValue]| {
+                 _args: ValueWindow<'_>,
+                 _state: ValueWindow<'_>| {
                     // Exact motion belongs to the queued collection, not ambient
                     // stress during construction of the completion or callback.
                     ctx.interp_mut().gc_heap_mut().set_gc_stress(0, false);
@@ -138,8 +139,8 @@ fn installer(kind: CompletionKind, records: Arc<Mutex<Records>>) -> RuntimeExten
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      _args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      _args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     let slots = persistent_slots(&ctx.interp_mut().root_census());
                     baseline_records
                         .lock()
@@ -154,8 +155,8 @@ fn installer(kind: CompletionKind, records: Arc<Mutex<Records>>) -> RuntimeExten
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      _args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      _args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     ctx.scope(|mut scope| match kind {
                         CompletionKind::Object => {
                             let value = scope.object()?;
@@ -188,8 +189,8 @@ fn installer(kind: CompletionKind, records: Arc<Mutex<Records>>) -> RuntimeExten
             0,
             RuntimeNativeCall::Dynamic(Arc::new(
                 move |ctx: &mut RuntimeNativeCtx<'_>,
-                      _args: &[RuntimeValue],
-                      _state: &[RuntimeValue]| {
+                      _args: ValueWindow<'_>,
+                      _state: ValueWindow<'_>| {
                     let result = (|| {
                         let before = observe(ctx, kind)?;
                         let stats = ctx.interp_mut().gc_stats_snapshot();

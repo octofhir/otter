@@ -24,7 +24,7 @@
 //!         -> Result<ArrayBuffer, JsError> { … }
 //!
 //!     #[method(name = "fastPath", length = 1, raw)]
-//!     fn fast(ctx: &mut NativeCtx<'_>, args: &[Value]) -> Result<Value, NativeError> { … }
+//!     fn fast(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> { … }
 //! }
 //! ```
 //!
@@ -361,7 +361,7 @@ fn expand_inner(args: &NamespaceArgs, ns_impl: &mut ItemImpl) -> Result<proc_mac
         glue.extend(quote! {
             fn #glue_ident(
                 ctx: &mut ::otter_vm::__macro_support::NativeCtx<'_>,
-                args: &[::otter_vm::__macro_support::Value],
+                args: ::otter_vm::__macro_support::ValueWindow<'_>,
             ) -> ::core::result::Result<::otter_vm::__macro_support::Value, ::otter_vm::__macro_support::NativeError> {
                 ctx.scope(|__scope| {
                     let mut __cx = ::otter_vm::__macro_support::marshal::MarshalCx::new(__scope);

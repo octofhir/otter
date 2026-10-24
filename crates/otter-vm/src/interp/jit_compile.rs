@@ -1777,6 +1777,11 @@ impl Interpreter {
                     };
                     Self::typed_element_access(kind, element)
                 }
+                jit::JitElementFamily::DenseTagged
+                    if !write && view.out_of_bounds_element_sites.contains(&byte_pc) =>
+                {
+                    Self::absent_reading_element_access()
+                }
                 jit::JitElementFamily::DenseTagged => Self::dense_element_access(
                     jit::JitElementRepr::Boxed,
                     crate::array::DENSE_ELEMENT_KIND_TAGGED,
@@ -1869,7 +1874,28 @@ impl Interpreter {
             },
             element,
             holes: None,
+            reads_absent: false,
         }
+    }
+
+    /// Tagged dense storage of a read site that met holes or indices past the
+    /// elements: the exotic sidecar itself is guarded null, which proves no
+    /// prototype override, sparse element or indexed accessor besides the
+    /// present own slots, so an absent index reads the realm element
+    /// prototypes alone.
+    fn absent_reading_element_access() -> jit::JitElementAccess {
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        let mut access = Self::dense_element_access(
+            jit::JitElementRepr::Boxed,
+            crate::array::DENSE_ELEMENT_KIND_TAGGED,
+            false,
+        );
+        access.guards[0] = Some(jit::JitBodyGuard::clear(
+            header + std::mem::offset_of!(crate::array::ArrayBody, exotic) as u32,
+            jit::JitGuardWidth::Word32,
+        ));
+        access.reads_absent = true;
+        access
     }
 
     /// Numeric dense storage of either kind, read through the hole bitmap.
@@ -1942,6 +1968,7 @@ impl Interpreter {
             },
             element,
             holes: None,
+            reads_absent: false,
         }
     }
 

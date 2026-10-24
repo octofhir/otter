@@ -751,11 +751,14 @@ pub struct JitCompileSnapshot {
     /// compile deoptimizes when it reaches one ("insufficient feedback"), so
     /// the next generation specializes it instead of calling cold forever.
     pub unseen_element_sites: rustc_hash::FxHashSet<u32>,
-    /// Byte-PCs of indexed store sites where a store reached past its
-    /// receiver's dense elements (an append or a gap). The optimizing tier
-    /// keeps their generic store instead of an in-bounds speculation that
-    /// would leave generated code at each one; the baseline keeps its
-    /// in-bounds fast path and completes the rest in the runtime.
+    /// Byte-PCs of indexed sites that named an index their receiver's dense
+    /// elements do not hold: a store's append or gap, a load's hole or index
+    /// past a plain Array's elements. The optimizing tier keeps such a
+    /// store's generic operation instead of an in-bounds speculation that
+    /// would leave generated code at each one, and reads such a load's absent
+    /// index as `undefined` in place when its access [`JitElementAccess::reads_absent`];
+    /// the baseline keeps its in-bounds fast path and completes the rest in
+    /// the runtime.
     pub out_of_bounds_element_sites: rustc_hash::FxHashSet<u32>,
     /// Static heap-layout offsets for inline primitive string `.length`.
     pub string_layout: JitStringLayout,
@@ -2088,6 +2091,12 @@ pub struct JitElementAccess {
     /// has one. A set bit is an absent element whatever the payload word
     /// holds.
     pub holes: Option<JitHoleBitmap>,
+    /// The guards prove a plain Array with no exotic state, so an index its
+    /// elements do not hold (a hole, or one past the length) is looked up
+    /// only on the realm's %Array.prototype% and %Object.prototype%. While the
+    /// array-index protector holds neither owns an index, and such a read is
+    /// `undefined`.
+    pub reads_absent: bool,
 }
 
 /// Numeric dense storage that may have holes: either numeric storage kind
@@ -2165,6 +2174,7 @@ impl JitElementAccess {
             },
             element: JitElementRepr::Float64,
             holes: None,
+            reads_absent: false,
         }
     }
 

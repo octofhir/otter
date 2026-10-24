@@ -114,7 +114,6 @@ fn execute(case: Case) {
         }),
         prototype_root: offset(root),
     };
-    if plan.initial_field_count != 0 {}
     store32(&mut memory, root + 12, offset(prototype));
     store32(&mut memory, initial + 12, offset(prototype));
     store32(&mut memory, initial + 8, 2);

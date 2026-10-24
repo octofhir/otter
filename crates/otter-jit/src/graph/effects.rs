@@ -236,6 +236,7 @@ fn proves_inputs(kind: &Kind) -> bool {
         | Kind::CheckElements { .. }
         | Kind::CheckElementPresent
         | Kind::LoadPresentElement
+        | Kind::LoadElementOrUndefined
         | Kind::CheckHoleyElementPresent(_)
         | Kind::CheckBounds
         | Kind::CheckNumber
@@ -354,6 +355,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         Kind::CheckElements { .. } => Effects::reads(&[H::ElementStorage, H::MapWords]),
         Kind::CheckElementPresent
         | Kind::LoadPresentElement
+        | Kind::LoadElementOrUndefined
         | Kind::CheckHoleyElementPresent(_) => Effects::deref(&[H::Elements]),
         Kind::LoadShapedProperty { atom } => Effects::reads(&[H::MapWords, H::Field(*atom)]),
         Kind::LoadOwnField { atom, .. } | Kind::LoadNumberOwnField { atom, .. } => Effects::deref(&[H::Field(*atom)]),

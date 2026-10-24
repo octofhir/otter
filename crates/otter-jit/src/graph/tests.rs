@@ -688,6 +688,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
         },
         Kind::CheckElementPresent,
         Kind::LoadPresentElement,
+        Kind::LoadElementOrUndefined,
         Kind::CheckHoleyElementPresent(holes),
         Kind::LoadOwnField { field, atom: 0 },
         Kind::LoadNumberOwnField {
@@ -946,6 +947,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::CheckElements { .. }
         | K::CheckElementPresent
         | K::LoadPresentElement
+        | K::LoadElementOrUndefined
         | K::CheckHoleyElementPresent(_)
         | K::LoadOwnField { .. }
         | K::LoadNumberOwnField { .. }

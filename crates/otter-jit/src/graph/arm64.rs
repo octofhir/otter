@@ -1914,6 +1914,44 @@ impl<'a> Codegen<'a> {
                 dynasm!(self.ops ; .arch aarch64 ; cmp x16, x17 ; b.eq =>exit
                     ; mov X(destination), x16);
             }
+            Kind::LoadElementOrUndefined => {
+                let (base, index, length) =
+                    (Self::gp(input(0)), Self::gp(input(1)), Self::gp(input(2)));
+                let destination = Self::gp(result.expect("a result"));
+                let exit = self.eager_exit(node, DeoptReason::OutOfBounds);
+                let absent = self.ops.new_dynamic_label();
+                let done = self.ops.new_dynamic_label();
+                // Unsigned, so a negative index takes the absent path too and
+                // leaves there; the element is read only below the count.
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp W(index), W(length)
+                    ; b.hs =>absent
+                    ; ldr x16, [X(base), W(index), uxtw #3]
+                );
+                self.load_immediate(17, VALUE_HOLE);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; cmp x16, x17
+                    ; b.eq =>absent
+                    ; mov X(destination), x16
+                    ; =>done
+                );
+                self.deferred
+                    .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                        dynasm!(codegen.ops
+                            ; .arch aarch64
+                            ; =>absent
+                            ; tbnz W(index), #31, =>exit
+                            ; ldr x16, [x20, THREAD_OFFSET]
+                            ; ldr x16, [x16, ARRAY_INDEX_PROTECTOR]
+                            ; ldrb w16, [x16]
+                            ; cbnz w16, =>exit
+                        );
+                        codegen.load_immediate(destination, VALUE_UNDEFINED);
+                        dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
+                    }));
+            }
             Kind::LoadElementsLength { byte, width } => {
                 let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));

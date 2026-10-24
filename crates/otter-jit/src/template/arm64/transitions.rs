@@ -28,7 +28,8 @@ use otter_vm::native_abi::{self as abi};
 use otter_vm::runtime_stubs::alloc_value_stub_by_id;
 
 use super::ic_probe::{
-    element_access_for, emit_element_address, emit_element_read, emit_element_write,
+    element_access_for, emit_element_address, emit_element_read, emit_element_read_or_undefined,
+    emit_element_write,
 };
 use super::values::{emit_load_reg, emit_load_runtime_stub, emit_load_u64, emit_store_reg};
 pub(super) use crate::entry::TransitionTable;
@@ -275,8 +276,22 @@ pub(super) fn emit_load_element(
     let done = ops.new_dynamic_label();
     // Dense fast path: read the element straight from the buffer. A hole is an
     // absent property — the prototype chain answers — so it misses like every
-    // other failed guard.
-    if let Some(access) = element_access_for(view, byte_pc) {
+    // other failed guard, unless the site reads absent indices as `undefined`.
+    if let Some(access) = element_access_for(view, byte_pc)
+        && access.reads_absent
+    {
+        emit_element_read_or_undefined(
+            ops,
+            relocations,
+            view,
+            access,
+            |ops, register| emit_load_reg(ops, register, receiver),
+            |ops, register| emit_load_reg(ops, register, index),
+            miss,
+        )?;
+        emit_store_reg(ops, 9, dst)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+    } else if let Some(access) = element_access_for(view, byte_pc) {
         emit_element_address(
             ops,
             relocations,

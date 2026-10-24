@@ -3,8 +3,9 @@
 //! # Contents
 //! - Recording one receiver family at a `LoadElement` / `StoreElement` site,
 //!   or the array a fast iterator record steps at an `IteratorNext` site.
-//! - Recording that a store at such a site reached past its receiver's
-//!   dense elements (an append or a gap).
+//! - Recording that an access at such a site named an index its receiver's
+//!   dense elements do not hold: a store's append or gap, a load's hole or
+//!   index past the elements of a plain Array.
 //!
 //! # Invariants
 //! - Classification precedes the indexed operation, so getters, proxies, and
@@ -38,10 +39,12 @@ impl Interpreter {
         self.commit_element_family_feedback_transition(code_block, instruction_pc, observed)
     }
 
-    /// Note that the store at one computed-element site reached past its
-    /// receiver's dense elements at `key` (an append or a gap), so the next
-    /// compilation keeps the site's generic store instead of an in-bounds
-    /// speculation.
+    /// Note that one computed-element site named, at `key`, an index its
+    /// receiver's dense elements do not hold: a store's append or gap, so the
+    /// next compilation keeps the site's generic store instead of an
+    /// in-bounds speculation; or a load's hole or index past the elements of
+    /// a plain Array, so the next compilation reads such an index as
+    /// `undefined` in place instead of leaving generated code.
     pub(crate) fn record_element_bounds_feedback(
         &mut self,
         code_block: &CodeBlock,
@@ -49,16 +52,17 @@ impl Interpreter {
         receiver: Value,
         key: Value,
     ) -> bool {
-        if !self.element_index_out_of_bounds(receiver, key) {
-            return false;
-        }
         let Some(instruction) = code_block.instr_at_index(instruction_pc as usize) else {
             return false;
         };
-        if !matches!(
-            code_block.op(instruction),
-            Op::StoreElement | Op::StoreElementStrict
-        ) {
+        let absent = match code_block.op(instruction) {
+            Op::StoreElement | Op::StoreElementStrict => {
+                self.element_index_out_of_bounds(receiver, key)
+            }
+            Op::LoadElement => self.plain_array_index_absent(receiver, key),
+            _ => false,
+        };
+        if !absent {
             return false;
         }
         code_block
@@ -119,7 +123,7 @@ mod tests {
     }
 
     #[test]
-    fn a_store_past_the_dense_elements_marks_its_site_once() {
+    fn an_access_past_the_dense_elements_marks_its_site_once() {
         let mut interpreter = Interpreter::new().expect("fixture interpreter bootstrap");
         let array = crate::array::alloc_array_old_for_fixture(&mut interpreter.gc_heap)
             .expect("fixture array");
@@ -157,15 +161,31 @@ mod tests {
             assert_eq!(site.feedback_epoch(), 1);
         }
 
-        // Loads, negative and non-int keys, and non-element receivers are not
-        // element-bounds questions.
+        // A load past a plain Array's elements marks its site once; a
+        // negative key is a name, not an absent index.
         let load = element_site(Op::LoadElement);
         assert!(!interpreter.record_element_bounds_feedback(
             &load,
             0,
             receiver,
+            Value::number_i32(-1)
+        ));
+        assert!(interpreter.record_element_bounds_feedback(
+            &load,
+            0,
+            receiver,
             Value::number_i32(5)
         ));
+        assert!(!interpreter.record_element_bounds_feedback(
+            &load,
+            0,
+            receiver,
+            Value::number_i32(6)
+        ));
+        assert!(load.feedback_at(0).unwrap().element_out_of_bounds());
+
+        // Negative and non-int keys, and non-element receivers are not
+        // element-bounds questions.
         let other = element_site(Op::StoreElement);
         for (receiver, key) in [
             (receiver, Value::number_i32(-1)),

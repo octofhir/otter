@@ -197,6 +197,9 @@ impl GcHeap {
                 // Preserve every FREE header/link prefix before publication.
                 // SAFETY: as above; the old free list holds none of `ranges`.
                 unsafe { self.old_space.discard_swept_unused_payload(&ranges) };
+                // Pages this cycle freed sit in the cage's pool with their
+                // memory, as do any freed before it.
+                crate::compressed::release_retained_pages();
             }
             for (offset, bytes) in ranges {
                 self.old_space.push_free_range(offset, bytes);

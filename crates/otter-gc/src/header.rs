@@ -481,6 +481,13 @@ impl GcHeader {
         self.flags.load(Ordering::Acquire) & FLAG_SWEPT != 0
     }
 
+    /// [`Self::is_swept`] once no sweep runs beside the caller: a pause that
+    /// completed the sweep already ordered its writes before the read.
+    #[inline]
+    pub(crate) fn is_swept_settled(&self) -> bool {
+        self.flags.load(Ordering::Relaxed) & FLAG_SWEPT != 0
+    }
+
     /// Record that the sweeper has finalized + dropped this object.
     #[inline]
     pub fn set_swept(&self) {
@@ -490,15 +497,19 @@ impl GcHeader {
     /// True iff this old/large parent is currently recorded in the
     /// remembered set (see [`FLAG_REMEMBERED`]). Drives the barrier's
     /// dedup: a parent already in the set is not pushed again.
+    ///
+    /// The remembered bit orders nothing: the mutator owns it between
+    /// collections, and a scavenge's workers own the parents they trace,
+    /// each side separated from the other by the pause.
     #[inline]
     pub fn is_remembered(&self) -> bool {
-        self.flags.load(Ordering::Acquire) & FLAG_REMEMBERED != 0
+        self.flags.load(Ordering::Relaxed) & FLAG_REMEMBERED != 0
     }
 
     /// Record that this parent is now in the remembered set.
     #[inline]
     pub fn set_remembered(&self) {
-        self.flags.fetch_or(FLAG_REMEMBERED, Ordering::Release);
+        self.flags.fetch_or(FLAG_REMEMBERED, Ordering::Relaxed);
     }
 
     /// Clear the remembered bit. Called by the scavenge that consumes the
@@ -506,7 +517,7 @@ impl GcHeader {
     /// old→young edge after evacuation is re-pushed for the next scavenge.
     #[inline]
     pub fn clear_remembered(&self) {
-        self.flags.fetch_and(!FLAG_REMEMBERED, Ordering::Release);
+        self.flags.fetch_and(!FLAG_REMEMBERED, Ordering::Relaxed);
     }
 
     /// Returns true iff the object is pinned (future compactor
@@ -526,24 +537,30 @@ impl GcHeader {
     pub(crate) unsafe fn claim_forwarding(this: *const Self) -> ForwardingClaim {
         // SAFETY: caller contract; the flag byte is atomic.
         let flags = unsafe { &(*this).flags };
-        let mut current = flags.load(Ordering::Acquire);
+        // Only a published forwarding offset is read after another worker
+        // wrote it, so only that path acquires: relaxed loads let a worker
+        // overlap the cache misses of consecutive cells. A claimed cell's
+        // payload was written before the pause.
+        let mut current = flags.load(Ordering::Relaxed);
         loop {
             if current & FLAG_FORWARDED != 0 {
                 if current & FLAG_COPYING == 0 {
-                    // SAFETY: the acquire load above saw the publishing store.
+                    std::sync::atomic::fence(Ordering::Acquire);
+                    // SAFETY: the fence orders the read after the load that
+                    // saw the publishing store.
                     return ForwardingClaim::Forwarded(unsafe {
                         Self::read_forwarding_offset(this)
                     });
                 }
                 std::hint::spin_loop();
-                current = flags.load(Ordering::Acquire);
+                current = flags.load(Ordering::Relaxed);
                 continue;
             }
             match flags.compare_exchange_weak(
                 current,
                 current | FLAG_FORWARDED | FLAG_COPYING,
-                Ordering::Acquire,
-                Ordering::Acquire,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
             ) {
                 Ok(_) => return ForwardingClaim::Claimed(current),
                 Err(actual) => current = actual,

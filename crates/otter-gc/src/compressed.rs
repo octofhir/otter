@@ -13,8 +13,10 @@
 //!   functions that walk slots polymorphically.
 //! - [`init_cage_with_size`] — debug-only init API: tests/benches
 //!   override the default cage size before any heap is created.
-//! - [`Cage`] — process-global cage owning the 4 GiB virtual region
-//!   and the page free-list.
+//! - [`Cage`] — process-global cage owning the 4 GiB virtual region,
+//!   the page free-list and the pool of released pages still committed.
+//! - [`age_retained_pages`] / [`release_retained_pages`] — give pooled
+//!   pages' memory back once they sit unused, or at once.
 //! - [`discard`] — address-preserving physical release of unused cage ranges.
 //!
 //! # Invariants
@@ -29,6 +31,12 @@
 //!   `init_cage_with_size` calls return [`CageError::AlreadyInit`].
 //! - Page allocation from the cage is single-mutex-protected; one
 //!   isolate per process today, so contention is zero.
+//! - A released page keeps its memory and its stale bytes until it is
+//!   reused or aged out: [`crate::page::Page`] rewrites every header
+//!   field on reuse and every allocator initializes each byte it hands
+//!   out, so nothing reads a page's prior contents. A pooled page left
+//!   unused across a whole aging window is remapped, which releases its
+//!   memory and leaves it reading as zero.
 //!
 //! # See also
 //!
@@ -39,6 +47,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::marker::PhantomData;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::page::PAGE_SIZE;
 
@@ -170,6 +179,8 @@ pub struct CageStats {
     pub free_pages: usize,
     /// Page slots currently owned by GC heaps.
     pub allocated_pages: usize,
+    /// Free page slots whose memory is still committed for reuse.
+    pub retained_pages: usize,
 }
 
 /// Return cage occupancy diagnostics after initialisation.
@@ -177,6 +188,30 @@ pub struct CageStats {
 #[must_use]
 pub fn cage_stats() -> Option<CageStats> {
     Cage::stats()
+}
+
+/// How long a released page stays committed in the pool, unused, before
+/// its memory goes back to the system: a page pooled just after an aging
+/// step is released between one and two windows later.
+const RETAINED_PAGE_WINDOW: Duration = Duration::from_secs(8);
+
+/// Age the pool of released pages at `now`: once a window has passed since
+/// the previous step, every page pooled before that step and still unused
+/// is released. Collections call this at their start.
+pub fn age_retained_pages(now: Instant) {
+    let mut guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
+    if let Some(cage) = guard.as_mut() {
+        cage.age_retained(now);
+    }
+}
+
+/// Release the memory of every pooled page at once, as a collection that
+/// gives back unused physical memory does.
+pub fn release_retained_pages() {
+    let mut guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
+    if let Some(cage) = guard.as_mut() {
+        cage.release_retained(|_| true);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -456,6 +491,16 @@ pub(crate) struct Cage {
     next_fresh: u32,
     /// Total page count (`size / PAGE_SIZE`).
     page_count: u32,
+    /// Free pages whose memory is still committed, one bit per page: a
+    /// single-page request takes one of these before anything else, so
+    /// reuse neither faults memory in nor costs a system call.
+    retained: Vec<u64>,
+    /// Retained pages already pooled at the previous aging step.
+    aging: Vec<u64>,
+    /// Set bits in `retained`.
+    retained_count: u32,
+    /// When the next aging step is due; `None` while the pool is empty.
+    next_aging: Option<Instant>,
 }
 
 // SAFETY: Cage is mutex-protected at the call site (CAGE_GUARD).
@@ -509,8 +554,7 @@ impl Cage {
         // SAFETY: Layout is built from a non-zero size we just
         // validated; `alloc` obtains the region without eagerly
         // zeroing it. Individual pages initialise their headers in
-        // `Page::new`, and returned pages are zeroed before reuse in
-        // `free_page`.
+        // `Page::new`; nothing reads the bytes a reused page held before.
         let reservation_size = size_bytes + CAGE_ALIGN_BYTES;
         let reservation_layout = Layout::from_size_align(reservation_size, PAGE_SIZE)
             .map_err(|_| CageError::InvalidSize(size_bytes))?;
@@ -545,6 +589,7 @@ impl Cage {
         // Page 0 is reserved so that Gc<T>(0) stays null.
         // Page 0 stays reserved so `Gc<T>(0)` is null.
         let free_runs: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+        let words = (page_count as usize).div_ceil(64);
         let cage = Cage {
             base: ptr,
             size: size_bytes,
@@ -553,6 +598,10 @@ impl Cage {
             free_runs,
             next_fresh: 1,
             page_count,
+            retained: vec![0; words],
+            aging: vec![0; words],
+            retained_count: 0,
+            next_aging: None,
         };
         CAGE_BASE.store(ptr, Ordering::Release);
         CAGE_SIZE.store(size_bytes, Ordering::Release);
@@ -631,15 +680,36 @@ impl Cage {
             + (self.page_count - self.next_fresh) as usize
     }
 
-    /// Take `count` consecutive pages, preferring a released run and
-    /// falling back to the untouched tail. First fit: runs are few, and a
-    /// best-fit scan would cost more than the fragmentation it saves.
+    /// Take `count` consecutive pages: one page from the retained pool
+    /// when it holds any, else a released run, else the untouched tail.
+    /// First fit: runs are few, and a best-fit scan would cost more than
+    /// the fragmentation it saves.
     fn take_run(&mut self, count: u32) -> Option<u32> {
+        if count == 1
+            && let Some(index) = self.first_retained()
+        {
+            let (&start, &len) = self
+                .free_runs
+                .range(..=index)
+                .next_back()
+                .expect("a retained page lies in a free run");
+            debug_assert!(index < start + len);
+            self.free_runs.remove(&start);
+            if index > start {
+                self.free_runs.insert(start, index - start);
+            }
+            if start + len > index + 1 {
+                self.free_runs.insert(index + 1, start + len - index - 1);
+            }
+            self.claim_retained(index, 1);
+            return Some(index);
+        }
         if let Some((&start, &len)) = self.free_runs.iter().find(|entry| *entry.1 >= count) {
             self.free_runs.remove(&start);
             if len > count {
                 self.free_runs.insert(start + count, len - count);
             }
+            self.claim_retained(start, count);
             return Some(start);
         }
         let end = self.next_fresh.checked_add(count)?;
@@ -649,6 +719,115 @@ impl Cage {
         let first = self.next_fresh;
         self.next_fresh = end;
         Some(first)
+    }
+
+    /// The lowest retained page, if any.
+    fn first_retained(&self) -> Option<u32> {
+        if self.retained_count == 0 {
+            return None;
+        }
+        self.retained
+            .iter()
+            .enumerate()
+            .find(|(_, word)| **word != 0)
+            .map(|(index, word)| index as u32 * 64 + word.trailing_zeros())
+    }
+
+    /// Drop pages `start..start + count`, being handed out, from the pool.
+    fn claim_retained(&mut self, start: u32, count: u32) {
+        if self.retained_count == 0 {
+            return;
+        }
+        for index in start..start + count {
+            let (word, bit) = (index as usize / 64, 1u64 << (index % 64));
+            if self.retained[word] & bit != 0 {
+                self.retained[word] &= !bit;
+                self.aging[word] &= !bit;
+                self.retained_count -= 1;
+            }
+        }
+        if self.retained_count == 0 {
+            self.next_aging = None;
+        }
+    }
+
+    /// Pool pages `start..start + count`, just released, with their memory.
+    fn retain(&mut self, start: u32, count: u32) {
+        for index in start..start + count {
+            self.retained[index as usize / 64] |= 1u64 << (index % 64);
+        }
+        self.retained_count += count;
+    }
+
+    /// One aging step at `now`, when due: release the pages pooled before
+    /// the previous step, then age the rest.
+    fn age_retained(&mut self, now: Instant) {
+        if self.retained_count == 0 {
+            return;
+        }
+        let Some(due) = self.next_aging else {
+            self.next_aging = Some(now + RETAINED_PAGE_WINDOW);
+            return;
+        };
+        if now < due {
+            return;
+        }
+        let aging = self.aging.clone();
+        self.release_retained(|index| aging[index as usize / 64] & (1u64 << (index % 64)) != 0);
+        self.aging.clone_from(&self.retained);
+        self.next_aging = (self.retained_count != 0).then(|| now + RETAINED_PAGE_WINDOW);
+    }
+
+    /// Release the memory of every retained page `select` picks, one
+    /// remap per consecutive stretch.
+    fn release_retained(&mut self, select: impl Fn(u32) -> bool) {
+        let mut index = 0;
+        while let Some(start) = self.next_released(index, &select) {
+            let mut end = start + 1;
+            while end < self.page_count && self.is_retained(end) && select(end) {
+                end += 1;
+            }
+            // SAFETY: a retained page is free: no live object refers to
+            // it and the mutex makes the cage the range's only owner.
+            unsafe {
+                release_memory(
+                    self.base.add(start as usize * PAGE_SIZE),
+                    (end - start) as usize * PAGE_SIZE,
+                );
+            }
+            for page in start..end {
+                let (word, bit) = (page as usize / 64, 1u64 << (page % 64));
+                self.retained[word] &= !bit;
+                self.aging[word] &= !bit;
+            }
+            self.retained_count -= end - start;
+            index = end;
+        }
+        if self.retained_count == 0 {
+            self.aging.fill(0);
+            self.next_aging = None;
+        }
+    }
+
+    /// The first retained page at or after `from` that `select` picks.
+    fn next_released(&self, from: u32, select: &impl Fn(u32) -> bool) -> Option<u32> {
+        let mut word = from as usize / 64;
+        let mut bits = self.retained.get(word)? & (!0u64 << (from % 64));
+        loop {
+            while bits != 0 {
+                let index = word as u32 * 64 + bits.trailing_zeros();
+                if select(index) {
+                    return Some(index);
+                }
+                bits &= bits - 1;
+            }
+            word += 1;
+            bits = *self.retained.get(word)?;
+        }
+    }
+
+    fn is_retained(&self, index: u32) -> bool {
+        self.retained[index as usize / 64] & (1u64 << (index % 64)) != 0
     }
 
     /// Return `count` consecutive pages, merging with any neighbouring
@@ -670,14 +849,8 @@ impl Cage {
         self.free_runs.insert(start, count);
     }
 
-    /// Return a page to the cage free-list.
-    ///
-    /// # Safety
-    ///
-    /// The caller must guarantee no live `Gc<T>` still references
-    /// any object on this page. Returning a still-referenced page
-    /// will manifest as a use-after-free on the next alloc.
-    /// Return `count` consecutive pages starting at `offset`.
+    /// Return `count` consecutive pages starting at `offset` to the
+    /// free-list, their memory pooled for reuse.
     ///
     /// # Safety
     ///
@@ -688,27 +861,24 @@ impl Cage {
         debug_assert!(offset.is_multiple_of(PAGE_SIZE as u32));
         let idx = offset / (PAGE_SIZE as u32);
         debug_assert!(idx + count <= cage.page_count);
-        // SAFETY: the run is in-range, and its memory belongs to the cage
-        // while the mutex is held.
-        unsafe {
-            let page_ptr = cage.base.add(idx as usize * PAGE_SIZE);
-            decommit_zeroed(page_ptr, count as usize * PAGE_SIZE);
-        }
+        cage.retain(idx, count);
         cage.release_run(idx, count);
     }
 
+    /// Return a page to the cage free-list, its memory pooled for reuse.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee no live `Gc<T>` still references
+    /// any object on this page. Returning a still-referenced page
+    /// will manifest as a use-after-free on the next alloc.
     pub(crate) unsafe fn free_page(offset: u32) {
         let mut guard = CAGE_GUARD.lock().expect("cage mutex poisoned");
         let cage = guard.as_mut().expect("cage not initialised");
         debug_assert!(offset.is_multiple_of(PAGE_SIZE as u32));
         debug_assert!(offset / (PAGE_SIZE as u32) < cage.page_count);
         let idx = offset / (PAGE_SIZE as u32);
-        // SAFETY: `idx` is in-range, so this address is inside the cage page
-        // currently being returned to the free-list.
-        let page_ptr = unsafe { cage.base.add(idx as usize * PAGE_SIZE) };
-        // SAFETY: `page_ptr` is in-range, page memory belongs to the cage and
-        // is owned by the cage allocator (we hold the mutex).
-        unsafe { decommit_zeroed(page_ptr, PAGE_SIZE) };
+        cage.retain(idx, 1);
         cage.release_run(idx, 1);
     }
 
@@ -740,30 +910,26 @@ impl Cage {
                 total_pages: c.page_count,
                 free_pages,
                 allocated_pages,
+                retained_pages: c.retained_count as usize,
             }
         })
     }
 }
 
 /// Give the physical memory of `len` freed cage bytes at `ptr` back to the
-/// system and leave them reading as zero, so reuse sees a fresh page header.
-/// A fresh anonymous mapping over the range releases the memory at once,
-/// where zeroing would fault every page in and a lazy advice would leave it
-/// charged to the process until memory pressure; the address range stays
-/// reserved and writable. Should the remap fail, the range is zeroed in
-/// place.
+/// system. A fresh anonymous mapping over the range releases the memory at
+/// once, where a lazy advice would leave it charged to the process until
+/// memory pressure; the address range stays reserved and writable. Should
+/// the remap fail, the memory simply stays committed: nothing reads a free
+/// page's bytes.
 ///
 /// # Safety
 ///
 /// `ptr..ptr + len` is page-aligned, inside the cage reservation, and no
 /// live GC object refers to it.
-unsafe fn decommit_zeroed(ptr: *mut u8, len: usize) {
+unsafe fn release_memory(ptr: *mut u8, len: usize) {
     // SAFETY: per docstring; the range is aligned and exclusively owned.
-    if unsafe { discard::remap_zeroed(ptr, len) } {
-        return;
-    }
-    // SAFETY: per docstring.
-    unsafe { core::ptr::write_bytes(ptr, 0, len) };
+    let _ = unsafe { discard::remap_zeroed(ptr, len) };
 }
 
 impl Drop for Cage {
@@ -834,6 +1000,74 @@ mod tests {
             Cage::free_page(p1.offset);
             Cage::free_page(p2.offset);
         }
+    }
+
+    /// A private cage of `pages` pages, outside the process-global one.
+    fn local_cage(pages: u32) -> Cage {
+        let size = pages as usize * PAGE_SIZE;
+        let layout = Layout::from_size_align(size, PAGE_SIZE).expect("layout");
+        // SAFETY: the layout has a non-zero size.
+        let reservation = unsafe { alloc(layout) };
+        assert!(!reservation.is_null());
+        let words = (pages as usize).div_ceil(64);
+        Cage {
+            base: reservation,
+            size,
+            reservation,
+            reservation_layout: layout,
+            free_runs: std::collections::BTreeMap::new(),
+            next_fresh: 1,
+            page_count: pages,
+            retained: vec![0; words],
+            aging: vec![0; words],
+            retained_count: 0,
+            next_aging: None,
+        }
+    }
+
+    #[test]
+    fn released_pages_are_reused_committed_and_age_out() {
+        let mut cage = local_cage(8);
+        let byte = |cage: &Cage, page: u32| {
+            // SAFETY: the page lies inside the local cage's reservation.
+            unsafe { cage.base.add(page as usize * PAGE_SIZE + 64) }
+        };
+        let pages: Vec<u32> = (0..3).map(|_| cage.take_run(1).expect("page")).collect();
+        assert_eq!(pages, [1, 2, 3]);
+        for &page in &pages {
+            // SAFETY: as above; the page is owned by this test.
+            unsafe { byte(&cage, page).write(0xa5) };
+        }
+        cage.retain(2, 1);
+        cage.release_run(2, 1);
+        // A single page comes back from the pool with its memory.
+        assert_eq!(cage.take_run(1), Some(2));
+        // SAFETY: as above.
+        assert_eq!(unsafe { byte(&cage, 2).read() }, 0xa5);
+        assert_eq!(cage.retained_count, 0);
+
+        cage.retain(2, 2);
+        cage.release_run(2, 2);
+        let start = Instant::now();
+        cage.age_retained(start);
+        cage.age_retained(start + RETAINED_PAGE_WINDOW);
+        // The first step only ages what the pool held.
+        assert_eq!(cage.retained_count, 2);
+        // SAFETY: as above.
+        assert_eq!(unsafe { byte(&cage, 3).read() }, 0xa5);
+        cage.age_retained(start + RETAINED_PAGE_WINDOW * 2);
+        assert_eq!(cage.retained_count, 0);
+        assert!(cage.next_aging.is_none());
+        #[cfg(unix)]
+        for page in [2, 3] {
+            // SAFETY: as above; the remap left the range readable.
+            assert_eq!(unsafe { byte(&cage, page).read() }, 0);
+        }
+        // A run taken across retained pages leaves none of them pooled.
+        cage.retain(1, 1);
+        cage.release_run(1, 1);
+        assert_eq!(cage.take_run(3), Some(1));
+        assert_eq!(cage.retained_count, 0);
     }
 
     #[test]

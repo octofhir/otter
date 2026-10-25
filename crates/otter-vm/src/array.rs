@@ -2579,17 +2579,21 @@ where
 /// Remember every value a freshly filled slab holds.
 ///
 /// Construction and growth copy values in behind the mutator's back, so
-/// the edges they create need recording in one pass afterwards.
+/// the edges they create need recording in one pass afterwards: one bulk
+/// barrier, which outside marking is done once the slab is remembered.
 fn record_slab_contents(heap: &mut GcHeap, slab: elements::ElementSlabHandle, len: usize) {
     if slab.is_null() || elements::kind_of(slab) != DenseElementKind::Tagged {
         return;
     }
     let body = elements::body_of(slab).expect("live element slab");
-    for index in 0..len {
-        // SAFETY: `index < len`, the tagged prefix the caller just wrote.
-        let value = unsafe { (*body).get(index).expect("live tagged slot") };
-        heap.record_write(slab, &value);
-    }
+    heap.record_bulk_writes(
+        slab,
+        (0..len).map(|index| {
+            // SAFETY: `index < len`, the tagged prefix the caller just wrote;
+            // the barrier neither allocates nor moves the slab.
+            unsafe { (*body).get(index).expect("live tagged slot") }
+        }),
+    );
 }
 
 /// Make room for `target_len` dense elements, growing the slab if the

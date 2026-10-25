@@ -563,6 +563,9 @@ pub(crate) enum Kind {
     /// or a slice of a flat string, and the index lies within it. Eager
     /// deopt otherwise.
     StringCharCodeAt,
+    /// The `length` of the primitive string input0 as an int32. Eager deopt
+    /// unless input0 is a string.
+    LoadStringLength,
     /// The own-property bag of the closure or native function input0 whose
     /// named lookup starts there: the bag exists, no `[[Prototype]]` override
     /// is installed and the default realm is active. Eager deopt otherwise.
@@ -766,6 +769,11 @@ pub(crate) enum Kind {
     /// call, or the `call` a method call reads from its closure receiver
     /// input0 through the pinned `%Function.prototype%`.
     CheckFunctionPrototypeCall(u32),
+    /// Eager deopt unless input0 is a receiver of the guarded builtin method
+    /// call at this byte PC and the method its pinned prototype holds is
+    /// still that builtin: the receiver's body kind, the prototype's layout
+    /// and the slot's native.
+    CheckGuardedMethod(u32),
     /// Eager deopt unless input0 is the native function whose external
     /// reference index is the immediate.
     CheckNative(u32),
@@ -1071,6 +1079,7 @@ impl Kind {
             | Self::CheckShapes { .. }
             | Self::CheckBounds
             | Self::CheckFunctionPrototypeCall(_)
+            | Self::CheckGuardedMethod(_)
             | Self::CheckNative(_)
             | Self::CheckArgumentsElided
             | Self::LoadActualArgument
@@ -1089,6 +1098,7 @@ impl Kind {
             | Self::LoadHoleyFloat64Element(_)
             | Self::LoadArrayLength { .. }
             | Self::LoadTypedArrayLength
+            | Self::LoadStringLength
             | Self::StringCharCodeAt => eager,
             // A derived constructor changes its physical this binding at
             // super(); lexical capture must read the current binding here.
@@ -1511,7 +1521,7 @@ impl Kind {
                 simple(2, ResultPolicy::None)
             }
             Self::StoreElement(_) | Self::ElementWriteBarrier => simple(3, ResultPolicy::None),
-            Self::CheckFunctionPrototypeCall(_) => Constraints {
+            Self::CheckFunctionPrototypeCall(_) | Self::CheckGuardedMethod(_) => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::None,
                 gp_temps: 1,
@@ -1684,6 +1694,7 @@ impl Kind {
             | Self::LoadReceiverShape
             | Self::LoadArrayLength { .. }
             | Self::LoadTypedArrayLength
+            | Self::LoadStringLength
             | Self::BooleanToInt32 => simple(1, ResultPolicy::Register),
             Self::LoadOwnField { .. } | Self::Float64ToTagged => simple(1, ResultPolicy::Register),
             Self::LoadNumberOwnField { .. } => simple(1, ResultPolicy::Register),

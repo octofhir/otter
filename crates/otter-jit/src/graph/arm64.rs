@@ -2167,6 +2167,19 @@ impl<'a> Codegen<'a> {
                     exit,
                 );
             }
+            Kind::LoadStringLength => {
+                let (receiver, destination) =
+                    (Self::gp(input(0)), Self::gp(result.expect("a result")));
+                let exit = self.eager_exit(node, DeoptReason::WrongType);
+                let p = self.view.string_layout;
+                self.emit_cell_receiver(receiver, exit);
+                dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(receiver), JIT_MAP_WORD_BYTE]);
+                self.emit_compare_w16(p.map_atom_word as u32);
+                dynasm!(self.ops ; .arch aarch64
+                    ; b.ne =>exit
+                    ; ldr W(destination), [X(receiver), p.string_len_byte]
+                );
+            }
             Kind::StringCharCodeAt => {
                 let exit = self.eager_exit(node, DeoptReason::WrongType);
                 self.emit_string_char_code_at(
@@ -2574,6 +2587,15 @@ impl<'a> Codegen<'a> {
                 let byte_pc = *byte_pc;
                 self.emit_check_function_prototype_call(node, byte_pc, value, temp)?;
             }
+            Kind::CheckGuardedMethod(byte_pc) => {
+                let value = Self::gp(input(0));
+                let temp = allocation.gp_temps[0];
+                let byte_pc = *byte_pc;
+                let (method, site) =
+                    super::call::guarded_intrinsic_method(self.view_of(node), byte_pc)?;
+                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                self.emit_intrinsic_method_identity(method, site, value, temp, exit);
+            }
             Kind::LoadGuardedMethod {
                 byte_pc,
                 target,
@@ -2835,7 +2857,7 @@ impl<'a> Codegen<'a> {
         self.emit_intrinsic_method_identity(
             IntrinsicMethod {
                 receiver: lookup.receiver,
-                holder_shape: lookup.holder_shape,
+                holder: super::call::IntrinsicHolder::Shape(lookup.holder_shape),
                 field: lookup.call_field,
                 native_ref,
             },
@@ -2879,8 +2901,30 @@ impl<'a> Codegen<'a> {
             ; add X(temp), X(temp), x16
             ; ldr w16, [X(temp), view.object_shape_byte]
         );
-        self.load_immediate(17, u64::from(method.holder_shape));
-        dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>miss);
+        match method.holder {
+            super::call::IntrinsicHolder::Shape(shape) => {
+                self.load_immediate(17, u64::from(shape));
+                dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>miss);
+            }
+            // A dictionary-mode holder keeps every existing key's slot while
+            // its layout epoch is unchanged.
+            super::call::IntrinsicHolder::Dictionary(layout) => {
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; and x17, X(temp), #0xffff_ffff_0000_0000
+                    ; add x16, x17, x16
+                    ; ldrb w16, [x16, view.shape_state_byte]
+                    ; tst w16, u32::from(otter_vm::object::ShapeState::DICTIONARY_MASK)
+                    ; b.eq =>miss
+                    ; ldr w16, [X(temp), view.object_exotic_handle_byte]
+                    ; cbz w16, =>miss
+                    ; add x16, x17, x16
+                    ; ldr w16, [x16, view.exotic_dictionary_layout_byte]
+                );
+                self.load_immediate(17, layout);
+                dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>miss);
+            }
+        }
         self.emit_field_storage(temp, 16, method.field);
         let byte = method.field.byte_offset();
         if byte <= 32760 {

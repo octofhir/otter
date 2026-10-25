@@ -153,6 +153,7 @@ fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
         }
         Kind::CheckBounds => &[R::BoundsGuard],
         Kind::StringCharCodeAt => &[R::TypeMismatch, R::BoundsGuard],
+        Kind::LoadStringLength => &[R::TypeMismatch],
         Kind::Int32Add | Kind::Int32Sub | Kind::Int32Negate => &[R::Int32Overflow, R::NegativeZero],
         Kind::Int32Mul
         | Kind::Int32MulIdentifyZeros
@@ -163,6 +164,7 @@ fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
         | Kind::CheckCellValue(_)
         | Kind::CheckNative(_)
         | Kind::CheckFunctionPrototypeCall(_)
+        | Kind::CheckGuardedMethod(_)
         | Kind::CheckClosureContext(_) => &[R::IdentityGuard],
         Kind::CheckFieldTypes(_)
         | Kind::CheckContextSlot { .. }

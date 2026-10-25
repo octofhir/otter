@@ -725,6 +725,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
         },
         Kind::LoadArrayExpando(JitArrayLayout::default()),
         Kind::StringCharCodeAt,
+        Kind::LoadStringLength,
         Kind::LoadFunctionBag,
         Kind::StoreOwnField {
             field,
@@ -816,6 +817,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
             bindings: Box::new([]),
         },
         Kind::CheckFunctionPrototypeCall(0),
+        Kind::CheckGuardedMethod(0),
         Kind::CheckNative(0),
         Kind::CheckArgumentsElided,
         Kind::LoadArgumentCount,
@@ -978,6 +980,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::LoadNumberOwnField { .. }
         | K::LoadArrayExpando(_)
         | K::StringCharCodeAt
+        | K::LoadStringLength
         | K::LoadFunctionBag
         | K::StoreOwnField { .. }
         | K::StoreDoubleOwnField { .. }
@@ -1008,6 +1011,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::CallJs { .. }
         | K::CallForward { .. }
         | K::CheckFunctionPrototypeCall(_)
+        | K::CheckGuardedMethod(_)
         | K::CheckNative(_)
         | K::CheckArgumentsElided
         | K::LoadArgumentCount

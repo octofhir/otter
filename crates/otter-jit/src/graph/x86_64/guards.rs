@@ -182,6 +182,18 @@ impl Codegen<'_> {
                     assigned.gp_temps[0],
                 )?;
             }
+            Kind::CheckGuardedMethod(byte_pc) => {
+                let (method, site) =
+                    crate::graph::call::guarded_intrinsic_method(self.view_of(node), byte_pc)?;
+                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                self.emit_intrinsic_method_identity(
+                    method,
+                    site,
+                    input(0),
+                    assigned.gp_temps[0],
+                    exit,
+                );
+            }
             _ => return Ok(false),
         }
         Ok(true)
@@ -300,7 +312,7 @@ impl Codegen<'_> {
             self.emit_intrinsic_method_identity(
                 IntrinsicMethod {
                     receiver: lookup.receiver,
-                    holder_shape: lookup.holder_shape,
+                    holder: crate::graph::call::IntrinsicHolder::Shape(lookup.holder_shape),
                     field: lookup.call_field,
                     native_ref: proof.call_native_ref,
                 },
@@ -328,8 +340,31 @@ impl Codegen<'_> {
     ) {
         self.emit_intrinsic_prototype(method.receiver, byte_pc, value, holder, miss, stub_id);
         let view = self.view;
-        dynasm!(self.ops ; .arch x64
-            ; cmp DWORD [Rq(holder) + view.object_shape_byte as i32], method.holder_shape as i32 ; jne =>miss);
+        match method.holder {
+            crate::graph::call::IntrinsicHolder::Shape(shape) => dynasm!(self.ops ; .arch x64
+                ; cmp DWORD [Rq(holder) + view.object_shape_byte as i32], shape as i32 ; jne =>miss),
+            // A dictionary-mode holder keeps every existing key's slot while
+            // its layout epoch is unchanged.
+            crate::graph::call::IntrinsicHolder::Dictionary(layout) => {
+                emit_load_symbol_u64(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    11,
+                    view.cage_base as u64,
+                    RelocationTarget::GcCageBase,
+                );
+                dynasm!(self.ops ; .arch x64
+                    ; mov r10d, [Rq(holder) + view.object_shape_byte as i32]
+                    ; test BYTE [r11 + r10 + view.shape_state_byte as i32], otter_vm::object::ShapeState::DICTIONARY_MASK as i8
+                    ; jz =>miss
+                    ; mov r10d, [Rq(holder) + view.object_exotic_handle_byte as i32]
+                    ; test r10d, r10d
+                    ; jz =>miss
+                    ; add r10, r11
+                    ; cmp DWORD [r10 + view.exotic_dictionary_layout_byte as i32], layout as u32 as i32
+                    ; jne =>miss);
+            }
+        }
         crate::x86_64::fields::emit_own_field(
             &mut self.ops,
             view.field_layout,

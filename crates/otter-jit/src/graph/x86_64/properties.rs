@@ -153,6 +153,16 @@ impl Codegen<'_> {
                     exit,
                 );
             }
+            Kind::LoadStringLength => {
+                let exit = self.eager_exit(node, DeoptReason::WrongType);
+                let p = self.view.string_layout;
+                let (receiver, destination) = (input(0), result());
+                self.emit_cell_guard(receiver, exit);
+                dynasm!(self.ops ; .arch x64
+                    ; cmp DWORD [Rq(receiver) + otter_vm::jit::JIT_MAP_WORD_BYTE as i32], p.map_atom_word as u32 as i32
+                    ; jne =>exit
+                    ; mov Rd(destination), [Rq(receiver) + p.string_len_byte as i32]);
+            }
             Kind::StringCharCodeAt => {
                 let exit = self.eager_exit(node, DeoptReason::WrongType);
                 self.emit_string_char_code_at(

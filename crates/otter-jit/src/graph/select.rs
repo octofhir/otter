@@ -82,6 +82,7 @@ fn loads_stored_value(kind: &Kind) -> bool {
             | Kind::LoadCellValue(_)
             | Kind::LoadArrayLength { .. }
             | Kind::LoadTypedArrayLength
+            | Kind::LoadStringLength
             | Kind::LoadElementsLength { .. }
     )
 }

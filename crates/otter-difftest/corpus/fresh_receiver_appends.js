@@ -83,4 +83,32 @@ for (let i = 0; i < 40000; i++) {
 }
 results.push(points);
 
+// The same, with the counts the recompiled loop must keep: once the setter
+// exists no receiver is born holding its own field for the key.
+function Pair(a, b) {
+  this.a = a;
+  this.b = b;
+}
+let ownB = 0;
+let wrongB = 0;
+for (let i = 0; i < 40000; i++) {
+  if (i === 20000) {
+    Object.defineProperty(Pair.prototype, 'b', {
+      set(v) {
+        this._b = v * 3;
+      },
+      get() {
+        return this._b;
+      },
+      configurable: true,
+    });
+  }
+  const p = new Pair(i, i + 1);
+  if (i >= 20000) {
+    if (Object.prototype.hasOwnProperty.call(p, 'b')) ownB++;
+    if (p.b !== (i + 1) * 3) wrongB++;
+  }
+}
+results.push(ownB, wrongB);
+
 console.log(JSON.stringify(results));

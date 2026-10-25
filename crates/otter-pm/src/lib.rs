@@ -37,6 +37,7 @@ mod npm_range;
 mod policy;
 mod registry;
 mod release_age;
+mod resolve;
 mod script_sniff;
 mod store;
 mod tarball;
@@ -46,9 +47,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::time::SystemTime;
-
-use crate::release_age::ReleaseAgeGate;
 
 use otter_pm_lockfile::{
     LifecycleMetadata, LockedPackage, Lockfile, ResolvedSource, ResolvedSourceKind, TrustState,
@@ -66,15 +64,16 @@ pub use freshness::{
     DependencyState, StaleDependency, StaleReason, inspect_installed_dependencies,
 };
 pub use install::{ExtractedPackage, FsPackageStore, InstalledPackage};
-pub use npm_range::NpmRange;
 pub use installed_graph::{prune_removed_registry_packages, resolve_installed_project};
 pub use lifecycle::{LifecycleOutcome, LifecycleRun, PendingBuild, pending_builds};
+pub use npm_range::NpmRange;
 pub use policy::{BuildDecision, InstallPolicy};
 pub use registry::{
     FileRegistryMetadataClient, FsRegistryMetadataCache, HttpRegistryMetadataClient,
     NpmAttestations, NpmDist, NpmPackageVersion, NpmProvenance, NpmRegistryMetadata,
     RegistryMetadataClient,
 };
+pub use resolve::enrich_resolution_with_registry_metadata;
 pub use script_sniff::{ScriptFinding, suspicious_script_findings};
 pub use store::{ContentStore, PackageIndex, StoredFile};
 pub use tarball::{
@@ -84,7 +83,7 @@ pub use tarball::{
 pub use warning::InstallWarning;
 
 /// Package-manager error type.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum PackageManagerError {
     /// Filesystem operation failed.
@@ -251,10 +250,23 @@ impl PackageId {
         ))
     }
 
-    /// Build a registry range package id.
+    /// Build a registry range package id: a dependency not resolved yet.
     #[must_use]
     pub fn registry(name: &str, range: &str) -> Self {
         Self(format!("{name}@npm:{range}"))
+    }
+
+    /// Build a resolved registry package id: the package at one version.
+    #[must_use]
+    pub fn registry_version(name: &str, version: &str) -> Self {
+        Self(format!("{name}@npm:{version}"))
+    }
+
+    /// Build the id of an `npm:` alias resolved to one version of the
+    /// package it names.
+    #[must_use]
+    pub fn registry_alias(alias: &str, package: &str, version: &str) -> Self {
+        Self(format!("{alias}@npm:{package}@{version}"))
     }
 
     /// Build a tarball package id.
@@ -796,21 +808,27 @@ async fn apply_tarball_manifest_metadata(
         let Some(locked) = resolution.lockfile.packages.get(&package.package_id) else {
             continue;
         };
-        if !locked
+        let Some(source_kind) = locked
             .resolved
             .as_ref()
-            .is_some_and(|source| is_tarball_reference(&source.reference))
-        {
+            .filter(|source| is_tarball_reference(&source.reference))
+            .map(|source| source.kind)
+        else {
             continue;
-        }
+        };
         let manifest = PackageManifest::read_from_dir(&package.installed_root).await?;
         let id = PackageId::new(&package.package_id);
+        // A registry package's name, version and edges come from its registry
+        // manifest; a tarball named directly reveals them once unpacked.
+        let direct = source_kind == ResolvedSourceKind::Tarball;
         if let Some(root) = resolution.graph.packages.get_mut(&id) {
-            root.name = manifest.name.clone().unwrap_or_else(|| root.name.clone());
-            root.version = manifest
-                .version
-                .clone()
-                .unwrap_or_else(|| root.version.clone());
+            if direct {
+                root.name = manifest.name.clone().unwrap_or_else(|| root.name.clone());
+                root.version = manifest
+                    .version
+                    .clone()
+                    .unwrap_or_else(|| root.version.clone());
+            }
             root.manifest = manifest.clone();
         }
         insert_bins_for_manifest(
@@ -819,30 +837,52 @@ async fn apply_tarball_manifest_metadata(
             &package.installed_root,
             &manifest,
         );
-
-        let before = resolution.lockfile.clone();
         if let Some(locked) = resolution.lockfile.packages.get_mut(&package.package_id) {
-            if let Some(name) = &manifest.name {
-                locked.name = name.clone();
-            }
-            if let Some(version) = &manifest.version {
-                locked.version = version.clone();
+            if direct {
+                if let Some(name) = &manifest.name {
+                    locked.name = name.clone();
+                }
+                if let Some(version) = &manifest.version {
+                    locked.version = version.clone();
+                }
             }
             locked.lifecycle =
                 lifecycle_metadata_for_manifest(&manifest, Some(&package.installed_root));
         }
+        if !direct {
+            continue;
+        }
+        // The unpacked manifest is the same on every pass: only the edges not
+        // yet linked are new.
+        let linked = resolution.graph.dependencies.get(&id).cloned();
         let workspace_by_name: BTreeMap<String, &otter_pm_manifest::WorkspacePackage> =
             BTreeMap::new();
-        resolve_manifest_dependencies(
-            project_root,
-            &mut resolution.graph,
-            &mut resolution.lockfile,
-            &id,
-            &manifest,
-            &workspace_by_name,
-        )
-        .await?;
-        changed |= before != resolution.lockfile;
+        for (bucket_name, dependencies) in manifest.dependency_buckets() {
+            let kind = dependency_kind_for_bucket(bucket_name);
+            let fresh: DependencySet = dependencies
+                .iter()
+                .filter(|(name, _)| {
+                    linked
+                        .as_ref()
+                        .is_none_or(|linked| !linked.contains_key(*name))
+                })
+                .map(|(name, spec)| (name.clone(), spec.clone()))
+                .collect();
+            if kind == PackageDependencyKind::Development || fresh.is_empty() {
+                continue;
+            }
+            changed = true;
+            resolve_dependency_bucket(
+                project_root,
+                &mut resolution.graph,
+                &mut resolution.lockfile,
+                &id,
+                &fresh,
+                kind,
+                &workspace_by_name,
+            )
+            .await?;
+        }
     }
     Ok(changed)
 }
@@ -1020,109 +1060,6 @@ pub async fn resolve_local_project_with_registry_metadata(
     Ok(resolution)
 }
 
-/// Enrich an existing local resolution with registry metadata.
-pub async fn enrich_resolution_with_registry_metadata(
-    resolution: &mut LocalResolution,
-    cache: &FsRegistryMetadataCache,
-    client: &impl RegistryMetadataClient,
-    policy: &InstallPolicy,
-    warnings: &mut Vec<InstallWarning>,
-) -> Result<(), PackageManagerError> {
-    let gate = ReleaseAgeGate::new(policy, SystemTime::now());
-    let project_root = infer_project_root(&resolution.graph);
-    let mut processed = BTreeMap::new();
-    while let Some((id, name, range)) =
-        next_unresolved_registry_package(&resolution.lockfile, &processed)
-    {
-        processed.insert(id.clone(), ());
-        let metadata = cache.get_or_fetch(&name, client).await?;
-        let version = select_registry_version(&metadata, &range, &gate, warnings)?;
-        let graph_id = PackageId::new(id.clone());
-        let mut dependency_edges = Vec::new();
-        let package = resolution
-            .lockfile
-            .packages
-            .get_mut(&id)
-            .ok_or_else(|| PackageManagerError::UnknownPackage(id.clone()))?;
-        package.version = version.version.clone();
-        package.integrity = version
-            .dist
-            .integrity
-            .clone()
-            .or_else(|| version.dist.shasum.as_ref().map(|s| format!("sha1-{s}")));
-        package.resolved = version.dist.tarball.as_ref().map(|tarball| ResolvedSource {
-            kind: ResolvedSourceKind::Registry,
-            reference: tarball.clone(),
-        });
-        package.attested = version.has_provenance();
-        package.lifecycle = LifecycleMetadata::from_scripts(&version.scripts, TrustState::Unknown);
-        for (dep_name, dep_range, dependency_kind) in registry_dependency_edges(&version) {
-            let dep_id = PackageId::registry(&dep_name, &dep_range);
-            package
-                .dependencies
-                .entry(dep_name.clone())
-                .or_insert_with(|| dep_id.to_string());
-            dependency_edges.push((dep_name.clone(), dep_range.clone(), dep_id, dependency_kind));
-        }
-
-        if let Some(root) = resolution.graph.packages.get_mut(&graph_id) {
-            root.version = version.version.clone();
-            root.manifest.version = Some(version.version.clone());
-            root.manifest.dependencies = version.dependencies.clone();
-            root.manifest.peer_dependencies = version.peer_dependencies.clone();
-            root.manifest.optional_dependencies = version.optional_dependencies.clone();
-            root.manifest.bin = version.bin.clone();
-            root.manifest.scripts = version.scripts.clone();
-            let root_path = root.root.clone();
-            let manifest = root.manifest.clone();
-            insert_bins_for_manifest(&mut resolution.graph, &graph_id, &root_path, &manifest);
-        }
-        for (dep_name, dep_range, dep_id, dependency_kind) in dependency_edges {
-            ensure_registry_package(
-                &project_root,
-                &mut resolution.graph,
-                &mut resolution.lockfile,
-                &dep_id,
-                &dep_name,
-                &dep_range,
-            );
-            resolution.graph.insert_dependency_with_kind(
-                graph_id.clone(),
-                dep_name,
-                dep_id,
-                dependency_kind,
-            );
-        }
-    }
-    Ok(())
-}
-
-fn registry_dependency_edges(
-    version: &NpmPackageVersion,
-) -> Vec<(String, String, PackageDependencyKind)> {
-    let mut edges = Vec::new();
-    edges.extend(
-        version
-            .dependencies
-            .iter()
-            .map(|(name, range)| (name.clone(), range.clone(), PackageDependencyKind::Runtime)),
-    );
-    edges.extend(
-        version
-            .peer_dependencies
-            .iter()
-            .map(|(name, range)| (name.clone(), range.clone(), PackageDependencyKind::Peer)),
-    );
-    edges.extend(
-        version
-            .optional_dependencies
-            .iter()
-            .map(|(name, range)| (name.clone(), range.clone(), PackageDependencyKind::Optional)),
-    );
-    edges.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
-    edges
-}
-
 /// Fetch all registry tarballs referenced by an enriched lockfile into a
 /// content-addressed cache.
 pub async fn cache_registry_tarballs(
@@ -1178,141 +1115,7 @@ pub trait PackageResolver {
     >;
 }
 
-fn select_registry_version(
-    metadata: &NpmRegistryMetadata,
-    range: &str,
-    gate: &ReleaseAgeGate,
-    warnings: &mut Vec<InstallWarning>,
-) -> Result<NpmPackageVersion, PackageManagerError> {
-    if let Some(version) = metadata.versions.get(range) {
-        return accept_sole_candidate(metadata, version, gate, warnings);
-    }
-    if matches!(range, "*" | "latest")
-        && let Some(latest) = metadata.dist_tags.get("latest")
-        && let Some(version) = metadata.versions.get(latest)
-    {
-        return accept_sole_candidate(metadata, version, gate, warnings);
-    }
-    if let Some(version) = select_semver_version(metadata, range, gate, warnings)? {
-        return Ok(version);
-    }
-    Err(PackageManagerError::NoMatchingVersion {
-        package: metadata.name.clone(),
-        range: range.to_string(),
-    })
-}
-
-/// Apply the age gate where the range leaves exactly one candidate.
-///
-/// There is nothing to fall back to, so a non-strict gate warns and proceeds
-/// rather than failing an install whose version the project itself pinned.
-fn accept_sole_candidate(
-    metadata: &NpmRegistryMetadata,
-    version: &NpmPackageVersion,
-    gate: &ReleaseAgeGate,
-    warnings: &mut Vec<InstallWarning>,
-) -> Result<NpmPackageVersion, PackageManagerError> {
-    if gate.is_disabled() || gate.admits(metadata, &version.version) {
-        return Ok(version.clone());
-    }
-    let age_hours = gate.version_age_hours(metadata, &version.version);
-    if gate.is_strict() {
-        return Err(PackageManagerError::ReleaseTooNew {
-            package: metadata.name.clone(),
-            version: version.version.clone(),
-            age_hours,
-            minimum_hours: gate.window_hours(),
-        });
-    }
-    warnings.push(InstallWarning::new(
-        "PM_RELEASE_INSIDE_COOLING_WINDOW",
-        format!(
-            "`{}@{}` was published {age_hours}h ago and is the only version the range allows",
-            metadata.name, version.version
-        ),
-    ));
-    Ok(version.clone())
-}
-
-fn select_semver_version(
-    metadata: &NpmRegistryMetadata,
-    range: &str,
-    gate: &ReleaseAgeGate,
-    warnings: &mut Vec<InstallWarning>,
-) -> Result<Option<NpmPackageVersion>, PackageManagerError> {
-    let Some(req) = NpmRange::parse(range) else {
-        return Ok(None);
-    };
-    let mut versions = metadata
-        .versions
-        .keys()
-        .filter_map(|version| semver::Version::parse(version).ok())
-        .filter(|version| req.matches(version))
-        .collect::<Vec<_>>();
-    versions.sort();
-    let Some(newest) = versions.pop() else {
-        return Ok(None);
-    };
-    let newest = newest.to_string();
-    if gate.is_disabled() || gate.admits(metadata, &newest) {
-        return Ok(metadata.versions.get(&newest).cloned());
-    }
-
-    let age_hours = gate.version_age_hours(metadata, &newest);
-    if gate.is_strict() {
-        return Err(PackageManagerError::ReleaseTooNew {
-            package: metadata.name.clone(),
-            version: newest,
-            age_hours,
-            minimum_hours: gate.window_hours(),
-        });
-    }
-    // The newest match is still inside the cooling window, so fall back to the
-    // newest match that has cleared it.
-    while let Some(candidate) = versions.pop() {
-        let candidate = candidate.to_string();
-        if gate.admits(metadata, &candidate) {
-            warnings.push(InstallWarning::new(
-                "PM_RELEASE_HELD_BACK",
-                format!(
-                    "`{}` resolved to {candidate}: {newest} was published {age_hours}h ago, \
-                     inside the {}h minimum release age",
-                    metadata.name,
-                    gate.window_hours()
-                ),
-            ));
-            return Ok(metadata.versions.get(&candidate).cloned());
-        }
-    }
-    Err(PackageManagerError::ReleaseTooNew {
-        package: metadata.name.clone(),
-        version: newest,
-        age_hours,
-        minimum_hours: gate.window_hours(),
-    })
-}
-
-fn next_unresolved_registry_package(
-    lockfile: &Lockfile,
-    processed: &BTreeMap<String, ()>,
-) -> Option<(String, String, String)> {
-    lockfile.packages.iter().find_map(|(id, package)| {
-        if processed.contains_key(id) {
-            return None;
-        }
-        match &package.resolved {
-            Some(ResolvedSource {
-                kind: ResolvedSourceKind::Registry,
-                reference,
-            }) if !is_tarball_reference(reference) => {
-                Some((id.clone(), package.name.clone(), reference.clone()))
-            }
-            _ => None,
-        }
-    })
-}
-
-fn infer_project_root(graph: &PackageGraph) -> PathBuf {
+pub(crate) fn infer_project_root(graph: &PackageGraph) -> PathBuf {
     graph
         .packages
         .iter()
@@ -1333,7 +1136,7 @@ fn infer_project_root(graph: &PackageGraph) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn is_tarball_reference(reference: &str) -> bool {
+pub(crate) fn is_tarball_reference(reference: &str) -> bool {
     reference.ends_with(".tgz")
         || reference.ends_with(".tar.gz")
         || reference
@@ -1530,7 +1333,7 @@ fn ensure_registry_package(
     );
 }
 
-fn ensure_tarball_package(
+pub(crate) fn ensure_tarball_package(
     project_root: &Path,
     graph: &mut PackageGraph,
     lockfile: &mut Lockfile,
@@ -1627,7 +1430,7 @@ fn lifecycle_metadata_for_manifest(
     LifecycleMetadata::from_install_scripts(scripts, TrustState::Unknown)
 }
 
-fn insert_bins_for_manifest(
+pub(crate) fn insert_bins_for_manifest(
     graph: &mut PackageGraph,
     package_id: &PackageId,
     package_root: &Path,
@@ -1890,7 +1693,7 @@ mod tests {
         let package = resolution
             .lockfile
             .packages
-            .get("left-pad@npm:^1.0.0")
+            .get("left-pad@npm:1.3.0")
             .unwrap();
         assert_eq!(package.version, "1.3.0");
         assert_eq!(package.integrity.as_deref(), Some("sha512-new"));
@@ -1900,7 +1703,7 @@ mod tests {
         );
         assert_eq!(
             package.dependencies["repeat-string"],
-            "repeat-string@npm:^1.6.1"
+            "repeat-string@npm:1.6.1"
         );
         assert_eq!(
             package.lifecycle.scripts["postinstall"],
@@ -2091,12 +1894,9 @@ mod tests {
         .await
         .unwrap();
 
-        let pkg_a = PackageId::registry("pkg-a", "^1.0.0");
-        let pkg_b = PackageId::registry("pkg-b", "^1.0.0");
-        assert_eq!(
-            resolution.graph.dependencies[&pkg_a]["pkg-b"],
-            PackageId::registry("pkg-b", "^1.0.0")
-        );
+        let pkg_a = PackageId::registry_version("pkg-a", "1.0.0");
+        let pkg_b = PackageId::registry_version("pkg-b", "1.0.0");
+        assert_eq!(resolution.graph.dependencies[&pkg_a]["pkg-b"], pkg_b);
         assert_eq!(
             resolution.graph.dependency_kind(&pkg_a, "pkg-b"),
             Some(PackageDependencyKind::Runtime)
@@ -2781,7 +2581,7 @@ mod tests {
         assert!(lockfile.contains("version = \"1.0.0\""));
         assert!(lockfile.contains("kind = \"tarball\""));
         assert!(lockfile.contains("postinstall = \"node setup.js\""));
-        assert!(lockfile.contains("dep = \"dep@npm:^1.0.0\""));
+        assert!(lockfile.contains("dep = \"dep@npm:1.0.0\""));
         assert!(project.join("node_modules/dep/index.js").is_file());
         assert!(project.join("node_modules/tool/bin.js").is_file());
         assert!(project.join("node_modules/.bin/tool").is_file());

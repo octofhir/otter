@@ -22,9 +22,12 @@
 //!   updates a stored file in place.
 //! - Writes land through a temporary path and a rename, so a reader never
 //!   observes a partially written file or index.
-//! - Materialization prefers a hard link and falls back to a copy. A link is
-//!   free; a copy is correct on a filesystem that cannot link across its
-//!   layout. Both leave the same tree behind.
+//! - Materialization clones a package's stored tree where the filesystem
+//!   clones directories, and otherwise prefers a hard link per file and falls
+//!   back to a copy. A link is free; a copy is correct on a filesystem that
+//!   cannot link across its layout. All leave the same tree behind.
+//! - A stored tree, like stored content, is written once through a temporary
+//!   directory and never changed; a clone of it is the project's own copy.
 //! - Index maps are ordered, so a fingerprint over an index is stable across
 //!   platforms and runs.
 //!
@@ -85,6 +88,7 @@ impl PackageIndex {
 pub struct ContentStore {
     files_root: PathBuf,
     index_root: PathBuf,
+    trees_root: PathBuf,
 }
 
 impl ContentStore {
@@ -95,6 +99,7 @@ impl ContentStore {
         Self {
             files_root: root.join("files"),
             index_root: root.join("index"),
+            trees_root: root.join("trees"),
         }
     }
 
@@ -149,7 +154,13 @@ impl ContentStore {
         if !path.exists() {
             let parent = path.parent().unwrap_or(&self.files_root);
             create_dir_all(parent)?;
-            let temporary = parent.join(format!(".tmp-{hash}-{}", std::process::id()));
+            // Packages store concurrently and often share a file: the
+            // temporary name is the writing thread's own.
+            let temporary = parent.join(format!(
+                ".tmp-{hash}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
             std::fs::write(&temporary, bytes).map_err(|err| PackageManagerError::Io {
                 path: temporary.clone(),
                 message: err.to_string(),
@@ -198,6 +209,67 @@ impl ContentStore {
         })
     }
 
+    /// Materialize the package filed under `key` into `target_root`, a path
+    /// that does not exist yet.
+    ///
+    /// Where the filesystem clones directories (APFS), the package's tree is
+    /// built once in the store and every install clones it whole: one call
+    /// per package, its files sharing the stored blocks until written.
+    /// Elsewhere every file is linked as [`Self::materialize`] links it.
+    pub fn materialize_package(
+        &self,
+        key: &str,
+        index: &PackageIndex,
+        target_root: &Path,
+    ) -> Result<(), PackageManagerError> {
+        #[cfg(target_os = "macos")]
+        {
+            // A clone creates its target, not the directories above it.
+            if let Some(parent) = target_root.parent() {
+                create_dir_all(parent)?;
+            }
+            if self.ensure_tree(key, index).is_ok()
+                && clone_tree(&self.trees_root.join(key), target_root).is_ok()
+            {
+                return Ok(());
+            }
+        }
+        self.materialize(index, target_root)
+    }
+
+    /// The stored tree of the package filed under `key`, built on first use.
+    #[cfg(target_os = "macos")]
+    fn ensure_tree(&self, key: &str, index: &PackageIndex) -> Result<(), PackageManagerError> {
+        let tree = self.trees_root.join(key);
+        if tree.exists() {
+            return Ok(());
+        }
+        let temporary = self.trees_root.join(format!(
+            ".tmp-{key}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        if temporary.exists() {
+            std::fs::remove_dir_all(&temporary).map_err(|err| PackageManagerError::Io {
+                path: temporary.clone(),
+                message: err.to_string(),
+            })?;
+        }
+        self.materialize(index, &temporary)?;
+        // A concurrent install may have landed the same tree first.
+        match std::fs::rename(&temporary, &tree) {
+            Ok(()) => Ok(()),
+            Err(_) if tree.exists() => {
+                let _ = std::fs::remove_dir_all(&temporary);
+                Ok(())
+            }
+            Err(err) => Err(PackageManagerError::Io {
+                path: tree,
+                message: err.to_string(),
+            }),
+        }
+    }
+
     /// Materialize `index` into `target_root`, linking to stored content.
     pub fn materialize(
         &self,
@@ -236,6 +308,12 @@ impl ContentStore {
         }
         Ok(())
     }
+}
+
+/// Clone directory `source` to `target` with one copy-on-write call.
+#[cfg(target_os = "macos")]
+fn clone_tree(source: &Path, target: &Path) -> std::io::Result<()> {
+    reflink_copy::reflink(source, target)
 }
 
 fn create_dir_all(path: &Path) -> Result<(), PackageManagerError> {

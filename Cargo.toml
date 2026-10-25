@@ -83,6 +83,7 @@ brotli      = { version = "8.0.4", default-features = false, features = ["std"] 
 zstd-safe   = { version = "7.2.4", features = ["std"] }
 libz-rs-sys = { version = "0.6.7", default-features = false, features = ["std", "rust-allocator"] }
 tar         = "0.4.45"
+reflink-copy = "0.1.30"
 
 # CLI / diagnostics / tracing.
 clap                = { version = "4", features = ["derive"] }

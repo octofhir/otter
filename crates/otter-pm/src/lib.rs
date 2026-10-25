@@ -32,6 +32,7 @@ mod advisory;
 mod freshness;
 mod install;
 mod installed_graph;
+mod layout;
 mod lifecycle;
 mod npm_range;
 mod policy;
@@ -70,16 +71,13 @@ pub use npm_range::NpmRange;
 pub use policy::{BuildDecision, InstallPolicy};
 pub use registry::{
     FileRegistryMetadataClient, FsRegistryMetadataCache, HttpRegistryMetadataClient,
-    NpmAttestations, NpmDist, NpmPackageVersion, NpmProvenance, NpmRegistryMetadata,
-    RegistryMetadataClient,
+    METADATA_FRESH_FOR, MetadataFetch, NpmAttestations, NpmDist, NpmPackageVersion,
+    NpmProvenance, NpmRegistryMetadata, RegistryMetadataClient,
 };
 pub use resolve::enrich_resolution_with_registry_metadata;
 pub use script_sniff::{ScriptFinding, suspicious_script_findings};
 pub use store::{ContentStore, PackageIndex, StoredFile};
-pub use tarball::{
-    CachedTarball, FileTarballClient, FsTarballCache, HttpTarballClient, TarballFetchClient,
-    TarballSource,
-};
+pub use tarball::{FileTarballClient, HttpTarballClient, TarballFetchClient, TarballSource};
 pub use warning::InstallWarning;
 
 /// Package-manager error type.
@@ -459,6 +457,8 @@ pub struct InstallReport {
     pub lockfile_changed: bool,
     /// Source lockfile format imported during this install, if any.
     pub imported_lockfile: Option<otter_pm_lockfile::LockfileFormat>,
+    /// Packages the previous lockfile installed that this one no longer has.
+    pub pruned: PruneReport,
 }
 
 /// Result of pruning packages no longer present in the lockfile.
@@ -517,6 +517,7 @@ pub async fn install_local_project(
                 metadata_cache,
                 metadata_client,
                 &policy,
+                previous_lockfile.as_ref(),
                 &mut warnings,
             )
             .await?,
@@ -526,6 +527,7 @@ pub async fn install_local_project(
     check_provenance_continuity(previous_lockfile.as_ref(), &resolution.lockfile, &policy)?;
     check_advisories(
         &resolution.lockfile,
+        previous_lockfile.as_ref(),
         advisory_client,
         &policy,
         &mut warnings,
@@ -555,6 +557,7 @@ pub async fn install_local_project(
             metadata_cache,
             metadata_client,
             &policy,
+            previous_lockfile.as_ref(),
             &mut warnings,
         )
         .await?;
@@ -566,6 +569,16 @@ pub async fn install_local_project(
                 .to_string(),
         });
     }
+    layout::link_project(project_root, &resolution.graph, &resolution.lockfile).await?;
+    let pruned = match &previous_lockfile {
+        Some(previous) => {
+            prune_removed_registry_packages(project_root, previous, &resolution.lockfile).await?
+        }
+        None => PruneReport {
+            removed_packages: 0,
+            removed_bins: 0,
+        },
+    };
     let lifecycle_outcome = lifecycle::run_install_lifecycle_scripts(
         project_root,
         &mut resolution.lockfile,
@@ -588,6 +601,7 @@ pub async fn install_local_project(
         warnings,
         lockfile_changed,
         imported_lockfile,
+        pruned,
     })
 }
 
@@ -645,8 +659,13 @@ fn check_provenance_continuity(
 }
 
 /// Refuse any resolved version the advisory database calls malicious.
+///
+/// A version the `previous` lockfile already held was asked about when it
+/// entered the project; only the versions this resolution brings in are
+/// asked about now, so an unchanged project installs without a lookup.
 async fn check_advisories(
     lockfile: &Lockfile,
+    previous: Option<&Lockfile>,
     client: &impl AdvisoryClient,
     policy: &InstallPolicy,
     warnings: &mut Vec<InstallWarning>,
@@ -656,13 +675,16 @@ async fn check_advisories(
     }
     let mut queries = lockfile
         .packages
-        .values()
-        .filter(|package| {
+        .iter()
+        .filter(|(id, package)| {
             matches!(
                 package.resolved.as_ref().map(|source| source.kind),
                 Some(ResolvedSourceKind::Registry)
-            )
+            ) && previous
+                .and_then(|previous| previous.packages.get(id.as_str()))
+                .is_none_or(|held| held.version != package.version)
         })
+        .map(|(_, package)| package)
         .map(|package| AdvisoryQuery {
             name: package.name.clone(),
             version: package.version.clone(),
@@ -990,32 +1012,6 @@ pub async fn resolve_local_project(
     Ok(LocalResolution { graph, lockfile })
 }
 
-/// Write a deterministic `otter.lock` for the local project and return whether
-/// the bytes changed.
-pub async fn write_local_lockfile(
-    project_root: impl AsRef<Path>,
-) -> Result<bool, PackageManagerError> {
-    let project_root = project_root.as_ref();
-    let resolution = resolve_local_project(project_root).await?;
-    write_lockfile_if_changed(project_root, &resolution.lockfile).await
-}
-
-/// Resolve a local project with registry metadata enrichment, write
-/// deterministic `otter.lock`, and return whether the bytes changed.
-pub async fn write_local_lockfile_with_registry_metadata(
-    project_root: impl AsRef<Path>,
-    cache: &FsRegistryMetadataCache,
-    client: &impl RegistryMetadataClient,
-    policy: &InstallPolicy,
-    warnings: &mut Vec<InstallWarning>,
-) -> Result<bool, PackageManagerError> {
-    let project_root = project_root.as_ref();
-    let resolution =
-        resolve_local_project_with_registry_metadata(project_root, cache, client, policy, warnings)
-            .await?;
-    write_lockfile_if_changed(project_root, &resolution.lockfile).await
-}
-
 async fn write_lockfile_if_changed(
     project_root: &Path,
     lockfile: &Lockfile,
@@ -1047,61 +1043,26 @@ async fn write_lockfile_if_changed(
 /// Resolve a local project, fetch/cache registry metadata, and enrich registry
 /// lockfile entries with selected version, tarball, integrity, scripts, and
 /// bin metadata. This does not download tarballs or execute lifecycle scripts.
+/// What `pinned` resolved stands where the ranges still admit it.
 pub async fn resolve_local_project_with_registry_metadata(
     project_root: impl AsRef<Path>,
     cache: &FsRegistryMetadataCache,
     client: &impl RegistryMetadataClient,
     policy: &InstallPolicy,
+    pinned: Option<&Lockfile>,
     warnings: &mut Vec<InstallWarning>,
 ) -> Result<LocalResolution, PackageManagerError> {
     let mut resolution = resolve_local_project(project_root).await?;
-    enrich_resolution_with_registry_metadata(&mut resolution, cache, client, policy, warnings)
-        .await?;
+    enrich_resolution_with_registry_metadata(
+        &mut resolution,
+        cache,
+        client,
+        policy,
+        pinned,
+        warnings,
+    )
+    .await?;
     Ok(resolution)
-}
-
-/// Fetch all registry tarballs referenced by an enriched lockfile into a
-/// content-addressed cache.
-pub async fn cache_registry_tarballs(
-    lockfile: &Lockfile,
-    cache: &FsTarballCache,
-    client: &impl TarballFetchClient,
-) -> Result<Vec<CachedTarball>, PackageManagerError> {
-    let mut sources = registry_tarball_packages(lockfile)
-        .into_iter()
-        .map(|(_, _, source)| source)
-        .collect::<Vec<_>>();
-    sources.sort_by(|a, b| a.url.cmp(&b.url));
-    sources.dedup_by(|a, b| a.url == b.url && a.integrity == b.integrity);
-
-    let mut cached = Vec::with_capacity(sources.len());
-    for source in &sources {
-        cached.push(cache.get_or_fetch(source, client).await?);
-    }
-    Ok(cached)
-}
-
-pub(crate) fn registry_tarball_packages(
-    lockfile: &Lockfile,
-) -> Vec<(String, LockedPackage, TarballSource)> {
-    lockfile
-        .packages
-        .iter()
-        .filter_map(|(id, package)| match &package.resolved {
-            Some(ResolvedSource {
-                kind: ResolvedSourceKind::Registry | ResolvedSourceKind::Tarball,
-                reference,
-            }) if is_tarball_reference(reference) => Some((
-                id.clone(),
-                package.clone(),
-                TarballSource {
-                    url: reference.clone(),
-                    integrity: package.integrity.clone(),
-                },
-            )),
-            _ => None,
-        })
-        .collect()
 }
 
 /// Resolver backend interface.
@@ -1353,9 +1314,7 @@ pub(crate) fn ensure_tarball_package(
         id: id.clone(),
         name: name.to_string(),
         version: reference.to_string(),
-        root: project_root
-            .join("node_modules")
-            .join(package_name_path(name)),
+        root: layout::package_dir(project_root, id.as_str(), name),
         manifest: manifest.clone(),
     });
     lockfile.packages.insert(
@@ -1684,6 +1643,7 @@ mod tests {
             &cache,
             &client,
             &InstallPolicy::default(),
+            None,
             &mut Vec::new(),
         )
         .await
@@ -1889,6 +1849,7 @@ mod tests {
             &FsRegistryMetadataCache::new(tmp.path().join("cache")),
             &FileRegistryMetadataClient::new(&fixture),
             &InstallPolicy::default(),
+            None,
             &mut Vec::new(),
         )
         .await
@@ -1944,74 +1905,67 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(cache.metadata_path("left-pad").is_file());
+
+        /// Answers every request with "not modified", recording its tag.
+        struct Unchanged(std::sync::Mutex<Vec<Option<String>>>);
+        impl RegistryMetadataClient for Unchanged {
+            fn fetch_metadata<'a>(
+                &'a self,
+                _package: &'a str,
+                etag: Option<&'a str>,
+            ) -> Pin<Box<dyn Future<Output = Result<MetadataFetch, PackageManagerError>> + Send + 'a>>
+            {
+                self.0.lock().unwrap().push(etag.map(str::to_string));
+                Box::pin(async { Ok(MetadataFetch::NotModified) })
+            }
+        }
+        // A document past its freshness is asked about by its tag, and a
+        // "not modified" answer renews it.
+        let path = cache.metadata_path("left-pad");
+        std::fs::write(tmp.path().join("cache/left-pad.etag"), "\"v1\"").unwrap();
+        std::fs::File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - METADATA_FRESH_FOR * 2)
+            .unwrap();
+        let unchanged = Unchanged(std::sync::Mutex::new(Vec::new()));
+        let third = cache.get_or_fetch("left-pad", &unchanged).await.unwrap();
+        let fourth = cache.get_or_fetch("left-pad", &unchanged).await.unwrap();
+        assert_eq!(third, first);
+        assert_eq!(fourth, first);
+        assert_eq!(*unchanged.0.lock().unwrap(), [Some("\"v1\"".to_string())]);
     }
 
     #[tokio::test]
-    async fn tarball_cache_is_integrity_checked_and_reused() {
+    async fn a_tarball_that_misses_its_integrity_stores_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let source_bytes = b"pretend tgz bytes";
-        let integrity = format!(
-            "sha512-{}",
-            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(source_bytes))
-        );
         let url = "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz";
         let fixture = tmp.path().join("tarballs");
-        write_bytes(&fixture.join(cache_key(url)), source_bytes).await;
-        let cache = FsTarballCache::new(tmp.path().join("cache"));
-        let client = FileTarballClient::new(&fixture);
+        let tarball = npm_tgz(&[("package/index.js", "module.exports = 1;\n")]);
+        write_bytes(&fixture.join(cache_key(url)), &tarball).await;
         let source = TarballSource {
             url: url.to_string(),
-            integrity: Some(integrity),
+            integrity: Some(format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode(Sha512::digest(b"other bytes"))
+            )),
         };
+        let store = FsPackageStore::new(tmp.path().join("cache"));
 
-        let first = cache.get_or_fetch(&source, &client).await.unwrap();
-        tokio::fs::remove_file(fixture.join(cache_key(url)))
-            .await
-            .unwrap();
-        let second = cache.get_or_fetch(&source, &client).await.unwrap();
+        let refused = store
+            .get_or_fetch_and_extract(&source, &FileTarballClient::new(&fixture))
+            .await;
 
-        assert!(!first.reused);
-        assert!(second.reused);
-        assert_eq!(first.path, second.path);
-    }
-
-    #[tokio::test]
-    async fn registry_tarball_cache_uses_enriched_lockfile_sources() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bytes = b"cached package";
-        let integrity = format!(
-            "sha512-{}",
-            base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
+        assert!(matches!(refused, Err(PackageManagerError::Integrity { .. })));
+        assert!(
+            store
+                .content_store()
+                .read_index(&tarball::tarball_cache_key(&source))
+                .await
+                .unwrap()
+                .is_none()
         );
-        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
-        let mut lockfile = Lockfile::new();
-        lockfile.packages.insert(
-            "left-pad@npm:^1.0.0".to_string(),
-            LockedPackage {
-                name: "left-pad".to_string(),
-                version: "1.3.0".to_string(),
-                dependencies: BTreeMap::new(),
-                integrity: Some(integrity),
-                attested: false,
-                resolved: Some(ResolvedSource {
-                    kind: ResolvedSourceKind::Registry,
-                    reference: url.to_string(),
-                }),
-                lifecycle: LifecycleMetadata::default(),
-            },
-        );
-        let fixture = tmp.path().join("tarballs");
-        write_bytes(&fixture.join(cache_key(url)), bytes).await;
-        let cached = cache_registry_tarballs(
-            &lockfile,
-            &FsTarballCache::new(tmp.path().join("cache")),
-            &FileTarballClient::new(&fixture),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(cached.len(), 1);
-        assert!(!cached[0].reused);
     }
 
     #[tokio::test]
@@ -2071,10 +2025,10 @@ mod tests {
             second[0].reused_cache,
             "the second project must not re-extract the archive"
         );
-        let one = tmp.path().join("one/node_modules/left-pad/index.js");
-        let two = tmp.path().join("two/node_modules/left-pad/index.js");
+        let one = first[0].installed_root.join("index.js");
+        let two = second[0].installed_root.join("index.js");
         assert_eq!(std::fs::read(&one).unwrap(), std::fs::read(&two).unwrap());
-        #[cfg(unix)]
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             use std::os::unix::fs::MetadataExt;
 
@@ -2085,6 +2039,16 @@ mod tests {
                 two.ino(),
                 "both trees must link to the same stored bytes"
             );
+        }
+        // Each project clones the package's one stored tree: its own files,
+        // sharing the stored blocks.
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            assert!(tmp.path().join("cache/store/trees").read_dir().unwrap().count() == 1);
+            assert_eq!(std::fs::metadata(&one).unwrap().nlink(), 1);
+            assert_eq!(std::fs::metadata(&two).unwrap().nlink(), 1);
         }
     }
 
@@ -2144,11 +2108,7 @@ mod tests {
         assert_eq!(first[0].linked_bins, 1);
         assert!(second[0].reused_install);
         assert_eq!(second[0].linked_bins, 1);
-        assert!(
-            tmp.path()
-                .join("project/node_modules/left-pad/index.js")
-                .is_file()
-        );
+        assert!(first[0].installed_root.join("index.js").is_file());
         assert!(
             tmp.path()
                 .join("project/node_modules/.bin/left-pad")
@@ -2376,6 +2336,12 @@ mod tests {
         let lockfile_first = tokio::fs::read_to_string(project.join("otter.lock"))
             .await
             .unwrap();
+        // The lockfile pins every version: the second install asks no
+        // registry and reads no cached manifest.
+        tokio::fs::remove_dir_all(&registry).await.unwrap();
+        tokio::fs::remove_dir_all(tmp.path().join("metadata-cache"))
+            .await
+            .unwrap();
         let second = install_local_project(
             &project,
             &metadata_cache,
@@ -2512,6 +2478,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_versions_of_one_name_each_reach_their_own_dependents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        let registry = tmp.path().join("registry");
+        let tarballs = tmp.path().join("tarballs");
+        let versions = |name: &str, entries: &[(&str, &str, &str)]| {
+            entries
+                .iter()
+                .map(|(version, dependencies, body)| {
+                    let manifest = format!(
+                        r#"{{"name":"{name}","version":"{version}","dependencies":{dependencies}}}"#
+                    );
+                    (
+                        format!("https://registry.example.test/{name}/-/{name}-{version}.tgz"),
+                        npm_tgz(&[("package/package.json", &manifest), ("package/index.js", body)]),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let ms = versions(
+            "ms",
+            &[
+                ("1.0.0", "{}", "module.exports = 'ms1';\n"),
+                ("2.0.0", "{}", "module.exports = 'ms2';\n"),
+            ],
+        );
+        let a = versions(
+            "a",
+            &[("1.0.0", r#"{"ms":"^1.0.0"}"#, "module.exports = require('ms');\n")],
+        );
+        let document = |name: &str, latest: &str, entries: &[(&str, &str)], files: &[(String, Vec<u8>)]| {
+            let versions = entries
+                .iter()
+                .zip(files)
+                .map(|((version, dependencies), (url, tarball))| {
+                    let integrity = format!(
+                        "sha512-{}",
+                        base64::engine::general_purpose::STANDARD.encode(Sha512::digest(tarball))
+                    );
+                    format!(
+                        r#""{version}":{{"name":"{name}","version":"{version}","dependencies":{dependencies},"dist":{{"tarball":"{url}","integrity":"{integrity}"}}}}"#
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(r#"{{"name":"{name}","dist-tags":{{"latest":"{latest}"}},"versions":{{{versions}}}}}"#)
+        };
+        write(
+            &registry.join("ms.json"),
+            &document("ms", "2.0.0", &[("1.0.0", "{}"), ("2.0.0", "{}")], &ms),
+        )
+        .await;
+        write(
+            &registry.join("a.json"),
+            &document("a", "1.0.0", &[("1.0.0", r#"{"ms":"^1.0.0"}"#)], &a),
+        )
+        .await;
+        for (url, tarball) in ms.iter().chain(&a) {
+            write_bytes(&tarballs.join(cache_key(url)), tarball).await;
+        }
+        write(
+            &project.join("package.json"),
+            r#"{"name":"app","dependencies":{"a":"^1.0.0","ms":"^2.0.0"}}"#,
+        )
+        .await;
+
+        install_local_project(
+            &project,
+            &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
+            &FileRegistryMetadataClient::new(&registry),
+            &FsPackageStore::new(tmp.path().join("package-cache")),
+            &FileTarballClient::new(&tarballs),
+            &FixtureAdvisoryClient::default(),
+        )
+        .await
+        .unwrap();
+
+        let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
+        // The project sees the version it asked for; `a`, from where it is
+        // stored, sees the one it asked for.
+        assert_eq!(read(project.join("node_modules/ms/index.js")), "module.exports = 'ms2';\n");
+        let stored_a = std::fs::canonicalize(project.join("node_modules/a")).unwrap();
+        assert_eq!(
+            read(stored_a.parent().unwrap().join("ms/index.js")),
+            "module.exports = 'ms1';\n"
+        );
+    }
+
+    #[tokio::test]
     async fn install_local_project_materializes_direct_tarball_dependency() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
@@ -2591,7 +2646,12 @@ mod tests {
         assert!(lockfile.contains("kind = \"tarball\""));
         assert!(lockfile.contains("postinstall = \"node setup.js\""));
         assert!(lockfile.contains("dep = \"dep@npm:1.0.0\""));
-        assert!(project.join("node_modules/dep/index.js").is_file());
+        // `dep` is the tool's dependency, not the project's: it sits beside
+        // the tool, and only the shared fallback names it for everyone else.
+        let tool = layout::package_dir(&project, &format!("tool@tarball:{url}"), "tool");
+        assert!(tool.parent().unwrap().join("dep/index.js").is_file());
+        assert!(!project.join("node_modules/dep").exists());
+        assert!(project.join("node_modules/.otter/node_modules/dep/index.js").is_file());
         assert!(project.join("node_modules/tool/bin.js").is_file());
         assert!(project.join("node_modules/.bin/tool").is_file());
     }
@@ -2640,21 +2700,24 @@ mod tests {
     async fn prune_removed_registry_packages_removes_package_root_and_bins() {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
+        let stored = layout::package_dir(&project, "tool@npm:1.0.0", "tool");
         write(
-            &project.join("node_modules/tool/package.json"),
+            &stored.join("package.json"),
             r#"{"name":"tool","version":"1.0.0","bin":{"tool":"./bin.js"}}"#,
         )
         .await;
-        write(&project.join("node_modules/tool/bin.js"), "undefined;").await;
+        write(&stored.join("bin.js"), "undefined;").await;
         write(&project.join("node_modules/.bin/tool"), "undefined;").await;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&stored, project.join("node_modules/tool")).unwrap();
         write(
-            &project.join("node_modules/.otter-state/tool%40npm%3A%5E1.0.0.source"),
+            &project.join("node_modules/.otter-state/tool%40npm%3A1.0.0.source"),
             "source",
         )
         .await;
         let mut previous = Lockfile::new();
         previous.packages.insert(
-            "tool@npm:^1.0.0".to_string(),
+            "tool@npm:1.0.0".to_string(),
             LockedPackage {
                 name: "tool".to_string(),
                 version: "1.0.0".to_string(),
@@ -2675,7 +2738,11 @@ mod tests {
 
         assert_eq!(report.removed_packages, 1);
         assert_eq!(report.removed_bins, 1);
-        assert!(!project.join("node_modules/tool").exists());
+        assert!(!layout::store_entry_dir(&project, "tool@npm:1.0.0").exists());
+        assert!(
+            std::fs::symlink_metadata(project.join("node_modules/tool")).is_err(),
+            "the project's link to a removed package goes with it"
+        );
         assert!(!project.join("node_modules/.bin/tool").exists());
     }
 
@@ -2754,8 +2821,12 @@ mod tests {
         }"#;
         let metadata_url = serve_http_once(metadata.as_bytes().to_vec()).await;
         let metadata_client = HttpRegistryMetadataClient::with_base_url(metadata_url);
-        let fetched = metadata_client.fetch_metadata("pkg").await.unwrap();
-        assert_eq!(fetched.name, "pkg");
+        let MetadataFetch::Fresh { metadata, .. } =
+            metadata_client.fetch_metadata("pkg", None).await.unwrap()
+        else {
+            panic!("an unconditional request returns the document");
+        };
+        assert_eq!(metadata.name, "pkg");
 
         let tarball_url = serve_http_once(b"tgz bytes".to_vec()).await;
         let tarball = HttpTarballClient::new()
@@ -2812,6 +2883,7 @@ mod tests {
             &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
             &FileRegistryMetadataClient::new(tmp.path().join("registry")),
             &InstallPolicy::default(),
+            None,
             &mut warnings,
         )
         .await
@@ -2845,6 +2917,7 @@ mod tests {
             &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
             &FileRegistryMetadataClient::new(tmp.path().join("registry")),
             &policy,
+            None,
             &mut Vec::new(),
         )
         .await
@@ -2873,6 +2946,7 @@ mod tests {
             &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
             &FileRegistryMetadataClient::new(tmp.path().join("registry")),
             &policy,
+            None,
             &mut warnings,
         )
         .await
@@ -2952,6 +3026,7 @@ mod tests {
         }]);
         let error = check_advisories(
             &lockfile,
+            None,
             &client,
             &InstallPolicy::default(),
             &mut Vec::new(),
@@ -2974,9 +3049,15 @@ mod tests {
         let client = FixtureAdvisoryClient::unavailable("connection refused");
 
         let mut warnings = Vec::new();
-        check_advisories(&lockfile, &client, &InstallPolicy::default(), &mut warnings)
-            .await
-            .unwrap();
+        check_advisories(
+            &lockfile,
+            None,
+            &client,
+            &InstallPolicy::default(),
+            &mut warnings,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             warnings
                 .iter()
@@ -2988,13 +3069,24 @@ mod tests {
         let required = InstallPolicy::from_settings(
             &serde_json::from_str(r#"{"advisoryCheck":"required"}"#).unwrap(),
         );
-        let error = check_advisories(&lockfile, &client, &required, &mut Vec::new())
+        let error = check_advisories(&lockfile, None, &client, &required, &mut Vec::new())
             .await
             .unwrap_err();
         assert!(matches!(
             error,
             PackageManagerError::AdvisoryUnavailable { .. }
         ));
+        // Versions the previous lockfile held were asked about then: an
+        // unchanged project needs no lookup, even when one is required.
+        check_advisories(
+            &lockfile,
+            Some(&lockfile),
+            &client,
+            &required,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -3004,7 +3096,7 @@ mod tests {
         let policy = InstallPolicy::from_settings(
             &serde_json::from_str(r#"{"advisoryCheck":"off"}"#).unwrap(),
         );
-        check_advisories(&lockfile, &client, &policy, &mut Vec::new())
+        check_advisories(&lockfile, None, &client, &policy, &mut Vec::new())
             .await
             .unwrap();
     }

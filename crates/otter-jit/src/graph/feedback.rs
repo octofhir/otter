@@ -431,6 +431,24 @@ pub(crate) fn body_slot_store(
 /// The programs a `StoreNamedProperty` node of the site at `byte_pc` runs:
 /// the site's own, or for a `proved` node the source's one program for its
 /// proved `receiver_shape`.
+/// Whether a named store emits at least one program and each first guards
+/// the receiver's exact shape.
+pub(crate) fn store_programs_guard_receiver<'a>(
+    programs: impl IntoIterator<Item = &'a otter_vm::JitCacheIrProgram>,
+) -> bool {
+    let mut any = false;
+    for program in programs {
+        if !matches!(
+            program.ops.first(),
+            Some(JitCacheIrOp::GuardShape { object: 0, .. })
+        ) {
+            return false;
+        }
+        any = true;
+    }
+    any
+}
+
 pub(crate) fn store_node_programs(
     view: &JitCompileSnapshot,
     byte_pc: u32,

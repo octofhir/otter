@@ -483,16 +483,28 @@ impl Codegen<'_> {
             Kind::NewReceiver(plan) if fresh => plan.prototype_validity.map(|cell| cell.address),
             _ => None,
         };
+        // The baker exports no store program for a prototype-role shape, nor
+        // an append for one that cannot grow: when every emitted program
+        // guards the receiver's exact shape, that guard alone proves both,
+        // and the map word it compares rules out every other cell kind.
+        let shape_guarded = value.is_some()
+            && crate::graph::feedback::store_programs_guard_receiver(
+                selected.iter().map(|&index| &programs[index as usize]),
+            );
         if value.is_some() {
             // Every successful static path proves an eligible receiver shape
             // before its field/effect. Prototype writes additionally need the
             // canonical invalidation owner and cannot commit this direct hit.
             if receiver_shape.is_none() {
-                self.emit_object_receiver(receiver, exit);
+                if shape_guarded {
+                    self.emit_cell_guard(receiver, exit);
+                } else {
+                    self.emit_object_receiver(receiver, exit);
+                }
             }
             // A fresh receiver ran no code since its allocation, so it has no
             // prototype role.
-            if !fresh {
+            if !fresh && !shape_guarded {
                 self.emit_shape_state(receiver);
                 dynasm!(self.ops ; .arch x64 ; test r10b, ShapeState::PROTOTYPE_MASK as i8 ; jnz =>exit);
             }
@@ -622,8 +634,9 @@ impl Codegen<'_> {
                                 ; cmp DWORD [r10 + view.field_layout.slab_capacity_byte as i32], field.index() as i32 ; jbe =>next);
                         }
                         // A fresh receiver ran no code since its allocation,
-                        // so it is still extensible.
-                        if !fresh {
+                        // so it is still extensible; an exact guarded shape
+                        // was exported extensible.
+                        if !fresh && !shape_guarded {
                             self.emit_shape_state(receiver);
                             dynasm!(self.ops ; .arch x64 ; test r10b, ShapeState::EXTENSIBLE_MASK as i8 ; jz =>next);
                         }

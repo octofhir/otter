@@ -30,6 +30,60 @@ use crate::jit_inline_plan::{InlineCandidate, InlineTree};
 use crate::{ExecutionContext, Interpreter};
 use otter_bytecode::Op;
 
+impl Interpreter {
+    /// Calls `code_block` makes per entry that would stay calls where it is
+    /// built in place: its sites with call feedback, less those whose every
+    /// target is a small body, a native or an intrinsic.
+    pub(super) fn inline_body_invokes(
+        &self,
+        context: &ExecutionContext,
+        code_block: &crate::CodeBlock,
+    ) -> f32 {
+        let small = |function_id: u32| {
+            context.for_function(function_id).ok().is_some_and(|owner| {
+                owner.exec_function(function_id).is_some_and(|body| {
+                    body.instruction_count() <= crate::jit::JIT_SMALL_INLINE_INSTRUCTIONS
+                })
+            })
+        };
+        let mut invokes = 0.0;
+        for (index, instruction) in code_block.code.iter().enumerate() {
+            let Some(frequency) = code_block.call_frequency_at(index) else {
+                continue;
+            };
+            let method = (code_block.op(instruction) == Op::CallMethodValue)
+                .then(|| {
+                    instruction
+                        .property_ic_site()
+                        .and_then(|site| self.method_target_feedback(site))
+                })
+                .flatten();
+            let stays = match method {
+                Some(crate::MethodCallFeedback::Mono { method_fid, .. }) => !small(method_fid),
+                Some(crate::MethodCallFeedback::Poly(targets)) => {
+                    targets.iter().any(|target| !small(target.method_fid))
+                }
+                _ => match code_block.call_distribution_at(index) {
+                    Some(crate::feedback::CallSiteDistribution::Mono(target)) => {
+                        match target.target {
+                            crate::feedback::OrdinaryCallTarget::Bytecode(callee)
+                            | crate::feedback::OrdinaryCallTarget::FunctionPrototypeCall(callee) => {
+                                !small(callee)
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => true,
+                },
+            };
+            if stays {
+                invokes += frequency;
+            }
+        }
+        invokes
+    }
+}
+
 /// The call sites from the compiled function to one inline body: each
 /// site's byte PC and the function it calls.
 pub(super) type InlinePath = smallvec::SmallVec<[(u32, u32); 6]>;
@@ -233,20 +287,21 @@ impl InlineTree for FeedbackTree<'_> {
                                     && self.interp.current_direct_callee_plan(code_block).is_some()
                             }
                         };
-                    admitted.then(|| code_block.instruction_count())
+                    admitted.then(|| {
+                        (
+                            code_block.instruction_count(),
+                            self.interp.inline_body_invokes(self.context, code_block),
+                        )
+                    })
                 })?;
+                let (instructions, invokes) = instructions;
                 let mut key = path.clone();
                 key.push((byte_pc, callee));
                 Some(InlineCandidate {
                     key,
                     site_frequency,
                     instructions,
-                    optimized_inlined_instructions: self
-                        .interp
-                        .jit_optimized_code
-                        .get(&callee)
-                        .and_then(Option::as_ref)
-                        .map_or(0, |code| code.inlined_instructions()),
+                    invokes,
                     recursion: usize::from(callee == self.root)
                         + path.iter().filter(|&&(_, caller)| caller == callee).count(),
                 })

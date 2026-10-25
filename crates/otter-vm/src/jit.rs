@@ -269,6 +269,12 @@ pub const JIT_SMALL_INLINE_INSTRUCTIONS: u32 = 10;
 pub const JIT_MAX_INLINED_INSTRUCTIONS_CUMULATIVE: u32 = 320;
 /// The most bytecode instructions one compilation inlines from any bodies.
 pub const JIT_MAX_INLINED_INSTRUCTIONS_ABSOLUTE: u32 = 1600;
+/// The most calls per entry a body that is not small and runs at most once
+/// per run of the compiled function may make itself and still be built in
+/// place: one that makes more is a driver whose own compilation spends its
+/// budget on those calls, while building it in place saves a single call and
+/// hands its calls the caller's remaining budget.
+pub const JIT_MAX_INLINED_CALLEE_INVOKES: f32 = 5.0;
 /// The fewest calls per run of the compiled function at which a call site is
 /// inlined: a site reached more rarely is left a call.
 pub const JIT_MIN_INLINING_FREQUENCY: f32 = 0.10;
@@ -922,10 +928,9 @@ pub struct JitCompileSnapshot {
     /// site with call feedback, keyed by byte PC: what an optimizing caller
     /// weighs its inline candidates by. Baked with the call-site plans.
     pub call_frequencies: rustc_hash::FxHashMap<u32, f32>,
-    /// What the function's installed optimized code inlined, in bytecode
-    /// instructions, when this snapshot is a body to inline: a caller that
-    /// builds it builds those again.
-    pub optimized_inlined_instructions: u32,
+    /// Calls per entry of this body that would stay calls where it is built
+    /// in place; see [`JIT_MAX_INLINED_CALLEE_INVOKES`].
+    pub invokes: f32,
     /// Guarded method calls into a declared native entry, keyed by call byte PC.
     pub guarded_method_calls: rustc_hash::FxHashMap<u32, JitGuardedMethodCall>,
     /// `f.call(...)` sites keyed by byte PC: an `Op::CallMethodValue` named
@@ -2459,7 +2464,7 @@ impl JitCompileSnapshot {
             method_targets: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
             call_frequencies: rustc_hash::FxHashMap::default(),
-            optimized_inlined_instructions: 0,
+            invokes: 0.0,
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             function_prototype_calls: rustc_hash::FxHashMap::default(),
             instanceof_cells: rustc_hash::FxHashMap::default(),
@@ -2834,13 +2839,6 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
     /// independently on each entry.
     fn spliced_functions(&self) -> &[u32] {
         &[]
-    }
-
-    /// Bytecode instructions of the bodies this code built in place of their
-    /// calls: what inlining the function elsewhere costs on top of its own
-    /// body when a caller would build those again.
-    fn inlined_instructions(&self) -> u32 {
-        0
     }
 
     /// Base address of the complete executable mapping, retained by this owner.

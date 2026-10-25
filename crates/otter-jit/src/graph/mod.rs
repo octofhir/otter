@@ -444,11 +444,6 @@ pub(crate) fn compile_optimized(
         register_count: view.code_block.register_count,
         allocator_spill_slot_count: allocation.tagged_slots + allocation.untagged_slots,
         spill_slot_count: allocation.tagged_slots + allocation.untagged_slots,
-        inlined_instructions: built
-            .inline_views
-            .iter()
-            .map(|body| body.code_block.instruction_count())
-            .sum(),
     };
     let code = CompiledCode::new(
         emission.buffer,

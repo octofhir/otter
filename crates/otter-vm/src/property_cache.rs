@@ -39,9 +39,10 @@ pub(crate) mod jit;
 
 /// Sets of the shared table. It serves every keyed and megamorphic named
 /// site of the isolate under `(shape, atom)` keys, so it is sized for a large
-/// program's live (shape, name) working set: 8K entries, within 1 MiB with
-/// their proof owners.
-const SETS: usize = 2048;
+/// program's live (shape, name) working set: 64K entries. The rows are
+/// committed lazily — an all-zero row is empty — so an isolate pays only for
+/// the rows its program fills.
+const SETS: usize = 16384;
 const WAYS: usize = 4;
 const HASH_SHAPE_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 const HASH_ATOM_MULTIPLIER: u64 = 0xC2B2_AE3D_27D4_EB4F;
@@ -177,23 +178,66 @@ pub(crate) enum PropertyLoad {
 #[derive(Debug)]
 pub(crate) struct PropertyActionCache {
     entries: Box<[Cell<PropertyActionEntry>]>,
-    owners: Box<[RefCell<ActionOwners>]>,
+    /// Proof owners of the rows that have any, by row index.
+    owners: RefCell<rustc_hash::FxHashMap<u32, ActionOwners>>,
 }
 
 impl Default for PropertyActionCache {
     fn default() -> Self {
+        // SAFETY: every field of a row is an integer, a compressed handle, a
+        // `bool` or a `u8` enum whose zero is a variant, so all-zero bits are
+        // a valid row: the empty one, whose unassigned shape id no receiver
+        // has. The zeroed allocation commits pages only as rows are written.
+        let entries = unsafe { Box::new_zeroed_slice(SETS * WAYS).assume_init() };
         Self {
-            entries: (0..SETS * WAYS)
-                .map(|_| Cell::new(PropertyActionEntry::EMPTY))
-                .collect(),
-            owners: (0..SETS * WAYS)
-                .map(|_| RefCell::new(ActionOwners::default()))
-                .collect(),
+            entries,
+            owners: RefCell::new(rustc_hash::FxHashMap::default()),
         }
     }
 }
 
 impl PropertyActionCache {
+    /// Take row `index`'s proof owners, leaving it none.
+    fn take_owners(&self, index: usize) -> ActionOwners {
+        self.owners
+            .borrow_mut()
+            .remove(&(index as u32))
+            .unwrap_or_default()
+    }
+
+    /// Give row `index` exactly `owners`.
+    fn put_owners(&self, index: usize, owners: ActionOwners) {
+        let mut table = self.owners.borrow_mut();
+        if owners.load.is_none() && owners.store.is_none() {
+            table.remove(&(index as u32));
+        } else {
+            table.insert(index as u32, owners);
+        }
+    }
+
+    /// Change row `index`'s proof owners in place.
+    fn update_owners(&self, index: usize, change: impl FnOnce(&mut ActionOwners)) {
+        let mut owners = self.take_owners(index);
+        change(&mut owners);
+        self.put_owners(index, owners);
+    }
+
+    /// Row `index`'s load proof.
+    fn load_owner(&self, index: usize) -> Option<Arc<PrototypeValidity>> {
+        self.owners
+            .borrow()
+            .get(&(index as u32))
+            .and_then(|owners| owners.load.clone())
+    }
+
+    /// Row `index`'s store transition kind.
+    fn store_owner(&self, index: usize) -> Option<object::StorePropertyTransitionKind> {
+        self.owners
+            .borrow()
+            .get(&(index as u32))
+            .and_then(|owners| owners.store.clone())
+    }
+
     fn set_start(shape: ShapeId, atom: AtomId) -> usize {
         let mixed = shape.raw().wrapping_mul(HASH_SHAPE_MULTIPLIER)
             ^ u64::from(atom.raw()).wrapping_mul(HASH_ATOM_MULTIPLIER);
@@ -219,10 +263,10 @@ impl PropertyActionCache {
             .find(|&index| self.entries[index].get().receiver_shape_id == ShapeId::UNASSIGNED)
             .unwrap_or(start + WAYS - 1);
         self.entries[vacate].set(PropertyActionEntry::EMPTY);
-        self.owners[vacate].replace(ActionOwners::default());
+        self.take_owners(vacate);
         for index in (start + 1..=vacate).rev() {
-            let owners = self.owners[index - 1].replace(ActionOwners::default());
-            self.owners[index].replace(owners);
+            let owners = self.take_owners(index - 1);
+            self.put_owners(index, owners);
             self.entries[index].set(self.entries[index - 1].get());
         }
         self.entries[start].set(PropertyActionEntry {
@@ -255,7 +299,7 @@ impl PropertyActionCache {
         let Some((index, entry)) = self.entry_for(obj, heap, key) else {
             return PropertyProbe::Unknown;
         };
-        let validity = self.owners[index].borrow().load.clone();
+        let validity = self.load_owner(index);
         if matches!(
             entry.load_action,
             PropertyLoadAction::Unresolvable | PropertyLoadAction::NonExistent
@@ -362,8 +406,10 @@ impl PropertyActionCache {
                     entry.store_action = PropertyStoreAction::Unknown;
                     entry.store_owner = object::ShapeHandle::null();
                     entry.store_receiver = object::ShapeHandle::null();
-                    self.owners[index].borrow_mut().store = None;
-                    self.owners[index].borrow_mut().load = validity;
+                    self.update_owners(index, |owners| {
+                        owners.store = None;
+                        owners.load = validity;
+                    });
                     self.entries[index].set(entry);
                     return;
                 };
@@ -375,14 +421,14 @@ impl PropertyActionCache {
                 entry.store_validity = 0;
                 entry.store_owner = owner;
                 entry.store_receiver = resolved.hit.shape;
-                self.owners[index].borrow_mut().store = None;
+                self.update_owners(index, |owners| owners.store = None);
             }
         } else if nonexistent {
             entry.load_action = PropertyLoadAction::NonExistent;
         } else {
             entry.load_action = PropertyLoadAction::Unresolvable;
         }
-        self.owners[index].borrow_mut().load = validity;
+        self.update_owners(index, |owners| owners.load = validity);
         self.entries[index].set(entry);
     }
 
@@ -397,7 +443,7 @@ impl PropertyActionCache {
             return;
         };
         let index = self.record_way(hit.shape_id, hit.atom_id);
-        self.owners[index].replace(ActionOwners::default());
+        self.take_owners(index);
         let entry = PropertyActionEntry {
             receiver_shape_id: hit.shape_id,
             atom: hit.atom_id,
@@ -455,7 +501,7 @@ impl PropertyActionCache {
                 validity.address()
             }
         };
-        self.owners[index].borrow_mut().store = Some(transition.kind);
+        self.update_owners(index, |owners| owners.store = Some(transition.kind));
         self.entries[index].set(entry);
     }
 
@@ -480,7 +526,7 @@ impl PropertyActionCache {
             }
             PropertyStoreAction::AddOwn => {
                 // No proof borrow crosses the allocating replay/weak sweep.
-                let Some(kind) = self.owners[index].borrow().store.clone() else {
+                let Some(kind) = self.store_owner(index) else {
                     return Ok(None);
                 };
                 object::replay_store_property_transition(
@@ -515,7 +561,7 @@ impl PropertyActionCache {
             let mut entry = way.get();
             if dead(entry.store_receiver) || dead(entry.store_owner) {
                 way.set(PropertyActionEntry::EMPTY);
-                self.owners[index].replace(ActionOwners::default());
+                self.take_owners(index);
                 continue;
             }
             if dead(entry.holder_shape) || dead(entry.holder_root) {
@@ -524,7 +570,7 @@ impl PropertyActionCache {
                     entry = PropertyActionEntry::EMPTY;
                 }
                 way.set(entry);
-                self.owners[index].borrow_mut().load = None;
+                self.update_owners(index, |owners| owners.load = None);
             }
         }
     }

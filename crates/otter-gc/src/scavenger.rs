@@ -44,7 +44,9 @@
 //!
 //! Evacuating a cell tagged with an allocation site counts it as found for
 //! that site and clears the copy's tag, so a cell is counted once in its life.
-//! The heap digests the counts into pretenuring decisions after the flip.
+//! Each worker counts into its own cache and hands the counts to the shared
+//! site records when it finishes; the heap digests them into pretenuring
+//! decisions after the flip.
 //!
 //! # Promotion
 //!
@@ -231,6 +233,8 @@ struct Worker<'s> {
     /// Copies promoted gray during a marking cycle.
     promoted_gray: Vec<RawGc>,
     stats: ScavengeStats,
+    /// Allocation-site found counts not yet in the shared records.
+    found: crate::pretenuring::LocalFound,
     /// True while a remembered parent or a freshly promoted body is traced:
     /// its young children promote immediately, and its slots count toward
     /// the remembered/promoted work counter. This policy does not select the
@@ -656,6 +660,7 @@ impl<'s> Worker<'s> {
             remembered: Vec::new(),
             promoted_gray: Vec::new(),
             stats: ScavengeStats::default(),
+            found: crate::pretenuring::LocalFound::new(),
             in_dirty_scan: false,
             parent_old: false,
         }
@@ -671,6 +676,7 @@ impl<'s> Worker<'s> {
             unsafe { (*old_space.0).return_lab(self.lab_cursor, unused) };
             self.lab_cursor = self.lab_end;
         }
+        self.found.flush(&self.shared.sites);
         WorkerOutput {
             remembered: std::mem::take(&mut self.remembered),
             promoted_gray: std::mem::take(&mut self.promoted_gray),
@@ -812,7 +818,7 @@ impl<'s> Worker<'s> {
             let offset = (header as usize - self.shared.cage as usize) as u32;
             let site = (*header).allocation_site();
             if site != 0 {
-                self.shared.sites.record_found(site);
+                self.found.record(site, &self.shared.sites);
                 GcHeader::set_allocation_site(header, 0);
             }
             if self.shared.marking {
@@ -874,7 +880,7 @@ impl<'s> Worker<'s> {
             // A site-tagged cell is found once: its copy drops the tag.
             let site = (*header).allocation_site();
             if site != 0 {
-                self.shared.sites.record_found(site);
+                self.found.record(site, &self.shared.sites);
                 GcHeader::set_allocation_site(dest_header, 0);
             }
             if promoted {
@@ -1041,7 +1047,7 @@ impl<'s> Worker<'s> {
                 // backing as live GC slots (use-after-free). A full GC also
                 // prunes dead parents from the buffer, so this is
                 // belt-and-suspenders.
-                if (*header).size_bytes() != 0 && !(*header).is_swept() {
+                if (*header).size_bytes() != 0 && !(*header).is_swept_settled() {
                     self.stats.objects_retraced += 1;
                     self.trace_one(header, TraceKind::Remembered);
                 }

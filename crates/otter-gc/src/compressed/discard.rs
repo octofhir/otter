@@ -3,7 +3,7 @@
 //! # Contents
 //! - Host OS page size, queried once by each cold discard operation.
 //! - Inward-rounded discard of unused bytes with unchanged cage ownership.
-//! - Anonymous writable remapping shared with whole freed-page recycling.
+//! - Anonymous writable remapping shared with aged-out pooled pages.
 //!
 //! # Invariants
 //! - Only whole OS pages strictly within the supplied unused range change.
@@ -13,7 +13,7 @@
 //!
 //! # See also
 //! - [`crate::space::NewSpace`] retains nursery headers and allocation capacity.
-//! - `super::decommit_zeroed` also zeros on failure when returning freed pages.
+//! - `super::release_memory` remaps pooled free pages that aged out.
 
 /// The host's actual OS page size; unsupported hosts have no discard path.
 pub(crate) fn system_page_size() -> Option<usize> {

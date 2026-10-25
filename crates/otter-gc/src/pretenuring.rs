@@ -102,8 +102,8 @@ pub(crate) struct FoundCounters {
 unsafe impl Sync for FoundCounters {}
 
 impl FoundCounters {
-    /// Count one cell of `site` found alive.
-    pub(crate) fn record_found(&self, site: u16) {
+    /// Count `count` cells of `site` found alive.
+    fn add_found(&self, site: u16, count: u32) {
         if site == 0 || site > self.len {
             return;
         }
@@ -114,7 +114,51 @@ impl FoundCounters {
             let record = self.chunks[index / CHUNK].add(index % CHUNK);
             let found = std::ptr::addr_of_mut!((*record).found);
             std::sync::atomic::AtomicU32::from_ptr(found)
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// Entries in a worker's [`LocalFound`] cache.
+const LOCAL_FOUND_SLOTS: usize = 64;
+
+/// One scavenge worker's found counts, kept apart from the shared records:
+/// every worker evacuating cells of one hot site would otherwise contend on
+/// that record's cache line for each cell. A direct-mapped cache by site id;
+/// an entry reaches the shared record when another site displaces it and at
+/// [`Self::flush`].
+pub(crate) struct LocalFound {
+    entries: [(u16, u32); LOCAL_FOUND_SLOTS],
+}
+
+impl LocalFound {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entries: [(0, 0); LOCAL_FOUND_SLOTS],
+        }
+    }
+
+    /// Count one cell of `site` found alive.
+    #[inline]
+    pub(crate) fn record(&mut self, site: u16, shared: &FoundCounters) {
+        let entry = &mut self.entries[usize::from(site) % LOCAL_FOUND_SLOTS];
+        if entry.0 == site {
+            entry.1 += 1;
+            return;
+        }
+        if entry.0 != 0 {
+            shared.add_found(entry.0, entry.1);
+        }
+        *entry = (site, 1);
+    }
+
+    /// Hand every count to the shared records, before the heap digests them.
+    pub(crate) fn flush(&mut self, shared: &FoundCounters) {
+        for entry in &mut self.entries {
+            if entry.0 != 0 {
+                shared.add_found(entry.0, entry.1);
+                *entry = (0, 0);
+            }
         }
     }
 }

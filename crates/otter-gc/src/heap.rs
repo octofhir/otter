@@ -157,6 +157,9 @@ pub const EMBEDDER_ROOT_SLOTS: usize = 2;
 /// Old-generation size from which a stop-the-world mark drain runs on the
 /// helper threads too.
 const PARALLEL_MARK_MIN_OLD_BYTES: u64 = 8 * 1024 * 1024;
+/// Smallest overshoot of the old-generation limit that stops the world for
+/// a mark-sweep rather than letting a concurrent cycle run on.
+const LIMIT_OVERSHOOT_MARGIN_FOR_SMALL_HEAPS: u64 = 32 * 1024 * 1024;
 /// How a fresh cell's trailing storage starts.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TrailingInit {
@@ -2516,6 +2519,7 @@ impl GcHeap {
         trigger: GcPauseTrigger,
         work: impl FnOnce(&mut Self) -> (R, GcPauseOutcome),
     ) -> R {
+        crate::compressed::age_retained_pages(Instant::now());
         let token = self.pause_recorder.begin(
             kind,
             trigger,
@@ -2931,20 +2935,36 @@ impl GcHeap {
         }
         if self.marking.is_concurrent() {
             // Helpers are marking: hand them what the barrier shaded, and
-            // finish the cycle once they ran dry or the limit arrived.
+            // finish the cycle once they ran dry, the old generation
+            // overshot its limit by the margin the cycle may run into, or
+            // external bytes reached theirs.
             self.marking.publish();
-            if !self.marking.concurrent_done() && !self.major_gc_due() {
+            if !self.marking.concurrent_done()
+                && !self.limit_overshot_by_large_margin()
+                && !self.external_limit_reached()
+            {
                 return Ok(());
             }
-        } else if !self.major_gc_due() {
-            if self.concurrent_marking_due() {
+        } else {
+            // The old-generation limit is soft: reaching it starts a
+            // concurrent cycle, and only an overshoot past the margin stops
+            // the world for one. The external limit stays hard.
+            let due = self.major_gc_due();
+            if (due || self.concurrent_marking_due())
+                && !self.external_limit_reached()
+                && self.concurrent_marking_possible()
+                && !self.limit_overshot_by_large_margin()
+            {
                 self.with_gc_pause_result(
                     GcPauseKind::MarkStart,
                     GcPauseTrigger::GrowthBudget,
                     |heap| heap.start_concurrent_marking_work(external_visit),
                 )?;
+                return Ok(());
             }
-            return Ok(());
+            if !due {
+                return Ok(());
+            }
         }
         self.with_gc_pause_result(GcPauseKind::Full, GcPauseTrigger::GrowthBudget, |heap| {
             heap.collect_major_work(external_visit)
@@ -2952,12 +2972,41 @@ impl GcHeap {
     }
 
     /// Whether a concurrent marking cycle should start now: the old
-    /// generation reached its start occupancy and helper threads exist.
+    /// generation reached its start occupancy and a cycle can start.
     fn concurrent_marking_due(&mut self) -> bool {
+        self.old_generation_consumed_bytes() >= self.concurrent_marking_start
+            && self.concurrent_marking_possible()
+    }
+
+    /// Whether a concurrent marking cycle can start: none runs and helper
+    /// threads exist.
+    fn concurrent_marking_possible(&mut self) -> bool {
         !self.marking.is_marking()
             && self.machine_allocation_allowed()
-            && self.old_generation_consumed_bytes() >= self.concurrent_marking_start
             && self.gc_threads.workers() > 1
+    }
+
+    /// Whether the old generation passed its limit by more than a running
+    /// concurrent cycle may let it: half the limit, at least
+    /// [`LIMIT_OVERSHOOT_MARGIN_FOR_SMALL_HEAPS`], and at most half the room
+    /// left under the cage ceiling.
+    fn limit_overshot_by_large_margin(&self) -> bool {
+        let consumed = self.old_generation_consumed_bytes();
+        let limit = self.old_generation_limit;
+        if consumed < limit {
+            return false;
+        }
+        let ceiling = allocation_limits::cage_hardcap_bytes();
+        let margin = (limit / 2)
+            .max(LIMIT_OVERSHOOT_MARGIN_FOR_SMALL_HEAPS)
+            .min(ceiling.saturating_sub(limit) / 2);
+        consumed - limit >= margin
+    }
+
+    /// Whether external bytes reached their limit, which a mark-sweep
+    /// answers at once.
+    fn external_limit_reached(&self) -> bool {
+        self.reserved_bytes >= self.external_limit
     }
 
     /// Begin a concurrent marking cycle: shade the roots and hand the drain
@@ -3641,6 +3690,37 @@ impl GcHeap {
             self.write_barrier_raw(parent, edge.raw());
         };
         value.visit_gc_edges(&mut record);
+    }
+
+    /// Barrier for `values` copied into `parent` in one bulk fill, such as
+    /// a grown element slab. Outside marking a young parent owes nothing,
+    /// and an old one is remembered at its first young child: the parent,
+    /// not the slot, is what a scavenge re-traces. While marking, every
+    /// white child is shaded as an individual store would.
+    pub fn record_bulk_writes<T: ?Sized, V: GcStore>(
+        &mut self,
+        parent: Gc<T>,
+        values: impl IntoIterator<Item = V>,
+    ) {
+        if parent.is_null() {
+            return;
+        }
+        let header = parent.as_header_ptr();
+        let marking = self.marking.is_marking();
+        // SAFETY: a non-null handle names a live object's header.
+        let remembered = unsafe { !(*header).is_old() || (*header).is_remembered() };
+        if !marking && remembered {
+            return;
+        }
+        for value in values {
+            // SAFETY: the parent's header is live for the call; every edge
+            // is an in-cage child offset by construction.
+            unsafe { self.record_write_at(header, &value) };
+            // SAFETY: as above.
+            if !marking && unsafe { (*header).is_remembered() } {
+                return;
+            }
+        }
     }
 
     /// Write barrier for a caller that already holds the parent's header

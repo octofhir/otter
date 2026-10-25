@@ -1034,31 +1034,25 @@ mod tests {
         old.reserve_promotion_pages(3, PAGE_PAYLOAD_SIZE * 3)
             .expect("reserve");
         assert_eq!(old.standby.len(), 3);
-        let free_before = crate::compressed::cage_stats()
-            .expect("cage stats")
-            .free_pages;
+        // Other tests' heaps share the cage, so the held pages are compared
+        // by identity rather than through the cage's free count.
+        let held =
+            |old: &OldSpace| -> Vec<u32> { old.standby.iter().map(Page::cage_offset).collect() };
+        let before = held(&old);
         // The next scavenge's reservation is covered by the held pages and
         // takes nothing from the cage; a larger one takes only the shortfall.
         old.reserve_promotion_pages(3, PAGE_PAYLOAD_SIZE * 3)
             .expect("reuse");
-        assert_eq!(old.standby.len(), 3);
+        assert_eq!(held(&old), before);
         old.reserve_promotion_pages(4, PAGE_PAYLOAD_SIZE * 4)
             .expect("shortfall");
-        assert_eq!(old.standby.len(), 4);
-        assert_eq!(
-            crate::compressed::cage_stats()
-                .expect("cage stats")
-                .free_pages,
-            free_before - 1
-        );
+        let after = held(&old);
+        assert_eq!(after.len(), 4);
+        assert!(before.iter().all(|page| after.contains(page)));
+        let pages = old.page_count();
         let reaped = reap_unmarked(&mut old);
         assert!(old.standby.is_empty());
-        assert_eq!(
-            crate::compressed::cage_stats()
-                .expect("cage stats")
-                .free_pages,
-            free_before + 3 + reaped
-        );
+        assert_eq!(reaped, pages);
     }
 
     #[test]
@@ -1073,19 +1067,9 @@ mod tests {
             .expect("old page")
             .header()
             .bump_remaining();
-        let free_before = crate::compressed::cage_stats()
-            .expect("cage stats")
-            .free_pages;
-
         old.reserve_promotion_pages(2, tail)
             .expect("tail covers nursery");
         assert!(old.standby.is_empty());
-        assert_eq!(
-            crate::compressed::cage_stats()
-                .expect("cage stats")
-                .free_pages,
-            free_before
-        );
         assert_eq!(old.alloc(tail).expect("promote full bound"), first + 64);
         assert_eq!(old.page_count(), 1);
 

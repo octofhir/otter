@@ -238,13 +238,21 @@ impl JitCodeRegistry {
     }
 
     pub(crate) fn link_function(&mut self, function: &otter_bytecode::Function, realm_id: u32) {
+        self.link_function_header(crate::code_space::FunctionHeader::of(function), realm_id);
+    }
+
+    /// [`Self::link_function`] from a header alone, for a function whose
+    /// chunk is not decoded yet.
+    pub(crate) fn link_function_header(
+        &mut self,
+        header: crate::code_space::FunctionHeader,
+        realm_id: u32,
+    ) {
         self.ensure_function_entry(
-            function.id,
-            function.param_count,
-            function
-                .register_count()
-                .expect("admitted function header has a register window"),
-            crate::executable::bytecode_call_flags(function),
+            header.id,
+            header.param_count,
+            header.register_count,
+            header.call_flags,
             realm_id,
         );
     }

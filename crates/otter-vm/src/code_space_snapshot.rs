@@ -3,7 +3,8 @@
 //! # Contents
 //! - Capture immutable ranges/compiler owners and freshly copied execution.
 //! - Restore fresh local feedback/atoms on the supplied resource account.
-//! - Encode/decode the directory as part of the executable's startup image.
+//! - Encode/decode the directory as part of the executable's startup image;
+//!   a decoded chunk stays dormant until a function in it is resolved.
 //!
 //! # Invariants
 //! - Captured directories never observe later donor links or evictions.
@@ -34,10 +35,17 @@ struct CapturedChunk {
     payload: Option<CapturedPayload>,
 }
 
-struct CapturedPayload {
-    module: Arc<LinkedBytecode>,
-    executable: Arc<ExecutableModule>,
-    sources: crate::source_registry::SourceRegistry,
+enum CapturedPayload {
+    /// A linked chunk: its immutable module, a fresh execution copy, and
+    /// the atom ids its constants resolved to.
+    Linked {
+        module: Arc<LinkedBytecode>,
+        executable: Arc<ExecutableModule>,
+        atom_ids: Arc<[u32]>,
+        sources: crate::source_registry::SourceRegistry,
+    },
+    /// A startup-image chunk no function of which was resolved yet.
+    Dormant(DormantChunk),
 }
 
 impl CodeSpace {
@@ -56,16 +64,20 @@ impl CodeSpace {
                 .payload
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let payload = guard
-                .as_ref()
-                .map(|payload| -> Result<CapturedPayload, ResourceError> {
-                    Ok(CapturedPayload {
-                        module: Arc::clone(&payload.module),
-                        executable: Arc::new(payload.executable.fresh_isolate_copy(account)?),
-                        sources: payload.sources.clone(),
-                    })
-                })
-                .transpose()?;
+            let payload = match guard.as_ref() {
+                Some(payload) => Some(CapturedPayload::Linked {
+                    module: Arc::clone(&payload.module),
+                    executable: Arc::new(payload.executable.fresh_isolate_copy(account)?),
+                    atom_ids: payload.atoms.ids().collect(),
+                    sources: payload.sources.clone(),
+                }),
+                None => chunk
+                    .dormant
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .map(CapturedPayload::Dormant),
+            };
             captured.push(CapturedChunk {
                 function_base: chunk.function_base,
                 function_count: chunk.function_count,
@@ -93,35 +105,48 @@ impl CodeSpaceSnapshot {
     ) -> Result<Arc<CodeSpace>, ResourceError> {
         let space = Arc::new(CodeSpace::default());
         for chunk in &self.chunks {
-            let payload = chunk
-                .payload
-                .as_ref()
-                .map(|captured| -> Result<Arc<ChunkPayload>, ResourceError> {
-                    let executable = Arc::new(captured.executable.fresh_isolate_copy(account)?);
+            let (payload, dormant) = match &chunk.payload {
+                Some(CapturedPayload::Linked {
+                    module,
+                    executable,
+                    sources,
+                    ..
+                }) => {
+                    let executable = Arc::new(executable.fresh_isolate_copy(account)?);
                     let metadata_bytes = (std::mem::size_of::<ChunkPayload>() as u64)
                         .saturating_add(std::mem::size_of::<AtomTable>() as u64)
-                        .saturating_add(AtomTable::allocation_bytes(&captured.module.constants));
+                        .saturating_add(AtomTable::allocation_bytes(&module.constants));
                     let mut retained_lease =
                         account.reserve_exact(ResourceClass::SourceModuleBytes, metadata_bytes)?;
                     let atoms = Arc::new(AtomTable::from_constants(
-                        &captured.module.constants,
+                        &module.constants,
                         &mut retained_lease,
                     )?);
                     let metadata_bytes = payload_metadata_bytes(&atoms);
                     retained_lease.resize(metadata_bytes)?;
                     let retained_bytes = metadata_bytes
-                        .saturating_add(captured.module.retained_bytes())
+                        .saturating_add(module.retained_bytes())
                         .saturating_add(executable.retained_bytes());
-                    Ok(Arc::new(ChunkPayload {
-                        module: Arc::clone(&captured.module),
+                    let payload = Arc::new(ChunkPayload {
+                        module: Arc::clone(module),
                         executable,
                         atoms,
-                        sources: captured.sources.clone(),
+                        sources: sources.clone(),
                         retained_bytes,
                         _retained_lease: retained_lease,
-                    }))
-                })
-                .transpose()?;
+                    });
+                    (Some(payload), None)
+                }
+                // The restoring isolate's account charges what it decodes.
+                Some(CapturedPayload::Dormant(dormant)) => (
+                    None,
+                    Some(DormantChunk {
+                        account: account.clone(),
+                        ..dormant.clone()
+                    }),
+                ),
+                None => (None, None),
+            };
             let restored = Arc::new(CodeChunk {
                 function_base: chunk.function_base,
                 function_count: chunk.function_count,
@@ -130,6 +155,7 @@ impl CodeSpaceSnapshot {
                 retention: chunk.retention,
                 alias: chunk.alias,
                 payload: RwLock::new(payload),
+                dormant: Mutex::new(dormant),
                 _directory_node_lease: account.reserve_exact(
                     ResourceClass::SourceModuleBytes,
                     std::mem::size_of::<CodeChunk>() as u64,
@@ -161,29 +187,41 @@ impl CodeSpaceSnapshot {
                 continue;
             };
             out.u8(1);
-            out.bytes(&otter_bytecode::binary::encode_module(
-                payload.module.verified().module(),
-            ));
-            let count = payload.module.functions.len();
-            out.len(count);
-            for index in 0..count {
-                out.u32(payload.executable.forward(index as u32).unwrap_or(u32::MAX));
-            }
-            let entries: Vec<_> = payload.sources.entries().collect();
-            out.len(entries.len());
-            for (url, text, prologue) in entries {
-                out.str(url);
-                out.u32(prologue);
-                match text.program_image_text() {
-                    Some(text) => {
-                        out.u8(1);
-                        out.u64((text.as_ptr() as usize).wrapping_sub(anchor) as u64);
-                        out.len(text.len());
+            match payload {
+                CapturedPayload::Linked {
+                    module,
+                    executable,
+                    atom_ids,
+                    sources,
+                } => {
+                    out.bytes(&otter_bytecode::binary::encode_module(
+                        module.verified().module(),
+                    ));
+                    let count = module.functions.len();
+                    out.len(count);
+                    for index in 0..count {
+                        out.u32(executable.forward(index as u32).unwrap_or(u32::MAX));
                     }
-                    None => {
-                        out.u8(0);
-                        out.str(text);
+                    out.len(atom_ids.len());
+                    atom_ids.iter().for_each(|&id| out.u32(id));
+                    out.len(count);
+                    for function in &module.functions {
+                        encode_header(out, FunctionHeader::of(function));
                     }
+                    encode_sources(out, sources, anchor);
+                }
+                CapturedPayload::Dormant(dormant) => {
+                    out.bytes(dormant.bytes);
+                    out.len(dormant.forwards.len());
+                    dormant.forwards.iter().for_each(|&base| out.u32(base));
+                    out.len(dormant.atom_ids.len());
+                    dormant.atom_ids.iter().for_each(|&id| out.u32(id));
+                    out.len(dormant.headers.len());
+                    dormant
+                        .headers
+                        .iter()
+                        .for_each(|&header| encode_header(out, header));
+                    encode_sources(out, &dormant.sources, anchor);
                 }
             }
         }
@@ -217,25 +255,21 @@ impl CodeSpaceSnapshot {
             let payload = match input.u8()? {
                 0 => None,
                 1 => {
-                    let verified = otter_bytecode::binary::decode_startup_image_module(
-                        input.bytes()?,
-                        function_base,
-                    )
-                    .ok()?;
-                    let module = LinkedBytecode::new(verified, account).ok()?;
-                    let mut executable =
-                        ExecutableModule::lazy(Arc::clone(&module), property_ic_site_base, account)
-                            .ok()?;
-                    if let Some(alias) = alias {
-                        executable = executable.with_alias(alias);
-                    }
-                    let forwards = input.len()?;
-                    for index in 0..forwards {
-                        let base = input.u32()?;
-                        if base != u32::MAX {
-                            executable.set_forward(index as u32, base);
-                        }
-                    }
+                    // The module stays encoded until a function in it is
+                    // first resolved.
+                    let bytes = input.bytes()?;
+                    let forwards = decode_u32s(input)?;
+                    let atom_ids = decode_u32s(input)?;
+                    let headers = (0..input.len()?)
+                        .map(|_| {
+                            Some(FunctionHeader {
+                                id: input.u32()?,
+                                param_count: u16::try_from(input.u32()?).ok()?,
+                                register_count: u16::try_from(input.u32()?).ok()?,
+                                call_flags: input.u32()?,
+                            })
+                        })
+                        .collect::<Option<Arc<[FunctionHeader]>>>()?;
                     let entries = input.len()?;
                     let mut sources = Vec::with_capacity(entries);
                     for _ in 0..entries {
@@ -268,11 +302,14 @@ impl CodeSpaceSnapshot {
                     let sources =
                         crate::source_registry::SourceRegistry::from_entries(sources, account)
                             .ok()?;
-                    Some(CapturedPayload {
-                        module,
-                        executable: Arc::new(executable),
+                    Some(CapturedPayload::Dormant(DormantChunk {
+                        bytes,
+                        forwards,
+                        atom_ids,
+                        headers,
                         sources,
-                    })
+                        account: account.clone(),
+                    }))
                 }
                 _ => return None,
             };
@@ -297,6 +334,43 @@ impl CodeSpaceSnapshot {
             _directory_lease: lease,
         })
     }
+}
+
+fn encode_header(out: &mut otter_gc::image_codec::ImageWriter, header: FunctionHeader) {
+    out.u32(header.id);
+    out.u32(u32::from(header.param_count));
+    out.u32(u32::from(header.register_count));
+    out.u32(header.call_flags);
+}
+
+/// A chunk's sources: program-image text as its displacement from
+/// `anchor`, other text verbatim.
+fn encode_sources(
+    out: &mut otter_gc::image_codec::ImageWriter,
+    sources: &crate::source_registry::SourceRegistry,
+    anchor: usize,
+) {
+    let entries: Vec<_> = sources.entries().collect();
+    out.len(entries.len());
+    for (url, text, prologue) in entries {
+        out.str(url);
+        out.u32(prologue);
+        match text.program_image_text() {
+            Some(text) => {
+                out.u8(1);
+                out.u64((text.as_ptr() as usize).wrapping_sub(anchor) as u64);
+                out.len(text.len());
+            }
+            None => {
+                out.u8(0);
+                out.str(text);
+            }
+        }
+    }
+}
+
+fn decode_u32s(input: &mut otter_gc::image_codec::ImageReader<'static>) -> Option<Arc<[u32]>> {
+    (0..input.len()?).map(|_| input.u32()).collect()
 }
 
 #[cfg(test)]

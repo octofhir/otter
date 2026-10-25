@@ -383,6 +383,21 @@ impl AtomTable {
     /// ids, and resolving against a different interner re-keys the whole table.
     /// That is what makes adopting a foreign code space sound — the adopting
     /// interpreter's ids are the only ones its shapes ever see.
+    /// The atom id of every slot, in constant order.
+    pub(crate) fn ids(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
+        self.slots
+            .iter()
+            .map(|slot| slot.id.load(Ordering::Relaxed))
+    }
+
+    /// Take the ids [`Self::ids`] of an equal table resolved against an
+    /// interner this isolate's re-mints: what a startup-image chunk recorded.
+    pub(crate) fn adopt_ids(&self, ids: &[u32]) {
+        for (slot, &id) in self.slots.iter().zip(ids) {
+            slot.id.store(id, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn resolve(&self, names: &mut NameInterner) {
         for slot in &self.slots {
             if let Some(text) = slot.text.as_deref() {

@@ -96,7 +96,7 @@ pub fn project_lockfile_candidates(project_root: &Path) -> Vec<(PathBuf, Lockfil
 }
 
 /// Parse/serialize errors for `otter.lock`.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum LockfileError {
     /// TOML parsing failed.

@@ -53,6 +53,45 @@ pub struct NpmRegistryMetadata {
     pub time: BTreeMap<String, String>,
 }
 
+/// One entry of `peerDependenciesMeta`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NpmPeerMeta {
+    /// The package works without the peer.
+    #[serde(default)]
+    pub optional: bool,
+}
+
+/// `peerDependenciesMeta` as published: entries that are no object are left
+/// out.
+fn peer_meta<'de, D>(deserializer: D) -> Result<BTreeMap<String, NpmPeerMeta>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Object(entries) => entries
+            .into_iter()
+            .filter_map(|(name, meta)| Some((name, serde_json::from_value(meta).ok()?)))
+            .collect(),
+        _ => BTreeMap::new(),
+    })
+}
+
+/// An `os` / `cpu` list as published: a single string is a list of one, and
+/// anything else names no platform restriction.
+fn platform_list<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(entry) => vec![entry],
+        serde_json::Value::Array(entries) => entries
+            .into_iter()
+            .filter_map(|entry| entry.as_str().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    })
+}
+
 /// One npm package version metadata entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NpmPackageVersion {
@@ -69,6 +108,19 @@ pub struct NpmPackageVersion {
     /// Optional dependencies.
     #[serde(rename = "optionalDependencies", default)]
     pub optional_dependencies: DependencySet,
+    /// Per-peer settings; a peer marked `optional` is never installed.
+    #[serde(
+        rename = "peerDependenciesMeta",
+        default,
+        deserialize_with = "peer_meta"
+    )]
+    pub peer_dependencies_meta: BTreeMap<String, NpmPeerMeta>,
+    /// Operating systems the package runs on, npm's `os` list.
+    #[serde(default, deserialize_with = "platform_list")]
+    pub os: Vec<String>,
+    /// CPU architectures the package runs on, npm's `cpu` list.
+    #[serde(default, deserialize_with = "platform_list")]
+    pub cpu: Vec<String>,
     /// Package binaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<PackageBinManifest>,

@@ -47,7 +47,7 @@ pub const PACKAGE_JSON: &str = "package.json";
 pub const PNPM_WORKSPACE_YAML: &str = "pnpm-workspace.yaml";
 
 /// Parse/discovery error for package manifests.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum ManifestError {
     /// Filesystem read/write operation failed.

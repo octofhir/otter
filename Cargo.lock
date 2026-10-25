@@ -2702,6 +2702,7 @@ dependencies = [
  "chrono",
  "dirs",
  "flate2",
+ "futures-util",
  "otter-http-client",
  "otter-pm-lockfile",
  "otter-pm-manifest",

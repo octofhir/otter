@@ -497,10 +497,13 @@ impl Codegen<'_> {
                 dynasm!(self.ops ; .arch x64 ; test r10b, ShapeState::PROTOTYPE_MASK as i8 ; jnz =>exit);
             }
         }
+        let last = selected.last().copied();
         for index in selected {
             let program = programs
                 .get(index as usize)
                 .ok_or(Unsupported::OperandShape("x86 graph named program index"))?;
+            // The last program's misses leave; it falls through to `done`.
+            let final_program = Some(index) == last;
             let expando = matches!(
                 program.ops.first(),
                 Some(Op::LoadArrayExpando {
@@ -511,7 +514,11 @@ impl Codegen<'_> {
             );
             let known = owners.get(index as usize);
             let mut owner = known.map_or(0, |record| record.owner_shape);
-            let next = self.ops.new_dynamic_label();
+            let next = if final_program {
+                exit
+            } else {
+                self.ops.new_dynamic_label()
+            };
             let object = |operand| {
                 if operand == 0 || (expando && value.is_some()) {
                     receiver
@@ -726,9 +733,14 @@ impl Codegen<'_> {
                     record,
                 );
             }
-            dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>next);
+            if !final_program {
+                dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>next);
+            }
         }
-        dynasm!(self.ops ; .arch x64 ; jmp =>exit ; =>done);
+        if last.is_none() {
+            dynasm!(self.ops ; .arch x64 ; jmp =>exit);
+        }
+        dynasm!(self.ops ; .arch x64 ; =>done);
         Ok(())
     }
 

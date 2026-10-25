@@ -255,18 +255,35 @@ impl Codegen<'_> {
             self.record_js_return(node, return_pc)?;
             dynasm!(self.ops ; .arch x64 ; jmp =>returned);
         }
-        dynasm!(self.ops ; .arch x64 ; =>generic);
-        let return_pc = emit_call(
-            &mut self.ops,
-            &mut self.relocations,
-            self.transitions,
-            15,
-            receiver,
-            construct,
-            count,
-            CallTarget::Generic,
-        );
-        self.record_js_return(node, return_pc)?;
+        let generic_call = move |codegen: &mut Codegen<'_>| {
+            dynasm!(codegen.ops ; .arch x64 ; =>generic);
+            let return_pc = emit_call(
+                &mut codegen.ops,
+                &mut codegen.relocations,
+                codegen.transitions,
+                15,
+                receiver,
+                construct,
+                count,
+                CallTarget::Generic,
+            );
+            codegen.record_js_return(node, return_pc)
+        };
+        if matches!(plan, crate::call_linkage::CallPlan::Generic) {
+            generic_call(self)?;
+        } else {
+            // A proved target makes the generic entry the cold path.
+            let sp_delta = self.sp_delta;
+            self.deferred
+                .push(Box::new(move |codegen: &mut Codegen<'_>| {
+                    let outer = std::mem::replace(&mut codegen.sp_delta, sp_delta);
+                    if let Err(failure) = generic_call(codegen) {
+                        codegen.deferred_failure.get_or_insert(failure);
+                    }
+                    codegen.sp_delta = outer;
+                    dynasm!(codegen.ops ; .arch x64 ; jmp =>returned);
+                }));
+        }
         dynasm!(self.ops ; .arch x64 ; =>returned);
         self.emit_pop_actuals(bytes);
         self.emit_call_completion(node)?;
@@ -353,10 +370,42 @@ impl Codegen<'_> {
     }
     pub(super) fn emit_call_completion(&mut self, node: NodeId) -> Result<(), Unsupported> {
         let (threw, committed) = self.throw_targets(node);
-        let completion = self.ops.new_dynamic_label();
-        let error = self.ops.new_dynamic_label();
+        // A callee's Fatal is final: no handler may observe it and its parked
+        // error must not be projected into an exception again.
+        let fatal = self.fatal;
+        let abrupt = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
-        dynasm!(self.ops ; .arch x64 ; =>completion ; test rdx, rdx ; jz =>done
+        dynasm!(self.ops ; .arch x64 ; test rdx, rdx ; jnz =>abrupt ; =>done);
+        // Every status but success leaves the hot path: a callee that retired
+        // itself for a tail call it staged is entered in its place, anything
+        // else is routed to its handler.
+        let sp_delta = self.sp_delta;
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'_>| {
+                let outer = std::mem::replace(&mut codegen.sp_delta, sp_delta);
+                if let Err(failure) =
+                    codegen.emit_abrupt_completion(node, abrupt, done, (threw, committed, fatal))
+                {
+                    codegen.deferred_failure.get_or_insert(failure);
+                }
+                codegen.sp_delta = outer;
+            }));
+        Ok(())
+    }
+
+    /// The out-of-line part of a call's completion from `abrupt`, with a
+    /// nonzero status in `rdx`: staged tail calls until one completes, then
+    /// success back to `done` or the status's handler.
+    fn emit_abrupt_completion(
+        &mut self,
+        node: NodeId,
+        abrupt: DynamicLabel,
+        done: DynamicLabel,
+        (threw, committed, fatal): (DynamicLabel, DynamicLabel, DynamicLabel),
+    ) -> Result<(), Unsupported> {
+        let error = self.ops.new_dynamic_label();
+        dynasm!(self.ops ; .arch x64
+            ; =>abrupt
             ; cmp edx, abi::NativeResultStatus::Continue as i32 ; jne =>error);
         let return_pc = crate::x86_64::js_call::emit_enter_staged(
             &mut self.ops,
@@ -365,16 +414,13 @@ impl Codegen<'_> {
             15,
         );
         self.record_js_return(node, return_pc)?;
-        dynasm!(self.ops ; .arch x64 ; jmp =>completion ; =>error);
+        dynasm!(self.ops ; .arch x64 ; test rdx, rdx ; jnz =>abrupt ; jmp =>done ; =>error);
         self.stamp_node_safepoint(node)?;
         self.stamp_pc(node);
-        // A callee's Fatal is final: no handler may observe it and its parked
-        // error must not be projected into an exception again.
-        let fatal = self.fatal;
         dynasm!(self.ops ; .arch x64
             ; cmp edx, abi::NativeResultStatus::Throw as i32 ; je =>committed
             ; cmp edx, abi::NativeResultStatus::Fatal as i32 ; je =>fatal
-            ; jmp =>threw ; =>done);
+            ; jmp =>threw);
         Ok(())
     }
     pub(super) fn emit_generic(

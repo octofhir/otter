@@ -247,6 +247,7 @@ impl Codegen<'_> {
     ) {
         let proved = self.ops.new_dynamic_label();
         let verified = self.ops.new_dynamic_label();
+        let prove = self.ops.new_dynamic_label();
         let target = RelocationTarget::CalleeIdentityCell {
             function_id,
             call_pc: pc,
@@ -262,19 +263,23 @@ impl Codegen<'_> {
             dynasm!(self.ops ; .arch x64 ; cmp Rq(value), [r11] ; je =>proved);
         }
         self.load_immediate(10, tag::box_function_id(function_id));
-        dynasm!(self.ops ; .arch x64 ; cmp Rq(value), r10 ; je =>verified);
-        self.emit_cell_guard(value, miss);
-        let layout = self.view.closure_call_layout;
-        dynasm!(self.ops ; .arch x64
-            ; cmp BYTE [Rq(value)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8 ; jne =>miss
-            ; test DWORD [Rq(value) + layout.flags_byte as i32], layout.runtime_setup_flags as i32 ; jnz =>miss
-            ; cmp DWORD [Rq(value) + layout.function_id_byte as i32], function_id as i32 ; jne =>miss);
-        dynasm!(self.ops ; .arch x64 ; =>verified);
+        dynasm!(self.ops ; .arch x64 ; cmp Rq(value), r10 ; jne =>prove ; =>verified);
         if cell != 0 {
             emit_load_symbol_u64(&mut self.ops, &mut self.relocations, 11, cell, target);
             dynasm!(self.ops ; .arch x64 ; mov [r11], Rq(value));
         }
         dynasm!(self.ops ; .arch x64 ; =>proved);
+        // The closure proof leaves the hot path.
+        let layout = self.view.closure_call_layout;
+        self.deferred.push(Box::new(move |codegen: &mut Codegen<'_>| {
+            dynasm!(codegen.ops ; .arch x64 ; =>prove);
+            codegen.emit_cell_guard(value, miss);
+            dynasm!(codegen.ops ; .arch x64
+                ; cmp BYTE [Rq(value)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8 ; jne =>miss
+                ; test DWORD [Rq(value) + layout.flags_byte as i32], layout.runtime_setup_flags as i32 ; jnz =>miss
+                ; cmp DWORD [Rq(value) + layout.function_id_byte as i32], function_id as i32 ; jne =>miss
+                ; jmp =>verified);
+        }));
     }
 
     fn emit_check_function_prototype_call(

@@ -296,6 +296,21 @@ impl Interpreter {
         interp.code_space.visit_function_headers(|header| {
             interp.jit_code_registry.link_function_header(header, 0)
         });
+        // Host events run their callbacks against the realm's host-script
+        // context, which a restored isolate never ran a script to set.
+        interp.realm_context = snapshot.realm_context_base.and_then(|base| {
+            match interp.code_space.resolve_chunk(base) {
+                crate::code_space::ChunkResolution::Live {
+                    function_base,
+                    payload,
+                } => Some(crate::ExecutionContext::from_chunk_payload(
+                    payload,
+                    function_base,
+                    std::sync::Arc::clone(&interp.code_space),
+                )),
+                _ => None,
+            }
+        });
 
         // Write the captured fixed roots back through the same walk that
         // collected them, relocated to the restored pages.

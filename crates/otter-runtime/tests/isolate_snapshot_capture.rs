@@ -106,6 +106,13 @@ fn restored_runtime_evaluates_javascript() {
     let snapshot = source.capture_isolate_snapshot().expect("capture");
     let mut restored =
         otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
+    // Host events (a child's exit, a server's request) run their callbacks
+    // against the realm's host-script context before any script of the
+    // restored run has executed.
+    assert!(
+        restored.realm_execution_context().is_some(),
+        "a restored isolate keeps its realm's host-script context"
+    );
 
     let result = restored
         .eval(otter_runtime::SourceInput::from_javascript("1 + 1"))

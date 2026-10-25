@@ -45,6 +45,9 @@
 //! - `registered_symbols` keeps registration order, so `Symbol.for` and
 //!   `Symbol.keyFor` answer a restored isolate as they answered the
 //!   captured one.
+//! - `realm_context_base` names the chunk the realm's host scripts ran in:
+//!   a restored isolate runs no script before host events need that
+//!   context, so the restore rebuilds it from the code space.
 //! - Code capture admits independent mutable execution tables and directory
 //!   metadata on the current resource account; immutable compiler/source owners
 //!   retain their existing shared leases without pinning donor payloads.
@@ -114,6 +117,9 @@ pub struct IsolateSnapshot {
     /// the process counter past this so freshly minted shape ids never
     /// collide with the image's — shape ids key the property caches.
     pub(crate) next_shape_id: u64,
+    /// First function id of the chunk the realm's host scripts ran in, which
+    /// host events run their native callbacks against.
+    pub(crate) realm_context_base: Option<u32>,
     /// Distance from the capturing process's [`startup_image_anchor`] to
     /// this process's: what every program-image address in the image moved
     /// by. Zero for an in-process capture.
@@ -261,6 +267,10 @@ impl crate::Interpreter {
             });
         }
         let next_shape_id = crate::object::snapshot_next_shape_id();
+        let realm_context_base = self
+            .realm_context
+            .as_ref()
+            .map(crate::ExecutionContext::function_base);
         let atom_names = self.snapshot_atom_names();
         let mut global_lexicals: Vec<(Box<str>, RawGc, bool)> = self
             .snapshot_global_lexicals()
@@ -284,6 +294,7 @@ impl crate::Interpreter {
             regexp_payloads,
             array_indexed_records,
             next_shape_id,
+            realm_context_base,
         })
     }
 }
@@ -379,6 +390,7 @@ impl IsolateSnapshot {
             }
         }
         out.u64(self.next_shape_id);
+        out.u32(self.realm_context_base.unwrap_or(u32::MAX));
     }
 
     /// Read back an image [`Self::encode`] wrote, its dynamic natives
@@ -480,6 +492,7 @@ impl IsolateSnapshot {
             ));
         }
         let next_shape_id = input.u64()?;
+        let realm_context_base = Some(input.u32()?).filter(|&base| base != u32::MAX);
         Some(Self {
             image,
             code_space,
@@ -494,6 +507,7 @@ impl IsolateSnapshot {
             regexp_payloads,
             array_indexed_records,
             next_shape_id,
+            realm_context_base,
             image_slide,
         })
     }

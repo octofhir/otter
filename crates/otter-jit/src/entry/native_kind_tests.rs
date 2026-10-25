@@ -33,7 +33,7 @@ fn classifier(value: u8) -> crate::CompiledCode {
         ; =>hit ; cmp x17, 85 ; b.ne =>changed
         ; cmp X(value), x15 ; b.ne =>changed ; mov w0, 1 ; ret
         ; =>changed ; mov w0, 2 ; ret);
-    crate::CompiledCode::new(ops.finalize().unwrap(), entry)
+    crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap()
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -52,7 +52,7 @@ fn classifier(value: u8) -> crate::CompiledCode {
         ; cmp Rq(value), rdi ; jne =>changed ; mov eax, 1 ; ret
         ; =>miss ; cmp Rq(value), rdi ; jne =>changed ; xor eax, eax ; ret
         ; =>changed ; mov eax, 2 ; ret);
-    crate::CompiledCode::new(ops.finalize().unwrap(), entry)
+    crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap()
 }
 
 #[test]
@@ -260,9 +260,18 @@ fn same_source_whole_compilation_exposes_both_hit_and_miss_code_cost() {
         let view = view(selected);
         // Compile-only source selection: no address is called, no policy or
         // execution feedback is simulated. Runtime owns actual admission.
-        let template = crate::template::compile(&view, 31, &table).unwrap();
-        let graph =
-            crate::graph::compile(&view, 32, &table, None, false, &Default::default()).unwrap();
+        let template =
+            crate::template::compile(&view, 31, &table, &crate::NativeCodeSpace::new()).unwrap();
+        let graph = crate::graph::compile(
+            &view,
+            32,
+            &table,
+            &crate::routines::fixture_routines(&view, &table),
+            None,
+            false,
+            &Default::default(),
+        )
+        .unwrap();
         let plans: Vec<_> = graph
             .built
             .graph

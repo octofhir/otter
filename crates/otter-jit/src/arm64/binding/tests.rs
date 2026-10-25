@@ -215,7 +215,7 @@ fn executable_mode(
         assert_eq!(records[0]["target"]["functionId"], view.code_block.id);
         assert_eq!(records[0]["target"]["bytePc"], BYTE_PC);
     }
-    CompiledCode::new(buffer, entry)
+    CompiledCode::new(&crate::CodeMemory::new(), buffer, entry).unwrap()
 }
 fn run(code: &CompiledCode, activation: &mut Activation, cage: &mut [u64]) -> u64 {
     let mut observed = [0u64; 5];

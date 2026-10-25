@@ -402,7 +402,7 @@ pub(super) fn emit_fused_numeric_chain(
 pub(super) fn emit_add_generic(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
-    shared: &mut super::shared_property::SharedPropertyProbes,
+    shared: &crate::routines::RoutineRequest<'_>,
     table: &TransitionTable,
     dst: u16,
     lhs: u16,
@@ -447,6 +447,7 @@ pub(super) fn emit_add_generic(
     let collecting = ops.new_dynamic_label();
     super::primitive_strings::emit_concat_fit(
         ops,
+        relocations,
         shared,
         dst,
         lhs,

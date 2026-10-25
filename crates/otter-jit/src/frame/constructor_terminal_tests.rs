@@ -67,7 +67,8 @@ fn execute(pair: NativeResultPair) {
     } else {
         dynasm!(leaf ; .arch x64 ; mov rax, [r11] ; mov rdx, [r11 + 8] ; ret);
     }
-    let leaf = CompiledCode::new(leaf.finalize().unwrap(), entry);
+    let leaf =
+        CompiledCode::new(&crate::CodeMemory::new(), leaf.finalize().unwrap(), entry).unwrap();
     let mut wrapper = Assembler::new().unwrap();
     let entry = wrapper.offset();
     dynasm!(wrapper ; .arch x64
@@ -85,7 +86,12 @@ fn execute(pair: NativeResultPair) {
     dynasm!(wrapper ; .arch x64
         ; add rsp, 16 ; mov [r15 + AFTER], rsp ; pop r15 ; ret
     );
-    let wrapper = CompiledCode::new(wrapper.finalize().unwrap(), entry);
+    let wrapper = CompiledCode::new(
+        &crate::CodeMemory::new(),
+        wrapper.finalize().unwrap(),
+        entry,
+    )
+    .unwrap();
     let mut context = empty_context();
     // SAFETY: this wrapper follows private System V arguments/results even
     // on Windows. Its one C crossing above follows the actual target platform.
@@ -119,7 +125,8 @@ fn execute(pair: NativeResultPair) {
         ; and x9, x11, 15 ; str x9, [x10, POINTER as u32]
         ; ldp x0, x1, [x11] ; ret
     );
-    let leaf = CompiledCode::new(leaf.finalize().unwrap(), entry);
+    let leaf =
+        CompiledCode::new(&crate::CodeMemory::new(), leaf.finalize().unwrap(), entry).unwrap();
     let mut wrapper = Assembler::new().unwrap();
     let entry = wrapper.offset();
     dynasm!(wrapper ; .arch aarch64
@@ -136,7 +143,12 @@ fn execute(pair: NativeResultPair) {
         ; add sp, sp, 16 ; mov x9, sp ; str x9, [x19, AFTER as u32]
         ; ldp x19, x30, [sp], 16 ; ret
     );
-    let wrapper = CompiledCode::new(wrapper.finalize().unwrap(), entry);
+    let wrapper = CompiledCode::new(
+        &crate::CodeMemory::new(),
+        wrapper.finalize().unwrap(),
+        entry,
+    )
+    .unwrap();
     let mut context = empty_context();
     // SAFETY: this wrapper and leaf follow the target C convention and retain
     // these exact live private host records; neither can allocate or collect.

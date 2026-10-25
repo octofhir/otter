@@ -527,6 +527,7 @@ fn symbolic_target(target: &RelocationTarget) -> String {
         }
         RelocationTarget::BackedgeFuelCell => "backedgeFuelCell".to_string(),
         RelocationTarget::DependencyFlag => "dependencyFlag".to_string(),
+        RelocationTarget::PropertyRoutine { routine } => format!("propertyRoutine({routine})"),
     }
 }
 

@@ -121,6 +121,7 @@ pub(super) fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &crate::entry::TransitionTable,
+    code_space: &crate::NativeCodeSpace,
     artifact_request: Option<ArtifactRequest>,
     capture_events: bool,
 ) -> Result<NativeCompileOutput<TemplateCode>, Unsupported> {
@@ -130,6 +131,7 @@ pub(super) fn compile(
         view,
         code_object_id,
         transitions,
+        code_space,
         artifact_request.clone(),
         capture_events,
         false,
@@ -138,6 +140,7 @@ pub(super) fn compile(
             view,
             code_object_id,
             transitions,
+            code_space,
             artifact_request,
             capture_events,
             true,
@@ -153,6 +156,7 @@ fn compile_with_reach(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &crate::entry::TransitionTable,
+    code_space: &crate::NativeCodeSpace,
     artifact_request: Option<ArtifactRequest>,
     capture_events: bool,
     far_branches: bool,
@@ -167,7 +171,8 @@ fn compile_with_reach(
     let poll_entry = transitions.entry(abi::STUB_JIT_BACKEDGE_POLL);
     let mut coercion_slow_paths = Vec::new();
     let mut numeric_slow_paths = Vec::new();
-    let mut shared_property = shared_property::SharedPropertyProbes::default();
+    let routine_request = crate::routines::RoutineRequest::new(code_space, view, transitions);
+    let shared_property = &routine_request;
     let mut ops = Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
     // Shared exit labels. Each veneer island defines the labels its segment
@@ -416,7 +421,7 @@ fn compile_with_reach(
                 far_branches,
                 numeric_slow_paths: &mut numeric_slow_paths,
                 coercion_slow_paths: &mut coercion_slow_paths,
-                shared_property: &mut shared_property,
+                shared_property,
                 direct_call_events: &mut direct_call_events,
                 code_map: &mut code_map,
                 saved_pairs: 0,
@@ -691,18 +696,6 @@ fn compile_with_reach(
         osr_entries.insert(header_pc, offset);
     }
 
-    let shared_start = ops.offset().0;
-    shared_property.emit(&mut ops, &mut relocations, transitions, view);
-    if let Some(code_map) = code_map.as_mut()
-        && ops.offset().0 != shared_start
-    {
-        code_map.record(CodeRegion::structural(
-            "sharedPropertyProbes",
-            shared_start,
-            ops.offset().0,
-        ));
-    }
-
     if let Some((start, end)) = relocations.emit_literal_pool(&mut ops)
         && let Some(code_map) = code_map.as_mut()
     {
@@ -718,7 +711,9 @@ fn compile_with_reach(
     } = plan;
     safepoint_records.sort_by_key(|record| record.id);
     return_sites.sort_by_key(|site| site.native_return_offset);
-    let compiled_code = CompiledCode::new(buf, entry);
+    let routines = routine_request.finish()?;
+    let mut compiled_code = CompiledCode::new(code_space.memory(), buf, entry)?;
+    compiled_code.retain_routines(routines);
     let required_cells = relocations.take_required_cells();
     let artifact = artifact_request.map(|request| {
         build_bundle(
@@ -861,7 +856,7 @@ pub(crate) struct OperationContext<'c, 'a> {
     pub(crate) far_branches: bool,
     pub(crate) numeric_slow_paths: &'c mut Vec<arith::NumericSlowPath>,
     pub(crate) coercion_slow_paths: &'c mut Vec<arith::CoercionSlowPath>,
-    pub(crate) shared_property: &'c mut shared_property::SharedPropertyProbes,
+    pub(crate) shared_property: &'c crate::routines::RoutineRequest<'a>,
     pub(crate) direct_call_events: &'c mut Option<super::DirectCallEvents>,
     pub(crate) code_map: &'c mut Option<CodeMapCapture>,
     /// Callee-saved pairs the enclosing body saved; a tail transfer that

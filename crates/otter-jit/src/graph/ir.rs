@@ -627,26 +627,22 @@ pub(crate) enum Kind {
     /// barrier is a separate node.
     StoreBodySlot(otter_vm::jit::JitBodySlot),
     /// `[[Get]]` of the named property at the load site `pc` from receiver
-    /// input0: an own or prototype data slot proved by the load fact in the
-    /// isolate's shared property action table for `atom`, else the committed
-    /// source operation in the runtime. A `length` site first reads an
-    /// ordinary array's or a string's length inline.
+    /// input0 through the compiler's load routine: the site's IC slot
+    /// handlers, the isolate's shared property action table under the slot's
+    /// atom, else the committed source operation in the runtime. A `length`
+    /// site first reads an ordinary array's or a string's length inline.
     LoadPropertyCached {
         pc: u32,
-        atom: Option<u32>,
         length: bool,
     },
     /// `[[Set]]` of input1 as the named property of receiver input0 at the
-    /// store site `pc`: an existing writable own slot or an addition proved
-    /// by the independent store fact in the shared property action table for
-    /// `atom`; else the committed source operation in the runtime.
-    /// The source receiver remains input0; each hit barriers its selected
-    /// storage unless `barrier` is false: the value is never a cell, or the
-    /// receiver is a fresh ordinary cell, which is its own storage.
+    /// store site `pc` through the compiler's store routine: the site's IC
+    /// slot handlers, an existing writable own slot or an addition proved by
+    /// the independent store fact in the shared action table, else the
+    /// committed source operation in the runtime. Every hit barriers the
+    /// storage it selected.
     StorePropertyCached {
         pc: u32,
-        atom: Option<u32>,
-        barrier: bool,
     },
     /// `[[Set]]` of input2 at key input1 of receiver input0 at the element
     /// store site `pc` as a generic keyed store: an in-bounds store into
@@ -1583,20 +1579,24 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::LoadShapedProperty { .. } | Self::LoadPropertyCached { .. } => Constraints {
+            Self::LoadShapedProperty { .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,
                 gp_temps: 4,
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::StorePropertyCached { .. } => Constraints {
-                inputs: registers(2),
-                result: ResultPolicy::None,
-                gp_temps: 4,
+            // The probe routine preserves every other allocatable register;
+            // its miss completes through the committed operation.
+            Self::LoadPropertyCached { .. } => Constraints {
+                inputs: smallvec::smallvec![FixedGp(target.property_probe.receiver)],
+                result: ResultPolicy::FixedGp(target.property_probe.result),
+                gp_temps: 0,
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
+            // The routine call stages its operands itself.
+            Self::StorePropertyCached { .. } => simple(2, ResultPolicy::None),
             Self::StoreKeyedCached { .. } => Constraints {
                 inputs: registers(3),
                 result: ResultPolicy::None,

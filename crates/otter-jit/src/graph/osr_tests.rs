@@ -52,6 +52,7 @@ fn native_osr_consumes_live_loop_values_and_restores_the_prior_interpreter_roots
         &view,
         8011,
         &TransitionTable::resolve(),
+        &crate::routines::fixture_routines(&view, &TransitionTable::resolve()),
         Some(1),
         true,
         &Default::default(),

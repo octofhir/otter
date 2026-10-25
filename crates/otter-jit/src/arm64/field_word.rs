@@ -69,7 +69,9 @@ mod tests {
         let done = ops.new_dynamic_label();
         dynasm!(ops ; .arch aarch64 ; fmov x1, d4 ; cmp x1, x2 ; b.eq =>done
             ; movz x0, 10 ; =>done ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                .unwrap();
         // SAFETY: this leaf receives IEEE bits and returns one Value word.
         let run: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.entry_ptr()) };
         for number in numbers() {
@@ -80,7 +82,9 @@ mod tests {
             let entry = ops.offset();
             emit_decode_number(&mut ops, 0, 0, 16, double_only);
             dynasm!(ops ; .arch aarch64 ; fmov x0, d0 ; ret);
-            let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+            let code =
+                crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                    .unwrap();
             // SAFETY: this leaf receives a summary-proven numeric Value.
             let run: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.entry_ptr()) };
             for number in numbers() {

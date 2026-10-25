@@ -76,13 +76,9 @@ fn executed_empty_cache_sites_use_committed_runtime_probes() {
         );
         assert!(built.graph.nodes.iter().any(|node| matches!(
             (op, &node.kind),
-            (
-                Op::LoadProperty,
-                Kind::LoadPropertyCached { atom: None, .. }
-            ) | (
-                Op::StoreProperty,
-                Kind::StorePropertyCached { atom: None, .. }
-            ) | (Op::StorePropertyStrict, Kind::Generic { .. })
+            (Op::LoadProperty, Kind::LoadPropertyCached { .. })
+                | (Op::StoreProperty, Kind::StorePropertyCached { .. })
+                | (Op::StorePropertyStrict, Kind::Generic { .. })
         )));
     }
 }

@@ -23,7 +23,8 @@ use otter_vm::native_abi as abi;
 
 pub(super) fn emit_concat_fit(
     ops: &mut Assembler,
-    shared: &mut super::shared_property::SharedPropertyProbes,
+    relocations: &mut crate::artifact::relocation::RelocationCapture,
+    shared: &crate::routines::RoutineRequest<'_>,
     dst: u16,
     lhs: u16,
     rhs: u16,
@@ -35,8 +36,13 @@ pub(super) fn emit_concat_fit(
     emit_load_reg(ops, CONCAT_LHS, lhs)?;
     emit_load_reg(ops, CONCAT_RHS, rhs)?;
     super::values::emit_load_u64(ops, CONCAT_SITE, site.record);
-    let routine = shared.concat_label(ops);
-    dynasm!(ops ; .arch aarch64 ; bl =>routine ; cbnz x1, =>slow);
+    super::shared_property::emit_call(
+        ops,
+        relocations,
+        shared,
+        crate::routines::PropertyRoutine::Concat,
+    );
+    dynasm!(ops ; .arch aarch64 ; cbnz x1, =>slow);
     emit_store_reg(ops, CONCAT_RESULT, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done);
     Ok(())

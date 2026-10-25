@@ -138,12 +138,15 @@ fn snapshot() -> JitCompileSnapshot {
 
 fn compile(view: &JitCompileSnapshot, table: &TransitionTable) -> Vec<Box<dyn JitFunctionCode>> {
     vec![
-        Box::new(crate::template::compile(view, 11, table).unwrap()),
+        Box::new(
+            crate::template::compile(view, 11, table, &crate::NativeCodeSpace::new()).unwrap(),
+        ),
         Box::new(
             crate::graph::compile_optimized(
                 view,
                 12,
                 table,
+                &crate::NativeCodeSpace::new(),
                 None,
                 None,
                 false,

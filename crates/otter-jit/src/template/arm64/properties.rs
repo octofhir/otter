@@ -307,7 +307,7 @@ pub(super) fn emit_intrinsic_loads(
 pub(super) fn emit_load_property(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
-    shared_probes: &mut super::shared_property::SharedPropertyProbes,
+    shared_probes: &crate::routines::RoutineRequest<'_>,
     view: &JitCompileSnapshot,
     dst: u16,
     object: u16,
@@ -366,9 +366,13 @@ pub(super) fn emit_load_property(
     );
     // The inline miss is pre-effect; the routine re-proves the receiver from
     // the published window.
-    let routine = shared_probes.label(ops, false);
     emit_load_reg(ops, LOAD_RECEIVER, object)?;
-    dynasm!(ops ; .arch aarch64 ; bl =>routine);
+    super::shared_property::emit_call(
+        ops,
+        relocations,
+        shared_probes,
+        crate::routines::PropertyRoutine::Load,
+    );
     emit_shared_status(ops, throw_value, fatal);
     emit_store_reg(ops, 0, dst)?;
     dynasm!(ops ; .arch aarch64 ; =>done);
@@ -380,7 +384,7 @@ pub(super) fn emit_load_property(
 pub(super) fn emit_store_property(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
-    shared_probes: &mut super::shared_property::SharedPropertyProbes,
+    shared_probes: &crate::routines::RoutineRequest<'_>,
     view: &JitCompileSnapshot,
     object: u16,
     value: u16,
@@ -421,10 +425,14 @@ pub(super) fn emit_store_property(
         ; b =>done
         ; =>shared
     );
-    let routine = shared_probes.label(ops, true);
     emit_load_reg(ops, STORE_RECEIVER, object)?;
     emit_load_reg(ops, STORE_VALUE, value)?;
-    dynasm!(ops ; .arch aarch64 ; bl =>routine);
+    super::shared_property::emit_call(
+        ops,
+        relocations,
+        shared_probes,
+        crate::routines::PropertyRoutine::Store,
+    );
     emit_shared_status(ops, throw_value, fatal);
     dynasm!(ops ; .arch aarch64 ; =>done);
     Ok(())

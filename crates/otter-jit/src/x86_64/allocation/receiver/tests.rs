@@ -206,7 +206,8 @@ fn execute(case: Case) {
         ; jmp =>done ; =>done
         ; pop r15 ; pop r14 ; pop r13 ; pop r12 ; pop rbp ; pop rbx ; ret
     );
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     // SAFETY: the private System V entry touches only these bounded host
     // cells/LAB/output, saves nonvolatiles and never calls or enters GC.
     let call: extern "sysv64" fn(*mut JitCtx, u64, *mut u64) =

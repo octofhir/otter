@@ -120,8 +120,16 @@ fn actual_emission_records_one_group_probe_and_exact_first_source_eager_recovery
         (Op::ReturnValue, vec![Operand::Register(1)]),
     ]);
     let transitions = crate::entry::TransitionTable::resolve();
-    let compiled = crate::graph::compile(&v, 9191, &transitions, None, false, &Default::default())
-        .expect("current group target emission");
+    let compiled = crate::graph::compile(
+        &v,
+        9191,
+        &transitions,
+        &crate::routines::fixture_routines(&v, &transitions),
+        None,
+        false,
+        &Default::default(),
+    )
+    .expect("current group target emission");
     assert_eq!(compiled.built.graph.allocation_groups.len(), 1);
     let graph = &compiled.built.graph;
     let first = graph.allocation_groups[0].members[0].node;
@@ -163,8 +171,16 @@ fn disabled_and_unprepared_source_snapshots_keep_standalone_native_allocations()
     ]);
     v.literal_allocations.group_allowed = false;
     let transitions = crate::entry::TransitionTable::resolve();
-    let compiled = crate::graph::compile(&v, 9192, &transitions, None, false, &Default::default())
-        .expect("disabled policy still compiles standalone native shells");
+    let compiled = crate::graph::compile(
+        &v,
+        9192,
+        &transitions,
+        &crate::routines::fixture_routines(&v, &transitions),
+        None,
+        false,
+        &Default::default(),
+    )
+    .expect("disabled policy still compiles standalone native shells");
     assert!(compiled.built.graph.allocation_groups.is_empty());
     assert_eq!(
         compiled

@@ -256,6 +256,7 @@ fn emitted_inline_factory_uses_own_plans_receiver_and_undefined_new_target() {
         &caller,
         9001,
         &transitions,
+        &crate::routines::fixture_routines(&caller, &transitions),
         None,
         false,
         &Default::default(),
@@ -310,6 +311,7 @@ fn emitted_inline_factory_uses_own_plans_receiver_and_undefined_new_target() {
         &caller,
         9002,
         &transitions,
+        &crate::NativeCodeSpace::new(),
         None,
         Some(crate::artifact::ArtifactRequest {
             identity: JitArtifactIdentity {

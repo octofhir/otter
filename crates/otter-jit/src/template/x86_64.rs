@@ -138,6 +138,7 @@ pub(super) fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &crate::entry::TransitionTable,
+    code_space: &crate::NativeCodeSpace,
     artifact_request: Option<ArtifactRequest>,
     capture_events: bool,
 ) -> Result<NativeCompileOutput<TemplateCode>, Unsupported> {
@@ -155,7 +156,8 @@ pub(super) fn compile(
     let mut relocations = RelocationCapture::new(artifact_request.is_some());
     let mut code_map = artifact_request.as_ref().map(|_| CodeMapCapture::default());
     let mut direct_call_events = capture_events.then(|| super::seed_direct_call_events(view));
-    let mut shared_property = shared_property::SharedPropertyProbes::default();
+    let routine_request = crate::routines::RoutineRequest::new(code_space, view, transitions);
+    let shared_property = &routine_request;
     let type_mismatch = ops.new_dynamic_label();
     let identity_guard = ops.new_dynamic_label();
     let unsupported = ops.new_dynamic_label();
@@ -278,7 +280,7 @@ pub(super) fn compile(
                     fatal,
                 },
                 frame_kind: shape.kind,
-                shared_property: &mut shared_property,
+                shared_property,
                 direct_call_events: &mut direct_call_events,
                 code_map: &mut code_map,
             },
@@ -443,7 +445,6 @@ pub(super) fn compile(
         }
         osr_entries.insert(header_pc, offset);
     }
-    shared_property.emit(&mut ops, &mut relocations, transitions, view);
 
     let buffer = crate::entry::finalize_assembler(ops)?;
     let TemplatePlan {
@@ -455,7 +456,9 @@ pub(super) fn compile(
     } = plan;
     safepoint_records.sort_by_key(|record| record.id);
     return_sites.sort_by_key(|site| site.native_return_offset);
-    let compiled_code = CompiledCode::new(buffer, entry);
+    let routines = routine_request.finish()?;
+    let mut compiled_code = CompiledCode::new(code_space.memory(), buffer, entry)?;
+    compiled_code.retain_routines(routines);
     if let Some(code_map) = code_map.as_mut() {
         code_map.record(CodeRegion::structural(
             "templateFunction",
@@ -809,7 +812,7 @@ pub(crate) fn emit_alloc_packet(
 fn emit_add_generic(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
-    shared: &mut shared_property::SharedPropertyProbes,
+    shared: &crate::routines::RoutineRequest<'_>,
     transitions: &crate::entry::TransitionTable,
     dst: u16,
     lhs: u16,
@@ -840,7 +843,17 @@ fn emit_add_generic(
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>runtime_path);
 
     let collecting = ops.new_dynamic_label();
-    primitive_strings::emit_concat_fit(ops, shared, dst, lhs, rhs, site, collecting, done);
+    primitive_strings::emit_concat_fit(
+        ops,
+        relocations,
+        shared,
+        dst,
+        lhs,
+        rhs,
+        site,
+        collecting,
+        done,
+    );
     dynasm!(ops ; .arch x64 ; =>collecting);
 
     if let Some(stub_addr) =
@@ -1661,7 +1674,7 @@ fn emit_pair_status(ops: &mut Assembler, throw_value: DynamicLabel, fatal: Dynam
 fn emit_store_property(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
-    shared_property: &mut shared_property::SharedPropertyProbes,
+    shared_property: &crate::routines::RoutineRequest<'_>,
     view: &JitCompileSnapshot,
     byte_pc: u32,
     object: u16,
@@ -1681,10 +1694,14 @@ fn emit_store_property(
     crate::x86_64::field_type::emit_observe(ops, relocations, view, STORE_SLOT, STORE_VALUE);
     emit_template_value_barrier(ops, relocations, view, STORE_RECEIVER, STORE_VALUE);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>shared);
-    let routine = shared_property.label(ops, true);
     emit_load_reg(ops, STORE_RECEIVER, object);
     emit_load_reg(ops, STORE_VALUE, value);
-    dynasm!(ops ; .arch x64 ; call =>routine);
+    shared_property::emit_call(
+        ops,
+        relocations,
+        shared_property,
+        crate::routines::PropertyRoutine::Store,
+    );
     emit_pair_status(ops, throw_value, fatal);
     dynasm!(ops ; .arch x64 ; =>done);
     Ok(())
@@ -1900,7 +1917,7 @@ fn emit_intrinsic_loads(
 fn emit_load_property(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
-    shared_property: &mut shared_property::SharedPropertyProbes,
+    shared_property: &crate::routines::RoutineRequest<'_>,
     view: &JitCompileSnapshot,
     byte_pc: u32,
     dst: u16,
@@ -1922,9 +1939,13 @@ fn emit_load_property(
     dynasm!(ops ; .arch x64
         ; jmp =>done
         ; =>shared);
-    let routine = shared_property.label(ops, false);
     emit_load_reg(ops, LOAD_RECEIVER, object);
-    dynasm!(ops ; .arch x64 ; call =>routine);
+    shared_property::emit_call(
+        ops,
+        relocations,
+        shared_property,
+        crate::routines::PropertyRoutine::Load,
+    );
     emit_pair_status(ops, throw_value, fatal);
     dynasm!(ops ; .arch x64 ; =>done);
     emit_store_reg(ops, 0, dst);
@@ -2060,7 +2081,7 @@ fn emit_load_element(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
-    shared_property: &mut shared_property::SharedPropertyProbes,
+    shared_property: &crate::routines::RoutineRequest<'_>,
     dst: u16,
     receiver: u16,
     index: u16,
@@ -2069,10 +2090,15 @@ fn emit_load_element(
 ) {
     // A name key: the receiver class's table entry, as a named load's.
     use shared_property::{KEYED_LOAD_KEY, KEYED_LOAD_RECEIVER};
-    let routine = shared_property.keyed_label(ops, false);
     emit_load_reg(ops, KEYED_LOAD_RECEIVER, receiver);
     emit_load_reg(ops, KEYED_LOAD_KEY, index);
-    dynasm!(ops ; .arch x64 ; call =>routine ; test rdx, rdx ; jz >done);
+    shared_property::emit_call(
+        ops,
+        relocations,
+        shared_property,
+        crate::routines::PropertyRoutine::KeyedLoad,
+    );
+    dynasm!(ops ; .arch x64 ; test rdx, rdx ; jz >done);
     emit_load_reg(ops, 6, receiver);
     emit_load_reg(ops, 2, index);
     dynasm!(ops ; .arch x64 ; mov rdi, r15);
@@ -2099,7 +2125,7 @@ fn emit_store_element(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     transitions: &crate::entry::TransitionTable,
-    shared_property: &mut shared_property::SharedPropertyProbes,
+    shared_property: &crate::routines::RoutineRequest<'_>,
     receiver: u16,
     index: u16,
     value: u16,
@@ -2108,11 +2134,16 @@ fn emit_store_element(
 ) {
     // A name key: the receiver class's table entry, as a named store's.
     use shared_property::{KEYED_STORE_KEY, KEYED_STORE_RECEIVER, KEYED_STORE_VALUE};
-    let routine = shared_property.keyed_label(ops, true);
     emit_load_reg(ops, KEYED_STORE_RECEIVER, receiver);
     emit_load_reg(ops, KEYED_STORE_VALUE, value);
     emit_load_reg(ops, KEYED_STORE_KEY, index);
-    dynasm!(ops ; .arch x64 ; call =>routine ; test rdx, rdx ; jz >done);
+    shared_property::emit_call(
+        ops,
+        relocations,
+        shared_property,
+        crate::routines::PropertyRoutine::KeyedStore,
+    );
+    dynasm!(ops ; .arch x64 ; test rdx, rdx ; jz >done);
     emit_load_reg(ops, 6, receiver);
     emit_load_reg(ops, 2, index);
     emit_load_reg(ops, 1, value);
@@ -2209,7 +2240,8 @@ mod tests {
             emit_cmp_rax_imm8(&mut ops, immediate);
             assert_eq!(ops.offset().0 - start, 4);
             dynasm!(ops ; .arch x64 ; pushfq ; pop rax ; ret);
-            let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+            let code = CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                .unwrap();
             assert_eq!(
                 &code.bytes()[start..start + 4],
                 &[0x48, 0x83, 0xf8, immediate as u8]
@@ -2283,7 +2315,9 @@ mod tests {
                     ; xor eax, eax
                     ; ret
                 );
-                let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+                let code =
+                    CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                        .unwrap();
                 // SAFETY: the generated System V entry writes one owned u64,
                 // uses only caller-saved registers, and returns before this
                 // executable mapping is released.
@@ -2314,7 +2348,9 @@ mod tests {
                 );
                 assert_eq!(ops.offset().0 - start, 10);
                 dynasm!(ops ; .arch x64 ; ret);
-                let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+                let code =
+                    CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                        .unwrap();
                 let rendered = relocations
                     .render(code.bytes())
                     .expect("every symbolic address must validate as an exact imm64 move");

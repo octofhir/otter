@@ -631,7 +631,6 @@ mod tests {
         assert!(writes(&Kind::LooseEqual { negate: false }).is_empty());
         let load = Kind::LoadPropertyCached {
             pc: 0,
-            atom: None,
             length: false,
         };
         assert!(writes(&load).is_world());

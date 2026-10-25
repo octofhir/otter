@@ -77,8 +77,13 @@ fn assert_physical_call(bytes: &[u8], offset: usize) {
 
 #[test]
 fn calls_retain_physical_return_offsets_and_exact_zero_source_without_capture() {
-    let code = super::compile(&view(true), 9, &crate::entry::TransitionTable::resolve())
-        .expect("ordinary calls compile without artifact capture");
+    let code = super::compile(
+        &view(true),
+        9,
+        &crate::entry::TransitionTable::resolve(),
+        &crate::NativeCodeSpace::new(),
+    )
+    .expect("ordinary calls compile without artifact capture");
     let bytes = code.exact_bytes_for_test();
     let sites = code.return_sites();
     assert!(!sites.is_empty());
@@ -112,8 +117,13 @@ fn calls_retain_physical_return_offsets_and_exact_zero_source_without_capture() 
 
 #[test]
 fn pure_operations_do_not_manufacture_generated_return_sites() {
-    let code = super::compile(&view(false), 10, &crate::entry::TransitionTable::resolve())
-        .expect("pure function compiles");
+    let code = super::compile(
+        &view(false),
+        10,
+        &crate::entry::TransitionTable::resolve(),
+        &crate::NativeCodeSpace::new(),
+    )
+    .expect("pure function compiles");
     assert!(code.return_sites().is_empty());
 }
 
@@ -145,8 +155,15 @@ fn captured_callable_entry_matches_retained_emission_for_template_and_graph() {
         });
         let (code, artifact): (Box<dyn JitFunctionCode>, _) = match tier {
             JitDebugTier::Template => {
-                let output = super::compile_with_artifacts(&view, 41, &transitions, request, false)
-                    .expect("complete Template body");
+                let output = super::compile_with_artifacts(
+                    &view,
+                    41,
+                    &transitions,
+                    &crate::NativeCodeSpace::new(),
+                    request,
+                    false,
+                )
+                .expect("complete Template body");
                 (Box::new(output.code), output.artifact.unwrap())
             }
             JitDebugTier::Optimizing => {
@@ -154,6 +171,7 @@ fn captured_callable_entry_matches_retained_emission_for_template_and_graph() {
                     &view,
                     42,
                     &transitions,
+                    &crate::NativeCodeSpace::new(),
                     None,
                     request,
                     false,

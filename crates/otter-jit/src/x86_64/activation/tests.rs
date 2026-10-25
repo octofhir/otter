@@ -22,7 +22,9 @@ fn native_primitive_tag_comparisons_preserve_all_unsigned_bytes() {
         let comparison_bytes = ops.offset().0 - start;
         assert_eq!(comparison_bytes, if expected <= 127 { 4 } else { 7 });
         dynasm!(ops ; .arch x64 ; sete al ; movzx eax, al ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                .unwrap();
         // SAFETY: this mapping takes one unsigned integer, returns a Boolean,
         // and touches only caller-saved registers with no memory or call edge.
         let run: extern "sysv64" fn(u32) -> u32 = unsafe { std::mem::transmute(code.entry_ptr()) };
@@ -64,7 +66,9 @@ fn native_object_test_preserves_low_word_function_identity_and_unsigned_cell_tag
             ; mov eax, 2
             ; ret
         );
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                .unwrap();
         // SAFETY: non-cell inputs cannot reach the header read; every cell
         // input below points to a live, aligned local header word. No external
         // call, allocation, stack reservation or callee-saved clobber occurs.

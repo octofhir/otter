@@ -147,8 +147,16 @@ fn boxed_load_proves_own_presence_as_it_reads_and_recovers_its_exact_pc() {
     );
     seed_elements(&mut view, JitElementRepr::Boxed, &[0]);
     let transitions = crate::entry::TransitionTable::resolve();
-    let compiled =
-        crate::graph::compile(&view, 7007, &transitions, None, false, &Default::default()).unwrap();
+    let compiled = crate::graph::compile(
+        &view,
+        7007,
+        &transitions,
+        &crate::routines::fixture_routines(&view, &transitions),
+        None,
+        false,
+        &Default::default(),
+    )
+    .unwrap();
     let graph = &compiled.built.graph;
     assert!(
         !graph

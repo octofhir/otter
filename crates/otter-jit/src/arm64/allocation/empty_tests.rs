@@ -34,7 +34,8 @@ fn executable(layout: EmptyLiteralLayout, realm_id: u32, regs: LabRegisters) -> 
         ; ldp x20, x30, [sp], #16
         ; ret
     );
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     if !matches!(layout, EmptyLiteralLayout::Array(_)) || realm_id == 0 {
         let words: Vec<u32> = code
             .bytes()

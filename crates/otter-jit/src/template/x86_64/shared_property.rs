@@ -1,9 +1,9 @@
-//! Per-code-object named-property IC routines for x86-64 baseline sites,
-//! over the site's native feedback slot.
+//! Named-property IC routines shared by every x86-64 code object of one
+//! compiler, over a site's native feedback slot.
 //!
 //! # Contents
-//! - [`SharedPropertyProbes`] names one load, one store and one method
-//!   routine, requested by sites and emitted once after the body.
+//! - [`emit_routine`] emits one routine: load, store, method, concat, keyed
+//!   load or keyed store. [`emit_call`] calls one of them.
 //! - Load: the receiver shape selects an entry of the site's slot whose
 //!   handler runs in machine code: own field, prototype field under its chain
 //!   proof, nonexistent key. A megamorphic slot probes the isolate's shared
@@ -35,6 +35,10 @@
 //!   precedes the first effect. Only barriers and the miss call out.
 //! - Feedback is read, never baked: a miss's slot update serves the next
 //!   execution of already-published code.
+//! - The load and store inputs are the committed runtime ABI's, so an
+//!   optimized site calls them like the runtime stub, with every live value in
+//!   its home and the safepoint stamped.
+//! - Routines embed only isolate-wide layouts and addresses.
 //!
 //! # See also
 //! - `otter_vm::property_ic` owns the slot, handler kinds and state machine.
@@ -45,11 +49,12 @@ use otter_vm::JitCompileSnapshot;
 use otter_vm::jit::PROPERTY_IC_LAYOUT as IC;
 use otter_vm::native_abi as abi;
 
-use crate::artifact::relocation::{PropertySourceAccess, RelocationCapture};
+use crate::artifact::relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget};
+use crate::routines::{PropertyRoutine, RoutineObject, RoutineOffsets, RoutineRequest};
 use crate::x86_64::call_abi::emit_runtime_call;
-use crate::x86_64::property_actions::{AtomOperand, emit_action_probe};
+use crate::x86_64::property_actions::emit_action_probe;
 use crate::x86_64::property_ic;
-use crate::x86_64::values::{emit_load_runtime_stub, emit_load_u64};
+use crate::x86_64::values::{emit_load_runtime_stub, emit_load_symbol_u64, emit_load_u64};
 
 /// Load routine inputs.
 pub(crate) const LOAD_RECEIVER: u8 = 6;
@@ -81,75 +86,92 @@ pub(crate) const CONCAT_RESULT: u8 = 7;
 /// or zero.
 pub(crate) const CONCAT_SITE: u8 = 2;
 
-/// The shared routines one code object's sites requested.
-#[derive(Default)]
-pub(crate) struct SharedPropertyProbes {
-    load: Option<DynamicLabel>,
-    store: Option<DynamicLabel>,
-    method: Option<DynamicLabel>,
-    concat: Option<DynamicLabel>,
-    keyed_load: Option<DynamicLabel>,
-    keyed_store: Option<DynamicLabel>,
+/// Call `routine` of the compiler's routine set: its inputs are in their
+/// fixed registers; `r11` is clobbered by the call itself.
+pub(crate) fn emit_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    routines: &RoutineRequest<'_>,
+    routine: PropertyRoutine,
+) {
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        11,
+        routines.entry(routine),
+        RelocationTarget::PropertyRoutine {
+            routine: routine.name(),
+        },
+    );
+    dynasm!(ops ; .arch x64 ; call r11);
 }
 
-impl SharedPropertyProbes {
-    /// The routine serving store or load sites.
-    pub(crate) fn label(&mut self, ops: &mut Assembler, store: bool) -> DynamicLabel {
-        let slot = if store {
-            &mut self.store
-        } else {
-            &mut self.load
-        };
-        *slot.get_or_insert_with(|| ops.new_dynamic_label())
+/// Emit the routine `object` holds, returning its entry offsets. The load
+/// and store routines already take the committed runtime ABI, so their
+/// committed entries are the routines themselves.
+pub(crate) fn emit_routine(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    view: &JitCompileSnapshot,
+    object: RoutineObject,
+) -> RoutineOffsets {
+    let label = ops.new_dynamic_label();
+    let entry = ops.offset().0;
+    match object {
+        RoutineObject::Load => emit_load(ops, relocations, transitions, view, label),
+        RoutineObject::Store => emit_store(ops, relocations, transitions, view, label),
+        RoutineObject::Method => emit_method(ops, relocations, view, label),
+        RoutineObject::Concat => emit_concat(ops, view, label),
+        RoutineObject::KeyedLoad => emit_keyed_load(ops, relocations, view, label),
+        RoutineObject::KeyedStore => emit_keyed_store(ops, relocations, view, label),
     }
+    let second = ops.offset().0;
+    match object {
+        RoutineObject::Load => emit_load_probe(ops, relocations, view),
+        _ => {
+            return RoutineOffsets {
+                entry,
+                second: entry,
+            };
+        }
+    }
+    RoutineOffsets { entry, second }
+}
 
-    /// The probe-only routine serving method-call sites.
-    pub(crate) fn method_label(&mut self, ops: &mut Assembler) -> DynamicLabel {
-        *self.method.get_or_insert_with(|| ops.new_dynamic_label())
-    }
+/// Probe entry inputs: the receiver and the site's slot address.
+pub(crate) const PROBE_RECEIVER: u8 = LOAD_RECEIVER;
+pub(crate) const PROBE_SLOT: u8 = 10;
+/// Probe entry status: zero on a hit.
+pub(crate) const PROBE_STATUS: u8 = 11;
 
-    /// The string-concatenation fit serving `Add` sites.
-    pub(crate) fn concat_label(&mut self, ops: &mut Assembler) -> DynamicLabel {
-        *self.concat.get_or_insert_with(|| ops.new_dynamic_label())
-    }
-
-    /// The name-keyed table probe serving element load or store sites.
-    pub(crate) fn keyed_label(&mut self, ops: &mut Assembler, store: bool) -> DynamicLabel {
-        let slot = if store {
-            &mut self.keyed_store
-        } else {
-            &mut self.keyed_load
-        };
-        *slot.get_or_insert_with(|| ops.new_dynamic_label())
-    }
-
-    /// Emit every requested routine once, after the body.
-    pub(crate) fn emit(
-        self,
-        ops: &mut Assembler,
-        relocations: &mut RelocationCapture,
-        transitions: &crate::entry::TransitionTable,
-        view: &JitCompileSnapshot,
-    ) {
-        if let Some(label) = self.load {
-            emit_load(ops, relocations, transitions, view, label);
-        }
-        if let Some(label) = self.store {
-            emit_store(ops, relocations, transitions, view, label);
-        }
-        if let Some(label) = self.method {
-            emit_method(ops, relocations, view, label);
-        }
-        if let Some(label) = self.concat {
-            emit_concat(ops, view, label);
-        }
-        if let Some(label) = self.keyed_load {
-            emit_keyed_load(ops, relocations, view, label);
-        }
-        if let Some(label) = self.keyed_store {
-            emit_keyed_store(ops, relocations, view, label);
-        }
-    }
+/// The load selection for an optimized site, receiver in `rsi` and slot
+/// address in `r10`: `r11 == 0` with the value in `rax`, else `r11 != 0`.
+/// Every register but `rax`, `r10` and `r11` is preserved; nothing is called.
+fn emit_load_probe(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+) {
+    let loaded = ops.new_dynamic_label();
+    let miss = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    debug_assert_eq!(PROBE_RECEIVER, LOAD_RECEIVER);
+    dynasm!(ops ; .arch x64
+        ; push rdx ; push rcx ; push rdi ; push r8 ; push r9
+        ; mov Rq(LOAD_SLOT), Rq(PROBE_SLOT)
+    );
+    emit_load_handlers(ops, relocations, view, loaded, miss);
+    dynasm!(ops ; .arch x64
+        ; =>loaded
+        ; xor Rd(PROBE_STATUS), Rd(PROBE_STATUS)
+        ; jmp =>done
+        ; =>miss
+        ; mov Rd(PROBE_STATUS), 1
+        ; =>done
+        ; pop r9 ; pop r8 ; pop rdi ; pop rcx ; pop rdx
+        ; ret
+    );
 }
 
 /// Leave the atom of the string `key` in `Rd(atom)`, or branch to `miss`
@@ -242,7 +264,7 @@ fn emit_keyed_load(
         relocations,
         view,
         view.property_action_cache,
-        Some(AtomOperand::Register(9)),
+        9,
         PropertySourceAccess::Load,
         KEYED_LOAD_RECEIVER,
         None,
@@ -300,7 +322,7 @@ fn emit_keyed_store(
         relocations,
         view,
         view.property_action_cache,
-        Some(AtomOperand::Register(9)),
+        9,
         PropertySourceAccess::Store,
         KEYED_STORE_RECEIVER,
         Some(KEYED_STORE_VALUE),
@@ -393,7 +415,7 @@ fn emit_load_handlers(
         relocations,
         view,
         view.property_action_cache,
-        Some(AtomOperand::Register(9)),
+        9,
         PropertySourceAccess::Load,
         LOAD_RECEIVER,
         None,
@@ -523,7 +545,7 @@ fn emit_store(
         relocations,
         view,
         view.property_action_cache,
-        Some(AtomOperand::Register(9)),
+        9,
         PropertySourceAccess::Store,
         STORE_RECEIVER,
         Some(STORE_VALUE),

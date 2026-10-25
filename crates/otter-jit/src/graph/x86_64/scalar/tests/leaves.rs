@@ -124,6 +124,7 @@ fn fixture(kind: Kind) -> crate::CompiledCode {
     let committed_throw = ops.new_dynamic_label();
     let propagate = ops.new_dynamic_label();
     let materialize = ops.new_dynamic_label();
+    let routines = crate::routines::fixture_routines(&view, &transitions);
     let mut codegen = Codegen {
         ops,
         relocations: RelocationCapture::new(false),
@@ -162,7 +163,7 @@ fn fixture(kind: Kind) -> crate::CompiledCode {
         deopt_runtime: 0,
         plan: &plan,
         plan_index: FxHashMap::default(),
-        shared_property: Default::default(),
+        shared_property: &routines,
         no_direct_call_events: None,
         no_code_map: None,
         spliced_functions: Default::default(),
@@ -219,7 +220,12 @@ fn fixture(kind: Kind) -> crate::CompiledCode {
         codegen.exits.is_empty(),
         "pure predicates and scalar leaves have no eager/committed exits"
     );
-    crate::CompiledCode::new(codegen.ops.finalize().unwrap(), start)
+    crate::CompiledCode::new(
+        &crate::CodeMemory::new(),
+        codegen.ops.finalize().unwrap(),
+        start,
+    )
+    .unwrap()
 }
 
 fn context(heap: &otter_gc::GcHeap, thread: &mut VmThread) -> JitCtx {

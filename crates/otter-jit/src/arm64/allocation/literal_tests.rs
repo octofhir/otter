@@ -153,7 +153,8 @@ fn execute(
         ),
     }
     dynasm!(ops ; .arch aarch64 ; mov x0, X(regs.candidate) ; b =>done ; =>slow ; mov x0, xzr ; =>done ; add sp, sp, stack ; ldp x20, x30, [sp], #16 ; ret);
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     // SAFETY: this private ABI receives valid bounded host inputs and LAB,
     // preserves x20/LR/SP, and neither calls the VM nor exposes host cells to GC.
     let call: extern "C" fn(*mut JitCtx, *const u64) -> usize =

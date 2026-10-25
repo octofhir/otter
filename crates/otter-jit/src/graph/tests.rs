@@ -53,6 +53,7 @@ fn cancellation_precedes_bytecode_analysis() {
         &view,
         7000,
         &TransitionTable::resolve(),
+        &crate::NativeCodeSpace::new(),
         None,
         None,
         false,
@@ -65,8 +66,16 @@ fn cancellation_precedes_bytecode_analysis() {
 /// and the frame window afterwards.
 fn run(view: &JitCompileSnapshot, args: &[u64]) -> (NativeResultPair, Vec<u64>) {
     let transitions = TransitionTable::resolve();
-    let compiled = super::compile(view, 7001, &transitions, None, false, &Default::default())
-        .expect("graph compile");
+    let compiled = super::compile(
+        view,
+        7001,
+        &transitions,
+        &crate::routines::fixture_routines(view, &transitions),
+        None,
+        false,
+        &Default::default(),
+    )
+    .expect("graph compile");
     let entry: JitEntry = unsafe {
         std::mem::transmute(
             compiled
@@ -209,6 +218,7 @@ fn captured_splices_report_exact_nested_source_owners_and_budget_bytes() {
         &root,
         7002,
         &transitions,
+        &crate::NativeCodeSpace::new(),
         None,
         None,
         false,
@@ -222,6 +232,7 @@ fn captured_splices_report_exact_nested_source_owners_and_budget_bytes() {
         &root,
         7003,
         &transitions,
+        &crate::NativeCodeSpace::new(),
         None,
         None,
         true,
@@ -417,8 +428,16 @@ fn branches_merge_through_phis() {
     seed(&mut view, &[0, 5], ARITH_INT32);
     // The builder's diamond, edge blocks and all, picks with one select.
     let transitions = TransitionTable::resolve();
-    let compiled = super::compile(&view, 7002, &transitions, None, false, &Default::default())
-        .expect("graph compile");
+    let compiled = super::compile(
+        &view,
+        7002,
+        &transitions,
+        &crate::routines::fixture_routines(&view, &transitions),
+        None,
+        false,
+        &Default::default(),
+    )
+    .expect("graph compile");
     let graph = &compiled.built.graph;
     let selects = compiled
         .built
@@ -552,8 +571,16 @@ fn nested_loops() -> JitCompileSnapshot {
 fn nested_loops_carry_values_through_both_headers() {
     let view = nested_loops();
     let transitions = TransitionTable::resolve();
-    let compiled = super::compile(&view, 7001, &transitions, None, false, &Default::default())
-        .expect("graph compile");
+    let compiled = super::compile(
+        &view,
+        7001,
+        &transitions,
+        &crate::routines::fixture_routines(&view, &transitions),
+        None,
+        false,
+        &Default::default(),
+    )
+    .expect("graph compile");
     let dump = compiled.built.graph.dump(&compiled.built.layout);
     let (result, _) = run(&view, &[int(10), int(1)]);
     assert_eq!(
@@ -746,14 +773,9 @@ fn every_kind() -> Vec<super::ir::Kind> {
         }),
         Kind::LoadPropertyCached {
             pc: 0,
-            atom: None,
             length: true,
         },
-        Kind::StorePropertyCached {
-            pc: 0,
-            atom: None,
-            barrier: true,
-        },
+        Kind::StorePropertyCached { pc: 0 },
         Kind::StoreKeyedCached { pc: 0 },
         Kind::LoadKeyedCached { pc: 0 },
         Kind::BuiltinMethod(crate::intrinsic_calls::IntrinsicMethodForm::RegExpTest),

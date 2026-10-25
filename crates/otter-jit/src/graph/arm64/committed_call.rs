@@ -26,7 +26,29 @@ impl Codegen<'_> {
         arguments: &[CommittedArgument],
         destination: Option<u8>,
     ) -> Result<(), crate::Unsupported> {
-        self.emit_committed_call_inner(node, stub, arguments, destination, 0)
+        let target = (
+            self.transitions.entry(stub),
+            RelocationTarget::runtime_stub(stub),
+        );
+        self.emit_committed_call_inner(node, target, arguments, destination, 0)
+    }
+
+    /// [`Self::emit_committed_call`] of a routine of the compiler's set that
+    /// takes the committed runtime ABI.
+    pub(super) fn emit_committed_routine_call(
+        &mut self,
+        node: NodeId,
+        routine: crate::routines::PropertyRoutine,
+        arguments: &[CommittedArgument],
+        destination: Option<u8>,
+    ) -> Result<(), crate::Unsupported> {
+        let target = (
+            self.shared_property.entry(routine),
+            RelocationTarget::PropertyRoutine {
+                routine: routine.name(),
+            },
+        );
+        self.emit_committed_call_inner(node, target, arguments, destination, 0)
     }
 
     pub(super) fn emit_committed_span_call(
@@ -37,9 +59,13 @@ impl Codegen<'_> {
         destination: u8,
     ) -> Result<(), crate::Unsupported> {
         let bytes = self.emit_push_actuals(values)?;
+        let target = (
+            self.transitions.entry(stub),
+            RelocationTarget::runtime_stub(stub),
+        );
         self.emit_committed_call_inner(
             node,
-            stub,
+            target,
             &[
                 CommittedArgument::StackAddress(0),
                 CommittedArgument::Scalar(values.len() as u64),
@@ -52,7 +78,7 @@ impl Codegen<'_> {
     fn emit_committed_call_inner(
         &mut self,
         node: NodeId,
-        stub: abi::RuntimeStubDescriptor,
+        (entry, target): (u64, RelocationTarget),
         arguments: &[CommittedArgument],
         destination: Option<u8>,
         span_bytes: u32,
@@ -123,13 +149,7 @@ impl Codegen<'_> {
         if pushed != 0 {
             dynasm!(self.ops ; .arch aarch64 ; add sp, sp, pushed * 16);
         }
-        emit_load_symbol_u64(
-            &mut self.ops,
-            &mut self.relocations,
-            16,
-            self.transitions.entry(stub),
-            RelocationTarget::runtime_stub(stub),
-        );
+        emit_load_symbol_u64(&mut self.ops, &mut self.relocations, 16, entry, target);
         let (_, committed_throw) = self.throw_targets(node);
         let committed_throw = self.cond_target(committed_throw);
         let fatal = self.cond_target(self.fatal);

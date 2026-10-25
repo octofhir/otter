@@ -72,7 +72,7 @@ fn program(operation: Operation, feedback: &mut u8) -> crate::CompiledCode {
     dynasm!(ops ; .arch aarch64 ; =>refused
         ; movz x0, VALUE_UNDEFINED as u32
         ; ldp x19, x30, [sp], #16 ; ret);
-    crate::CompiledCode::new(ops.finalize().unwrap(), entry)
+    crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap()
 }
 
 #[test]

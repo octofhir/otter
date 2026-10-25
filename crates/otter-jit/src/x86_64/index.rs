@@ -102,7 +102,9 @@ mod tests {
             ; =>check ; cmp rdi, r8 ; jne =>corrupt ; cmp rsi, r9 ; jne =>corrupt
             ; movq rax, xmm0 ; cmp rax, r9 ; jne =>corrupt ; mov rax, rdx ; ret
             ; =>corrupt ; mov rax, -2 ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                .unwrap();
         // SAFETY: a noncollecting scalar leaf with two word inputs.
         let run: extern "sysv64" fn(u64, u64) -> u64 =
             unsafe { std::mem::transmute(code.entry_ptr()) };
@@ -111,7 +113,12 @@ mod tests {
         let alias_miss = aliased.new_dynamic_label();
         emit_exact_int32(&mut aliased, 7, 7, 4, alias_miss);
         dynasm!(aliased ; .arch x64 ; =>alias_miss ; mov rax, rdi ; ret);
-        let alias_code = crate::CompiledCode::new(aliased.finalize().unwrap(), alias_entry);
+        let alias_code = crate::CompiledCode::new(
+            &crate::CodeMemory::new(),
+            aliased.finalize().unwrap(),
+            alias_entry,
+        )
+        .unwrap();
         // SAFETY: the same leaf, reusing a dead input register for its result.
         let run_alias: extern "sysv64" fn(u64) -> u64 =
             unsafe { std::mem::transmute(alias_code.entry_ptr()) };
@@ -165,7 +172,9 @@ mod tests {
             ; =>check ; cmp rdi, r8 ; jne =>corrupt ; cmp rsi, r9 ; jne =>corrupt
             ; movq rax, xmm0 ; cmp rax, r9 ; jne =>corrupt ; mov rax, rdx ; ret
             ; =>corrupt ; mov rax, -2 ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                .unwrap();
         // SAFETY: a noncollecting scalar leaf with two word inputs.
         let run: extern "sysv64" fn(u64, u64) -> u64 =
             unsafe { std::mem::transmute(code.entry_ptr()) };

@@ -165,6 +165,7 @@ pub(crate) fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &crate::entry::TransitionTable,
+    routines: &crate::routines::RoutineRequest<'_>,
     osr_pc: Option<u32>,
     capture: bool,
     cancellation: &JitCompileCancellation,
@@ -268,6 +269,7 @@ pub(crate) fn compile(
             &built,
             &allocation,
             transitions,
+            routines,
             code_object_id,
             deopt_address,
             &plan,
@@ -295,6 +297,7 @@ pub(crate) fn compile(
         &built,
         &allocation,
         transitions,
+        routines,
         code_object_id,
         deopt_address,
         &plan,
@@ -403,15 +406,18 @@ pub(crate) fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &crate::entry::TransitionTable,
+    code_space: &crate::NativeCodeSpace,
     osr_pc: Option<u32>,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
     capture_events: bool,
     cancellation: &JitCompileCancellation,
 ) -> Result<crate::artifact::NativeCompileOutput<OptimizedCode>, CompileFailure> {
+    let routine_request = crate::routines::RoutineRequest::new(code_space, view, transitions);
     let compiled = compile(
         view,
         code_object_id,
         transitions,
+        &routine_request,
         osr_pc,
         artifact_request.is_some(),
         cancellation,
@@ -445,10 +451,12 @@ pub(crate) fn compile_optimized(
         allocator_spill_slot_count: allocation.tagged_slots + allocation.untagged_slots,
         spill_slot_count: allocation.tagged_slots + allocation.untagged_slots,
     };
-    let code = CompiledCode::new(
+    let mut code = CompiledCode::new(
+        code_space.memory(),
         emission.buffer,
         dynasmrt::AssemblyOffset(emission.tier_entry),
-    );
+    )?;
+    code.retain_routines(routine_request.finish()?);
     let node_count = built.graph.nodes.len() as u64;
     check_cancellation(cancellation)?;
     let diagnostics = if capture_events {

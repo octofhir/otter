@@ -263,7 +263,7 @@ pub(super) fn emit_load_element(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
-    shared_probes: &mut super::shared_property::SharedPropertyProbes,
+    shared_probes: &crate::routines::RoutineRequest<'_>,
     view: &JitCompileSnapshot,
     dst: u16,
     receiver: u16,
@@ -308,11 +308,16 @@ pub(super) fn emit_load_element(
     // A name key: the receiver class's table entry, as a named load's.
     use super::shared_property::{KEYED_LOAD_KEY, KEYED_LOAD_RECEIVER};
     let runtime = ops.new_dynamic_label();
-    let routine = shared_probes.keyed_label(ops, false);
     dynasm!(ops ; .arch aarch64 ; =>miss);
     emit_load_reg(ops, KEYED_LOAD_RECEIVER, receiver)?;
     emit_load_reg(ops, KEYED_LOAD_KEY, index)?;
-    dynasm!(ops ; .arch aarch64 ; bl =>routine ; cbnz x1, =>runtime);
+    super::shared_property::emit_call(
+        ops,
+        relocations,
+        shared_probes,
+        crate::routines::PropertyRoutine::KeyedLoad,
+    );
+    dynasm!(ops ; .arch aarch64 ; cbnz x1, =>runtime);
     emit_store_reg(ops, 0, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done ; =>runtime);
     emit_ctx_arg(ops);
@@ -344,7 +349,7 @@ pub(super) fn emit_store_element(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
-    shared_probes: &mut super::shared_property::SharedPropertyProbes,
+    shared_probes: &crate::routines::RoutineRequest<'_>,
     view: &JitCompileSnapshot,
     receiver: u16,
     index: u16,
@@ -376,12 +381,17 @@ pub(super) fn emit_store_element(
     }
     // A name key: the receiver class's table entry, as a named store's.
     use super::shared_property::{KEYED_STORE_KEY, KEYED_STORE_RECEIVER, KEYED_STORE_VALUE};
-    let routine = shared_probes.keyed_label(ops, true);
     dynasm!(ops ; .arch aarch64 ; =>miss);
     emit_load_reg(ops, KEYED_STORE_RECEIVER, receiver)?;
     emit_load_reg(ops, KEYED_STORE_VALUE, value)?;
     emit_load_reg(ops, KEYED_STORE_KEY, index)?;
-    dynasm!(ops ; .arch aarch64 ; bl =>routine ; cbz x1, =>done);
+    super::shared_property::emit_call(
+        ops,
+        relocations,
+        shared_probes,
+        crate::routines::PropertyRoutine::KeyedStore,
+    );
+    dynasm!(ops ; .arch aarch64 ; cbz x1, =>done);
     emit_ctx_arg(ops);
     emit_load_reg(ops, 1, receiver)?;
     emit_load_reg(ops, 2, index)?;

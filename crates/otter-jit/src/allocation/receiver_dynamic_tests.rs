@@ -74,7 +74,7 @@ fn executable(view: &JitCompileSnapshot) -> CompiledCode {
         ; ldp d8, d9, [sp], #16
         ; ldp x24, x25, [sp], #16 ; ldp x22, x23, [sp], #16
         ; ldp x20, x21, [sp], #16 ; ldp x19, x30, [sp], #16 ; ret);
-    CompiledCode::new(ops.finalize().unwrap(), entry)
+    CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap()
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -97,7 +97,7 @@ fn executable(view: &JitCompileSnapshot) -> CompiledCode {
         ; mov [rbx], rbp ; mov [rbx + 8], r12 ; mov [rbx + 16], r13
         ; movq [rbx + 32], xmm0 ; movq [rbx + 40], xmm8 ; movq [rbx + 48], xmm15
         ; pop r15 ; pop r14 ; pop r13 ; pop r12 ; pop rbp ; pop rbx ; ret);
-    CompiledCode::new(ops.finalize().unwrap(), entry)
+    CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap()
 }
 
 fn store32(words: &mut [u64], byte: usize, value: u32) {

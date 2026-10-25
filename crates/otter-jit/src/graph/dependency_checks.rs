@@ -559,7 +559,6 @@ mod tests {
         let literal = Kind::NewObjectLiteral { fields: None };
         let load = Kind::LoadPropertyCached {
             pc: 0,
-            atom: None,
             length: false,
         };
         append(&mut graph, entry, literal.clone());

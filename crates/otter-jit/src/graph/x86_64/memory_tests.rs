@@ -119,7 +119,10 @@ fn codegen<'a>(
         deopt_runtime: 0,
         plan,
         plan_index: FxHashMap::default(),
-        shared_property: Default::default(),
+        shared_property: Box::leak(Box::new(crate::routines::fixture_routines(
+            view,
+            transitions,
+        ))),
         no_direct_call_events: None,
         no_code_map: None,
         spliced_functions: Default::default(),

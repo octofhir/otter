@@ -14,9 +14,10 @@
 //! the single top store; the result is committed late by the tier's caller.
 //! Only four declared GP temporaries plus the target's reserved GP/FP scratch
 //! registers and flags are clobbered. String geometry/hash/header bits are VM data.
-//! An old string is never born pointing at a young child: such a cons misses
-//! to the canonical allocator, which remembers the edge. A tenured site read
-//! at run time misses before any write.
+//! An old cons leaves its two child edges to its caller, which takes the
+//! write barrier for each (the remembered set for a young child, the
+//! insertion barrier for a white one while marking runs) before anything
+//! else runs. A tenured site read at run time misses before any write.
 //!
 //! # See also
 //! - `otter_vm::jit::JitStringLayout` owns the current physical string recipe.
@@ -28,9 +29,8 @@ use crate::entry::{ALLOC_WINDOW_LAB_OFFSET, ALLOC_WINDOW_OLD_LAB_OFFSET};
 use crate::template::arm64::values::emit_load_u64;
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::jit::{
-    JIT_GC_YOUNG_FLAG, JIT_HEADER_FLAGS_BYTE, JIT_HEADER_SITE_BYTES, JIT_SITE_CREATED_OFFSET,
-    JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET, JIT_SITE_ID_OFFSET, JitSiteMode,
-    JitStringLayout,
+    JIT_HEADER_SITE_BYTES, JIT_SITE_CREATED_OFFSET, JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET,
+    JIT_SITE_ID_OFFSET, JitSiteMode, JitStringLayout,
 };
 
 const TENURE: u32 = otter_vm::jit::JIT_SITE_TENURE as u32;
@@ -44,6 +44,12 @@ fn lab_offset(placement: ConcatPlacement) -> u32 {
 }
 
 /// Candidate is the result on fit/identity; every miss is pre-effect.
+///
+/// For an old placement, returns the label the cons path reaches with the
+/// new cell in `X(r.candidate)` and its child edges not yet barriered: the
+/// caller binds it, takes the write barrier for both children, and joins
+/// the other results.
+#[must_use]
 pub(crate) fn emit_concat(
     ops: &mut Assembler,
     context: u8,
@@ -52,7 +58,7 @@ pub(crate) fn emit_concat(
     r: LabRegisters,
     placement: ConcatPlacement,
     slow: DynamicLabel,
-) {
+) -> Option<DynamicLabel> {
     validate_inputs(r, &inputs);
     debug_assert_eq!(r.size, 17);
     debug_assert!(
@@ -107,23 +113,6 @@ pub(crate) fn emit_concat(
         ; csel W(r.scratch),W(r.scratch),W(r.end),hs
         ; add WSP(r.scratch),WSP(r.scratch),1
         ; cmp WSP(r.scratch),p.max_rope_depth as u32 ; b.hi =>slow);
-    if placement.old() {
-        // An old cons is born black while marking runs, so a white child would
-        // be an edge no visit follows: the canonical allocator shades it.
-        dynasm!(ops ; .arch aarch64
-            ; ldr x16, [X(context), crate::entry::THREAD_OFFSET]
-            ; ldr x16, [x16, crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET]
-            ; ldrb W(r.scratch), [x16]);
-        for input in inputs {
-            let next = ops.new_dynamic_label();
-            emit_value(ops, 16, input);
-            dynasm!(ops ; .arch aarch64 ; ldrb w17, [x16, JIT_HEADER_FLAGS_BYTE]
-                ; tbnz w17, JIT_GC_YOUNG_FLAG.trailing_zeros(), =>slow
-                ; cbz W(r.scratch), =>next
-                ; tst w17, #3 ; b.eq =>slow
-                ; =>next);
-        }
-    }
     emit_load_u64(ops, r.size, u64::from(p.pair_cell_bytes));
     initialize(ops, context, p, inputs, r, placement, p.cons_tag, slow);
     emit_value(ops, 16, a);
@@ -137,8 +126,11 @@ pub(crate) fn emit_concat(
         ; add WSP(r.scratch),WSP(r.scratch),1
         ; strb W(r.scratch),[X(r.candidate),p.cons_depth_byte]);
     publish(ops, context, r, placement);
-    dynasm!(ops ; .arch aarch64 ; b =>done ; =>empty_a ; mov X(r.candidate),X(r.end)
+    let old_cons = placement.old().then(|| ops.new_dynamic_label());
+    let joined = old_cons.unwrap_or(done);
+    dynasm!(ops ; .arch aarch64 ; b =>joined ; =>empty_a ; mov X(r.candidate),X(r.end)
         ; b =>done ; =>empty_b ; mov X(r.candidate),X(r.buffer) ; =>done);
+    old_cons
 }
 fn classify(
     ops: &mut Assembler,

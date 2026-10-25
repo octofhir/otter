@@ -14,9 +14,10 @@
 //! the single top store; the result is committed late by the tier's caller.
 //! Only four declared GP temporaries plus the target's reserved GP/FP scratch
 //! registers and flags are clobbered. String geometry/hash/header bits are VM data.
-//! An old string is never born pointing at a young child: such a cons misses
-//! to the canonical allocator, which remembers the edge. A tenured site read
-//! at run time misses before any write.
+//! An old cons leaves its two child edges to its caller, which takes the
+//! write barrier for each (the remembered set for a young child, the
+//! insertion barrier for a white one while marking runs) before anything
+//! else runs. A tenured site read at run time misses before any write.
 //!
 //! # See also
 //! - `otter_vm::jit::JitStringLayout` owns the current physical string recipe.
@@ -28,12 +29,11 @@ use crate::entry::{ALLOC_WINDOW_LAB_OFFSET, ALLOC_WINDOW_OLD_LAB_OFFSET};
 use crate::x86_64::values::emit_load_u64;
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::jit::{
-    JIT_GC_YOUNG_FLAG, JIT_SITE_CREATED_OFFSET, JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET,
-    JitSiteMode, JitStringLayout,
+    JIT_SITE_CREATED_OFFSET, JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET, JitSiteMode,
+    JitStringLayout,
 };
 
 const SITE_ID_OFFSET: i32 = otter_vm::jit::JIT_SITE_ID_OFFSET as i32;
-const HEADER_FLAGS_BYTE: i32 = otter_vm::jit::JIT_HEADER_FLAGS_BYTE as i32;
 const HEADER_SITE_BYTES: i32 = otter_vm::jit::JIT_HEADER_SITE_BYTES as i32;
 const TENURE: i8 = otter_vm::jit::JIT_SITE_TENURE as i8;
 
@@ -46,6 +46,12 @@ fn lab_offset(placement: ConcatPlacement) -> u32 {
 }
 
 /// Candidate is the result on fit/identity; every miss is pre-effect.
+///
+/// For an old placement, returns the label the cons path reaches with the
+/// new cell in `Rq(r.candidate)` and its child edges not yet barriered: the
+/// caller binds it, takes the write barrier for both children, and joins
+/// the other results.
+#[must_use]
 pub(crate) fn emit_concat(
     ops: &mut Assembler,
     context: u8,
@@ -54,7 +60,7 @@ pub(crate) fn emit_concat(
     r: LabRegisters,
     placement: ConcatPlacement,
     slow: DynamicLabel,
-) {
+) -> Option<DynamicLabel> {
     validate_inputs(r, &inputs);
     debug_assert_eq!(r.size, 11);
     debug_assert!(
@@ -111,23 +117,6 @@ pub(crate) fn emit_concat(
     emit_depth(ops, p, b, r.end, r.buffer);
     dynasm!(ops ; .arch x64 ; cmp Rd(r.scratch),Rd(r.end) ; cmovb Rd(r.scratch),Rd(r.end)
         ; inc Rd(r.scratch) ; cmp Rd(r.scratch),p.max_rope_depth as i32 ; ja =>slow);
-    if placement.old() {
-        // An old cons is born black while marking runs, so a white child would
-        // be an edge no visit follows: the canonical allocator shades it.
-        dynasm!(ops ; .arch x64
-            ; mov Rq(r.scratch),[Rq(context)+crate::entry::THREAD_OFFSET as i32]
-            ; mov Rq(r.scratch),[Rq(r.scratch)+crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
-            ; movzx Rd(r.scratch),BYTE [Rq(r.scratch)]);
-        for input in inputs {
-            let next = ops.new_dynamic_label();
-            emit_value(ops, 10, input);
-            dynasm!(ops ; .arch x64 ; test BYTE [r10+HEADER_FLAGS_BYTE],JIT_GC_YOUNG_FLAG as i8
-                ; jnz =>slow
-                ; test Rd(r.scratch),Rd(r.scratch) ; jz =>next
-                ; test BYTE [r10+HEADER_FLAGS_BYTE],3 ; jz =>slow
-                ; =>next);
-        }
-    }
     emit_load_u64(ops, r.size, u64::from(p.pair_cell_bytes));
     initialize(ops, context, p, inputs, r, placement, p.cons_tag, slow);
     emit_value(ops, 10, a);
@@ -139,8 +128,11 @@ pub(crate) fn emit_concat(
     dynasm!(ops ; .arch x64 ; cmp Rd(r.scratch),Rd(r.buffer) ; cmovb Rd(r.scratch),Rd(r.buffer)
         ; inc Rd(r.scratch) ; mov [Rq(r.candidate)+p.cons_depth_byte as i32],Rb(r.scratch));
     publish(ops, context, r, placement);
-    dynasm!(ops ; .arch x64 ; jmp =>done ; =>empty_a ; mov Rq(r.candidate),Rq(r.end)
+    let old_cons = placement.old().then(|| ops.new_dynamic_label());
+    let joined = old_cons.unwrap_or(done);
+    dynasm!(ops ; .arch x64 ; jmp =>joined ; =>empty_a ; mov Rq(r.candidate),Rq(r.end)
         ; jmp =>done ; =>empty_b ; mov Rq(r.candidate),Rq(r.buffer) ; =>done);
+    old_cons
 }
 
 fn classify(

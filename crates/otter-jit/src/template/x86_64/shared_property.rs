@@ -334,7 +334,8 @@ fn emit_keyed_store(
 fn emit_concat(ops: &mut Assembler, view: &JitCompileSnapshot, label: DynamicLabel) {
     let miss = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>label);
-    crate::x86_64::allocation::emit_concat(
+    // A record places by its run-time decision, never in old space.
+    let old_cons = crate::x86_64::allocation::emit_concat(
         ops,
         15,
         view.string_layout,
@@ -352,6 +353,7 @@ fn emit_concat(ops: &mut Assembler, view: &JitCompileSnapshot, label: DynamicLab
         crate::allocation::ConcatPlacement::Record(CONCAT_SITE),
         miss,
     );
+    debug_assert!(old_cons.is_none());
     dynasm!(ops
         ; .arch x64
         ; xor edx, edx

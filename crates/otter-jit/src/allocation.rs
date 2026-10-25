@@ -75,8 +75,8 @@ mod string_group_tests;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConcatPlacement {
     /// The `+` site's placement when the code was compiled. An old cons
-    /// whose child is young misses, so the canonical allocator remembers the
-    /// edge; a tracking site's cells are tagged and each birth is counted.
+    /// owes its caller's write barrier for both child edges; a tracking
+    /// site's cells are tagged and each birth is counted.
     Site(JitAllocationSite),
     /// Code shared by many sites: this register holds the site record's
     /// address, or zero for none, and its decision when the code runs

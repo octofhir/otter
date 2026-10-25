@@ -3,8 +3,15 @@
 //! # Contents
 //! - Existing boxed LeafValue2 admission and ContextWords feedback commit.
 //! - Variable-capacity initialization through the common LAB owner.
+//! - The planned entry of an optimized body: its own steady family proved
+//!   inline and its root receiver fitted with no runtime call.
 //!
 //! # Invariants
+//! The planned entry takes only a closure new.target whose family head is the
+//! plan's finalized family, under an optimized caller, which records no
+//! construct feedback; it publishes no sampling ticket, as a finalized
+//! family's commit would release it. Every miss reaches the dynamic entry
+//! before any effect.
 //! Frame owns new.target/actuals/tagged homes before either leaf. Only a nonzero
 //! int32 Probe Success reaches writes. No call/GC separates complete payload
 //! initialization from one LAB publication. Pre-effect misses prepare once;
@@ -41,6 +48,37 @@ const LAB: LabRegisters = LabRegisters {
 fn count(ops: &mut Assembler, byte: u32) {
     dynasm!(ops ; .arch x64 ; mov r10, [r15 + RUNTIME_STATS_OFFSET as i32]
         ; add QWORD [r10 + byte as i32], 1);
+}
+
+/// The receiver of an optimized body's own steady family, `plan`: proved
+/// and fitted inline, then `complete` with the receiver in RAX and success
+/// in RDX; any miss jumps to `dynamic` before an effect. r15 context / r14
+/// frame / r13 actuals / r12 promotion decision are pinned.
+pub(crate) fn emit_planned_construct_receiver(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    plan: otter_vm::jit::JitReceiverAllocationPlan,
+    complete: DynamicLabel,
+    dynamic: DynamicLabel,
+) {
+    dynasm!(ops ; .arch x64
+        ; mov r11, [r14 + abi::NATIVE_FRAME_CALLER_OFFSET as i32] ; test r11, r11 ; jz =>dynamic
+        ; cmp BYTE [r11 + abi::NATIVE_FRAME_KIND_OFFSET as i32], abi::NativeFrameKind::Optimizing as i8
+        ; jne =>dynamic
+        ; mov rcx, [r14 + abi::NATIVE_FRAME_NEW_TARGET_OFFSET as i32]);
+    emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64
+        ; test rcx, r11 ; jnz =>dynamic ; test rcx, rcx ; jz =>dynamic
+        ; cmp BYTE [rcx], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8 ; jne =>dynamic);
+    super::receiver::emit_receiver_guards(ops, relocations, view, plan, dynamic);
+    super::receiver::emit_receiver_fit(ops, view, plan, 15, dynamic);
+    super::receiver::emit_receiver_bump(ops);
+    dynasm!(ops ; .arch x64
+        ; mov DWORD [r14 + abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET as i32], 0
+        ; mov [r14 + abi::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET as i32], rax
+        ; mov [r14 + NATIVE_FRAME_THIS_OFFSET as i32], rax
+        ; xor edx, edx ; jmp =>complete);
 }
 
 /// r15 context/r14 frame/r13 actuals/r12 promotion decision are pinned. Body

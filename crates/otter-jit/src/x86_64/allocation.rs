@@ -46,7 +46,9 @@ use crate::allocation::{AllocationValue, LabRegisters};
 use crate::entry::{ALLOC_WINDOW_LAB_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, VALUE_UNDEFINED};
 
 mod receiver_dynamic;
-pub(crate) use receiver_dynamic::emit_dynamic_construct_receiver;
+pub(crate) use receiver_dynamic::{
+    emit_dynamic_construct_receiver, emit_planned_construct_receiver,
+};
 
 mod string;
 pub(crate) use string::emit_concat;

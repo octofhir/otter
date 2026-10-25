@@ -49,6 +49,8 @@ struct TransitionKey {
 struct WeakShapeTables {
     handles_by_id: FxHashMap<ShapeId, ShapeHandle>,
     transitions: FxHashMap<TransitionKey, ShapeHandle>,
+    /// The same transitions by parent: every interned child of each shape.
+    children: FxHashMap<ShapeId, smallvec::SmallVec<[ShapeHandle; 2]>>,
     /// Rooted state variants are weak and keyed by stable source identity.
     state_variants: FxHashMap<(ShapeId, ShapeState), ShapeHandle>,
     /// Transitions out of each provisional shape: the tree slack tracking
@@ -137,6 +139,7 @@ impl ShapeInterner {
             assert_eq!(*existing, child, "one canonical child per transition");
         } else {
             tables.transitions.insert(key, child);
+            tables.children.entry(parent).or_default().push(child);
             if provisional {
                 tables
                     .provisional_children
@@ -298,6 +301,32 @@ impl ShapeInterner {
         Ok((handle, atom))
     }
 
+    /// Every interned child of `parent`: the shapes one own-property append
+    /// to an object of that shape has produced. Never allocates.
+    pub(crate) fn children_of(
+        heap: &GcHeap,
+        parent: ShapeHandle,
+    ) -> smallvec::SmallVec<[ShapeHandle; 2]> {
+        let parent = heap.read_payload(parent, ShapeBody::id);
+        Self::of(heap)
+            .tables
+            .borrow()
+            .children
+            .get(&parent)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The interned default-data child of `parent` appending `atom`, if one
+    /// exists. Never allocates.
+    pub(crate) fn data_child(
+        heap: &GcHeap,
+        parent: ShapeHandle,
+        atom: AtomId,
+    ) -> Option<ShapeHandle> {
+        Self::child_exact_if_cached(heap, parent, atom, PropertyFlags::data_default(), false)
+    }
+
     pub(crate) fn child_if_cached(
         heap: &GcHeap,
         parent: ShapeHandle,
@@ -416,6 +445,7 @@ impl ShapeInterner {
         let WeakShapeTables {
             handles_by_id,
             transitions,
+            children,
             state_variants,
             provisional_children,
             ..
@@ -434,6 +464,10 @@ impl ShapeInterner {
             return;
         }
         transitions.retain(|_, child| !dead.contains(&child.offset()));
+        children.retain(|parent, shapes| {
+            shapes.retain(|child| !dead.contains(&child.offset()));
+            handles_by_id.contains_key(parent) && !shapes.is_empty()
+        });
         provisional_children.retain(|parent, children| {
             children.retain(|child| !dead.contains(&child.offset()));
             handles_by_id.contains_key(parent)

@@ -124,11 +124,21 @@ pub(crate) fn finalize(
                         }
                     }
                 }
-                Kind::StoreNamedProperty { byte_pc, .. } => {
+                Kind::StoreNamedProperty {
+                    byte_pc,
+                    receiver_shape,
+                    proved,
+                    ..
+                } => {
                     let Some(bound) = numeric_word(graph, graph.node(node).inputs[1]) else {
                         continue;
                     };
-                    let Some(programs) = source.property_programs.get(&byte_pc) else {
+                    let Some(programs) = super::feedback::store_node_programs(
+                        source,
+                        byte_pc,
+                        receiver_shape,
+                        proved,
+                    ) else {
                         continue;
                     };
                     let owners: Option<SmallVec<[FieldStoreOwner; 4]>> = programs
@@ -265,6 +275,7 @@ mod tests {
                 owners: smallvec::smallvec![old],
                 receiver_shape: Some(128),
                 fresh: false,
+                proved: false,
             },
             &[receiver, boxed],
             Repr::None,

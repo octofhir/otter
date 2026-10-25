@@ -552,6 +552,7 @@ mod tests {
             owners: Default::default(),
             receiver_shape: None,
             fresh: false,
+            proved: false,
         });
         assert!(method.reads_overlap(&append));
         assert!(clobberize(&Kind::CheckDependencies).reads_overlap(&overwrite));

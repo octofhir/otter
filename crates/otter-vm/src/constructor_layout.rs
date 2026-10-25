@@ -205,6 +205,8 @@ impl otter_gc::SafeTraceable for ConstructorLayoutBody {
 pub(crate) struct ConstructorFamilies {
     next_id: Cell<u64>,
     by_id: RefCell<FxHashMap<u64, ConstructorLayout>>,
+    /// The same cells by the function of their new.target owner.
+    by_owner: RefCell<FxHashMap<u32, smallvec::SmallVec<[ConstructorLayout; 1]>>>,
 }
 
 impl Default for ConstructorFamilies {
@@ -212,6 +214,7 @@ impl Default for ConstructorFamilies {
         Self {
             next_id: Cell::new(1),
             by_id: RefCell::new(FxHashMap::default()),
+            by_owner: RefCell::new(FxHashMap::default()),
         }
     }
 }
@@ -229,9 +232,24 @@ impl ConstructorFamilies {
 
     /// Index one freshly allocated family cell under its identity.
     pub(crate) fn register(&self, heap: &GcHeap, layout: ConstructorLayout) {
-        let id = heap.read_payload(layout, ConstructorLayoutBody::family_id);
+        let (id, (_, owner)) = heap.read_payload(layout, |body| (body.family_id(), body.owner()));
         let replaced = self.by_id.borrow_mut().insert(id, layout);
         debug_assert!(replaced.is_none(), "family identities are never reused");
+        self.by_owner
+            .borrow_mut()
+            .entry(owner)
+            .or_default()
+            .push(layout);
+    }
+
+    /// Every indexed family whose new.target owner is a closure or class of
+    /// the function `owner`.
+    pub(crate) fn of_owner(&self, owner: u32) -> smallvec::SmallVec<[ConstructorLayout; 1]> {
+        self.by_owner
+            .borrow()
+            .get(&owner)
+            .cloned()
+            .unwrap_or_default()
     }
 
     #[must_use]
@@ -245,6 +263,10 @@ impl ConstructorFamilies {
         self.by_id
             .borrow_mut()
             .retain(|_, layout| heap.is_marked(layout.raw()));
+        self.by_owner.borrow_mut().retain(|_, layouts| {
+            layouts.retain(|layout| heap.is_marked(layout.raw()));
+            !layouts.is_empty()
+        });
     }
 
     /// Rebuild the index from a restored heap; identities continue after the
@@ -260,14 +282,16 @@ impl ConstructorFamilies {
             // SAFETY: the payload walk visited a live layout cell at this
             // cage offset.
             let layout: ConstructorLayout = unsafe { Gc::from_offset(offset) };
-            restored.push((body.family_id, layout));
+            restored.push((body.family_id, body.owner_function_id, layout));
         });
         let mut next = 1u64;
         {
             let mut by_id = families.by_id.borrow_mut();
-            for (id, layout) in restored {
+            let mut by_owner = families.by_owner.borrow_mut();
+            for (id, owner, layout) in restored {
                 next = next.max(id.saturating_add(1));
                 by_id.insert(id, layout);
+                by_owner.entry(owner).or_default().push(layout);
             }
         }
         families.next_id.set(next);

@@ -2211,6 +2211,7 @@ impl<'a> Codegen<'a> {
                 receiver_shape,
                 fresh,
                 plan,
+                proved,
             } => {
                 let receiver = Self::gp(input(0));
                 let value = if plan.is_double() {
@@ -2219,11 +2220,17 @@ impl<'a> Codegen<'a> {
                     Self::gp(input(1))
                 };
                 let [holder, scratch] = [allocation.gp_temps[0], allocation.gp_temps[1]];
-                let (byte_pc, owners, receiver_shape, fresh, plan) =
-                    (*byte_pc, owners.clone(), *receiver_shape, *fresh, *plan);
+                let (byte_pc, owners, receiver_shape, fresh, plan, proved) = (
+                    *byte_pc,
+                    owners.clone(),
+                    *receiver_shape,
+                    *fresh,
+                    *plan,
+                    *proved,
+                );
                 self.emit_store_named_property(
                     node,
-                    (byte_pc, receiver_shape, fresh, plan),
+                    (byte_pc, receiver_shape, fresh, plan, proved),
                     &owners,
                     [receiver, value],
                     [holder, scratch],
@@ -3076,18 +3083,26 @@ impl<'a> Codegen<'a> {
     fn emit_store_named_property(
         &mut self,
         node: NodeId,
-        (byte_pc, receiver_shape, fresh, plan): (u32, Option<u32>, bool, NamedStorePlan),
+        (byte_pc, receiver_shape, fresh, plan, proved): (
+            u32,
+            Option<u32>,
+            bool,
+            NamedStorePlan,
+            bool,
+        ),
         owners: &[FieldStoreOwner],
         [receiver, value]: [u8; 2],
         [holder, scratch]: [u8; 2],
     ) -> Result<(), Unsupported> {
         use otter_vm::JitCacheIrOp as Op;
-        let programs = self
-            .view_of(node)
-            .property_programs
-            .get(&byte_pc)
-            .ok_or(Unsupported::OperandShape("graph named store programs"))?
-            .clone();
+        let programs = super::feedback::store_node_programs(
+            self.view_of(node),
+            byte_pc,
+            receiver_shape,
+            proved,
+        )
+        .ok_or(Unsupported::OperandShape("graph named store programs"))?
+        .to_vec();
         let selected = plan.program().map(usize::from);
         if selected.is_some_and(|index| {
             programs

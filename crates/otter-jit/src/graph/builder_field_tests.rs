@@ -1104,6 +1104,7 @@ fn selected_inline_append_keeps_numeric_source_and_recovery() {
             owners: smallvec::smallvec![owner],
             receiver_shape: Some(128),
             fresh: false,
+            proved: false,
         },
         &[receiver, phi],
         Repr::None,
@@ -1149,4 +1150,100 @@ fn selected_inline_append_keeps_numeric_source_and_recovery() {
     crate::graph::escape::remove_dead_values(&mut graph, &layout);
     assert!(!graph.block(merge).body.contains(&boxed));
     assert!(!graph.block(merge).body.contains(&barrier));
+}
+
+/// `this` of a body whose own construct entry allocates one family's root,
+/// stored at a megamorphic site: the entry proves the root and the store
+/// runs the proved receiver's program instead of the shared probe.
+#[test]
+fn own_construct_receiver_proves_root_and_selects_its_store_program() {
+    let build_with = |proved: bool| {
+        let mut view = JitCompileSnapshot::without_feedback(
+            90,
+            2,
+            3,
+            vec![
+                JitTestInstruction::new(Op::LoadThis, 0, 0, vec![Operand::Register(0)]),
+                JitTestInstruction::new(
+                    Op::StoreProperty,
+                    1,
+                    2,
+                    vec![
+                        Operand::Register(0),
+                        Operand::ConstIndex(0),
+                        Operand::Register(1),
+                        Operand::Register(2),
+                    ],
+                ),
+                JitTestInstruction::new(Op::ReturnUndefined, 2, 6, vec![]),
+            ],
+        );
+        view.seed_property_attempted_for_test(1);
+        view.property_accesses.insert(
+            2,
+            otter_vm::jit::JitPropertyAccess {
+                atom: 7,
+                shared: true,
+                ic_slot: 0,
+            },
+        );
+        view.own_receiver_plan = Some(otter_vm::jit::JitReceiverAllocationPlan {
+            new_target_function_id: 90,
+            new_target_is_class: false,
+            family_id: 1,
+            family_cell: 432,
+            receiver_shape: 0,
+            initial_field_count: 0,
+            inline_capacity: 4,
+            prototype_validity: None,
+            prototype_root: 128,
+        });
+        if proved {
+            view.proved_store_programs
+                .insert((2, 128), transition_program(128, FieldLocation::inline(0)));
+        }
+        let programs: Vec<_> = view.proved_store_programs.values().cloned().collect();
+        view.property_programs.insert(u32::MAX, programs);
+        seed_top_fields(&mut view);
+        view.property_programs.remove(&u32::MAX);
+        let analysis = Rc::new(Analysis::build(&view).unwrap());
+        build(
+            &view,
+            &analysis,
+            &BaselineSupport {
+                supported: vec![true; view.instructions.len()],
+            },
+            None,
+        )
+        .unwrap()
+    };
+    let built = build_with(true);
+    assert!(built.graph.nodes.iter().any(|node| matches!(
+        &node.kind,
+        Kind::CheckShapes { shapes, writable: true, .. } if shapes.as_slice() == [128]
+    )));
+    assert!(built.graph.nodes.iter().any(|node| matches!(
+        node.kind,
+        Kind::StoreNamedProperty {
+            proved: true,
+            receiver_shape: Some(128),
+            ..
+        }
+    )));
+    assert!(
+        !built
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, Kind::StorePropertyCached { .. }))
+    );
+    // Without a program for the proved shape the site keeps its shared probe.
+    let built = build_with(false);
+    assert!(
+        built
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, Kind::StorePropertyCached { .. }))
+    );
 }

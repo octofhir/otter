@@ -134,6 +134,7 @@ fn a_shape_changing_arm_keeps_the_reload() {
         owners: Default::default(),
         receiver_shape: None,
         fresh: false,
+        proved: false,
     };
     let (mut b, _, again, _) = diamond(store);
     let layout = b.blocks.clone();

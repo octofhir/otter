@@ -721,6 +721,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
             owners: Default::default(),
             receiver_shape: None,
             fresh: false,
+            proved: false,
         },
         Kind::StoreNamedProperty {
             plan: super::ir::NamedStorePlan::TransitionTagged(0),
@@ -728,6 +729,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
             owners: Default::default(),
             receiver_shape: None,
             fresh: false,
+            proved: false,
         },
         Kind::StoreNamedProperty {
             plan: super::ir::NamedStorePlan::TransitionDouble(0),
@@ -735,6 +737,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
             owners: Default::default(),
             receiver_shape: None,
             fresh: false,
+            proved: false,
         },
         Kind::StoreBodySlot(JitBodySlot {
             type_tag: 0,

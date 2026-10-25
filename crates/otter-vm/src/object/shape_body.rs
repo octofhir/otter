@@ -1120,6 +1120,12 @@ pub(crate) fn property_count_of(shape: ShapeHandle) -> u32 {
 }
 
 /// Validate the immutable ordinary append geometry accepted by generated stores.
+/// The storage location of the property a non-root `shape` appended.
+#[must_use]
+pub(crate) fn own_field_of(shape: ShapeHandle) -> super::FieldLocation {
+    body_of(shape).own_field
+}
+
 pub(crate) fn append_geometry_matches(
     parent: ShapeHandle,
     target: ShapeHandle,

@@ -157,6 +157,15 @@ pub const EMBEDDER_ROOT_SLOTS: usize = 2;
 /// Old-generation size from which a stop-the-world mark drain runs on the
 /// helper threads too.
 const PARALLEL_MARK_MIN_OLD_BYTES: u64 = 8 * 1024 * 1024;
+/// How a fresh cell's trailing storage starts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrailingInit {
+    /// Zeroed before the initializer runs.
+    Zeroed,
+    /// Written whole by the initializer; only the padding after it is zeroed.
+    Filled,
+}
+
 /// Trivial empty-roots implementation; useful in tests where all
 /// reachable objects sit in handle scopes.
 pub struct EmptyRoots;
@@ -1619,6 +1628,7 @@ impl GcHeap {
         aligned: usize,
         value: T,
         extra_bytes: usize,
+        tail: TrailingInit,
         initialize: impl FnOnce(&mut T),
     ) -> Gc<T> {
         // The cage base is 4 GiB-aligned: the low half of the address is
@@ -1634,9 +1644,18 @@ impl GcHeap {
                 .cast::<u8>()
                 .add(std::mem::size_of::<GcHeader>())
                 .cast::<T>();
+            if extra_bytes != 0 && tail == TrailingInit::Filled {
+                // The cell's last word holds any alignment padding; the
+                // initializer writes every trailing byte before it.
+                header_ptr
+                    .cast::<u8>()
+                    .add(aligned - CELL_SIZE)
+                    .cast::<u64>()
+                    .write_unaligned(0);
+            }
             std::ptr::write(header_ptr, GcHeader::new_young(T::TYPE_TAG, aligned as u32));
             std::ptr::write(payload_ptr, value);
-            if extra_bytes != 0 {
+            if extra_bytes != 0 && tail == TrailingInit::Zeroed {
                 let tail = payload_ptr.cast::<u8>().add(std::mem::size_of::<T>());
                 std::ptr::write_bytes(
                     tail,
@@ -1707,6 +1726,29 @@ impl GcHeap {
         extra_bytes: usize,
         initialize: impl FnOnce(&mut T),
     ) -> Result<Gc<T>, T> {
+        self.try_alloc_trailing_no_collect_as(value, extra_bytes, TrailingInit::Zeroed, initialize)
+    }
+
+    /// [`Self::try_alloc_trailing_no_collect_or_return`] whose `initialize`
+    /// writes every one of the `extra_bytes`: the trailing storage is not
+    /// zeroed first, only the cell's alignment padding after it.
+    #[inline]
+    pub fn try_alloc_filled_trailing_no_collect_or_return<T: Traceable>(
+        &mut self,
+        value: T,
+        extra_bytes: usize,
+        initialize: impl FnOnce(&mut T),
+    ) -> Result<Gc<T>, T> {
+        self.try_alloc_trailing_no_collect_as(value, extra_bytes, TrailingInit::Filled, initialize)
+    }
+
+    fn try_alloc_trailing_no_collect_as<T: Traceable>(
+        &mut self,
+        value: T,
+        extra_bytes: usize,
+        tail: TrailingInit,
+        initialize: impl FnOnce(&mut T),
+    ) -> Result<Gc<T>, T> {
         const {
             assert!(
                 std::mem::align_of::<T>() <= crate::OBJECT_ALIGNMENT,
@@ -1739,7 +1781,7 @@ impl GcHeap {
                 address
             }
         };
-        Ok(self.publish_lab_cell(address, aligned, value, extra_bytes, initialize))
+        Ok(self.publish_lab_cell(address, aligned, value, extra_bytes, tail, initialize))
     }
 
     /// Allocate a `T` while exposing caller-owned root slots to any
@@ -1855,7 +1897,14 @@ impl GcHeap {
         if aligned <= LARGE_OBJECT_THRESHOLD
             && let Some(address) = self.lab.bump(aligned)
         {
-            return Ok(self.publish_lab_cell(address, aligned, value, extra_bytes, initialize));
+            return Ok(self.publish_lab_cell(
+                address,
+                aligned,
+                value,
+                extra_bytes,
+                TrailingInit::Zeroed,
+                initialize,
+            ));
         }
         self.alloc_trailing_slow(value, aligned, extra_bytes, external_visit, initialize)
     }
@@ -1952,7 +2001,14 @@ impl GcHeap {
                 let Some(address) = self.lab.bump(aligned) else {
                     unreachable!("a refilled buffer holds the cell it was sized for");
                 };
-                return Ok(self.publish_lab_cell(address, aligned, value, extra_bytes, initialize));
+                return Ok(self.publish_lab_cell(
+                    address,
+                    aligned,
+                    value,
+                    extra_bytes,
+                    TrailingInit::Zeroed,
+                    initialize,
+                ));
             }
         }
 

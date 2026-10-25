@@ -500,6 +500,9 @@ impl Interpreter {
         for key in keys {
             shape = self.layout_shape_child(shape, key)?;
         }
+        // A match record's fields hold whatever each match produced, as a
+        // fixed result layout's fields do: they track nothing.
+        crate::object::field_type::generalize(shape);
         let layout = ObjectLayout {
             shape: self.shape_runtime.id_for_handle(&self.gc_heap, shape),
             len: keys.len() as u32,

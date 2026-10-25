@@ -105,6 +105,7 @@ mod keyed_store;
 mod native_leaf;
 mod nullish;
 mod own_fields;
+pub(crate) mod truthy;
 
 const NUMBER_TAG: u64 = tag::NUMBER_TAG;
 const NOT_CELL_MASK: u64 = tag::NOT_CELL_MASK;
@@ -188,7 +189,7 @@ struct Codegen<'a> {
     plan_index: FxHashMap<u32, Vec<usize>>,
     /// Shared property subroutines requested by Generic sites.
     /// The compiler's routine set, which generic sites call.
-    shared_property: &'a crate::routines::RoutineRequest<'a>,
+    routines: &'a crate::routines::RoutineRequest<'a>,
     no_direct_call_events: Option<crate::template::DirectCallEvents>,
     no_code_map: Option<crate::artifact::CodeMapCapture>,
     spliced_functions: std::collections::BTreeSet<u32>,
@@ -365,7 +366,7 @@ pub(crate) fn emit(
         deopt_runtime: deopt_runtime as u64,
         plan,
         plan_index: metadata::operation_index(plan),
-        shared_property: routines,
+        routines,
         no_direct_call_events: None,
         no_code_map: None,
         spliced_functions: std::collections::BTreeSet::new(),
@@ -1156,7 +1157,7 @@ impl<'a> Codegen<'a> {
                         dynasm!(self.ops ; .arch aarch64 ; mov X(destination), X(value));
                     }
                 } else {
-                    self.emit_to_boolean(node, value, destination, negate);
+                    self.emit_to_boolean(value, destination, negate);
                 }
             }
             Kind::Int32AddWrapping | Kind::Int32SubWrapping => {
@@ -3593,8 +3594,8 @@ impl<'a> Codegen<'a> {
         crate::template::arm64::shared_property::emit_call(
             &mut self.ops,
             &mut self.relocations,
-            self.shared_property,
-            crate::routines::PropertyRoutine::ProbeLoad,
+            self.routines,
+            crate::routines::Routine::ProbeLoad,
         );
         dynasm!(self.ops ; .arch aarch64 ; cbz X(PROBE_SLOT), =>done);
         self.emit_committed_call(
@@ -3623,7 +3624,7 @@ impl<'a> Codegen<'a> {
         let (slot, target) = self.property_site_slot(node, pc)?;
         self.emit_committed_routine_call(
             node,
-            crate::routines::PropertyRoutine::CommittedStore,
+            crate::routines::Routine::CommittedStore,
             &[
                 CommittedArgument::Value(receiver),
                 CommittedArgument::Value(value),
@@ -5187,7 +5188,7 @@ impl<'a> Codegen<'a> {
                     exits,
                     poll_entry: self.transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
                     far_branches: true,
-                    shared_property: self.shared_property,
+                    shared_property: self.routines,
                     numeric_slow_paths: &mut numeric_slow_paths,
                     coercion_slow_paths: &mut coercion_slow_paths,
                     direct_call_events: &mut self.no_direct_call_events,
@@ -5479,7 +5480,7 @@ impl<'a> Codegen<'a> {
                     }
                     BranchKind::Truthy => {
                         let a = Self::gp(allocation.inputs[0]);
-                        self.emit_truthy_branch(control, a, true_label, false_label);
+                        self.emit_truthy_branch(a, true_label, false_label);
                     }
                 }
                 if next != Some(if_false) {
@@ -5598,11 +5599,37 @@ impl<'a> Codegen<'a> {
     /// for `!`: immediates, Numbers, strings and objects inline, native
     /// functions, BigInts and other immediates through the VM's leaf
     /// predicate with live registers saved.
-    fn emit_to_boolean(&mut self, node: NodeId, value: u8, destination: u8, negate: bool) {
+    fn emit_to_boolean(&mut self, value: u8, destination: u8, negate: bool) {
         let truthy = self.ops.new_dynamic_label();
         let falsy = self.ops.new_dynamic_label();
-        let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
+        self.emit_truthiness(value, truthy, falsy);
+        let (when_truthy, when_falsy) = if negate {
+            (VALUE_FALSE, VALUE_TRUE)
+        } else {
+            (VALUE_TRUE, VALUE_FALSE)
+        };
+        dynasm!(self.ops ; .arch aarch64 ; =>truthy);
+        self.load_immediate(destination, when_truthy);
+        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>falsy);
+        self.load_immediate(destination, when_falsy);
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+    }
+
+    /// Branch on `ToBoolean(X(value))`: booleans, `null`, `undefined`, int32
+    /// Numbers, ordinary objects, arrays and closures inline, every other
+    /// value through the compiler's truthiness routine, which preserves
+    /// every allocatable register.
+    fn emit_truthy_branch(&mut self, value: u8, if_true: DynamicLabel, if_false: DynamicLabel) {
+        let true_target = self.cond_target(if_true);
+        let false_target = self.cond_target(if_false);
+        self.emit_truthiness(value, true_target, false_target);
+    }
+
+    /// Jump to `truthy` or `falsy` by `ToBoolean(X(value))`; both may be
+    /// conditional-branch targets.
+    fn emit_truthiness(&mut self, value: u8, truthy: DynamicLabel, falsy: DynamicLabel) {
+        use truthy::TRUTHY_VALUE;
         let not_int = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
@@ -5624,165 +5651,29 @@ impl<'a> Codegen<'a> {
             ; b.eq =>falsy
             ; b =>truthy
             ; =>not_int
-        );
-        self.emit_heap_truthiness(value, truthy, falsy, slow);
-        let (when_truthy, when_falsy) = if negate {
-            (VALUE_FALSE, VALUE_TRUE)
-        } else {
-            (VALUE_TRUE, VALUE_FALSE)
-        };
-        dynasm!(self.ops ; .arch aarch64 ; =>truthy);
-        self.load_immediate(destination, when_truthy);
-        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>falsy);
-        self.load_immediate(destination, when_falsy);
-        dynasm!(self.ops ; .arch aarch64 ; =>done);
-        let live = self.allocation.node(node).live_registers.clone();
-        self.deferred
-            .push(Box::new(move |codegen: &mut Codegen<'a>| {
-                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
-                let saved = codegen.emit_save_registers(&live);
-                dynasm!(codegen.ops
-                    ; .arch aarch64
-                    ; mov x1, X(value)
-                    ; ldr x0, [x20, THREAD_OFFSET]
-                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-                );
-                emit_load_symbol_u64(
-                    &mut codegen.ops,
-                    &mut codegen.relocations,
-                    16,
-                    otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
-                    RelocationTarget::runtime_stub(abi::STUB_TO_BOOLEAN_LEAF),
-                );
-                dynasm!(codegen.ops ; .arch aarch64 ; blr x16 ; mov x16, x0);
-                codegen.emit_restore_registers(&live, saved);
-                dynasm!(codegen.ops
-                    ; .arch aarch64
-                    ; cmp x16, VALUE_TRUE as u32
-                    ; b.eq =>truthy
-                    ; b =>falsy
-                );
-            }));
-    }
-
-    /// Branch on `ToBoolean(X(value))`: immediates, Numbers, strings and
-    /// objects inline, native functions, BigInts and other immediates
-    /// through the VM's leaf predicate with live registers saved.
-    fn emit_truthy_branch(
-        &mut self,
-        node: NodeId,
-        value: u8,
-        if_true: DynamicLabel,
-        if_false: DynamicLabel,
-    ) {
-        let not_int = self.ops.new_dynamic_label();
-        let slow = self.ops.new_dynamic_label();
-        let true_target = self.cond_target(if_true);
-        let false_target = self.cond_target(if_false);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; cmp XSP(value), VALUE_TRUE as u32
-            ; b.eq =>true_target
-            ; cmp XSP(value), VALUE_FALSE as u32
-            ; b.eq =>false_target
-            ; cmp XSP(value), VALUE_UNDEFINED as u32
-            ; b.eq =>false_target
-            ; cmp XSP(value), VALUE_NULL as u32
-            ; b.eq =>false_target
-        );
-        self.load_immediate(16, NUMBER_TAG);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; cmp X(value), x16
-            ; b.lo =>not_int
-            ; cmp WSP(value), #0
-            ; b.eq =>false_target
-            ; b =>if_true
-            ; =>not_int
-        );
-        self.emit_heap_truthiness(value, true_target, false_target, slow);
-        let live = self.allocation.node(node).live_registers.clone();
-        self.deferred
-            .push(Box::new(move |codegen: &mut Codegen<'a>| {
-                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
-                let saved = codegen.emit_save_registers(&live);
-                dynasm!(codegen.ops
-                    ; .arch aarch64
-                    ; mov x1, X(value)
-                    ; ldr x0, [x20, THREAD_OFFSET]
-                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-                );
-                emit_load_symbol_u64(
-                    &mut codegen.ops,
-                    &mut codegen.relocations,
-                    16,
-                    otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
-                    RelocationTarget::runtime_stub(abi::STUB_TO_BOOLEAN_LEAF),
-                );
-                dynasm!(codegen.ops ; .arch aarch64 ; blr x16 ; mov x16, x0);
-                codegen.emit_restore_registers(&live, saved);
-                let true_target = codegen.cond_target(if_true);
-                dynasm!(codegen.ops
-                    ; .arch aarch64
-                    ; cmp x16, VALUE_TRUE as u32
-                    ; b.eq =>true_target
-                    ; b =>if_false
-                );
-            }));
-    }
-
-    /// `ToBoolean` of a value below the int32 tag range that is not a
-    /// boolean, `null` or `undefined`: a double is falsy at ±0 and NaN, a
-    /// string at length zero, and every other cell is an object, truthy,
-    /// except a native function (the only possible `[[IsHTMLDDA]]`) and a
-    /// BigInt, which go to `slow` with the remaining immediates. Clobbers
-    /// `x16` and `x17`.
-    fn emit_heap_truthiness(
-        &mut self,
-        value: u8,
-        truthy: DynamicLabel,
-        falsy: DynamicLabel,
-        slow: DynamicLabel,
-    ) {
-        let cell = self.ops.new_dynamic_label();
-        let string_tag = u32::from(self.view.string_layout.string_type_tag);
-        let length = self.view.string_layout.string_len_byte;
-        dynasm!(self.ops
-            ; .arch aarch64
             ; tst X(value), #0xfffe_0000_0000_0007
-            ; b.eq =>cell
-            // A boxed double carries number tag bits; other immediates do not.
-            ; lsr x16, X(value), #49
-            ; cbz x16, =>slow
-        );
-        self.load_immediate(16, DOUBLE_OFFSET);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; sub x16, X(value), x16
-            ; lsl x17, x16, #1
-            ; cbz x17, =>falsy
-        );
-        // NaN boxes as the one canonical pattern.
-        self.load_immediate(17, tag::CANONICAL_NAN);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; cmp x16, x17
-            ; b.eq =>falsy
-            ; b =>truthy
-            ; =>cell
-            ; cbz X(value), =>slow
+            ; b.ne >routine
+            ; cbz X(value), >routine
             ; ldrb w16, [X(value)]
-            ; cmp w16, string_tag
-            ; b.ne >object
-            ; ldr w16, [X(value), length]
-            ; cbz w16, =>falsy
-            ; b =>truthy
-            ; object:
-            ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
-            ; b.eq =>slow
-            ; cmp w16, u32::from(otter_vm::bigint::BIG_INT_BODY_TYPE_TAG)
-            ; b.eq =>slow
-            ; b =>truthy
+            ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
+            ; b.eq =>truthy
+            ; cmp w16, u32::from(self.view.array_layout.type_tag)
+            ; b.eq =>truthy
+            ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
+            ; b.eq =>truthy
+            ; routine:
+            ; mov X(TRUTHY_VALUE), X(value)
+        );
+        crate::template::arm64::shared_property::emit_call(
+            &mut self.ops,
+            &mut self.relocations,
+            self.routines,
+            crate::routines::Routine::Truthy,
+        );
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cbnz X(TRUTHY_VALUE), =>truthy
+            ; b =>falsy
         );
     }
 

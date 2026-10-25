@@ -60,7 +60,7 @@ use super::values::{CellTest, emit_cell_test, emit_load_runtime_stub, emit_load_
 use crate::arm64::property_actions;
 use crate::arm64::property_ic;
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
-use crate::routines::{PropertyRoutine, RoutineObject, RoutineOffsets, RoutineRequest};
+use crate::routines::{Routine, RoutineObject, RoutineOffsets, RoutineRequest};
 
 /// Load routine inputs.
 pub(crate) const LOAD_RECEIVER: u8 = 9;
@@ -91,14 +91,14 @@ pub(crate) fn emit_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     routines: &RoutineRequest<'_>,
-    routine: PropertyRoutine,
+    routine: Routine,
 ) {
     emit_load_symbol_u64(
         ops,
         relocations,
         16,
         routines.entry(routine),
-        RelocationTarget::PropertyRoutine {
+        RelocationTarget::Routine {
             routine: routine.name(),
         },
     );
@@ -122,6 +122,8 @@ pub(crate) fn emit_routine(
         RoutineObject::Concat => emit_concat(ops, view, label),
         RoutineObject::KeyedLoad => emit_keyed_load(ops, relocations, view, label),
         RoutineObject::KeyedStore => emit_keyed_store(ops, relocations, view, label),
+        RoutineObject::StoreTail => emit_store_tail(ops, relocations, view, label),
+        RoutineObject::Truthy => unreachable!("the truthiness routine is the graph tier's"),
     }
     let second = ops.offset().0;
     match object {
@@ -142,6 +144,34 @@ pub(crate) fn emit_routine(
         }
     }
     RoutineOffsets { entry, second }
+}
+
+/// Store tail inputs: the receiver, the stored value and the compressed
+/// defining shape whose field summary observes it (zero for none).
+pub(crate) const TAIL_RECEIVER: u8 = STORE_RECEIVER;
+pub(crate) const TAIL_VALUE: u8 = STORE_VALUE;
+pub(crate) const TAIL_OWNER: u8 = STORE_SLOT;
+
+/// After a baseline site's inline own-field store: the field summary of
+/// `W(TAIL_OWNER)` observes `X(TAIL_VALUE)`, then the value barrier of
+/// `X(TAIL_RECEIVER)`. The site holds nothing else in registers.
+fn emit_store_tail(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    label: DynamicLabel,
+) {
+    let primitive = ops.new_dynamic_label();
+    // The barrier's slow path calls out.
+    dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]!);
+    crate::arm64::field_type::emit_observe(ops, relocations, view, TAIL_OWNER, TAIL_VALUE);
+    emit_cell_test(ops, TAIL_VALUE, CellTest::IsNotCell, primitive);
+    super::values::emit_write_barrier(ops, relocations, view, TAIL_RECEIVER, TAIL_VALUE);
+    dynasm!(ops ; .arch aarch64
+        ; =>primitive
+        ; ldp x29, x30, [sp], #16
+        ; ret
+    );
 }
 
 /// Probe entry inputs: the receiver and the site's slot address.

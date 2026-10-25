@@ -55,6 +55,7 @@ mod native_leaf;
 mod nullish;
 mod properties;
 mod scalar;
+pub(crate) mod truthy;
 
 type Deferred<'a> = Box<dyn FnOnce(&mut Codegen<'a>) + 'a>;
 
@@ -83,7 +84,7 @@ struct Codegen<'a> {
     plan_index: FxHashMap<u32, Vec<usize>>,
     /// Shared property routines requested by Generic sites.
     /// The compiler's routine set, which generic sites call.
-    shared_property: &'a crate::routines::RoutineRequest<'a>,
+    routines: &'a crate::routines::RoutineRequest<'a>,
     no_direct_call_events: Option<crate::template::DirectCallEvents>,
     no_code_map: Option<crate::artifact::CodeMapCapture>,
     spliced_functions: std::collections::BTreeSet<u32>,
@@ -189,7 +190,7 @@ pub(crate) fn emit(
         deopt_runtime: deopt_runtime as u64,
         plan,
         plan_index: metadata::operation_index(plan),
-        shared_property: routines,
+        routines,
         no_direct_call_events: None,
         no_code_map: None,
         spliced_functions: std::collections::BTreeSet::new(),

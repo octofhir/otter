@@ -856,8 +856,8 @@ impl Codegen<'_> {
         crate::template::x86_64::shared_property::emit_call(
             &mut self.ops,
             &mut self.relocations,
-            self.shared_property,
-            crate::routines::PropertyRoutine::ProbeLoad,
+            self.routines,
+            crate::routines::Routine::ProbeLoad,
         );
         dynasm!(self.ops ; .arch x64 ; test Rq(PROBE_STATUS), Rq(PROBE_STATUS) ; jz =>done);
         self.emit_committed_call(
@@ -885,7 +885,7 @@ impl Codegen<'_> {
         let (slot, target) = self.property_site_slot(node, pc)?;
         self.emit_committed_routine_call(
             node,
-            crate::routines::PropertyRoutine::CommittedStore,
+            crate::routines::Routine::CommittedStore,
             &[
                 CommittedArgument::Value(receiver),
                 CommittedArgument::Value(value),

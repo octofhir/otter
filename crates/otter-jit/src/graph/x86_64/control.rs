@@ -183,7 +183,7 @@ impl<'a> Codegen<'a> {
                     }
                     BranchKind::Truthy => {
                         let a = Self::gp(allocation.inputs[0]);
-                        self.emit_truthy_branch(node, a, true_label, false_label);
+                        self.emit_truthy_branch(a, true_label, false_label);
                         return Ok(());
                     }
                 }

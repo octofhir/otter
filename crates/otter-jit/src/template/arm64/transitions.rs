@@ -315,7 +315,7 @@ pub(super) fn emit_load_element(
         ops,
         relocations,
         shared_probes,
-        crate::routines::PropertyRoutine::KeyedLoad,
+        crate::routines::Routine::KeyedLoad,
     );
     dynasm!(ops ; .arch aarch64 ; cbnz x1, =>runtime);
     emit_store_reg(ops, 0, dst)?;
@@ -389,7 +389,7 @@ pub(super) fn emit_store_element(
         ops,
         relocations,
         shared_probes,
-        crate::routines::PropertyRoutine::KeyedStore,
+        crate::routines::Routine::KeyedStore,
     );
     dynasm!(ops ; .arch aarch64 ; cbz x1, =>done);
     emit_ctx_arg(ops);

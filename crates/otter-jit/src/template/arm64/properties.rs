@@ -38,7 +38,6 @@ use otter_vm::native_abi as abi;
 use super::ic_probe;
 use super::values::{
     CellTest, emit_cell_test, emit_load_reg, emit_load_symbol_u64, emit_store_reg,
-    emit_write_barrier,
 };
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{OBJECT_BODY_TYPE_TAG, Unsupported, reg_offset};
@@ -136,17 +135,6 @@ impl IntrinsicLoadOutput {
     }
 }
 
-/// Whether `ops` read a method for a receiver whose committed resolution
-/// records no call feedback: a primitive string or a RegExp.
-pub(crate) fn feedback_free_method_program(ops: &[otter_vm::JitCacheIrOp]) -> bool {
-    matches!(
-        ops.first(),
-        Some(otter_vm::JitCacheIrOp::LoadIntrinsicPrototype { target, .. })
-            if target.type_tag == otter_vm::string::JS_STRING_BODY_TYPE_TAG
-                || target.type_tag == otter_vm::regexp::REGEXP_BODY_TYPE_TAG
-    )
-}
-
 /// Static intrinsic-prototype reads: a receiver of an intrinsic body type
 /// (primitive string, RegExp, closure, collection) reading a data slot of its
 /// pinned realm prototype, a closure's own `prototype` slot, or a RegExp's
@@ -163,11 +151,13 @@ pub(super) fn emit_intrinsic_loads(
     output: IntrinsicLoadOutput,
     done: DynamicLabel,
 ) {
+    use crate::template::intrinsic_loads::{IntrinsicLoad, intrinsic_loads};
     use otter_vm::JitCacheIrOp as Op;
-    let Some(programs) = view.property_programs.get(&byte_pc) else {
+    let loads = intrinsic_loads(view, byte_pc, matches!(output, IntrinsicLoadOutput::Result));
+    if loads.is_empty() {
         return;
-    };
-    // Every program proves a receiver that is not an ordinary object: an
+    }
+    // Every read proves a receiver that is not an ordinary object: an
     // immediate or an ordinary object skips them all at once.
     let skip = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, obj_off]);
@@ -177,127 +167,74 @@ pub(super) fn emit_intrinsic_loads(
         ; cmp w16, OBJECT_BODY_TYPE_TAG
         ; b.eq =>skip
     );
-    for program in programs {
-        if matches!(output, IntrinsicLoadOutput::Result)
-            && !feedback_free_method_program(&program.ops)
-        {
-            continue;
-        }
-        if let [Op::LoadClosurePrototype { object: 0 }] = *program.ops {
-            let next = ops.new_dynamic_label();
-            dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, obj_off]);
-            ic_probe::emit_closure_prototype_load(ops, view, 9, 9, next);
-            output.emit(ops);
-            dynasm!(ops ; .arch aarch64
-                ; b =>done
-                ; =>next);
-            continue;
-        }
-        // An exotic body's own data slot; the prefix above proved a cell.
-        if let [Op::LoadBodySlot { object: 0, slot }] = *program.ops {
-            if slot.is_generated(false) && slot.guard.is_none() {
-                let next = ops.new_dynamic_label();
-                dynasm!(ops ; .arch aarch64
-                    ; ldr x9, [x19, obj_off]
-                    ; ldrb w16, [x9]
-                    ; cmp w16, u32::from(slot.type_tag)
-                    ; b.ne =>next
-                    ; ldr x9, [x9, slot.byte]
-                );
-
-                output.emit(ops);
-                dynasm!(ops ; .arch aarch64
-                    ; b =>done
-                    ; =>next);
-            }
-            continue;
-        }
-        let Some((projection, rest)) = program.ops.split_first() else {
-            continue;
-        };
-        if !matches!(
-            projection,
-            Op::LoadIntrinsicPrototype {
-                object: 0,
-                result: 1,
-                ..
-            } | Op::LoadArrayExpando {
-                object: 0,
-                result: 1,
-                ..
-            }
-        ) {
-            continue;
-        }
-        let Some((Op::LoadField { object: 1, .. }, guards)) = rest.split_last() else {
-            continue;
-        };
-        if !guards.iter().all(|op| {
-            matches!(
-                op,
-                Op::GuardShape { object: 1, .. }
-                    | Op::GuardDictionaryLayout { object: 1, .. }
-                    | Op::GuardAtomSlot {
-                        object: 1,
-                        writable: false,
-                        ..
-                    }
-                    | Op::GuardPrototypeValidity { .. }
-            )
-        }) {
-            continue;
-        }
+    for load in loads {
         let next = ops.new_dynamic_label();
         dynasm!(ops ; .arch aarch64 ; ldr x9, [x19, obj_off]);
-        match *projection {
-            Op::LoadIntrinsicPrototype { target, .. } => ic_probe::emit_intrinsic_prototype_header(
-                ops,
-                relocations,
-                view,
-                target,
-                byte_pc,
-                20,
-                next,
+        match load {
+            IntrinsicLoad::ClosurePrototype => {
+                ic_probe::emit_closure_prototype_load(ops, view, 9, 9, next);
+            }
+            // An exotic body's own data slot; the prefix above proved a cell.
+            IntrinsicLoad::BodySlot(slot) => dynasm!(ops ; .arch aarch64
+                ; ldrb w16, [x9]
+                ; cmp w16, u32::from(slot.type_tag)
+                ; b.ne =>next
+                ; ldr x9, [x9, slot.byte]
             ),
-            Op::LoadArrayExpando { layout, .. } => {
-                crate::arm64::property_ic::emit_array_expando(ops, layout, 9, 15, next)
+            IntrinsicLoad::Holder {
+                projection,
+                guards,
+                field,
+            } => {
+                match *projection {
+                    Op::LoadIntrinsicPrototype { target, .. } => {
+                        ic_probe::emit_intrinsic_prototype_header(
+                            ops,
+                            relocations,
+                            view,
+                            target,
+                            byte_pc,
+                            20,
+                            next,
+                        );
+                    }
+                    Op::LoadArrayExpando { layout, .. } => {
+                        crate::arm64::property_ic::emit_array_expando(ops, layout, 9, 15, next);
+                    }
+                    _ => unreachable!("classified storage projection"),
+                }
+                for op in guards {
+                    match *op {
+                        Op::GuardShape { shape, .. } => {
+                            ic_probe::emit_check_shape_identity(ops, view, 15, shape, next);
+                        }
+                        Op::GuardDictionaryLayout { layout, .. } => {
+                            ic_probe::emit_dictionary_layout_guard(
+                                ops,
+                                relocations,
+                                view,
+                                15,
+                                layout,
+                                next,
+                            );
+                        }
+                        Op::GuardPrototypeValidity { validity } => {
+                            super::values::emit_prototype_validity_guard(
+                                ops,
+                                relocations,
+                                validity,
+                                14,
+                                next,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                ic_probe::emit_load_field(ops, relocations, view, 15, field, next);
             }
-            _ => unreachable!("validated storage projection"),
         }
-        for op in rest {
-            match *op {
-                Op::GuardShape { shape, .. } => {
-                    ic_probe::emit_check_shape_identity(ops, view, 15, shape, next);
-                }
-                Op::GuardDictionaryLayout { layout, .. } => {
-                    ic_probe::emit_dictionary_layout_guard(
-                        ops,
-                        relocations,
-                        view,
-                        15,
-                        layout,
-                        next,
-                    );
-                }
-                Op::GuardPrototypeValidity { validity } => {
-                    super::values::emit_prototype_validity_guard(
-                        ops,
-                        relocations,
-                        validity,
-                        14,
-                        next,
-                    );
-                }
-                Op::LoadField { field, .. } => {
-                    ic_probe::emit_load_field(ops, relocations, view, 15, field, next);
-
-                    output.emit(ops);
-                    dynasm!(ops ; .arch aarch64 ; b =>done);
-                }
-                _ => {}
-            }
-        }
-        dynasm!(ops ; .arch aarch64 ; =>next);
+        output.emit(ops);
+        dynasm!(ops ; .arch aarch64 ; b =>done ; =>next);
     }
     dynasm!(ops ; .arch aarch64 ; =>skip);
 }
@@ -371,7 +308,7 @@ pub(super) fn emit_load_property(
         ops,
         relocations,
         shared_probes,
-        crate::routines::PropertyRoutine::Load,
+        crate::routines::Routine::Load,
     );
     emit_shared_status(ops, throw_value, fatal);
     emit_store_reg(ops, 0, dst)?;
@@ -402,7 +339,6 @@ pub(super) fn emit_store_property(
     let obj_off = reg_offset(object)?;
     let src_off = reg_offset(value)?;
     let shared = ops.new_dynamic_label();
-    let primitive = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
 
     emit_slot_address(ops, relocations, view, byte_pc, ic_slot, STORE_SLOT);
@@ -416,12 +352,14 @@ pub(super) fn emit_store_property(
         ; str X(STORE_VALUE), [x16, x14, lsl #3]
         ; ldr W(STORE_SLOT), [X(STORE_SLOT), IC.inline_owner_byte]
     );
-    crate::arm64::field_type::emit_observe(ops, relocations, view, STORE_SLOT, STORE_VALUE);
-    emit_cell_test(ops, STORE_VALUE, CellTest::IsNotCell, primitive);
-    emit_write_barrier(ops, relocations, view, STORE_RECEIVER, STORE_VALUE);
+    super::shared_property::emit_call(
+        ops,
+        relocations,
+        shared_probes,
+        crate::routines::Routine::StoreTail,
+    );
     dynasm!(ops
         ; .arch aarch64
-        ; =>primitive
         ; b =>done
         ; =>shared
     );
@@ -431,7 +369,7 @@ pub(super) fn emit_store_property(
         ops,
         relocations,
         shared_probes,
-        crate::routines::PropertyRoutine::Store,
+        crate::routines::Routine::Store,
     );
     emit_shared_status(ops, throw_value, fatal);
     dynasm!(ops ; .arch aarch64 ; =>done);

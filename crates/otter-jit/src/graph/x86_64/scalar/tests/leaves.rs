@@ -163,7 +163,7 @@ fn fixture(kind: Kind) -> crate::CompiledCode {
         deopt_runtime: 0,
         plan: &plan,
         plan_index: FxHashMap::default(),
-        shared_property: &routines,
+        routines: &routines,
         no_direct_call_events: None,
         no_code_map: None,
         spliced_functions: Default::default(),

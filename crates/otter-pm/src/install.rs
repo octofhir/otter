@@ -108,8 +108,18 @@ impl FsPackageStore {
         let url = source.url.clone();
         let index = tokio::task::spawn_blocking(move || {
             verify_tarball_integrity(&source, &bytes)?;
-            let index = store_tgz_package(&content, &bytes, &source.url)?;
+            // Where installs clone a stored tree, the extraction builds it
+            // in the same pass that stores the files.
+            let staging = if ContentStore::keeps_trees() {
+                Some(content.tree_staging(&key)?)
+            } else {
+                None
+            };
+            let index = store_tgz_package(&content, &bytes, &source.url, staging.as_deref())?;
             content.write_index(&key, &index)?;
+            if let Some(staging) = &staging {
+                content.publish_tree(&key, staging)?;
+            }
             Ok::<_, PackageManagerError>(index)
         })
         .await
@@ -121,6 +131,28 @@ impl FsPackageStore {
             index,
             reused: false,
         })
+    }
+
+    /// Fetch and extract into the store every tarball announced on
+    /// `announced`, up to [`FETCH_CONCURRENCY`] at a time, until the channel
+    /// closes. Failures are left for materialization, which fetches what is
+    /// still missing and reports why it cannot.
+    pub async fn prefetch(
+        &self,
+        announced: tokio::sync::mpsc::UnboundedReceiver<TarballSource>,
+        client: &impl TarballFetchClient,
+    ) {
+        let mut seen = std::collections::HashSet::new();
+        stream::unfold(announced, |mut announced| async move {
+            announced.recv().await.map(|source| (source, announced))
+        })
+        .filter(move |source| std::future::ready(seen.insert(tarball_cache_key(source))))
+        .map(|source| async move {
+            let _ = self.get_or_fetch_and_extract(&source, client).await;
+        })
+        .buffer_unordered(FETCH_CONCURRENCY)
+        .collect::<()>()
+        .await;
     }
 
     /// Materialize all registry tarballs from `lockfile` into `node_modules`.
@@ -376,6 +408,7 @@ fn store_tgz_package(
     content: &ContentStore,
     archive: &[u8],
     url: &str,
+    tree: Option<&Path>,
 ) -> Result<PackageIndex, PackageManagerError> {
     let archive_path = Path::new(url);
     let decoder = GzDecoder::new(archive);
@@ -413,7 +446,11 @@ fn store_tgz_package(
                 message: err.to_string(),
             })?;
         let stored = content.add_file(&bytes, executable)?;
-        index.files.insert(index_key(&relative), stored);
+        let key = index_key(&relative);
+        if let Some(tree) = tree {
+            ContentStore::stage_tree_file(tree, &key, &bytes, executable)?;
+        }
+        index.files.insert(key, stored);
     }
     Ok(index)
 }

@@ -71,10 +71,10 @@ pub use npm_range::NpmRange;
 pub use policy::{BuildDecision, InstallPolicy};
 pub use registry::{
     FileRegistryMetadataClient, FsRegistryMetadataCache, HttpRegistryMetadataClient,
-    METADATA_FRESH_FOR, MetadataFetch, NpmAttestations, NpmDist, NpmPackageVersion,
-    NpmProvenance, NpmRegistryMetadata, RegistryMetadataClient,
+    METADATA_FRESH_FOR, MetadataFetch, NpmAttestations, NpmDist, NpmPackageVersion, NpmProvenance,
+    NpmRegistryMetadata, RegistryMetadataClient,
 };
-pub use resolve::enrich_resolution_with_registry_metadata;
+pub use resolve::{Announced, Prefetch, enrich_resolution_with_registry_metadata};
 pub use script_sniff::{ScriptFinding, suspicious_script_findings};
 pub use store::{ContentStore, PackageIndex, StoredFile};
 pub use tarball::{FileTarballClient, HttpTarballClient, TarballFetchClient, TarballSource};
@@ -498,39 +498,59 @@ pub async fn install_local_project(
     let policy = InstallPolicy::from_manifest(&PackageManifest::read_from_dir(project_root).await?);
     let previous_lockfile = read_project_lockfile(project_root).await?;
     let mut warnings = Vec::new();
-    let (mut resolution, imported_lockfile) = if previous_lockfile.is_none()
-        && let Some((format, mut lockfile)) = read_migration_lockfile(project_root).await?
-    {
-        enrich_imported_lockfile_with_registry_metadata(
-            &mut lockfile,
-            metadata_cache,
-            metadata_client,
-        )
-        .await?;
-        let mut resolution = resolve_local_project(project_root).await?;
-        resolution.lockfile = lockfile;
-        (resolution, Some(format))
-    } else {
-        (
-            resolve_local_project_with_registry_metadata(
-                project_root,
+    // Tarballs fetch into the store while resolution goes on and while the
+    // advisory database is consulted; nothing reaches the project before the
+    // checks below pass.
+    let (prefetch, announced) = tokio::sync::mpsc::unbounded_channel();
+    let prefetching = prefetch_and_advise(
+        announced,
+        package_store,
+        tarball_client,
+        advisory_client,
+        &policy,
+        previous_lockfile.as_ref(),
+    );
+    let resolving = async {
+        let resolved = if previous_lockfile.is_none()
+            && let Some((format, mut lockfile)) = read_migration_lockfile(project_root).await?
+        {
+            enrich_imported_lockfile_with_registry_metadata(
+                &mut lockfile,
                 metadata_cache,
                 metadata_client,
-                &policy,
-                previous_lockfile.as_ref(),
-                &mut warnings,
             )
-            .await?,
-            None,
-        )
+            .await?;
+            let mut resolution = resolve_local_project(project_root).await?;
+            resolution.lockfile = lockfile;
+            (resolution, Some(format))
+        } else {
+            (
+                resolve_local_project_with_registry_metadata(
+                    project_root,
+                    metadata_cache,
+                    metadata_client,
+                    &policy,
+                    previous_lockfile.as_ref(),
+                    Some(&prefetch),
+                    &mut warnings,
+                )
+                .await?,
+                None,
+            )
+        };
+        drop(prefetch);
+        check_provenance_continuity(previous_lockfile.as_ref(), &resolved.0.lockfile, &policy)?;
+        Ok::<_, PackageManagerError>(resolved)
     };
-    check_provenance_continuity(previous_lockfile.as_ref(), &resolution.lockfile, &policy)?;
+    let (resolved, answers) = tokio::join!(resolving, prefetching);
+    let (mut resolution, imported_lockfile) = resolved?;
     check_advisories(
         &resolution.lockfile,
         previous_lockfile.as_ref(),
         advisory_client,
         &policy,
         &mut warnings,
+        answers,
     )
     .await?;
     check_store_integrity(&resolution.lockfile, &policy, &mut warnings)?;
@@ -558,6 +578,7 @@ pub async fn install_local_project(
             metadata_client,
             &policy,
             previous_lockfile.as_ref(),
+            None,
             &mut warnings,
         )
         .await?;
@@ -658,63 +679,159 @@ fn check_provenance_continuity(
     Ok(())
 }
 
+/// Advisory answers gathered while a resolution went on.
+#[derive(Debug, Default)]
+struct AdvisoryAnswers {
+    /// Versions the database answered for.
+    answered: BTreeSet<AdvisoryQuery>,
+    /// Its confirmed-malicious answers among them.
+    malicious: Vec<MaliciousAdvisory>,
+}
+
+/// Whether the version `id` resolves to must be asked about: a version the
+/// `previous` lockfile already held was asked about when it entered.
+fn needs_advisory(previous: Option<&Lockfile>, id: &str, version: &str) -> bool {
+    previous
+        .and_then(|previous| previous.packages.get(id))
+        .is_none_or(|held| held.version != version)
+}
+
+/// Fetch every announced tarball into the store and ask the advisory
+/// database about every announced registry version, in batches sent while
+/// resolution goes on: one batch in flight, the next one gathering.
+async fn prefetch_and_advise(
+    mut announced: tokio::sync::mpsc::UnboundedReceiver<Announced>,
+    store: &FsPackageStore,
+    tarball_client: &impl TarballFetchClient,
+    advisory_client: &impl AdvisoryClient,
+    policy: &InstallPolicy,
+    previous: Option<&Lockfile>,
+) -> AdvisoryAnswers {
+    let ask = policy.advisory_check != otter_pm_manifest::AdvisoryCheck::Off;
+    let (sources, fetch) = tokio::sync::mpsc::unbounded_channel();
+    let fetching = store.prefetch(fetch, tarball_client);
+    let advising = async {
+        let mut sources = Some(sources);
+        let mut answers = AdvisoryAnswers::default();
+        let mut asked = BTreeSet::new();
+        let mut gathering: Vec<AdvisoryQuery> = Vec::new();
+        let mut in_flight = None;
+        loop {
+            if in_flight.is_none() && !gathering.is_empty() {
+                let batch = std::mem::take(&mut gathering);
+                in_flight = Some(Box::pin(async move {
+                    let answer = advisory_client.query_malicious(&batch).await;
+                    (batch, answer)
+                }));
+            }
+            if sources.is_none() && in_flight.is_none() {
+                break;
+            }
+            tokio::select! {
+                next = announced.recv(), if sources.is_some() => match next {
+                    Some(package) => {
+                        if let Some(sources) = &sources {
+                            let _ = sources.send(package.source);
+                        }
+                        if let Some(query) = package.query
+                            && ask
+                            && needs_advisory(previous, &package.id, &query.version)
+                            && asked.insert(query.clone())
+                        {
+                            gathering.push(query);
+                        }
+                    }
+                    None => sources = None,
+                },
+                (batch, answer) = async { in_flight.as_mut().expect("guarded").await },
+                    if in_flight.is_some() =>
+                {
+                    in_flight = None;
+                    // A failed batch stays unanswered: the final check asks
+                    // for it again and reports what its policy says.
+                    if let Ok(malicious) = answer {
+                        answers.answered.extend(batch);
+                        answers.malicious.extend(malicious);
+                    }
+                }
+            }
+        }
+        answers
+    };
+    let (answers, ()) = tokio::join!(advising, fetching);
+    answers
+}
+
 /// Refuse any resolved version the advisory database calls malicious.
 ///
 /// A version the `previous` lockfile already held was asked about when it
 /// entered the project; only the versions this resolution brings in are
 /// asked about now, so an unchanged project installs without a lookup.
+/// Versions `known` already answers for are not asked again.
 async fn check_advisories(
     lockfile: &Lockfile,
     previous: Option<&Lockfile>,
     client: &impl AdvisoryClient,
     policy: &InstallPolicy,
     warnings: &mut Vec<InstallWarning>,
+    known: AdvisoryAnswers,
 ) -> Result<(), PackageManagerError> {
     if policy.advisory_check == otter_pm_manifest::AdvisoryCheck::Off {
         return Ok(());
     }
-    let mut queries = lockfile
+    let mut required = lockfile
         .packages
         .iter()
         .filter(|(id, package)| {
             matches!(
                 package.resolved.as_ref().map(|source| source.kind),
                 Some(ResolvedSourceKind::Registry)
-            ) && previous
-                .and_then(|previous| previous.packages.get(id.as_str()))
-                .is_none_or(|held| held.version != package.version)
+            ) && needs_advisory(previous, id, &package.version)
         })
-        .map(|(_, package)| package)
-        .map(|package| AdvisoryQuery {
+        .map(|(_, package)| AdvisoryQuery {
             name: package.name.clone(),
             version: package.version.clone(),
         })
         .collect::<Vec<_>>();
-    queries.sort();
-    queries.dedup();
-    if queries.is_empty() {
-        return Ok(());
-    }
-    match client.query_malicious(&queries).await {
-        Ok(advisories) => {
-            if let Some(advisory) = advisories.first() {
-                return Err(PackageManagerError::MaliciousPackage {
-                    package: advisory.name.clone(),
-                    version: advisory.version.clone(),
-                    advisory: advisory.id.clone(),
-                });
+    required.sort();
+    required.dedup();
+    let unanswered: Vec<AdvisoryQuery> = required
+        .iter()
+        .filter(|query| !known.answered.contains(*query))
+        .cloned()
+        .collect();
+    let mut malicious = known.malicious;
+    if !unanswered.is_empty() {
+        match client.query_malicious(&unanswered).await {
+            Ok(answer) => malicious.extend(answer),
+            Err(err) if policy.advisory_check == otter_pm_manifest::AdvisoryCheck::Required => {
+                return Err(err);
             }
-            Ok(())
-        }
-        Err(err) if policy.advisory_check == otter_pm_manifest::AdvisoryCheck::Required => Err(err),
-        Err(err) => {
-            warnings.push(InstallWarning::new(
-                "PM_ADVISORY_LOOKUP_FAILED",
-                format!("malicious-package advisories were not consulted: {err}"),
-            ));
-            Ok(())
+            Err(err) => {
+                warnings.push(InstallWarning::new(
+                    "PM_ADVISORY_LOOKUP_FAILED",
+                    format!("malicious-package advisories were not consulted: {err}"),
+                ));
+            }
         }
     }
+    // An answer for a version the final graph no longer holds is moot.
+    malicious.sort();
+    if let Some(advisory) = malicious.iter().find(|advisory| {
+        required
+            .binary_search(&AdvisoryQuery {
+                name: advisory.name.clone(),
+                version: advisory.version.clone(),
+            })
+            .is_ok()
+    }) {
+        return Err(PackageManagerError::MaliciousPackage {
+            package: advisory.name.clone(),
+            version: advisory.version.clone(),
+            advisory: advisory.id.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Report registry packages the registry published without an integrity
@@ -1050,6 +1167,7 @@ pub async fn resolve_local_project_with_registry_metadata(
     client: &impl RegistryMetadataClient,
     policy: &InstallPolicy,
     pinned: Option<&Lockfile>,
+    prefetch: Option<&Prefetch>,
     warnings: &mut Vec<InstallWarning>,
 ) -> Result<LocalResolution, PackageManagerError> {
     let mut resolution = resolve_local_project(project_root).await?;
@@ -1059,6 +1177,7 @@ pub async fn resolve_local_project_with_registry_metadata(
         client,
         policy,
         pinned,
+        prefetch,
         warnings,
     )
     .await?;
@@ -1644,6 +1763,7 @@ mod tests {
             &client,
             &InstallPolicy::default(),
             None,
+            None,
             &mut Vec::new(),
         )
         .await
@@ -1850,6 +1970,7 @@ mod tests {
             &FileRegistryMetadataClient::new(&fixture),
             &InstallPolicy::default(),
             None,
+            None,
             &mut Vec::new(),
         )
         .await
@@ -1957,7 +2078,10 @@ mod tests {
             .get_or_fetch_and_extract(&source, &FileTarballClient::new(&fixture))
             .await;
 
-        assert!(matches!(refused, Err(PackageManagerError::Integrity { .. })));
+        assert!(matches!(
+            refused,
+            Err(PackageManagerError::Integrity { .. })
+        ));
         assert!(
             store
                 .content_store()
@@ -2046,7 +2170,14 @@ mod tests {
         {
             use std::os::unix::fs::MetadataExt;
 
-            assert!(tmp.path().join("cache/store/trees").read_dir().unwrap().count() == 1);
+            assert!(
+                tmp.path()
+                    .join("cache/store/trees")
+                    .read_dir()
+                    .unwrap()
+                    .count()
+                    == 1
+            );
             assert_eq!(std::fs::metadata(&one).unwrap().nlink(), 1);
             assert_eq!(std::fs::metadata(&two).unwrap().nlink(), 1);
         }
@@ -2396,7 +2527,11 @@ mod tests {
             tool
         );
         assert!(graph.packages[&tool].manifest.bin.is_some());
-        assert!(!graph.packages.contains_key(&PackageId::registry("tool", "^1.0.0")));
+        assert!(
+            !graph
+                .packages
+                .contains_key(&PackageId::registry("tool", "^1.0.0"))
+        );
     }
 
     #[tokio::test]
@@ -2483,8 +2618,9 @@ mod tests {
         let project = tmp.path().join("project");
         let registry = tmp.path().join("registry");
         let tarballs = tmp.path().join("tarballs");
-        let versions = |name: &str, entries: &[(&str, &str, &str)]| {
-            entries
+        let versions =
+            |name: &str, entries: &[(&str, &str, &str)]| {
+                entries
                 .iter()
                 .map(|(version, dependencies, body)| {
                     let manifest = format!(
@@ -2496,7 +2632,7 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>()
-        };
+            };
         let ms = versions(
             "ms",
             &[
@@ -2506,9 +2642,16 @@ mod tests {
         );
         let a = versions(
             "a",
-            &[("1.0.0", r#"{"ms":"^1.0.0"}"#, "module.exports = require('ms');\n")],
+            &[(
+                "1.0.0",
+                r#"{"ms":"^1.0.0"}"#,
+                "module.exports = require('ms');\n",
+            )],
         );
-        let document = |name: &str, latest: &str, entries: &[(&str, &str)], files: &[(String, Vec<u8>)]| {
+        let document = |name: &str,
+                        latest: &str,
+                        entries: &[(&str, &str)],
+                        files: &[(String, Vec<u8>)]| {
             let versions = entries
                 .iter()
                 .zip(files)
@@ -2523,7 +2666,9 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
-            format!(r#"{{"name":"{name}","dist-tags":{{"latest":"{latest}"}},"versions":{{{versions}}}}}"#)
+            format!(
+                r#"{{"name":"{name}","dist-tags":{{"latest":"{latest}"}},"versions":{{{versions}}}}}"#
+            )
         };
         write(
             &registry.join("ms.json"),
@@ -2558,7 +2703,10 @@ mod tests {
         let read = |path: PathBuf| std::fs::read_to_string(path).unwrap();
         // The project sees the version it asked for; `a`, from where it is
         // stored, sees the one it asked for.
-        assert_eq!(read(project.join("node_modules/ms/index.js")), "module.exports = 'ms2';\n");
+        assert_eq!(
+            read(project.join("node_modules/ms/index.js")),
+            "module.exports = 'ms2';\n"
+        );
         let stored_a = std::fs::canonicalize(project.join("node_modules/a")).unwrap();
         assert_eq!(
             read(stored_a.parent().unwrap().join("ms/index.js")),
@@ -2651,7 +2799,11 @@ mod tests {
         let tool = layout::package_dir(&project, &format!("tool@tarball:{url}"), "tool");
         assert!(tool.parent().unwrap().join("dep/index.js").is_file());
         assert!(!project.join("node_modules/dep").exists());
-        assert!(project.join("node_modules/.otter/node_modules/dep/index.js").is_file());
+        assert!(
+            project
+                .join("node_modules/.otter/node_modules/dep/index.js")
+                .is_file()
+        );
         assert!(project.join("node_modules/tool/bin.js").is_file());
         assert!(project.join("node_modules/.bin/tool").is_file());
     }
@@ -2821,12 +2973,12 @@ mod tests {
         }"#;
         let metadata_url = serve_http_once(metadata.as_bytes().to_vec()).await;
         let metadata_client = HttpRegistryMetadataClient::with_base_url(metadata_url);
-        let MetadataFetch::Fresh { metadata, .. } =
+        let MetadataFetch::Fresh { body, .. } =
             metadata_client.fetch_metadata("pkg", None).await.unwrap()
         else {
             panic!("an unconditional request returns the document");
         };
-        assert_eq!(metadata.name, "pkg");
+        assert!(body.contains(r#""name": "pkg""#));
 
         let tarball_url = serve_http_once(b"tgz bytes".to_vec()).await;
         let tarball = HttpTarballClient::new()
@@ -2884,6 +3036,7 @@ mod tests {
             &FileRegistryMetadataClient::new(tmp.path().join("registry")),
             &InstallPolicy::default(),
             None,
+            None,
             &mut warnings,
         )
         .await
@@ -2918,6 +3071,7 @@ mod tests {
             &FileRegistryMetadataClient::new(tmp.path().join("registry")),
             &policy,
             None,
+            None,
             &mut Vec::new(),
         )
         .await
@@ -2946,6 +3100,7 @@ mod tests {
             &FsRegistryMetadataCache::new(tmp.path().join("metadata-cache")),
             &FileRegistryMetadataClient::new(tmp.path().join("registry")),
             &policy,
+            None,
             None,
             &mut warnings,
         )
@@ -3030,6 +3185,7 @@ mod tests {
             &client,
             &InstallPolicy::default(),
             &mut Vec::new(),
+            AdvisoryAnswers::default(),
         )
         .await
         .unwrap_err();
@@ -3055,6 +3211,7 @@ mod tests {
             &client,
             &InstallPolicy::default(),
             &mut warnings,
+            AdvisoryAnswers::default(),
         )
         .await
         .unwrap();
@@ -3069,9 +3226,16 @@ mod tests {
         let required = InstallPolicy::from_settings(
             &serde_json::from_str(r#"{"advisoryCheck":"required"}"#).unwrap(),
         );
-        let error = check_advisories(&lockfile, None, &client, &required, &mut Vec::new())
-            .await
-            .unwrap_err();
+        let error = check_advisories(
+            &lockfile,
+            None,
+            &client,
+            &required,
+            &mut Vec::new(),
+            AdvisoryAnswers::default(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             error,
             PackageManagerError::AdvisoryUnavailable { .. }
@@ -3084,6 +3248,30 @@ mod tests {
             &client,
             &required,
             &mut Vec::new(),
+            AdvisoryAnswers::default(),
+        )
+        .await
+        .unwrap();
+        // Answers gathered while the graph resolved are not asked again, and
+        // a verdict on a version the final graph does not hold is moot.
+        let tool = AdvisoryQuery {
+            name: "tool".to_string(),
+            version: "1.0.0".to_string(),
+        };
+        check_advisories(
+            &lockfile,
+            None,
+            &client,
+            &required,
+            &mut Vec::new(),
+            AdvisoryAnswers {
+                answered: BTreeSet::from([tool]),
+                malicious: vec![MaliciousAdvisory {
+                    name: "tool".to_string(),
+                    version: "0.9.0".to_string(),
+                    id: "MAL-2026-1".to_string(),
+                }],
+            },
         )
         .await
         .unwrap();
@@ -3096,9 +3284,16 @@ mod tests {
         let policy = InstallPolicy::from_settings(
             &serde_json::from_str(r#"{"advisoryCheck":"off"}"#).unwrap(),
         );
-        check_advisories(&lockfile, None, &client, &policy, &mut Vec::new())
-            .await
-            .unwrap();
+        check_advisories(
+            &lockfile,
+            None,
+            &client,
+            &policy,
+            &mut Vec::new(),
+            AdvisoryAnswers::default(),
+        )
+        .await
+        .unwrap();
     }
 
     #[test]

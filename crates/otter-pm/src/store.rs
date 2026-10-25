@@ -237,30 +237,70 @@ impl ContentStore {
         self.materialize(index, target_root)
     }
 
-    /// The stored tree of the package filed under `key`, built on first use.
+    /// The stored tree of the package filed under `key`, built from its
+    /// index when its extraction did not build it.
     #[cfg(target_os = "macos")]
     fn ensure_tree(&self, key: &str, index: &PackageIndex) -> Result<(), PackageManagerError> {
-        let tree = self.trees_root.join(key);
-        if tree.exists() {
+        if self.trees_root.join(key).exists() {
             return Ok(());
         }
-        let temporary = self.trees_root.join(format!(
+        let staging = self.tree_staging(key)?;
+        self.materialize(index, &staging)?;
+        self.publish_tree(key, &staging)
+    }
+
+    /// An empty directory an extraction builds the tree of `key` in, private
+    /// to the calling thread.
+    pub(crate) fn tree_staging(&self, key: &str) -> Result<PathBuf, PackageManagerError> {
+        let staging = self.trees_root.join(format!(
             ".tmp-{key}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
-        if temporary.exists() {
-            std::fs::remove_dir_all(&temporary).map_err(|err| PackageManagerError::Io {
-                path: temporary.clone(),
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging).map_err(|err| PackageManagerError::Io {
+                path: staging.clone(),
                 message: err.to_string(),
             })?;
         }
-        self.materialize(index, &temporary)?;
+        create_dir_all(&staging)?;
+        Ok(staging)
+    }
+
+    /// Write one file of a tree being staged.
+    pub(crate) fn stage_tree_file(
+        staging: &Path,
+        relative: &str,
+        bytes: &[u8],
+        executable: bool,
+    ) -> Result<(), PackageManagerError> {
+        let target = relative
+            .split('/')
+            .fold(staging.to_path_buf(), |path, part| path.join(part));
+        if let Some(parent) = target.parent()
+            && parent != staging
+        {
+            create_dir_all(parent)?;
+        }
+        std::fs::write(&target, bytes).map_err(|err| PackageManagerError::Io {
+            path: target.clone(),
+            message: err.to_string(),
+        })?;
+        set_executable(&target, executable)
+    }
+
+    /// Make a staged tree the stored tree of `key`.
+    pub(crate) fn publish_tree(
+        &self,
+        key: &str,
+        staging: &Path,
+    ) -> Result<(), PackageManagerError> {
+        let tree = self.trees_root.join(key);
         // A concurrent install may have landed the same tree first.
-        match std::fs::rename(&temporary, &tree) {
+        match std::fs::rename(staging, &tree) {
             Ok(()) => Ok(()),
             Err(_) if tree.exists() => {
-                let _ = std::fs::remove_dir_all(&temporary);
+                let _ = std::fs::remove_dir_all(staging);
                 Ok(())
             }
             Err(err) => Err(PackageManagerError::Io {
@@ -268,6 +308,12 @@ impl ContentStore {
                 message: err.to_string(),
             }),
         }
+    }
+
+    /// Whether this platform keeps stored trees to clone.
+    #[must_use]
+    pub(crate) const fn keeps_trees() -> bool {
+        cfg!(target_os = "macos")
     }
 
     /// Materialize `index` into `target_root`, linking to stored content.

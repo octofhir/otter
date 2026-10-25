@@ -22,6 +22,9 @@
 //!   connection. 303 (except after HEAD), and 301/302 after POST, continue as
 //!   a bodiless GET; a hop to another origin drops the credential headers.
 //! - A timeout bounds the whole exchange, body reads included.
+//! - Sockets send without delay, and an HTTP/2 connection grants every stream
+//!   and itself a 16 MiB window, so one connection carries a host's
+//!   concurrent requests at the link's speed.
 //!
 //! # See also
 //! - `otter_runtime::web_fetch_host` — `fetch` over this client.
@@ -62,6 +65,10 @@ pub enum Redirects {
 }
 
 type Connection = Pool<HttpsConnector<HttpConnector>, Full<Bytes>>;
+
+/// The HTTP/2 flow-control window a client grants each stream and each
+/// connection.
+const HTTP2_WINDOW: u32 = 16 << 20;
 
 struct Inner {
     redirects: Redirects,
@@ -201,13 +208,22 @@ impl Client {
 
     fn pool(&self) -> &Connection {
         self.inner.pool.get_or_init(|| {
+            let mut tcp = HttpConnector::new();
+            tcp.enforce_http(false);
+            // Requests are small writes waiting on their answer.
+            tcp.set_nodelay(true);
             let connector = hyper_rustls::HttpsConnectorBuilder::new()
                 .with_tls_config(tls_config())
                 .https_or_http()
                 .enable_http1()
                 .enable_http2()
-                .build();
-            Pool::builder(TokioExecutor::new()).build(connector)
+                .wrap_connector(tcp);
+            let mut pool = Pool::builder(TokioExecutor::new());
+            // One HTTP/2 connection carries every request to a host: a small
+            // window caps its throughput at one window per round trip.
+            pool.http2_initial_stream_window_size(HTTP2_WINDOW)
+                .http2_initial_connection_window_size(HTTP2_WINDOW);
+            pool.build(connector)
         })
     }
 }

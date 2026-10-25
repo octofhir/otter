@@ -19,6 +19,8 @@
 //! - The callable prefix has C layout; generated dispatch reads no Rust container.
 //! - Bound argument slabs are immutable after publication and traced in place.
 //! - Construction roots every input in a handle scope across allocations.
+//! - A body owns nothing outside the heap: its builtin `name` is a heap
+//!   string, so a startup image can carry it.
 //!
 //! # See also
 //! - [`crate::value_slab`] — shared collector-owned argument storage.
@@ -73,7 +75,7 @@ pub struct BoundFunctionBody {
     /// receiver the caller supplies.
     pub bound_this: Value,
     /// Bound function builtin `name`, computed once by `bind`.
-    pub(crate) builtin_name: String,
+    pub(crate) builtin_name: crate::string::JsString,
     /// Bound function builtin `length`, computed once by `bind`.
     #[pelt(skip)]
     pub(crate) builtin_length: NumberValue,
@@ -231,6 +233,8 @@ impl Interpreter {
                 .copied()
                 .map(|value| interp.scoped_value(scope, value))
                 .collect();
+            let name = crate::string::JsString::from_str(&metadata.name, &mut interp.gc_heap)?;
+            let name = interp.scoped_value(scope, Value::string(name));
             let default_prototype = interp.function_prototype_object().ok().map(Value::object);
             let prototype =
                 prototype.filter(|value| Some(interp.escape_scoped(*value)) != default_prototype);
@@ -245,7 +249,10 @@ impl Interpreter {
                 target: interp.escape_scoped(target),
                 bound_this: interp.escape_scoped(receiver),
                 bound_args,
-                builtin_name: metadata.name,
+                builtin_name: interp
+                    .escape_scoped(name)
+                    .as_string(&interp.gc_heap)
+                    .expect("bound callable name"),
                 builtin_length: metadata.length,
                 name_property: BoundFunctionMetadataProperty::Builtin,
                 length_property: BoundFunctionMetadataProperty::Builtin,

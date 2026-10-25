@@ -4,8 +4,8 @@
 //! of the VM. Each CommonJS file runs inside a wrapper function
 //! `(function (exports, require, module, __filename, __dirname) { ... })` built
 //! by [`otter_vm::Interpreter::create_commonjs_wrapper`], and `require` is a
-//! per-module native closure that re-enters the runtime synchronously to load
-//! dependencies.
+//! per-module native function that re-enters the runtime synchronously to
+//! load dependencies.
 //!
 //! # Contents
 //! - [`CjsConfig`] - capability snapshot, hosted-module list and resolver
@@ -25,6 +25,10 @@
 //!   `node:<name>`.
 //!
 //! # Invariants
+//! - A module's `require`, `require.resolve` and `require.resolve.paths` are
+//!   plain native functions: the referrer they resolve from rides their
+//!   traced captures and the config is the runtime's [`CommonJsHost`], so a
+//!   startup image carries the builtins a build loaded.
 //! - The require cache is one null-prototype JS object exposed as
 //!   `require.cache`. Its values are live module records, never export
 //!   snapshots. Every hit, including a circular back-edge, reads the record's
@@ -465,99 +469,201 @@ fn module_not_found(
     }
 }
 
-/// Build a per-module `require` native function bound to its referrer. The
-/// shared cache object is passed as a traced VM capture; the referrer and
-/// config are moved into the Rust closure.
+/// Build a per-module `require` native function bound to its referrer.
+///
+/// The shared cache and the referrer ride the function's traced captures
+/// ([`referrer_captures`]) and the config is the runtime's [`CommonJsHost`],
+/// so the callable holds no Rust state and a startup image can carry it.
 fn make_require<'scope>(
     scope: &mut NativeScope<'scope, '_>,
-    cfg: Arc<CjsConfig>,
     cache: Local<'_>,
-    referrer: CjsReferrer,
+    referrer: &CjsReferrer,
     from_builtin: bool,
 ) -> Result<Local<'scope>, NativeError> {
-    let cfg_for_resolve = Arc::clone(&cfg);
-    let referrer_for_resolve = referrer.clone();
-    let closure = move |ctx: &mut NativeCtx<'_>,
-                        args: ValueWindow<'_>,
-                        captures: ValueWindow<'_>|
-          -> Result<Value, NativeError> {
-        let cache = captures
-            .first()
-            .and_then(|value| value.as_object())
-            .ok_or_else(|| runtime_type_error("require", "missing require cache"))?;
-        let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
-        if spec.is_empty() {
-            return Err(runtime_type_error(
-                "require",
-                "module specifier is required",
-            ));
-        }
-        cjs_load(ctx, &cfg, cache, &referrer, &spec, from_builtin)
-    };
-    let require = scope.native_closure("require", 1, &[cache], closure)?;
+    let [dir, file, chain, builtin] = referrer_captures(scope, referrer, from_builtin)?;
+    let require = scope.native_with_captures(
+        "require",
+        1,
+        &[cache, dir, file, chain, builtin],
+        require_call,
+    )?;
     scope.define(require, "cache", cache, Attr::data().to_flags())?;
-    let resolve = make_require_resolve(scope, cfg_for_resolve, referrer_for_resolve, from_builtin)?;
+    let resolve = scope.native_with_captures(
+        "resolve",
+        1,
+        &[dir, file, chain, builtin],
+        require_resolve_call,
+    )?;
+    let paths =
+        scope.native_with_captures("paths", 1, &[dir, file, chain, builtin], require_paths_call)?;
+    scope.define(resolve, "paths", paths, Attr::data().to_flags())?;
     scope.define(require, "resolve", resolve, Attr::data().to_flags())?;
     Ok(require)
 }
 
-/// Build `require.resolve` for one referrer.
+/// The captures that name a referrer: its directory, its file or
+/// `undefined`, its require chain innermost first and joined by NUL (no path
+/// holds one), and whether it is a builtin.
+fn referrer_captures<'scope>(
+    scope: &mut NativeScope<'scope, '_>,
+    referrer: &CjsReferrer,
+    from_builtin: bool,
+) -> Result<[Local<'scope>; 4], NativeError> {
+    let dir = scope.string(&referrer.dir.to_string_lossy())?;
+    let file = match &referrer.file {
+        Some(file) => scope.string(&file.to_string_lossy())?,
+        None => scope.undefined(),
+    };
+    let chain: Vec<&str> =
+        std::iter::successors(referrer.chain.as_ref(), |link| link.parent.as_ref())
+            .map(|link| link.filename.as_str())
+            .collect();
+    let chain = scope.string(&chain.join("\0"))?;
+    let builtin = scope.boolean(from_builtin);
+    Ok([dir, file, chain, builtin])
+}
+
+/// The referrer and builtin flag [`referrer_captures`] recorded, read from
+/// `captures` starting at `first`.
+fn read_referrer(
+    ctx: &NativeCtx<'_>,
+    captures: ValueWindow<'_>,
+    first: usize,
+) -> (CjsReferrer, bool) {
+    let heap = ctx.heap();
+    let dir = PathBuf::from(crate::runtime_arg_to_string(captures, first, heap));
+    let file = captures
+        .get(first + 1)
+        .filter(|value| !value.is_undefined())
+        .map(|_| PathBuf::from(crate::runtime_arg_to_string(captures, first + 1, heap)));
+    let chain = crate::runtime_arg_to_string(captures, first + 2, heap);
+    let chain = chain
+        .split('\0')
+        .filter(|filename| !filename.is_empty())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .fold(None, |parent, filename| {
+            Some(Arc::new(RequireChain {
+                filename: filename.to_owned(),
+                parent,
+            }))
+        });
+    let from_builtin = captures
+        .get(first + 3)
+        .is_some_and(|value| value.as_boolean() == Some(true));
+    (CjsReferrer { dir, file, chain }, from_builtin)
+}
+
+/// The runtime's CommonJS config, which every `require` shares.
+fn commonjs_config(ctx: &NativeCtx<'_>, name: &'static str) -> Result<Arc<CjsConfig>, NativeError> {
+    ctx.host_service::<CommonJsHost>()
+        .map(|CommonJsHost(cfg)| cfg)
+        .ok_or_else(|| runtime_type_error(name, "CommonJS is not enabled"))
+}
+
+fn require_call(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
+    let cache = captures
+        .first()
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| runtime_type_error("require", "missing require cache"))?;
+    let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
+    if spec.is_empty() {
+        return Err(runtime_type_error(
+            "require",
+            "module specifier is required",
+        ));
+    }
+    let cfg = commonjs_config(ctx, "require")?;
+    let (referrer, from_builtin) = read_referrer(ctx, captures, 1);
+    cjs_load(ctx, &cfg, cache, &referrer, &spec, from_builtin)
+}
+
+/// `require.resolve` for one referrer.
 ///
 /// It answers with the same resolution `require` itself would take — a
 /// builtin with the request as written, as Node does, a file with its
 /// canonical path — and reports anything unresolvable, a `node:` id naming
 /// no builtin included, with `MODULE_NOT_FOUND`.
-fn make_require_resolve<'scope>(
-    scope: &mut NativeScope<'scope, '_>,
-    cfg: Arc<CjsConfig>,
-    referrer: CjsReferrer,
-    from_builtin: bool,
-) -> Result<Local<'scope>, NativeError> {
-    let paths_dir = referrer.dir.clone();
-    let resolve = scope.native_closure("resolve", 1, &[], move |ctx, args, _captures| {
-        let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
-        if spec.is_empty() {
-            return Err(runtime_type_error(
-                "require.resolve",
-                "module specifier is required",
-            ));
+fn require_resolve_call(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
+    let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
+    if spec.is_empty() {
+        return Err(runtime_type_error(
+            "require.resolve",
+            "module specifier is required",
+        ));
+    }
+    let cfg = commonjs_config(ctx, "require.resolve")?;
+    let (referrer, from_builtin) = read_referrer(ctx, captures, 0);
+    let Ok(resolution) = resolve_module(&cfg, &referrer, &spec, from_builtin) else {
+        return Err(module_not_found(ctx, &spec, referrer.chain.as_ref()));
+    };
+    let answer = match resolution.target {
+        CjsTarget::Hosted(_) => spec.as_str(),
+        CjsTarget::File(_) => resolution.filename.as_str(),
+    };
+    ctx.scope(|mut scope| {
+        let filename = scope.string(answer)?;
+        Ok(scope.finish(filename))
+    })
+}
+
+/// `require.resolve.paths`: the directories a request is looked up in, as
+/// Node lists them. A builtin request answers `null`, a relative one its
+/// referrer's directory (`.` for a referrer without a file), and any other
+/// the `node_modules` chain above the referrer.
+fn require_paths_call(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+    captures: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
+    let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
+    let cfg = commonjs_config(ctx, "require.resolve.paths")?;
+    let (referrer, from_builtin) = read_referrer(ctx, captures, 0);
+    let entries: Option<Vec<String>> = if resolve_builtin(&cfg, &spec, from_builtin).is_some() {
+        None
+    } else if is_relative_request(&spec) {
+        Some(vec![match &referrer.file {
+            Some(_) => referrer.dir.to_string_lossy().into_owned(),
+            None => ".".to_owned(),
+        }])
+    } else {
+        let chain: Vec<String> = referrer
+            .dir
+            .ancestors()
+            .filter(|ancestor| !ancestor.as_os_str().is_empty())
+            .map(|ancestor| ancestor.join("node_modules").to_string_lossy().into_owned())
+            .collect();
+        (!chain.is_empty()).then_some(chain)
+    };
+    ctx.scope(|mut scope| {
+        let Some(entries) = entries else {
+            let null = scope.null();
+            return Ok(scope.finish(null));
+        };
+        let array = scope.array(entries.len())?;
+        for (index, entry) in entries.iter().enumerate() {
+            let value = scope.string(entry)?;
+            scope.set_index(array, index, value)?;
         }
-        let Ok(resolution) = resolve_module(&cfg, &referrer, &spec, from_builtin) else {
-            return Err(module_not_found(ctx, &spec, referrer.chain.as_ref()));
-        };
-        let answer = match resolution.target {
-            CjsTarget::Hosted(_) => spec.as_str(),
-            CjsTarget::File(_) => resolution.filename.as_str(),
-        };
-        ctx.scope(|mut scope| {
-            let filename = scope.string(answer)?;
-            Ok(scope.finish(filename))
-        })
-    })?;
-    // §`require.resolve.paths` — the `node_modules` chain a bare
-    // specifier would walk. A builtin has no chain and answers `null`.
-    let paths = scope.native_closure("paths", 1, &[], move |ctx, args, _captures| {
-        let spec = crate::runtime_arg_to_string(args, 0, ctx.heap());
-        let is_relative = spec.starts_with('.') || Path::new(&spec).is_absolute();
-        ctx.scope(|mut scope| {
-            if !is_relative && paths_dir.as_os_str().is_empty() {
-                let null = scope.null();
-                return Ok(scope.finish(null));
-            }
-            let entries: Vec<String> = paths_dir
-                .ancestors()
-                .map(|ancestor| ancestor.join("node_modules").to_string_lossy().into_owned())
-                .collect();
-            let array = scope.array(entries.len())?;
-            for (index, entry) in entries.iter().enumerate() {
-                let value = scope.string(entry)?;
-                scope.set_index(array, index, value)?;
-            }
-            Ok(scope.finish(array))
-        })
-    })?;
-    scope.define(resolve, "paths", paths, Attr::data().to_flags())?;
-    Ok(resolve)
+        Ok(scope.finish(array))
+    })
+}
+
+/// Node's relative request: `.` or `..` alone or before a separator.
+fn is_relative_request(spec: &str) -> bool {
+    let rest = spec.strip_prefix("..").or_else(|| spec.strip_prefix('.'));
+    rest.is_some_and(|rest| {
+        rest.is_empty() || rest.starts_with('/') || (cfg!(windows) && rest.starts_with('\\'))
+    })
 }
 
 fn cached_exports<'scope>(
@@ -639,9 +745,8 @@ fn load_resolved_scoped<'scope>(
     let result = (|| {
         let require = make_require(
             scope,
-            cfg.clone(),
             cache,
-            resolution.referrer(),
+            &resolution.referrer(),
             matches!(resolution.target, CjsTarget::Hosted(_)),
         )?;
         match &resolution.target {
@@ -899,9 +1004,7 @@ pub fn create_require(
     ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
-    let CommonJsHost(cfg) = ctx
-        .host_service::<CommonJsHost>()
-        .ok_or_else(|| runtime_type_error("createRequire", "CommonJS is not enabled"))?;
+    commonjs_config(ctx, "createRequire")?;
     let filename = crate::runtime_arg_to_string(args, 0, ctx.heap());
     let path = PathBuf::from(&filename);
     let referrer = CjsReferrer {
@@ -916,7 +1019,7 @@ pub fn create_require(
     };
     ctx.scope(|mut scope| {
         let cache = canonical_cache(&mut scope)?;
-        let require = make_require(&mut scope, cfg, cache, referrer, false)?;
+        let require = make_require(&mut scope, cache, &referrer, false)?;
         Ok(scope.finish(require))
     })
 }

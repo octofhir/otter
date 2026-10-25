@@ -13,6 +13,8 @@
 //! before observable coercion at the exact source instruction.
 //! A tracking site leaves before any effect once it tenures; one the
 //! collector declined keeps tagging cells, which only its counters see.
+//! An old site's cons takes the write barrier for both children itself, so
+//! a young or white child never sends it to the collecting Probe.
 //!
 //! # See also
 //! - `super::lexical` owns the sole collecting fixed-value Probe packet.
@@ -94,7 +96,7 @@ impl Codegen<'_> {
                 ; ldrb w17, [x16, JIT_SITE_DECISION_OFFSET]
                 ; cmp w17, u32::from(JIT_SITE_TENURE) ; b.eq =>exit);
         }
-        crate::arm64::allocation::emit_concat(
+        let old_cons = crate::arm64::allocation::emit_concat(
             &mut self.ops,
             20,
             layout,
@@ -103,7 +105,23 @@ impl Codegen<'_> {
             ConcatPlacement::Site(site),
             slow,
         );
-        dynasm!(self.ops ; .arch aarch64 ; mov X(destination),X(regs.candidate) ; b =>done ; =>slow);
+        dynasm!(self.ops ; .arch aarch64 ; mov X(destination),X(regs.candidate) ; b =>done);
+        if let Some(old_cons) = old_cons {
+            // A pretenured cons may hold a young child, or a white one while
+            // marking runs: both edges take the barrier before anything runs.
+            dynasm!(self.ops ; .arch aarch64 ; =>old_cons ; mov X(destination),X(regs.candidate));
+            crate::arm64::allocation::emit_value(&mut self.ops, regs.buffer, values[0]);
+            crate::arm64::allocation::emit_value(&mut self.ops, regs.end, values[1]);
+            self.emit_write_barrier_keeping(
+                node,
+                destination,
+                regs.buffer,
+                &[destination, regs.end],
+            );
+            self.emit_write_barrier_keeping(node, destination, regs.end, &[destination]);
+            dynasm!(self.ops ; .arch aarch64 ; b =>done);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>slow);
         self.emit_probe_allocation(
             node,
             abi::STUB_STRING_CONCAT_ALLOC,

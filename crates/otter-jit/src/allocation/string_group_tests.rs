@@ -157,14 +157,17 @@ fn run(
             AllocationValue::StackByte(16),
         ];
         match &recipe {
-            Recipe::String(layout) => crate::arm64::allocation::emit_concat(
-                &mut ops,
-                20,
-                *layout,
-                [input[0], input[1]],
-                regs,
-                crate::allocation::ConcatPlacement::YOUNG,
-                slow,
+            Recipe::String(layout) => assert!(
+                crate::arm64::allocation::emit_concat(
+                    &mut ops,
+                    20,
+                    *layout,
+                    [input[0], input[1]],
+                    regs,
+                    crate::allocation::ConcatPlacement::YOUNG,
+                    slow,
+                )
+                .is_none()
             ),
             Recipe::Group { realm, members } => crate::arm64::allocation::emit_fixed_group(
                 &mut ops,
@@ -216,14 +219,17 @@ fn run(
             AllocationValue::StackByte(16),
         ];
         match &recipe {
-            Recipe::String(layout) => crate::x86_64::allocation::emit_concat(
-                &mut ops,
-                15,
-                *layout,
-                [input[0], input[1]],
-                regs,
-                crate::allocation::ConcatPlacement::YOUNG,
-                slow,
+            Recipe::String(layout) => assert!(
+                crate::x86_64::allocation::emit_concat(
+                    &mut ops,
+                    15,
+                    *layout,
+                    [input[0], input[1]],
+                    regs,
+                    crate::allocation::ConcatPlacement::YOUNG,
+                    slow,
+                )
+                .is_none()
             ),
             Recipe::Group { realm, members } => crate::x86_64::allocation::emit_fixed_group(
                 &mut ops,

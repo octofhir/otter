@@ -1319,7 +1319,7 @@ impl Kind {
             Self::CopyContext => &[abi::STUB_COPY_CONTEXT_ALLOC],
             Self::NewClosure => &[abi::STUB_JIT_MAKE_FN, abi::STUB_JIT_MAKE_CLOSURE],
             Self::NewArrayWithLength => &[abi::STUB_ARRAY_CONSTRUCT_ALLOC],
-            Self::PrimitiveAdd => &[abi::STUB_STRING_CONCAT_ALLOC],
+            Self::PrimitiveAdd => &[abi::STUB_STRING_CONCAT_ALLOC, abi::STUB_WRITE_BARRIER],
             Self::BigIntBinary(_) => &[abi::STUB_BIGINT_BINARY_ALLOC],
             Self::CallJs { .. } | Self::CallForward { .. } => &[
                 abi::STUB_JIT_CALL,

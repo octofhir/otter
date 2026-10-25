@@ -13,6 +13,8 @@
 //! before observable coercion at the exact source instruction.
 //! A tracking site leaves before any effect once it tenures; one the
 //! collector declined keeps tagging cells, which only its counters see.
+//! An old site's cons takes the write barrier for both children itself, so
+//! a young or white child never sends it to the collecting Probe.
 //!
 //! # See also
 //! - `super::lexical` owns the sole collecting fixed-value Probe packet.
@@ -103,7 +105,7 @@ impl Codegen<'_> {
                 ; cmp BYTE [r10 + JIT_SITE_DECISION_OFFSET as i32], JIT_SITE_TENURE as i8
                 ; je =>exit);
         }
-        crate::x86_64::allocation::emit_concat(
+        let old_cons = crate::x86_64::allocation::emit_concat(
             &mut self.ops,
             15,
             layout,
@@ -112,7 +114,18 @@ impl Codegen<'_> {
             ConcatPlacement::Site(site),
             slow,
         );
-        dynasm!(self.ops ; .arch x64 ; mov Rq(destination),Rq(regs.candidate) ; jmp =>done ; =>slow);
+        dynasm!(self.ops ; .arch x64 ; mov Rq(destination),Rq(regs.candidate) ; jmp =>done);
+        if let Some(old_cons) = old_cons {
+            // A pretenured cons may hold a young child, or a white one while
+            // marking runs: both edges take the barrier before anything runs.
+            dynasm!(self.ops ; .arch x64 ; =>old_cons ; mov Rq(destination),Rq(regs.candidate));
+            crate::x86_64::allocation::emit_value(&mut self.ops, regs.buffer, values[0]);
+            crate::x86_64::allocation::emit_value(&mut self.ops, regs.end, values[1]);
+            self.emit_cell_edge_barrier(node, destination, regs.buffer, &[destination, regs.end]);
+            self.emit_cell_edge_barrier(node, destination, regs.end, &[destination]);
+            dynasm!(self.ops ; .arch x64 ; jmp =>done);
+        }
+        dynasm!(self.ops ; .arch x64 ; =>slow);
         self.emit_probe_allocation(
             node,
             abi::STUB_STRING_CONCAT_ALLOC,

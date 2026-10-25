@@ -1457,15 +1457,19 @@ fn process_memory_usage(
     _args: otter_vm::ValueWindow<'_>,
 ) -> Result<otter_vm::Value, NativeError> {
     let rss = crate::process_info::resident_bytes().unwrap_or(0) as f64;
-    let heap_used = ctx.interp_mut().gc_heap_mut().gc_stats().live_bytes as f64;
-    let heap_total = heap_used;
+    // The heap's pages, both nursery semispaces included, against the bytes
+    // its cells occupy; external is what off-heap buffers charge the heap.
+    let stats = ctx.interp_mut().gc_heap_mut().stats();
+    let heap_total = (stats.page_count * otter_gc::PAGE_SIZE) as f64;
+    let heap_used = stats.allocated_bytes as f64;
+    let external = stats.reserved_bytes as f64;
     ctx.scope(|mut scope| {
         let object = scope.bare_object()?;
         for (name, value) in [
             ("rss", rss),
             ("heapTotal", heap_total),
             ("heapUsed", heap_used),
-            ("external", 0.0),
+            ("external", external),
             ("arrayBuffers", 0.0),
         ] {
             let value = scope.number(value);

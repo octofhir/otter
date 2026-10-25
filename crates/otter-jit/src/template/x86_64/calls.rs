@@ -543,7 +543,7 @@ pub(super) fn emit_method_call(
             ops,
             relocations,
             shared_property,
-            crate::routines::PropertyRoutine::Method,
+            crate::routines::Routine::Method,
         );
         dynasm!(ops ; .arch x64
             ; test rdx, rdx

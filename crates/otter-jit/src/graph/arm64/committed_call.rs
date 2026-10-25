@@ -38,13 +38,13 @@ impl Codegen<'_> {
     pub(super) fn emit_committed_routine_call(
         &mut self,
         node: NodeId,
-        routine: crate::routines::PropertyRoutine,
+        routine: crate::routines::Routine,
         arguments: &[CommittedArgument],
         destination: Option<u8>,
     ) -> Result<(), crate::Unsupported> {
         let target = (
-            self.shared_property.entry(routine),
-            RelocationTarget::PropertyRoutine {
+            self.routines.entry(routine),
+            RelocationTarget::Routine {
                 routine: routine.name(),
             },
         );

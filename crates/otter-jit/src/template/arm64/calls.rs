@@ -1981,7 +1981,7 @@ pub(super) fn emit_method_call(
             ops,
             relocations,
             shared_probes,
-            crate::routines::PropertyRoutine::Method,
+            crate::routines::Routine::Method,
         );
         dynasm!(ops ; .arch aarch64 ; cbz x1, =>resolved);
     }

@@ -36,12 +36,7 @@ pub(super) fn emit_concat_fit(
     emit_load_reg(ops, CONCAT_LHS, lhs)?;
     emit_load_reg(ops, CONCAT_RHS, rhs)?;
     super::values::emit_load_u64(ops, CONCAT_SITE, site.record);
-    super::shared_property::emit_call(
-        ops,
-        relocations,
-        shared,
-        crate::routines::PropertyRoutine::Concat,
-    );
+    super::shared_property::emit_call(ops, relocations, shared, crate::routines::Routine::Concat);
     dynasm!(ops ; .arch aarch64 ; cbnz x1, =>slow);
     emit_store_reg(ops, CONCAT_RESULT, dst)?;
     dynasm!(ops ; .arch aarch64 ; b =>done);

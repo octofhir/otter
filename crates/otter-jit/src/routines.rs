@@ -1,7 +1,8 @@
 //! Machine-code routines every code object of one compiler calls instead of
 //! carrying its own copy, and the code space that owns them.
 //!
-//! The named-property routines select a site's IC slot handler, probe the
+//! The truthiness routine decides `ToBoolean` of the values optimized code
+//! does not test inline. The named-property routines select a site's IC slot handler, probe the
 //! isolate's shared action table and, on a miss, enter the committed runtime
 //! operation. Each is emitted once per isolate, when a site first calls it,
 //! into the compiler's [`CodeMemory`]; baseline sites call them with their
@@ -11,7 +12,7 @@
 //!
 //! # Contents
 //! - [`NativeCodeSpace`] — one compiler's executable memory and routines.
-//! - [`PropertyRoutine`] — which routine a call site enters.
+//! - [`Routine`] — which routine a call site enters.
 //! - [`Routines`] — the routines of one isolate, each emitted on first use.
 //! - [`RoutineRequest`] — one compile's access to its isolate's routines.
 //!
@@ -40,7 +41,7 @@ use crate::{CompiledCode, Unsupported};
 
 /// A routine generated code calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PropertyRoutine {
+pub(crate) enum Routine {
     /// Named load over a baseline site's IC slot, with the committed miss.
     Load,
     /// Named store over a baseline site's IC slot, with the committed miss.
@@ -58,9 +59,15 @@ pub(crate) enum PropertyRoutine {
     ProbeLoad,
     /// [`Self::Store`] entered through the committed runtime ABI.
     CommittedStore,
+    /// `ToBoolean` of a value that is not an immediate optimized code tests
+    /// inline, preserving every allocatable register.
+    Truthy,
+    /// The field-summary observation and barriers that follow a baseline
+    /// site's inline own-field store.
+    StoreTail,
 }
 
-impl PropertyRoutine {
+impl Routine {
     /// Stable name for artifacts.
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -72,6 +79,8 @@ impl PropertyRoutine {
             Self::KeyedStore => "keyedStore",
             Self::ProbeLoad => "probeLoad",
             Self::CommittedStore => "committedStore",
+            Self::Truthy => "truthy",
+            Self::StoreTail => "storeTail",
         }
     }
 
@@ -84,6 +93,8 @@ impl PropertyRoutine {
             Self::Concat => RoutineObject::Concat,
             Self::KeyedLoad => RoutineObject::KeyedLoad,
             Self::KeyedStore => RoutineObject::KeyedStore,
+            Self::Truthy => RoutineObject::Truthy,
+            Self::StoreTail => RoutineObject::StoreTail,
         }
     }
 
@@ -103,10 +114,12 @@ pub(crate) enum RoutineObject {
     Concat,
     KeyedLoad,
     KeyedStore,
+    Truthy,
+    StoreTail,
 }
 
 impl RoutineObject {
-    const COUNT: usize = 6;
+    const COUNT: usize = 8;
 }
 
 /// Entry offsets of one routine object: the routine and its second entry,
@@ -135,7 +148,7 @@ pub(crate) struct Routines {
 impl Routines {
     fn entry(
         &self,
-        routine: PropertyRoutine,
+        routine: Routine,
         view: &JitCompileSnapshot,
         transitions: &crate::entry::TransitionTable,
         memory: &Arc<CodeMemory>,
@@ -244,7 +257,7 @@ impl<'a> RoutineRequest<'a> {
 
     /// Entry address of `routine`; zero, with the failure kept for
     /// [`Self::finish`], when it could not be emitted.
-    pub(crate) fn entry(&self, routine: PropertyRoutine) -> u64 {
+    pub(crate) fn entry(&self, routine: Routine) -> u64 {
         let set = self.set.get_or_init(|| self.space.routines(self.view));
         set.entry(routine, self.view, self.transitions, &self.space.memory)
             .unwrap_or_else(|failure| {
@@ -304,13 +317,18 @@ fn emit(
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
     let mut relocations =
         crate::artifact::relocation::RelocationCapture::new(false).with_literal_pool();
-    let offsets = crate::template::arm64::shared_property::emit_routine(
-        &mut ops,
-        &mut relocations,
-        transitions,
-        view,
-        object,
-    );
+    let offsets = match object {
+        RoutineObject::Truthy => {
+            crate::graph::arm64::truthy::emit_routine(&mut ops, &mut relocations, view)
+        }
+        _ => crate::template::arm64::shared_property::emit_routine(
+            &mut ops,
+            &mut relocations,
+            transitions,
+            view,
+            object,
+        ),
+    };
     relocations.emit_literal_pool(&mut ops);
     Ok((crate::entry::finalize_assembler(ops)?, offsets))
 }
@@ -324,13 +342,18 @@ fn emit(
     let mut ops = dynasmrt::x64::Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
     let mut relocations = crate::artifact::relocation::RelocationCapture::new(false);
-    let offsets = crate::template::x86_64::shared_property::emit_routine(
-        &mut ops,
-        &mut relocations,
-        transitions,
-        view,
-        object,
-    );
+    let offsets = match object {
+        RoutineObject::Truthy => {
+            crate::graph::x86_64::truthy::emit_routine(&mut ops, &mut relocations, view)
+        }
+        _ => crate::template::x86_64::shared_property::emit_routine(
+            &mut ops,
+            &mut relocations,
+            transitions,
+            view,
+            object,
+        ),
+    };
     Ok((crate::entry::finalize_assembler(ops)?, offsets))
 }
 

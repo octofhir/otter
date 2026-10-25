@@ -24,7 +24,7 @@ use crate::x86_64::js_call::{CallTarget, emit_call};
 #[derive(Clone, Copy)]
 pub(super) enum CommittedTarget {
     Stub(abi::RuntimeStubDescriptor),
-    Routine(crate::routines::PropertyRoutine),
+    Routine(crate::routines::Routine),
 }
 
 impl Codegen<'_> {
@@ -43,7 +43,7 @@ impl Codegen<'_> {
     pub(super) fn emit_committed_routine_call(
         &mut self,
         node: NodeId,
-        routine: crate::routines::PropertyRoutine,
+        routine: crate::routines::Routine,
         arguments: &[CommittedArgument],
         destination: Option<u8>,
     ) -> Result<(), Unsupported> {
@@ -151,7 +151,7 @@ impl Codegen<'_> {
                 crate::template::x86_64::shared_property::emit_call(
                     &mut self.ops,
                     &mut self.relocations,
-                    self.shared_property,
+                    self.routines,
                     routine,
                 );
             }
@@ -469,7 +469,7 @@ impl Codegen<'_> {
                     labels: &labels,
                     exits,
                     frame_kind: abi::NativeFrameKind::Optimizing,
-                    shared_property: self.shared_property,
+                    shared_property: self.routines,
                     direct_call_events: &mut self.no_direct_call_events,
                     code_map: &mut self.no_code_map,
                 },

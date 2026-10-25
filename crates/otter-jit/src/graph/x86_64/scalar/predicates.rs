@@ -41,7 +41,7 @@ impl<'a> Codegen<'a> {
                         dynasm!(self.ops ; .arch x64 ; xor Rq(dst), 1);
                     }
                 } else {
-                    self.emit_to_boolean(node, value, dst, negate);
+                    self.emit_to_boolean(value, dst, negate);
                 }
             }
             Kind::StrictEqual { negate } => {
@@ -342,17 +342,11 @@ impl<'a> Codegen<'a> {
         );
     }
 
-    pub(in super::super) fn emit_to_boolean(
-        &mut self,
-        node: NodeId,
-        value: u8,
-        dst: u8,
-        negate: bool,
-    ) {
+    pub(in super::super) fn emit_to_boolean(&mut self, value: u8, dst: u8, negate: bool) {
         let truthy = self.ops.new_dynamic_label();
         let falsy = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
-        self.emit_truthy_branch(node, value, truthy, falsy);
+        self.emit_truthy_branch(value, truthy, falsy);
         dynasm!(self.ops ; .arch x64 ; =>truthy);
         self.load_immediate(
             dst,
@@ -374,14 +368,17 @@ impl<'a> Codegen<'a> {
         dynasm!(self.ops ; .arch x64 ; =>done);
     }
 
+    /// Branch on `ToBoolean(Rq(value))`: booleans, `null`, `undefined`, int32
+    /// Numbers, ordinary objects, arrays and closures inline, every other
+    /// value through the compiler's truthiness routine, which preserves
+    /// every allocatable register.
     pub(in super::super) fn emit_truthy_branch(
         &mut self,
-        node: NodeId,
         value: u8,
         if_true: DynamicLabel,
         if_false: DynamicLabel,
     ) {
-        let slow = self.ops.new_dynamic_label();
+        use crate::graph::x86_64::truthy::TRUTHY_VALUE;
         let not_int = self.ops.new_dynamic_label();
         dynasm!(self.ops ; .arch x64
             ; cmp Rq(value), DWORD tag::VALUE_TRUE as i32 ; je =>if_true
@@ -392,61 +389,26 @@ impl<'a> Codegen<'a> {
             ; test Rd(value), Rd(value) ; jz =>if_false ; jmp =>if_true
             ; =>not_int
         );
-        self.emit_heap_truthiness(value, if_true, if_false, slow);
-        self.defer_predicate_leaf(
-            node,
-            value,
-            None,
-            slow,
-            if_true,
-            if_false,
-            abi::STUB_TO_BOOLEAN_LEAF,
-            otter_vm::runtime_stubs::TO_BOOLEAN_LEAF.entry_addr() as u64,
-        );
-    }
-
-    /// `ToBoolean` of a value outside the int32 tag range that is not a
-    /// boolean, `null` or `undefined`: a double is falsy at ±0 and NaN, a
-    /// string at length zero, and every other cell is an object, truthy,
-    /// except a native function (the only possible `[[IsHTMLDDA]]`) and a
-    /// BigInt, which go to `slow` with the remaining immediates. `r10` holds
-    /// the value's top bits shifted down by 49. Clobbers `r10` and `r11`.
-    fn emit_heap_truthiness(
-        &mut self,
-        value: u8,
-        truthy: DynamicLabel,
-        falsy: DynamicLabel,
-        slow: DynamicLabel,
-    ) {
-        let cell = self.ops.new_dynamic_label();
-        let object = self.ops.new_dynamic_label();
-        let string_tag = self.view.string_layout.string_type_tag as i8;
-        let length = self.view.string_layout.string_len_byte as i32;
         self.load_immediate(11, tag::NOT_CELL_MASK);
+        let array_tag = self.view.array_layout.type_tag as i8;
         dynasm!(self.ops ; .arch x64
-            ; test Rq(value), r11 ; jz =>cell
-            // A boxed double carries number tag bits; other immediates do not.
-            ; test r10, r10 ; jz =>slow
+            ; test Rq(value), r11 ; jnz >routine
+            ; test Rq(value), Rq(value) ; jz >routine
+            ; movzx r11d, BYTE [Rq(value)]
+            ; cmp r11d, crate::entry::OBJECT_BODY_TYPE_TAG as i32 ; je =>if_true
+            ; cmp r11b, array_tag ; je =>if_true
+            ; cmp r11d, otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i32 ; je =>if_true
+            ; routine:
+            ; mov Rq(TRUTHY_VALUE), Rq(value)
         );
-        self.load_immediate(11, tag::DOUBLE_ENCODE_OFFSET);
-        dynasm!(self.ops ; .arch x64
-            ; mov r10, Rq(value) ; sub r10, r11
-            ; mov r11, r10 ; shl r11, 1 ; jz =>falsy
+        crate::template::x86_64::shared_property::emit_call(
+            &mut self.ops,
+            &mut self.relocations,
+            self.routines,
+            crate::routines::Routine::Truthy,
         );
-        // NaN boxes as the one canonical pattern.
-        self.load_immediate(11, tag::CANONICAL_NAN);
         dynasm!(self.ops ; .arch x64
-            ; cmp r10, r11 ; je =>falsy ; jmp =>truthy
-            ; =>cell
-            ; test Rq(value), Rq(value) ; jz =>slow
-            ; cmp BYTE [Rq(value)], string_tag ; jne =>object
-            ; cmp DWORD [Rq(value) + length], 0 ; je =>falsy ; jmp =>truthy
-            ; =>object
-            ; cmp BYTE [Rq(value)], otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG as i8
-            ; je =>slow
-            ; cmp BYTE [Rq(value)], otter_vm::bigint::BIG_INT_BODY_TYPE_TAG as i8
-            ; je =>slow
-            ; jmp =>truthy
+            ; test Rd(TRUTHY_VALUE), Rd(TRUTHY_VALUE) ; jnz =>if_true ; jmp =>if_false
         );
     }
 

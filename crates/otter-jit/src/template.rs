@@ -45,6 +45,7 @@ pub(crate) mod arm64;
 pub(crate) mod code;
 #[cfg(any(test, target_arch = "aarch64"))]
 mod inline_leaf;
+pub(crate) mod intrinsic_loads;
 pub(crate) mod operation;
 pub(crate) mod plan;
 #[cfg(target_arch = "x86_64")]

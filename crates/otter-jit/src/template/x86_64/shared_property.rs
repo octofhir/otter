@@ -50,7 +50,7 @@ use otter_vm::jit::PROPERTY_IC_LAYOUT as IC;
 use otter_vm::native_abi as abi;
 
 use crate::artifact::relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget};
-use crate::routines::{PropertyRoutine, RoutineObject, RoutineOffsets, RoutineRequest};
+use crate::routines::{Routine, RoutineObject, RoutineOffsets, RoutineRequest};
 use crate::x86_64::call_abi::emit_runtime_call;
 use crate::x86_64::property_actions::emit_action_probe;
 use crate::x86_64::property_ic;
@@ -92,14 +92,14 @@ pub(crate) fn emit_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     routines: &RoutineRequest<'_>,
-    routine: PropertyRoutine,
+    routine: Routine,
 ) {
     emit_load_symbol_u64(
         ops,
         relocations,
         11,
         routines.entry(routine),
-        RelocationTarget::PropertyRoutine {
+        RelocationTarget::Routine {
             routine: routine.name(),
         },
     );
@@ -125,6 +125,8 @@ pub(crate) fn emit_routine(
         RoutineObject::Concat => emit_concat(ops, view, label),
         RoutineObject::KeyedLoad => emit_keyed_load(ops, relocations, view, label),
         RoutineObject::KeyedStore => emit_keyed_store(ops, relocations, view, label),
+        RoutineObject::StoreTail => emit_store_tail(ops, relocations, view, label),
+        RoutineObject::Truthy => unreachable!("the truthiness routine is the graph tier's"),
     }
     let second = ops.offset().0;
     match object {
@@ -137,6 +139,28 @@ pub(crate) fn emit_routine(
         }
     }
     RoutineOffsets { entry, second }
+}
+
+/// Store tail inputs: the receiver, the stored value and the compressed
+/// defining shape whose field summary observes it (zero for none).
+pub(crate) const TAIL_RECEIVER: u8 = STORE_RECEIVER;
+pub(crate) const TAIL_VALUE: u8 = STORE_VALUE;
+pub(crate) const TAIL_OWNER: u8 = STORE_SLOT;
+
+/// After a baseline site's inline own-field store: the field summary of
+/// `Rd(TAIL_OWNER)` observes `Rq(TAIL_VALUE)`, then the value barrier of
+/// `Rq(TAIL_RECEIVER)`. The site holds nothing else in registers.
+fn emit_store_tail(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    label: DynamicLabel,
+) {
+    // Sites call with an aligned stack; both steps may call out.
+    dynasm!(ops ; .arch x64 ; =>label ; sub rsp, 8);
+    crate::x86_64::field_type::emit_observe(ops, relocations, view, TAIL_OWNER, TAIL_VALUE);
+    super::emit_template_value_barrier(ops, relocations, view, TAIL_RECEIVER, TAIL_VALUE);
+    dynasm!(ops ; .arch x64 ; add rsp, 8 ; ret);
 }
 
 /// Probe entry inputs: the receiver and the site's slot address.

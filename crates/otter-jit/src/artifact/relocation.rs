@@ -76,7 +76,7 @@ const TARGET_DEPENDENCY_FLAG: u8 = 21;
 const TARGET_PROTOTYPE_VALIDITY_CELL: u8 = 15;
 const TARGET_CLOSURE_CONTEXT_CELL: u8 = 22;
 const TARGET_CALL_COUNT_CELL: u8 = 23;
-const TARGET_PROPERTY_ROUTINE: u8 = 24;
+const TARGET_ROUTINE: u8 = 24;
 
 /// Whether a named-property probe serves a load or a store site.
 #[cfg(target_arch = "x86_64")]
@@ -197,7 +197,7 @@ pub(crate) enum RelocationTarget {
     /// its shape-fact dependencies.
     DependencyFlag,
     /// Entry of one routine of the compiler's shared routine set.
-    PropertyRoutine {
+    Routine {
         routine: &'static str,
     },
 }
@@ -1684,8 +1684,8 @@ fn encode_target(target: &RelocationTarget, output: &mut Vec<u8>) -> Result<(), 
         }
         RelocationTarget::BackedgeFuelCell => output.push(TARGET_BACKEDGE_FUEL_CELL),
         RelocationTarget::DependencyFlag => output.push(TARGET_DEPENDENCY_FLAG),
-        RelocationTarget::PropertyRoutine { routine } => {
-            output.push(TARGET_PROPERTY_ROUTINE);
+        RelocationTarget::Routine { routine } => {
+            output.push(TARGET_ROUTINE);
             put_text(output, "routine", routine)?;
         }
     }

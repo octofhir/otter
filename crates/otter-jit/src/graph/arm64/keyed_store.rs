@@ -368,8 +368,8 @@ impl Codegen<'_> {
         crate::template::arm64::shared_property::emit_call(
             &mut self.ops,
             &mut self.relocations,
-            self.shared_property,
-            crate::routines::PropertyRoutine::KeyedStore,
+            self.routines,
+            crate::routines::Routine::KeyedStore,
         );
         dynasm!(self.ops ; .arch aarch64 ; mov x17, x1);
         self.emit_restore_registers(&live, saved);

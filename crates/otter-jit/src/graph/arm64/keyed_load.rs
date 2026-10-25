@@ -173,8 +173,8 @@ impl Codegen<'_> {
         crate::template::arm64::shared_property::emit_call(
             &mut self.ops,
             &mut self.relocations,
-            self.shared_property,
-            crate::routines::PropertyRoutine::KeyedLoad,
+            self.routines,
+            crate::routines::Routine::KeyedLoad,
         );
         dynasm!(self.ops
             ; .arch aarch64

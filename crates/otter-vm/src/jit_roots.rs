@@ -188,6 +188,17 @@ impl CompilationRoot {
         roots.into_boxed_slice()
     }
 
+    /// The roots of a [`Self::key`]-sorted list that hold values a
+    /// collection may move or forget: its callee identity and `instanceof`
+    /// cells. Hidden classes, families and validity cells before and after
+    /// them are old-space cells or no heap value at all.
+    pub(crate) fn value_cells(sorted: &[Self]) -> &[Self] {
+        debug_assert!(sorted.windows(2).all(|pair| pair[0].key() <= pair[1].key()));
+        let start = sorted.partition_point(|root| root.key().0 < 2);
+        let end = sorted.partition_point(|root| root.key().0 < 4);
+        &sorted[start..end]
+    }
+
     pub(crate) fn key(&self) -> (u8, usize) {
         match self {
             Self::Shape(shape) => (0, shape.offset() as usize),

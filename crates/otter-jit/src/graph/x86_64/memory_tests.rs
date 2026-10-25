@@ -94,6 +94,7 @@ fn codegen<'a>(
         labels: FxHashMap::default(),
         exits: vec![],
         deferred: vec![],
+        deferred_failure: None,
         returned,
         deopt,
         fatal,
@@ -545,6 +546,9 @@ fn graph_bare_function_guard_populates_the_current_identity_cell() {
     assert!(cg.emit_guard(guard).unwrap());
     cg.load_immediate(11, address);
     dynasm!(cg.ops ; .arch x64 ; mov rax, [r11] ; ret);
+    while let Some(deferred) = cg.deferred.pop() {
+        deferred(&mut cg);
+    }
     for exit in &cg.exits {
         let label = exit.label;
         dynasm!(cg.ops ; .arch x64 ; =>label ; xor eax, eax ; ret);

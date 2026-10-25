@@ -72,6 +72,8 @@ struct Codegen<'a> {
     labels: FxHashMap<BlockId, DynamicLabel>,
     exits: Vec<ExitSite>,
     deferred: Vec<Deferred<'a>>,
+    /// The first failure of deferred code, reported when emission ends.
+    deferred_failure: Option<Unsupported>,
     returned: DynamicLabel,
     deopt: DynamicLabel,
     fatal: DynamicLabel,
@@ -180,6 +182,7 @@ pub(crate) fn emit(
         labels,
         exits: Vec::new(),
         deferred: Vec::new(),
+        deferred_failure: None,
         returned,
         deopt,
         fatal,
@@ -255,6 +258,9 @@ pub(crate) fn emit(
         spill,
     );
     codegen.emit_exit_stubs();
+    if let Some(failure) = codegen.deferred_failure.take() {
+        return Err(failure);
+    }
     codegen
         .return_sites
         .sort_by_key(|site| site.native_return_offset);

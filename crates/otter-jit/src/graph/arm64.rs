@@ -175,6 +175,8 @@ struct Codegen<'a> {
     exits: Vec<ExitSite>,
     /// Deferred slow paths, emitted after the body.
     deferred: Vec<Deferred<'a>>,
+    /// The first failure of deferred code, reported when emission ends.
+    deferred_failure: Option<Unsupported>,
     /// Shared labels.
     returned: DynamicLabel,
     deopt: DynamicLabel,
@@ -356,6 +358,7 @@ pub(crate) fn emit(
         labels,
         exits: Vec::new(),
         deferred: Vec::new(),
+        deferred_failure: None,
         returned,
         deopt,
         fatal,
@@ -457,6 +460,9 @@ pub(crate) fn emit(
     codegen.emit_exit_stubs();
     if codegen.far {
         emit_shared_exits(&mut codegen);
+    }
+    if let Some(failure) = codegen.deferred_failure.take() {
+        return Err(failure);
     }
     codegen.emit_float_pool();
     codegen.relocations.emit_literal_pool(&mut codegen.ops);
@@ -2935,7 +2941,9 @@ impl<'a> Codegen<'a> {
     /// Branch to `miss` unless `X(value)` is the function `function_id`:
     /// its function-id immediate, or a closure of it that needs no runtime
     /// setup. `cell`, when not zero, holds the last value proved here, and
-    /// a new proof is stored there. Clobbers only `x16` and `x17`.
+    /// a new proof is stored there. The comparisons with the cell and the
+    /// immediate stay inline; the closure proof is deferred out of line.
+    /// Clobbers only `x16` and `x17`.
     fn emit_function_identity(
         &mut self,
         function_id: u32,
@@ -2945,6 +2953,7 @@ impl<'a> Codegen<'a> {
         exit: DynamicLabel,
     ) {
         let proved = self.ops.new_dynamic_label();
+        let prove = self.ops.new_dynamic_label();
         let layout = self.view.closure_call_layout;
         let cell_target = RelocationTarget::CalleeIdentityCell {
             function_id,
@@ -2961,30 +2970,44 @@ impl<'a> Codegen<'a> {
             dynasm!(self.ops ; .arch aarch64 ; ldr x16, [x16] ; cmp X(value), x16 ; b.eq =>proved);
         }
         self.load_immediate(16, tag::box_function_id(function_id));
-        dynasm!(self.ops ; .arch aarch64 ; cmp X(value), x16 ; b.eq =>proved);
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; tst X(value), #0xfffe_0000_0000_0007
-            ; b.ne =>exit
-            ; cbz X(value), =>exit
-            ; ldrb w16, [X(value)]
-            ; cmp w16, otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as u32
-            ; b.ne =>exit
+        dynasm!(self.ops ; .arch aarch64
+            ; cmp X(value), x16
+            ; b.ne =>prove
+            ; =>proved
         );
-        if layout.runtime_setup_flags != 0 {
-            dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(value), layout.flags_byte]);
-            self.load_immediate(17, u64::from(layout.runtime_setup_flags));
-            dynasm!(self.ops ; .arch aarch64 ; tst w16, w17 ; b.ne =>exit);
-        }
-        dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(value), layout.function_id_byte]);
-        self.load_immediate(17, u64::from(function_id));
-        dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>exit);
-        if cell != 0 {
-            // The proved value is the one the next check compares first.
-            emit_load_symbol_u64(&mut self.ops, &mut self.relocations, 16, cell, cell_target);
-            dynasm!(self.ops ; .arch aarch64 ; str X(value), [x16]);
-        }
-        dynasm!(self.ops ; .arch aarch64 ; =>proved);
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                dynasm!(codegen.ops
+                    ; .arch aarch64
+                    ; =>prove
+                    ; tst X(value), #0xfffe_0000_0000_0007
+                    ; b.ne =>exit
+                    ; cbz X(value), =>exit
+                    ; ldrb w16, [X(value)]
+                    ; cmp w16, otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as u32
+                    ; b.ne =>exit
+                );
+                if layout.runtime_setup_flags != 0 {
+                    dynasm!(codegen.ops ; .arch aarch64 ; ldr w16, [X(value), layout.flags_byte]);
+                    codegen.load_immediate(17, u64::from(layout.runtime_setup_flags));
+                    dynasm!(codegen.ops ; .arch aarch64 ; tst w16, w17 ; b.ne =>exit);
+                }
+                dynasm!(codegen.ops ; .arch aarch64 ; ldr w16, [X(value), layout.function_id_byte]);
+                codegen.load_immediate(17, u64::from(function_id));
+                dynasm!(codegen.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>exit);
+                if cell != 0 {
+                    // The proved value is the one the next check compares first.
+                    emit_load_symbol_u64(
+                        &mut codegen.ops,
+                        &mut codegen.relocations,
+                        16,
+                        cell,
+                        cell_target,
+                    );
+                    dynasm!(codegen.ops ; .arch aarch64 ; str X(value), [x16]);
+                }
+                dynasm!(codegen.ops ; .arch aarch64 ; b =>proved);
+            }));
     }
 
     fn emit_load_guarded_method(
@@ -3142,18 +3165,30 @@ impl<'a> Codegen<'a> {
         if owners.len() != programs.len() {
             return Err(Unsupported::OperandShape("graph named store owner records"));
         }
-        for (index, (program, authority)) in programs.iter().zip(owners).enumerate() {
-            if selected.is_some_and(|selected| selected != index) {
-                continue;
-            }
-            // A proved receiver matches only the programs that guard its shape.
-            let receiver_guard = program.ops.iter().find_map(|op| match *op {
+        let guard_of = |program: &otter_vm::JitCacheIrProgram| {
+            program.ops.iter().find_map(|op| match *op {
                 Op::GuardShape { object: 0, shape } => Some(shape),
                 _ => None,
-            });
-            if receiver_shape.is_some() && receiver_guard != receiver_shape {
+            })
+        };
+        // A proved receiver matches only the programs that guard its shape.
+        let emitted = |index: usize, program: &otter_vm::JitCacheIrProgram| {
+            selected.is_none_or(|selected| selected == index)
+                && (receiver_shape.is_none() || guard_of(program) == receiver_shape)
+        };
+        let last = programs
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|&(index, program)| emitted(index, program))
+            .map(|(index, _)| index);
+        for (index, (program, authority)) in programs.iter().zip(owners).enumerate() {
+            if !emitted(index, program) {
                 continue;
             }
+            // The last program's misses leave; it falls through to `done`.
+            let final_program = Some(index) == last;
+            let receiver_guard = guard_of(program);
             let expando = matches!(
                 program.ops.first(),
                 Some(Op::LoadArrayExpando {
@@ -3163,7 +3198,11 @@ impl<'a> Codegen<'a> {
                 })
             );
             let mut owner = authority.owner_shape;
-            let next = self.ops.new_dynamic_label();
+            let next = if final_program {
+                exit
+            } else {
+                self.ops.new_dynamic_label()
+            };
             let mut stored_byte = None;
             for op in program.ops.iter() {
                 let object = |operand: u8| {
@@ -3329,9 +3368,14 @@ impl<'a> Codegen<'a> {
                     authority,
                 );
             }
-            dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>next);
+            if !final_program {
+                dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>next);
+            }
         }
-        dynasm!(self.ops ; .arch aarch64 ; b =>exit ; =>done);
+        if last.is_none() {
+            dynasm!(self.ops ; .arch aarch64 ; b =>exit);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
         Ok(())
     }
 
@@ -4024,11 +4068,18 @@ impl<'a> Codegen<'a> {
             .clone();
         let exit = self.eager_exit(node, DeoptReason::WrongShape);
         let done = self.ops.new_dynamic_label();
+        let last = selected.last().copied();
         for index in selected {
             let program = programs
                 .get(index as usize)
                 .ok_or(Unsupported::OperandShape("graph named load program index"))?;
-            let next = self.ops.new_dynamic_label();
+            // The last program's misses leave; it falls through to `done`.
+            let final_program = Some(index) == last;
+            let next = if final_program {
+                exit
+            } else {
+                self.ops.new_dynamic_label()
+            };
             for op in program.ops.iter() {
                 let object = |operand: u8| if operand == 0 { receiver } else { holder };
                 match *op {
@@ -4169,7 +4220,9 @@ impl<'a> Codegen<'a> {
                             dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [x16, x17]);
                         }
 
-                        dynasm!(self.ops ; .arch aarch64 ; b =>done);
+                        if !final_program {
+                            dynasm!(self.ops ; .arch aarch64 ; b =>done);
+                        }
                     }
                     Op::LoadClosurePrototype { object: 0 } => {
                         crate::template::arm64::ic_probe::emit_closure_prototype_load(
@@ -4179,7 +4232,9 @@ impl<'a> Codegen<'a> {
                             destination,
                             next,
                         );
-                        dynasm!(self.ops ; .arch aarch64 ; b =>done);
+                        if !final_program {
+                            dynasm!(self.ops ; .arch aarch64 ; b =>done);
+                        }
                     }
                     Op::LoadBodySlot { object: 0, slot } if slot.is_generated(false) => {
                         self.emit_body_slot_receiver(receiver, slot, next);
@@ -4188,14 +4243,21 @@ impl<'a> Codegen<'a> {
                             ; ldr X(destination), [X(receiver), slot.byte]
                         );
 
-                        dynasm!(self.ops ; .arch aarch64 ; b =>done);
+                        if !final_program {
+                            dynasm!(self.ops ; .arch aarch64 ; b =>done);
+                        }
                     }
                     _ => return Err(Unsupported::OperandShape("graph named load operation")),
                 }
             }
-            dynasm!(self.ops ; .arch aarch64 ; =>next);
+            if !final_program {
+                dynasm!(self.ops ; .arch aarch64 ; =>next);
+            }
         }
-        dynasm!(self.ops ; .arch aarch64 ; b =>exit ; =>done);
+        if last.is_none() {
+            dynasm!(self.ops ; .arch aarch64 ; b =>exit);
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
         Ok(())
     }
 
@@ -4845,19 +4907,36 @@ impl<'a> Codegen<'a> {
             self.record_js_return(node, return_pc)?;
             dynasm!(self.ops ; .arch aarch64 ; b =>returned);
         }
-        dynasm!(self.ops ; .arch aarch64 ; =>generic);
-        let return_pc = emit_call(
-            &mut self.ops,
-            &mut self.relocations,
-            self.transitions,
-            20,
-            1,
-            receiver_register,
-            new_target,
-            Some(count),
-            CallTarget::Generic,
-        );
-        self.record_js_return(node, return_pc)?;
+        let generic_call = move |codegen: &mut Codegen<'a>| {
+            dynasm!(codegen.ops ; .arch aarch64 ; =>generic);
+            let return_pc = emit_call(
+                &mut codegen.ops,
+                &mut codegen.relocations,
+                codegen.transitions,
+                20,
+                1,
+                receiver_register,
+                new_target,
+                Some(count),
+                CallTarget::Generic,
+            );
+            codegen.record_js_return(node, return_pc)
+        };
+        if matches!(plan, crate::call_linkage::CallPlan::Generic) {
+            generic_call(self)?;
+        } else {
+            // A proved target makes the generic entry the cold path.
+            let sp_delta = self.sp_delta;
+            self.deferred
+                .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                    let outer = std::mem::replace(&mut codegen.sp_delta, sp_delta);
+                    if let Err(failure) = generic_call(codegen) {
+                        codegen.deferred_failure.get_or_insert(failure);
+                    }
+                    codegen.sp_delta = outer;
+                    dynasm!(codegen.ops ; .arch aarch64 ; b =>returned);
+                }));
+        }
         dynasm!(self.ops ; .arch aarch64 ; =>returned);
         self.emit_pop_actuals(bytes);
         self.emit_call_completion(node)?;
@@ -4968,18 +5047,49 @@ impl<'a> Codegen<'a> {
     /// a throw or a parked error goes where `node` throws to.
     fn emit_call_completion(&mut self, node: NodeId) -> Result<(), Unsupported> {
         let (threw, committed_throw) = self.throw_targets(node);
-        let threw = self.cond_target(threw);
-        let committed_throw = self.cond_target(committed_throw);
         // A callee's Fatal is final: no handler may observe it and its parked
         // error must not be projected into an exception again.
-        let fatal = self.cond_target(self.fatal);
-        let completion = self.ops.new_dynamic_label();
-        let error = self.ops.new_dynamic_label();
+        let fatal = self.fatal;
+        let abrupt = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
+        dynasm!(self.ops ; .arch aarch64 ; cbnz x1, =>abrupt ; =>done);
+        // Every status but success leaves the hot path: a callee that retired
+        // itself for a tail call it staged is entered in its place, anything
+        // else is routed to its handler.
+        let sp_delta = self.sp_delta;
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                let outer = std::mem::replace(&mut codegen.sp_delta, sp_delta);
+                if let Err(failure) = codegen.emit_abrupt_completion(
+                    node,
+                    abrupt,
+                    done,
+                    (threw, committed_throw, fatal),
+                ) {
+                    codegen.deferred_failure.get_or_insert(failure);
+                }
+                codegen.sp_delta = outer;
+            }));
+        Ok(())
+    }
+
+    /// The out-of-line part of a call's completion from `abrupt`, with a
+    /// nonzero status in `x1`: staged tail calls until one completes, then
+    /// success back to `done` or the status's handler.
+    fn emit_abrupt_completion(
+        &mut self,
+        node: NodeId,
+        abrupt: DynamicLabel,
+        done: DynamicLabel,
+        (threw, committed_throw, fatal): (DynamicLabel, DynamicLabel, DynamicLabel),
+    ) -> Result<(), Unsupported> {
+        let threw = self.cond_target(threw);
+        let committed_throw = self.cond_target(committed_throw);
+        let fatal = self.cond_target(fatal);
+        let error = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
-            ; =>completion
-            ; cbz x1, =>done
+            ; =>abrupt
             ; cmp x1, abi::NativeResultStatus::Continue as u32
             ; b.ne =>error
         );
@@ -4992,7 +5102,8 @@ impl<'a> Codegen<'a> {
         self.record_js_return(node, return_pc)?;
         dynasm!(self.ops
             ; .arch aarch64
-            ; b =>completion
+            ; cbnz x1, =>abrupt
+            ; b =>done
             ; =>error
         );
         self.stamp_node_safepoint(node)?;
@@ -5004,7 +5115,6 @@ impl<'a> Codegen<'a> {
             ; cmp x1, abi::NativeResultStatus::Fatal as u32
             ; b.eq =>fatal
             ; b =>threw
-            ; =>done
         );
         Ok(())
     }

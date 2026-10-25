@@ -138,6 +138,7 @@ fn fixture(kind: Kind) -> crate::CompiledCode {
         labels: FxHashMap::default(),
         exits: Vec::new(),
         deferred: Vec::new(),
+        deferred_failure: None,
         returned,
         deopt,
         fatal,

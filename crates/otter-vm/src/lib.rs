@@ -75,6 +75,7 @@ pub mod bigint;
 pub mod binary;
 pub mod boolean;
 mod call_feedback;
+mod call_site;
 mod call_ops;
 pub mod closure;
 mod closure_construct;
@@ -901,6 +902,9 @@ pub struct Interpreter {
     /// it stays `false`, a fixed-length typed array's cached element base is
     /// live, so generated element access needs no per-buffer detach proof.
     array_buffer_detach_protector: bool,
+    /// `true` while `Error.prepareStackTrace` runs: a stack read inside it
+    /// formats with the default renderer instead of re-entering the hook.
+    preparing_stack_trace: bool,
     interrupt: InterruptFlag,
     /// Non-reused ECMA agent identity for `Atomics.wait` lifecycle control.
     /// Host shutdown holds a cloneable handle while this owner token ensures

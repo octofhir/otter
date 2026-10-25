@@ -286,6 +286,9 @@ pub struct ErrorClassRegistry {
     wasm_compile_error: ClassEntry,
     wasm_link_error: ClassEntry,
     wasm_runtime_error: ClassEntry,
+    /// `%CallSite.prototype%`, inherited by the call sites
+    /// `Error.prepareStackTrace` receives.
+    call_site_prototype: JsObject,
 }
 
 /// §20.5.3.4 Error.prototype.toString — single source of truth for
@@ -503,6 +506,7 @@ impl ErrorClassRegistry {
             wasm_compile_error: entry(),
             wasm_link_error: entry(),
             wasm_runtime_error: entry(),
+            call_site_prototype: crate::object::JsObject::null(),
         }
     }
 
@@ -528,6 +532,13 @@ impl ErrorClassRegistry {
         ] {
             entry.trace_roots(visitor);
         }
+        visitor(std::ptr::addr_of!(self.call_site_prototype) as *mut RawGc);
+    }
+
+    /// `%CallSite.prototype%`.
+    #[must_use]
+    pub(crate) fn call_site_prototype(&self) -> JsObject {
+        self.call_site_prototype
     }
 
     /// Build the intrinsic prototypes + constructors and link the
@@ -720,6 +731,35 @@ impl ErrorClassRegistry {
                 .and_then(|obj| crate::object::error_stack_string(obj, ctx.heap()))
             {
                 return Ok(Value::string(stack));
+            }
+            // A realm `Error.prepareStackTrace` hook decides the value. A
+            // string result is cached like a rendered one; any other value
+            // becomes the receiver's own `stack`.
+            let prepared = ctx.scope(|mut scope| {
+                let receiver = scope.value(receiver);
+                let Some(result) = crate::call_site::prepare_stack_trace(&mut scope, receiver)?
+                else {
+                    return Ok::<_, NativeError>(None);
+                };
+                let value = scope.raw(result);
+                let obj = scope.raw(receiver).as_object().expect("an error object");
+                let cached = scope.with_turn_parts(|interp, _| {
+                    let stack = value.as_string(&interp.gc_heap)?;
+                    crate::object::set_error_stack_string(obj, &mut interp.gc_heap, stack);
+                    Some(())
+                });
+                if cached.is_none() {
+                    scope.define(
+                        receiver,
+                        "stack",
+                        result,
+                        crate::object::PropertyFlags::new(true, false, true),
+                    )?;
+                }
+                Ok(Some(scope.raw(result)))
+            })?;
+            if let Some(value) = prepared {
+                return Ok(value);
             }
             // step 4 — implementation-defined stack string. The header
             // is the error's `toString` form (`Name: message`); when
@@ -1366,6 +1406,26 @@ impl ErrorClassRegistry {
             // position rather than the rendered text read them.
             crate::object::set_error_stack(&mut target_obj, ctx.heap_mut(), &draft)?;
             if !crate::object::has_error_data(target_obj, ctx.heap()) {
+                // A realm `Error.prepareStackTrace` hook decides the value.
+                let prepared = ctx.scope(|mut scope| {
+                    let target = scope.value(target);
+                    let Some(result) = crate::call_site::prepare_stack_trace(&mut scope, target)?
+                    else {
+                        return Ok::<_, NativeError>(false);
+                    };
+                    scope.define(
+                        target,
+                        "stack",
+                        result,
+                        crate::object::PropertyFlags::new(true, false, true),
+                    )?;
+                    Ok(true)
+                })?;
+                if prepared {
+                    return Ok(Value::undefined());
+                }
+                let target = args.first().copied().unwrap_or(target);
+                let target_obj = target.as_object().unwrap_or(target_obj);
                 // Plain object: install an own formatted `stack` data
                 // property (an eager shape, acceptable per the
                 // TC39 capture-stack-trace proposal).
@@ -1583,6 +1643,7 @@ impl ErrorClassRegistry {
             wasm_compile_error: take(ErrorKind::WasmCompileError),
             wasm_link_error: take(ErrorKind::WasmLinkError),
             wasm_runtime_error: take(ErrorKind::WasmRuntimeError),
+            call_site_prototype: JsObject::null(),
         })
     }
 
@@ -1633,6 +1694,7 @@ impl ErrorClassRegistry {
             // SAFETY: registered only for the stationary registry borrowed below.
             unsafe { (&*slot.cast::<ErrorClassRegistry>()).trace_gc_roots(visitor) };
         }
+        let mut native_root = Value::undefined();
         let mut roots = otter_gc::RootScope::new(gc_heap);
         // SAFETY: the registry and parameters remain stationary throughout this
         // method, including root preparation and descriptor allocation.
@@ -1641,6 +1703,7 @@ impl ErrorClassRegistry {
             roots.add_object(&mut function_prototype);
             roots.add_object(&mut object_prototype);
             roots.add_object(&mut global_this);
+            roots.add_value(&mut native_root);
         }
         let mut constructor = self.error.constructor;
         if !object::set_prototype(&mut constructor, gc_heap, Some(function_prototype))? {
@@ -1693,6 +1756,31 @@ impl ErrorClassRegistry {
                 true,
             );
             if !object::define_own_property_in_place(&mut global_this, gc_heap, name, descriptor)? {
+                return Err(crate::js_surface::JsSurfaceError::DefinePropertyFailed(
+                    name,
+                ));
+            }
+        }
+        // The registry is rooted, so every allocation below rewrites the
+        // prototype field in place; each define reads it afresh.
+        self.call_site_prototype = alloc_registry_object(gc_heap, &mut [])?;
+        let mut prototype = self.call_site_prototype;
+        if !object::set_prototype(&mut prototype, gc_heap, Some(object_prototype))? {
+            return Err(crate::js_surface::JsSurfaceError::DefinePropertyFailed(
+                "CallSite.prototype.[[Prototype]]",
+            ));
+        }
+        for &(name, length, call) in crate::call_site::METHODS {
+            native_root = Value::native_function(native_static_with_roots(
+                gc_heap,
+                name,
+                length,
+                call,
+                &mut [],
+            )?);
+            let mut prototype = self.call_site_prototype;
+            let descriptor = PropertyDescriptor::data(native_root, true, false, true);
+            if !object::define_own_property_in_place(&mut prototype, gc_heap, name, descriptor)? {
                 return Err(crate::js_surface::JsSurfaceError::DefinePropertyFailed(
                     name,
                 ));

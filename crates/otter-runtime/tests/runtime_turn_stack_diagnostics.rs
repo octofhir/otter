@@ -50,3 +50,59 @@ fn error_diagnostics_walk_the_current_runtime_turn() {
 
     assert_eq!(result.completion_string(), "true|true|true|true|true");
 }
+
+#[test]
+fn prepare_stack_trace_hands_the_hook_structured_call_sites() {
+    let mut runtime = Runtime::builder().build().expect("runtime");
+    let result = runtime
+        .run_script(
+            SourceInput::from_javascript(
+                r#"
+                function sites() {
+                    const target = {};
+                    const previous = Error.prepareStackTrace;
+                    Error.prepareStackTrace = (_, callSites) => callSites;
+                    Error.captureStackTrace(target);
+                    const stack = target.stack;
+                    Error.prepareStackTrace = previous;
+                    return stack;
+                }
+                function caller() {
+                    return sites();
+                }
+                const callSites = caller();
+                const top = callSites[0];
+
+                let inner;
+                Error.prepareStackTrace = function (error, callSites) {
+                    inner = new Error("inside").stack;
+                    return { frames: callSites.length, self: this === Error };
+                };
+                const shaped = new Error("hooked").stack;
+                delete Error.prepareStackTrace;
+                const plain = new Error("plain").stack;
+                [
+                    Array.isArray(callSites),
+                    top.getFunctionName(),
+                    callSites[1].getFunctionName(),
+                    top.getFileName(),
+                    typeof top.getLineNumber(),
+                    top.getColumnNumber() > 0,
+                    top.isEval(),
+                    String(top).startsWith("sites ("),
+                    shaped.frames > 0,
+                    shaped.self,
+                    inner.startsWith("Error: inside"),
+                    plain.startsWith("Error: plain")
+                ].join("|");
+                "#,
+            ),
+            "prepare-stack-trace.js",
+        )
+        .expect("prepare stack trace fixture");
+
+    assert_eq!(
+        result.completion_string(),
+        "true|sites|caller|prepare-stack-trace.js|number|true|false|true|true|true|true|true"
+    );
+}

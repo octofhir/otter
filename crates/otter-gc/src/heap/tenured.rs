@@ -199,13 +199,19 @@ impl GcHeap {
     /// `aligned` bytes. Never collects; `false` leaves the buffer empty.
     pub(super) fn refill_old_lab(&mut self, aligned: usize) -> bool {
         self.retire_old_lab();
+        self.help_old_sweep();
         if !self.machine_allocation_allowed() {
             return false;
         }
         let mut extent = OLD_LAB_BYTES.max(aligned);
         if self.max_heap_bytes != 0 {
             self.drain_shared_external_releases();
-            let available = self.max_heap_bytes.saturating_sub(self.tracked_bytes);
+            let mut available = self.max_heap_bytes.saturating_sub(self.tracked_bytes);
+            if available < aligned as u64 && self.is_sweeping() {
+                // The cap charges a sweep's dead cells until it ends.
+                self.complete_old_sweep();
+                available = self.max_heap_bytes.saturating_sub(self.tracked_bytes);
+            }
             extent = (extent as u64).min(available) as usize & !(CELL_SIZE - 1);
             if extent < aligned {
                 return false;

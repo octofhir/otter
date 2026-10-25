@@ -561,7 +561,8 @@ impl Interpreter {
     /// without holding allocator paths open — safe to call from
     /// any mutator-turn boundary.
     #[must_use]
-    pub fn heap_snapshot_summary(&self) -> inspect::HeapSnapshotSummary {
+    pub fn heap_snapshot_summary(&mut self) -> inspect::HeapSnapshotSummary {
+        self.gc_heap.finish_sweeping();
         let census = self.gc_heap.census();
         inspect::HeapSnapshotSummary::from_census(&census)
     }
@@ -571,14 +572,16 @@ impl Interpreter {
     /// edge graph — and it separates old space from the nursery, which
     /// lets the opaque in-process snapshot path size its retained image.
     #[must_use]
-    pub fn heap_census(&self) -> otter_gc::HeapCensus {
+    pub fn heap_census(&mut self) -> otter_gc::HeapCensus {
+        self.gc_heap.finish_sweeping();
         self.gc_heap.census()
     }
 
     /// Census of every live native callable by dispatch storage. See
     /// [`crate::native_census`].
     #[must_use]
-    pub fn native_census(&self) -> crate::native_census::NativeCensus {
+    pub fn native_census(&mut self) -> crate::native_census::NativeCensus {
+        self.gc_heap.finish_sweeping();
         crate::native_census::native_census(&self.gc_heap)
     }
 
@@ -669,9 +672,10 @@ impl Interpreter {
     /// # Errors
     /// Propagates I/O errors from `writer`.
     pub fn write_chrome_heap_snapshot<W: std::io::Write>(
-        &self,
+        &mut self,
         writer: &mut W,
     ) -> std::io::Result<()> {
+        self.gc_heap.finish_sweeping();
         otter_gc::devtools_snapshot::write_heap_snapshot(&self.gc_heap, &mut *writer)?;
         writer.write_all(b"\n")?;
         Ok(())

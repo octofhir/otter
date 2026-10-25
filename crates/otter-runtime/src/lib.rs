@@ -5682,14 +5682,14 @@ impl Runtime {
     /// Type-count summary of every live GC body. See
     /// [`inspect::HeapSnapshotSummary`].
     #[must_use]
-    pub fn heap_snapshot_summary(&self) -> inspect::HeapSnapshotSummary {
+    pub fn heap_snapshot_summary(&mut self) -> inspect::HeapSnapshotSummary {
         self.interp.heap_snapshot_summary()
     }
 
     /// Per-space, per-type-tag census of the live heap. Separates old
     /// space (what a bootstrap snapshot would dump) from the nursery.
     #[must_use]
-    pub fn heap_census(&self) -> otter_gc::HeapCensus {
+    pub fn heap_census(&mut self) -> otter_gc::HeapCensus {
         self.interp.heap_census()
     }
 
@@ -5697,7 +5697,7 @@ impl Runtime {
     /// function pointers, VM intrinsics, and closure-backed natives retained by
     /// an in-process snapshot.
     #[must_use]
-    pub fn native_census(&self) -> otter_vm::native_census::NativeCensus {
+    pub fn native_census(&mut self) -> otter_vm::native_census::NativeCensus {
         self.interp.native_census()
     }
 
@@ -5771,7 +5771,7 @@ impl Runtime {
     /// # Errors
     /// Propagates I/O errors from `writer`.
     pub fn write_chrome_heap_snapshot<W: std::io::Write>(
-        &self,
+        &mut self,
         writer: &mut W,
     ) -> std::io::Result<()> {
         self.interp.write_chrome_heap_snapshot(writer)

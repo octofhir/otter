@@ -68,6 +68,11 @@ impl OldFreeList {
         self.nonempty = 0;
     }
 
+    /// Whether no range is listed.
+    pub(super) fn is_empty(&self) -> bool {
+        self.nonempty == 0
+    }
+
     /// Relinquish a dead range to this list. Tiny fillers remain unlisted.
     ///
     /// # Safety

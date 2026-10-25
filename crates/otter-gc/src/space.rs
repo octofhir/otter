@@ -601,18 +601,65 @@ impl OldSpace {
         unsafe { free_list.push(tail_offset, remaining) };
     }
 
-    /// Rebuild the open-page set from the pages' bump cursors after a sweep
-    /// moved dead tails back into bump range.
-    pub(crate) fn reopen_bump_pages(&mut self) {
-        self.open = self
-            .pages
-            .iter()
-            .filter(|page| {
-                let header = page.header();
-                header.span_bytes() - header.bump_cursor >= OPEN_PAGE_MIN_ROOM
-            })
-            .map(Page::cage_offset)
-            .collect();
+    /// Close every page to allocation for a sweep: no free range and no bump
+    /// room remains until [`Self::apply_swept_page`] reopens a page with
+    /// what its walk found. Pages taken from here on are fresh. Until then a
+    /// page counts the bytes its mark found live.
+    pub(crate) fn begin_sweep(&mut self) {
+        self.clear_free_list();
+        self.open.clear();
+        for page in &self.pages {
+            let header = page.header_mut();
+            header.allocated_bytes = header.live_bytes.min(header.allocated_bytes);
+        }
+        self.recount_allocated();
+    }
+
+    /// Give the walked page at `base` its new bump cursor and allocated
+    /// bytes, and reopen its bump room when real room remains. Its free
+    /// ranges are listed separately, after its dead cells' hooks ran.
+    pub(crate) fn apply_swept_page(&mut self, base: usize, bump_cursor: usize, allocated: usize) {
+        // SAFETY: `base` is a live old page of this space whose walk ended;
+        // only this thread writes its header from here on.
+        let header = unsafe { &mut *(base as *mut crate::page::PageHeader) };
+        self.allocated = self.allocated - header.allocated_bytes + allocated;
+        header.allocated_bytes = allocated;
+        header.bump_cursor = bump_cursor;
+        if header.span_bytes() - bump_cursor >= OPEN_PAGE_MIN_ROOM {
+            self.open.push(header.cage_offset);
+        }
+    }
+
+    /// Whether an allocation can reuse space without taking a fresh page:
+    /// a listed range, the linear area or a page with bump room.
+    pub(crate) fn has_reusable_space(&self) -> bool {
+        self.lab.is_some() || !self.free_list.is_empty() || !self.open.is_empty()
+    }
+
+    /// Account the walked page at `base` as holding nothing. It stays closed
+    /// to allocation until [`Self::reap_swept_pages`] returns it.
+    pub(crate) fn apply_dead_page(&mut self, base: usize) {
+        // SAFETY: as in `apply_swept_page`.
+        let header = unsafe { &mut *(base as *mut crate::page::PageHeader) };
+        self.allocated -= header.allocated_bytes;
+        header.allocated_bytes = 0;
+    }
+
+    /// Return the pages a sweep found without survivors, and every unused
+    /// standby page, to the cage. No free range lies in them: their walks
+    /// listed none and the sweep closed every page first.
+    pub(crate) fn reap_swept_pages(&mut self, dead: &[usize]) -> usize {
+        let before = self.pages.len();
+        let mut dead = dead.to_vec();
+        dead.sort_unstable();
+        self.pages
+            .retain(|page| dead.binary_search(&(page.base_ptr() as usize)).is_err());
+        self.standby.clear();
+        let pages = &self.pages;
+        self.open
+            .retain(|offset| pages.iter().any(|page| page.cage_offset() == *offset));
+        self.recount_allocated();
+        before - self.pages.len()
     }
 
     /// Drop every free-list entry; the sweep that follows rebuilds the
@@ -725,24 +772,6 @@ impl OldSpace {
         for page in &self.pages {
             page.header_mut().live_bytes = 0;
         }
-    }
-
-    /// Drop pages whose `live_bytes` is zero after a sweep.
-    /// Returns the number of pages reclaimed.
-    /// Return fully dead pages and every unused standby page to the cage.
-    pub fn reap_dead_pages(&mut self) -> usize {
-        let before = self.pages.len();
-        // Sweep republishes retained ranges after the reap. Discard every
-        // old link before any page can return to the cage, including when
-        // this space is reaped directly outside the heap's sweep driver.
-        self.clear_free_list();
-        self.pages.retain(|p| p.header().live_bytes > 0);
-        self.standby.clear();
-        let pages = &self.pages;
-        self.open
-            .retain(|offset| pages.iter().any(|page| page.cage_offset() == *offset));
-        self.recount_allocated();
-        before - self.pages.len()
     }
 }
 
@@ -884,6 +913,18 @@ const _: usize = PAGE_HEADER_SIZE;
 
 #[cfg(test)]
 mod tests {
+
+    /// Reap, as a sweep would, every old page no mark reached.
+    fn reap_unmarked(old: &mut OldSpace) -> usize {
+        old.begin_sweep();
+        let dead: Vec<usize> = old
+            .pages()
+            .iter()
+            .filter(|page| page.header().live_bytes == 0)
+            .map(|page| page.base_ptr() as usize)
+            .collect();
+        old.reap_swept_pages(&dead)
+    }
     use super::*;
     use crate::compressed::{CAGE_TEST_LOCK, Cage};
 
@@ -965,7 +1006,7 @@ mod tests {
         // …so the next allocation keeps filling the same tail page.
         let second = old.alloc(64).expect("second alloc");
         assert_eq!(second, first + 64, "tail page keeps filling");
-        old.reap_dead_pages();
+        reap_unmarked(&mut old);
         assert!(old.standby.is_empty());
     }
 
@@ -978,7 +1019,7 @@ mod tests {
             .expect("nearly full page");
         // The failed fit retires a free tail in the first page.
         old.alloc(2048).expect("second page");
-        assert_eq!(old.reap_dead_pages(), 2);
+        assert_eq!(reap_unmarked(&mut old), 2);
         old.alloc(64).expect("fresh storage after reap");
         assert_eq!(old.page_count(), 1, "allocation must own a live page");
         assert_eq!(old.allocated_bytes(), 64);
@@ -1010,7 +1051,7 @@ mod tests {
                 .free_pages,
             free_before - 1
         );
-        let reaped = old.reap_dead_pages();
+        let reaped = reap_unmarked(&mut old);
         assert!(old.standby.is_empty());
         assert_eq!(
             crate::compressed::cage_stats()
@@ -1051,7 +1092,7 @@ mod tests {
         old.reserve_promotion_pages(2, CELL_SIZE)
             .expect("exhausted tail reserves");
         assert_eq!(old.standby.len(), 2);
-        old.reap_dead_pages();
+        reap_unmarked(&mut old);
         assert!(old.standby.is_empty());
     }
 

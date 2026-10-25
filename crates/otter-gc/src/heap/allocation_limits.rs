@@ -130,12 +130,12 @@ impl GcHeap {
     pub(super) fn recompute_allocation_limits(
         &mut self,
         pause_start: Instant,
+        pause_end: Instant,
         old_generation_before: u64,
     ) {
         self.initial_old_limit_pending = false;
-        let now = Instant::now();
         let live = self.old_generation_consumed_bytes();
-        let pause_ms = now.duration_since(pause_start).as_secs_f64() * 1000.0;
+        let pause_ms = pause_end.duration_since(pause_start).as_secs_f64() * 1000.0;
         let minor_ms = self
             .gc_stats
             .minor_pause_ns_total
@@ -169,7 +169,7 @@ impl GcHeap {
             .reserved_bytes
             .saturating_add(EXTERNAL_ALLOCATION_SOFT_LIMIT);
         self.old_generation_bytes_at_last_gc = live;
-        self.last_major_gc_end = now;
+        self.last_major_gc_end = pause_end;
         self.minor_pause_ns_at_last_major_gc = self.gc_stats.minor_pause_ns_total;
     }
 

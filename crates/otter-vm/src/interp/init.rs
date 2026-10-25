@@ -192,6 +192,7 @@ impl Interpreter {
             external_memory_adjustment: None,
             array_index_accessor_protector: false,
             array_buffer_detach_protector: false,
+            preparing_stack_trace: false,
             array_index_accessor_protector_epoch: 0,
             interrupt: {
                 let interrupt = InterruptFlag::new();

@@ -1,7 +1,8 @@
 //! Intrinsic error registry roots and same-process restore completeness.
 //!
 //! # Contents
-//! - Complete eleven-class constructor/prototype/root contracts.
+//! - Complete eleven-class constructor/prototype/root contracts and
+//!   `%CallSite.prototype%`.
 //! - Actual full collection and isolate snapshot restoration.
 //!
 //! # Invariants
@@ -21,7 +22,17 @@ fn assert_complete_registry(interp: &Interpreter) {
     let heap = interp.gc_heap();
     let mut roots = 0;
     registry.trace_gc_roots(&mut |_| roots += 1);
-    assert_eq!(roots, 22, "one constructor/prototype pair per intrinsic");
+    assert_eq!(
+        roots, 23,
+        "one constructor/prototype pair per intrinsic and %CallSite.prototype%"
+    );
+    let call_site = registry.call_site_prototype();
+    for &(name, _, _) in crate::call_site::METHODS {
+        assert!(
+            object::get(call_site, heap, name).is_some_and(|method| method.is_callable()),
+            "%CallSite.prototype%.{name} survives"
+        );
+    }
     assert_eq!(ErrorKind::all().len(), 11);
     let mut identities = std::collections::BTreeSet::new();
     for &kind in ErrorKind::all() {

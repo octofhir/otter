@@ -5132,6 +5132,74 @@ pub(crate) fn visit_error_stack_frames(
     })
 }
 
+/// One single-frame draft per captured frame of `obj`, top of stack first:
+/// the frames a structured call-site list hands out one object at a time.
+pub(crate) fn error_stack_frame_drafts(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Vec<ErrorStackDraft> {
+    heap.read_payload(obj, |body| {
+        let Some(stack) = body
+            .exotic()
+            .and_then(|e| error_stack_body_of(e.error_stack_frames))
+        else {
+            return Vec::new();
+        };
+        // SAFETY: the sidecar owns this live immutable managed body; nothing
+        // here allocates on the GC heap while the arena is borrowed.
+        let stack = unsafe { &*stack };
+        (0..stack.frame_count)
+            .map(|index| {
+                // SAFETY: fully initialized records lie inside the extent.
+                let record = unsafe { *stack.records_ptr().add(index) };
+                let mut draft = ErrorStackDraft::default();
+                draft.push_parts(
+                    record.function_id,
+                    stack.str_at(record.name_offset, record.name_len),
+                    stack.str_at(record.module_offset, record.module_len),
+                    (record.span_lo, record.span_hi),
+                    record.has_source.then(|| {
+                        (
+                            record.line_number,
+                            record.start_column,
+                            stack.str_at(record.source_offset, record.source_len),
+                        )
+                    }),
+                );
+                draft
+            })
+            .collect()
+    })
+}
+
+/// The top captured frame of `obj`: function name, module, `(line,
+/// zero-based column)` when known, and the source byte offset it stopped at.
+pub(crate) fn error_stack_top_frame(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Option<(String, String, Option<(u32, u32)>, u32)> {
+    heap.read_payload(obj, |body| {
+        let stack = body
+            .exotic()
+            .and_then(|e| error_stack_body_of(e.error_stack_frames))?;
+        // SAFETY: as in `visit_error_stack_frames`.
+        let stack = unsafe { &*stack };
+        if stack.frame_count == 0 {
+            return None;
+        }
+        // SAFETY: the first record is initialized when `frame_count != 0`.
+        let record = unsafe { *stack.records_ptr() };
+        Some((
+            stack.str_at(record.name_offset, record.name_len).to_owned(),
+            stack.str_at(record.module_offset, record.module_len).to_owned(),
+            record
+                .has_source
+                .then_some((record.line_number, record.start_column)),
+            record.span_lo,
+        ))
+    })
+}
+
 /// `true` when the object carries captured stack frames.
 #[must_use]
 pub fn has_error_stack_frames(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {

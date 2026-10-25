@@ -908,10 +908,21 @@ impl JitCodeRegistry {
 
     /// Visit every hidden class a registered (not yet retired) code object
     /// embeds, as strong roots.
-    pub(crate) fn trace_retained_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+    pub(crate) fn trace_retained_roots(
+        &self,
+        visitor: &mut otter_gc::raw::SlotVisitor<'_>,
+        young: bool,
+    ) {
         for registered in self.codes.values() {
-            for shape in &*registered.roots {
-                shape.trace(visitor);
+            // A scavenge moves no old cell: only the value cells can name a
+            // young one.
+            let roots = if young {
+                crate::jit_roots::CompilationRoot::value_cells(&registered.roots)
+            } else {
+                &registered.roots
+            };
+            for root in roots {
+                root.trace(visitor);
             }
         }
     }
@@ -925,7 +936,7 @@ impl JitCodeRegistry {
     ) {
         self.closure_contexts.process_weak(resolve);
         for registered in self.codes.values() {
-            for root in &*registered.roots {
+            for root in crate::jit_roots::CompilationRoot::value_cells(&registered.roots) {
                 root.process_weak(resolve);
             }
         }

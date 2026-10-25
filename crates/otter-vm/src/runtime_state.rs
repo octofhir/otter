@@ -177,7 +177,7 @@ impl<'a> RuntimeState<'a> {
         // data roots current-turn pins and canonical key strings itself; its
         // identity and transition tables are weak.
 
-        interp.trace_compiled_shapes(visitor);
+        interp.trace_compiled_shapes(visitor, roots);
         if roots == RootSet::All {
             interp.trace_layout_shapes(visitor);
             for shape in interp.simple_constructor_shapes_for_trace() {

@@ -458,15 +458,16 @@ impl<'a> PropertyFeedbackSlot<'a> {
     }
 
     /// Record the read of `key` from `receiver`: a `length` read of anything
-    /// but an Array, and one of anything but a typed array, each mark the
-    /// site, once.
+    /// but an Array, one of anything but a typed array and one of anything
+    /// but a primitive string each mark the site, once.
     pub(crate) fn record_length_receiver(self, key: &str, receiver: crate::Value) {
         if key != "length" {
             return;
         }
         let non_array = receiver.as_array().is_none() && self.slot.record_length_non_array();
         let non_typed = !receiver.is_typed_array() && self.slot.record_length_non_typed_array();
-        if non_array || non_typed {
+        let non_string = !receiver.is_string() && self.slot.record_length_non_string();
+        if non_array || non_typed || non_string {
             self.vector.bump_epoch();
         }
     }
@@ -481,6 +482,13 @@ impl<'a> PropertyFeedbackSlot<'a> {
     #[must_use]
     pub(crate) fn length_reads_typed_arrays_only(self) -> bool {
         self.slot.attempted() && !self.slot.length_read_non_typed_array()
+    }
+
+    /// Whether a `length` site has read only primitive strings since it
+    /// first ran.
+    #[must_use]
+    pub(crate) fn length_reads_strings_only(self) -> bool {
+        self.slot.attempted() && !self.slot.length_read_non_string()
     }
 
     #[must_use]

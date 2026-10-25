@@ -251,13 +251,17 @@ fn proves_inputs(kind: &Kind) -> bool {
         | Kind::CheckCellValue(_)
         | Kind::CheckNative(_)
         | Kind::CheckFunctionPrototypeCall(_)
+        | Kind::CheckGuardedMethod(_)
         | Kind::CheckClosureContext(_) => true,
         Kind::LoadGuardedMethod {
             receiver_proved, ..
         } => !receiver_proved,
         Kind::LoadArrayLength { array_proved } => !array_proved,
         Kind::LoadTypedArrayLength => true,
-        Kind::LoadArrayExpando(_) | Kind::LoadFunctionBag | Kind::StringCharCodeAt => true,
+        Kind::LoadArrayExpando(_)
+        | Kind::LoadFunctionBag
+        | Kind::StringCharCodeAt
+        | Kind::LoadStringLength => true,
         _ => false,
     }
 }
@@ -339,7 +343,8 @@ fn heap_effects(kind: &Kind) -> Effects {
         // changes; a pair that would convert leaves before reading more.
         | Kind::LooseEqual { .. }
         // String content never changes; the node tests its own receiver.
-        | Kind::StringCharCodeAt => Effects::default(),
+        | Kind::StringCharCodeAt
+        | Kind::LoadStringLength => Effects::default(),
         // A cell's map word decides the result. An unproved input is tested
         // for a cell first; a proved one is read directly.
         Kind::CheckShapes { cell_proved, .. } => {
@@ -354,7 +359,9 @@ fn heap_effects(kind: &Kind) -> Effects {
         // and closure words are read through values that are contexts or
         // closures by construction, never by a guard's proof.
         Kind::LoadContextParent | Kind::LoadClosureContext => Effects::default(),
-        Kind::CheckFunctionPrototypeCall(_) => Effects::reads(&[H::Fields, H::MapWords]),
+        Kind::CheckFunctionPrototypeCall(_) | Kind::CheckGuardedMethod(_) => {
+            Effects::reads(&[H::Fields, H::MapWords])
+        }
         Kind::CheckElements { .. } => Effects::reads(&[H::ElementStorage, H::MapWords]),
         Kind::CheckElementPresent
         | Kind::LoadPresentElement

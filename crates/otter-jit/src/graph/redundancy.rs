@@ -117,6 +117,7 @@ fn origin_free(kind: &Kind) -> bool {
             | Kind::LoadElementsBase { .. }
             | Kind::LoadElement(_)
             | Kind::StringCharCodeAt
+            | Kind::LoadStringLength
     )
 }
 

@@ -30,12 +30,63 @@ pub(crate) enum CommittedArgument {
 }
 
 /// A builtin method read from a pinned intrinsic prototype: the receiver
-/// proof that selects the prototype, the prototype's hidden class, the slot
-/// that class fixes, and the native the slot must hold.
+/// proof that selects the prototype, the layout proof of the prototype, the
+/// slot that layout fixes, and the native the slot must hold.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IntrinsicMethod {
     pub(crate) receiver: JitIntrinsicPrototype,
-    pub(crate) holder_shape: u32,
+    pub(crate) holder: IntrinsicHolder,
     pub(crate) field: FieldLocation,
     pub(crate) native_ref: u32,
+}
+
+/// The builtin method a guarded call on an intrinsic receiver at `byte_pc`
+/// reads, with the site and entry its prototype reference names.
+pub(crate) fn guarded_intrinsic_method(
+    view: &otter_vm::JitCompileSnapshot,
+    byte_pc: u32,
+) -> Result<(IntrinsicMethod, (u32, u32)), crate::Unsupported> {
+    let call = view
+        .guarded_method_calls
+        .get(&byte_pc)
+        .ok_or(crate::Unsupported::OperandShape(
+            "graph guarded method site",
+        ))?;
+    let (otter_vm::jit::JitGuardedReceiver::Exotic(receiver), Some(holder)) =
+        (call.receiver, IntrinsicHolder::of(call.holder))
+    else {
+        return Err(crate::Unsupported::OperandShape(
+            "graph guarded method proof",
+        ));
+    };
+    Ok((
+        IntrinsicMethod {
+            receiver,
+            holder,
+            field: call.method_field,
+            native_ref: call.builtin_native_ref,
+        },
+        (byte_pc, call.entry_stub_id),
+    ))
+}
+
+/// How a pinned intrinsic prototype's slot layout is proved.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum IntrinsicHolder {
+    /// A fast-mode prototype with this hidden-class handle offset.
+    Shape(u32),
+    /// A dictionary-mode prototype with this slot-layout epoch.
+    Dictionary(u64),
+}
+
+impl IntrinsicHolder {
+    /// The layout proof a guarded method call names for its holder, if it is
+    /// one this record can carry.
+    pub(crate) const fn of(holder: otter_vm::jit::JitMethodHolder) -> Option<Self> {
+        match holder {
+            otter_vm::jit::JitMethodHolder::Shape(shape) => Some(Self::Shape(shape)),
+            otter_vm::jit::JitMethodHolder::Dictionary(layout) => Some(Self::Dictionary(layout)),
+            _ => None,
+        }
+    }
 }

@@ -3178,6 +3178,15 @@ impl<'a> Builder<'a> {
                 self.known.entry(object).heap_object = true;
                 return self.write(instruction.writes[0], value);
             }
+            // A site that has read only primitive strings reads the length
+            // word; a string's length never changes.
+            if site.load_array_length
+                && site.length_reads_strings_only
+                && !self.exited_for(ExitReason::TypeMismatch)
+            {
+                let value = self.add(Kind::LoadStringLength, &[object], Repr::Int32);
+                return self.write(instruction.writes[0], value);
+            }
             if self.view.instructions[self.pc as usize].load_array_length {
                 let value = self.add(
                     Kind::LoadPropertyCached {
@@ -4445,7 +4454,9 @@ impl<'a> Builder<'a> {
         if !self.view.instructions[self.pc as usize].call_attempted {
             return self.deopt(DeoptReason::InsufficientFeedback);
         }
-        if self.emit_array_method(instruction, receiver, &arguments) {
+        if self.emit_array_method(instruction, receiver, &arguments)
+            || self.emit_string_method(instruction, receiver, &arguments)
+        {
             return;
         }
         let byte_pc = instruction.byte_pc;

@@ -438,6 +438,8 @@ impl ExecutionContext {
                 instr.length_reads_typed_arrays_only = slot.is_some_and(
                     crate::feedback::PropertyFeedbackSlot::length_reads_typed_arrays_only,
                 );
+                instr.length_reads_strings_only = slot
+                    .is_some_and(crate::feedback::PropertyFeedbackSlot::length_reads_strings_only);
             }
             if instr.op(&code_block) == otter_bytecode::Op::CallMethodValue
                 && let Some(otter_bytecode::Operand::ConstIndex(idx)) =

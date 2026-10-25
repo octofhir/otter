@@ -267,7 +267,7 @@ impl Codegen<'_> {
         };
         let method = IntrinsicMethod {
             receiver: target,
-            holder_shape,
+            holder: crate::graph::call::IntrinsicHolder::Shape(holder_shape),
             field: call.method_field,
             native_ref: call.builtin_native_ref,
         };

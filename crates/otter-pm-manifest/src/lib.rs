@@ -146,6 +146,36 @@ impl PackageJsonWorkspaces {
     }
 }
 
+/// A string field as npm and Node read one from a published manifest: any
+/// other JSON value is the field left out.
+pub fn string_or_absent<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(text) => Some(text),
+        _ => None,
+    })
+}
+
+/// A map of strings read as [`string_or_absent`] reads one string: entries
+/// with any other value are left out, and so is a value that is no object.
+pub fn string_entries<'de, D>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Object(entries) => entries
+            .into_iter()
+            .filter_map(|(key, value)| match value {
+                serde_json::Value::String(text) => Some((key, text)),
+                _ => None,
+            })
+            .collect(),
+        _ => BTreeMap::new(),
+    })
+}
+
 /// Typed `package.json` representation for the active package manager.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,11 +189,20 @@ pub struct PackageManifest {
     /// Package module mode.
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub package_type: Option<PackageType>,
-    /// Legacy package entrypoint.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Legacy package entrypoint. A value that is not a string (published
+    /// packages write `false`) names none, as Node reads it.
+    #[serde(
+        default,
+        deserialize_with = "string_or_absent",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub main: Option<String>,
-    /// ESM-oriented package entrypoint.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// ESM-oriented package entrypoint, read as `main` is.
+    #[serde(
+        default,
+        deserialize_with = "string_or_absent",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub module: Option<String>,
     /// Package exports map/string.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,8 +223,13 @@ pub struct PackageManifest {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub optional_dependencies: DependencySet,
     /// Package scripts. Recorded by PM; execution policy belongs to later
-    /// lifecycle/capability slices.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// lifecycle/capability slices. An entry whose command is not a string
+    /// is no script, as npm reads it.
+    #[serde(
+        default,
+        deserialize_with = "string_entries",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
     pub scripts: BTreeMap<String, String>,
     /// Package binaries.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -592,6 +636,27 @@ mod tests {
         let rewritten = manifest.to_stable_json().unwrap();
         assert!(rewritten.contains(r#""license": "MIT""#));
         assert!(rewritten.contains(r#""access": "public""#));
+    }
+
+    #[test]
+    fn published_manifests_read_as_node_and_npm_read_them() {
+        // Published packages write `"main": false` and nest a tool's
+        // settings under `scripts`; neither is an entry point or a script.
+        let manifest = PackageManifest::parse_json(
+            r#"{
+              "name": "dunder",
+              "main": false,
+              "module": { "x": 1 },
+              "scripts": { "test": "make test", "blanket": { "pattern": "lib" } }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(manifest.main, None);
+        assert_eq!(manifest.module, None);
+        assert_eq!(
+            manifest.scripts.into_iter().collect::<Vec<_>>(),
+            [("test".to_owned(), "make test".to_owned())]
+        );
     }
 
     #[test]

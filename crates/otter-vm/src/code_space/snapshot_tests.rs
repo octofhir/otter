@@ -5,6 +5,7 @@
 //! - Fresh restore tables have independent feedback, work counters and atoms.
 //! - Rejected admissions preserve donor topology and release unpublished bytes.
 //! - Escaped blocks and source-work cells retain their exact individual leases.
+//! - An image chunk restores dormant and wakes on its first resolution.
 //!
 //! # Invariants
 //! - Every observed charge belongs to the actual allocation's resource account.
@@ -54,6 +55,22 @@ fn module() -> BytecodeModule {
     module
 }
 
+/// The module and execution copy of a captured linked chunk.
+struct Linked<'a> {
+    module: &'a Arc<LinkedBytecode>,
+    executable: &'a Arc<ExecutableModule>,
+}
+
+fn linked(payload: &CapturedPayload) -> Linked<'_> {
+    let CapturedPayload::Linked {
+        module, executable, ..
+    } = payload
+    else {
+        panic!("a linked capture")
+    };
+    Linked { module, executable }
+}
+
 fn payload(space: &CodeSpace) -> Arc<ChunkPayload> {
     let ChunkResolution::Live { payload, .. } = space.resolve_chunk(0) else {
         panic!("live first payload")
@@ -87,9 +104,9 @@ fn captured_code_shares_compiler_but_not_donor_execution_and_restores_independen
     let old_atoms = Arc::downgrade(&original.atoms);
     let compiler_bytes = original.module.retained_bytes();
     let snapshot = donor.capture(&capture_account).unwrap();
-    let captured = snapshot.chunks[0].payload.as_ref().unwrap();
-    assert!(Arc::ptr_eq(&captured.module, &original.module));
-    assert!(!Arc::ptr_eq(&captured.executable, &original.executable));
+    let captured = linked(snapshot.chunks[0].payload.as_ref().unwrap());
+    assert!(Arc::ptr_eq(captured.module, &original.module));
+    assert!(!Arc::ptr_eq(captured.executable, &original.executable));
     assert!(
         captured
             .executable
@@ -313,4 +330,42 @@ fn escaped_code_block_and_native_source_work_keep_their_individual_physical_leas
     assert_eq!(work.total(), 41);
     drop(work);
     assert_eq!(current(&account), 0);
+}
+
+#[test]
+fn an_image_chunk_restores_dormant_and_wakes_with_its_recorded_atoms() {
+    let account = ResourceAccount::default();
+    let donor = Arc::new(CodeSpace::default());
+    donor
+        .link_module(module(), SourceRegistry::default(), &account)
+        .unwrap();
+    let mut names = NameInterner::default();
+    let _ = names.intern("first");
+    donor.resolve_atoms(&mut names);
+    let donor_ids: Vec<u32> = payload(&donor).atoms.ids().collect();
+    let mut out = otter_gc::image_codec::ImageWriter::new();
+    donor.capture(&account).unwrap().encode(&mut out, 0);
+    let bytes: &'static [u8] = Box::leak(out.into_bytes().into_boxed_slice());
+    let mut input = otter_gc::image_codec::ImageReader::new(bytes);
+    // SAFETY: the bytes are an encoding of a directory without
+    // program-image text, so no displacement is followed.
+    let decoded = unsafe { CodeSpaceSnapshot::decode(&mut input, 0, &account) }.unwrap();
+    let restored = decoded
+        .restore(&mut NameInterner::default(), &account)
+        .unwrap();
+    let chunk = Arc::clone(&restored.chunks()[0]);
+    let mut headers = Vec::new();
+    restored.visit_function_headers(|header| headers.push(header.id));
+    assert_eq!(headers, [0]);
+    assert!(
+        chunk.payload.read().unwrap().is_none(),
+        "headers wake nothing"
+    );
+    let woken = payload(&restored);
+    assert_eq!(woken.atoms.ids().collect::<Vec<_>>(), donor_ids);
+    assert!(chunk.dormant.lock().unwrap().is_none());
+    assert!(
+        Arc::ptr_eq(&woken, &payload(&restored)),
+        "a chunk wakes once"
+    );
 }

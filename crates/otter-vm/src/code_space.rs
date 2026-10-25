@@ -24,6 +24,8 @@
 //!   IC-site bases.
 //! - [`ChunkPayload`] — one live linked chunk's tables and retained-byte lease.
 //! - [`ResolvedCtx`] — borrowed-or-owned context for one function id.
+//! - [`DormantChunk`] / [`FunctionHeader`] — a startup-image chunk not yet
+//!   decoded, and the call-visible facts of its functions.
 //!
 //! # Invariants
 //!
@@ -65,6 +67,11 @@
 //!   chunks never alias one interpreter IC slot.
 //! - Snapshot restore owns a new directory and fresh mutable execution state.
 //!   Only immutable compiler bytecode may be shared across isolates.
+//! - A chunk restored from the startup image is dormant until a function id
+//!   in it is first resolved: its module bytes stay in the executable's image
+//!   section and are decoded then, with the atom ids the image recorded,
+//!   which the restored interner holds already. Its function headers are
+//!   known without decoding it.
 //!
 //! # See also
 //!
@@ -107,6 +114,92 @@ impl ChunkPayload {
     #[must_use]
     pub(crate) fn retained_bytes(&self) -> u64 {
         self.retained_bytes
+    }
+}
+
+/// What a caller of a function needs before its chunk is decoded.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FunctionHeader {
+    pub(crate) id: u32,
+    pub(crate) param_count: u16,
+    pub(crate) register_count: u16,
+    pub(crate) call_flags: u32,
+}
+
+impl FunctionHeader {
+    pub(crate) fn of(function: &otter_bytecode::Function) -> Self {
+        Self {
+            id: function.id,
+            param_count: function.param_count,
+            register_count: function
+                .register_count()
+                .expect("admitted function header has a register window"),
+            call_flags: crate::executable::bytecode_call_flags(function),
+        }
+    }
+}
+
+/// A startup-image chunk not yet decoded: its module bytes, which live as
+/// long as the executable, and what building its tables takes besides.
+#[derive(Debug, Clone)]
+pub(crate) struct DormantChunk {
+    pub(crate) bytes: &'static [u8],
+    /// Per function, the base of the lazy body that replaced it, or
+    /// `u32::MAX`.
+    pub(crate) forwards: Arc<[u32]>,
+    /// The atom ids of the module's constant slots, in constant order.
+    pub(crate) atom_ids: Arc<[u32]>,
+    pub(crate) headers: Arc<[FunctionHeader]>,
+    pub(crate) sources: SourceRegistry,
+    pub(crate) account: ResourceAccount,
+}
+
+impl DormantChunk {
+    /// Decode the chunk and build its tables, as a link of the module would.
+    /// A refusal leaves the chunk dormant.
+    fn wake(
+        &self,
+        function_base: u32,
+        property_ic_site_base: u32,
+        alias: Option<u32>,
+    ) -> Option<Arc<ChunkPayload>> {
+        let account = &self.account;
+        let verified =
+            otter_bytecode::binary::decode_startup_image_module(self.bytes, function_base).ok()?;
+        let module = LinkedBytecode::new(verified, account).ok()?;
+        let mut executable =
+            ExecutableModule::lazy(Arc::clone(&module), property_ic_site_base, account).ok()?;
+        if let Some(alias) = alias {
+            executable = executable.with_alias(alias);
+        }
+        for (index, &base) in self.forwards.iter().enumerate() {
+            if base != u32::MAX {
+                executable.set_forward(index as u32, base);
+            }
+        }
+        let executable = Arc::new(executable);
+        let metadata_bytes = (std::mem::size_of::<ChunkPayload>() as u64)
+            .saturating_add(std::mem::size_of::<AtomTable>() as u64)
+            .saturating_add(AtomTable::allocation_bytes(&module.constants));
+        let mut retained_lease = account
+            .reserve_exact(ResourceClass::SourceModuleBytes, metadata_bytes)
+            .ok()?;
+        let atoms = AtomTable::from_constants(&module.constants, &mut retained_lease).ok()?;
+        atoms.adopt_ids(&self.atom_ids);
+        let atoms = Arc::new(atoms);
+        let metadata_bytes = payload_metadata_bytes(&atoms);
+        retained_lease.resize(metadata_bytes).ok()?;
+        let retained_bytes = metadata_bytes
+            .saturating_add(module.retained_bytes())
+            .saturating_add(executable.retained_bytes());
+        Some(Arc::new(ChunkPayload {
+            module,
+            executable,
+            atoms,
+            sources: self.sources.clone(),
+            retained_bytes,
+            _retained_lease: retained_lease,
+        }))
     }
 }
 
@@ -420,6 +513,9 @@ struct CodeChunk {
     /// The lazy record whose body this chunk is, if it is one.
     alias: Option<u32>,
     payload: RwLock<Option<Arc<ChunkPayload>>>,
+    /// The image record a dormant chunk decodes from; `None` once it woke,
+    /// and for every chunk that was linked.
+    dormant: Mutex<Option<DormantChunk>>,
     _directory_node_lease: ResourceLease,
 }
 
@@ -523,6 +619,7 @@ fn build_chunk(
         retention,
         alias,
         payload: RwLock::new(Some(payload)),
+        dormant: Mutex::new(None),
         _directory_node_lease: account.reserve_exact(
             ResourceClass::SourceModuleBytes,
             std::mem::size_of::<CodeChunk>() as u64,
@@ -765,20 +862,52 @@ impl CodeSpace {
         let Some(current) = Self::chunk_for(&chunks, function_id) else {
             return ChunkResolution::Unlinked;
         };
-        let payload = current
+        let live = current
             .payload
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match payload.as_ref() {
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // The read guard is gone: waking takes the payload's write lock.
+        let payload = live.or_else(|| self.wake(current));
+        match payload {
             Some(payload) => ChunkResolution::Live {
                 function_base: current.function_base,
-                payload: Arc::clone(payload),
+                payload,
             },
             None => ChunkResolution::Evicted {
                 function_base: current.function_base,
                 function_count: current.function_count,
             },
         }
+    }
+
+    /// Decode a dormant chunk on its first resolution and publish its
+    /// payload; `None` for a chunk that is not dormant.
+    fn wake(&self, chunk: &CodeChunk) -> Option<Arc<ChunkPayload>> {
+        let mut slot = chunk
+            .payload
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(payload) = slot.as_ref() {
+            return Some(Arc::clone(payload));
+        }
+        let mut dormant = chunk
+            .dormant
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let payload = dormant.as_ref()?.wake(
+            chunk.function_base,
+            chunk.property_ic_site_base,
+            chunk.alias,
+        )?;
+        *dormant = None;
+        if chunk.retention == ChunkRetention::Evictable {
+            self.evictable_retained_bytes
+                .fetch_add(payload.retained_bytes(), Ordering::AcqRel);
+        }
+        *slot = Some(Arc::clone(&payload));
+        self.epoch.fetch_add(1, Ordering::Release);
+        Some(payload)
     }
 
     /// Resolve every linked chunk's property-name atoms against `names`.
@@ -819,20 +948,28 @@ impl CodeSpace {
             .map(crate::executable::CodeBlock::feedback_epoch)
     }
 
-    /// Visit every live chunk's admitted functions while the linked directory
-    /// is held. The visitor must neither enter JavaScript nor mutate this code
-    /// space.
-    pub(crate) fn visit_linked_functions(
-        &self,
-        mut visitor: impl FnMut(&otter_bytecode::Function),
-    ) {
+    /// Visit the header of every function of a live or dormant chunk while
+    /// the linked directory is held. The visitor must neither enter
+    /// JavaScript nor mutate this code space.
+    pub(crate) fn visit_function_headers(&self, mut visitor: impl FnMut(FunctionHeader)) {
         for chunk in self.chunks().iter() {
             let payload = chunk
                 .payload
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(payload) = payload.as_ref() {
-                payload.module.functions.iter().for_each(&mut visitor);
+                payload
+                    .module
+                    .functions
+                    .iter()
+                    .for_each(|function| visitor(FunctionHeader::of(function)));
+            } else if let Some(dormant) = chunk
+                .dormant
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+            {
+                dormant.headers.iter().copied().for_each(&mut visitor);
             }
         }
     }

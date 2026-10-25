@@ -293,9 +293,9 @@ impl Interpreter {
         };
 
         interp.jit_code_registry.set_account(account.clone());
-        interp
-            .code_space
-            .visit_linked_functions(|function| interp.jit_code_registry.link_function(function, 0));
+        interp.code_space.visit_function_headers(|header| {
+            interp.jit_code_registry.link_function_header(header, 0)
+        });
 
         // Write the captured fixed roots back through the same walk that
         // collected them, relocated to the restored pages.

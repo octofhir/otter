@@ -124,6 +124,9 @@ pub(crate) fn emit_routine(
         RoutineObject::KeyedStore => emit_keyed_store(ops, relocations, view, label),
         RoutineObject::StoreTail => emit_store_tail(ops, relocations, view, label),
         RoutineObject::Truthy => unreachable!("the truthiness routine is the graph tier's"),
+        RoutineObject::FieldObserve => {
+            unreachable!("the field-observation routine is the graph tier's")
+        }
     }
     let second = ops.offset().0;
     match object {

@@ -136,6 +136,7 @@ impl Codegen<'_> {
                     emit_object_literal(
                         &mut self.ops,
                         &mut self.relocations,
+                        self.routines,
                         source,
                         15,
                         realm,

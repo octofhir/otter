@@ -23,10 +23,14 @@ use otter_vm::{JitCompileSnapshot, Value};
 fn compile(view: &JitCompileSnapshot, captured: Option<&FieldStoreOwner>) -> ExecutableBuffer {
     let mut ops = dynasmrt::aarch64::Assembler::new().unwrap();
     let mut relocations = RelocationCapture::default();
+    let transitions = crate::entry::TransitionTable::resolve();
+    // The observation routine is called through the link register.
+    dynasm!(ops ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
     match captured {
         Some(record) => crate::arm64::field_type::emit_observe_known(
             &mut ops,
             &mut relocations,
+            &crate::routines::fixture_routines(view, &transitions),
             view,
             0,
             1,
@@ -35,7 +39,7 @@ fn compile(view: &JitCompileSnapshot, captured: Option<&FieldStoreOwner>) -> Exe
         None => crate::arm64::field_type::emit_observe(&mut ops, &mut relocations, view, 0, 1),
     }
     dynasm!(ops ; .arch aarch64
-        ; ldr x0, [x2, view.shape_field_type_byte] ; ret);
+        ; ldr x0, [x2, view.shape_field_type_byte] ; ldp x29, x30, [sp], #16 ; ret);
     ops.finalize().unwrap()
 }
 
@@ -43,10 +47,12 @@ fn compile(view: &JitCompileSnapshot, captured: Option<&FieldStoreOwner>) -> Exe
 fn compile(view: &JitCompileSnapshot, captured: Option<&FieldStoreOwner>) -> ExecutableBuffer {
     let mut ops = dynasmrt::x64::Assembler::new().unwrap();
     let mut relocations = RelocationCapture::default();
+    let transitions = crate::entry::TransitionTable::resolve();
     match captured {
         Some(record) => crate::x86_64::field_type::emit_observe_known(
             &mut ops,
             &mut relocations,
+            &crate::routines::fixture_routines(view, &transitions),
             view,
             7,
             6,

@@ -1055,6 +1055,21 @@ impl<'a> Codegen<'a> {
         emit(self)
     }
 
+    /// Queue `emit` as deferred code, out of the body's line. It runs with
+    /// the stack depth of this point; its failure is reported when emission
+    /// ends.
+    fn defer(&mut self, emit: impl FnOnce(&mut Codegen<'a>) -> Result<(), Unsupported> + 'a) {
+        let sp_delta = self.sp_delta;
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                let outer = std::mem::replace(&mut codegen.sp_delta, sp_delta);
+                if let Err(failure) = emit(codegen) {
+                    codegen.deferred_failure.get_or_insert(failure);
+                }
+                codegen.sp_delta = outer;
+            }));
+    }
+
     fn emit_node(&mut self, node: NodeId) -> Result<(), Unsupported> {
         let data = self.graph.node(node);
         let allocation = self.allocation.node(node);
@@ -2085,6 +2100,7 @@ impl<'a> Codegen<'a> {
                         crate::arm64::field_type::emit_observe_known(
                             &mut self.ops,
                             &mut self.relocations,
+                            self.routines,
                             self.view,
                             owner,
                             value,
@@ -2105,6 +2121,7 @@ impl<'a> Codegen<'a> {
                             crate::arm64::field_type::emit_observe_known(
                                 &mut self.ops,
                                 &mut self.relocations,
+                                self.routines,
                                 self.view,
                                 owner,
                                 value,
@@ -3379,6 +3396,7 @@ impl<'a> Codegen<'a> {
                             crate::arm64::field_type::emit_observe_known(
                                 &mut self.ops,
                                 &mut self.relocations,
+                                self.routines,
                                 view,
                                 holder,
                                 stored_value,
@@ -3406,6 +3424,7 @@ impl<'a> Codegen<'a> {
                 crate::arm64::field_type::emit_observe_known(
                     &mut self.ops,
                     &mut self.relocations,
+                    self.routines,
                     view,
                     holder,
                     stored_value,
@@ -4970,16 +4989,11 @@ impl<'a> Codegen<'a> {
             generic_call(self)?;
         } else {
             // A proved target makes the generic entry the cold path.
-            let sp_delta = self.sp_delta;
-            self.deferred
-                .push(Box::new(move |codegen: &mut Codegen<'a>| {
-                    let outer = std::mem::replace(&mut codegen.sp_delta, sp_delta);
-                    if let Err(failure) = generic_call(codegen) {
-                        codegen.deferred_failure.get_or_insert(failure);
-                    }
-                    codegen.sp_delta = outer;
-                    dynasm!(codegen.ops ; .arch aarch64 ; b =>returned);
-                }));
+            self.defer(move |codegen| {
+                generic_call(codegen)?;
+                dynasm!(codegen.ops ; .arch aarch64 ; b =>returned);
+                Ok(())
+            });
         }
         dynasm!(self.ops ; .arch aarch64 ; =>returned);
         self.emit_pop_actuals(bytes);
@@ -5100,20 +5114,9 @@ impl<'a> Codegen<'a> {
         // Every status but success leaves the hot path: a callee that retired
         // itself for a tail call it staged is entered in its place, anything
         // else is routed to its handler.
-        let sp_delta = self.sp_delta;
-        self.deferred
-            .push(Box::new(move |codegen: &mut Codegen<'a>| {
-                let outer = std::mem::replace(&mut codegen.sp_delta, sp_delta);
-                if let Err(failure) = codegen.emit_abrupt_completion(
-                    node,
-                    abrupt,
-                    done,
-                    (threw, committed_throw, fatal),
-                ) {
-                    codegen.deferred_failure.get_or_insert(failure);
-                }
-                codegen.sp_delta = outer;
-            }));
+        self.defer(move |codegen| {
+            codegen.emit_abrupt_completion(node, abrupt, done, (threw, committed_throw, fatal))
+        });
         Ok(())
     }
 

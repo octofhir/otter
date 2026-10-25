@@ -5,6 +5,10 @@
 //! - Inline Top, exact Int32 and category membership with scalar widening.
 //! - A cold noncollecting VM leaf through the platform C boundary, also for
 //!   every widening of a summary code subscribed to.
+//! - [`emit_routine`] — that classification and leaf once per isolate: an
+//!   optimized store tests captured membership and an absorbing Top inline
+//!   and calls the routine for the rest, the value pushed above its return
+//!   address.
 //!
 //! # Invariants
 //! - Every store guard precedes observation. A store whose selected record has
@@ -25,7 +29,7 @@
 //! - `otter_vm::object::field_type` owns classification and monotone widening.
 //! - [`super::call_abi`] owns platform C arguments and result normalization.
 
-use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
+use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::object::field_type::{
     CONST_INT32, DOUBLE, FIRST_SHAPE_SHIFT, INT32, NULL, SECOND_SHAPE_SHIFT, SHAPE_MASK, TOP,
     UNDEFINED,
@@ -39,12 +43,17 @@ use crate::entry::{
     OBJECT_BODY_TYPE_TAG, THREAD_OFFSET, VALUE_NULL, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
 };
 use crate::field_store::FieldStoreOwner;
+use crate::routines::{Routine, RoutineOffsets, RoutineRequest};
+
+/// The register carrying the owner's address into the observation routine.
+pub(crate) const OBSERVE_OWNER: u8 = 10;
 
 /// Observe a store through `record`'s nonzero defining owner, already
 /// materialized in `Rq(owner)`: captured membership first, then the live word.
 pub(crate) fn emit_observe_known(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
+    routines: &RoutineRequest<'_>,
     view: &JitCompileSnapshot,
     owner: u8,
     value: u8,
@@ -58,7 +67,7 @@ pub(crate) fn emit_observe_known(
     let nullish_mask = u64::from(nullish_mask);
     debug_assert!(nullish_mask & !(NULL | UNDEFINED) == 0);
     if stored_shapes.is_empty() && nullish_mask == 0 && !record.int32 && !record.double {
-        emit_observe(ops, relocations, view, owner, value);
+        emit_observe_call(ops, relocations, routines, view, owner, value);
         return;
     }
     let done = ops.new_dynamic_label();
@@ -107,10 +116,88 @@ pub(crate) fn emit_observe_known(
         dynasm!(ops ; .arch x64 ; cmp Rq(value), nullish as i32 ; je =>done);
     }
     dynasm!(ops ; .arch x64 ; =>fallback);
-    emit_observe(ops, relocations, view, owner, value);
+    emit_observe_call(ops, relocations, routines, view, owner, value);
     dynasm!(ops ; .arch x64 ; =>done);
 }
 
+/// Observe a store through the owner in `Rq(owner)` with the shared routine:
+/// the owner's word answers an absorbing Top inline.
+fn emit_observe_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    routines: &RoutineRequest<'_>,
+    view: &JitCompileSnapshot,
+    owner: u8,
+    value: u8,
+) {
+    let done = ops.new_dynamic_label();
+    emit_live_word(ops, relocations, view, owner, done);
+    // The value travels on the stack: the call's target takes the other
+    // scratch register. The routine pops it as it returns.
+    dynasm!(ops ; .arch x64
+        ; mov Rq(OBSERVE_OWNER), Rq(owner)
+        ; push Rq(value));
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        11,
+        routines.entry(Routine::FieldObserve),
+        RelocationTarget::Routine {
+            routine: Routine::FieldObserve.name(),
+        },
+    );
+    dynasm!(ops ; .arch x64 ; call r11 ; =>done);
+}
+
+/// Emit the observation routine, returning its entry offsets. The owner's
+/// address arrives in [`OBSERVE_OWNER`] and the stored value in the word
+/// above the return address, which the routine pops; every other register
+/// survives.
+pub(crate) fn emit_routine(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+) -> RoutineOffsets {
+    let entry = ops.offset().0;
+    let done = ops.new_dynamic_label();
+    // The pushed value and the return address keep the stack aligned.
+    dynasm!(ops ; .arch x64
+        ; sub rsp, 16 ; mov [rsp], rax ; mov [rsp + 8], rcx
+        ; mov rax, Rq(OBSERVE_OWNER) ; mov rcx, [rsp + 24]);
+    emit_classify(ops, relocations, view, 0, 1, done);
+    dynasm!(ops ; .arch x64
+        ; =>done
+        ; mov rax, [rsp] ; mov rcx, [rsp + 8] ; add rsp, 16
+        ; ret 8);
+    RoutineOffsets {
+        entry,
+        second: entry,
+    }
+}
+
+/// `Rq(owner)` becomes the address of the owner it holds the offset of; a
+/// zero owner or a Top summary go to `done`.
+fn emit_live_word(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    owner: u8,
+    done: DynamicLabel,
+) {
+    dynasm!(ops ; .arch x64 ; test Rd(owner), Rd(owner) ; jz =>done);
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        10,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops ; .arch x64
+        ; add Rq(owner), r10
+        ; test BYTE [Rq(owner) + view.shape_field_type_byte as i32], TOP as i8 ; jnz =>done);
+}
+
+/// Observe a store through the owner whose offset `Rq(owner)` holds, inline.
 pub(crate) fn emit_observe(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -118,12 +205,28 @@ pub(crate) fn emit_observe(
     owner: u8,
     value: u8,
 ) {
+    let done = ops.new_dynamic_label();
+    emit_live_word(ops, relocations, view, owner, done);
+    emit_classify(ops, relocations, view, owner, value, done);
+    dynasm!(ops ; .arch x64 ; =>done);
+}
+
+/// Widen the summary of the owner at `Rq(owner)` by `value`, going to `done`
+/// once it holds the value, or falling through after the cold leaf widened
+/// it.
+fn emit_classify(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    owner: u8,
+    value: u8,
+    done: DynamicLabel,
+) {
     // Code subscribed to the summary: every widening goes through the VM,
     // which fires it.
     const WATCHED: i8 = otter_vm::code_dependencies::ShapeFact::FieldType as i8;
     debug_assert!(owner != value && !matches!(owner, 4 | 5 | 10 | 11 | 13 | 14 | 15));
     debug_assert!(!matches!(value, 10 | 11));
-    let done = ops.new_dynamic_label();
     let scalar = ops.new_dynamic_label();
     let top = ops.new_dynamic_label();
     let null = ops.new_dynamic_label();
@@ -137,17 +240,6 @@ pub(crate) fn emit_observe(
     let null_union = ops.new_dynamic_label();
     let undefined_union = ops.new_dynamic_label();
     let slow = ops.new_dynamic_label();
-    dynasm!(ops ; .arch x64 ; test Rd(owner), Rd(owner) ; jz =>done);
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        10,
-        view.cage_base as u64,
-        RelocationTarget::GcCageBase,
-    );
-    dynasm!(ops ; .arch x64
-        ; add Rq(owner), r10
-        ; test BYTE [Rq(owner) + view.shape_field_type_byte as i32], TOP as i8 ; jnz =>done);
     emit_load_u64(ops, 10, 0xfffe_0000_0000_0007);
     dynasm!(ops ; .arch x64
         ; test Rq(value), r10 ; jnz =>scalar ; test Rq(value), Rq(value) ; jz =>top
@@ -257,5 +349,5 @@ pub(crate) fn emit_observe(
     for (index, register) in registers.iter().copied().enumerate() {
         dynasm!(ops ; .arch x64 ; mov Rq(register), [rsp + index as i32 * 8]);
     }
-    dynasm!(ops ; .arch x64 ; add rsp, 208 ; =>done);
+    dynasm!(ops ; .arch x64 ; add rsp, 208);
 }

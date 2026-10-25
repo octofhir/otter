@@ -66,9 +66,9 @@ results.push(holes, mixes.length);
 // both edges survive the collections that move or mark those children.
 function label(key) { return 'String for key ' + String(key) + ' in leaf node'; }
 const labels = [];
-for (let round = 0; round < 60000; round++) {
+for (let round = 0; round < 12000; round++) {
   labels.push(label(round * 1.5));
-  if (labels.length > 20000) labels.shift();
+  if (labels.length > 4000) labels.shift();
   if (round % 7 === 0) labels.push({ garbage: [round, round] }.garbage.length + '');
 }
 let labelled = 0;

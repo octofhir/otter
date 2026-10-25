@@ -116,7 +116,7 @@ use crate::page::{CELL_SIZE, align_up};
 use crate::page::{LARGE_OBJECT_THRESHOLD, PAGE_HEADER_SIZE, page_base_from_offset};
 use crate::scavenger::ScavengeStats;
 use crate::space::{LargeObjectSpace, NewSpace, OldSpace};
-use crate::stats::{GcStats, TYPE_TAG_COUNT};
+use crate::stats::GcStats;
 use crate::store::GcStore;
 use crate::trace::{TraceTable, Traceable};
 
@@ -157,8 +157,6 @@ pub const EMBEDDER_ROOT_SLOTS: usize = 2;
 /// Old-generation size from which a stop-the-world mark drain runs on the
 /// helper threads too.
 const PARALLEL_MARK_MIN_OLD_BYTES: u64 = 8 * 1024 * 1024;
-/// Old-space pages from which a sweep runs on the helper threads too.
-const PARALLEL_SWEEP_MIN_PAGES: usize = 32;
 /// Trivial empty-roots implementation; useful in tests where all
 /// reachable objects sit in handle scopes.
 pub struct EmptyRoots;
@@ -376,6 +374,9 @@ pub struct GcHeap {
     /// whitened its survivors, and no restored page brought colors in. A
     /// cycle starting while this holds skips the whole-heap color reset.
     marks_white: bool,
+    /// The old-space sweep of the last full collection while its pages are
+    /// still being walked behind the pause; see [`sweeping`].
+    sweeping: Option<sweeping::SweepCycle>,
     /// External reservation bytes that force a mark-compact: the surviving
     /// reservations plus [`EXTERNAL_ALLOCATION_SOFT_LIMIT`].
     external_limit: u64,
@@ -600,6 +601,7 @@ impl GcHeap {
             ),
             gc_threads: crate::gc_threads::GcThreads::default(),
             marks_white: true,
+            sweeping: None,
             external_limit: EXTERNAL_ALLOCATION_SOFT_LIMIT,
             old_generation_bytes_at_last_gc: 0,
             last_major_gc_end: Instant::now(),
@@ -1033,6 +1035,13 @@ impl GcHeap {
         }
         if self.tracked_bytes.saturating_add(bytes) <= cap {
             return Ok(true);
+        }
+        // A sweep still in progress charges its dead cells until it ends.
+        if self.sweeping.is_some() {
+            self.complete_old_sweep();
+            if self.tracked_bytes.saturating_add(bytes) <= cap {
+                return Ok(true);
+            }
         }
         if self.always_allocate_depth != 0 {
             return Ok(false);
@@ -1979,6 +1988,7 @@ impl GcHeap {
                 Some(off) => off,
                 None if self.always_allocate_depth != 0 || scavenged => {
                     placed_in_old = true;
+                    self.help_old_sweep();
                     self.old_space.alloc(aligned)?
                 }
                 None => {
@@ -2004,6 +2014,7 @@ impl GcHeap {
                         // set (e.g. building a large array of objects).
                         None => {
                             placed_in_old = true;
+                            self.help_old_sweep();
                             self.old_space.alloc(aligned)?
                         }
                     }
@@ -2273,6 +2284,7 @@ impl GcHeap {
         let offset = if aligned > LARGE_OBJECT_THRESHOLD {
             self.large_space.alloc(aligned)?
         } else {
+            self.help_old_sweep();
             self.old_space.alloc(aligned)?
         };
         // SAFETY: offset is a fresh in-cage allocation.
@@ -2612,6 +2624,8 @@ impl GcHeap {
         &mut self,
         external_visit: &mut RootSlotVisitor<'_>,
     ) -> Result<(), OutOfMemory> {
+        // The scavenge needs the helpers and promotes into old space.
+        self.complete_old_sweep();
         // A concurrent marker never reads young cells, but the scavenge needs
         // the helpers; it resumes once the nursery is evacuated.
         let resume_marking = self.marking.is_concurrent();
@@ -2763,6 +2777,7 @@ impl GcHeap {
         external_visit: &mut RootSlotVisitor<'_>,
         goal: FullGcGoal,
     ) -> Result<(), OutOfMemory> {
+        self.complete_old_sweep();
         let pause_start = Instant::now();
         let old_generation_before = self.old_generation_consumed_bytes();
         // A cycle already marking, concurrently or between incremental
@@ -2773,8 +2788,7 @@ impl GcHeap {
             self.mark_phase(external_visit)?;
         }
         self.run_post_mark_processing();
-        self.sweep_phase_with_pause_start(pause_start, goal);
-        self.recompute_allocation_limits(pause_start, old_generation_before);
+        self.sweep_phase_with_pause_start(pause_start, goal, Some(old_generation_before));
         Ok(())
     }
 
@@ -2850,6 +2864,14 @@ impl GcHeap {
     ) -> Result<(), OutOfMemory> {
         if self.always_allocate_depth != 0 || self.in_major_gc {
             return Ok(());
+        }
+        if self.sweeping.is_some() {
+            // The last cycle's sweep is still settling the old generation's
+            // size; no cycle starts before it completes.
+            self.drain_old_sweep();
+            if self.sweeping.is_some() {
+                return Ok(());
+            }
         }
         if self.marking.is_concurrent() {
             // Helpers are marking: hand them what the barrier shaded, and
@@ -3332,12 +3354,20 @@ impl GcHeap {
     /// Finish an explicit split full-GC cycle and release unused physical payload.
     pub fn sweep_phase(&mut self) {
         self.with_gc_pause(GcPauseKind::SplitSweep, GcPauseTrigger::Explicit, |heap| {
-            heap.sweep_phase_with_pause_start(Instant::now(), FullGcGoal::ReleaseMemory);
+            heap.sweep_phase_with_pause_start(Instant::now(), FullGcGoal::ReleaseMemory, None);
             ((), GcPauseOutcome::Completed)
         });
     }
 
-    fn sweep_phase_with_pause_start(&mut self, pause_start: Instant, goal: FullGcGoal) {
+    /// Sweep after a completed mark. With `limits` (the old generation's
+    /// size before the collection), the allocation limits follow the
+    /// completed sweep.
+    fn sweep_phase_with_pause_start(
+        &mut self,
+        pause_start: Instant,
+        goal: FullGcGoal,
+        limits: Option<u64>,
+    ) {
         self.retire_machine_labs();
         self.prepare_collection_observations();
         // Heap-owned weak state is always present, even when a split sweep
@@ -3362,30 +3392,20 @@ impl GcHeap {
         self.prune_weak_finalization_registry_to_marked();
         self.weak_cleanup_due |= self.weak_finalization.has_finalization_registries();
 
-        // Sweep white old/large cells and reap wholly dead pages.
-        // The finishing scavenge has already copied nursery survivors
-        // into the active from-space. Preserve its initialized prefix,
-        // including cells whose old parent became unreachable only in
-        // this full mark; the next scavenge can reclaim those cells.
-        // Only inactive payload and unused active tails may be discarded.
+        // White large cells are reclaimed and wholly dead large pages reaped
+        // here; old pages are swept by an [`sweep::OldSweep`] cycle, in this
+        // pause or behind it. The finishing scavenge has already copied
+        // nursery survivors into the active from-space. Preserve its
+        // initialized prefix, including cells whose old parent became
+        // unreachable only in this full mark; the next scavenge can reclaim
+        // those cells. Only inactive payload and unused active tails may be
+        // discarded.
         //
-        // The same walk also accumulates per-tag live counts
-        // for [`crate::stats::GcStats`] reconciliation — fused
-        // into one pass over the heap so the GC pause cost
-        // stays bounded by the existing sweep work.
-        // SAFETY: STW pause.
-        let mut reclaimed = 0usize;
-        // Physical retained bytes are accumulated in the sweep's existing
-        // page loops; no second object census is needed for cap accounting.
+        // The same walks accumulate per-tag live counts for
+        // [`crate::stats::GcStats`] reconciliation, so a full collection
+        // pays for one heap walk.
         let track_cap = self.max_heap_bytes != 0;
-        let mut retained_bytes = 0u64;
-        let mut per_tag_live_count = [0u64; TYPE_TAG_COUNT];
-        let mut per_tag_live_bytes = [0usize; TYPE_TAG_COUNT];
-        // Free ranges recovered from partially-live old pages this sweep
-        // (page-absolute cage offset + byte length), published to the
-        // old-space free list after the walk and the reclamation hooks.
-        let free_ranges: Vec<(u32, usize)>;
-        self.old_space.clear_free_list();
+        let mut totals = sweep::SweepTotals::default();
         // Prune the remembered set to parents that survived this full GC.
         // The embedded pre-mark scavenge (`start_incremental_mark_phase`)
         // repopulated the buffer with the live old→young edges among
@@ -3406,39 +3426,8 @@ impl GcHeap {
                 false
             }
         });
+        // SAFETY: STW pause.
         unsafe {
-            // Old-space sweep, on the helper threads too for a large old
-            // space; see `sweep::sweep_old_pages`. The dead cells with
-            // reclamation hooks it recorded are reclaimed here, before any
-            // recovered range is listed.
-            let parallel = self.old_space.page_count() >= PARALLEL_SWEEP_MIN_PAGES;
-            let old = sweep::sweep_old_pages(
-                self.old_space.pages(),
-                &self.trace_table,
-                &mut self.gc_threads,
-                parallel,
-            );
-            for &(header, tag) in &old.reclaim {
-                let h = header as *mut GcHeader;
-                if let Some(release_fn) = self.trace_table.get_host_release(tag) {
-                    release_fn(h, &mut self.host_refs);
-                }
-                if let Some(finalize_fn) = self.trace_table.get_finalize(tag) {
-                    finalize_fn(h);
-                }
-                if let Some(drop_fn) = self.trace_table.get_drop(tag) {
-                    drop_fn(h);
-                }
-            }
-            reclaimed += old.reclaimed;
-            for tag in 0..TYPE_TAG_COUNT {
-                per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(old.live_count[tag]);
-                per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(old.live_bytes[tag]);
-            }
-            if track_cap {
-                retained_bytes = retained_bytes.saturating_add(old.retained);
-            }
-            free_ranges = old.free_ranges;
             for page in self.large_space.pages() {
                 page.for_each_object(|h, _| {
                     let tag = (*h).type_tag() as usize;
@@ -3459,17 +3448,18 @@ impl GcHeap {
                                 drop_fn(h);
                             }
                             (*h).set_swept();
-                            reclaimed += size;
+                            totals.reclaimed += size;
                         }
                     } else {
                         (*h).clear_mark();
-                        per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
-                        per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(size);
+                        totals.live_count[tag] = totals.live_count[tag].wrapping_add(1);
+                        totals.live_bytes[tag] = totals.live_bytes[tag].wrapping_add(size);
                     }
                 });
                 if track_cap && page.header().live_bytes != 0 {
-                    retained_bytes =
-                        retained_bytes.saturating_add(page.header().allocated_bytes as u64);
+                    totals.retained = totals
+                        .retained
+                        .saturating_add(page.header().allocated_bytes as u64);
                 }
             }
             // Young from-space is recycled at next scavenge but
@@ -3481,54 +3471,23 @@ impl GcHeap {
                 // These physical survivor cells remain in the nursery until
                 // the next scavenge, regardless of per-type mark statistics.
                 if track_cap {
-                    retained_bytes =
-                        retained_bytes.saturating_add(page.header().allocated_bytes as u64);
+                    totals.retained = totals
+                        .retained
+                        .saturating_add(page.header().allocated_bytes as u64);
                 }
                 // Every nursery cell is a survivor of the finishing scavenge.
                 page.for_each_object(|h, _| {
                     if (*h).type_tag() != crate::header::FREE_TAG {
                         let tag = (*h).type_tag() as usize;
                         let size = (*h).size_bytes() as usize;
-                        per_tag_live_count[tag] = per_tag_live_count[tag].wrapping_add(1);
-                        per_tag_live_bytes[tag] = per_tag_live_bytes[tag].wrapping_add(size);
+                        totals.live_count[tag] = totals.live_count[tag].wrapping_add(1);
+                        totals.live_bytes[tag] = totals.live_bytes[tag].wrapping_add(size);
                     }
                 });
             }
         }
-        // Reap empty pages. Free-range publication follows every reader
-        // and the physical discard below, using the sweep's same range vector.
-        let _ = self.old_space.reap_dead_pages();
         let _ = self.large_space.reap_dead_pages();
-        // A dead tail was handed back to bump allocation above; reopen every
-        // page that has real bump room again.
-        self.old_space.reopen_bump_pages();
         self.marking.finish_cycle();
-        // The walks above whitened every surviving cell.
-        self.marks_white = true;
-        // All dead-cell and backing-store finalizers have completed. This is
-        // the sole ledger commit shared by full, split and incremental sweep.
-        self.drain_shared_external_releases();
-        if self.max_heap_bytes != 0 {
-            self.tracked_bytes = retained_bytes.saturating_add(self.reserved_bytes);
-        }
-        if goal == FullGcGoal::ReleaseMemory {
-            // Every weak/finalizer/trace consumer is finished and marker
-            // workers are stopped. Throughput requests retain resident payload
-            // for reuse; release requests preserve its virtual ownership.
-            // SAFETY: this STW sweep retired both LABs before walking the heap;
-            // finish_cycle above drained the marker and all reclamation hooks ran.
-            unsafe { self.new_space.discard_unused_payload() };
-            // Preserve every FREE header/link prefix before publication.
-            // SAFETY: all workers and hooks finished, dead pages were reaped,
-            // the old free list is still clear and both LABs are retired.
-            unsafe { self.old_space.discard_swept_unused_payload(&free_ranges) };
-        }
-        for (offset, bytes) in free_ranges {
-            self.old_space.push_free_range(offset, bytes);
-        }
-        self.stats.last_full_reclaimed = reclaimed;
-        self.stats.total_full_reclaimed = self.stats.total_full_reclaimed.saturating_add(reclaimed);
-        self.gc_stats.last_gc_reclaimed_bytes = reclaimed;
         self.gc_stats.gc_cycles = self.gc_stats.gc_cycles.saturating_add(1);
         let elapsed = pause_start.elapsed();
         self.gc_stats.last_gc_pause_ms = elapsed.as_secs_f32() * 1000.0;
@@ -3536,14 +3495,7 @@ impl GcHeap {
             .gc_stats
             .full_pause_ns_total
             .saturating_add(elapsed.as_nanos().min(u128::from(u64::MAX)) as u64);
-        // Commit the per-tag counters gathered during the sweep
-        // pass — replaces the standalone `reconcile_live_counts`
-        // walk so the full GC pays for at most one heap walk.
-        for tag in 0..TYPE_TAG_COUNT {
-            let row = &mut self.gc_stats.by_type[tag];
-            row.live_bytes = per_tag_live_bytes[tag];
-            row.live_count = per_tag_live_count[tag];
-        }
+        self.start_old_sweep(totals, goal, pause_start, limits);
     }
 
     /// `(minor cycles, full cycles)` completed so far.
@@ -3561,8 +3513,11 @@ impl GcHeap {
     /// allocator updates its type's row; the aggregates `live_objects` and
     /// `live_bytes` are summed from the rows here. `alloc_bytes_total` adds
     /// what generated code carved, derived from the allocation buffers'
-    /// progress rather than counted per cell.
+    /// progress rather than counted per cell. A sweep still in progress
+    /// completes first.
     pub fn gc_stats(&mut self) -> &GcStats {
+        // A full collection's statistics are its completed sweep's.
+        self.complete_old_sweep();
         let mut live_objects = 0usize;
         let mut live_bytes = 0usize;
         let mut alloc_bytes_total = 0u64;
@@ -3707,6 +3662,7 @@ impl GcHeap {
     where
         F: FnMut(*mut GcHeader),
     {
+        debug_assert!(self.sweeping.is_none(), "finish the sweep before walking");
         self.sync_lab();
         // SAFETY: STW pause + valid pages.
         unsafe {
@@ -3809,6 +3765,7 @@ impl GcHeap {
     /// from-space, large, young large. Lets [`crate::census`] attribute
     /// objects to a space without opening up the space fields.
     pub(crate) fn census_spaces(&self) -> [(crate::page::SpaceKind, &[crate::page::Page]); 4] {
+        debug_assert!(self.sweeping.is_none(), "finish the sweep before walking");
         self.sync_lab();
         [
             (crate::page::SpaceKind::Old, self.old_space.pages()),
@@ -3880,6 +3837,7 @@ impl std::fmt::Debug for GcHeap {
 impl Drop for GcHeap {
     fn drop(&mut self) {
         self.marking.stop_concurrent(&mut self.gc_threads);
+        self.complete_old_sweep();
         self.retire_machine_labs();
         // Runtime disposal is a terminal STW boundary. Page ownership alone
         // returns cage memory, but Rust payloads may own external resources
@@ -3943,6 +3901,7 @@ mod tenured;
 
 #[path = "heap/sweep.rs"]
 mod sweep;
+mod sweeping;
 pub use tenured::{OLD_LAB_BYTES, SitePlacement};
 
 #[cfg(test)]

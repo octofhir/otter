@@ -72,7 +72,7 @@ fn assert_buckets_are_consistent(natives: &NativeCensus) {
 
 #[test]
 fn full_surface_bootstrap_census() {
-    let runtime = full_surface_runtime();
+    let mut runtime = full_surface_runtime();
     let heap = runtime.heap_census();
     let natives = runtime.native_census();
 
@@ -164,7 +164,7 @@ fn a_built_runtime_leaves_nothing_in_the_nursery() {
 }
 
 fn built_runtimes_leave_nothing_in_the_nursery() {
-    let surfaces: [(&str, Runtime); 5] = [
+    let mut surfaces: [(&str, Runtime); 5] = [
         ("base", base_runtime()),
         (
             "+node",
@@ -192,7 +192,7 @@ fn built_runtimes_leave_nothing_in_the_nursery() {
         "surface", "old_obj", "old_bytes", "yng_obj", "yng_bytes", "natives", "old_nat", "yng_nat",
     );
     let mut rows = Vec::new();
-    for (label, runtime) in &surfaces {
+    for (label, runtime) in &mut surfaces {
         let heap = runtime.heap_census();
         let natives = runtime.native_census();
         println!(

@@ -617,6 +617,9 @@ pub(crate) enum Kind {
         owners: SmallVec<[FieldStoreOwner; 4]>,
         receiver_shape: Option<u32>,
         fresh: bool,
+        /// The one program is the source's proved program for
+        /// `receiver_shape`, not one of the site's own.
+        proved: bool,
     },
     /// Store input1 into the own data property receiver input0 keeps in an
     /// exotic body slot (a RegExp's `lastIndex`). Eager deopt unless input0

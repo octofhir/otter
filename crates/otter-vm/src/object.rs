@@ -169,8 +169,8 @@ pub(crate) use shape_runtime::ShapeRuntime;
 #[cfg(test)]
 pub(crate) use shape_transition::capture_store_property_transition;
 pub(crate) use shape_transition::{
-    StorePropertyTransition, StorePropertyTransitionKind,
-    capture_store_property_transition_with_shape, replay_store_property_transition,
+    ShapeStore, StorePropertyTransition, StorePropertyTransitionKind,
+    capture_store_property_transition_with_shape, replay_store_property_transition, shape_store,
 };
 
 /// Id 0 is reserved: [`ShapeId::UNASSIGNED`].

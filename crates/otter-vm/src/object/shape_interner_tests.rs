@@ -292,3 +292,50 @@ fn shape_interner_collecting_young_prototype_publication_can_reenter_state_owner
     .expect("cached prototype root");
     assert_eq!(repeated, instance_root);
 }
+
+#[test]
+fn shape_stores_follow_interned_children_and_own_slots() {
+    use crate::object::{ShapeStore, StorePropertyTransitionKind, shape_store};
+    use crate::property_atom::{AtomizedPropertyKey, PropertyAtom};
+    let (mut heap, mut runtime) = fixture();
+    let root = shape_body::null_root(&heap);
+    let first = child(&mut runtime, &mut heap, root, "a");
+    let second = child(&mut runtime, &mut heap, first, "b");
+    let key = |heap: &GcHeap, name: &'static str| {
+        let atom = IsolateNames::of(heap).names().lookup(name);
+        AtomizedPropertyKey::new(PropertyAtom::new(atom), name)
+    };
+    assert_eq!(
+        crate::object::shape_interner::ShapeInterner::children_of(&heap, root).as_slice(),
+        &[first]
+    );
+    // A null-prototype append needs no chain proof.
+    match shape_store(&heap, root, key(&heap, "a")) {
+        Some(ShapeStore::Append {
+            child,
+            field,
+            kind: StorePropertyTransitionKind::OwnAdd,
+        }) => {
+            assert_eq!(child, first);
+            assert_eq!(field, shape_body::own_field_of(first));
+        }
+        other => panic!("append expected, got {other:?}"),
+    }
+    match shape_store(&heap, second, key(&heap, "a")) {
+        Some(ShapeStore::Own(field)) => {
+            assert_eq!(
+                field.logical_slot(shape_body::inline_capacity_of(second)),
+                0
+            );
+        }
+        other => panic!("own overwrite expected, got {other:?}"),
+    }
+    assert!(matches!(
+        shape_store(&heap, first, key(&heap, "b")),
+        Some(ShapeStore::Append { child, .. }) if child == second
+    ));
+    // A key never appended to the shape has no interned child.
+    let unseen = IsolateNames::of_mut(&mut heap).names_mut().intern("never");
+    let never = AtomizedPropertyKey::new(PropertyAtom::new(unseen), "never");
+    assert!(shape_store(&heap, root, never).is_none());
+}

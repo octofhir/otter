@@ -389,6 +389,7 @@ fn walk(
                     fresh,
                     plan,
                     owners,
+                    proved,
                 } => {
                     let receiver = node_data.inputs[0];
                     let Some(object) = candidate_object(&state, candidates, receiver, &mut escaped)
@@ -396,7 +397,9 @@ fn walk(
                         continue;
                     };
                     let index = plan.program().map(usize::from).or_else(|| {
-                        source.property_programs.get(byte_pc)?.iter().position(|program| {
+                        super::feedback::store_node_programs(source, *byte_pc, *receiver_shape, *proved)?
+                            .iter()
+                            .position(|program| {
                             matches!(program.ops.first(), Some(JitCacheIrOp::GuardShape { object: 0, shape }) if *shape == object.shape)
                         })
                     });
@@ -751,11 +754,17 @@ fn receiver_program(
     shape: u32,
 ) -> Option<&[JitCacheIrOp]> {
     view.property_programs
-        .get(&byte_pc)?
-        .iter()
+        .get(&byte_pc)
+        .into_iter()
+        .flatten()
         .map(|program| &program.ops[..])
         .find(|ops| {
             matches!(ops.first(), Some(JitCacheIrOp::GuardShape { object: 0, shape: guarded }) if *guarded == shape)
+        })
+        .or_else(|| {
+            view.proved_store_programs
+                .get(&(byte_pc, shape))
+                .map(|program| &program.ops[..])
         })
 }
 

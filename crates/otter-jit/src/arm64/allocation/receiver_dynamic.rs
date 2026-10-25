@@ -3,8 +3,15 @@
 //! # Contents
 //! - Existing boxed LeafValue2 admission and ContextWords feedback commit.
 //! - Variable-capacity initialization through the common LAB owner.
+//! - The planned entry of an optimized body: its own steady family proved
+//!   inline and its root receiver fitted with no runtime call.
 //!
 //! # Invariants
+//! The planned entry takes only a closure new.target whose family head is the
+//! plan's finalized family, under an optimized caller, which records no
+//! construct feedback; it publishes no sampling ticket, as a finalized
+//! family's commit would release it. Every miss reaches the dynamic entry
+//! before any effect.
 //! Frame, actuals and tagged homes are published first. Only a nonzero int32
 //! Probe Success reaches writes. No call/GC separates full initialization and
 //! one LAB publication. Ticket stores preserve DerivedThis. Pre-effect misses
@@ -38,6 +45,38 @@ const LAB: LabRegisters = LabRegisters {
 fn count(ops: &mut Assembler, byte: u32) {
     dynasm!(ops ; .arch aarch64 ; ldr x15, [x20, RUNTIME_STATS_OFFSET]
         ; ldr x14, [x15, byte] ; add x14, x14, #1 ; str x14, [x15, byte]);
+}
+
+/// The receiver of an optimized body's own steady family, `plan`: proved
+/// and fitted inline, then `complete` with the receiver in `x0` and success
+/// in `x1`; any miss branches to `dynamic` before an effect. x20 context /
+/// x21 frame are pinned.
+pub(crate) fn emit_planned_construct_receiver(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    plan: otter_vm::jit::JitReceiverAllocationPlan,
+    complete: DynamicLabel,
+    dynamic: DynamicLabel,
+) {
+    use crate::template::arm64::values::{CellTest, emit_cell_test};
+    dynasm!(ops ; .arch aarch64
+        ; ldr x11, [x21, abi::NATIVE_FRAME_CALLER_OFFSET] ; cbz x11, =>dynamic
+        ; ldrb w11, [x11, abi::NATIVE_FRAME_KIND_OFFSET]
+        ; cmp w11, abi::NativeFrameKind::Optimizing as u32 ; b.ne =>dynamic
+        ; ldr x2, [x21, abi::NATIVE_FRAME_NEW_TARGET_OFFSET]);
+    emit_cell_test(ops, 2, CellTest::IsNotCell, dynamic);
+    dynasm!(ops ; .arch aarch64
+        ; ldrb w11, [x2] ; cmp w11, otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as u32
+        ; b.ne =>dynamic);
+    crate::arm64::emit_receiver_guards(ops, relocations, view, plan, dynamic);
+    crate::arm64::emit_receiver_fit(ops, view, plan, 20, dynamic);
+    crate::arm64::emit_receiver_bump(ops);
+    dynasm!(ops ; .arch aarch64
+        ; str wzr, [x21, abi::NATIVE_FRAME_CONSTRUCT_LAYOUT_OFFSET]
+        ; str x0, [x21, abi::NATIVE_FRAME_CONSTRUCT_RECEIVER_OFFSET]
+        ; str x0, [x21, NATIVE_FRAME_THIS_OFFSET]
+        ; mov x1, xzr ; b =>complete);
 }
 
 /// x20 context/x21 frame are pinned. Caller preserves its live x6 promotion

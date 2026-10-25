@@ -50,7 +50,12 @@ impl Interpreter {
     /// Prepare defining cells for every own property and native birth field.
     pub(super) fn bake_field_types(&self, view: &mut JitCompileSnapshot) {
         let mut locations = BTreeSet::new();
-        for programs in view.property_programs.values() {
+        let programs = view
+            .property_programs
+            .values()
+            .flatten()
+            .chain(view.proved_store_programs.values());
+        {
             for program in programs {
                 let operand = u8::from(matches!(
                     program.ops.first(),

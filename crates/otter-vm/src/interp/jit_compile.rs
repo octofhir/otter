@@ -58,6 +58,9 @@ mod field_types;
 #[path = "jit_inline_methods.rs"]
 mod inline_methods;
 
+#[path = "jit_proved_stores.rs"]
+mod proved_stores;
+
 #[path = "jit_receiver_methods.rs"]
 mod receiver_methods;
 use receiver_methods::ConstructReceiver;
@@ -649,6 +652,8 @@ impl Interpreter {
         Self::bake_context_allocations(&mut snapshot);
         self.bake_closure_allocations(&mut snapshot, context);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
+        self.bake_own_receiver_plan(&mut snapshot, fid);
+        self.bake_proved_stores_tree(&mut snapshot);
         self.bake_field_type_tree(&mut snapshot);
         // Every shape baked so far that no object has left yet: a value
         // proven to have one survives calls while the generation's

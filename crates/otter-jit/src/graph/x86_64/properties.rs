@@ -400,12 +400,22 @@ impl Codegen<'_> {
         [holder, scratch]: [u8; 2],
         destination: Option<u8>,
     ) -> Result<(), Unsupported> {
-        let programs = self
-            .view_of(node)
-            .property_programs
-            .get(&pc)
-            .ok_or(Unsupported::OperandShape("x86 graph named programs"))?
-            .clone();
+        let (receiver_shape, proved) = match self.graph.node(node).kind {
+            Kind::StoreNamedProperty {
+                receiver_shape,
+                proved,
+                ..
+            } => (receiver_shape, proved),
+            _ => (None, false),
+        };
+        let programs = crate::graph::feedback::store_node_programs(
+            self.view_of(node),
+            pc,
+            receiver_shape,
+            proved,
+        )
+        .ok_or(Unsupported::OperandShape("x86 graph named programs"))?
+        .to_vec();
         let (selected, receiver_shape, owners, fresh, plan) =
             match self.graph.node(node).kind.clone() {
                 Kind::LoadNamedProperty {

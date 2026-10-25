@@ -41,7 +41,9 @@ use crate::entry::{ALLOC_WINDOW_LAB_OFFSET, LAB_LIMIT_OFFSET, LAB_TOP_OFFSET, VA
 use crate::template::arm64::values::{CellTest, emit_cell_test, emit_load_u64};
 
 mod receiver_dynamic;
-pub(crate) use receiver_dynamic::emit_dynamic_construct_receiver;
+pub(crate) use receiver_dynamic::{
+    emit_dynamic_construct_receiver, emit_planned_construct_receiver,
+};
 
 mod string;
 pub(crate) use string::emit_concat;

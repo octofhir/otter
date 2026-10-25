@@ -665,6 +665,8 @@ impl CodeBlock {
             instanceof_cells: rustc_hash::FxHashMap::default(),
             forward_apply_native_ref: None,
             property_programs: rustc_hash::FxHashMap::default(),
+            proved_store_programs: rustc_hash::FxHashMap::default(),
+            own_receiver_plan: None,
             property_action_cache: None,
             property_accesses: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),

@@ -13,6 +13,8 @@
 //!   write and return replay metadata when the path is IC-compatible.
 //! - [`replay_store_property_transition`] — validate guards and add the cached
 //!   own data slot on a fresh matching receiver.
+//! - [`shape_store`] — what a named store does to any object of one exact
+//!   shape, from the shape, its interned children and the live chain alone.
 //!
 //! # Invariants
 //! - Replay only applies to fast-shape ordinary objects.
@@ -379,32 +381,95 @@ fn transition_kind(
         is_fast_shape_body(body).then(|| body.prototype())
     })? {
         ObjectPrototype::Null => Some(StorePropertyTransitionKind::OwnAdd),
-        ObjectPrototype::Object(first) => {
-            let mut proto = first;
-            for _ in 0..super::PROTO_CHAIN_HARD_CAP {
-                if !super::supports_fast_property_ic(proto, heap) {
-                    return None;
-                }
-                match lookup_own_atom(proto, heap, key).lookup {
-                    PropertyLookup::Absent => {}
-                    PropertyLookup::Data { flags, .. } if flags.writable() => {
-                        return Some(StorePropertyTransitionKind::PrototypeWritableData {
-                            validity: chain_validity(first, heap)?,
-                        });
-                    }
-                    PropertyLookup::Data { .. } | PropertyLookup::Accessor { .. } => return None,
-                }
-                if prototype_value(proto, heap).is_none() {
-                    return Some(StorePropertyTransitionKind::PrototypeChainMissing {
-                        validity: chain_validity(first, heap)?,
-                    });
-                }
-                proto = super::prototype(proto, heap)?;
-            }
-            None
-        }
+        ObjectPrototype::Object(first) => chain_append_kind(heap, first, key),
         ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_) => None,
     }
+}
+
+/// The proof an own append of `key` under the ordinary prototype chain
+/// starting at `first` needs: the key is absent from the whole chain, or its
+/// first holder has writable data the append shadows.
+fn chain_append_kind(
+    heap: &otter_gc::GcHeap,
+    first: JsObject,
+    key: AtomizedPropertyKey<'_>,
+) -> Option<StorePropertyTransitionKind> {
+    let mut proto = first;
+    for _ in 0..super::PROTO_CHAIN_HARD_CAP {
+        if !super::supports_fast_property_ic(proto, heap) {
+            return None;
+        }
+        match lookup_own_atom(proto, heap, key).lookup {
+            PropertyLookup::Absent => {}
+            PropertyLookup::Data { flags, .. } if flags.writable() => {
+                return Some(StorePropertyTransitionKind::PrototypeWritableData {
+                    validity: chain_validity(first, heap)?,
+                });
+            }
+            PropertyLookup::Data { .. } | PropertyLookup::Accessor { .. } => return None,
+        }
+        if prototype_value(proto, heap).is_none() {
+            return Some(StorePropertyTransitionKind::PrototypeChainMissing {
+                validity: chain_validity(first, heap)?,
+            });
+        }
+        proto = super::prototype(proto, heap)?;
+    }
+    None
+}
+
+/// What a named `[[Set]]` of `key` does to any extensible ordinary object of
+/// the exact `shape`, as far as the shape, its interned children and the live
+/// prototype chain fix it.
+#[derive(Debug, Clone)]
+pub(crate) enum ShapeStore {
+    /// Overwrite the existing own writable data slot.
+    Own(super::FieldLocation),
+    /// Append the slot at `field` and publish the interned `child`, under the
+    /// chain proof `kind` names.
+    Append {
+        child: ShapeHandle,
+        field: super::FieldLocation,
+        kind: StorePropertyTransitionKind,
+    },
+}
+
+/// [`ShapeStore`] of `key` on objects of `shape`. `None` for a non-ordinary
+/// shape, an accessor or read-only own property, a key never appended to
+/// this shape, an append outside its inline geometry, or a chain whose
+/// holder forbids the append. Reads only; never allocates.
+pub(crate) fn shape_store(
+    heap: &otter_gc::GcHeap,
+    shape: ShapeHandle,
+    key: AtomizedPropertyKey<'_>,
+) -> Option<ShapeStore> {
+    use super::shape_body;
+    let atom = key.atom().id();
+    if shape.is_null()
+        || atom == AtomId::NONE
+        || shape_body::state_of(shape) != super::ShapeState::ORDINARY
+    {
+        return None;
+    }
+    if let Some(slot) = shape_body::shape_slot_of_atom(heap, shape, atom) {
+        return (!slot.is_accessor && slot.flags.writable()).then(|| {
+            ShapeStore::Own(super::FieldLocation::for_slot(
+                slot.offset,
+                shape_body::inline_capacity_of(shape),
+            ))
+        });
+    }
+    let child = super::shape_interner::ShapeInterner::data_child(heap, shape, atom)?;
+    let field = shape_body::own_field_of(child);
+    if !shape_body::append_geometry_matches(shape, child, field) {
+        return None;
+    }
+    let kind = match shape_body::prototype_of(shape) {
+        shape_body::ShapePrototype::Null => StorePropertyTransitionKind::OwnAdd,
+        shape_body::ShapePrototype::Object(first) => chain_append_kind(heap, first, key)?,
+        shape_body::ShapePrototype::Value(_) => return None,
+    };
+    Some(ShapeStore::Append { child, field, kind })
 }
 
 fn transition_kind_matches(

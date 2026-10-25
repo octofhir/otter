@@ -6,7 +6,8 @@ usage: region_hot_asm.py <out-dir> <perf-map> <kind> [regions]
 <out-dir> is a `sample_kind_prof.py` output directory (its `sample.txt` and
 `art/` bundle from the same run) and <perf-map> that run's
 `/tmp/perf-<pid>.map`. Every self sample in an optimizing-tier region whose
-operation is <kind> is credited to the instruction holding it; the hottest
+operation is <kind> (or, for `<outside>`, in the gap between node regions)
+is credited to the instruction holding it; the hottest
 regions are printed with their per-instruction samples, then the kind's
 samples by offset from the region start.
 """
@@ -79,6 +80,11 @@ for i, (depth, count, frame) in enumerate(rows):
         offset = (address - maps[k][0]) & ~3
         regions, _ = code(m.group(1))
         hit = [r for r in regions if r[0] <= offset < r[1]]
+        if want == "<outside>" and not hit:
+            # Code outside every node region, credited to the gap holding it.
+            before = [r[1] for r in regions if r[1] <= offset]
+            after = [r[0] for r in regions if r[0] > offset]
+            hit = [(max(before, default=0), min(after, default=offset + 4), "<outside>")]
         if not hit or not hit[-1][2].startswith(want):
             continue
         region = hit[-1]

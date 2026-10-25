@@ -2292,6 +2292,18 @@ impl<'a> Builder<'a> {
                         {
                             self.known.entry(value).heap_object = true;
                         }
+                        // The receiver the body's own construct entry
+                        // allocates has its family's root shape: proving
+                        // it once lets every store to `this` follow the
+                        // shape's transitions. An entry with any other
+                        // receiver leaves once, and the body is rebuilt
+                        // without the proof.
+                        if let Some(plan) = self.view.own_receiver_plan
+                            && !self.exited_for(ExitReason::ShapeGuard)
+                        {
+                            let root = plan.prototype_root;
+                            self.check_shapes(value, &smallvec::smallvec![root], true);
+                        }
                         value
                     }
                 };
@@ -3331,11 +3343,33 @@ impl<'a> Builder<'a> {
             self.known.entry(object).heap_object = true;
             return;
         }
-        if !self.exited_for(ExitReason::ShapeGuard)
-            && let Some((projection, programs)) =
-                super::feedback::named_store_programs(self.view, byte_pc)
+        // A megamorphic site's receiver proved to have one shape runs the
+        // program a monomorphic site would hold for that shape.
+        let proved = if self.exited_for(ExitReason::ShapeGuard)
+            || super::feedback::named_store_programs(self.view, byte_pc).is_some()
         {
+            None
+        } else {
+            let object = self.read(instruction.reads[0]);
+            let view: &'a JitCompileSnapshot = self.view;
+            match self.known_shapes(object).as_deref() {
+                Some(&[shape]) => view
+                    .proved_store_programs
+                    .get(&(byte_pc, shape))
+                    .map(std::slice::from_ref),
+                _ => None,
+            }
+        };
+        let site = proved
+            .map(|programs| (otter_vm::jit::PropertyStorageProjection::Receiver, programs))
+            .or_else(|| {
+                (!self.exited_for(ExitReason::ShapeGuard))
+                    .then(|| super::feedback::named_store_programs(self.view, byte_pc))
+                    .flatten()
+            });
+        if let Some((projection, programs)) = site {
             use otter_vm::JitCacheIrOp as Op;
+            let proved = proved.is_some();
             let object = self.read(instruction.reads[0]);
             let object = self.tagged(object);
             let object = self.property_storage(object, projection);
@@ -3422,6 +3456,7 @@ impl<'a> Builder<'a> {
                     owners,
                     receiver_shape,
                     fresh,
+                    proved,
                 },
                 &[object, value],
                 Repr::None,

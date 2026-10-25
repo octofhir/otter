@@ -55,17 +55,18 @@ pub(crate) fn refine(
             let Kind::StoreNamedProperty {
                 byte_pc,
                 plan: NamedStorePlan::TransitionTagged(index),
+                receiver_shape,
+                proved,
                 ..
             } = graph.node(node).kind
             else {
                 continue;
             };
             let source = super::metadata::source_view(view, inline_views, graph, node);
-            let Some(_program) = source
-                .property_programs
-                .get(&byte_pc)
-                .and_then(|programs| programs.get(usize::from(index)))
-                .filter(|program| super::feedback::inline_store_transition(program))
+            let Some(_program) =
+                super::feedback::store_node_programs(source, byte_pc, receiver_shape, proved)
+                    .and_then(|programs| programs.get(usize::from(index)))
+                    .filter(|program| super::feedback::inline_store_transition(program))
             else {
                 continue;
             };

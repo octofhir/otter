@@ -769,6 +769,18 @@ pub(crate) fn emit_call_entry_cold(
         );
         let canonical = ops.new_dynamic_label();
         let complete = ops.new_dynamic_label();
+        if let Some(plan) = view.own_receiver_plan {
+            let dynamic = ops.new_dynamic_label();
+            crate::arm64::allocation::emit_planned_construct_receiver(
+                ops,
+                relocations,
+                view,
+                plan,
+                complete,
+                dynamic,
+            );
+            dynasm!(ops ; .arch aarch64 ; =>dynamic);
+        }
         crate::arm64::allocation::emit_dynamic_construct_receiver(
             ops,
             relocations,

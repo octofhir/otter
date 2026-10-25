@@ -428,6 +428,24 @@ pub(crate) fn body_slot_store(
     }
 }
 
+/// The programs a `StoreNamedProperty` node of the site at `byte_pc` runs:
+/// the site's own, or for a `proved` node the source's one program for its
+/// proved `receiver_shape`.
+pub(crate) fn store_node_programs(
+    view: &JitCompileSnapshot,
+    byte_pc: u32,
+    receiver_shape: Option<u32>,
+    proved: bool,
+) -> Option<&[otter_vm::JitCacheIrProgram]> {
+    if proved {
+        let program = view
+            .proved_store_programs
+            .get(&(byte_pc, receiver_shape?))?;
+        return Some(std::slice::from_ref(program));
+    }
+    view.property_programs.get(&byte_pc).map(Vec::as_slice)
+}
+
 /// The store programs of the site at `byte_pc`, when every one proves an
 /// ordinary receiver by shape and either writes an existing writable own
 /// slot, or appends the slot within the receiver's storage and publishes the

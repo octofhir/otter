@@ -702,6 +702,17 @@ pub struct JitCompileSnapshot {
     /// representable or the site is absent and uses its committed cold edge.
     /// A `CallMethodValue` site's programs describe its method lookup.
     pub property_programs: rustc_hash::FxHashMap<u32, Vec<JitCacheIrProgram>>,
+    /// Store programs of megamorphic named store sites for one receiver
+    /// shape each, keyed by `(byte PC, receiver shape)`: what the store does to
+    /// an object of exactly that shape, from the shape's interned transitions
+    /// and live chain alone. A tier runs one only on a receiver proved to have
+    /// that shape; any other receiver keeps the site's shared probe.
+    pub proved_store_programs: rustc_hash::FxHashMap<(u32, u32), JitCacheIrProgram>,
+    /// The receiver this body's own construct entry allocates for its one
+    /// steady base-constructor family: the entry proves the family and fits
+    /// the plan's empty root receiver inline, and `this` has that root shape.
+    /// Its `receiver_shape` is always `0`.
+    pub own_receiver_plan: Option<JitReceiverAllocationPlan>,
     /// Stable layout of this isolate's one shared key/action table.
     /// Generated loads and stores consume independent facts under one key.
     pub property_action_cache: Option<JitPropertyActionCache>,
@@ -2454,6 +2465,8 @@ impl JitCompileSnapshot {
             instanceof_cells: rustc_hash::FxHashMap::default(),
             forward_apply_native_ref: None,
             property_programs: rustc_hash::FxHashMap::default(),
+            proved_store_programs: rustc_hash::FxHashMap::default(),
+            own_receiver_plan: None,
             property_action_cache: None,
             property_accesses: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),

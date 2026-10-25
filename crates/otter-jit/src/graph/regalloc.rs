@@ -1158,14 +1158,16 @@ impl<'g> Allocator<'g> {
         if !properties.call {
             // Live registers a slow path must preserve.
             let mut live = SmallVec::new();
+            // A slow path that enters the runtime also keeps what this node's
+            // own exits read: an exit taken after the call, or a throw of a
+            // collecting one, rebuilds the frame from those locations once
+            // the runtime returns.
+            let calls_out = properties.may_collect || !data.kind.slow_path_stubs().is_empty();
             for float in [false, true] {
                 for register in self.file(float).held() {
-                    // A slow path that may collect also keeps what this
-                    // node's own exits read: a throw rebuilds the frame
-                    // from those locations after the runtime returns.
                     if let Some(value) = self.file(float).holder(register)
                         && (self.liveness.is_live_after(node, value)
-                            || (properties.may_collect && eager_values.contains(&value)))
+                            || (calls_out && eager_values.contains(&value)))
                     {
                         let location = Self::register_location(float, register);
                         live.push((location, graph.node(value).repr));

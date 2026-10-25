@@ -8,6 +8,7 @@
 //! - Cold expiration selecting eager versus lazy reconstruction homes.
 //! - Backend-supplied fixed call registers and bulk canonical-home inputs.
 //! - Fixed shift counts and implicit division writes across exits and calls.
+//! - Leaf calls preserving the values an exit after them reads.
 //!
 //! # Invariants
 //! Tests inspect the final allocation, before any backend emits code.
@@ -1561,6 +1562,55 @@ fn poll_saves_eager_state_values_that_die_on_the_backedge() {
         }]
     );
     assert!(!allocation.definition_spills.contains(&value));
+}
+
+#[test]
+fn a_leaf_call_saves_the_operands_its_later_exit_reads() {
+    for target in [AARCH64, X86_64] {
+        let mut graph = Graph::default();
+        let entry = graph.new_block();
+        let a = append(
+            &mut graph,
+            entry,
+            Kind::InitialRegister(0),
+            &[],
+            Repr::Tagged,
+        );
+        let b = append(
+            &mut graph,
+            entry,
+            Kind::InitialRegister(1),
+            &[],
+            Repr::Tagged,
+        );
+        // The order leaf runs before the exit that resumes with both
+        // operands, whose last use is the compare itself.
+        let eager = state(&mut graph, &[a, b]);
+        let compare = append(
+            &mut graph,
+            entry,
+            Kind::PrimitiveCompare(super::super::ir::Condition::Equal),
+            &[a, b],
+            Repr::Tagged,
+        );
+        graph.node_mut(compare).eager = Some(eager);
+        terminate(&mut graph, entry, Kind::Return, &[compare]);
+        let allocation = allocate(&graph, &[entry], target);
+        let saved: Vec<Location> = allocation
+            .node(compare)
+            .live_registers
+            .iter()
+            .map(|&(location, _)| location)
+            .collect();
+        for operand in [a, b] {
+            let at = allocation.node(compare).eager
+                [[a, b].iter().position(|&value| value == operand).unwrap()];
+            assert!(
+                saved.contains(&at),
+                "the exit reads {operand:?} from {at:?}, which the leaf call must preserve",
+            );
+        }
+    }
 }
 
 #[test]

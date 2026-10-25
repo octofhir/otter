@@ -9,8 +9,10 @@
 //!   fast-mode `%Array.prototype%` lowers; its proof is the node's eager
 //!   deopt, and a site that left optimized code on that proof keeps its
 //!   baseline operation.
-//! - The node completes every receiver state its proof admits, so the
-//!   call needs no frame and an inlined body containing it stays inlined.
+//! - The node runs no JavaScript: a receiver state neither its inline paths
+//!   nor the VM's push and pop entries complete leaves through the same
+//!   eager deopt, so the call needs no frame, an inlined body containing it
+//!   stays inlined, and it writes only element storage and lengths.
 //!
 //! # See also
 //! - `otter_vm::Interpreter::jit_array_method_call` for the site's proof.

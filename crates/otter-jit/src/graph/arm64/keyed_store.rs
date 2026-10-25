@@ -428,13 +428,14 @@ impl Codegen<'_> {
         );
     }
 
-    /// The append the push leaf refused for want of room: the allocating
-    /// push grows the dense storage and appends. A refusal (a sidecar, a
-    /// non-dense tail, the protector) precedes every effect and reaches
-    /// `missed` with the operands as they were. Running out of memory may
-    /// follow a collection, so it resumes the store in the lower tier, which
-    /// reads its operands from the frame.
-    fn emit_array_push_grow(
+    /// The append the inline paths or the push leaf refused: the allocating
+    /// push grows the dense storage and appends `X(value)` to the Array in
+    /// `X(receiver)`, leaving the tagged new length in `x16` at `stored`. A
+    /// refusal (a sidecar, a non-dense tail, the protector) precedes every
+    /// effect and reaches `missed` with all three operands as they were.
+    /// Running out of memory may follow a collection, so it resumes the
+    /// operation in the lower tier, which reads its operands from the frame.
+    pub(super) fn emit_array_push_grow(
         &mut self,
         node: NodeId,
         [receiver, key, value]: [u8; 3],

@@ -2853,7 +2853,11 @@ impl<'a> Builder<'a> {
                 let b = self.tagged(rhs);
                 let value = self.add(Kind::PrimitiveCompare(condition), &[a, b], Repr::Tagged);
                 self.write(instruction.writes[0], value);
-            } else if matches!(instruction.op, Op::LooseEqual | Op::LooseNotEqual) {
+            } else if matches!(instruction.op, Op::LooseEqual | Op::LooseNotEqual)
+                // A site that left on a converting pair keeps its baseline
+                // operation, which completes every pair.
+                && !self.exited_for(ExitReason::TypeMismatch)
+            {
                 let a = self.tagged(lhs);
                 let b = self.tagged(rhs);
                 let negate = instruction.op == Op::LooseNotEqual;

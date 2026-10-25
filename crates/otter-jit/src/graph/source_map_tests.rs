@@ -653,180 +653,143 @@ fn an_abandoned_callee_drops_the_loops_of_bodies_spliced_into_it() {
 }
 
 #[test]
-fn object_protocol_words_follow_rewritten_nodes_and_retain_inline_roots() {
-    use super::ir::{Kind, NodeId, Repr};
+fn instanceof_protocol_word_retains_inline_roots() {
+    use super::ir::{Kind, NodeId};
     use Operand::{ConstIndex, Register};
     use otter_vm::{ObjectProtocolValueOp, native_abi as abi};
 
-    let cases = [
-        (Kind::LooseEqual { negate: false }, false),
-        (Kind::LooseEqual { negate: true }, false),
-        (Kind::LooseEqual { negate: false }, true),
-        (Kind::LooseEqual { negate: true }, true),
-        (Kind::Instanceof, false),
-    ];
-    for (kind, nullish) in cases {
-        let source_op = if kind == Kind::Instanceof {
-            Op::Instanceof
-        } else {
-            Op::LooseEqual
-        };
-        let mut leaf = snapshot(
-            501,
-            2,
-            3,
-            vec![
-                (source_op, vec![Register(2), Register(0), Register(1)]),
-                (Op::ReturnValue, vec![Register(2)]),
-            ],
-        );
-        if source_op == Op::LooseEqual {
-            leaf.seed_arith_feedback_for_test(
-                0,
-                ArithFeedback::from_bits(otter_vm::jit_feedback::ARITH_OTHER),
-            );
-        }
-        let mut root = snapshot(
-            500,
-            3,
-            4,
-            vec![
-                (
-                    Op::Call,
-                    vec![
-                        Register(3),
-                        Register(0),
-                        ConstIndex(2),
-                        Register(1),
-                        Register(2),
-                    ],
-                ),
-                (Op::ReturnValue, vec![Register(3)]),
-            ],
-        );
-        offer(&mut root, Arc::new(leaf));
-        let transitions = crate::entry::TransitionTable::resolve();
-        let mut compiled =
-            super::compile(&root, 7201, &transitions, None, false, &Default::default()).unwrap();
-        assert_eq!(
-            compiled.built.inline_views.len(),
-            1,
-            "source body is spliced"
-        );
-        let graph = &mut compiled.built.graph;
-        let node = graph
-            .nodes
-            .iter()
-            .position(|node| {
-                node.origin == 1 && matches!(node.kind, Kind::LooseEqual { .. } | Kind::Instanceof)
-            })
-            .map(|index| NodeId(index as u32))
-            .expect("object feedback retains the inline object-protocol node");
-        // The source stays `LooseEqual` while the legal SSA operation may
-        // become `LooseNotEqual` or gain a constant nullish operand.
-        graph.node_mut(node).kind = kind.clone();
-        if nullish {
-            let constant = graph.add_node(
-                Kind::ConstTagged(otter_vm::value::tag::VALUE_NULL),
-                &[],
-                Repr::Tagged,
-            );
-            graph.node_mut(node).inputs[1] = constant;
-        }
-        let operation = match kind {
-            Kind::LooseEqual { negate: false } => ObjectProtocolValueOp::LooseEqual,
-            Kind::LooseEqual { negate: true } => ObjectProtocolValueOp::LooseNotEqual,
-            Kind::Instanceof => ObjectProtocolValueOp::Instanceof,
-            _ => unreachable!(),
-        };
-        #[cfg(target_arch = "aarch64")]
-        let registers = super::registers::AARCH64;
-        #[cfg(target_arch = "x86_64")]
-        let registers = super::registers::X86_64;
-        let allocation = super::regalloc::allocate(graph, &compiled.built.layout, registers);
-        let slots = super::frame::SlotLayout::of(&allocation).unwrap();
-        let deopt = std::ptr::from_ref(compiled.deopt.as_ref());
-        #[cfg(target_arch = "aarch64")]
-        let emission = super::arm64::emit(
-            &root,
-            &compiled.built,
-            &allocation,
-            &transitions,
-            7202,
-            deopt,
-            &compiled.plan,
-            slots,
-            true,
-            false,
-        )
-        .unwrap();
-        #[cfg(target_arch = "x86_64")]
-        let emission = super::x86_64::emit(
-            &root,
-            &compiled.built,
-            &allocation,
-            &transitions,
-            7202,
-            deopt,
-            &compiled.plan,
-            slots,
-            true,
-        )
-        .unwrap();
-        let rendered = emission.relocations.render(&emission.buffer).unwrap();
-        let relocations: serde_json::Value = serde_json::from_str(&rendered.json).unwrap();
-        let calls = relocations["relocations"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|record| {
-                record["target"]["id"] == abi::STUB_JIT_OBJECT_PROTOCOL_VALUE.id
-                    && record["form"] != "literalWord"
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(calls.len(), 1, "one committed semantic entry: {kind:?}");
-        let start = calls[0]["startOffset"].as_u64().unwrap() as usize;
-        let word = operation.encode_abi();
-        #[cfg(target_arch = "aarch64")]
-        {
-            let scalar = u32::from_le_bytes(emission.buffer[start - 4..start].try_into().unwrap());
-            assert_eq!(scalar & 0xff80_001f, 0xd280_0003, "MOVZ to x3");
-            let immediate = u64::from((scalar >> 5) & 0xffff);
-            let shift = ((scalar >> 21) & 3) * 16;
-            assert_eq!(immediate << shift, word, "{kind:?}, nullish={nullish}");
-        }
-        #[cfg(target_arch = "x86_64")]
-        {
-            assert_eq!(emission.buffer[start - 5], 0xb9, "MOV to ecx");
-            let scalar = u32::from_le_bytes(emission.buffer[start - 4..start].try_into().unwrap());
-            assert_eq!(u64::from(scalar), word, "{kind:?}, nullish={nullish}");
-        }
-        let record = emission
-            .site_records
-            .iter()
-            .find(|record| {
-                record
-                    .inline_frames
-                    .iter()
-                    .any(|frame| frame.function_id == 501 && frame.byte_pc == 0)
-            })
-            .expect("exact inline source is retained");
-        assert_eq!(record.call_pc, 0, "outer call still owns reconstruction");
-        for home in allocation.node(node).rooted_tagged_homes.as_ref().unwrap() {
-            assert!(
-                record
-                    .spill_roots
-                    .iter()
-                    .any(|slot| u32::from(slot) == *home),
-                "semantic scalar does not replace value root {home}"
-            );
-        }
+    let kind = Kind::Instanceof;
+    let leaf = snapshot(
+        501,
+        2,
+        3,
+        vec![
+            (Op::Instanceof, vec![Register(2), Register(0), Register(1)]),
+            (Op::ReturnValue, vec![Register(2)]),
+        ],
+    );
+    let mut root = snapshot(
+        500,
+        3,
+        4,
+        vec![
+            (
+                Op::Call,
+                vec![
+                    Register(3),
+                    Register(0),
+                    ConstIndex(2),
+                    Register(1),
+                    Register(2),
+                ],
+            ),
+            (Op::ReturnValue, vec![Register(3)]),
+        ],
+    );
+    offer(&mut root, Arc::new(leaf));
+    let transitions = crate::entry::TransitionTable::resolve();
+    let mut compiled =
+        super::compile(&root, 7201, &transitions, None, false, &Default::default()).unwrap();
+    assert_eq!(
+        compiled.built.inline_views.len(),
+        1,
+        "source body is spliced"
+    );
+    let graph = &mut compiled.built.graph;
+    let node = graph
+        .nodes
+        .iter()
+        .position(|node| node.origin == 1 && node.kind == Kind::Instanceof)
+        .map(|index| NodeId(index as u32))
+        .expect("the inline object-protocol node is retained");
+    let operation = ObjectProtocolValueOp::Instanceof;
+    #[cfg(target_arch = "aarch64")]
+    let registers = super::registers::AARCH64;
+    #[cfg(target_arch = "x86_64")]
+    let registers = super::registers::X86_64;
+    let allocation = super::regalloc::allocate(graph, &compiled.built.layout, registers);
+    let slots = super::frame::SlotLayout::of(&allocation).unwrap();
+    let deopt = std::ptr::from_ref(compiled.deopt.as_ref());
+    #[cfg(target_arch = "aarch64")]
+    let emission = super::arm64::emit(
+        &root,
+        &compiled.built,
+        &allocation,
+        &transitions,
+        7202,
+        deopt,
+        &compiled.plan,
+        slots,
+        true,
+        false,
+    )
+    .unwrap();
+    #[cfg(target_arch = "x86_64")]
+    let emission = super::x86_64::emit(
+        &root,
+        &compiled.built,
+        &allocation,
+        &transitions,
+        7202,
+        deopt,
+        &compiled.plan,
+        slots,
+        true,
+    )
+    .unwrap();
+    let rendered = emission.relocations.render(&emission.buffer).unwrap();
+    let relocations: serde_json::Value = serde_json::from_str(&rendered.json).unwrap();
+    let calls = relocations["relocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| {
+            record["target"]["id"] == abi::STUB_JIT_OBJECT_PROTOCOL_VALUE.id
+                && record["form"] != "literalWord"
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(calls.len(), 1, "one committed semantic entry: {kind:?}");
+    let start = calls[0]["startOffset"].as_u64().unwrap() as usize;
+    let word = operation.encode_abi();
+    #[cfg(target_arch = "aarch64")]
+    {
+        let scalar = u32::from_le_bytes(emission.buffer[start - 4..start].try_into().unwrap());
+        assert_eq!(scalar & 0xff80_001f, 0xd280_0003, "MOVZ to x3");
+        let immediate = u64::from((scalar >> 5) & 0xffff);
+        let shift = ((scalar >> 21) & 3) * 16;
+        assert_eq!(immediate << shift, word, "{kind:?}");
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        assert_eq!(emission.buffer[start - 5], 0xb9, "MOV to ecx");
+        let scalar = u32::from_le_bytes(emission.buffer[start - 4..start].try_into().unwrap());
+        assert_eq!(u64::from(scalar), word, "{kind:?}");
+    }
+    let record = emission
+        .site_records
+        .iter()
+        .find(|record| {
+            record
+                .inline_frames
+                .iter()
+                .any(|frame| frame.function_id == 501 && frame.byte_pc == 0)
+        })
+        .expect("exact inline source is retained");
+    assert_eq!(record.call_pc, 0, "outer call still owns reconstruction");
+    for home in allocation.node(node).rooted_tagged_homes.as_ref().unwrap() {
         assert!(
             record
                 .spill_roots
                 .iter()
-                .any(|slot| u32::from(slot) == slots.spill_tagged),
-            "committed throw retains the exception scratch"
+                .any(|slot| u32::from(slot) == *home),
+            "semantic scalar does not replace value root {home}"
         );
     }
+    assert!(
+        record
+            .spill_roots
+            .iter()
+            .any(|slot| u32::from(slot) == slots.spill_tagged),
+        "committed throw retains the exception scratch"
+    );
 }

@@ -795,6 +795,23 @@ enum Command {
     StartupImage(StartupImageArgs),
 }
 
+impl Command {
+    /// Whether the command resolves and installs packages.
+    fn installs_packages(&self) -> bool {
+        matches!(
+            self,
+            Self::Install(_)
+                | Self::Add(_)
+                | Self::Remove(_)
+                | Self::Outdated(_)
+                | Self::ApproveBuilds(_)
+                | Self::Doctor(_)
+                | Self::Dlx(_)
+                | Self::Init(_)
+        )
+    }
+}
+
 #[derive(Debug, Args)]
 struct StartupImageArgs {
     /// The executable to write the image into: the running executable
@@ -965,14 +982,29 @@ fn clustered_switches(args: impl Iterator<Item = String>) -> Vec<String> {
     .collect()
 }
 
-// Multi-thread: host IO (HTTP server, fetch, timers) runs on Tokio workers
-// while the VM stays pinned to the isolate thread. Current-thread would stall
-// IO whenever the main thread blocks joining the isolate.
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> ExitCode {
+// Host IO (HTTP server, fetch, timers, child processes) runs on one event
+// loop thread while the VM stays pinned to the isolate thread, which the main
+// thread may block joining; blocking work goes to Tokio's pool, which grows
+// only when used. Package-manager commands download and unpack many packages
+// at once, so they drive IO from a worker per core.
+fn main() -> ExitCode {
     let startup_timer = CliStartupTimer::from_env();
     let cli = Cli::parse_from(clustered_switches(std::env::args()));
     startup_timer.mark("parse_args");
+    let mut event_loop = tokio::runtime::Builder::new_multi_thread();
+    if !cli.command.as_ref().is_some_and(Command::installs_packages) {
+        event_loop.worker_threads(1);
+    }
+    match event_loop.enable_all().build() {
+        Ok(event_loop) => event_loop.block_on(run_cli(cli, startup_timer)),
+        Err(error) => {
+            stderrln!("otter: cannot start the event loop: {error}");
+            ExitCode::from(70)
+        }
+    }
+}
+
+async fn run_cli(cli: Cli, startup_timer: CliStartupTimer) -> ExitCode {
     let jit_selection = if cli.interpreter {
         JitSelection::InterpreterOnly
     } else if cli.jitless {

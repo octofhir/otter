@@ -5734,6 +5734,32 @@ impl Runtime {
         })
     }
 
+    /// Build, before the capture, what every launch would build first: the
+    /// realm makes the program's `console` on its first read, and a run's
+    /// entry reads it, so reading it here puts the console in the image.
+    /// The build stays tenured, so the nursery the capture needs empty is.
+    ///
+    /// # Errors
+    /// Returns [`OtterError`] when the console fails to build.
+    pub fn prepare_startup_image(&mut self) -> Result<(), OtterError> {
+        self.interp.gc_heap_mut().set_tenure_all(true);
+        let global = otter_vm::Value::object(*self.interp.global_this());
+        let built = otter_vm::NativeCtx::with_host_context(
+            &mut self.interp,
+            otter_vm::NativeCallInfo::call(global),
+            None,
+            |ctx| {
+                ctx.scope(|mut scope| {
+                    let global = scope.global_this();
+                    let console = scope.get(global, "console")?;
+                    Ok(scope.finish(console))
+                })
+            },
+        );
+        self.interp.gc_heap_mut().set_tenure_all(false);
+        built.map(|_| ()).map_err(map_native_error)
+    }
+
     /// This built runtime as a startup image: its heap, code and side state
     /// as bytes a later process of this same executable restores.
     ///
@@ -7785,7 +7811,8 @@ impl OtterBuilder {
     /// # Errors
     /// Returns [`OtterError`] if the bootstrap or the capture fails.
     pub fn encode_startup_image(self) -> Result<Vec<u8>, OtterError> {
-        let runtime = self.runtime.startup_image(false).build()?;
+        let mut runtime = self.runtime.startup_image(false).build()?;
+        runtime.prepare_startup_image()?;
         runtime
             .encode_startup_image()
             .map_err(|error| OtterError::Internal {

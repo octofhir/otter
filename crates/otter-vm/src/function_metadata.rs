@@ -115,7 +115,7 @@ pub(crate) fn bound_own_property_descriptor(
     key: &str,
 ) -> Result<Option<PropertyDescriptor>, otter_gc::OutOfMemory> {
     enum Slot {
-        Builtin { name: String, length: NumberValue },
+        Builtin { name: JsString, length: NumberValue },
         Deleted,
         Overridden(PropertyDescriptor),
         Ordinary(JsObject),
@@ -128,7 +128,7 @@ pub(crate) fn bound_own_property_descriptor(
         };
         match property {
             BoundFunctionMetadataProperty::Builtin => Slot::Builtin {
-                name: body.builtin_name.clone(),
+                name: body.builtin_name,
                 length: body.builtin_length,
             },
             BoundFunctionMetadataProperty::Deleted => Slot::Deleted,
@@ -143,7 +143,7 @@ pub(crate) fn bound_own_property_descriptor(
         Slot::Overridden(desc) => Ok(Some(desc)),
         Slot::Builtin { name, length } => {
             let value = match key {
-                "name" => Value::string(JsString::from_str(&name, gc_heap)?),
+                "name" => Value::string(name),
                 "length" => Value::number(length),
                 _ => Value::undefined(),
             };

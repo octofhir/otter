@@ -1604,6 +1604,27 @@ where
     )?))
 }
 
+/// [`native_value_with_captures_and_roots`] for a plain `fn` entry: the
+/// callable carries no Rust state, so a startup image can hold it.
+pub(crate) fn native_value_with_static_captures_and_roots(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    length: u8,
+    captures: SmallVec<[Value; 4]>,
+    external_visit: &mut RootSlotVisitor<'_>,
+    call: NativeCapturesFn,
+) -> Result<Value, otter_gc::OutOfMemory> {
+    Ok(Value::native_function(NativeFunction::allocate_with_roots(
+        heap,
+        name,
+        length,
+        NativeCallStorage::StaticWithCaptures(call),
+        captures,
+        NativeFunctionMetadata::BUILTIN,
+        external_visit,
+    )?))
+}
+
 pub(crate) fn native_value_with_captures_unchecked_with_roots<F>(
     heap: &mut otter_gc::GcHeap,
     name: &'static str,

@@ -884,6 +884,39 @@ impl<'rt> NativeCtx<'rt> {
         Ok(self.cx.interp.stamp_native_creation_realm(value))
     }
 
+    /// [`Self::native_value_with_length`] for a plain `fn` entry, whose
+    /// state rides its traced captures only.
+    pub fn native_value_with_static_captures(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        captures: smallvec::SmallVec<[Value; 4]>,
+        call: native_function::NativeCapturesFn,
+    ) -> Result<Value, otter_gc::OutOfMemory> {
+        let roots = self.collect_native_roots();
+        let this_value = self.call_info.this_value;
+        let new_target = self.call_info.new_target;
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            visit_native_roots(
+                visitor,
+                &roots,
+                &this_value,
+                new_target.as_ref(),
+                &mut [],
+                &mut [],
+            );
+        };
+        let value = native_function::native_value_with_static_captures_and_roots(
+            self.heap_mut(),
+            name,
+            length,
+            captures,
+            &mut external_visit,
+            call,
+        )?;
+        Ok(self.cx.interp.stamp_native_creation_realm(value))
+    }
+
     /// Allocate a `Map` body through the native root contract.
     pub fn alloc_map(&mut self) -> Result<collections::JsMap, otter_gc::OutOfMemory> {
         let roots = self.collect_native_roots();
@@ -3404,6 +3437,25 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
             .ctx
             .native_value_with_length(name, length, captures, call)
             .map_err(|error| self.vm_error(VmError::from(error), "NativeScope::native_closure"))?;
+        Ok(self.value(result))
+    }
+
+    /// Allocate a static native callable with rooted JavaScript captures: the
+    /// form of [`Self::native_closure`] whose state is all in the heap.
+    pub fn native_with_captures(
+        &mut self,
+        name: &'static str,
+        length: u8,
+        captures: &[Local<'_>],
+        call: native_function::NativeCapturesFn,
+    ) -> Result<Local<'scope>, NativeError> {
+        let captures = captures.iter().map(|capture| self.raw(*capture)).collect();
+        let result = self
+            .ctx
+            .native_value_with_static_captures(name, length, captures, call)
+            .map_err(|error| {
+                self.vm_error(VmError::from(error), "NativeScope::native_with_captures")
+            })?;
         Ok(self.value(result))
     }
 

@@ -444,23 +444,23 @@ fn allocating_shared_replay_preserves_cap_cause_and_does_not_commit_or_hold_proo
 }
 
 #[test]
-fn fixed_entry_and_proof_owners_stay_within_the_table_budget() {
+fn rows_reserve_a_bounded_table_and_start_empty_with_no_owners() {
     let entries = SETS * WAYS;
-    let bytes = entries
-        * (std::mem::size_of::<Cell<PropertyActionEntry>>()
-            + std::mem::size_of::<RefCell<ActionOwners>>())
-        + std::mem::size_of::<PropertyActionCache>();
-    // One isolate's fixed table: entries and their proof owners. Arc
-    // allocations and allocator overhead are separate retained-memory terms,
-    // not part of this receipt.
-    let budget = 1024 * 1024;
+    let bytes = entries * std::mem::size_of::<Cell<PropertyActionEntry>>();
+    // One isolate's reserved rows; the zeroed allocation commits a page only
+    // once a row on it is written, and proof owners exist only for filled rows.
+    let budget = 8 * 1024 * 1024;
     assert!(
         bytes <= budget,
-        "fixed table {bytes} exceeds its {budget}-byte budget"
+        "reserved rows {bytes} exceed their {budget}-byte budget"
     );
-    eprintln!(
-        "shared-action fixed payload+owners={bytes}, budget={budget}, proof-owner-stride={}, max-Arc-retention-slots={}",
-        std::mem::size_of::<RefCell<ActionOwners>>(),
-        2 * entries
-    );
+    let table = PropertyActionCache::default();
+    assert!(table.entries.iter().all(|row| {
+        let row = row.get();
+        row.receiver_shape_id == ShapeId::UNASSIGNED
+            && row.load_action == PropertyLoadAction::Unknown
+            && row.store_action == PropertyStoreAction::Unknown
+            && row.target_shape.is_null()
+    }));
+    assert!(table.owners.borrow().is_empty());
 }

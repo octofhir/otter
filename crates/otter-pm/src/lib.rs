@@ -2422,6 +2422,15 @@ mod tests {
         let bins = graph.resolve_bin("tool");
         assert_eq!(bins.len(), 1);
         assert!(bins[0].path.ends_with("node_modules/.bin/tool"));
+        // The project's range edge leads to the installed version, whose
+        // manifest is the one on disk; no range placeholder stays behind.
+        let tool = PackageId::registry_version("tool", "1.0.0");
+        assert_eq!(
+            graph.dependencies[&PackageId::root_workspace("app")]["tool"],
+            tool
+        );
+        assert!(graph.packages[&tool].manifest.bin.is_some());
+        assert!(!graph.packages.contains_key(&PackageId::registry("tool", "^1.0.0")));
     }
 
     #[tokio::test]

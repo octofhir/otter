@@ -91,6 +91,49 @@ pub async fn resolve_installed_project(
             );
         }
     }
+    // The local graph names registry dependencies by their ranges; the
+    // lockfile records which installed package each one resolved to.
+    let placeholders: Vec<PackageId> = resolution
+        .lockfile
+        .packages
+        .iter()
+        .filter(|(id, package)| {
+            !lockfile.packages.contains_key(id.as_str())
+                && package
+                    .resolved
+                    .as_ref()
+                    .is_some_and(|source| source.kind == ResolvedSourceKind::Registry)
+        })
+        .map(|(id, _)| PackageId::new(id))
+        .collect();
+    for (from, dependencies) in resolution.graph.dependencies.clone() {
+        let Some(locked) = lockfile.packages.get(from.as_str()) else {
+            continue;
+        };
+        for (name, target) in dependencies {
+            if !placeholders.contains(&target) {
+                continue;
+            }
+            let Some(resolved) = locked.dependencies.get(&name) else {
+                continue;
+            };
+            let kind = resolution
+                .graph
+                .dependency_kind(&from, &name)
+                .unwrap_or(PackageDependencyKind::Runtime);
+            resolution.graph.insert_dependency_with_kind(
+                from.clone(),
+                name,
+                PackageId::new(resolved.clone()),
+                kind,
+            );
+        }
+    }
+    for id in &placeholders {
+        resolution.graph.packages.remove(id);
+        resolution.graph.dependencies.remove(id);
+        resolution.graph.dependency_kinds.remove(id);
+    }
     resolution.lockfile = lockfile;
     Ok(resolution)
 }

@@ -5,8 +5,11 @@
 //! candidate's own call sites are candidates below it. Every candidate has a
 //! frequency, how often its call runs per run of the compiled function (the
 //! product of the per-entry call frequencies along its path), and a size in
-//! bytecode instructions: its own, plus what its function's installed
-//! optimized code inlined, which building the body in place builds again.
+//! bytecode instructions: its own body's. The bodies it calls are candidates
+//! of their own, each sized and charged when it is admitted, so what a
+//! callee's own optimized code happened to inline never decides whether the
+//! callee is built in place: that would make the choice depend on which
+//! function finished compiling first.
 //!
 //! The same choice runs twice over the same feedback: on the isolate
 //! thread, before snapshots are prepared, so only chosen bodies are
@@ -33,13 +36,17 @@
 //!   admitted body charges its own instructions; the bodies below it charge
 //!   theirs when admitted. A body that does not fit is skipped and smaller
 //!   ones are still tried.
+//! - A body that is not small, runs at most once per run of the compiled
+//!   function and itself makes more than
+//!   [`crate::jit::JIT_MAX_INLINED_CALLEE_INVOKES`] calls per entry is never
+//!   admitted: building it in place saves one call, and it is compiled on
+//!   its own, where its calls have a budget.
 //! - Only an admitted body's own candidates become candidates.
 //! - A site without call feedback has an unknown frequency; unknown
 //!   candidates rank below every known one, smaller first.
-//! - A recursive candidate, whose function already runs on its inline path,
-//!   is sized by its own body: what its optimized code inlined is this very
-//!   expansion. One that already runs [`crate::jit::JIT_INLINE_RECURSION`]
-//!   times there is never admitted: the graph builder would not build it.
+//! - A candidate that already runs [`crate::jit::JIT_INLINE_RECURSION`] times
+//!   on its inline path is never admitted: the graph builder would not build
+//!   it.
 //!
 //! # See also
 //! - `otter_jit::graph::inline_plan` lists prepared bodies as the tree.
@@ -52,7 +59,7 @@ use std::hash::Hash;
 use rustc_hash::FxHashSet;
 
 use crate::jit::{
-    JIT_INLINE_RECURSION, JIT_MAX_INLINED_INSTRUCTIONS_ABSOLUTE,
+    JIT_INLINE_RECURSION, JIT_MAX_INLINED_CALLEE_INVOKES, JIT_MAX_INLINED_INSTRUCTIONS_ABSOLUTE,
     JIT_MAX_INLINED_INSTRUCTIONS_CUMULATIVE, JIT_MIN_INLINING_FREQUENCY,
     JIT_SMALL_INLINE_INSTRUCTIONS,
 };
@@ -66,8 +73,9 @@ pub struct InlineCandidate<K> {
     pub site_frequency: Option<f32>,
     /// Bytecode instructions of the candidate's own body.
     pub instructions: u32,
-    /// Bytecode instructions the function's installed optimized code inlined.
-    pub optimized_inlined_instructions: u32,
+    /// Calls the candidate's own body makes per entry, summed over its call
+    /// sites with feedback.
+    pub invokes: f32,
     /// How many bodies on the candidate's inline path, the compiled function
     /// included, run its function.
     pub recursion: usize,
@@ -151,19 +159,22 @@ impl<T: InlineTree> Chooser<'_, T> {
             if !small && frequency.is_some_and(|frequency| frequency < JIT_MIN_INLINING_FREQUENCY) {
                 continue;
             }
+            // Building a body entered at most once per run in place saves one
+            // call; its own calls would then compete for this compilation's
+            // budget instead of its own.
+            if !small
+                && candidate.invokes > JIT_MAX_INLINED_CALLEE_INVOKES
+                && frequency.is_none_or(|frequency| frequency <= 1.0)
+            {
+                continue;
+            }
             if small {
                 if self.total + candidate.instructions <= JIT_MAX_INLINED_INSTRUCTIONS_ABSOLUTE {
                     self.admit(candidate, frequency);
                 }
                 continue;
             }
-            let size = if candidate.recursion > 0 {
-                candidate.instructions
-            } else {
-                candidate
-                    .instructions
-                    .saturating_add(candidate.optimized_inlined_instructions)
-            };
+            let size = candidate.instructions;
             self.order += 1;
             self.queue.push(Queued {
                 candidate,
@@ -243,7 +254,7 @@ mod tests {
             key,
             site_frequency: Some(frequency),
             instructions,
-            optimized_inlined_instructions: 0,
+            invokes: 0.0,
             recursion: 0,
         }
     }
@@ -268,5 +279,25 @@ mod tests {
         // body is always taken.
         assert!(chosen.contains("loop") && chosen.contains("hot") && chosen.contains("tiny"));
         assert!(!chosen.contains("cold") && !chosen.contains("rare"));
+    }
+
+    #[test]
+    fn a_once_entered_body_that_makes_many_calls_is_compiled_on_its_own() {
+        let calling = |key, frequency, invokes| InlineCandidate {
+            invokes,
+            ..candidate(key, frequency, 60)
+        };
+        let mut tree = Fixture(vec![(
+            None,
+            vec![
+                calling("driver", 1.0, 400.0),
+                calling("hot", 300.0, 6.0),
+                calling("plain", 1.0, 2.0),
+            ],
+        )]);
+        let chosen = choose_inlined(&mut tree);
+        // The driver saves one call; the hot body saves hundreds.
+        assert!(!chosen.contains("driver"));
+        assert!(chosen.contains("hot") && chosen.contains("plain"));
     }
 }

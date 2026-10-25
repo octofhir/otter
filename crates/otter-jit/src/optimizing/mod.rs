@@ -90,8 +90,6 @@ pub struct OptimizedMetadata {
     /// Number of eight-byte canonical tagged and untagged homes selected by
     /// the allocator.
     pub spill_slot_count: u32,
-    /// Bytecode instructions of every body built in place of a call.
-    pub inlined_instructions: u32,
 }
 
 /// Finalized optimizing code and its exact-PC deoptimization metadata.
@@ -267,10 +265,6 @@ impl JitFunctionCode for OptimizedCode {
         &self.spliced_functions
     }
 
-    fn inlined_instructions(&self) -> u32 {
-        self.metadata.inlined_instructions
-    }
-
     fn code_len(&self) -> usize {
         self.code.len()
     }
@@ -376,7 +370,6 @@ mod tests {
                 register_count: 1,
                 allocator_spill_slot_count: 0,
                 spill_slot_count: 0,
-                inlined_instructions: 0,
             },
         );
         let expected = mapping_bytes

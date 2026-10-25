@@ -76,7 +76,7 @@ impl InlineTree for SnapshotTree<'_> {
                     key,
                     site_frequency: view.call_frequencies.get(&byte_pc).copied(),
                     instructions: body.code_block.instruction_count(),
-                    optimized_inlined_instructions: body.optimized_inlined_instructions,
+                    invokes: body.invokes,
                     recursion: path
                         .iter()
                         .filter(|&&function_id| function_id == body.code_block.id)

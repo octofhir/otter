@@ -2691,11 +2691,6 @@ impl Interpreter {
                 self.bake_unique_closure_context(&mut body);
             }
             self.bake_optimized_exit_profile(&mut body, fid);
-            body.optimized_inlined_instructions = self
-                .jit_optimized_code
-                .get(&fid)
-                .and_then(Option::as_ref)
-                .map_or(0, |code| code.inlined_instructions());
             Some(std::sync::Arc::new(body))
         })();
         budget.leave();
@@ -2838,6 +2833,7 @@ impl Interpreter {
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
     ) {
+        view.invokes = self.inline_body_invokes(context, &view.code_block);
         view.call_frequencies = view
             .instructions
             .iter()
@@ -3639,7 +3635,9 @@ impl Interpreter {
         // ends the prepared prefix, and its store must run as written.
         let prepared = self
             .gc_heap
-            .read_payload(layout, |body| body.prepared_capacity(root_handle, prototype))
+            .read_payload(layout, |body| {
+                body.prepared_capacity(root_handle, prototype)
+            })
             .unwrap_or(0);
         let mut initial_shape = root_handle;
         let (receiver_shape, initial_field_count) = match (

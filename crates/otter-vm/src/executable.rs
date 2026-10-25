@@ -659,7 +659,7 @@ impl CodeBlock {
             method_targets: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
             call_frequencies: rustc_hash::FxHashMap::default(),
-            optimized_inlined_instructions: 0,
+            invokes: 0.0,
             guarded_method_calls: rustc_hash::FxHashMap::default(),
             function_prototype_calls: rustc_hash::FxHashMap::default(),
             instanceof_cells: rustc_hash::FxHashMap::default(),

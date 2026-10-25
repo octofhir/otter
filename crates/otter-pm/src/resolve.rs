@@ -27,6 +27,9 @@
 //! - An optional edge that cannot resolve (no admitted version, a specifier
 //!   no registry serves, a failed fetch, a package for another platform) is
 //!   dropped with a warning; a required one fails the resolution.
+//! - A previous install's lockfile pins what it resolved: an edge whose
+//!   recorded version still satisfies its range keeps it, and the packages
+//!   that version reaches keep the versions recorded for them.
 //! - Edges to the unresolved placeholders the local graph starts with are
 //!   rewritten to resolved packages, and placeholders nothing reaches any
 //!   more leave the graph and the lockfile.
@@ -41,7 +44,7 @@ use std::time::SystemTime;
 
 use futures_util::stream::{self, StreamExt};
 use otter_pm_lockfile::{
-    LifecycleMetadata, LockedPackage, ResolvedSource, ResolvedSourceKind, TrustState,
+    LifecycleMetadata, LockedPackage, Lockfile, ResolvedSource, ResolvedSourceKind, TrustState,
 };
 use otter_pm_manifest::PackageManifest;
 
@@ -50,7 +53,7 @@ use crate::{
     FsRegistryMetadataCache, InstallPolicy, InstallWarning, LocalResolution, NpmPackageVersion,
     NpmRange, NpmRegistryMetadata, PackageDependencyKind, PackageId, PackageManagerError,
     PackageRoot, RegistryMetadataClient, infer_project_root, insert_bins_for_manifest,
-    is_tarball_reference, package_name_path,
+    is_tarball_reference,
 };
 
 /// The most registry manifest requests one resolution keeps in flight.
@@ -140,6 +143,10 @@ fn platform_admits(list: &[String], current: &str) -> bool {
 /// Resolve every open registry edge of `resolution` and the edges the
 /// packages it reaches declare, fetching manifests through `cache`.
 ///
+/// An edge the `pinned` lockfile already resolved, to a version its range
+/// still admits, keeps that version and everything it reaches as the
+/// lockfile records them, without asking the registry.
+///
 /// # Errors
 /// A required edge that cannot resolve, a failed fetch of a manifest a
 /// required edge needs, or a release-age refusal under a strict policy.
@@ -148,9 +155,11 @@ pub async fn enrich_resolution_with_registry_metadata(
     cache: &FsRegistryMetadataCache,
     client: &impl RegistryMetadataClient,
     policy: &InstallPolicy,
+    pinned: Option<&Lockfile>,
     warnings: &mut Vec<InstallWarning>,
 ) -> Result<(), PackageManagerError> {
     let mut resolver = Resolver {
+        pinned,
         project_root: infer_project_root(&resolution.graph),
         gate: ReleaseAgeGate::new(policy, SystemTime::now()),
         manifests: HashMap::new(),
@@ -186,7 +195,9 @@ pub async fn enrich_resolution_with_registry_metadata(
     Ok(())
 }
 
-struct Resolver {
+struct Resolver<'l> {
+    /// The lockfile of the previous install, whose resolutions stand.
+    pinned: Option<&'l Lockfile>,
     project_root: PathBuf,
     gate: ReleaseAgeGate,
     /// Fetched manifests by package name, failures included.
@@ -197,7 +208,7 @@ struct Resolver {
     placeholders: BTreeSet<PackageId>,
 }
 
-impl Resolver {
+impl Resolver<'_> {
     /// Record the registry packages the graph already holds at one version,
     /// and the placeholders still to resolve.
     fn index(&mut self, resolution: &LocalResolution) {
@@ -264,6 +275,7 @@ impl Resolver {
     ) {
         let names: BTreeSet<String> = wave
             .iter()
+            .filter(|edge| self.pinned_target(edge).is_none())
             .filter_map(|edge| match classify(&edge.name, &edge.spec) {
                 Spec::Registry { package, .. } => Some(package.to_string()),
                 Spec::Tarball | Spec::Unsupported => None,
@@ -371,6 +383,11 @@ impl Resolver {
                 });
             }
         };
+        if let Some(target) = self.pinned_target(&edge) {
+            self.adopt_pinned(resolution, &target);
+            link(resolution, &edge, &target);
+            return Ok(());
+        }
         let aliased = package != edge.name;
         // A version the graph already holds satisfies the range.
         if !aliased
@@ -447,6 +464,74 @@ impl Resolver {
         Ok(())
     }
 
+    /// The package the pinned lockfile resolved `edge` to, when its version
+    /// still satisfies the edge's range and everything it reaches is
+    /// recorded there.
+    fn pinned_target(&self, edge: &Edge) -> Option<PackageId> {
+        let pinned = self.pinned?;
+        let Spec::Registry { range, .. } = classify(&edge.name, &edge.spec) else {
+            return None;
+        };
+        let target = pinned
+            .packages
+            .get(edge.from.as_str())?
+            .dependencies
+            .get(&edge.name)?;
+        let package = pinned.packages.get(target)?;
+        let version = semver::Version::parse(&package.version).ok()?;
+        if package.name != edge.name || !NpmRange::parse(range)?.matches(&version) {
+            return None;
+        }
+        pinned_closure(pinned, target).map(|_| PackageId::new(target.clone()))
+    }
+
+    /// Install `target` and every package it reaches as the pinned lockfile
+    /// records them.
+    fn adopt_pinned(&mut self, resolution: &mut LocalResolution, target: &PackageId) {
+        let Some(pinned) = self.pinned else {
+            return;
+        };
+        for id in pinned_closure(pinned, target.as_str()).unwrap_or_default() {
+            let id = PackageId::new(id);
+            if resolution.graph.packages.contains_key(&id) {
+                continue;
+            }
+            let locked = &pinned.packages[id.as_str()];
+            let manifest = PackageManifest {
+                name: Some(locked.name.clone()),
+                version: Some(locked.version.clone()),
+                ..PackageManifest::default()
+            };
+            resolution.graph.insert_package(PackageRoot {
+                id: id.clone(),
+                name: locked.name.clone(),
+                version: locked.version.clone(),
+                root: crate::layout::package_dir(&self.project_root, id.as_str(), &locked.name),
+                manifest,
+            });
+            resolution
+                .lockfile
+                .packages
+                .insert(id.to_string(), locked.clone());
+            for (name, dependency) in &locked.dependencies {
+                resolution.graph.insert_dependency_with_kind(
+                    id.clone(),
+                    name.clone(),
+                    PackageId::new(dependency.clone()),
+                    PackageDependencyKind::Runtime,
+                );
+            }
+            if id == PackageId::registry_version(&locked.name, &locked.version)
+                && let Ok(version) = semver::Version::parse(&locked.version)
+            {
+                self.versions
+                    .entry(locked.name.clone())
+                    .or_default()
+                    .insert(version, id);
+            }
+        }
+    }
+
     fn remove_unreached_placeholders(&self, resolution: &mut LocalResolution) {
         let reached: BTreeSet<&PackageId> = resolution
             .graph
@@ -467,6 +552,30 @@ impl Resolver {
             resolution.lockfile.packages.remove(id.as_str());
         }
     }
+}
+
+/// Every package `root` reaches in `pinned`, `root` first; `None` when one of
+/// them is missing or names no fetched tarball, so the lockfile cannot stand
+/// for it alone.
+fn pinned_closure<'a>(pinned: &'a Lockfile, root: &'a str) -> Option<Vec<&'a str>> {
+    let mut seen = BTreeSet::new();
+    let mut order = Vec::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let package = pinned.packages.get(id)?;
+        let fetched = package.resolved.as_ref().is_some_and(|source| {
+            source.kind == ResolvedSourceKind::Registry && is_tarball_reference(&source.reference)
+        });
+        if !fetched {
+            return None;
+        }
+        order.push(id);
+        stack.extend(package.dependencies.values().map(String::as_str));
+    }
+    Some(order)
 }
 
 /// The edges a resolved registry package declares: dependencies and optional
@@ -547,9 +656,7 @@ fn add_registry_package(
         scripts: version.scripts.clone(),
         ..PackageManifest::default()
     };
-    let root = project_root
-        .join("node_modules")
-        .join(package_name_path(install_name));
+    let root = crate::layout::package_dir(project_root, id.as_str(), install_name);
     resolution.graph.insert_package(PackageRoot {
         id: id.clone(),
         name: install_name.to_string(),

@@ -2938,7 +2938,6 @@ async fn run_pm_remove(args: RemoveArgs, json: bool) -> Result<ExitCode, OtterEr
             "otter remove requires at least one package",
         ));
     }
-    let previous_lockfile = read_lockfile_if_present(&args.root).await?;
     let mut manifest = PackageManifest::read_from_dir(&args.root)
         .await
         .map_err(map_manifest_error)?;
@@ -2953,22 +2952,19 @@ async fn run_pm_remove(args: RemoveArgs, json: bool) -> Result<ExitCode, OtterEr
         .write_to_dir(&args.root)
         .await
         .map_err(|err| pm_config_error(err.to_string()))?;
-    let lockfile_changed = otter_pm::write_local_lockfile(&args.root)
-        .await
-        .map_err(map_pm_error)?;
-    let current_lockfile = read_lockfile_if_present(&args.root)
-        .await?
-        .unwrap_or_else(otter_pm_lockfile::Lockfile::new);
-    let prune = if let Some(previous_lockfile) = previous_lockfile {
-        otter_pm::prune_removed_registry_packages(&args.root, &previous_lockfile, &current_lockfile)
-            .await
-            .map_err(map_pm_error)?
-    } else {
-        otter_pm::PruneReport {
-            removed_packages: 0,
-            removed_bins: 0,
-        }
-    };
+    let cache_root = otter_pm::user_cache_root();
+    let report = otter_pm::install_local_project(
+        &args.root,
+        &otter_pm::FsRegistryMetadataCache::new(cache_root.join("registry-metadata")),
+        &otter_pm::HttpRegistryMetadataClient::new(),
+        &otter_pm::FsPackageStore::new(cache_root),
+        &otter_pm::HttpTarballClient::new(),
+        &otter_pm::HttpAdvisoryClient::new(),
+    )
+    .await
+    .map_err(map_pm_error)?;
+    let lockfile_changed = report.lockfile_changed;
+    let prune = report.pruned;
     if json {
         stdoutln!(
             "{}",

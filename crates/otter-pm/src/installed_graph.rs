@@ -14,6 +14,8 @@
 //! # Invariants
 //! - The graph is reconstructed from deterministic lockfile state plus the
 //!   package manifests present on disk; missing install roots are skipped.
+//! - A package is found in Otter's virtual store, or else where a flat
+//!   `node_modules` keeps it.
 //! - Prune only removes registry packages absent from the current lockfile.
 //!   Workspace and `file:` packages are never deleted by this module.
 //! - Lifecycle scripts are only metadata here. They are not executed.
@@ -54,9 +56,16 @@ pub async fn resolve_installed_project(
             continue;
         };
         let package_id = PackageId::new(id);
-        let package_root = project_root
-            .join("node_modules")
-            .join(package_name_path(&package.name));
+        // Otter's own layout first; a tree another package manager laid out
+        // keeps each package at `node_modules/<name>`.
+        let stored = crate::layout::package_dir(project_root, id, &package.name);
+        let package_root = if tokio::fs::try_exists(&stored).await.unwrap_or(false) {
+            stored
+        } else {
+            project_root
+                .join("node_modules")
+                .join(package_name_path(&package.name))
+        };
         let manifest_path = package_root.join(PACKAGE_JSON);
         if !tokio::fs::try_exists(&manifest_path)
             .await
@@ -175,24 +184,34 @@ pub async fn prune_removed_registry_packages(
         if current.packages.contains_key(id) || !is_installed_registry_package(package) {
             continue;
         }
-        let package_root = project_root
-            .join("node_modules")
-            .join(package_name_path(&package.name));
+        let package_root = crate::layout::package_dir(project_root, id, &package.name);
         report.removed_bins += remove_linked_bins(project_root, &package_root).await?;
-        if tokio::fs::try_exists(&package_root)
+        let entry = crate::layout::store_entry_dir(project_root, id);
+        if tokio::fs::try_exists(&entry)
             .await
             .map_err(|err| PackageManagerError::Io {
-                path: package_root.clone(),
+                path: entry.clone(),
                 message: err.to_string(),
             })?
         {
-            tokio::fs::remove_dir_all(&package_root)
+            tokio::fs::remove_dir_all(&entry)
                 .await
                 .map_err(|err| PackageManagerError::Io {
-                    path: package_root.clone(),
+                    path: entry.clone(),
                     message: err.to_string(),
                 })?;
             report.removed_packages += 1;
+        }
+        // The project's link to it, if it had one, now leads nowhere.
+        let link = project_root
+            .join("node_modules")
+            .join(package_name_path(&package.name));
+        if tokio::fs::symlink_metadata(&link)
+            .await
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            && !tokio::fs::try_exists(&link).await.unwrap_or(false)
+        {
+            remove_file_if_exists(&link).await?;
         }
         let marker = project_root
             .join("node_modules")

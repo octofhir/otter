@@ -1,19 +1,19 @@
-//! Tarball fetch clients and content-addressed cache.
+//! Tarball fetch clients and Subresource Integrity verification.
 //!
 //! This module owns the async tarball byte path: download or fixture read,
-//! Subresource Integrity verification, and cache-first persistence. Archive
-//! extraction and project materialization live in the install layer.
+//! and the integrity check the store runs before it unpacks anything.
+//! Archive extraction and project materialization live in the install layer.
 //!
 //! # Contents
 //! - [`TarballSource`] describes one registry-selected tarball.
 //! - [`TarballFetchClient`] abstracts async byte fetching.
-//! - [`FsTarballCache`] stores verified tarballs by deterministic key.
 //! - [`FileTarballClient`] and [`HttpTarballClient`] provide fixture-backed and
 //!   network-backed byte clients.
+//! - The store key a tarball's extracted tree is filed under.
 //!
 //! # Invariants
-//! - All APIs are async-only and cache-first.
-//! - Cached bytes are verified before reuse whenever integrity is present.
+//! - All APIs are async-only.
+//! - Bytes are verified before they are unpacked whenever integrity is present.
 //! - Supported SRI algorithms are `sha512` and `sha256`.
 //!
 //! # See also
@@ -35,17 +35,6 @@ pub struct TarballSource {
     pub url: String,
     /// Optional SRI integrity string.
     pub integrity: Option<String>,
-}
-
-/// Tarball cache result.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CachedTarball {
-    /// Content-addressed local path.
-    pub path: PathBuf,
-    /// Tarball size in bytes.
-    pub bytes: u64,
-    /// `true` when a cache hit avoided fetch/write work.
-    pub reused: bool,
 }
 
 /// Source of tarball bytes.
@@ -160,83 +149,6 @@ impl TarballFetchClient for HttpTarballClient {
     }
 }
 
-/// Content-addressed tarball cache.
-#[derive(Debug, Clone)]
-pub struct FsTarballCache {
-    root: PathBuf,
-}
-
-impl FsTarballCache {
-    /// Create a tarball cache rooted at `root`.
-    #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    /// Return the deterministic cache path for a tarball source.
-    #[must_use]
-    pub fn tarball_path(&self, source: &TarballSource) -> PathBuf {
-        self.root.join(tarball_cache_key(source))
-    }
-
-    /// Cache-first tarball fetch path. This is the install hot path:
-    /// existing verified cache entries avoid fetches and writes.
-    pub async fn get_or_fetch(
-        &self,
-        source: &TarballSource,
-        client: &impl TarballFetchClient,
-    ) -> Result<CachedTarball, PackageManagerError> {
-        tokio::fs::create_dir_all(&self.root)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: self.root.clone(),
-                message: err.to_string(),
-            })?;
-        let path = self.tarball_path(source);
-        if tokio::fs::try_exists(&path)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: path.clone(),
-                message: err.to_string(),
-            })?
-        {
-            let bytes = tokio::fs::read(&path)
-                .await
-                .map_err(|err| PackageManagerError::Io {
-                    path: path.clone(),
-                    message: err.to_string(),
-                })?;
-            verify_tarball_integrity(source, &bytes)?;
-            return Ok(CachedTarball {
-                path,
-                bytes: bytes.len() as u64,
-                reused: true,
-            });
-        }
-
-        let bytes = client.fetch_tarball(&source.url).await?;
-        verify_tarball_integrity(source, &bytes)?;
-        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-        tokio::fs::write(&tmp, &bytes)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: tmp.clone(),
-                message: err.to_string(),
-            })?;
-        tokio::fs::rename(&tmp, &path)
-            .await
-            .map_err(|err| PackageManagerError::Io {
-                path: path.clone(),
-                message: err.to_string(),
-            })?;
-        Ok(CachedTarball {
-            path,
-            bytes: bytes.len() as u64,
-            reused: false,
-        })
-    }
-}
-
 pub(crate) fn tarball_cache_key(source: &TarballSource) -> String {
     if let Some(integrity) = &source.integrity {
         return cache_key(integrity);
@@ -244,7 +156,7 @@ pub(crate) fn tarball_cache_key(source: &TarballSource) -> String {
     format!("url-{}", cache_key(&source.url))
 }
 
-fn verify_tarball_integrity(
+pub(crate) fn verify_tarball_integrity(
     source: &TarballSource,
     bytes: &[u8],
 ) -> Result<(), PackageManagerError> {

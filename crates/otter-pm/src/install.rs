@@ -23,30 +23,40 @@
 //! - A materialized file is a link to stored content wherever the filesystem
 //!   allows it, and a copy of the same bytes where it does not.
 //! - Bin links point at the project-local `node_modules/.bin` layout.
+//! - A package version materializes into its one directory of
+//!   [`crate::layout`]; no two packages share a directory or a temporary one.
 //!
 //! # See also
 //! - [`crate::install_local_project`] for the full resolve/fetch/write flow.
 //! - [`crate::store`] for the content store and package index.
 //! - [`crate::tarball`] for byte fetch and integrity verification.
 
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+
+use futures_util::{StreamExt, TryStreamExt, stream};
 
 use flate2::read::GzDecoder;
 use otter_pm_lockfile::{LockedPackage, Lockfile, ResolvedSource, ResolvedSourceKind};
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest};
 
 use crate::store::{ContentStore, PackageIndex};
-use crate::tarball::tarball_cache_key;
+use crate::tarball::{tarball_cache_key, verify_tarball_integrity};
 use crate::{
-    CachedTarball, FsTarballCache, PackageBin, PackageId, PackageManagerError, TarballFetchClient,
-    TarballSource, binary_name_from_package_name, cache_key, package_name_path,
+    PackageBin, PackageId, PackageManagerError, TarballFetchClient, TarballSource,
+    binary_name_from_package_name, cache_key,
 };
 
-/// Tarball cache, content-addressed package store, and project materializer.
+/// Distinct tarballs fetched and extracted at once.
+pub const FETCH_CONCURRENCY: usize = 64;
+
+/// Package directories materialized at once.
+pub const MATERIALIZE_CONCURRENCY: usize = 16;
+
+/// Content-addressed package store and project materializer.
 #[derive(Debug, Clone)]
 pub struct FsPackageStore {
-    tarballs: FsTarballCache,
     content: ContentStore,
 }
 
@@ -56,7 +66,6 @@ impl FsPackageStore {
     pub fn new(cache_root: impl Into<PathBuf>) -> Self {
         let cache_root = cache_root.into();
         Self {
-            tarballs: FsTarballCache::new(cache_root.join("tarballs")),
             content: ContentStore::new(cache_root.join("store")),
         }
     }
@@ -77,43 +86,49 @@ impl FsPackageStore {
     }
 
     /// Fetch, verify, and extract one package into the content store.
+    ///
+    /// A package already in the store is reused without its tarball: the
+    /// index is named by the tarball's integrity. A fetched tarball is
+    /// verified and unpacked from memory; it is never written to disk.
     pub async fn get_or_fetch_and_extract(
         &self,
         source: &TarballSource,
         client: &impl TarballFetchClient,
     ) -> Result<ExtractedPackage, PackageManagerError> {
-        let cached_tarball = self.tarballs.get_or_fetch(source, client).await?;
         let key = tarball_cache_key(source);
         if let Some(index) = self.content.read_index(&key).await? {
             return Ok(ExtractedPackage {
                 index,
-                tarball: cached_tarball,
                 reused: true,
             });
         }
-
-        let archive_path = cached_tarball.path.clone();
+        let bytes = client.fetch_tarball(&source.url).await?;
         let content = self.content.clone();
-        let key_for_task = key.clone();
+        let source = source.clone();
+        let url = source.url.clone();
         let index = tokio::task::spawn_blocking(move || {
-            let index = store_tgz_package(&content, &archive_path)?;
-            content.write_index(&key_for_task, &index)?;
+            verify_tarball_integrity(&source, &bytes)?;
+            let index = store_tgz_package(&content, &bytes, &source.url)?;
+            content.write_index(&key, &index)?;
             Ok::<_, PackageManagerError>(index)
         })
         .await
         .map_err(|err| PackageManagerError::Archive {
-            path: cached_tarball.path.clone(),
+            path: PathBuf::from(&url),
             message: err.to_string(),
         })??;
-
         Ok(ExtractedPackage {
             index,
-            tarball: cached_tarball,
             reused: false,
         })
     }
 
     /// Materialize all registry tarballs from `lockfile` into `node_modules`.
+    ///
+    /// Each distinct tarball is fetched and extracted once, up to
+    /// [`FETCH_CONCURRENCY`] at a time; package directories then materialize
+    /// up to [`MATERIALIZE_CONCURRENCY`] at a time. Bins link afterwards, one
+    /// package at a time, so two packages naming the same bin never race.
     pub async fn materialize_registry_packages(
         &self,
         project_root: impl AsRef<Path>,
@@ -121,52 +136,77 @@ impl FsPackageStore {
         client: &impl TarballFetchClient,
     ) -> Result<Vec<InstalledPackage>, PackageManagerError> {
         let project_root = project_root.as_ref();
-        let mut packages = tarball_packages_for_project(project_root, lockfile);
-        packages.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut installed = Vec::with_capacity(packages.len());
-        for (id, package, source) in packages {
-            let extracted = self.get_or_fetch_and_extract(&source, client).await?;
-            let install_root = project_root
-                .join("node_modules")
-                .join(package_name_path(&package.name));
-            let state_root = project_root.join("node_modules").join(".otter-state");
-            let marker = state_root.join(format!("{}.source", cache_key(&id)));
-            let fingerprint = extracted.index.fingerprint();
-            let reused_install =
-                existing_install_matches(&install_root, &marker, &fingerprint).await?;
-            if !reused_install {
-                self.materialize_install_root(
-                    &extracted.index,
-                    &install_root,
-                    &marker,
-                    &fingerprint,
-                )
-                .await?;
-            }
-            let linked_bins = link_package_bins(project_root, &PackageId::new(&id), &install_root)
-                .await?
-                .len();
-            installed.push(InstalledPackage {
-                package_id: id,
-                name: package.name,
-                source,
-                installed_root: install_root,
-                reused_cache: extracted.reused && extracted.tarball.reused,
-                reused_install,
-                linked_bins,
-            });
+        let packages = tarball_packages_for_project(project_root, lockfile);
+        let sources: BTreeMap<String, TarballSource> = packages
+            .iter()
+            .map(|(_, _, source)| (source.url.clone(), source.clone()))
+            .collect();
+        let extracted: HashMap<String, ExtractedPackage> = stream::iter(sources.into_values())
+            .map(|source| async move {
+                let extracted = self.get_or_fetch_and_extract(&source, client).await?;
+                Ok::<_, PackageManagerError>((source.url, extracted))
+            })
+            .buffer_unordered(FETCH_CONCURRENCY)
+            .try_collect()
+            .await?;
+        let extracted = &extracted;
+        let mut installed: Vec<InstalledPackage> = stream::iter(packages)
+            .map(|(id, package, source)| async move {
+                let extracted = &extracted[&source.url];
+                let install_root = crate::layout::package_dir(project_root, &id, &package.name);
+                let marker = project_root
+                    .join("node_modules")
+                    .join(".otter-state")
+                    .join(format!("{}.source", cache_key(&id)));
+                let fingerprint = extracted.index.fingerprint();
+                let reused_install =
+                    existing_install_matches(&install_root, &marker, &fingerprint).await?;
+                if !reused_install {
+                    self.materialize_install_root(
+                        &tarball_cache_key(&source),
+                        &extracted.index,
+                        &install_root,
+                        &marker,
+                        &fingerprint,
+                    )
+                    .await?;
+                }
+                Ok::<_, PackageManagerError>(InstalledPackage {
+                    package_id: id,
+                    name: package.name,
+                    source,
+                    installed_root: install_root,
+                    reused_cache: extracted.reused,
+                    reused_install,
+                    linked_bins: 0,
+                })
+            })
+            .buffer_unordered(MATERIALIZE_CONCURRENCY)
+            .try_collect()
+            .await?;
+        installed.sort_by(|a, b| a.package_id.cmp(&b.package_id));
+        for package in &mut installed {
+            package.linked_bins = link_package_bins(
+                project_root,
+                &PackageId::new(&package.package_id),
+                &package.installed_root,
+            )
+            .await?
+            .len();
         }
         Ok(installed)
     }
 
     async fn materialize_install_root(
         &self,
+        key: &str,
         index: &PackageIndex,
         install_root: &Path,
         marker: &Path,
         fingerprint: &str,
     ) -> Result<(), PackageManagerError> {
         let content = self.content.clone();
+        let key = key.to_string();
         let index = index.clone();
         let install_root = install_root.to_path_buf();
         let install_root_for_error = install_root.clone();
@@ -177,13 +217,15 @@ impl FsPackageStore {
                 .parent()
                 .unwrap_or_else(|| Path::new("."))
                 .join(format!(".otter-install-tmp-{}", std::process::id()));
+            // The temporary directory sits beside the package's own
+            // directory, which no other package shares.
             if temporary.exists() {
                 std::fs::remove_dir_all(&temporary).map_err(|err| PackageManagerError::Io {
                     path: temporary.clone(),
                     message: err.to_string(),
                 })?;
             }
-            content.materialize(&index, &temporary)?;
+            content.materialize_package(&key, &index, &temporary)?;
             replace_directory(&temporary, &install_root)?;
             write_marker(&marker, &fingerprint)
         })
@@ -243,8 +285,6 @@ fn materialization_tarball_url(
 pub struct ExtractedPackage {
     /// Package tree, with npm's leading `package/` prefix stripped.
     pub index: PackageIndex,
-    /// Backing cached tarball.
-    pub tarball: CachedTarball,
     /// `true` when the package was already in the content store.
     pub reused: bool,
 }
@@ -334,13 +374,11 @@ fn replace_directory(temporary: &Path, install_root: &Path) -> Result<(), Packag
 /// above it, and materialization creates them.
 fn store_tgz_package(
     content: &ContentStore,
-    archive_path: &Path,
+    archive: &[u8],
+    url: &str,
 ) -> Result<PackageIndex, PackageManagerError> {
-    let file = std::fs::File::open(archive_path).map_err(|err| PackageManagerError::Io {
-        path: archive_path.to_path_buf(),
-        message: err.to_string(),
-    })?;
-    let decoder = GzDecoder::new(file);
+    let archive_path = Path::new(url);
+    let decoder = GzDecoder::new(archive);
     let mut archive = tar::Archive::new(decoder);
     let entries = archive
         .entries()

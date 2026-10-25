@@ -7,14 +7,19 @@
 //! # Contents
 //! - [`NpmRegistryMetadata`] and [`NpmPackageVersion`] model the npm metadata
 //!   subset needed by Otter installs.
-//! - [`RegistryMetadataClient`] abstracts async metadata fetch.
-//! - [`FsRegistryMetadataCache`] stores deterministic on-disk metadata JSON.
+//! - [`RegistryMetadataClient`] abstracts async metadata fetch, conditional
+//!   on a cached document's entity tag.
+//! - [`FsRegistryMetadataCache`] stores deterministic on-disk metadata JSON
+//!   and the entity tag beside it.
 //! - [`FileRegistryMetadataClient`] and [`HttpRegistryMetadataClient`] provide
 //!   fixture-backed and network-backed client implementations.
 //!
 //! # Invariants
 //! - All client/cache APIs are async-only.
 //! - Metadata JSON cache filenames use crate-level deterministic escaping.
+//! - A cached document is used as it is for [`METADATA_FRESH_FOR`] after it
+//!   was fetched or last confirmed current; after that the registry is asked,
+//!   and a `304` renews it. An unreachable registry leaves it in use.
 //! - HTTP clients are transport only; lockfile trust state is decided by the
 //!   install resolver.
 //!
@@ -186,14 +191,35 @@ pub struct NpmProvenance {
     pub predicate_type: Option<String>,
 }
 
+/// What a metadata request found.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataFetch {
+    /// The current document, with the entity tag that names it.
+    Fresh {
+        /// The package's metadata.
+        metadata: NpmRegistryMetadata,
+        /// The registry's `ETag` for this document.
+        etag: Option<String>,
+    },
+    /// The document the request's entity tag names is still current.
+    NotModified,
+}
+
 /// Source of npm registry metadata.
 pub trait RegistryMetadataClient {
     /// Fetch metadata for `package` without blocking the async runtime.
+    /// With `etag`, the registry may answer that the document it names is
+    /// still current instead of sending it again.
     fn fetch_metadata<'a>(
         &'a self,
         package: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<NpmRegistryMetadata, PackageManagerError>> + Send + 'a>>;
+        etag: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<MetadataFetch, PackageManagerError>> + Send + 'a>>;
 }
+
+/// How long a cached document is used without asking the registry: the
+/// public registry's own `max-age`.
+pub const METADATA_FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Deterministic filesystem cache for npm registry metadata.
 #[derive(Debug, Clone)]
@@ -257,18 +283,83 @@ impl FsRegistryMetadataCache {
             })
     }
 
-    /// Read from cache, otherwise fetch through `client` and cache the result.
+    fn etag_path(&self, package: &str) -> PathBuf {
+        self.root.join(format!("{}.etag", cache_key(package)))
+    }
+
+    /// The cached document while it is younger than [`METADATA_FRESH_FOR`];
+    /// otherwise the registry's answer to a request conditional on the cached
+    /// document's entity tag. A registry that cannot be reached leaves the
+    /// cached document in use.
     pub async fn get_or_fetch(
         &self,
         package: &str,
         client: &impl RegistryMetadataClient,
     ) -> Result<NpmRegistryMetadata, PackageManagerError> {
-        if let Some(metadata) = self.read(package).await? {
+        let path = self.metadata_path(package);
+        let age = tokio::fs::metadata(&path)
+            .await
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(|modified| modified.elapsed().unwrap_or_default());
+        if age.is_some_and(|age| age < METADATA_FRESH_FOR)
+            && let Some(metadata) = self.read(package).await?
+        {
             return Ok(metadata);
         }
-        let metadata = client.fetch_metadata(package).await?;
-        self.write(&metadata).await?;
-        Ok(metadata)
+        let etag = match age {
+            Some(_) => tokio::fs::read_to_string(self.etag_path(package))
+                .await
+                .ok(),
+            None => None,
+        };
+        match client.fetch_metadata(package, etag.as_deref()).await {
+            Ok(MetadataFetch::NotModified) => {
+                if let Some(metadata) = self.read(package).await? {
+                    touch(&path).await;
+                    return Ok(metadata);
+                }
+                // The cached document went missing in between: ask again.
+                match client.fetch_metadata(package, None).await? {
+                    MetadataFetch::Fresh { metadata, etag } => {
+                        self.store(&metadata, etag.as_deref()).await?;
+                        Ok(metadata)
+                    }
+                    MetadataFetch::NotModified => Err(PackageManagerError::RegistryMetadata {
+                        package: package.to_string(),
+                        message: "registry reported an unrequested document as current".to_string(),
+                    }),
+                }
+            }
+            Ok(MetadataFetch::Fresh { metadata, etag }) => {
+                self.store(&metadata, etag.as_deref()).await?;
+                Ok(metadata)
+            }
+            Err(error) => match self.read(package).await? {
+                Some(metadata) => Ok(metadata),
+                None => Err(error),
+            },
+        }
+    }
+
+    async fn store(
+        &self,
+        metadata: &NpmRegistryMetadata,
+        etag: Option<&str>,
+    ) -> Result<(), PackageManagerError> {
+        self.write(metadata).await?;
+        let path = self.etag_path(&metadata.name);
+        let written = match etag {
+            Some(etag) => tokio::fs::write(&path, etag).await,
+            None => match tokio::fs::remove_file(&path).await {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        };
+        written.map_err(|err| PackageManagerError::Io {
+            path,
+            message: err.to_string(),
+        })
     }
 }
 
@@ -294,8 +385,8 @@ impl RegistryMetadataClient for FileRegistryMetadataClient {
     fn fetch_metadata<'a>(
         &'a self,
         package: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<NpmRegistryMetadata, PackageManagerError>> + Send + 'a>>
-    {
+        _etag: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<MetadataFetch, PackageManagerError>> + Send + 'a>> {
         Box::pin(async move {
             let path = self.path(package);
             let text =
@@ -305,7 +396,10 @@ impl RegistryMetadataClient for FileRegistryMetadataClient {
                         path,
                         message: err.to_string(),
                     })?;
-            parse_registry_metadata(package, &text)
+            Ok(MetadataFetch::Fresh {
+                metadata: parse_registry_metadata(package, &text)?,
+                etag: None,
+            })
         })
     }
 }
@@ -352,14 +446,18 @@ impl RegistryMetadataClient for HttpRegistryMetadataClient {
     fn fetch_metadata<'a>(
         &'a self,
         package: &'a str,
-    ) -> Pin<Box<dyn Future<Output = Result<NpmRegistryMetadata, PackageManagerError>> + Send + 'a>>
-    {
+        etag: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = Result<MetadataFetch, PackageManagerError>> + Send + 'a>> {
         Box::pin(async move {
             let url = self.metadata_url(package);
-            let response = self
+            let mut request = self
                 .client
                 .get(&url)
-                .header(otter_http_client::header::ACCEPT, "application/json")
+                .header(otter_http_client::header::ACCEPT, "application/json");
+            if let Some(etag) = etag {
+                request = request.header(otter_http_client::header::IF_NONE_MATCH, etag);
+            }
+            let response = request
                 .send()
                 .await
                 .map_err(|err| PackageManagerError::Http {
@@ -367,6 +465,14 @@ impl RegistryMetadataClient for HttpRegistryMetadataClient {
                     message: err.to_string(),
                 })?;
             let status = response.status();
+            if status == otter_http_client::StatusCode::NOT_MODIFIED {
+                return Ok(MetadataFetch::NotModified);
+            }
+            let etag = response
+                .headers()
+                .get(otter_http_client::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
             if !status.is_success() {
                 return Err(PackageManagerError::Http {
                     url,
@@ -380,9 +486,24 @@ impl RegistryMetadataClient for HttpRegistryMetadataClient {
                     url: url.clone(),
                     message: err.to_string(),
                 })?;
-            parse_registry_metadata(package, &text)
+            Ok(MetadataFetch::Fresh {
+                metadata: parse_registry_metadata(package, &text)?,
+                etag,
+            })
         })
     }
+}
+
+/// Mark a cached document as just confirmed current.
+async fn touch(path: &std::path::Path) {
+    let path = path.to_path_buf();
+    let _ = tokio::task::spawn_blocking(move || {
+        std::fs::File::options()
+            .append(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+    })
+    .await;
 }
 
 fn parse_registry_metadata(

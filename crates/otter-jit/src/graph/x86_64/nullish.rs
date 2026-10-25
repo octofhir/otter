@@ -72,24 +72,40 @@ impl<'a> Codegen<'a> {
             ; je =>slow
             ; =>differ
         );
-        self.load_immediate(
-            destination,
-            if negate {
-                tag::VALUE_TRUE
+        if let Some(sink) = self.sink {
+            // Fused into its branch: each inline answer jumps to its
+            // successor; only the native-function leaf's answer is tested.
+            let (on_equal, on_differ) = if negate {
+                (sink.if_false, sink.if_true)
             } else {
-                tag::VALUE_FALSE
-            },
-        );
-        dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>equal);
-        self.load_immediate(
-            destination,
-            if negate {
-                tag::VALUE_FALSE
-            } else {
-                tag::VALUE_TRUE
-            },
-        );
-        dynasm!(self.ops ; .arch x64 ; =>done);
+                (sink.if_true, sink.if_false)
+            };
+            dynasm!(self.ops ; .arch x64
+                ; jmp =>on_differ
+                ; =>equal
+                ; jmp =>on_equal
+                ; =>done
+            );
+        } else {
+            self.load_immediate(
+                destination,
+                if negate {
+                    tag::VALUE_TRUE
+                } else {
+                    tag::VALUE_FALSE
+                },
+            );
+            dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>equal);
+            self.load_immediate(
+                destination,
+                if negate {
+                    tag::VALUE_FALSE
+                } else {
+                    tag::VALUE_TRUE
+                },
+            );
+            dynasm!(self.ops ; .arch x64 ; =>done);
+        }
         let test = otter_bytecode::TypeOfTest {
             kind: otter_bytecode::TypeOfKind::Undefined,
             negate,

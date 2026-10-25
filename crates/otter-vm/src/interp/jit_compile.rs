@@ -3633,6 +3633,14 @@ impl Interpreter {
             .gc_heap
             .read_payload(layout, |body| body.preparation_validity())?;
         let prototype_validity = self.bake_prototype_validity(&cell)?;
+        // Receivers are born in the initializer's final shape only while the
+        // family's current preparation covers every initializer field: a
+        // name the chain gained since (an accessor, a read-only property)
+        // ends the prepared prefix, and its store must run as written.
+        let prepared = self
+            .gc_heap
+            .read_payload(layout, |body| body.prepared_capacity(root_handle, prototype))
+            .unwrap_or(0);
         let mut initial_shape = root_handle;
         let (receiver_shape, initial_field_count) = match (
             self.simple_constructor_init_cache
@@ -3645,6 +3653,7 @@ impl Interpreter {
         ) {
             (Some(field_count), Some(shape))
                 if field_count <= inline_capacity
+                    && field_count <= prepared
                     && !crate::object::shape_body::state_of(shape).is_provisional()
                     && crate::object::shape_body::inline_capacity_of(shape) == inline_capacity =>
             {

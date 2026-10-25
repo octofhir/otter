@@ -141,7 +141,9 @@ mod tests {
             dynasm!(ops ; .arch x64
                 ; mov rax, r8 ; jmp =>done
                 ; =>miss ; xor eax, eax ; =>done ; ret);
-            let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+            let code =
+                crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                    .unwrap();
             // SAFETY: the SysV fixture reads one initialized word within `body`.
             let call: extern "sysv64" fn(*const u64) -> usize =
                 unsafe { std::mem::transmute(code.entry_ptr()) };
@@ -179,7 +181,9 @@ mod tests {
         );
         dynasm!(ops ; .arch x64 ; mov rax, r8 ; jmp =>done
             ; =>miss ; xor eax, eax ; =>done ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                .unwrap();
         // SAFETY: the SysV fixture reads one aligned initialized word in `body`.
         let call: extern "sysv64" fn(*const u64) -> usize =
             unsafe { std::mem::transmute(code.entry_ptr()) };

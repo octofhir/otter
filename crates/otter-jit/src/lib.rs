@@ -5,12 +5,16 @@
 //! register windows and canonical miss exits. The optimizing tier is the graph tier: an
 //! SSA graph built straight from bytecode and feedback, with calls inlined,
 //! live-interval allocation with planned canonical homes, and AArch64/x86_64 code
-//! generation. The
-//! dynasm-backed [`CompiledCode`] remains the sole W^X executable-memory owner.
+//! generation. Every
+//! code object is a [`CompiledCode`] placed in its compiler's [`CodeMemory`].
 //!
 //! # Contents
-//! - [`CompiledCode`] — a finalized, owned block of W^X executable machine code
+//! - [`CompiledCode`] — a finalized, owned block of executable machine code
 //!   plus its entry offset. The foundational output type every compile produces.
+//! - [`CodeMemory`] — one compiler's executable regions, holding its code
+//!   objects packed at a cache-line granule.
+//! - [`NativeCodeSpace`] — that memory with the routines every code object
+//!   of the compiler calls.
 //! - `graph` — the optimizing compiler (AArch64/x86_64).
 //! - `intrinsic_calls` — shared admission for identity-proven ordinary calls.
 //! - [`optimizing`] — finalized optimizing code objects with function and
@@ -21,7 +25,7 @@
 //! # Invariants
 //! - **`unsafe` is contained here.** This crate lifts the workspace
 //!   `forbid(unsafe_code)` (like `otter-gc`) because emitting and executing
-//!   machine code requires W^X mappings and fn-pointer transmutes. All `unsafe`
+//!   machine code requires executable mappings and fn-pointer transmutes. All `unsafe`
 //!   stays behind this crate's safe API; `otter-vm` keeps the ban and reaches
 //!   the JIT through a runtime-wired trait hook (no dependency cycle).
 //! - **Canonical GC roots.** Template code roots its published register window.
@@ -51,6 +55,7 @@ mod arm64;
 mod artifact;
 mod call_linkage;
 mod code;
+mod code_memory;
 mod entry;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod field_access;
@@ -63,17 +68,20 @@ mod intrinsic_calls;
 mod measurement;
 pub mod optimizing;
 mod return_sites;
+mod routines;
 mod template;
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
 
 pub use code::CompiledCode;
+pub use code_memory::CodeMemory;
 pub use entry::{BackendFailure, TransitionTable, Unsupported};
 pub use measurement::{
     JitCompilerMeasurement, JitCompilerProbe, JitMeasurementTier, MeasuredCompilation,
     MeasuredValidation,
 };
 pub use optimizing::{CompileFailure, OptimizedCode, compile_optimized};
+pub use routines::NativeCodeSpace;
 pub use template::{TemplateCode, compile};
 
 /// Native-tier policy selected by the embedding runtime.
@@ -95,6 +103,9 @@ pub struct OtterJitCompiler {
     /// Hook-lifetime resolution of the transition inventory; every compile
     /// bakes entry addresses through this table.
     transitions: TransitionTable,
+    /// Executable memory every code object this compiler emits is placed
+    /// in, with the routines that code calls.
+    code_space: NativeCodeSpace,
 }
 
 impl Default for OtterJitCompiler {
@@ -140,6 +151,7 @@ impl OtterJitCompiler {
         Self {
             policy,
             transitions,
+            code_space: NativeCodeSpace::new(),
         }
     }
 }
@@ -182,22 +194,27 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             &request.snapshot,
             request.code_object_id,
             &self.transitions,
+            &self.code_space,
             artifact_request,
             capture_events,
         );
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
         let compiled = {
             let _ = artifact_request;
-            template::compile(&request.snapshot, request.code_object_id, &self.transitions).map(
-                |code| artifact::NativeCompileOutput {
-                    code,
-                    artifact: None,
-                    required_cells: Box::default(),
-                    diagnostics: Box::default(),
-                    ir_node_count: u64::try_from(request.snapshot.instructions.len())
-                        .unwrap_or(u64::MAX),
-                },
+            template::compile(
+                &request.snapshot,
+                request.code_object_id,
+                &self.transitions,
+                &self.code_space,
             )
+            .map(|code| artifact::NativeCompileOutput {
+                code,
+                artifact: None,
+                required_cells: Box::default(),
+                diagnostics: Box::default(),
+                ir_node_count: u64::try_from(request.snapshot.instructions.len())
+                    .unwrap_or(u64::MAX),
+            })
         };
         match compiled {
             Ok(output) => Ok(otter_vm::JitCompileStatus::Compiled {
@@ -249,6 +266,7 @@ impl otter_vm::JitCompilerHook for OtterJitCompiler {
             &request.snapshot,
             request.code_object_id,
             &self.transitions,
+            &self.code_space,
             request.osr_pc,
             artifact_request,
             request.debug.events_enabled(),
@@ -315,7 +333,7 @@ mod toolchain_tests {
     {
         let mut ops = dynasmrt::aarch64::Assembler::new().unwrap();
         let entry = emit(&mut ops);
-        CompiledCode::new(ops.finalize().unwrap(), entry)
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap()
     }
 
     #[test]
@@ -398,7 +416,7 @@ mod x86_64_toolchain_tests {
     {
         let mut ops = dynasmrt::x64::Assembler::new().unwrap();
         let entry = emit(&mut ops);
-        CompiledCode::new(ops.finalize().unwrap(), entry)
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap()
     }
 
     #[test]

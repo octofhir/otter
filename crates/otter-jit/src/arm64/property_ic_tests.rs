@@ -53,7 +53,8 @@ fn projected_store_returns_storage_owner_and_misses_preserve_source() {
         ; str x5, [x6, std::mem::offset_of!(Invocation, child) as u32]
         ; str x1, [x6, std::mem::offset_of!(Invocation, returned_value) as u32]
         ; mov x0, x7 ; ret);
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     // SAFETY: the fixture uses initialized host cells, a zero observation owner,
     // and the generated C signature; no helper or collection can run.
     let call: extern "C" fn(*mut Invocation) -> usize =
@@ -77,7 +78,8 @@ fn projected_double_loads_return_canonical_values() {
     dynasm!(ops ; .arch aarch64
         ; =>miss ; mov x0, #0
         ; =>done ; ret);
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     // SAFETY: the mapping reads initialized host cells and calls no helper.
     let call: extern "C" fn(*mut Invocation) -> u64 =
         unsafe { std::mem::transmute(code.entry_ptr()) };
@@ -104,7 +106,8 @@ fn array_expando_projection_reads_live_edge_and_preserves_source_receiver() {
     let done = ops.new_dynamic_label();
     emit_array_expando(&mut ops, layout, 0, 2, miss);
     dynasm!(ops ; .arch aarch64 ; mov x0, x2 ; b =>done ; =>miss ; mov x0, xzr ; =>done ; ret);
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     // SAFETY: the generated C fixture reads only initialized bounded host cells.
     let call: extern "C" fn(usize) -> usize = unsafe { std::mem::transmute(code.entry_ptr()) };
     assert_eq!(call(std::hint::black_box(&words).as_ptr() as usize), bag_a);

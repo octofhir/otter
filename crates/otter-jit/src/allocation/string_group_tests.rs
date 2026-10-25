@@ -252,7 +252,8 @@ fn run(
         }
         dynasm!(ops ; .arch x64 ; add rsp, 32 ; pop r15 ; pop r14 ; pop r13 ; pop r12 ; pop rbp ; pop rbx ; ret);
     }
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     // SAFETY: the finalized fixture has this exact preserved native ABI.
     #[cfg(target_arch = "aarch64")]
     let call: extern "C" fn(*mut JitCtx, *const u64, *mut u64) -> usize =

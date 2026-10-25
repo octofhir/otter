@@ -121,15 +121,23 @@ fn native_call_trampoline_enters_available_compiled_tiers_on_child_and_current_f
         )],
     );
     let transitions = super::TransitionTable::resolve();
-    let template = crate::template::compile(&snapshot, 1, &transitions).unwrap();
+    let template =
+        crate::template::compile(&snapshot, 1, &transitions, &crate::NativeCodeSpace::new())
+            .unwrap();
     let template_entry = (
         template.entry_addr().unwrap() as u64,
         NativeFrameKind::Baseline,
         1,
     );
     #[cfg(target_arch = "aarch64")]
-    let optimized =
-        crate::optimizing::compile_optimized(&snapshot, 2, None, &Default::default()).unwrap();
+    let optimized = crate::optimizing::compile_optimized(
+        &snapshot,
+        2,
+        &crate::NativeCodeSpace::new(),
+        None,
+        &Default::default(),
+    )
+    .unwrap();
     #[cfg(target_arch = "aarch64")]
     let compiled = vec![
         template_entry,
@@ -259,7 +267,7 @@ fn generated_staged_anchor_is_the_exact_return_table_coordinate() {
     parent.header.kind = NativeFrameKind::Baseline;
     parent.code_object_id = 17;
     let parent_address = std::ptr::from_mut(&mut parent) as u64;
-    let code = crate::CompiledCode::new(mapping, entry);
+    let code = crate::CompiledCode::new(&crate::CodeMemory::new(), mapping, entry).unwrap();
     // SAFETY: only the address is read; `code` outlives every use of it.
     let entry_address = unsafe { code.entry_ptr() } as usize as u64;
     let actual_return = entry_address + (returned.0 - entry.0) as u64;

@@ -447,7 +447,7 @@ pub(super) fn emit_method_call(
     table: &crate::entry::TransitionTable,
     return_sites: &mut crate::return_sites::ReturnSiteRecorder<'_>,
     view: &JitCompileSnapshot,
-    shared_property: &mut super::shared_property::SharedPropertyProbes,
+    shared_property: &crate::routines::RoutineRequest<'_>,
     mut direct_call_events: Option<&mut crate::template::DirectCallEvents>,
     mut code_map: Option<&mut crate::artifact::CodeMapCapture>,
     logical_pc: u32,
@@ -528,7 +528,6 @@ pub(super) fn emit_method_call(
         .filter(|&slot| slot != 0 && view.cage_base != 0)
     {
         use super::shared_property::{LOAD_RECEIVER, LOAD_SLOT};
-        let routine = shared_property.method_label(ops);
         emit_load_reg(ops, LOAD_RECEIVER, receiver);
         emit_load_symbol_u64(
             ops,
@@ -540,8 +539,13 @@ pub(super) fn emit_method_call(
                 byte_pc,
             },
         );
+        super::shared_property::emit_call(
+            ops,
+            relocations,
+            shared_property,
+            crate::routines::PropertyRoutine::Method,
+        );
         dynasm!(ops ; .arch x64
-            ; call =>routine
             ; test rdx, rdx
             ; jz =>resolved);
     }

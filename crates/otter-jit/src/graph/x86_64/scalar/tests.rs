@@ -40,7 +40,7 @@ fn integer_fixture(dst: u8, emit: impl FnOnce(&mut Assembler, Exits)) -> crate::
         ; =>exits.lost ; mov eax, 3
         ; =>finish ; mov [r8 + 8], rdi ; mov [r8 + 16], rsi ; ret
     );
-    crate::CompiledCode::new(ops.finalize().unwrap(), entry)
+    crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap()
 }
 
 fn run_integer(code: &crate::CompiledCode, a: i32, b: i32) -> (u64, [u64; 4]) {
@@ -256,7 +256,9 @@ fn scalar_float_comparisons_obey_unordered_and_signed_zero_conditions() {
         dynasm!(ops ; .arch x64 ; ucomisd xmm0, xmm1);
         emit_cset_bool(&mut ops, 0, condition, true);
         dynasm!(ops ; .arch x64 ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), start)
+                .unwrap();
         // SAFETY: two scalar System V float inputs, one word result, no stack
         // changes or calls; the mapping outlives every invocation.
         let run: extern "sysv64" fn(f64, f64) -> u64 =
@@ -314,7 +316,9 @@ fn float_two_address_results_preserve_rhs_and_nan_zero_semantics() {
             let start = ops.offset();
             arith::emit_float_binary(&mut ops, &kind, 0, 1, dst);
             dynasm!(ops ; .arch x64 ; movq rax, Rx(dst) ; ret);
-            let code = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+            let code =
+                crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), start)
+                    .unwrap();
             // SAFETY: this pure System V float fixture writes only volatile
             // XMM registers/RAX and retains its executable mapping.
             let run: extern "sysv64" fn(f64, f64) -> u64 =
@@ -354,7 +358,9 @@ fn exact_float_conversions_reject_nan_range_fraction_and_distinguish_index_negat
             ; xor eax, eax ; jmp =>finish ; =>exit ; mov eax, 1 ; jmp =>finish
             ; =>zero ; mov eax, 2 ; =>finish ; mov [rdi], rdx ; movq rsi, xmm0 ; mov [rdi + 8], rsi ; ret
         );
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), start)
+                .unwrap();
         // SAFETY: one float and a pointer to two owned observation words,
         // volatile register writes only; this fixture makes no calls.
         let run: extern "sysv64" fn(f64, *mut u64) -> u64 =
@@ -409,7 +415,8 @@ fn graph_number_boxing_preserves_double_words_at_integer_edges_nan_and_signed_ze
     let start = ops.offset();
     convert::emit_box_number(&mut ops, 0, 0);
     dynasm!(ops ; .arch x64 ; movq rdx, xmm0 ; mov [rdi], rdx ; ret);
-    let code = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+    let code = crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), start)
+        .unwrap();
     // SAFETY: scalar float input plus one owned observation word, one word
     // result and only volatile scratch; the mapping remains owned here.
     let run: extern "sysv64" fn(f64, *mut u64) -> u64 =
@@ -448,7 +455,9 @@ fn uint32_shift_converts_the_full_unsigned_domain_without_signed_truncation() {
             constant.map_or(Int32Operand::Register(1), Int32Operand::Constant),
         );
         dynasm!(ops ; .arch x64 ; cvtsi2sd xmm0, r10 ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), start)
+                .unwrap();
         // SAFETY: pure System V word inputs, scalar FP output and volatile
         // scratch only; the code mapping remains alive throughout the loop.
         let run: extern "sysv64" fn(u64, u64) -> f64 =
@@ -553,7 +562,8 @@ fn tagged_number_conversion_preserves_source_and_rejects_non_numbers_before_resu
         ; xor eax, eax ; jmp =>done ; =>exit ; mov eax, 1
         ; =>done ; movsd [rsi], xmm0 ; mov [rsi + 8], rdi ; ret
     );
-    let code = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+    let code = crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), start)
+        .unwrap();
     // SAFETY: one tagged word and a two-word owned observation span, with
     // no calls, allocation or heap dereference; only volatile words change.
     let run: extern "sysv64" fn(u64, *mut u64) -> u64 =

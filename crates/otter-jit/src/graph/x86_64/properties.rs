@@ -40,10 +40,10 @@ use otter_vm::{
 };
 
 use super::Codegen;
-use crate::x86_64::{property_actions::emit_action_probe, values::emit_load_symbol_u64};
+use crate::x86_64::values::emit_load_symbol_u64;
 use crate::{
     Unsupported,
-    artifact::relocation::{GuardedHeapComponent, PropertySourceAccess, RelocationTarget},
+    artifact::relocation::{GuardedHeapComponent, RelocationTarget},
     graph::{
         call::CommittedArgument,
         ir::{DeoptReason, Kind, NamedStorePlan, NodeId},
@@ -209,28 +209,16 @@ impl Codegen<'_> {
                 self.emit_body_slot_receiver(receiver, slot, exit);
                 dynasm!(self.ops ; .arch x64 ; mov [Rq(receiver) + slot.byte as i32], Rq(value));
             }
-            Kind::LoadPropertyCached { pc, atom, length } => {
+            Kind::LoadPropertyCached { pc, length } => {
                 let have_length = length.then(|| self.emit_exotic_length(node, input(0), result()));
-                self.emit_load_property_cached(
-                    node,
-                    pc,
-                    atom,
-                    input(0),
-                    assigned.gp_temps[..4].try_into().unwrap(),
-                    result(),
-                )?;
+                self.emit_property_probe_load(node, pc, input(0), result())?;
                 if let Some(have_length) = have_length {
                     dynasm!(self.ops ; .arch x64 ; =>have_length);
                 }
             }
-            Kind::StorePropertyCached { pc, atom, barrier } => self.emit_store_property_cached(
-                node,
-                pc,
-                atom,
-                barrier,
-                [input(0), input(1)],
-                assigned.gp_temps[..4].try_into().unwrap(),
-            )?,
+            Kind::StorePropertyCached { pc } => {
+                self.emit_property_routine_store(node, pc, [input(0), input(1)])?
+            }
             Kind::LoadGuardedMethod {
                 byte_pc,
                 target,
@@ -809,190 +797,14 @@ impl Codegen<'_> {
         done
     }
 
-    fn emit_load_property_cached(
-        &mut self,
+    /// The IC slot of the named-property site at `pc` of the body `node`
+    /// belongs to, with its relocation.
+    fn property_site_slot(
+        &self,
         node: NodeId,
         pc: u32,
-        atom: Option<u32>,
-        receiver: u8,
-        temps: [u8; 4],
-        destination: u8,
-    ) -> Result<(), Unsupported> {
-        let slow = self.ops.new_dynamic_label();
-        let done = self.ops.new_dynamic_label();
-        let table = self.ops.new_dynamic_label();
-        // The generic load: the site's own handlers first, then the
-        // isolate's shared table, then the committed miss.
-        if let Some((slot, function_id, byte_pc)) = self.property_ic_slot(node, pc) {
-            let view = self.view_of(node);
-            emit_load_symbol_u64(
-                &mut self.ops,
-                &mut self.relocations,
-                temps[0],
-                slot,
-                RelocationTarget::PropertyIcSlot {
-                    function_id,
-                    byte_pc,
-                },
-            );
-            crate::x86_64::property_ic::emit_slot_load(
-                &mut self.ops,
-                view,
-                receiver,
-                temps[0],
-                [temps[1], temps[2], temps[3]],
-                destination,
-                table,
-                table,
-                done,
-            );
-        }
-        dynasm!(self.ops ; .arch x64 ; =>table);
-        let cache = self.view_of(node).property_action_cache;
-        emit_action_probe(
-            &mut self.ops,
-            &mut self.relocations,
-            self.view,
-            cache,
-            atom.map(crate::x86_64::property_actions::AtomOperand::Immediate),
-            PropertySourceAccess::Load,
-            receiver,
-            None,
-            temps,
-            Some(destination),
-            slow,
-            done,
-            done,
-        );
-        dynasm!(self.ops ; .arch x64 ; =>slow);
-        self.emit_property_runtime(
-            node,
-            pc,
-            PropertySourceAccess::Load,
-            [receiver, receiver],
-            Some(destination),
-        )?;
-        dynasm!(self.ops ; .arch x64 ; =>done);
-        Ok(())
-    }
-
-    fn emit_store_property_cached(
-        &mut self,
-        node: NodeId,
-        pc: u32,
-        atom: Option<u32>,
-        barrier: bool,
-        [receiver, value]: [u8; 2],
-        temps: [u8; 4],
-    ) -> Result<(), Unsupported> {
-        let slow = self.ops.new_dynamic_label();
-        let done = self.ops.new_dynamic_label();
-        let appended = self.ops.new_dynamic_label();
-        let table = self.ops.new_dynamic_label();
-        let slot_stored = self.ops.new_dynamic_label();
-        let table_stored = self.ops.new_dynamic_label();
-        // The generic store: the site's own handlers, then the shared
-        // table; an append leaves its compressed child in `temps[1]`.
-        let slot = self.property_ic_slot(node, pc);
-        if let Some((slot, function_id, byte_pc)) = slot {
-            let view = self.view_of(node);
-            emit_load_symbol_u64(
-                &mut self.ops,
-                &mut self.relocations,
-                temps[0],
-                slot,
-                RelocationTarget::PropertyIcSlot {
-                    function_id,
-                    byte_pc,
-                },
-            );
-            crate::x86_64::property_ic::emit_slot_store(
-                &mut self.ops,
-                &mut self.relocations,
-                view,
-                receiver,
-                value,
-                temps[0],
-                [temps[2], temps[3], temps[1]],
-                table,
-                table,
-                slot_stored,
-            );
-        }
-        dynasm!(self.ops ; .arch x64 ; =>table);
-        let cache = self.view_of(node).property_action_cache;
-        emit_action_probe(
-            &mut self.ops,
-            &mut self.relocations,
-            self.view,
-            cache,
-            atom.map(crate::x86_64::property_actions::AtomOperand::Immediate),
-            PropertySourceAccess::Store,
-            receiver,
-            Some(value),
-            temps[..4].try_into().unwrap(),
-            None,
-            slow,
-            table_stored,
-            appended,
-        );
-        // A store that owes no value barrier completes at `done`.
-        let value_stored = if barrier {
-            self.ops.new_dynamic_label()
-        } else {
-            done
-        };
-        dynasm!(self.ops ; .arch x64 ; =>table_stored);
-        if barrier {
-            dynasm!(self.ops ; .arch x64 ; mov Rq(temps[0]), Rq(receiver));
-        }
-        dynasm!(self.ops ; .arch x64
-            ; jmp =>value_stored
-            ; =>slot_stored ; test Rd(temps[1]), Rd(temps[1]) ; jz =>value_stored
-            ; =>appended);
-        self.emit_dynamic_shape_child_barrier(node, receiver, temps[1], temps[2]);
-        if barrier {
-            dynasm!(self.ops ; .arch x64 ; mov Rq(temps[0]), Rq(receiver) ; =>value_stored);
-            self.emit_write_barrier(node, temps[0], value);
-        }
-        dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>slow);
-        self.emit_property_runtime(
-            node,
-            pc,
-            PropertySourceAccess::Store,
-            [receiver, value],
-            None,
-        )?;
-        dynasm!(self.ops ; .arch x64 ; =>done);
-        // Each hit barriers its actual storage owner; the committed miss owns its edges.
-        Ok(())
-    }
-
-    /// The native IC slot of the property site at `pc` of the body `node`
-    /// belongs to: `(address, function id, byte pc)`. A site that was already
-    /// megamorphic at compile time has none: that state is terminal, so its
-    /// handlers stay empty and the shared table serves every receiver.
-    fn property_ic_slot(&self, node: NodeId, pc: u32) -> Option<(u64, u32, u32)> {
+    ) -> Result<(u64, RelocationTarget), Unsupported> {
         let view = self.view_of(node);
-        let byte_pc = view.instructions.get(pc as usize)?.byte_pc;
-        let access = view.property_accesses.get(&byte_pc)?;
-        (access.ic_slot != 0 && !access.shared && view.cage_base != 0).then_some((
-            access.ic_slot,
-            view.code_block.id,
-            byte_pc,
-        ))
-    }
-
-    fn emit_property_runtime(
-        &mut self,
-        node: NodeId,
-        pc: u32,
-        access: PropertySourceAccess,
-        [receiver, value]: [u8; 2],
-        destination: Option<u8>,
-    ) -> Result<(), Unsupported> {
-        let view = self.view_of(node);
-        let function_id = view.code_block.id;
         let byte_pc = view
             .instructions
             .get(pc as usize)
@@ -1006,23 +818,81 @@ impl Codegen<'_> {
             .ok_or(Unsupported::OperandShape(
                 "x86 graph property site without an IC slot",
             ))?;
-        let stub = match access {
-            PropertySourceAccess::Load => abi::STUB_JIT_LOAD_PROPERTY,
-            PropertySourceAccess::Store => abi::STUB_JIT_STORE_PROPERTY,
-        };
-        let mut arguments: smallvec::SmallVec<[CommittedArgument; 3]> =
-            smallvec::smallvec![CommittedArgument::Value(receiver)];
-        if matches!(access, PropertySourceAccess::Store) {
-            arguments.push(CommittedArgument::Value(value));
-        }
-        arguments.push(CommittedArgument::Address(
+        Ok((
             slot,
             RelocationTarget::PropertyIcSlot {
-                function_id,
+                function_id: view.code_block.id,
                 byte_pc,
             },
-        ));
-        self.emit_committed_call(node, stub, &arguments, destination)
+        ))
+    }
+
+    /// `Rq(destination)` = the named property at `pc` of `Rq(receiver)`,
+    /// both in the probe routine's fixed words: the routine's selection,
+    /// which preserves every other register, and on its miss the committed
+    /// runtime operation with every live register kept in its canonical home.
+    fn emit_property_probe_load(
+        &mut self,
+        node: NodeId,
+        pc: u32,
+        receiver: u8,
+        destination: u8,
+    ) -> Result<(), Unsupported> {
+        use crate::template::x86_64::shared_property::{PROBE_RECEIVER, PROBE_SLOT, PROBE_STATUS};
+        debug_assert_eq!(receiver, PROBE_RECEIVER);
+        debug_assert_eq!(
+            destination,
+            super::super::registers::X86_64.property_probe.result
+        );
+        let (slot, target) = self.property_site_slot(node, pc)?;
+        let done = self.ops.new_dynamic_label();
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            PROBE_SLOT,
+            slot,
+            target.clone(),
+        );
+        crate::template::x86_64::shared_property::emit_call(
+            &mut self.ops,
+            &mut self.relocations,
+            self.shared_property,
+            crate::routines::PropertyRoutine::ProbeLoad,
+        );
+        dynasm!(self.ops ; .arch x64 ; test Rq(PROBE_STATUS), Rq(PROBE_STATUS) ; jz =>done);
+        self.emit_committed_call(
+            node,
+            abi::STUB_JIT_LOAD_PROPERTY,
+            &[
+                CommittedArgument::Value(receiver),
+                CommittedArgument::Address(slot, target),
+            ],
+            Some(destination),
+        )?;
+        dynasm!(self.ops ; .arch x64 ; =>done);
+        Ok(())
+    }
+
+    /// The named store at `pc` of `Rq(value)` into `Rq(receiver)` through
+    /// the compiler's store routine, whose inputs are the committed runtime
+    /// ABI's, every live register preserved through its canonical home.
+    fn emit_property_routine_store(
+        &mut self,
+        node: NodeId,
+        pc: u32,
+        [receiver, value]: [u8; 2],
+    ) -> Result<(), Unsupported> {
+        let (slot, target) = self.property_site_slot(node, pc)?;
+        self.emit_committed_routine_call(
+            node,
+            crate::routines::PropertyRoutine::CommittedStore,
+            &[
+                CommittedArgument::Value(receiver),
+                CommittedArgument::Value(value),
+                CommittedArgument::Address(slot, target),
+            ],
+            None,
+        )
     }
 
     fn emit_instanceof(

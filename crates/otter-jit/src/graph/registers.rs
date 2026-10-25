@@ -4,6 +4,7 @@
 //! - [`RegisterContract`] describes allocation pools, calls and arithmetic words.
 //! - [`IntDivisionRegisters`] names the quotient and remainder registers.
 //! - [`ReceiverAllocationRegisters`] names inline constructor receiver words.
+//! - [`PropertyProbeRegisters`] names the named-load probe routine's words.
 //! - `AARCH64` / `X86_64` supply each native Graph instruction encoder.
 //!
 //! # Invariants
@@ -50,6 +51,18 @@ pub(crate) struct RegisterContract {
     /// `None` means division has ordinary inputs, output and temporaries.
     pub(crate) integer_division: Option<IntDivisionRegisters>,
     pub(crate) receiver_allocation: ReceiverAllocationRegisters,
+    /// The receiver and result words of the compiler's named-load probe,
+    /// which preserves every other allocatable register.
+    pub(crate) property_probe: PropertyProbeRegisters,
+}
+
+/// The fixed words of the compiler's named-load probe routine: it reads the
+/// receiver from `receiver`, leaves a hit's value in `result` and writes no
+/// other allocatable register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PropertyProbeRegisters {
+    pub(crate) receiver: u8,
+    pub(crate) result: u8,
 }
 
 impl RegisterContract {
@@ -118,6 +131,13 @@ impl RegisterContract {
                 && receiver.new_target != receiver.result,
             "receiver allocation preserves its new.target input"
         );
+        let probe = self.property_probe;
+        for register in [probe.receiver, probe.result] {
+            assert!(
+                register < 32 && general & (1 << register) != 0,
+                "fixed probe word must have an allocatable physical register"
+            );
+        }
         if let Some(pair) = self.integer_division {
             assert_ne!(
                 pair.quotient, pair.remainder,
@@ -150,6 +170,10 @@ pub(crate) const AARCH64: RegisterContract = RegisterContract {
         result: 0,
         clobbers: &[1, 4, 11, 12, 13, 14, 15],
     },
+    property_probe: PropertyProbeRegisters {
+        receiver: 1,
+        result: 0,
+    },
 };
 
 #[cfg(any(test, target_arch = "x86_64"))]
@@ -171,6 +195,10 @@ pub(crate) const X86_64: RegisterContract = RegisterContract {
         new_target: 1,
         result: 0,
         clobbers: &[2, 7, 8, 9],
+    },
+    property_probe: PropertyProbeRegisters {
+        receiver: 6,
+        result: 0,
     },
 };
 

@@ -43,7 +43,8 @@ fn derived_context_publication_requires_exact_construct_frame_and_preserves_root
         crate::x86_64::allocation::emit_publish_derived_this_context(&mut ops, 8, 2, fid, [10, 11]);
         dynasm!(ops ; .arch x64 ; mov rax, rdx ; ret);
     }
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     let run: unsafe extern "C" fn(*mut Frame, u64) -> u64 =
         unsafe { std::mem::transmute(code.entry_ptr()) };
     for (derived, frame_fid) in [(true, fid), (false, fid), (true, fid + 1)] {

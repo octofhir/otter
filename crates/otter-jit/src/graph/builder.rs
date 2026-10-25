@@ -3182,7 +3182,6 @@ impl<'a> Builder<'a> {
                 let value = self.add(
                     Kind::LoadPropertyCached {
                         pc: self.pc,
-                        atom: atom.map(|site| site.atom),
                         length: true,
                     },
                     &[object],
@@ -3254,7 +3253,6 @@ impl<'a> Builder<'a> {
         self.add(
             Kind::LoadPropertyCached {
                 pc: self.pc,
-                atom,
                 length: false,
             },
             &[object],
@@ -3554,13 +3552,8 @@ impl<'a> Builder<'a> {
         let object = self.tagged(object);
         let value = self.read(instruction.reads[1]);
         let value = self.tagged(value);
-        let barrier = self.owes_barrier(object, value);
         self.add(
-            Kind::StorePropertyCached {
-                pc: self.pc,
-                atom,
-                barrier,
-            },
+            Kind::StorePropertyCached { pc: self.pc },
             &[object, value],
             Repr::None,
         );

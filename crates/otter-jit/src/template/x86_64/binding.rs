@@ -412,7 +412,12 @@ mod tests {
                         ; pop r15
                         ; ret
                     );
-                    let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+                    let code = crate::CompiledCode::new(
+                        &crate::CodeMemory::new(),
+                        ops.finalize().unwrap(),
+                        entry,
+                    )
+                    .unwrap();
                     // SAFETY: this private System V fixture reads only the owned
                     // stable byte arenas and scalar pointers written above. It
                     // preserves r15, has no call/GC boundary, and returns u32.

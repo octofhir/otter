@@ -38,7 +38,8 @@ fn whole_lookup_null_word_rejects_either_compressed_edge() {
     dynasm!(ops ; .arch aarch64
         ; mov x0, x13 ; b =>done
         ; =>miss ; mov x0, xzr ; =>done ; ret);
-    let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code = crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+        .unwrap();
     // SAFETY: the C fixture reads one aligned initialized word inside `body`.
     let call: extern "C" fn(*const u64) -> usize = unsafe { std::mem::transmute(code.entry_ptr()) };
     let mut body = [u64::MAX, 0, u64::MAX];
@@ -95,7 +96,8 @@ fn template_element_address_accepts_numeric_indices_and_preserves_miss_key() {
         ; fmov x5, d0 ; cmp x5, x4 ; b.ne =>corrupt
         ; ret
         ; =>corrupt ; movn x0, #0 ; ret);
-    let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code = crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+        .unwrap();
     // SAFETY: the leaf computes one in-range address or returns zero. The
     // caller owns the initialized output slot; it neither calls nor collects.
     let call: extern "C" fn(*const u64, u64, u64, *mut u64) -> usize =

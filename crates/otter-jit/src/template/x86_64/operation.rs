@@ -35,7 +35,7 @@ pub(crate) struct OperationContext<'c, 'a> {
     pub(crate) labels: &'c BTreeMap<u32, DynamicLabel>,
     pub(crate) exits: OperationExits,
     pub(crate) frame_kind: abi::NativeFrameKind,
-    pub(crate) shared_property: &'c mut super::shared_property::SharedPropertyProbes,
+    pub(crate) shared_property: &'c crate::routines::RoutineRequest<'a>,
     pub(crate) direct_call_events: &'c mut Option<crate::template::DirectCallEvents>,
     pub(crate) code_map: &'c mut Option<CodeMapCapture>,
 }

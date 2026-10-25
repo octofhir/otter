@@ -279,7 +279,8 @@ mod tests {
         let mut ops = dynasmrt::x64::Assembler::new_with_capacity(32_768).unwrap();
         let entry = ops.offset();
         ops.push(0xc3);
-        let mapping = CompiledCode::new(ops.finalize().unwrap(), entry);
+        let mapping =
+            CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
         let reserved = mapping.retained_mapping_bytes();
         let mut code = TemplateCode::from_emission(
             mapping,

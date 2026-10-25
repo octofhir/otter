@@ -442,6 +442,7 @@ fn nested_native_leaf_has_its_own_descriptor_source_and_complete_miss_recipe() {
         &root,
         707,
         &crate::entry::TransitionTable::resolve(),
+        &crate::routines::fixture_routines(&root, &crate::entry::TransitionTable::resolve()),
         None,
         true,
         &Default::default(),
@@ -495,6 +496,7 @@ fn nested_native_leaf_has_its_own_descriptor_source_and_complete_miss_recipe() {
         &root,
         708,
         &crate::entry::TransitionTable::resolve(),
+        &crate::NativeCodeSpace::new(),
         None,
         Some(crate::artifact::ArtifactRequest {
             identity: otter_vm::JitArtifactIdentity {

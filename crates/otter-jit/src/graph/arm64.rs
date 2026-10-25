@@ -187,7 +187,8 @@ struct Codegen<'a> {
     plan: &'a crate::template::TemplatePlan,
     plan_index: FxHashMap<u32, Vec<usize>>,
     /// Shared property subroutines requested by Generic sites.
-    shared_property: crate::template::arm64::shared_property::SharedPropertyProbes,
+    /// The compiler's routine set, which generic sites call.
+    shared_property: &'a crate::routines::RoutineRequest<'a>,
     no_direct_call_events: Option<crate::template::DirectCallEvents>,
     no_code_map: Option<crate::artifact::CodeMapCapture>,
     spliced_functions: std::collections::BTreeSet<u32>,
@@ -290,6 +291,7 @@ pub(crate) fn emit(
     built: &Built,
     allocation: &Allocation,
     transitions: &crate::entry::TransitionTable,
+    routines: &crate::routines::RoutineRequest<'_>,
     code_object_id: u64,
     deopt_runtime: *const otter_vm::deopt::DeoptRuntime,
     plan: &crate::template::TemplatePlan,
@@ -363,7 +365,7 @@ pub(crate) fn emit(
         deopt_runtime: deopt_runtime as u64,
         plan,
         plan_index: metadata::operation_index(plan),
-        shared_property: Default::default(),
+        shared_property: routines,
         no_direct_call_events: None,
         no_code_map: None,
         spliced_functions: std::collections::BTreeSet::new(),
@@ -455,13 +457,6 @@ pub(crate) fn emit(
     if codegen.far {
         emit_shared_exits(&mut codegen);
     }
-    let shared_property = std::mem::take(&mut codegen.shared_property);
-    shared_property.emit(
-        &mut codegen.ops,
-        &mut codegen.relocations,
-        transitions,
-        view,
-    );
     codegen.emit_float_pool();
     codegen.relocations.emit_literal_pool(&mut codegen.ops);
     codegen
@@ -2246,33 +2241,20 @@ impl<'a> Codegen<'a> {
                 self.emit_body_slot_receiver(receiver, slot, exit);
                 dynasm!(self.ops ; .arch aarch64 ; str X(value), [X(receiver), slot.byte]);
             }
-            Kind::LoadPropertyCached { pc, atom, length } => {
+            Kind::LoadPropertyCached { pc, length } => {
                 let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
-                let temps = [
-                    allocation.gp_temps[0],
-                    allocation.gp_temps[1],
-                    allocation.gp_temps[2],
-                    allocation.gp_temps[3],
-                ];
-                let (pc, atom) = (*pc, *atom);
+                let (pc, length) = (*pc, *length);
                 let have_length =
                     length.then(|| self.emit_exotic_length(node, receiver, destination));
-                self.emit_load_property_cached(node, pc, atom, receiver, temps, destination)?;
+                self.emit_property_probe_load(node, pc, receiver, destination)?;
                 if let Some(have_length) = have_length {
                     dynasm!(self.ops ; .arch aarch64 ; =>have_length);
                 }
             }
-            Kind::StorePropertyCached { pc, atom, barrier } => {
+            Kind::StorePropertyCached { pc } => {
                 let (receiver, value) = (Self::gp(input(0)), Self::gp(input(1)));
-                let temps = [
-                    allocation.gp_temps[0],
-                    allocation.gp_temps[1],
-                    allocation.gp_temps[2],
-                    allocation.gp_temps[3],
-                ];
-                let (pc, atom, barrier) = (*pc, *atom, *barrier);
-                self.emit_store_property_cached(node, pc, atom, barrier, [receiver, value], temps)?;
+                self.emit_property_routine_store(node, *pc, [receiver, value])?;
             }
             Kind::StoreKeyedCached { .. } => {
                 let (receiver, key, value) =
@@ -3555,192 +3537,14 @@ impl<'a> Codegen<'a> {
         done
     }
 
-    fn emit_load_property_cached(
-        &mut self,
+    /// The IC slot of the named-property site at `pc` of the body `node`
+    /// belongs to, with its relocation.
+    fn property_site_slot(
+        &self,
         node: NodeId,
         pc: u32,
-        atom: Option<u32>,
-        receiver: u8,
-        temps: [u8; 4],
-        destination: u8,
-    ) -> Result<(), Unsupported> {
-        let slow = self.ops.new_dynamic_label();
-        let done = self.ops.new_dynamic_label();
-        let table = self.ops.new_dynamic_label();
-        // The generic load: the site's own handlers first, then the
-        // isolate's shared table, then the committed miss.
-        if let Some((slot, function_id, byte_pc)) = self.property_ic_slot(node, pc) {
-            let view = metadata::source_view(self.view, self.inline_views, self.graph, node);
-            emit_load_symbol_u64(
-                &mut self.ops,
-                &mut self.relocations,
-                temps[0],
-                slot,
-                RelocationTarget::PropertyIcSlot {
-                    function_id,
-                    byte_pc,
-                },
-            );
-            crate::arm64::property_ic::emit_slot_load(
-                &mut self.ops,
-                view,
-                receiver,
-                temps[0],
-                [temps[1], temps[2], temps[3]],
-                destination,
-                table,
-                table,
-                done,
-            );
-        }
-        dynasm!(self.ops ; .arch aarch64 ; =>table);
-        if let Some(atom) = atom {
-            let view = metadata::source_view(self.view, self.inline_views, self.graph, node);
-            crate::arm64::property_actions::emit_load(
-                &mut self.ops,
-                &mut self.relocations,
-                view,
-                crate::arm64::property_actions::AtomOperand::Immediate(atom),
-                receiver,
-                temps,
-                destination,
-                slow,
-            );
-            dynasm!(self.ops ; .arch aarch64 ; b =>done);
-        }
-        dynasm!(self.ops ; .arch aarch64 ; =>slow);
-        self.emit_property_runtime(
-            node,
-            pc,
-            crate::artifact::relocation::PropertySourceAccess::Load,
-            [receiver, receiver],
-            Some(destination),
-        )?;
-        dynasm!(self.ops ; .arch aarch64 ; =>done);
-        Ok(())
-    }
-
-    /// Store actions are independent of the read fact under the shared key.
-    /// The probe commits only after all guards. Its hit returns the actual
-    /// storage object for the value barrier, which a `barrier`-free store
-    /// does not owe, while append children remain owned by the original
-    /// ordinary receiver.
-    fn emit_store_property_cached(
-        &mut self,
-        node: NodeId,
-        pc: u32,
-        atom: Option<u32>,
-        barrier: bool,
-        [receiver, value]: [u8; 2],
-        [holder, child_shape, entry, index]: [u8; 4],
-    ) -> Result<(), Unsupported> {
-        let slow = self.ops.new_dynamic_label();
-        let done = self.ops.new_dynamic_label();
-        let table = self.ops.new_dynamic_label();
-        let stored = self.ops.new_dynamic_label();
-        // The generic store: the site's own handlers, then the shared
-        // table; both leave the compressed child (zero for an overwrite).
-        let slot = self.property_ic_slot(node, pc);
-        if let Some((slot, function_id, byte_pc)) = slot {
-            let view = metadata::source_view(self.view, self.inline_views, self.graph, node);
-            emit_load_symbol_u64(
-                &mut self.ops,
-                &mut self.relocations,
-                holder,
-                slot,
-                RelocationTarget::PropertyIcSlot {
-                    function_id,
-                    byte_pc,
-                },
-            );
-            crate::arm64::property_ic::emit_slot_store(
-                &mut self.ops,
-                &mut self.relocations,
-                view,
-                receiver,
-                value,
-                holder,
-                [entry, index, child_shape],
-                table,
-                table,
-                stored,
-            );
-        }
-        dynasm!(self.ops ; .arch aarch64 ; =>table);
-        if let Some(atom) = atom {
-            let view = metadata::source_view(self.view, self.inline_views, self.graph, node);
-            crate::arm64::property_actions::emit_store(
-                &mut self.ops,
-                &mut self.relocations,
-                view,
-                crate::arm64::property_actions::AtomOperand::Immediate(atom),
-                [receiver, value],
-                [holder, child_shape, entry, index],
-                slow,
-            );
-        } else {
-            dynasm!(self.ops ; .arch aarch64 ; b =>slow);
-        }
-        if atom.is_some() && barrier {
-            dynasm!(self.ops ; .arch aarch64 ; mov X(holder), X(receiver));
-        }
-        if atom.is_some() || slot.is_some() {
-            // A store that owes no value barrier completes at `done`.
-            let overwritten = if barrier {
-                self.ops.new_dynamic_label()
-            } else {
-                done
-            };
-            dynasm!(self.ops ; .arch aarch64 ; =>stored ; cbz W(child_shape), =>overwritten);
-            self.emit_dynamic_shape_child_barrier(node, receiver, child_shape, entry);
-            if barrier {
-                dynasm!(self.ops ; .arch aarch64 ; mov X(holder), X(receiver) ; =>overwritten);
-                self.emit_write_barrier(node, holder, value);
-            }
-            dynasm!(self.ops ; .arch aarch64 ; b =>done);
-        }
-        dynasm!(self.ops ; .arch aarch64 ; =>slow);
-        self.emit_property_runtime(
-            node,
-            pc,
-            crate::artifact::relocation::PropertySourceAccess::Store,
-            [receiver, value],
-            None,
-        )?;
-        dynasm!(self.ops ; .arch aarch64 ; =>done);
-        Ok(())
-    }
-
-    /// The native IC slot of the property site at `pc` of the body `node`
-    /// belongs to: `(address, function id, byte pc)`. A site that was already
-    /// megamorphic at compile time has none: that state is terminal, so its
-    /// handlers stay empty and the shared table serves every receiver.
-    fn property_ic_slot(&self, node: NodeId, pc: u32) -> Option<(u64, u32, u32)> {
+    ) -> Result<(u64, RelocationTarget), Unsupported> {
         let view = self.view_of(node);
-        let byte_pc = view.instructions.get(pc as usize)?.byte_pc;
-        let access = view.property_accesses.get(&byte_pc)?;
-        (access.ic_slot != 0 && !access.shared && view.cage_base != 0).then_some((
-            access.ic_slot,
-            view.code_block.id,
-            byte_pc,
-        ))
-    }
-
-    /// The full property operation at `pc` in the runtime, with every live
-    /// register preserved through its canonical home around the call: the load
-    /// stub from `X(receiver)` into `X(destination)`, or the store stub of
-    /// `X(value)`. A throw leaves through the node's throw routing.
-    fn emit_property_runtime(
-        &mut self,
-        node: NodeId,
-        pc: u32,
-        access: crate::artifact::relocation::PropertySourceAccess,
-        [receiver, value]: [u8; 2],
-        destination: Option<u8>,
-    ) -> Result<(), Unsupported> {
-        use crate::artifact::relocation::PropertySourceAccess;
-        let view = self.view_of(node);
-        let function_id = view.code_block.id;
         let byte_pc = view
             .instructions
             .get(pc as usize)
@@ -3754,27 +3558,79 @@ impl<'a> Codegen<'a> {
             .ok_or(Unsupported::OperandShape(
                 "graph property site without an IC slot",
             ))?;
-        let stub = match access {
-            PropertySourceAccess::Load => abi::STUB_JIT_LOAD_PROPERTY,
-            PropertySourceAccess::Store => abi::STUB_JIT_STORE_PROPERTY,
-        };
-        let values: &[u8] = match access {
-            PropertySourceAccess::Load => &[receiver],
-            PropertySourceAccess::Store => &[receiver, value],
-        };
-        let mut arguments: smallvec::SmallVec<[CommittedArgument; 3]> = values
-            .iter()
-            .copied()
-            .map(CommittedArgument::Value)
-            .collect();
-        arguments.push(CommittedArgument::Address(
+        Ok((
             slot,
             RelocationTarget::PropertyIcSlot {
-                function_id,
+                function_id: view.code_block.id,
                 byte_pc,
             },
-        ));
-        self.emit_committed_call(node, stub, &arguments, destination)
+        ))
+    }
+
+    /// `X(destination)` = the named property at `pc` of `X(receiver)`, both
+    /// in the probe routine's fixed words: the routine's selection, which
+    /// preserves every other register, and on its miss the committed runtime
+    /// operation with every live register kept in its canonical home.
+    fn emit_property_probe_load(
+        &mut self,
+        node: NodeId,
+        pc: u32,
+        receiver: u8,
+        destination: u8,
+    ) -> Result<(), Unsupported> {
+        use crate::template::arm64::shared_property::{PROBE_RECEIVER, PROBE_SLOT};
+        debug_assert_eq!(receiver, PROBE_RECEIVER);
+        debug_assert_eq!(destination, super::registers::AARCH64.property_probe.result);
+        let (slot, target) = self.property_site_slot(node, pc)?;
+        let done = self.ops.new_dynamic_label();
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            PROBE_SLOT,
+            slot,
+            target.clone(),
+        );
+        crate::template::arm64::shared_property::emit_call(
+            &mut self.ops,
+            &mut self.relocations,
+            self.shared_property,
+            crate::routines::PropertyRoutine::ProbeLoad,
+        );
+        dynasm!(self.ops ; .arch aarch64 ; cbz X(PROBE_SLOT), =>done);
+        self.emit_committed_call(
+            node,
+            abi::STUB_JIT_LOAD_PROPERTY,
+            &[
+                CommittedArgument::Value(receiver),
+                CommittedArgument::Address(slot, target),
+            ],
+            Some(destination),
+        )?;
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        Ok(())
+    }
+
+    /// The named store at `pc` of `X(value)` into `X(receiver)` through the
+    /// compiler's store routine, called like the committed runtime operation
+    /// it completes with on a miss, every live register preserved through its
+    /// canonical home. A throw leaves through the node's throw routing.
+    fn emit_property_routine_store(
+        &mut self,
+        node: NodeId,
+        pc: u32,
+        [receiver, value]: [u8; 2],
+    ) -> Result<(), Unsupported> {
+        let (slot, target) = self.property_site_slot(node, pc)?;
+        self.emit_committed_routine_call(
+            node,
+            crate::routines::PropertyRoutine::CommittedStore,
+            &[
+                CommittedArgument::Value(receiver),
+                CommittedArgument::Value(value),
+                CommittedArgument::Address(slot, target),
+            ],
+            None,
+        )
     }
 
     /// `X(destination)` = `X(value) instanceof X(target)`. A target that is
@@ -3992,74 +3848,6 @@ impl<'a> Codegen<'a> {
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         self.emit_sink_register(destination);
         Ok(())
-    }
-
-    /// [`Self::emit_shape_child_barrier`] for a child shape whose compressed
-    /// handle is in `W(shape)`; `X(child)` is clobbered.
-    fn emit_dynamic_shape_child_barrier(
-        &mut self,
-        node: NodeId,
-        receiver: u8,
-        shape: u8,
-        child: u8,
-    ) {
-        let flags_byte = self.view.gc_barrier.header_flags_byte;
-        let young = self.view.gc_barrier.young_flag;
-        let settled = young | self.view.gc_barrier.remembered_flag;
-        let slow = self.ops.new_dynamic_label();
-        let done = self.ops.new_dynamic_label();
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; and XSP(child), X(receiver), #0xffff_ffff_0000_0000
-            ; add X(child), X(child), X(shape)
-            ; ldr x16, [x20, THREAD_OFFSET]
-            ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
-            ; ldrb w16, [x16]
-            ; cbz w16, >generational
-            // While marking runs, a white old shape owes the insertion barrier.
-            ; ldrb w16, [X(child), flags_byte]
-            ; movz w17, u32::from(young)
-            ; tst w16, w17
-            ; b.ne >generational
-            ; movz w17, self.view.gc_barrier.mark_color_bits
-            ; tst w16, w17
-            ; b.eq =>slow
-            ; generational:
-            ; ldrb w16, [X(receiver), flags_byte]
-            ; movz w17, u32::from(settled)
-            ; tst w16, w17
-            ; b.ne =>done
-            ; ldrb w16, [X(child), flags_byte]
-            ; movz w17, u32::from(young)
-            ; tst w16, w17
-            ; b.ne =>slow
-            ; =>done
-        );
-        let live = self.allocation.node(node).live_registers.clone();
-        self.deferred
-            .push(Box::new(move |codegen: &mut Codegen<'a>| {
-                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
-                let saved = codegen.emit_save_registers(&live);
-                dynasm!(codegen.ops
-                    ; .arch aarch64
-                    ; mov x16, X(receiver)
-                    ; mov x17, X(child)
-                    ; ldr x0, [x20, THREAD_OFFSET]
-                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-                    ; mov x1, x16
-                    ; mov x2, x17
-                );
-                emit_load_symbol_u64(
-                    &mut codegen.ops,
-                    &mut codegen.relocations,
-                    16,
-                    otter_vm::runtime_stubs::WRITE_BARRIER_MUTATING.entry_addr() as u64,
-                    RelocationTarget::runtime_stub(abi::STUB_WRITE_BARRIER),
-                );
-                dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
-                codegen.emit_restore_registers(&live, saved);
-                dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
-            }));
     }
 
     /// The receiver is leaving its current shape: clear the shape's stable
@@ -5399,7 +5187,7 @@ impl<'a> Codegen<'a> {
                     exits,
                     poll_entry: self.transitions.entry(abi::STUB_JIT_BACKEDGE_POLL),
                     far_branches: true,
-                    shared_property: &mut self.shared_property,
+                    shared_property: self.shared_property,
                     numeric_slow_paths: &mut numeric_slow_paths,
                     coercion_slow_paths: &mut coercion_slow_paths,
                     direct_call_events: &mut self.no_direct_call_events,

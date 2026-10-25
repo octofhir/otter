@@ -115,6 +115,7 @@ fn compile(
         view,
         3,
         &crate::entry::TransitionTable::resolve(),
+        &crate::NativeCodeSpace::new(),
         Some(crate::artifact::ArtifactRequest {
             identity: otter_vm::JitArtifactIdentity {
                 function_name: "directDiagnostics".into(),

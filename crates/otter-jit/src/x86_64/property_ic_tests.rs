@@ -54,7 +54,8 @@ fn projected_store_returns_storage_owner_and_misses_preserve_source() {
         ; mov [r8 + std::mem::offset_of!(Invocation, child) as i32], r9
         ; mov [r8 + std::mem::offset_of!(Invocation, returned_value) as i32], rsi
         ; mov eax, ecx ; pop rbx ; ret);
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     // SAFETY: the fixture uses initialized host cells, a zero observation owner,
     // and the generated SysV signature; no helper or collection can run.
     let call: extern "sysv64" fn(*mut Invocation) -> usize =
@@ -78,7 +79,8 @@ fn projected_double_loads_return_canonical_values() {
     dynasm!(ops ; .arch x64
         ; =>miss ; xor esi, esi
         ; =>done ; mov rax, rsi ; ret);
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     // SAFETY: this System V mapping reads bounded initialized host cells.
     let call: extern "sysv64" fn(*mut Invocation) -> u64 =
         unsafe { std::mem::transmute(code.entry_ptr()) };
@@ -105,7 +107,8 @@ fn array_expando_projection_reads_live_edge_and_preserves_source_receiver() {
     let done = ops.new_dynamic_label();
     emit_array_expando(&mut ops, layout, 7, 0, miss);
     dynasm!(ops ; .arch x64 ; jmp =>done ; =>miss ; xor eax, eax ; =>done ; ret);
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     // SAFETY: the generated SysV fixture reads only initialized bounded host cells.
     let call: extern "sysv64" fn(usize) -> usize = unsafe { std::mem::transmute(code.entry_ptr()) };
     assert_eq!(call(std::hint::black_box(&words).as_ptr() as usize), bag_a);

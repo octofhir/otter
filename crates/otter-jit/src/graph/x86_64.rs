@@ -82,7 +82,8 @@ struct Codegen<'a> {
     plan: &'a crate::template::TemplatePlan,
     plan_index: FxHashMap<u32, Vec<usize>>,
     /// Shared property routines requested by Generic sites.
-    shared_property: crate::template::x86_64::shared_property::SharedPropertyProbes,
+    /// The compiler's routine set, which generic sites call.
+    shared_property: &'a crate::routines::RoutineRequest<'a>,
     no_direct_call_events: Option<crate::template::DirectCallEvents>,
     no_code_map: Option<crate::artifact::CodeMapCapture>,
     spliced_functions: std::collections::BTreeSet<u32>,
@@ -117,6 +118,7 @@ pub(crate) fn emit(
     built: &Built,
     allocation: &Allocation,
     transitions: &crate::entry::TransitionTable,
+    routines: &crate::routines::RoutineRequest<'_>,
     code_object_id: u64,
     deopt_runtime: *const otter_vm::deopt::DeoptRuntime,
     plan: &crate::template::TemplatePlan,
@@ -187,7 +189,7 @@ pub(crate) fn emit(
         deopt_runtime: deopt_runtime as u64,
         plan,
         plan_index: metadata::operation_index(plan),
-        shared_property: Default::default(),
+        shared_property: routines,
         no_direct_call_events: None,
         no_code_map: None,
         spliced_functions: std::collections::BTreeSet::new(),
@@ -252,13 +254,6 @@ pub(crate) fn emit(
         spill,
     );
     codegen.emit_exit_stubs();
-    let shared_property = std::mem::take(&mut codegen.shared_property);
-    shared_property.emit(
-        &mut codegen.ops,
-        &mut codegen.relocations,
-        transitions,
-        view,
-    );
     codegen
         .return_sites
         .sort_by_key(|site| site.native_return_offset);

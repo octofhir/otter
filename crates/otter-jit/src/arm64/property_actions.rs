@@ -48,14 +48,6 @@ fn load_constant(
     }
 }
 
-/// The probed property key: a compile-time atom, or one held in a register by
-/// a shared per-code-object probe that serves many sites.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AtomOperand {
-    Immediate(u32),
-    Register(u8),
-}
-
 fn layout(view: &JitCompileSnapshot) -> Option<JitPropertyActionCache> {
     view.property_action_cache.filter(|cache| {
         cache.table_addr != 0
@@ -86,7 +78,7 @@ fn key(
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     cache: JitPropertyActionCache,
-    atom: AtomOperand,
+    atom: u8,
     receiver: u8,
     [holder, slot, entry, base]: [u8; 4],
     store: bool,
@@ -113,18 +105,8 @@ fn key(
     dynasm!(ops ; .arch aarch64 ; ldr X(slot), [X(holder), cache.shape_id_byte]);
     load_constant(ops, relocations, 17, cache.hash_shape_multiplier);
     dynasm!(ops ; .arch aarch64 ; mul X(entry), X(slot), x17);
-    match atom {
-        AtomOperand::Immediate(atom) => load_constant(
-            ops,
-            relocations,
-            17,
-            u64::from(atom).wrapping_mul(cache.hash_atom_multiplier),
-        ),
-        AtomOperand::Register(atom) => {
-            load_constant(ops, relocations, 17, cache.hash_atom_multiplier);
-            dynasm!(ops ; .arch aarch64 ; mov W(base), W(atom) ; mul x17, X(base), x17);
-        }
-    }
+    load_constant(ops, relocations, 17, cache.hash_atom_multiplier);
+    dynasm!(ops ; .arch aarch64 ; mov W(base), W(atom) ; mul x17, X(base), x17);
     dynasm!(ops ; .arch aarch64 ; eor X(entry), X(entry), x17);
     let set_bits = (cache.set_mask + 1).trailing_zeros();
     let stride = u64::from(cache.entry_bytes) * u64::from(cache.ways);
@@ -169,16 +151,7 @@ fn key(
     dynasm!(ops ; .arch aarch64 ; =>way
         ; ldr x16, [X(entry), cache.receiver_shape_id_byte] ; cmp x16, X(slot) ; b.ne =>next
         ; ldr w16, [X(entry), cache.atom_byte]);
-    match atom {
-        AtomOperand::Immediate(atom) if atom < 1 << 12 => {
-            dynasm!(ops ; .arch aarch64 ; cmp w16, atom);
-        }
-        AtomOperand::Immediate(atom) => {
-            emit_load_u64(ops, 17, u64::from(atom));
-            dynasm!(ops ; .arch aarch64 ; cmp w16, w17);
-        }
-        AtomOperand::Register(atom) => dynasm!(ops ; .arch aarch64 ; cmp w16, W(atom)),
-    }
+    dynasm!(ops ; .arch aarch64 ; cmp w16, W(atom));
     dynasm!(ops ; .arch aarch64 ; b.eq =>found
         ; =>next ; add XSP(entry), XSP(entry), #cache.entry_bytes
         ; subs W(base), WSP(base), #1 ; b.ne =>way ; b =>miss ; =>found);
@@ -229,16 +202,14 @@ pub(crate) fn emit_load(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
-    atom: AtomOperand,
+    atom: u8,
     receiver: u8,
     temps @ [holder, slot, entry, base]: [u8; 4],
     destination: u8,
     miss: DynamicLabel,
 ) {
     registers(&[receiver], temps);
-    if let AtomOperand::Register(atom) = atom {
-        debug_assert!(atom != receiver && !temps.contains(&atom) && !matches!(atom, 16 | 17));
-    }
+    debug_assert!(atom != receiver && !temps.contains(&atom) && !matches!(atom, 16 | 17));
     let Some(cache) = layout(view) else {
         dynasm!(ops ; .arch aarch64 ; b =>miss);
         return;
@@ -316,17 +287,15 @@ pub(crate) fn emit_store(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
-    atom: AtomOperand,
+    atom: u8,
     [receiver, value]: [u8; 2],
     temps @ [holder, slot, entry, base]: [u8; 4],
     miss: DynamicLabel,
 ) {
     registers(&[receiver, value], temps);
-    if let AtomOperand::Register(atom) = atom {
-        debug_assert!(
-            atom != receiver && atom != value && !temps.contains(&atom) && !matches!(atom, 16 | 17)
-        );
-    }
+    debug_assert!(
+        atom != receiver && atom != value && !temps.contains(&atom) && !matches!(atom, 16 | 17)
+    );
     let Some(cache) = layout(view) else {
         dynasm!(ops ; .arch aarch64 ; b =>miss);
         return;

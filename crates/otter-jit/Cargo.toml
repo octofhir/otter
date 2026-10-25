@@ -33,6 +33,12 @@ smallvec = { workspace = true }
 dynasm = "5"
 dynasmrt = "5"
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 yaxpeax-arch = { workspace = true }
 yaxpeax-arm = { workspace = true }

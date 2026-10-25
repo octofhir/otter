@@ -143,6 +143,7 @@ fn emitted_receiver_refill_and_retry_misses_keep_their_semantic_owner() {
         &receiver,
         8001,
         &transitions,
+        &crate::routines::fixture_routines(&receiver, &transitions),
         None,
         false,
         &Default::default(),
@@ -198,8 +199,16 @@ fn emitted_receiver_refill_and_retry_misses_keep_their_semantic_owner() {
             realm_id: array.literal_allocations.realm_id,
         }),
     );
-    let compiled =
-        super::compile(&array, 8002, &transitions, None, false, &Default::default()).unwrap();
+    let compiled = super::compile(
+        &array,
+        8002,
+        &transitions,
+        &crate::routines::fixture_routines(&array, &transitions),
+        None,
+        false,
+        &Default::default(),
+    )
+    .unwrap();
     assert!(
         compiled
             .built
@@ -278,8 +287,16 @@ fn nested_native_regions_use_their_own_function_and_byte_pc() {
     );
     offer(&mut root, Arc::new(middle));
     let transitions = crate::entry::TransitionTable::resolve();
-    let compiled =
-        super::compile(&root, 7001, &transitions, None, false, &Default::default()).unwrap();
+    let compiled = super::compile(
+        &root,
+        7001,
+        &transitions,
+        &crate::routines::fixture_routines(&root, &transitions),
+        None,
+        false,
+        &Default::default(),
+    )
+    .unwrap();
     assert_eq!(
         compiled.built.inline_views.len(),
         2,
@@ -308,6 +325,7 @@ fn nested_native_regions_use_their_own_function_and_byte_pc() {
         &root,
         7002,
         &transitions,
+        &crate::NativeCodeSpace::new(),
         None,
         Some(request),
         false,
@@ -318,6 +336,7 @@ fn nested_native_regions_use_their_own_function_and_byte_pc() {
         &root,
         7003,
         &transitions,
+        &crate::NativeCodeSpace::new(),
         None,
         None,
         false,
@@ -453,8 +472,16 @@ fn generic_window_owner_survives_nested_splices_and_abandoned_inline_source() {
     offer_at(&mut root, 1, Arc::new(middle));
     offer_at(&mut root, 2, Arc::new(needs_window));
     let transitions = crate::entry::TransitionTable::resolve();
-    let mut compiled =
-        super::compile(&root, 7101, &transitions, None, false, &Default::default()).unwrap();
+    let mut compiled = super::compile(
+        &root,
+        7101,
+        &transitions,
+        &crate::routines::fixture_routines(&root, &transitions),
+        None,
+        false,
+        &Default::default(),
+    )
+    .unwrap();
     assert_eq!(
         compiled.built.inline_views.len(),
         2,
@@ -518,6 +545,7 @@ fn generic_window_owner_survives_nested_splices_and_abandoned_inline_source() {
         &root,
         7102,
         &transitions,
+        &crate::NativeCodeSpace::new(),
         None,
         Some(request),
         false,
@@ -560,6 +588,7 @@ fn generic_window_owner_survives_nested_splices_and_abandoned_inline_source() {
         &compiled.built,
         &compiled.allocation,
         &transitions,
+        &crate::routines::fixture_routines(&root, &transitions),
         7103,
         deopt,
         &compiled.plan,
@@ -573,6 +602,7 @@ fn generic_window_owner_survives_nested_splices_and_abandoned_inline_source() {
         &compiled.built,
         &compiled.allocation,
         &transitions,
+        &crate::routines::fixture_routines(&root, &transitions),
         7103,
         deopt,
         &compiled.plan,
@@ -638,8 +668,16 @@ fn an_abandoned_callee_drops_the_loops_of_bodies_spliced_into_it() {
     );
     offer(&mut root, Arc::new(middle));
     let transitions = crate::entry::TransitionTable::resolve();
-    let compiled =
-        super::compile(&root, 7102, &transitions, None, false, &Default::default()).unwrap();
+    let compiled = super::compile(
+        &root,
+        7102,
+        &transitions,
+        &crate::routines::fixture_routines(&root, &transitions),
+        None,
+        false,
+        &Default::default(),
+    )
+    .unwrap();
     let graph = &compiled.built.graph;
     assert!(graph.inlined.is_empty(), "the middle body was abandoned");
     assert!(
@@ -688,8 +726,16 @@ fn instanceof_protocol_word_retains_inline_roots() {
     );
     offer(&mut root, Arc::new(leaf));
     let transitions = crate::entry::TransitionTable::resolve();
-    let mut compiled =
-        super::compile(&root, 7201, &transitions, None, false, &Default::default()).unwrap();
+    let mut compiled = super::compile(
+        &root,
+        7201,
+        &transitions,
+        &crate::routines::fixture_routines(&root, &transitions),
+        None,
+        false,
+        &Default::default(),
+    )
+    .unwrap();
     assert_eq!(
         compiled.built.inline_views.len(),
         1,
@@ -716,6 +762,7 @@ fn instanceof_protocol_word_retains_inline_roots() {
         &compiled.built,
         &allocation,
         &transitions,
+        &crate::routines::fixture_routines(&root, &transitions),
         7202,
         deopt,
         &compiled.plan,
@@ -730,6 +777,7 @@ fn instanceof_protocol_word_retains_inline_roots() {
         &compiled.built,
         &allocation,
         &transitions,
+        &crate::routines::fixture_routines(&root, &transitions),
         7202,
         deopt,
         &compiled.plan,

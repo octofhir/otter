@@ -156,7 +156,6 @@ impl Codegen<'_> {
             ; cmp w16, u32::from(string_tag)
             ; b.ne =>missed
         );
-        let routine = self.shared_property.keyed_label(&mut self.ops, false);
         let live = self.allocation.node(node).live_registers.clone();
         // The operands may sit in registers the routine's inputs name: park
         // them below the saved registers and load the inputs from there.
@@ -170,7 +169,15 @@ impl Codegen<'_> {
             ; .arch aarch64
             ; ldr X(KEYED_LOAD_RECEIVER), [sp, saved]
             ; ldr X(KEYED_LOAD_KEY), [sp, saved + 8]
-            ; bl =>routine
+        );
+        crate::template::arm64::shared_property::emit_call(
+            &mut self.ops,
+            &mut self.relocations,
+            self.shared_property,
+            crate::routines::PropertyRoutine::KeyedLoad,
+        );
+        dynasm!(self.ops
+            ; .arch aarch64
             ; mov x16, x0
             ; mov x17, x1
         );

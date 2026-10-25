@@ -545,7 +545,12 @@ mod tests {
                         ; mov w0, 1 ; b =>done
                         ; =>miss ; mov w0, wzr
                         ; =>done ; ldp x20, x30, [sp], #16 ; ret);
-                    let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+                    let code = crate::CompiledCode::new(
+                        &crate::CodeMemory::new(),
+                        ops.finalize().unwrap(),
+                        entry,
+                    )
+                    .unwrap();
                     // SAFETY: the guard reads only live owned byte arenas and
                     // scalar cells, preserves x20/LR/SP and never calls or publishes
                     // a VM/GC frame. All pointers outlive the executable mapping.

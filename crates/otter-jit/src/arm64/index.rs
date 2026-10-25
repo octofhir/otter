@@ -112,7 +112,9 @@ mod tests {
             ; =>check ; cmp x0, x3 ; b.ne =>corrupt ; cmp x1, x5 ; b.ne =>corrupt
             ; fmov x6, d0 ; cmp x6, x5 ; b.ne =>corrupt ; mov x0, x2 ; ret
             ; =>corrupt ; movn x0, #1 ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                .unwrap();
         // SAFETY: a noncollecting scalar leaf with two word inputs.
         let run: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.entry_ptr()) };
         let mut aliased = Assembler::new().unwrap();
@@ -120,7 +122,12 @@ mod tests {
         let alias_miss = aliased.new_dynamic_label();
         emit_exact_int32(&mut aliased, 0, 0, 4, alias_miss);
         dynasm!(aliased ; .arch aarch64 ; =>alias_miss ; ret);
-        let alias_code = crate::CompiledCode::new(aliased.finalize().unwrap(), alias_entry);
+        let alias_code = crate::CompiledCode::new(
+            &crate::CodeMemory::new(),
+            aliased.finalize().unwrap(),
+            alias_entry,
+        )
+        .unwrap();
         // SAFETY: the same leaf, reusing a dead input register for its result.
         let run_alias: extern "C" fn(u64) -> u64 =
             unsafe { std::mem::transmute(alias_code.entry_ptr()) };
@@ -174,7 +181,9 @@ mod tests {
             ; =>check ; cmp x0, x3 ; b.ne =>corrupt ; cmp x1, x5 ; b.ne =>corrupt
             ; fmov x6, d0 ; cmp x6, x5 ; b.ne =>corrupt ; mov x0, x2 ; ret
             ; =>corrupt ; movn x0, #1 ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                .unwrap();
         // SAFETY: a noncollecting scalar leaf with two word inputs.
         let run: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.entry_ptr()) };
         for (value, expected) in cases() {

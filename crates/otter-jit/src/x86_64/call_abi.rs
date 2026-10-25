@@ -346,7 +346,12 @@ mod tests {
             dynasm!(ops ; .arch x64 ; add rsp, 16);
         }
         dynasm!(ops ; .arch x64 ; add rsp, 8 ; pop rbx ; pop rbp ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry_offset);
+        let code = crate::CompiledCode::new(
+            &crate::CodeMemory::new(),
+            ops.finalize().unwrap(),
+            entry_offset,
+        )
+        .unwrap();
         // SAFETY: the harness follows System V, preserves its nonvolatile GPs,
         // keeps both owned C entry and mapping alive, and only writes six words.
         let run: extern "sysv64" fn(*mut u64) = unsafe { std::mem::transmute(code.entry_ptr()) };
@@ -474,7 +479,9 @@ mod tests {
                 assert_eq!(ops.offset(), returned);
             }
             dynasm!(ops ; .arch x64 ; pop rbp ; ret);
-            let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+            let code =
+                crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                    .unwrap();
             // SAFETY: the finalized mapping outlives every use of its entry.
             let entry_address = unsafe { code.entry_ptr() };
             let expected = entry_address as usize as u64 + (returned.0 - entry.0) as u64;
@@ -517,7 +524,9 @@ mod tests {
             None,
         );
         dynasm!(ops ; .arch x64 ; pop rbp ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), start)
+                .unwrap();
         // SAFETY: both ABIs place these two scalar floats in xmm0/xmm1 and
         // return xmm0; the emitted C boundary owns its aligned shadow area.
         let run: extern "sysv64" fn(f64, f64) -> f64 =
@@ -541,7 +550,9 @@ mod tests {
             None,
         );
         dynasm!(ops ; .arch x64 ; pop rbp ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), start)
+                .unwrap();
         // SAFETY: one scalar FP input and one word result, mapping kept alive.
         let run: extern "sysv64" fn(f64) -> u64 = unsafe { std::mem::transmute(code.entry_ptr()) };
         for bits in [
@@ -563,7 +574,9 @@ mod tests {
             None,
         );
         dynasm!(ops ; .arch x64 ; pop rbp ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), start)
+                .unwrap();
         // SAFETY: the word arrives in rdi and the doubles in xmm0/xmm1; the
         // boundary moves them to their Microsoft positions.
         let run: extern "sysv64" fn(u32, f64, f64) -> f64 =
@@ -591,7 +604,9 @@ mod tests {
             dynasm!(ops ; .arch x64 ; pxor Rx(register), Rx(register));
         }
         dynasm!(ops ; .arch x64 ; ret);
-        let body = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+        let body =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), start)
+                .unwrap();
 
         let mut ops = Assembler::new().unwrap();
         let start = ops.offset();
@@ -642,7 +657,9 @@ mod tests {
             dynasm!(ops ; .arch x64 ; movdqu [rbx + offset], Rx(register));
         }
         dynasm!(ops ; .arch x64 ; add rsp, 48 ; pop r12 ; pop rbx ; pop rbp ; ret);
-        let probe = crate::CompiledCode::new(ops.finalize().unwrap(), start);
+        let probe =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), start)
+                .unwrap();
         // SAFETY: the probe follows System V and writes exactly 26 owned
         // words. The second pointer is read only by the private body; both
         // mappings and the prepared word remain alive through the call.

@@ -232,7 +232,7 @@ fn executable(view: &JitCompileSnapshot, store: bool, alias: bool) -> CompiledCo
     let miss = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     let mut relocations = RelocationCapture::default();
-    dynasm!(ops ; .arch aarch64 ; mov x12, x0 ; mov x9, x1 ; mov x3, x2);
+    dynasm!(ops ; .arch aarch64 ; mov x12, x0 ; mov x9, x1 ; mov x3, x2 ; mov w14, wzr);
     for register in [4, 5, 6] {
         emit_load_u64(&mut ops, register, CANARY);
     }
@@ -243,7 +243,7 @@ fn executable(view: &JitCompileSnapshot, store: bool, alias: bool) -> CompiledCo
             &mut ops,
             &mut relocations,
             view,
-            AtomOperand::Immediate(0),
+            14,
             [12, 9],
             [10, 11, 13, 15],
             miss,
@@ -255,7 +255,7 @@ fn executable(view: &JitCompileSnapshot, store: bool, alias: bool) -> CompiledCo
             &mut ops,
             &mut relocations,
             view,
-            AtomOperand::Immediate(0),
+            14,
             9,
             [10, 11, 13, 15],
             9,
@@ -267,7 +267,7 @@ fn executable(view: &JitCompileSnapshot, store: bool, alias: bool) -> CompiledCo
             &mut ops,
             &mut relocations,
             view,
-            AtomOperand::Immediate(0),
+            14,
             12,
             [10, 11, 13, 15],
             0,
@@ -279,7 +279,7 @@ fn executable(view: &JitCompileSnapshot, store: bool, alias: bool) -> CompiledCo
     dynasm!(ops ; .arch aarch64 ; =>done
         ; stp x4, x5, [x3] ; str x6, [x3, #16] ; str d0, [x3, #24]
         ; str x12, [x3, #32] ; ret);
-    CompiledCode::new(ops.finalize().unwrap(), entry)
+    CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap()
 }
 fn run(code: &CompiledCode, arena: &mut [u64], value: Value) -> u64 {
     let receiver = address(arena, RECEIVER);
@@ -532,7 +532,8 @@ fn shape_directory_reads_live_banks_and_rejects_accessor_and_shared_suffix() {
         dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
         emit_load_u64(&mut ops, 0, POISON);
         dynasm!(ops ; .arch aarch64 ; =>done ; ret);
-        let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+        let code =
+            CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
         // SAFETY: emitted allocation-free leaf follows the platform C ABI.
         let call: extern "C" fn(u64, u64, *mut u64) -> u64 =
             unsafe { std::mem::transmute(code.entry_ptr()) };

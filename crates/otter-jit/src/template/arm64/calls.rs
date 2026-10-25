@@ -1784,7 +1784,7 @@ pub(super) fn emit_method_call(
     relocations: &mut RelocationCapture,
     table: &TransitionTable,
     return_sites: &mut crate::return_sites::ReturnSiteRecorder<'_>,
-    shared_probes: &mut super::shared_property::SharedPropertyProbes,
+    shared_probes: &crate::routines::RoutineRequest<'_>,
     view: &JitCompileSnapshot,
     spliced_functions: &mut BTreeSet<u32>,
     mut direct_call_events: Option<&mut BTreeMap<(u32, u32), otter_vm::JitCompilerDiagnostic>>,
@@ -1966,7 +1966,6 @@ pub(super) fn emit_method_call(
         .filter(|&slot| slot != 0 && view.cage_base != 0);
     if let Some(ic_slot) = ic_slot {
         use super::shared_property::{METHOD_RECEIVER, METHOD_SLOT};
-        let probe = shared_probes.method_label(ops);
         emit_load_reg(ops, METHOD_RECEIVER, receiver)?;
         super::values::emit_load_symbol_u64(
             ops,
@@ -1978,9 +1977,13 @@ pub(super) fn emit_method_call(
                 byte_pc,
             },
         );
-        dynasm!(ops ; .arch aarch64
-            ; bl =>probe
-            ; cbz x1, =>resolved);
+        super::shared_property::emit_call(
+            ops,
+            relocations,
+            shared_probes,
+            crate::routines::PropertyRoutine::Method,
+        );
+        dynasm!(ops ; .arch aarch64 ; cbz x1, =>resolved);
     }
     super::properties::emit_intrinsic_loads(
         ops,

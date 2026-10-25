@@ -191,7 +191,8 @@ fn execute(
         ; add rsp, stack as i32
         ; pop r15 ; pop r14 ; pop r13 ; pop r12 ; pop rbp ; pop rbx ; ret
     );
-    let code = CompiledCode::new(ops.finalize().unwrap(), entry);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
     // SAFETY: the private System V function receives valid bounded host
     // inputs and LAB, preserves every nonvolatile GP and exact stack, and
     // neither calls the VM nor exposes the fabricated host cells to GC.

@@ -320,7 +320,9 @@ impl Fixture {
         let appended = ops.new_dynamic_label();
         let exit = ops.new_dynamic_label();
         dynasm!(ops ; .arch x64
-            ; push rbx ; push r12 ; push r13 ; push r14 ; push r15
+            ; push rbp ; push rbx ; push r12 ; push r13 ; push r14 ; push r15
+            ; sub rsp, 8
+            ; mov ebp, atom as i32
             ; mov r12, rdx
             ; mov rbx, QWORD 0x1111_1111_1111_1111_u64 as i64
             ; mov r13, QWORD 0x2222_2222_2222_2222_u64 as i64
@@ -332,7 +334,7 @@ impl Fixture {
             &mut RelocationCapture::new(false),
             &self.view,
             Some(self.cache),
-            Some(super::AtomOperand::Immediate(atom)),
+            5,
             access,
             7,
             (!load).then_some(6),
@@ -353,7 +355,8 @@ impl Fixture {
             ; =>exit
             ; mov [r12], rdi ; mov [r12 + 8], rsi ; mov [r12 + 16], rbx
             ; mov [r12 + 24], r13 ; mov [r12 + 32], r14 ; mov [r12 + 40], r15
-            ; pop r15 ; pop r14 ; pop r13 ; pop r12 ; pop rbx ; ret);
+            ; add rsp, 8
+            ; pop r15 ; pop r14 ; pop r13 ; pop r12 ; pop rbx ; pop rbp ; ret);
         let buffer = ops.finalize().unwrap();
         // SAFETY: the generated SysV probe accesses only the stationary owned
         // fixture words/table and retained Box validity word, and saves every
@@ -645,7 +648,9 @@ fn shape_directory_reads_banks_and_refuses_shared_suffix_and_accessors() {
         dynasm!(ops ; .arch x64 ; jmp =>done ; =>miss);
         crate::x86_64::values::emit_load_u64(&mut ops, 0, poison);
         dynasm!(ops ; .arch x64 ; =>done ; ret);
-        let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+        let code =
+            crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                .unwrap();
         // SAFETY: the allocation-free emitted leaf follows the platform C ABI.
         let call: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(code.entry_ptr()) };
         let receiver = f.address(0);

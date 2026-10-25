@@ -146,7 +146,9 @@ mod tests {
                 ; mov rax, Rq(destination)
                 ; ret
             );
-            let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+            let code =
+                crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                    .unwrap();
             // SAFETY: the mapping accepts a System V f64 and one live output
             // word, returns a boxed word, and clobbers only caller-saved GPs.
             // It has no stack, allocation, or runtime-call boundary.
@@ -183,7 +185,9 @@ mod tests {
             let entry = ops.offset();
             emit_box_int32(&mut ops, 7, destination, scratch);
             dynasm!(ops ; .arch x64 ; mov rax, Rq(destination) ; ret);
-            let code = crate::CompiledCode::new(ops.finalize().unwrap(), entry);
+            let code =
+                crate::CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry)
+                    .unwrap();
             // SAFETY: this leaf System V fixture takes and returns u64 and
             // writes only volatile registers; the mapping outlives the call.
             let run: extern "sysv64" fn(u64) -> u64 =

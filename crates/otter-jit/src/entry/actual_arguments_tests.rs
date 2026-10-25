@@ -164,15 +164,23 @@ fn actual_only_known_and_generic_entries_initialize_missing_formals() {
             .is_strict = true;
         let call_flags = snapshot.code_block.call_flags();
         assert_ne!(call_flags & FUNCTION_CALL_NO_RECEIVER_CONVERSION, 0);
-        let template = crate::template::compile(&snapshot, 1, &transitions).unwrap();
+        let template =
+            crate::template::compile(&snapshot, 1, &transitions, &crate::NativeCodeSpace::new())
+                .unwrap();
         let codes: Vec<(Box<dyn JitFunctionCode>, u32)> = vec![(Box::new(template), 0)];
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         let codes = {
             let mut codes = codes;
             codes.push((
                 Box::new(
-                    crate::optimizing::compile_optimized(&snapshot, 2, None, &Default::default())
-                        .unwrap(),
+                    crate::optimizing::compile_optimized(
+                        &snapshot,
+                        2,
+                        &crate::NativeCodeSpace::new(),
+                        None,
+                        &Default::default(),
+                    )
+                    .unwrap(),
                 ),
                 otter_vm::native_abi::CODE_ENTRY_HAS_SAFEPOINTS
                     | otter_vm::native_abi::CODE_ENTRY_OPTIMIZING_TIER,

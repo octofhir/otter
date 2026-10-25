@@ -262,14 +262,7 @@ fn overflow_appends_keep_a_collecting_completion_inside_the_graph() {
             .iter()
             .find(|node| matches!(node.kind, Kind::StorePropertyCached { .. }))
             .expect("suffix append keeps its committed allocating miss");
-        assert_eq!(
-            store.kind,
-            Kind::StorePropertyCached {
-                pc: 0,
-                atom: None,
-                barrier: true,
-            }
-        );
+        assert_eq!(store.kind, Kind::StorePropertyCached { pc: 0 });
         assert!(store.kind.properties().may_collect);
         assert!(store.kind.properties().can_throw);
         assert!(

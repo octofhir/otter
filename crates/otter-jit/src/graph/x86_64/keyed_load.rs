@@ -139,7 +139,6 @@ impl Codegen<'_> {
             ; test Rq(key), r10 ; jnz =>missed
             ; cmp BYTE [Rq(key)], string_tag as i8 ; jne =>missed
         );
-        let routine = self.shared_property.keyed_label(&mut self.ops, false);
         let live = self.allocation.node(node).live_registers.clone();
         // The operands may sit in registers the routine's inputs name: park
         // them below the saved registers and load the inputs from there.
@@ -152,9 +151,14 @@ impl Codegen<'_> {
         dynasm!(self.ops ; .arch x64
             ; mov Rq(KEYED_LOAD_RECEIVER), [rsp + saved]
             ; mov Rq(KEYED_LOAD_KEY), [rsp + saved + 8]
-            ; call =>routine
-            ; mov r10, rax ; mov r11, rdx
         );
+        crate::template::x86_64::shared_property::emit_call(
+            &mut self.ops,
+            &mut self.relocations,
+            self.shared_property,
+            crate::routines::PropertyRoutine::KeyedLoad,
+        );
+        dynasm!(self.ops ; .arch x64 ; mov r10, rax ; mov r11, rdx);
         self.emit_restore_registers(&live, saved as u32);
         dynasm!(self.ops ; .arch x64
             ; mov Rq(receiver), [rsp] ; mov Rq(key), [rsp + 8]

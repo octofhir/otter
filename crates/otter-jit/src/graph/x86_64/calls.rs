@@ -19,6 +19,14 @@ use super::*;
 use crate::entry::VALUE_UNDEFINED;
 use crate::x86_64::js_call::{CallTarget, emit_call};
 
+/// What a committed call enters: a runtime stub, or a routine of the
+/// compiler's set that takes the same ABI.
+#[derive(Clone, Copy)]
+pub(super) enum CommittedTarget {
+    Stub(abi::RuntimeStubDescriptor),
+    Routine(crate::routines::PropertyRoutine),
+}
+
 impl Codegen<'_> {
     pub(super) fn emit_committed_call(
         &mut self,
@@ -27,7 +35,25 @@ impl Codegen<'_> {
         arguments: &[CommittedArgument],
         destination: Option<u8>,
     ) -> Result<(), Unsupported> {
-        self.emit_committed_call_inner(node, stub, arguments, destination, 0)
+        self.emit_committed_call_inner(node, CommittedTarget::Stub(stub), arguments, destination, 0)
+    }
+
+    /// [`Self::emit_committed_call`] of a routine of the compiler's set that
+    /// takes the committed runtime ABI.
+    pub(super) fn emit_committed_routine_call(
+        &mut self,
+        node: NodeId,
+        routine: crate::routines::PropertyRoutine,
+        arguments: &[CommittedArgument],
+        destination: Option<u8>,
+    ) -> Result<(), Unsupported> {
+        self.emit_committed_call_inner(
+            node,
+            CommittedTarget::Routine(routine),
+            arguments,
+            destination,
+            0,
+        )
     }
     pub(super) fn emit_committed_span_call(
         &mut self,
@@ -39,7 +65,7 @@ impl Codegen<'_> {
         let bytes = self.emit_push_actuals(values)?;
         self.emit_committed_call_inner(
             node,
-            stub,
+            CommittedTarget::Stub(stub),
             &[
                 CommittedArgument::StackAddress(0),
                 CommittedArgument::Scalar(values.len() as u64),
@@ -51,7 +77,7 @@ impl Codegen<'_> {
     pub(super) fn emit_committed_call_inner(
         &mut self,
         node: NodeId,
-        stub: abi::RuntimeStubDescriptor,
+        target: CommittedTarget,
         arguments: &[CommittedArgument],
         destination: Option<u8>,
         span_bytes: u32,
@@ -119,7 +145,17 @@ impl Codegen<'_> {
         let (_, committed_throw) = self.throw_targets(node);
         let fatal = self.fatal;
         let success = self.ops.new_dynamic_label();
-        self.emit_stub_call(stub);
+        match target {
+            CommittedTarget::Stub(stub) => self.emit_stub_call(stub),
+            CommittedTarget::Routine(routine) => {
+                crate::template::x86_64::shared_property::emit_call(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    self.shared_property,
+                    routine,
+                );
+            }
+        }
         // The stub copied a span before it could collect; discard the stale
         // packet before all status and recovery paths use canonical homes.
         self.emit_pop_actuals(span_bytes);
@@ -433,7 +469,7 @@ impl Codegen<'_> {
                     labels: &labels,
                     exits,
                     frame_kind: abi::NativeFrameKind::Optimizing,
-                    shared_property: &mut self.shared_property,
+                    shared_property: self.shared_property,
                     direct_call_events: &mut self.no_direct_call_events,
                     code_map: &mut self.no_code_map,
                 },

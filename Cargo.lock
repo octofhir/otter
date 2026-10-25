@@ -2599,6 +2599,7 @@ version = "0.1.0"
 dependencies = [
  "dynasm",
  "dynasmrt",
+ "libc",
  "otter-bytecode",
  "otter-gc",
  "otter-vm",
@@ -2606,6 +2607,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "windows-sys 0.61.2",
  "yaxpeax-arch",
  "yaxpeax-arm",
  "yaxpeax-x86",

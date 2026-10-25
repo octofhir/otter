@@ -278,8 +278,10 @@ pub fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
+    code_space: &crate::NativeCodeSpace,
 ) -> Result<TemplateCode, Unsupported> {
-    arm64::compile(view, code_object_id, transitions, None, false).map(|output| output.code)
+    arm64::compile(view, code_object_id, transitions, code_space, None, false)
+        .map(|output| output.code)
 }
 
 /// Compile a function view with the x86-64 template backend.
@@ -288,8 +290,10 @@ pub fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
+    code_space: &crate::NativeCodeSpace,
 ) -> Result<TemplateCode, Unsupported> {
-    x86_64::compile(view, code_object_id, transitions, None, false).map(|output| output.code)
+    x86_64::compile(view, code_object_id, transitions, code_space, None, false)
+        .map(|output| output.code)
 }
 
 /// Compile with an optional default-off artifact sidecar.
@@ -298,6 +302,7 @@ pub(crate) fn compile_with_artifacts(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
+    code_space: &crate::NativeCodeSpace,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
     capture_events: bool,
 ) -> Result<crate::artifact::NativeCompileOutput<TemplateCode>, Unsupported> {
@@ -305,6 +310,7 @@ pub(crate) fn compile_with_artifacts(
         view,
         code_object_id,
         transitions,
+        code_space,
         artifact_request,
         capture_events,
     )
@@ -316,6 +322,7 @@ pub(crate) fn compile_with_artifacts(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
+    code_space: &crate::NativeCodeSpace,
     artifact_request: Option<crate::artifact::ArtifactRequest>,
     capture_events: bool,
 ) -> Result<crate::artifact::NativeCompileOutput<TemplateCode>, Unsupported> {
@@ -323,6 +330,7 @@ pub(crate) fn compile_with_artifacts(
         view,
         code_object_id,
         transitions,
+        code_space,
         artifact_request,
         capture_events,
     )
@@ -334,8 +342,9 @@ pub fn compile(
     view: &JitCompileSnapshot,
     code_object_id: u64,
     transitions: &TransitionTable,
+    code_space: &crate::NativeCodeSpace,
 ) -> Result<TemplateCode, Unsupported> {
-    let _ = (view, code_object_id, transitions);
+    let _ = (view, code_object_id, transitions, code_space);
     Err(Unsupported::OperandShape("template compiler is arm64-only"))
 }
 
@@ -505,7 +514,7 @@ mod tests {
                 fixture_runtime_operation_throws as *const () as usize,
             );
         }
-        super::compile(view, 1, &transitions)
+        super::compile(view, 1, &transitions, &crate::NativeCodeSpace::new())
     }
 
     fn run(view: &JitCompileSnapshot, regs: &mut [u64]) -> Exit {
@@ -704,6 +713,7 @@ mod tests {
             &countdown_view(),
             1,
             &transitions,
+            &crate::NativeCodeSpace::new(),
             Some(crate::artifact::ArtifactRequest {
                 identity: otter_vm::JitArtifactIdentity {
                     function_name: "countdown".to_string(),
@@ -831,12 +841,20 @@ mod tests {
     fn artifact_capture_preserves_exact_code_and_layout() {
         let view = countdown_view();
         let transitions = crate::entry::TransitionTable::resolve();
-        let without_capture = super::compile_with_artifacts(&view, 1, &transitions, None, false)
-            .expect("template compiles without artifact capture");
+        let without_capture = super::compile_with_artifacts(
+            &view,
+            1,
+            &transitions,
+            &crate::NativeCodeSpace::new(),
+            None,
+            false,
+        )
+        .expect("template compiles without artifact capture");
         let with_capture = super::compile_with_artifacts(
             &view,
             1,
             &transitions,
+            &crate::NativeCodeSpace::new(),
             Some(crate::artifact::ArtifactRequest {
                 identity: otter_vm::JitArtifactIdentity {
                     function_name: "countdown".to_string(),

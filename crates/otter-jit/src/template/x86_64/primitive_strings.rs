@@ -18,7 +18,8 @@ use super::*;
 
 pub(super) fn emit_concat_fit(
     ops: &mut Assembler,
-    shared: &mut super::shared_property::SharedPropertyProbes,
+    relocations: &mut RelocationCapture,
+    shared: &crate::routines::RoutineRequest<'_>,
     dst: u16,
     lhs: u16,
     rhs: u16,
@@ -30,8 +31,13 @@ pub(super) fn emit_concat_fit(
     emit_load_reg(ops, CONCAT_LHS, lhs);
     emit_load_reg(ops, CONCAT_RHS, rhs);
     emit_load_u64(ops, CONCAT_SITE, site.record);
-    let routine = shared.concat_label(ops);
-    dynasm!(ops ; .arch x64 ; call =>routine ; test edx, edx ; jnz =>slow);
+    super::shared_property::emit_call(
+        ops,
+        relocations,
+        shared,
+        crate::routines::PropertyRoutine::Concat,
+    );
+    dynasm!(ops ; .arch x64 ; test edx, edx ; jnz =>slow);
     emit_store_reg(ops, CONCAT_RESULT, dst);
     dynasm!(ops ; .arch x64 ; jmp =>done);
 }

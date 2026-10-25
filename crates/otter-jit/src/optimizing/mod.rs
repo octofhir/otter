@@ -303,6 +303,7 @@ impl JitFunctionCode for OptimizedCode {
 pub fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
+    code_space: &crate::NativeCodeSpace,
     osr_pc: Option<u32>,
     cancellation: &JitCompileCancellation,
 ) -> Result<OptimizedCode, CompileFailure> {
@@ -312,6 +313,7 @@ pub fn compile_optimized(
         view,
         code_object_id,
         &transitions,
+        code_space,
         osr_pc,
         None,
         false,
@@ -325,11 +327,12 @@ pub fn compile_optimized(
 pub fn compile_optimized(
     view: &JitCompileSnapshot,
     code_object_id: u64,
+    code_space: &crate::NativeCodeSpace,
     osr_pc: Option<u32>,
     cancellation: &JitCompileCancellation,
 ) -> Result<OptimizedCode, CompileFailure> {
     check_cancellation(cancellation)?;
-    let _ = (view, code_object_id, osr_pc);
+    let _ = (view, code_object_id, code_space, osr_pc);
     Err(Unsupported::OperandShape("optimizing compiler target is unavailable").into())
 }
 
@@ -346,7 +349,12 @@ mod tests {
         let mut assembler = dynasmrt::x64::Assembler::new_with_capacity(32_768).unwrap();
         let entry = assembler.offset();
         assembler.push(0x90);
-        let code = crate::CompiledCode::new(assembler.finalize().unwrap(), entry);
+        let code = crate::CompiledCode::new(
+            &crate::CodeMemory::new(),
+            assembler.finalize().unwrap(),
+            entry,
+        )
+        .unwrap();
         let mapping_bytes = code.retained_mapping_bytes();
         let mut roots =
             otter_vm::native_abi::SafepointRecord::window(3, otter_vm::native_abi::NO_FRAME_STATE);
@@ -402,7 +410,13 @@ mod tests {
             JitTestInstruction::new(Op::ReturnValue, 1, 29, vec![Operand::Register(1)]),
         ];
         let view = JitCompileSnapshot::without_feedback(17, 1, 2, instructions);
-        let result = compile_optimized(&view, 91, None, &Default::default());
+        let result = compile_optimized(
+            &view,
+            91,
+            &crate::NativeCodeSpace::new(),
+            None,
+            &Default::default(),
+        );
         assert_eq!(
             result.is_ok(),
             cfg!(any(target_arch = "aarch64", target_arch = "x86_64"))

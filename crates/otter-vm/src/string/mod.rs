@@ -318,7 +318,11 @@ impl JsString {
     }
 
     /// The shared body of an empty or one-unit Latin-1 string, once installed.
-    fn shared_unit_string(len: usize, first: Option<u16>, heap: &GcHeap) -> Option<Self> {
+    pub(crate) fn shared_unit_string(
+        len: usize,
+        first: Option<u16>,
+        heap: &GcHeap,
+    ) -> Option<Self> {
         let index = match (len, first) {
             (0, _) => EMPTY_STRING_INDEX,
             (1, Some(unit)) if unit <= u16::from(u8::MAX) => usize::from(unit),

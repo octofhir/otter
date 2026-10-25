@@ -249,6 +249,25 @@ pub(super) fn observe_slot(shape: ShapeHandle, logical_slot: usize, value: Value
     }
 }
 
+/// Widen the summary of each of `shape`'s fields to [`TOP`]: a layout whose
+/// cells may hold anything there tracks nothing, so seeding and stores into
+/// those fields return at their first test.
+pub(crate) fn generalize(shape: ShapeHandle) {
+    if shape.is_null() || shape_body::is_dictionary_of(shape) {
+        return;
+    }
+    let mut cursor = shape;
+    while shape_body::property_count_of(cursor) != 0 {
+        let slot = shape_body::property_count_of(cursor) - 1;
+        if let Some(owner) = owner(cursor, slot)
+            && snapshot(owner) != TOP
+        {
+            shape_body::set_field_type_snapshot(owner, TOP);
+        }
+        cursor = shape_body::parent_of(cursor);
+    }
+}
+
 pub(super) fn seed(shape: ShapeHandle, count: usize, mut read: impl FnMut(u32) -> Value) {
     if shape.is_null() || shape_body::is_dictionary_of(shape) {
         return;

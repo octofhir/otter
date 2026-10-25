@@ -362,10 +362,10 @@ impl JsStringBody {
         // SAFETY: the allocation reserved `2 * len` trailing bytes, and
         // the source slice cannot alias a cell this heap just carved.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                units.as_ptr(),
-                self.trailing_ptr().cast::<u16>().cast_mut(),
-                units.len(),
+            copy_payload(
+                units.as_ptr().cast(),
+                self.trailing_ptr().cast_mut(),
+                units.len() * 2,
             );
         }
     }
@@ -412,13 +412,7 @@ impl JsStringBody {
     fn init_seq_latin1(&mut self, bytes: &[u8]) {
         debug_assert_eq!(bytes.len(), self.len as usize);
         // SAFETY: the allocation reserved `len` trailing bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                self.trailing_ptr().cast_mut(),
-                bytes.len(),
-            );
-        }
+        unsafe { copy_payload(bytes.as_ptr(), self.trailing_ptr().cast_mut(), bytes.len()) };
     }
 
     /// Rope depth: `0` for flat / latin1 / sliced, `1..=MAX_ROPE_DEPTH`
@@ -426,6 +420,50 @@ impl JsStringBody {
     #[must_use]
     pub fn depth(&self) -> u8 {
         self.depth
+    }
+}
+
+/// Copy `len` bytes of string payload. A payload of at most 24 bytes, the
+/// common short string, moves as overlapping words; a longer one through
+/// the bulk copy.
+///
+/// # Safety
+/// `src` is readable and `dst` writable for `len` bytes, and they do not
+/// overlap.
+#[inline]
+unsafe fn copy_payload(src: *const u8, dst: *mut u8, len: usize) {
+    // SAFETY: every access below lies inside `[0, len)` of either range.
+    unsafe {
+        match len {
+            0 => {}
+            1 => *dst = *src,
+            2..=3 => {
+                dst.cast::<u16>()
+                    .write_unaligned(src.cast::<u16>().read_unaligned());
+                dst.add(len - 2)
+                    .cast::<u16>()
+                    .write_unaligned(src.add(len - 2).cast::<u16>().read_unaligned());
+            }
+            4..=7 => {
+                dst.cast::<u32>()
+                    .write_unaligned(src.cast::<u32>().read_unaligned());
+                dst.add(len - 4)
+                    .cast::<u32>()
+                    .write_unaligned(src.add(len - 4).cast::<u32>().read_unaligned());
+            }
+            8..=24 => {
+                let middle = (len - 8).min(8);
+                let words = [
+                    src.cast::<u64>().read_unaligned(),
+                    src.add(middle).cast::<u64>().read_unaligned(),
+                    src.add(len - 8).cast::<u64>().read_unaligned(),
+                ];
+                dst.cast::<u64>().write_unaligned(words[0]);
+                dst.add(middle).cast::<u64>().write_unaligned(words[1]);
+                dst.add(len - 8).cast::<u64>().write_unaligned(words[2]);
+            }
+            _ => std::ptr::copy_nonoverlapping(src, dst, len),
+        }
     }
 }
 
@@ -912,9 +950,10 @@ fn substring_body(content: FlatContent<'_>) -> SubstringBody<'_> {
 /// The substring of the contiguous `string` at each range, `undefined` for a
 /// `None` range, appended to `out`, each in one cell from the allocation
 /// buffer within the bytes the caller reserved ([`SUBSTRING_CELL_BYTES`] per
-/// substring): short units copied straight from the subject, resolved once,
-/// longer ones viewed in place. `None` when the string does not read
-/// contiguously or the buffer runs out; `out` then holds a prefix.
+/// substring): an empty or one-unit Latin-1 range the heap's shared string,
+/// short units copied straight from the subject, resolved once, longer ones
+/// viewed in place. `None` when the string does not read contiguously or the
+/// buffer runs out; `out` then holds a prefix.
 pub(crate) fn try_substrings_no_collect(
     heap: &mut GcHeap,
     string: JsStringHandle,
@@ -935,10 +974,27 @@ pub(crate) fn try_substrings_no_collect(
         };
         let length = u32::try_from(range.len()).ok()?;
         let start = base.checked_add(u32::try_from(range.start).ok()?)?;
+        if range.len() <= 1 {
+            // SAFETY: a one-unit range lies inside the parent's payload.
+            let unit = (range.len() == 1).then(|| unsafe {
+                if latin1 {
+                    u16::from(*data.add(start as usize))
+                } else {
+                    *data.cast::<u16>().add(start as usize)
+                }
+            });
+            if let Some(shared) =
+                crate::string::JsString::shared_unit_string(range.len(), unit, heap)
+            {
+                out.push(crate::Value::string(shared));
+                continue;
+            }
+        }
         // Nothing below collects or moves a cell, so `data` stays the
-        // parent's units for the whole loop.
+        // parent's units for the whole loop. A copy writes every trailing
+        // byte, so its cell is not zeroed first.
         let handle = if latin1 && range.len() <= SHORT_CONCAT_LATIN1 {
-            heap.try_alloc_trailing_no_collect_or_return(
+            heap.try_alloc_filled_trailing_no_collect_or_return(
                 JsStringBody::seq(true, length),
                 range.len(),
                 |body| {
@@ -951,7 +1007,7 @@ pub(crate) fn try_substrings_no_collect(
                 },
             )
         } else if !latin1 && range.len() <= SHORT_CONCAT_FLAT {
-            heap.try_alloc_trailing_no_collect_or_return(
+            heap.try_alloc_filled_trailing_no_collect_or_return(
                 JsStringBody::seq(false, length),
                 range.len() * 2,
                 |body| {
@@ -1805,6 +1861,18 @@ mod tests {
     fn is_young(handle: JsStringHandle) -> bool {
         // SAFETY: each tested handle names a live body in its owning heap.
         unsafe { (*handle.as_header_ptr()).is_young() }
+    }
+
+    #[test]
+    fn payload_copies_every_length_exactly_and_nothing_past_it() {
+        let source: Vec<u8> = (0..48u8).map(|byte| byte.wrapping_mul(37) | 1).collect();
+        for len in 0..=40 {
+            let mut target = [0u8; 48];
+            // SAFETY: both buffers hold 48 bytes and are distinct.
+            unsafe { copy_payload(source.as_ptr(), target.as_mut_ptr(), len) };
+            assert_eq!(&target[..len], &source[..len], "length {len}");
+            assert!(target[len..].iter().all(|&byte| byte == 0), "length {len}");
+        }
     }
 
     #[test]

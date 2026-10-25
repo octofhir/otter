@@ -2,8 +2,8 @@
 //!
 //! # Contents
 //! - Numeric and identity strict equality, with content comparison in the VM.
-//! - Loose equality: the pairs that convert nothing inline, every coercing
-//!   pair through the committed runtime operation.
+//! - Loose equality: the pairs that convert nothing inline; every coercing
+//!   pair leaves through the eager deopt.
 //! - Unary nullish equality preserves heap facts through a total native leaf.
 //! - Truthiness of immediates, Numbers, strings and objects inline, and total
 //!   leaf handling for native functions, BigInts and other immediates.
@@ -14,14 +14,14 @@
 //! - Inputs remain intact until the final tagged boolean is committed.
 //! - Slow leaves see a live heap and preserve every control-flow-live register.
 //! - Numeric equality distinguishes NaN from identical words and equates ±0.
-//! - Coercive equality passes its operation explicitly; source records own
-//!   roots and reconstruction independently of the semantic operand.
+//! - Loose equality never runs JavaScript or enters the runtime: a pair
+//!   that may convert leaves before any effect, and a site that left so
+//!   lowers to its baseline operation.
 //!
 //! # See also
 //! - `otter_vm::runtime_stubs` owns total value semantics and leaf signatures.
 
 use super::*;
-use otter_vm::ObjectProtocolValueOp;
 
 impl<'a> Codegen<'a> {
     pub(super) fn emit_predicate(&mut self, node: NodeId) -> Result<bool, Unsupported> {
@@ -106,8 +106,8 @@ impl<'a> Codegen<'a> {
     /// `Rq(dst)` = `Rq(a) == Rq(b)` (`!=` when `negate`) as a tagged
     /// boolean: identity, two Numbers, `null`/`undefined` and two cells that
     /// convert nothing inline; every coercing pair, and `null`/`undefined`
-    /// against a native function (the only possible `[[IsHTMLDDA]]`), in the
-    /// runtime, which completes the explicit `==`/`!=` operation itself.
+    /// against a native function (the only possible `[[IsHTMLDDA]]`), leaves
+    /// through the eager deopt.
     fn emit_loose_equal(
         &mut self,
         node: NodeId,
@@ -121,11 +121,6 @@ impl<'a> Codegen<'a> {
         const NULLISH: i32 = tag::VALUE_UNDEFINED as i32;
         const _: () = assert!(tag::VALUE_NULL | NULLISH_BIT as u64 == tag::VALUE_UNDEFINED);
         const _: () = assert!(tag::VALUE_UNDEFINED | NULLISH_BIT as u64 == tag::VALUE_UNDEFINED);
-        let operation = if negate {
-            ObjectProtocolValueOp::LooseNotEqual
-        } else {
-            ObjectProtocolValueOp::LooseEqual
-        };
         let nullish = |input: NodeId| {
             matches!(
                 self.graph.node(input).kind,
@@ -143,7 +138,7 @@ impl<'a> Codegen<'a> {
         if let Some(other) = other {
             // `==` against `null`/`undefined`: both of those, and only an
             // `[[IsHTMLDDA]]` native function among cells.
-            let runtime = self.ops.new_dynamic_label();
+            let coerces = self.eager_exit(node, DeoptReason::WrongType);
             let done = self.ops.new_dynamic_label();
             let outcomes = self.equality_outcomes();
             let native_tag = i32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG);
@@ -154,21 +149,10 @@ impl<'a> Codegen<'a> {
             dynasm!(self.ops ; .arch x64
                 ; test Rq(other), r10 ; jnz =>outcomes.differ
                 ; test Rq(other), Rq(other) ; jz =>outcomes.differ
-                ; cmp BYTE [Rq(other)], native_tag as i8 ; je =>runtime
+                ; cmp BYTE [Rq(other)], native_tag as i8 ; je =>coerces
                 ; jmp =>outcomes.differ
             );
             self.emit_equality_results(node, a, b, dst, negate, outcomes, done);
-            dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>runtime);
-            self.emit_committed_call(
-                node,
-                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-                &[
-                    CommittedArgument::Value(a),
-                    CommittedArgument::Value(b),
-                    CommittedArgument::Scalar(operation.encode_abi()),
-                ],
-                Some(dst),
-            )?;
             dynasm!(self.ops ; .arch x64 ; =>done);
             self.emit_sink_register(dst);
             return Ok(());
@@ -180,7 +164,7 @@ impl<'a> Codegen<'a> {
         let b_nullish = self.ops.new_dynamic_label();
         let nullish_against = self.ops.new_dynamic_label();
         let same_type = self.ops.new_dynamic_label();
-        let runtime = self.ops.new_dynamic_label();
+        let coerces = self.eager_exit(node, DeoptReason::WrongType);
         let done = self.ops.new_dynamic_label();
         let outcomes = self.equality_outcomes();
         let native_tag = i32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG);
@@ -202,13 +186,13 @@ impl<'a> Codegen<'a> {
             ; =>not_both_booleans
         );
         // A boolean or function-id immediate converts or compares against a
-        // converted cell: the runtime decides.
+        // converted cell: the lower tier decides.
         self.load_immediate(10, tag::NOT_CELL_MASK);
         dynasm!(self.ops ; .arch x64
-            ; test Rq(a), r10 ; jnz =>runtime
-            ; test Rq(b), r10 ; jnz =>runtime
-            ; test Rq(a), Rq(a) ; jz =>runtime
-            ; test Rq(b), Rq(b) ; jz =>runtime
+            ; test Rq(a), r10 ; jnz =>coerces
+            ; test Rq(b), r10 ; jnz =>coerces
+            ; test Rq(a), Rq(a) ; jz =>coerces
+            ; test Rq(b), Rq(b) ; jz =>coerces
             ; movzx r10d, BYTE [Rq(a)] ; movzx r11d, BYTE [Rq(b)]
             ; cmp r10d, r11d ; je =>same_type
         );
@@ -216,8 +200,8 @@ impl<'a> Codegen<'a> {
         // two objects are equal only when identical, and these are not.
         for primitive in self.view.primitive_cell_type_tags {
             dynasm!(self.ops ; .arch x64
-                ; cmp r10d, DWORD i32::from(primitive) ; je =>runtime
-                ; cmp r11d, DWORD i32::from(primitive) ; je =>runtime
+                ; cmp r10d, DWORD i32::from(primitive) ; je =>coerces
+                ; cmp r11d, DWORD i32::from(primitive) ; je =>coerces
             );
         }
         dynasm!(self.ops ; .arch x64 ; jmp =>outcomes.differ ; =>same_type);
@@ -236,32 +220,21 @@ impl<'a> Codegen<'a> {
         dynasm!(self.ops ; .arch x64
             ; test r11, r10 ; jnz =>outcomes.differ
             ; test r11, r11 ; jz =>outcomes.differ
-            ; cmp BYTE [r11], native_tag as i8 ; je =>runtime
+            ; cmp BYTE [r11], native_tag as i8 ; je =>coerces
             ; jmp =>outcomes.differ
             // A Number against `null`/`undefined` differs; against anything
             // else that is not a Number, it converts.
             ; =>b_number
             ; mov r11, Rq(a) ; or r11, NULLISH_BIT ; cmp r11, NULLISH ; je =>outcomes.differ
-            ; jmp =>runtime
+            ; jmp =>coerces
             ; =>a_number
             ; test Rq(b), r10 ; jnz =>both_numbers
             ; mov r11, Rq(b) ; or r11, NULLISH_BIT ; cmp r11, NULLISH ; je =>outcomes.differ
-            ; jmp =>runtime
+            ; jmp =>coerces
             ; =>both_numbers
         );
         self.emit_number_pair(a, b, double, outcomes);
         self.emit_equality_results(node, a, b, dst, negate, outcomes, done);
-        dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>runtime);
-        self.emit_committed_call(
-            node,
-            abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-            &[
-                CommittedArgument::Value(a),
-                CommittedArgument::Value(b),
-                CommittedArgument::Scalar(operation.encode_abi()),
-            ],
-            Some(dst),
-        )?;
         dynasm!(self.ops ; .arch x64 ; =>done);
         self.emit_sink_register(dst);
         Ok(())

@@ -457,8 +457,8 @@ pub(crate) enum Kind {
     },
     /// `input0 == input1` (or `!=` when `negate`) on any two tagged values,
     /// producing a tagged boolean: identity, two Numbers, `null`/`undefined`
-    /// and two cells that convert nothing inline, every coercing pair in
-    /// the runtime, which may run JavaScript.
+    /// and two cells that convert nothing. Eager deopt for a pair that would
+    /// convert, or `null`/`undefined` against a native function.
     LooseEqual {
         negate: bool,
     },
@@ -826,16 +826,17 @@ pub(crate) enum Kind {
     /// `input0.push(input1)` at the guarded method call at this byte PC,
     /// whose callee is `%Array.prototype.push%`: an append to tagged or
     /// absent storage of an Array whose dense prefix is its whole length
-    /// inline, growing full storage into a nursery slab, every other Array
-    /// state through the builtin in the runtime. Eager
-    /// deopt unless the receiver is an Array that reads the builtin from its
-    /// pinned prototype and no indexed accessor exists in the realm.
+    /// inline, growing full storage into a nursery slab, any other dense
+    /// state through the VM's allocating push. Eager deopt unless the
+    /// receiver is an Array that reads the builtin from its pinned prototype
+    /// and no indexed accessor exists in the realm, or when the VM's push
+    /// refuses the receiver's state.
     ArrayPush(u32),
     /// `input0.pop()` at the guarded method call at this byte PC, whose
     /// callee is `%Array.prototype.pop%`: removal of a present tagged last
-    /// element inline, every other Array state through the builtin in the
-    /// runtime. Eager deopt unless the receiver is an Array that reads the
-    /// builtin from its pinned prototype.
+    /// element inline, any other present dense last element through the
+    /// VM's pop leaf. Eager deopt unless the receiver is an Array that reads
+    /// the builtin from its pinned prototype, or when the leaf refuses.
     ArrayPop(u32),
     /// The method the guarded method call at this byte PC reads from
     /// receiver input0: its proved shape, prototype chain and holder slot.
@@ -1154,10 +1155,7 @@ impl Kind {
             | Self::StoreKeyedCached { .. }
             | Self::LoadKeyedCached { .. }
             | Self::BuiltinMethod(_)
-            | Self::Instanceof
-            | Self::ArrayPush(_)
-            | Self::ArrayPop(_)
-            | Self::LooseEqual { .. } => Properties {
+            | Self::Instanceof => Properties {
                 eager_deopt: true,
                 can_throw: true,
                 writes: true,
@@ -1166,6 +1164,24 @@ impl Kind {
                 runs_js: true,
                 ..Properties::default()
             },
+            // Every receiver state the inline paths and the VM's push and
+            // pop entries refuse leaves before any effect; neither entry
+            // runs JavaScript, and only the push allocates.
+            Self::ArrayPush(_) => Properties {
+                eager_deopt: true,
+                writes: true,
+                effectful: true,
+                may_collect: true,
+                ..Properties::default()
+            },
+            Self::ArrayPop(_) => Properties {
+                eager_deopt: true,
+                writes: true,
+                effectful: true,
+                ..Properties::default()
+            },
+            // A pair that would convert leaves through the eager deopt.
+            Self::LooseEqual { .. } => eager,
             Self::StoreOwnField { .. }
             | Self::StoreDoubleOwnField { .. }
             | Self::StoreTaggedField(_)
@@ -1239,10 +1255,7 @@ impl Kind {
             Self::Float64Math(_) => &[abi::STUB_MATH_F64_LEAF],
             Self::TruncateFloat64ToInt32 => &[abi::STUB_NUMBER_TO_INT32_F64_LEAF],
             Self::StrictEqual { .. } => &[abi::STUB_STRICT_EQ_LEAF],
-            Self::LooseEqual { .. } => &[
-                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-                abi::STUB_STRICT_EQ_LEAF,
-            ],
+            Self::LooseEqual { .. } => &[abi::STUB_STRICT_EQ_LEAF],
             Self::PrimitiveCompare(_) => &[abi::STUB_PRIMITIVE_STRING_ORDER],
             Self::StoreOwnField { .. } | Self::StoreDoubleOwnField { .. } => {
                 &[abi::STUB_FIELD_TYPE_OBSERVE]
@@ -1290,11 +1303,11 @@ impl Kind {
                 abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
             ],
             Self::ArrayPush(_) => &[
-                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
+                abi::STUB_ARRAY_PUSH_ALLOC,
                 abi::STUB_ELEMENT_WRITE_BARRIER,
                 abi::STUB_WRITE_BARRIER,
             ],
-            Self::ArrayPop(_) => &[abi::STUB_JIT_OBJECT_PROTOCOL_VALUE],
+            Self::ArrayPop(_) => &[abi::STUB_ARRAY_POP_LEAF],
             Self::NewObject => &[abi::STUB_JIT_NEW_OBJECT],
             Self::NewArrayEmpty | Self::NewArrayLiteral => &[abi::STUB_JIT_NEW_ARRAY],
             Self::NewObjectLiteral { .. } => &[

@@ -5,9 +5,9 @@
 //! - [`Codegen::emit_strict_equal`] — §7.2.16 IsStrictlyEqual inline, with
 //!   the string/BigInt content leaf out of line.
 //! - [`Codegen::emit_loose_equal`] — §7.2.15 IsLooselyEqual: every case
-//!   that coerces nothing inline, every coercing case (and `[[IsHTMLDDA]]`)
-//!   in the runtime; against a `null`/`undefined` constant, only the
-//!   nullish test and the native-function check.
+//!   that coerces nothing inline; every coercing case (and `[[IsHTMLDDA]]`)
+//!   leaves through the eager deopt. Against a `null`/`undefined` constant,
+//!   only the nullish test and the native-function check.
 //!
 //! # Invariants
 //! - Both operands are read before the result is written; the result may
@@ -16,24 +16,22 @@
 //! - Two strings with recorded atoms are equal exactly when their atoms are;
 //!   any other pair of strings or BigInts of one type compares by content in
 //!   the no-allocation leaf, which keeps every live register.
-//! - Loose equality reaches the runtime only for an operand pair whose
-//!   comparison may run `ToPrimitive`/`ToNumber`, or for `null`/`undefined`
-//!   against a native function (the only cell that can be `[[IsHTMLDDA]]`).
-//!   The runtime completes the explicit `==`/`!=` operation, negation
-//!   included; source records retain root and reconstruction ownership.
+//! - Loose equality never runs JavaScript or enters the runtime: an operand
+//!   pair whose comparison may run `ToPrimitive`/`ToNumber`, or
+//!   `null`/`undefined` against a native function (the only cell that can
+//!   be `[[IsHTMLDDA]]`), leaves through the node's eager deopt before any
+//!   effect, and a site that left so lowers to its baseline operation.
 //!
 //! # See also
-//! - `otter_vm::Interpreter::loose_equal_with_context` — the runtime case.
 //! - [`super::super::ir::Kind::LooseEqual`] — the node.
 
 use super::{
-    Codegen, CommittedArgument, Condition, DOUBLE_OFFSET, DynamicLabel, NUMBER_TAG, NodeId,
+    Codegen, Condition, DOUBLE_OFFSET, DeoptReason, DynamicLabel, NUMBER_TAG, NodeId,
     RelocationTarget, THREAD_OFFSET, VALUE_FALSE, VALUE_NULL, VALUE_TRUE, VALUE_UNDEFINED,
     VM_THREAD_GC_HEAP_OFFSET, abi, emit_load_symbol_u64,
 };
 use crate::Unsupported;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
-use otter_vm::ObjectProtocolValueOp;
 
 /// `null | NULLISH_BIT == undefined | NULLISH_BIT == NULLISH`; no other
 /// value maps there (cells never carry the immediate tag bit).
@@ -119,7 +117,7 @@ impl Codegen<'_> {
     /// `X(destination)` = the tagged boolean of `X(a) == X(b)`, negated
     /// when `negate` (`!=`). Identity, two Numbers, `null`/`undefined`
     /// against anything, and two cells that need no conversion decide
-    /// inline; every coercing pair completes in the runtime.
+    /// inline; every coercing pair leaves through the eager deopt.
     pub(super) fn emit_loose_equal(
         &mut self,
         node: NodeId,
@@ -143,7 +141,7 @@ impl Codegen<'_> {
         let same_type = self.ops.new_dynamic_label();
         let nullish_against = self.ops.new_dynamic_label();
         let both_numbers = self.ops.new_dynamic_label();
-        let runtime = self.ops.new_dynamic_label();
+        let coerces = self.eager_exit(node, DeoptReason::WrongType);
         let done = self.ops.new_dynamic_label();
         let outcomes = self.equality_outcomes();
         let native_tag = u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG);
@@ -178,13 +176,13 @@ impl Codegen<'_> {
             ; =>not_both_booleans
         );
         // A boolean or function-id immediate converts or compares against
-        // a converted cell: the runtime decides.
+        // a converted cell: the lower tier decides.
         dynasm!(self.ops
             ; .arch aarch64
             ; tst X(a), #0xfffe_0000_0000_0007
-            ; b.ne =>runtime
+            ; b.ne =>coerces
             ; tst X(b), #0xfffe_0000_0000_0007
-            ; b.ne =>runtime
+            ; b.ne =>coerces
             ; ldrb w16, [X(a)]
             ; ldrb w17, [X(b)]
             ; cmp w16, w17
@@ -196,9 +194,9 @@ impl Codegen<'_> {
             dynasm!(self.ops
                 ; .arch aarch64
                 ; cmp w16, u32::from(tag)
-                ; b.eq =>runtime
+                ; b.eq =>coerces
                 ; cmp w17, u32::from(tag)
-                ; b.eq =>runtime
+                ; b.eq =>coerces
             );
         }
         dynasm!(self.ops ; .arch aarch64 ; b =>outcomes.differ ; =>same_type);
@@ -223,7 +221,7 @@ impl Codegen<'_> {
             ; b.ne =>outcomes.differ
             ; ldrb w16, [x17]
             ; cmp w16, native_tag
-            ; b.eq =>runtime
+            ; b.eq =>coerces
             ; b =>outcomes.differ
             // A Number against `null`/`undefined` differs; against anything
             // else that is not a Number, it converts.
@@ -231,37 +229,19 @@ impl Codegen<'_> {
             ; orr x17, X(a), NULLISH_BIT
             ; cmp x17, NULLISH
             ; b.eq =>outcomes.differ
-            ; b =>runtime
+            ; b =>coerces
             ; =>a_number
             ; tst X(b), x16
             ; b.ne =>both_numbers
             ; orr x17, X(b), NULLISH_BIT
             ; cmp x17, NULLISH
             ; b.eq =>outcomes.differ
-            ; b =>runtime
+            ; b =>coerces
             ; =>both_numbers
         );
         self.emit_number_pair_equal([a, b], double, destination, condition);
         dynasm!(self.ops ; .arch aarch64 ; b =>done);
         self.emit_equality_results(node, [a, b], destination, condition, outcomes, done);
-        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>runtime);
-        self.emit_committed_call(
-            node,
-            abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-            &[
-                CommittedArgument::Value(a),
-                CommittedArgument::Value(b),
-                CommittedArgument::Scalar(
-                    if negate {
-                        ObjectProtocolValueOp::LooseNotEqual
-                    } else {
-                        ObjectProtocolValueOp::LooseEqual
-                    }
-                    .encode_abi(),
-                ),
-            ],
-            Some(destination),
-        )?;
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         self.emit_sink_register(destination);
         Ok(())
@@ -289,8 +269,8 @@ impl Codegen<'_> {
 
     /// `X(other) == null` (or `undefined`, which `==` cannot tell apart):
     /// true for both, false for every other immediate and for every cell
-    /// but a native function, which may be `[[IsHTMLDDA]]` and asks the
-    /// runtime.
+    /// but a native function, which may be `[[IsHTMLDDA]]` and leaves
+    /// through the eager deopt.
     fn emit_loose_equal_nullish(
         &mut self,
         node: NodeId,
@@ -299,7 +279,7 @@ impl Codegen<'_> {
         destination: u8,
         condition: Condition,
     ) -> Result<(), Unsupported> {
-        let runtime = self.ops.new_dynamic_label();
+        let coerces = self.eager_exit(node, DeoptReason::WrongType);
         let done = self.ops.new_dynamic_label();
         let outcomes = self.equality_outcomes();
         let native_tag = u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG);
@@ -313,28 +293,10 @@ impl Codegen<'_> {
             ; cbz X(other), =>outcomes.differ
             ; ldrb w16, [X(other)]
             ; cmp w16, native_tag
-            ; b.eq =>runtime
+            ; b.eq =>coerces
             ; b =>outcomes.differ
         );
         self.emit_equality_results(node, [a, b], destination, condition, outcomes, done);
-        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>runtime);
-        self.emit_committed_call(
-            node,
-            abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-            &[
-                CommittedArgument::Value(a),
-                CommittedArgument::Value(b),
-                CommittedArgument::Scalar(
-                    if condition == Condition::NotEqual {
-                        ObjectProtocolValueOp::LooseNotEqual
-                    } else {
-                        ObjectProtocolValueOp::LooseEqual
-                    }
-                    .encode_abi(),
-                ),
-            ],
-            Some(destination),
-        )?;
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         self.emit_sink_register(destination);
         Ok(())

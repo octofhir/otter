@@ -335,6 +335,9 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::CheckNotHole
         | Kind::NativeLeaf(_)
         | Kind::BooleanToInt32
+        // Identity, numbers and string or BigInt content, which never
+        // changes; a pair that would convert leaves before reading more.
+        | Kind::LooseEqual { .. }
         // String content never changes; the node tests its own receiver.
         | Kind::StringCharCodeAt => Effects::default(),
         // A cell's map word decides the result. An unproved input is tested
@@ -431,6 +434,23 @@ fn heap_effects(kind: &Kind) -> Effects {
         Kind::StoreTaggedField(offset) => Effects::writes(&[], &[H::ContextSlot(*offset)]),
         Kind::StoreBodySlot(_) => Effects::writes(&[H::MapWords], &[H::BodySlots]),
         Kind::StoreElement(_) => Effects::writes(&[], &[H::Elements]),
+        // The receiver's proof reads its map word; the operation reads and
+        // writes its storage and lengths, and an append may grow the
+        // storage, which may collect. The realm's protector changes only
+        // when JavaScript runs.
+        Kind::ArrayPush(_) => Effects::writes(
+            &[H::MapWords, H::ElementStorage, H::ArrayLengths],
+            &[
+                H::Elements,
+                H::ElementStorage,
+                H::ArrayLengths,
+                H::Movement,
+            ],
+        ),
+        Kind::ArrayPop(_) => Effects::writes(
+            &[H::MapWords, H::ElementStorage, H::ArrayLengths, H::Elements],
+            &[H::Elements, H::ElementStorage, H::ArrayLengths],
+        ),
         Kind::NoteContextWrite(_) => Effects::writes(&[], &[H::ContextFacts]),
         // Remembered-set bookkeeping no program reads.
         Kind::WriteBarrier | Kind::ElementWriteBarrier => Effects::default(),
@@ -456,9 +476,6 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::LoadKeyedCached { .. }
         | Kind::BuiltinMethod(_)
         | Kind::Instanceof
-        | Kind::ArrayPush(_)
-        | Kind::ArrayPop(_)
-        | Kind::LooseEqual { .. }
         | Kind::CallJs { .. }
         | Kind::CallForward { .. }
         | Kind::Generic { .. } => Effects::world(),
@@ -559,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn an_allocation_moves_storage_but_keeps_fields_and_shapes() {
+    fn allocations_and_array_methods_keep_fields_and_shapes() {
         let writes = |kind: &Kind| {
             let mut set = HeapSet::default();
             for heap in clobberize(kind).writes {
@@ -596,6 +613,22 @@ mod tests {
         // A literal's values seed field types.
         assert!(field_types.reads_overlap(&writes(&Kind::NewObjectLiteral { fields: None })));
         assert!(!field_types.reads_overlap(&writes(&Kind::NewObject)));
+        // An Array append or removal runs no JavaScript: it changes element
+        // storage and lengths, and an append may move storage.
+        let length = clobberize(&Kind::LoadArrayLength {
+            array_proved: false,
+        });
+        for kind in [Kind::ArrayPush(0), Kind::ArrayPop(0)] {
+            let method = writes(&kind);
+            assert!(!method.is_world(), "{kind:?}");
+            assert!(!field.reads_overlap(&method), "{kind:?}");
+            assert!(!shapes.reads_overlap(&method), "{kind:?}");
+            assert!(!field_types.reads_overlap(&method), "{kind:?}");
+            assert!(length.reads_overlap(&method), "{kind:?}");
+        }
+        assert!(base.reads_overlap(&writes(&Kind::ArrayPush(0))));
+        // Loose equality leaves before any pair that would convert.
+        assert!(writes(&Kind::LooseEqual { negate: false }).is_empty());
         let load = Kind::LoadPropertyCached {
             pc: 0,
             atom: None,

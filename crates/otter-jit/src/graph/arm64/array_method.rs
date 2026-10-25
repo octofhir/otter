@@ -2,8 +2,9 @@
 //!
 //! # Contents
 //! - [`Codegen::emit_array_push`] appends to tagged storage, growing it when
-//!   full.
-//! - [`Codegen::emit_array_pop`] removes a present tagged last element.
+//!   full, or to any other dense storage through the VM's allocating push.
+//! - [`Codegen::emit_array_pop`] removes a present tagged last element, or
+//!   any other dense last element through the VM's pop leaf.
 //!
 //! # Invariants
 //! - The receiver is proved an Array that reads the site's builtin from its
@@ -15,8 +16,10 @@
 //! - The inline paths cover an Array whose dense prefix is its whole length:
 //!   an append to tagged storage, which grows full or absent storage into a
 //!   nursery slab while no marking runs, and the removal of a present tagged
-//!   last element. Every other state the proof admits completes in the
-//!   builtin through the committed object-protocol entry.
+//!   last element. Any other dense state completes in the VM's allocating
+//!   push or its pop leaf, neither of which runs JavaScript; a state those
+//!   refuse leaves through the eager deopt before any effect. Neither node
+//!   therefore writes more than element storage and lengths.
 //! - Grown storage is young, so its copied words owe no barrier; the Array
 //!   takes the barrier for the slab it now holds.
 //! - The appended value takes the element write barrier before the lengths
@@ -33,15 +36,14 @@
 //! - [`super::Codegen::emit_store_keyed_cached`] for the generic element store.
 
 use super::{
-    ARRAY_INDEX_PROTECTOR, Codegen, CommittedArgument, DeoptReason, DynamicLabel, IntrinsicMethod,
-    NUMBER_TAG, NodeId, THREAD_OFFSET, VALUE_HOLE, VALUE_UNDEFINED,
-    VM_THREAD_MARKING_FLAG_CELL_OFFSET, abi,
+    ARRAY_INDEX_PROTECTOR, Codegen, DeoptReason, DynamicLabel, IntrinsicMethod, NUMBER_TAG, NodeId,
+    RelocationTarget, THREAD_OFFSET, VALUE_HOLE, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
+    VM_THREAD_MARKING_FLAG_CELL_OFFSET, emit_load_symbol_u64,
 };
 use crate::Unsupported;
 use crate::allocation::LabRegisters;
 use crate::arm64::allocation::emit_grow_tagged_slab;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
-use otter_vm::ObjectProtocolValueOp;
 use otter_vm::jit::{JitArrayStorage, JitGuardedReceiver, JitMethodHolder};
 
 impl Codegen<'_> {
@@ -143,24 +145,18 @@ impl Codegen<'_> {
             ; b =>done
             ; =>runtime
         );
-        self.emit_committed_call(
-            node,
-            abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-            &[
-                CommittedArgument::Value(receiver),
-                CommittedArgument::Value(value),
-                CommittedArgument::Scalar(ObjectProtocolValueOp::ArrayPush.encode_abi()),
-            ],
-            Some(destination),
-        )?;
-        let committed = self.ops.new_dynamic_label();
+        let grown = self.ops.new_dynamic_label();
+        self.emit_array_push_grow(node, [receiver, value, value], exit, grown)?;
+        let finished = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
-            ; b =>committed
+            ; =>grown
+            ; mov X(destination), x16
+            ; b =>finished
             ; =>done
             ; mov W(destination), w16
             ; orr XSP(destination), X(destination), NUMBER_TAG
-            ; =>committed
+            ; =>finished
         );
         Ok(())
     }
@@ -207,18 +203,45 @@ impl Codegen<'_> {
         );
         self.load_immediate(destination, VALUE_UNDEFINED);
         dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>runtime);
-        self.emit_committed_call(
-            node,
-            abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-            &[
-                CommittedArgument::Value(receiver),
-                CommittedArgument::Scalar(VALUE_UNDEFINED),
-                CommittedArgument::Scalar(ObjectProtocolValueOp::ArrayPop.encode_abi()),
-            ],
-            Some(destination),
-        )?;
-        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        self.emit_array_pop_leaf(node, receiver, exit);
+        dynasm!(self.ops ; .arch aarch64 ; mov X(destination), x16 ; =>done);
         Ok(())
+    }
+
+    /// Remove the last element of the Array in `X(receiver)` through the
+    /// VM's pop leaf, which never allocates: its value is in `x16` after,
+    /// or, when the leaf refused before any effect, control reaches
+    /// `refused` with every register as it was.
+    fn emit_array_pop_leaf(&mut self, node: NodeId, receiver: u8, refused: DynamicLabel) {
+        let leaf = otter_vm::runtime_stubs::ARRAY_POP_LEAF;
+        let live = self.allocation.node(node).live_registers.clone();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; sub sp, sp, #16
+            ; str X(receiver), [sp]
+        );
+        let saved = self.emit_save_registers(&live);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr x1, [sp, saved]
+            ; ldr x0, [x20, THREAD_OFFSET]
+            ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
+        );
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            16,
+            leaf.entry_addr() as u64,
+            RelocationTarget::runtime_stub(leaf.descriptor),
+        );
+        dynasm!(self.ops ; .arch aarch64 ; blr x16 ; mov x16, x0 ; mov x17, x1);
+        self.emit_restore_registers(&live, saved);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr X(receiver), [sp]
+            ; add sp, sp, #16
+            ; cbnz x17, =>refused
+        );
     }
 
     /// Prove `X(receiver)` an Array that reads the builtin of the guarded

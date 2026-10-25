@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - [`Codegen::emit_array_method`] appends to tagged storage, growing it
-//!   when full, or removes a present tagged last element.
+//!   when full, or removes a present tagged last element; any other dense
+//!   state goes through the VM's allocating push or its pop leaf.
 //!
 //! # Invariants
 //! - The receiver is proved an Array that reads the site's builtin from its
@@ -12,8 +13,10 @@
 //! - The inline paths cover an Array whose dense prefix is its whole length:
 //!   an append to tagged storage, which grows full or absent storage into a
 //!   nursery slab while no marking runs, and the removal of a present tagged
-//!   last element. Every other state the proof admits completes in the
-//!   builtin through the committed object-protocol entry.
+//!   last element. Any other dense state completes in the VM's allocating
+//!   push or its pop leaf, neither of which runs JavaScript; a state those
+//!   refuse leaves through the eager deopt before any effect. Neither node
+//!   therefore writes more than element storage and lengths.
 //! - Grown storage is young, so its copied words owe no barrier; the Array
 //!   takes the barrier for the slab it now holds.
 //! - The appended value takes the element write barrier before the lengths
@@ -30,11 +33,10 @@
 //! - `otter_vm::jit::JitArrayStorage` for the words read and written.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm};
-use otter_vm::ObjectProtocolValueOp;
 use otter_vm::jit::{JitArrayStorage, JitGuardedReceiver, JitMethodHolder};
 use otter_vm::value::tag;
 
-use super::{Codegen, CommittedArgument, abi};
+use super::Codegen;
 use crate::allocation::LabRegisters;
 use crate::x86_64::allocation::emit_grow_tagged_slab;
 use crate::{
@@ -131,17 +133,10 @@ impl Codegen<'_> {
                 ; =>appended
                 ; lea r10d, [Rq(length) + 1]);
             crate::x86_64::values::emit_box_int32(&mut self.ops, 10, destination, 11);
+            let grown = self.ops.new_dynamic_label();
             dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>runtime);
-            self.emit_committed_call(
-                node,
-                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-                &[
-                    CommittedArgument::Value(receiver),
-                    CommittedArgument::Value(value),
-                    CommittedArgument::Scalar(ObjectProtocolValueOp::ArrayPush.encode_abi()),
-                ],
-                Some(destination),
-            )?;
+            self.emit_array_push_grow(node, [receiver, value, value], exit, grown)?;
+            dynasm!(self.ops ; .arch x64 ; =>grown ; mov Rq(destination), r10);
         } else {
             let empty = self.ops.new_dynamic_label();
             self.emit_whole_prefix(storage, receiver, length, false, runtime);
@@ -165,19 +160,43 @@ impl Codegen<'_> {
                 ; =>empty);
             self.load_immediate(destination, tag::VALUE_UNDEFINED);
             dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>runtime);
-            self.emit_committed_call(
-                node,
-                abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
-                &[
-                    CommittedArgument::Value(receiver),
-                    CommittedArgument::Scalar(tag::VALUE_UNDEFINED),
-                    CommittedArgument::Scalar(ObjectProtocolValueOp::ArrayPop.encode_abi()),
-                ],
-                Some(destination),
-            )?;
+            self.emit_array_pop_leaf(node, receiver, exit);
+            dynasm!(self.ops ; .arch x64 ; mov Rq(destination), r10);
         }
         dynasm!(self.ops ; .arch x64 ; =>done);
         Ok(true)
+    }
+
+    /// Remove the last element of the Array in `receiver` through the VM's
+    /// pop leaf, which never allocates: its value is in `r10` after, or,
+    /// when the leaf refused before any effect, control reaches `refused`
+    /// with every register as it was.
+    fn emit_array_pop_leaf(&mut self, node: NodeId, receiver: u8, refused: DynamicLabel) {
+        let leaf = otter_vm::runtime_stubs::ARRAY_POP_LEAF;
+        let live = self.allocation.node(node).live_registers.clone();
+        dynasm!(self.ops ; .arch x64 ; sub rsp, 16 ; mov [rsp], Rq(receiver));
+        self.sp_delta += 16;
+        let saved = self.emit_save_registers(&live) as i32;
+        dynasm!(self.ops ; .arch x64
+            ; mov rsi, [rsp + saved]
+            ; mov rdi, [r15 + crate::entry::THREAD_OFFSET as i32]
+            ; mov rdi, [rdi + crate::entry::VM_THREAD_GC_HEAP_OFFSET as i32]
+        );
+        crate::x86_64::values::emit_load_runtime_stub(
+            &mut self.ops,
+            &mut self.relocations,
+            leaf.entry_addr() as u64,
+            leaf.descriptor,
+        );
+        crate::x86_64::call_abi::emit_runtime_call(&mut self.ops, leaf.descriptor);
+        dynasm!(self.ops ; .arch x64 ; mov r10, rax ; mov r11, rdx);
+        self.emit_restore_registers(&live, saved as u32);
+        dynasm!(self.ops ; .arch x64
+            ; mov Rq(receiver), [rsp]
+            ; add rsp, 16
+            ; test r11, r11 ; jnz =>refused
+        );
+        self.sp_delta -= 16;
     }
 
     /// Prove `receiver` an Array that reads the builtin of the guarded

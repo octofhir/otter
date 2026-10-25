@@ -345,12 +345,14 @@ impl Codegen<'_> {
         self.sp_delta -= PARKED_BYTES;
     }
 
-    /// The append the push leaf refused for want of room: the allocating
-    /// push grows the dense storage and appends. A refusal precedes every
-    /// effect and reaches `missed` with the operands as they were; running
-    /// out of memory may follow a collection, so it resumes the store in the
-    /// lower tier, which reads its operands from the frame.
-    fn emit_array_push_grow(
+    /// The append the inline paths or the push leaf refused: the allocating
+    /// push grows the dense storage and appends `Rq(value)` to the Array in
+    /// `Rq(receiver)`, leaving the tagged new length in `r10` at `stored`. A
+    /// refusal precedes every effect and reaches `missed` with all three
+    /// operands as they were; running out of memory may follow a collection,
+    /// so it resumes the operation in the lower tier, which reads its
+    /// operands from the frame.
+    pub(super) fn emit_array_push_grow(
         &mut self,
         node: NodeId,
         [receiver, key, value]: [u8; 3],
@@ -406,6 +408,7 @@ impl Codegen<'_> {
         let success = self.ops.new_dynamic_label();
         let fatal = self.fatal;
         dynasm!(self.ops ; .arch x64
+            ; mov r10, [rsp + ALLOC_CTX_STACK_SIZE as i32]
             ; mov r11, [rsp + ALLOC_CTX_STACK_SIZE as i32 + 8]
             ; add rsp, bytes as i32
             ; test r11, r11 ; jz =>success

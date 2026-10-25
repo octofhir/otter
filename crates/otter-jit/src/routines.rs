@@ -2,7 +2,8 @@
 //! carrying its own copy, and the code space that owns them.
 //!
 //! The truthiness routine decides `ToBoolean` of the values optimized code
-//! does not test inline. The named-property routines select a site's IC slot handler, probe the
+//! does not test inline, and the field-observation routine widens a field
+//! summary an optimized store did not find holding its value. The named-property routines select a site's IC slot handler, probe the
 //! isolate's shared action table and, on a miss, enter the committed runtime
 //! operation. Each is emitted once per isolate, when a site first calls it,
 //! into the compiler's [`CodeMemory`]; baseline sites call them with their
@@ -65,6 +66,9 @@ pub(crate) enum Routine {
     /// The field-summary observation and barriers that follow a baseline
     /// site's inline own-field store.
     StoreTail,
+    /// The widening of a field summary an optimized store's inline test did
+    /// not find holding its value, preserving every register.
+    FieldObserve,
 }
 
 impl Routine {
@@ -81,6 +85,7 @@ impl Routine {
             Self::CommittedStore => "committedStore",
             Self::Truthy => "truthy",
             Self::StoreTail => "storeTail",
+            Self::FieldObserve => "fieldObserve",
         }
     }
 
@@ -95,6 +100,7 @@ impl Routine {
             Self::KeyedStore => RoutineObject::KeyedStore,
             Self::Truthy => RoutineObject::Truthy,
             Self::StoreTail => RoutineObject::StoreTail,
+            Self::FieldObserve => RoutineObject::FieldObserve,
         }
     }
 
@@ -116,10 +122,11 @@ pub(crate) enum RoutineObject {
     KeyedStore,
     Truthy,
     StoreTail,
+    FieldObserve,
 }
 
 impl RoutineObject {
-    const COUNT: usize = 8;
+    const COUNT: usize = 9;
 }
 
 /// Entry offsets of one routine object: the routine and its second entry,
@@ -321,6 +328,9 @@ fn emit(
         RoutineObject::Truthy => {
             crate::graph::arm64::truthy::emit_routine(&mut ops, &mut relocations, view)
         }
+        RoutineObject::FieldObserve => {
+            crate::arm64::field_type::emit_routine(&mut ops, &mut relocations, view)
+        }
         _ => crate::template::arm64::shared_property::emit_routine(
             &mut ops,
             &mut relocations,
@@ -345,6 +355,9 @@ fn emit(
     let offsets = match object {
         RoutineObject::Truthy => {
             crate::graph::x86_64::truthy::emit_routine(&mut ops, &mut relocations, view)
+        }
+        RoutineObject::FieldObserve => {
+            crate::x86_64::field_type::emit_routine(&mut ops, &mut relocations, view)
         }
         _ => crate::template::x86_64::shared_property::emit_routine(
             &mut ops,

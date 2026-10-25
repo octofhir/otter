@@ -6,6 +6,8 @@
 //!   state goes through the VM's allocating push or its pop leaf.
 //!
 //! # Invariants
+//! - Growing storage and the VM's push are deferred code: the body holds
+//!   only the append into spare capacity.
 //! - The receiver is proved an Array that reads the site's builtin from its
 //!   pinned `%Array.prototype%` before any effect; a failed proof, or for an
 //!   append an indexed accessor anywhere in the realm, leaves through the
@@ -89,16 +91,9 @@ impl Codegen<'_> {
                 ; mov [Rq(receiver) + storage.length_byte as i32], r10d
                 ; mov [Rq(base) + storage.slab_length_from_base], r10d
                 ; mov [Rq(receiver) + storage.logical_length_byte as i32], r10d
-                ; jmp =>appended
-                ; =>grow
-                // The copied words would owe marking barriers.
-                ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
-                ; mov r10, [r10 + crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
-                ; cmp BYTE [r10], 0 ; jne =>runtime
-                // Double the capacity, and at least four words.
-                ; lea Rd(base), [r11 + r11] ; mov r10d, 4 ; cmp Rd(base), r10d ; cmovb Rd(base), r10d
-                // Shared storage reports capacity zero but retains its prefix.
-                ; lea r10d, [Rq(length) + 1] ; cmp Rd(base), r10d ; cmovb Rd(base), r10d);
+                ; =>appended
+                ; lea r10d, [Rq(length) + 1]);
+            crate::x86_64::values::emit_box_int32(&mut self.ops, 10, destination, 11);
             let regs = LabRegisters {
                 buffer: assigned.gp_temps[3],
                 candidate: temp,
@@ -106,37 +101,51 @@ impl Codegen<'_> {
                 scratch: assigned.gp_temps[5],
                 size: base,
             };
-            emit_grow_tagged_slab(
-                &mut self.ops,
-                15,
-                storage,
-                [receiver, length],
-                regs,
-                runtime,
-            );
-            // The new storage is young and no marking runs, so its words owe
-            // no barrier; the Array owes one for the slab it now holds.
-            dynasm!(self.ops ; .arch x64
-                ; mov [Rq(base) + Rq(length) * 8], Rq(value)
-                ; lea r10d, [Rq(length) + 1]
-                ; mov [Rq(base) + storage.slab_length_from_base], r10d
-                ; mov [Rq(receiver) + storage.slab_byte as i32], Rd(temp)
-                ; mov [Rq(receiver) + storage.base_byte as i32], Rq(base)
-                ; mov r11d, [Rq(base) + storage.numeric.capacity_byte]
-                ; mov [Rq(receiver) + storage.capacity_byte as i32], r11d
-                ; mov BYTE [Rq(receiver) + storage.numeric.kind_byte as i32], storage.tagged_kind as i8
-                ; mov BYTE [Rq(receiver) + storage.own_guard_byte as i32], 0
-                ; mov [Rq(receiver) + storage.length_byte as i32], r10d
-                ; mov [Rq(receiver) + storage.logical_length_byte as i32], r10d);
-            self.emit_cell_edge_barrier(node, receiver, temp, &[length]);
-            dynasm!(self.ops ; .arch x64
-                ; =>appended
-                ; lea r10d, [Rq(length) + 1]);
-            crate::x86_64::values::emit_box_int32(&mut self.ops, 10, destination, 11);
-            let grown = self.ops.new_dynamic_label();
-            dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>runtime);
-            self.emit_array_push_grow(node, [receiver, value, value], exit, grown)?;
-            dynasm!(self.ops ; .arch x64 ; =>grown ; mov Rq(destination), r10);
+            // Growing storage and the VM's push are the cold side of an
+            // append.
+            self.defer(move |codegen| {
+                dynasm!(codegen.ops ; .arch x64
+                    ; =>grow
+                    // The copied words would owe marking barriers.
+                    ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
+                    ; mov r10, [r10 + crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
+                    ; cmp BYTE [r10], 0 ; jne =>runtime
+                    // Double the capacity, and at least four words.
+                    ; lea Rd(base), [r11 + r11] ; mov r10d, 4 ; cmp Rd(base), r10d ; cmovb Rd(base), r10d
+                    // Shared storage reports capacity zero but retains its prefix.
+                    ; lea r10d, [Rq(length) + 1] ; cmp Rd(base), r10d ; cmovb Rd(base), r10d);
+                emit_grow_tagged_slab(
+                    &mut codegen.ops,
+                    15,
+                    storage,
+                    [receiver, length],
+                    regs,
+                    runtime,
+                );
+                // The new storage is young and no marking runs, so its words
+                // owe no barrier; the Array owes one for the slab it now holds.
+                dynasm!(codegen.ops ; .arch x64
+                    ; mov [Rq(base) + Rq(length) * 8], Rq(value)
+                    ; lea r10d, [Rq(length) + 1]
+                    ; mov [Rq(base) + storage.slab_length_from_base], r10d
+                    ; mov [Rq(receiver) + storage.slab_byte as i32], Rd(temp)
+                    ; mov [Rq(receiver) + storage.base_byte as i32], Rq(base)
+                    ; mov r11d, [Rq(base) + storage.numeric.capacity_byte]
+                    ; mov [Rq(receiver) + storage.capacity_byte as i32], r11d
+                    ; mov BYTE [Rq(receiver) + storage.numeric.kind_byte as i32], storage.tagged_kind as i8
+                    ; mov BYTE [Rq(receiver) + storage.own_guard_byte as i32], 0
+                    ; mov [Rq(receiver) + storage.length_byte as i32], r10d
+                    ; mov [Rq(receiver) + storage.logical_length_byte as i32], r10d);
+                codegen.emit_cell_edge_barrier(node, receiver, temp, &[length]);
+                dynasm!(codegen.ops ; .arch x64 ; jmp =>appended ; =>runtime);
+                let grown = codegen.ops.new_dynamic_label();
+                codegen.emit_array_push_grow(node, [receiver, value, value], exit, grown)?;
+                dynasm!(codegen.ops ; .arch x64
+                    ; =>grown
+                    ; mov Rq(destination), r10
+                    ; jmp =>done);
+                Ok(())
+            });
         } else {
             let empty = self.ops.new_dynamic_label();
             self.emit_whole_prefix(storage, receiver, length, false, runtime);

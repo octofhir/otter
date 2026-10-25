@@ -125,6 +125,7 @@ impl Codegen<'_> {
                         crate::x86_64::field_type::emit_observe_known(
                             &mut self.ops,
                             &mut self.relocations,
+                            self.routines,
                             self.view,
                             owner,
                             value,
@@ -143,6 +144,7 @@ impl Codegen<'_> {
                             crate::x86_64::field_type::emit_observe_known(
                                 &mut self.ops,
                                 &mut self.relocations,
+                                self.routines,
                                 self.view,
                                 owner,
                                 value,

@@ -273,16 +273,11 @@ impl Codegen<'_> {
             generic_call(self)?;
         } else {
             // A proved target makes the generic entry the cold path.
-            let sp_delta = self.sp_delta;
-            self.deferred
-                .push(Box::new(move |codegen: &mut Codegen<'_>| {
-                    let outer = std::mem::replace(&mut codegen.sp_delta, sp_delta);
-                    if let Err(failure) = generic_call(codegen) {
-                        codegen.deferred_failure.get_or_insert(failure);
-                    }
-                    codegen.sp_delta = outer;
-                    dynasm!(codegen.ops ; .arch x64 ; jmp =>returned);
-                }));
+            self.defer(move |codegen| {
+                generic_call(codegen)?;
+                dynasm!(codegen.ops ; .arch x64 ; jmp =>returned);
+                Ok(())
+            });
         }
         dynasm!(self.ops ; .arch x64 ; =>returned);
         self.emit_pop_actuals(bytes);
@@ -379,17 +374,9 @@ impl Codegen<'_> {
         // Every status but success leaves the hot path: a callee that retired
         // itself for a tail call it staged is entered in its place, anything
         // else is routed to its handler.
-        let sp_delta = self.sp_delta;
-        self.deferred
-            .push(Box::new(move |codegen: &mut Codegen<'_>| {
-                let outer = std::mem::replace(&mut codegen.sp_delta, sp_delta);
-                if let Err(failure) =
-                    codegen.emit_abrupt_completion(node, abrupt, done, (threw, committed, fatal))
-                {
-                    codegen.deferred_failure.get_or_insert(failure);
-                }
-                codegen.sp_delta = outer;
-            }));
+        self.defer(move |codegen| {
+            codegen.emit_abrupt_completion(node, abrupt, done, (threw, committed, fatal))
+        });
         Ok(())
     }
 

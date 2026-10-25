@@ -706,6 +706,7 @@ impl Codegen<'_> {
                             crate::x86_64::field_type::emit_observe_known(
                                 &mut self.ops,
                                 &mut self.relocations,
+                                self.routines,
                                 view,
                                 holder,
                                 stored_value.expect("named store value"),
@@ -737,6 +738,7 @@ impl Codegen<'_> {
                 crate::x86_64::field_type::emit_observe_known(
                     &mut self.ops,
                     &mut self.relocations,
+                    self.routines,
                     view,
                     holder,
                     stored_value.expect("named store value"),

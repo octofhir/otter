@@ -448,6 +448,20 @@ impl<'a> Codegen<'a> {
         #[cfg(not(debug_assertions))]
         emit(self)
     }
+    /// Queue `emit` as deferred code, out of the body's line. It runs with
+    /// the stack depth of this point; its failure is reported when emission
+    /// ends.
+    fn defer(&mut self, emit: impl FnOnce(&mut Codegen<'a>) -> Result<(), Unsupported> + 'a) {
+        let sp_delta = self.sp_delta;
+        self.deferred
+            .push(Box::new(move |codegen: &mut Codegen<'a>| {
+                let outer = std::mem::replace(&mut codegen.sp_delta, sp_delta);
+                if let Err(failure) = emit(codegen) {
+                    codegen.deferred_failure.get_or_insert(failure);
+                }
+                codegen.sp_delta = outer;
+            }));
+    }
     fn spill_definition(&mut self, node: NodeId) {
         if let (Some(result), Some(&home)) = (
             self.allocation.node(node).result,

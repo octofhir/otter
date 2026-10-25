@@ -65,6 +65,7 @@ fn emit_load_input(ops: &mut Assembler, input: AllocationValue) {
 pub(crate) fn emit_object_literal(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
+    routines: &crate::routines::RoutineRequest<'_>,
     view: &otter_vm::JitCompileSnapshot,
     context: u8,
     realm: u32,
@@ -122,6 +123,7 @@ pub(crate) fn emit_object_literal(
         crate::arm64::field_type::emit_observe_known(
             ops,
             relocations,
+            routines,
             view,
             regs.scratch,
             regs.buffer,

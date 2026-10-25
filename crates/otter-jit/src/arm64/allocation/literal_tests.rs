@@ -114,11 +114,13 @@ fn execute(
         })
         .collect::<Vec<_>>();
     let view = otter_vm::JitCompileSnapshot::without_feedback(0, 0, 0, vec![]);
+    let transitions = crate::entry::TransitionTable::resolve();
     let mut relocations = RelocationCapture::default();
     match layout {
         Layout::Object(plan) => emit_object_literal(
             &mut ops,
             &mut relocations,
+            &crate::routines::fixture_routines(&view, &transitions),
             &view,
             20,
             0,
@@ -385,9 +387,11 @@ fn zero_records_emit_no_observation_and_keep_the_buffer_live() {
         let mut ops = Assembler::new().unwrap();
         let slow = ops.new_dynamic_label();
         let mut relocations = RelocationCapture::new(true);
+        let transitions = crate::entry::TransitionTable::resolve();
         emit_object_literal(
             &mut ops,
             &mut relocations,
+            &crate::routines::fixture_routines(&view, &transitions),
             &view,
             20,
             0,
@@ -416,6 +420,6 @@ fn zero_records_emit_no_observation_and_keep_the_buffer_live() {
             "probe, then publication"
         );
         let json = relocations.render(&code).unwrap().json;
-        assert_eq!(json.contains("field_type_observe"), observed);
+        assert_eq!(json.contains("fieldObserve"), observed);
     }
 }

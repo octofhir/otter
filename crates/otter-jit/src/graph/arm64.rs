@@ -1033,7 +1033,11 @@ impl<'a> Codegen<'a> {
     /// Run `emit` for `node`. Debug builds check that every runtime stub it
     /// calls, and every stub of the deferred code it queues, is one of the
     /// node's [`Kind::slow_path_stubs`].
-    fn audited<T>(&mut self, node: NodeId, emit: impl FnOnce(&mut Self) -> T) -> T {
+    fn audited<T>(
+        &mut self,
+        #[cfg_attr(not(debug_assertions), allow(unused_variables))] node: NodeId,
+        emit: impl FnOnce(&mut Self) -> T,
+    ) -> T {
         #[cfg(debug_assertions)]
         {
             let outer = self.relocations.begin_stub_audit();

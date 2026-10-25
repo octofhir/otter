@@ -429,7 +429,11 @@ impl<'a> Codegen<'a> {
     /// node's [`Kind::slow_path_stubs`]. Deferred code runs after the body,
     /// so the entries `emit` queues are the ones past the queue's length
     /// before it.
-    fn audited<T>(&mut self, node: NodeId, emit: impl FnOnce(&mut Self) -> T) -> T {
+    fn audited<T>(
+        &mut self,
+        #[cfg_attr(not(debug_assertions), allow(unused_variables))] node: NodeId,
+        emit: impl FnOnce(&mut Self) -> T,
+    ) -> T {
         #[cfg(debug_assertions)]
         {
             let outer = self.relocations.begin_stub_audit();

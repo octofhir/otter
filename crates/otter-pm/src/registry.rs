@@ -196,8 +196,8 @@ pub struct NpmProvenance {
 pub enum MetadataFetch {
     /// The current document, with the entity tag that names it.
     Fresh {
-        /// The package's metadata.
-        metadata: NpmRegistryMetadata,
+        /// The package's metadata document, as the registry sent it.
+        body: String,
         /// The registry's `ETag` for this document.
         etag: Option<String>,
     },
@@ -256,7 +256,7 @@ impl FsRegistryMetadataCache {
                 });
             }
         };
-        parse_registry_metadata(package, &text).map(Some)
+        parse_off_runtime(package, text).await.map(Some)
     }
 
     /// Write metadata into the cache using stable JSON formatting.
@@ -321,9 +321,8 @@ impl FsRegistryMetadataCache {
                 }
                 // The cached document went missing in between: ask again.
                 match client.fetch_metadata(package, None).await? {
-                    MetadataFetch::Fresh { metadata, etag } => {
-                        self.store(&metadata, etag.as_deref()).await?;
-                        Ok(metadata)
+                    MetadataFetch::Fresh { body, etag } => {
+                        self.store(package, body, etag.as_deref()).await
                     }
                     MetadataFetch::NotModified => Err(PackageManagerError::RegistryMetadata {
                         package: package.to_string(),
@@ -331,9 +330,8 @@ impl FsRegistryMetadataCache {
                     }),
                 }
             }
-            Ok(MetadataFetch::Fresh { metadata, etag }) => {
-                self.store(&metadata, etag.as_deref()).await?;
-                Ok(metadata)
+            Ok(MetadataFetch::Fresh { body, etag }) => {
+                self.store(package, body, etag.as_deref()).await
             }
             Err(error) => match self.read(package).await? {
                 Some(metadata) => Ok(metadata),
@@ -342,13 +340,28 @@ impl FsRegistryMetadataCache {
         }
     }
 
+    /// Keep the registry's document as it was sent, with its entity tag,
+    /// and parse it.
     async fn store(
         &self,
-        metadata: &NpmRegistryMetadata,
+        package: &str,
+        body: String,
         etag: Option<&str>,
-    ) -> Result<(), PackageManagerError> {
-        self.write(metadata).await?;
-        let path = self.etag_path(&metadata.name);
+    ) -> Result<NpmRegistryMetadata, PackageManagerError> {
+        tokio::fs::create_dir_all(&self.root)
+            .await
+            .map_err(|err| PackageManagerError::Io {
+                path: self.root.clone(),
+                message: err.to_string(),
+            })?;
+        let document = self.metadata_path(package);
+        tokio::fs::write(&document, &body)
+            .await
+            .map_err(|err| PackageManagerError::Io {
+                path: document,
+                message: err.to_string(),
+            })?;
+        let path = self.etag_path(package);
         let written = match etag {
             Some(etag) => tokio::fs::write(&path, etag).await,
             None => match tokio::fs::remove_file(&path).await {
@@ -359,7 +372,8 @@ impl FsRegistryMetadataCache {
         written.map_err(|err| PackageManagerError::Io {
             path,
             message: err.to_string(),
-        })
+        })?;
+        parse_off_runtime(package, body).await
     }
 }
 
@@ -397,7 +411,7 @@ impl RegistryMetadataClient for FileRegistryMetadataClient {
                         message: err.to_string(),
                     })?;
             Ok(MetadataFetch::Fresh {
-                metadata: parse_registry_metadata(package, &text)?,
+                body: text,
                 etag: None,
             })
         })
@@ -486,10 +500,7 @@ impl RegistryMetadataClient for HttpRegistryMetadataClient {
                     url: url.clone(),
                     message: err.to_string(),
                 })?;
-            Ok(MetadataFetch::Fresh {
-                metadata: parse_registry_metadata(package, &text)?,
-                etag,
-            })
+            Ok(MetadataFetch::Fresh { body: text, etag })
         })
     }
 }
@@ -504,6 +515,21 @@ async fn touch(path: &std::path::Path) {
             .and_then(|file| file.set_modified(std::time::SystemTime::now()))
     })
     .await;
+}
+
+/// Parse a document on the blocking pool: a large one takes long enough to
+/// stall every request the resolving task is driving.
+async fn parse_off_runtime(
+    package: &str,
+    text: String,
+) -> Result<NpmRegistryMetadata, PackageManagerError> {
+    let name = package.to_string();
+    tokio::task::spawn_blocking(move || parse_registry_metadata(&name, &text))
+        .await
+        .map_err(|err| PackageManagerError::RegistryMetadata {
+            package: package.to_string(),
+            message: err.to_string(),
+        })?
 }
 
 fn parse_registry_metadata(

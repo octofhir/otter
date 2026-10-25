@@ -2,14 +2,18 @@
 //! names on the registry, resolved to one exact package version.
 //!
 //! Resolution walks the graph breadth-first in a fixed order, so the same
-//! manifests always give the same graph. The manifests one wave of edges
-//! needs are fetched together, up to [`MANIFEST_CONCURRENCY`] requests at
-//! once, before any edge of the wave resolves; what an edge resolves to never
-//! depends on which response arrived first.
+//! manifests always give the same graph. Manifests are requested as soon as
+//! an edge naming them is queued, up to [`MANIFEST_CONCURRENCY`] at once, and
+//! the dependencies of the version a manifest most likely resolves to are
+//! requested the moment it arrives; the queue's head waits only for its own
+//! manifest. What an edge resolves to never depends on which response
+//! arrived first.
 //!
 //! # Contents
 //! - [`enrich_resolution_with_registry_metadata`] — resolve the graph's open
 //!   registry edges and every edge the packages they reach declare.
+//! - [`Prefetch`] / [`Announced`] — the channel resolved packages are
+//!   announced on.
 //! - Version choice: a version already in the graph that the range admits,
 //!   else the manifest's `latest` when the range admits it, else the newest
 //!   admitted release, each through the release-age gate.
@@ -42,7 +46,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use otter_pm_lockfile::{
     LifecycleMetadata, LockedPackage, Lockfile, ResolvedSource, ResolvedSourceKind, TrustState,
 };
@@ -58,6 +62,22 @@ use crate::{
 
 /// The most registry manifest requests one resolution keeps in flight.
 pub(crate) const MANIFEST_CONCURRENCY: usize = 64;
+
+/// The packages a resolution reaches, announced as they resolve so their
+/// tarballs fetch and their advisories are looked up while it goes on.
+pub type Prefetch = tokio::sync::mpsc::UnboundedSender<Announced>;
+
+/// One package the moment it resolves.
+#[derive(Debug, Clone)]
+pub struct Announced {
+    /// Its id in the lockfile.
+    pub id: String,
+    /// Its tarball.
+    pub source: crate::TarballSource,
+    /// The registry version to ask the advisory database about; `None` for
+    /// a package that is not a registry release.
+    pub query: Option<crate::AdvisoryQuery>,
+}
 
 /// One dependency edge still to resolve.
 #[derive(Debug, Clone)]
@@ -156,10 +176,12 @@ pub async fn enrich_resolution_with_registry_metadata(
     client: &impl RegistryMetadataClient,
     policy: &InstallPolicy,
     pinned: Option<&Lockfile>,
+    prefetch: Option<&Prefetch>,
     warnings: &mut Vec<InstallWarning>,
 ) -> Result<(), PackageManagerError> {
     let mut resolver = Resolver {
         pinned,
+        prefetch,
         project_root: infer_project_root(&resolution.graph),
         gate: ReleaseAgeGate::new(policy, SystemTime::now()),
         manifests: HashMap::new(),
@@ -169,27 +191,56 @@ pub async fn enrich_resolution_with_registry_metadata(
     resolver.index(resolution);
     let mut queue = resolver.open_edges(resolution);
     let mut peers = Vec::new();
+    let mut fetches = Fetches::default();
+    let mut pending = FuturesUnordered::new();
+    for edge in &queue {
+        fetches.want(&resolver, edge);
+    }
     loop {
+        while pending.len() < MANIFEST_CONCURRENCY
+            && let Some(name) = fetches.backlog.pop_front()
+        {
+            pending.push(fetch_manifest(cache, client, name));
+        }
+        // Resolve from the head of the queue while its manifests are in hand.
+        while let Some(edge) = queue.front() {
+            if edge.kind == PackageDependencyKind::Peer && !edge.peer_pass {
+                peers.extend(queue.pop_front());
+                continue;
+            }
+            if let Some(name) = resolver.missing_manifest(edge) {
+                fetches.hurry(name);
+                break;
+            }
+            let edge = queue.pop_front().expect("the head edge");
+            let known = queue.len();
+            resolver.resolve(resolution, edge, &mut queue, &mut peers, warnings)?;
+            for edge in queue.range(known..) {
+                fetches.want(&resolver, edge);
+            }
+        }
         if queue.is_empty() {
             if peers.is_empty() {
                 break;
             }
             for edge in std::mem::take(&mut peers) {
                 if let Some(edge) = resolver.satisfy_peer(resolution, edge, warnings) {
+                    fetches.want(&resolver, &edge);
                     queue.push_back(edge);
                 }
             }
             continue;
         }
-        let wave: Vec<Edge> = queue.drain(..).collect();
-        resolver.fetch_manifests(&wave, cache, client).await;
-        for edge in wave {
-            if edge.kind == PackageDependencyKind::Peer && !edge.peer_pass {
-                peers.push(edge);
-                continue;
-            }
-            resolver.resolve(resolution, edge, &mut queue, &mut peers, warnings)?;
+        if !fetches.backlog.is_empty() && pending.len() < MANIFEST_CONCURRENCY {
+            continue;
         }
+        let Some((name, manifest)) = pending.next().await else {
+            continue;
+        };
+        if let Ok(metadata) = &manifest {
+            fetches.speculate(&resolver, metadata);
+        }
+        resolver.manifests.insert(name, manifest);
     }
     resolver.remove_unreached_placeholders(resolution);
     Ok(())
@@ -198,6 +249,8 @@ pub async fn enrich_resolution_with_registry_metadata(
 struct Resolver<'l> {
     /// The lockfile of the previous install, whose resolutions stand.
     pinned: Option<&'l Lockfile>,
+    /// Where each package's tarball is announced the moment it resolves.
+    prefetch: Option<&'l Prefetch>,
     project_root: PathBuf,
     gate: ReleaseAgeGate,
     /// Fetched manifests by package name, failures included.
@@ -266,31 +319,28 @@ impl Resolver<'_> {
         edges
     }
 
-    /// Fetch, all at once, the manifests `wave` needs that are not in hand.
-    async fn fetch_manifests(
-        &mut self,
-        wave: &[Edge],
-        cache: &FsRegistryMetadataCache,
-        client: &impl RegistryMetadataClient,
-    ) {
-        let names: BTreeSet<String> = wave
-            .iter()
-            .filter(|edge| self.pinned_target(edge).is_none())
-            .filter_map(|edge| match classify(&edge.name, &edge.spec) {
-                Spec::Registry { package, .. } => Some(package.to_string()),
-                Spec::Tarball | Spec::Unsupported => None,
-            })
-            .filter(|name| !self.manifests.contains_key(name))
-            .collect();
-        let fetched: Vec<_> = stream::iter(names)
-            .map(|name| async move {
-                let metadata = cache.get_or_fetch(&name, client).await;
-                (name, metadata)
-            })
-            .buffer_unordered(MANIFEST_CONCURRENCY)
-            .collect()
-            .await;
-        self.manifests.extend(fetched);
+    /// The manifest `edge` waits on: `None` when it resolves without one
+    /// (pinned, held, a tarball) or the manifest is in hand.
+    fn missing_manifest(&self, edge: &Edge) -> Option<String> {
+        let name = self.manifest_for(edge)?;
+        (!self.manifests.contains_key(&name)).then_some(name)
+    }
+
+    /// The registry package whose manifest resolving `edge` reads.
+    fn manifest_for(&self, edge: &Edge) -> Option<String> {
+        let Spec::Registry { package, range } = classify(&edge.name, &edge.spec) else {
+            return None;
+        };
+        if self.pinned_target(edge).is_some() {
+            return None;
+        }
+        let held = package == edge.name
+            && NpmRange::parse(range).is_some_and(|range| {
+                self.versions
+                    .get(package)
+                    .is_some_and(|held| held.keys().any(|version| range.matches(version)))
+            });
+        (!held).then(|| package.to_string())
     }
 
     /// Satisfy `edge` from the versions the graph holds; the edge to resolve
@@ -446,6 +496,7 @@ impl Resolver<'_> {
         };
         if !resolution.graph.packages.contains_key(&id) {
             add_registry_package(resolution, &self.project_root, &id, &edge.name, &version);
+            self.announce(resolution, &id);
             if !aliased && let Ok(parsed) = semver::Version::parse(&version.version) {
                 self.versions
                     .entry(package.clone())
@@ -513,6 +564,7 @@ impl Resolver<'_> {
                 .lockfile
                 .packages
                 .insert(id.to_string(), locked.clone());
+            self.announce(resolution, &id);
             for (name, dependency) in &locked.dependencies {
                 resolution.graph.insert_dependency_with_kind(
                     id.clone(),
@@ -529,6 +581,36 @@ impl Resolver<'_> {
                     .or_default()
                     .insert(version, id);
             }
+        }
+    }
+
+    /// Hand package `id`'s tarball to the prefetching store, when one listens.
+    fn announce(&self, resolution: &LocalResolution, id: &PackageId) {
+        let Some(prefetch) = self.prefetch else {
+            return;
+        };
+        let Some(package) = resolution.lockfile.packages.get(id.as_str()) else {
+            return;
+        };
+        if let Some(source) = &package.resolved
+            && is_tarball_reference(&source.reference)
+        {
+            // A closed channel means nobody prefetches; materialization
+            // fetches what it needs, and the install asks what it must,
+            // either way.
+            let _ = prefetch.send(Announced {
+                id: id.to_string(),
+                source: crate::TarballSource {
+                    url: source.reference.clone(),
+                    integrity: package.integrity.clone(),
+                },
+                query: (source.kind == ResolvedSourceKind::Registry).then(|| {
+                    crate::AdvisoryQuery {
+                        name: package.name.clone(),
+                        version: package.version.clone(),
+                    }
+                }),
+            });
         }
     }
 
@@ -552,6 +634,83 @@ impl Resolver<'_> {
             resolution.lockfile.packages.remove(id.as_str());
         }
     }
+}
+
+/// Manifest requests: which names were asked for, and which wait for a free
+/// request slot.
+#[derive(Default)]
+struct Fetches {
+    requested: BTreeSet<String>,
+    backlog: VecDeque<String>,
+    /// The first range each requested name was wanted under, which picks the
+    /// version whose dependencies are fetched ahead of resolution.
+    ranges: HashMap<String, String>,
+}
+
+impl Fetches {
+    /// Ask for the manifest `edge` will read, if it reads one.
+    fn want(&mut self, resolver: &Resolver<'_>, edge: &Edge) {
+        if let Some(name) = resolver.manifest_for(edge) {
+            if let Spec::Registry { range, .. } = classify(&edge.name, &edge.spec) {
+                self.ranges
+                    .entry(name.clone())
+                    .or_insert_with(|| range.to_string());
+            }
+            self.request(name);
+        }
+    }
+
+    fn request(&mut self, name: String) {
+        if self.requested.insert(name.clone()) {
+            self.backlog.push_back(name);
+        }
+    }
+
+    /// The queue's head waits on `name`: it goes before every name fetched
+    /// ahead of need.
+    fn hurry(&mut self, name: String) {
+        if self.requested.insert(name.clone()) {
+            self.backlog.push_front(name);
+        } else if let Some(at) = self.backlog.iter().position(|queued| *queued == name) {
+            let name = self.backlog.remove(at).expect("a queued name");
+            self.backlog.push_front(name);
+        }
+    }
+
+    /// Fetch ahead the dependencies of the version `metadata` most likely
+    /// resolves to. The guess only orders requests; resolution reads every
+    /// manifest it uses itself.
+    fn speculate(&mut self, resolver: &Resolver<'_>, metadata: &NpmRegistryMetadata) {
+        let Some(range) = self.ranges.get(&metadata.name) else {
+            return;
+        };
+        let Ok(version) = select_registry_version(metadata, range, &resolver.gate, &mut Vec::new())
+        else {
+            return;
+        };
+        for (name, spec) in version
+            .dependencies
+            .iter()
+            .chain(&version.optional_dependencies)
+        {
+            if let Spec::Registry { package, range } = classify(name, spec) {
+                self.ranges
+                    .entry(package.to_string())
+                    .or_insert_with(|| range.to_string());
+                self.request(package.to_string());
+            }
+        }
+    }
+}
+
+/// Read `name`'s manifest through the cache.
+async fn fetch_manifest(
+    cache: &FsRegistryMetadataCache,
+    client: &impl RegistryMetadataClient,
+    name: String,
+) -> (String, Result<NpmRegistryMetadata, PackageManagerError>) {
+    let manifest = cache.get_or_fetch(&name, client).await;
+    (name, manifest)
 }
 
 /// Every package `root` reaches in `pinned`, `root` first; `None` when one of

@@ -56,7 +56,7 @@ use otter_runtime::{
     JitSelection, OtterError, Permission, SourceInput,
 };
 use otter_web::WebApiBuilderExt;
-use semver::{Version, VersionReq};
+use semver::Version;
 
 mod dlx;
 mod error_render;
@@ -3316,8 +3316,7 @@ fn wanted_registry_version(
     if let Some(version) = metadata.versions.get(range) {
         return Some(version.version.clone());
     }
-    let req = normalize_npm_range_for_cli(range)
-        .and_then(|normalized| VersionReq::parse(&normalized).ok())?;
+    let req = otter_pm::NpmRange::parse(range)?;
     let mut versions = semver_versions(metadata);
     versions.retain(|version| req.matches(version));
     versions.pop().map(|version| version.to_string())
@@ -3344,21 +3343,6 @@ fn semver_versions(metadata: &otter_pm::NpmRegistryMetadata) -> Vec<Version> {
         .collect::<Vec<_>>();
     versions.sort();
     versions
-}
-
-fn normalize_npm_range_for_cli(range: &str) -> Option<String> {
-    let trimmed = range.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed {
-        "*" | "latest" => Some("*".to_string()),
-        value if value.starts_with('^') || value.starts_with('~') => Some(value.to_string()),
-        value if value.chars().next().is_some_and(|c| c.is_ascii_digit()) => {
-            Some(format!("={value}"))
-        }
-        value => Some(value.to_string()),
-    }
 }
 
 fn classify_bump(current: &str, latest: &str) -> VersionBump {

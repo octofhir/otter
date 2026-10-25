@@ -33,6 +33,7 @@ mod freshness;
 mod install;
 mod installed_graph;
 mod lifecycle;
+mod npm_range;
 mod policy;
 mod registry;
 mod release_age;
@@ -65,6 +66,7 @@ pub use freshness::{
     DependencyState, StaleDependency, StaleReason, inspect_installed_dependencies,
 };
 pub use install::{ExtractedPackage, FsPackageStore, InstalledPackage};
+pub use npm_range::NpmRange;
 pub use installed_graph::{prune_removed_registry_packages, resolve_installed_project};
 pub use lifecycle::{LifecycleOutcome, LifecycleRun, PendingBuild, pending_builds};
 pub use policy::{BuildDecision, InstallPolicy};
@@ -1238,9 +1240,7 @@ fn select_semver_version(
     gate: &ReleaseAgeGate,
     warnings: &mut Vec<InstallWarning>,
 ) -> Result<Option<NpmPackageVersion>, PackageManagerError> {
-    let Some(req) = normalize_npm_range(range)
-        .and_then(|normalized| semver::VersionReq::parse(&normalized).ok())
-    else {
+    let Some(req) = NpmRange::parse(range) else {
         return Ok(None);
     };
     let mut versions = metadata
@@ -1290,21 +1290,6 @@ fn select_semver_version(
         age_hours,
         minimum_hours: gate.window_hours(),
     })
-}
-
-fn normalize_npm_range(range: &str) -> Option<String> {
-    let trimmed = range.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    match trimmed {
-        "*" | "latest" => Some("*".to_string()),
-        value if value.starts_with('^') || value.starts_with('~') => Some(value.to_string()),
-        value if value.chars().next().is_some_and(|c| c.is_ascii_digit()) => {
-            Some(format!("={value}"))
-        }
-        value => Some(value.to_string()),
-    }
 }
 
 fn next_unresolved_registry_package(

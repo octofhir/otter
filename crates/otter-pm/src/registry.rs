@@ -73,7 +73,7 @@ pub struct NpmPackageVersion {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bin: Option<PackageBinManifest>,
     /// Lifecycle scripts.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "otter_pm_manifest::string_entries")]
     pub scripts: BTreeMap<String, String>,
     /// Distribution metadata.
     #[serde(default)]

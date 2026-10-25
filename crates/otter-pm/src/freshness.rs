@@ -160,7 +160,7 @@ fn version_satisfies(version: &str, range: &str) -> Satisfaction {
     let Ok(version) = semver::Version::parse(version) else {
         return Satisfaction::Unknown;
     };
-    let Some(req) = normalized_range(range) else {
+    let Some(req) = crate::NpmRange::parse(range) else {
         return Satisfaction::Unknown;
     };
     if req.matches(&version) {
@@ -168,17 +168,6 @@ fn version_satisfies(version: &str, range: &str) -> Satisfaction {
     } else {
         Satisfaction::No
     }
-}
-
-fn normalized_range(range: &str) -> Option<semver::VersionReq> {
-    let trimmed = range.trim();
-    let normalized = match trimmed {
-        "*" | "x" | "latest" => "*".to_string(),
-        value if value.starts_with('^') || value.starts_with('~') => value.to_string(),
-        value if value.chars().next().is_some_and(|c| c.is_ascii_digit()) => format!("={value}"),
-        value => value.to_string(),
-    };
-    semver::VersionReq::parse(&normalized).ok()
 }
 
 /// `true` when a specifier is a plain semver range rather than a protocol,

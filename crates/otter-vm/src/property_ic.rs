@@ -1202,6 +1202,21 @@ impl PropertyIcSlot {
                 continue;
             }
             let receiver = entry.shape_handle();
+            // A direct store never commits into a prototype, nor appends to
+            // an object that cannot grow: both are immutable facts of the
+            // receiver's shape, so a program for such a shape could never
+            // pass. Exporting none lets an exact shape guard alone prove a
+            // store's receiver eligible.
+            let state = object::shape_body::state_of(receiver);
+            match entry.kind() {
+                IcHandlerKind::StoreField if state.is_prototype() => continue,
+                IcHandlerKind::StoreTransition
+                    if state.is_prototype() || !state.is_extensible() =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
             let Some(shape) = bake_shape(receiver) else {
                 continue;
             };

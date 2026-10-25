@@ -3129,13 +3129,28 @@ impl<'a> Codegen<'a> {
         // Each successful ordinary program proves its exact finalized shape
         // before its field/effect, unless the receiver is already proved to
         // have it. Prototype-role writes require the canonical invalidation
-        // owner and cannot commit this direct store.
+        // owner and cannot commit this direct store. The baker exports no
+        // store program for a prototype-role shape, nor an append for one
+        // that cannot grow, so when every program guards the receiver's
+        // exact shape, that guard alone proves both, and the map word it
+        // compares rules out every other cell kind.
+        let shape_guarded = super::feedback::store_programs_guard_receiver(
+            programs
+                .iter()
+                .enumerate()
+                .filter(|&(index, _)| selected.is_none_or(|selected| selected == index))
+                .map(|(_, program)| program),
+        );
         if receiver_shape.is_none() {
-            self.emit_object_receiver(receiver, exit);
+            if shape_guarded {
+                self.emit_cell_receiver(receiver, exit);
+            } else {
+                self.emit_object_receiver(receiver, exit);
+            }
         }
         // A fresh receiver ran no code since its allocation, so it has no
         // prototype role.
-        if !fresh {
+        if !fresh && !shape_guarded {
             self.emit_shape_state(receiver);
             dynasm!(self.ops ; .arch aarch64
                 ; tst w16, u32::from(ShapeState::PROTOTYPE_MASK)
@@ -3246,8 +3261,9 @@ impl<'a> Codegen<'a> {
                             dynasm!(self.ops ; .arch aarch64 ; cmp w17, w16 ; b.hs =>next);
                         }
                         // A fresh receiver ran no code since its allocation,
-                        // so it is still extensible.
-                        if !fresh {
+                        // so it is still extensible; an exact guarded shape
+                        // was exported extensible.
+                        if !fresh && !shape_guarded {
                             self.emit_shape_state(receiver);
                             dynasm!(self.ops ; .arch aarch64
                                 ; tst w16, u32::from(ShapeState::EXTENSIBLE_MASK)

@@ -20,6 +20,8 @@
 //!   receiver shape: shape guard, chain proof (null link or validity cell),
 //!   extensibility and geometry guards, then the store and the published
 //!   child. Every shape and validity cell it names enters the compile roots.
+//!   As for exported programs, a prototype-role shape, or a shape that
+//!   cannot grow for an append, gets none.
 //! - Programs are keyed by `(byte PC, shape)` beside the site's own: a tier
 //!   uses one only for a receiver proved to have that shape.
 //! - Nothing here allocates on the GC heap or changes any shape or table.
@@ -134,6 +136,14 @@ impl Interpreter {
         key: AtomizedPropertyKey<'_>,
     ) -> Option<(u32, JitCacheIrProgram)> {
         let store = shape_store(&self.gc_heap, shape, key)?;
+        // As an exported program: never into a prototype, never an append to
+        // an object that cannot grow.
+        let state = crate::object::shape_body::state_of(shape);
+        if state.is_prototype()
+            || (matches!(store, ShapeStore::Append { .. }) && !state.is_extensible())
+        {
+            return None;
+        }
         let token = self.bake_shape(shape)?;
         let atom = key.atom().id().raw();
         let ops = match store {

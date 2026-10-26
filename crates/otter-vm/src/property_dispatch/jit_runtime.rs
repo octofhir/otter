@@ -767,6 +767,25 @@ impl Interpreter {
                 }
             }
         }
+        // An Array's own writable named data property lives in its bag; the
+        // shared table records the bag's slot, which keyed code then writes.
+        if let Some((bag, atom, name, symbol)) = self.array_bag_name_key(receiver, key_value) {
+            let key = match symbol {
+                Some(symbol) => crate::property_atom::AtomizedPropertyKey::symbol(atom, symbol),
+                None => crate::property_atom::AtomizedPropertyKey::new(
+                    crate::property_atom::PropertyAtom::new(atom),
+                    name.as_deref().unwrap_or_default(),
+                ),
+            };
+            if let crate::property_cache::PropertyLoad::Data(resolved) =
+                self.resolve_property_load(bag, key)
+                && resolved.hops == 0
+                && resolved.is_writable
+            {
+                object::store_proven_data_slot(bag, &mut self.gc_heap, resolved.hit.slot, value);
+                return Ok(());
+            }
+        }
         let mut property_key = Value::undefined();
         let strict = force_strict || context.function_is_strict(function_id);
 

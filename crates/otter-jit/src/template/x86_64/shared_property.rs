@@ -283,6 +283,7 @@ fn emit_keyed_load(
     let loaded = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     let generic = ops.new_dynamic_label();
+    let object = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>label);
     // Entered by `call`: `rsp` is eight bytes past alignment.
     emit_key_atom(
@@ -295,6 +296,8 @@ fn emit_keyed_load(
         generic,
         miss,
     );
+    // An Array's own named data lives in its bag.
+    emit_array_bag(ops, view, KEYED_LOAD_RECEIVER, object, miss);
     emit_action_probe(
         ops,
         relocations,
@@ -306,6 +309,24 @@ fn emit_keyed_load(
         None,
         [1, 7, 8, 0],
         Some(0),
+        true,
+        miss,
+        loaded,
+        loaded,
+    );
+    dynasm!(ops ; .arch x64 ; =>object);
+    emit_action_probe(
+        ops,
+        relocations,
+        view,
+        view.property_action_cache,
+        9,
+        PropertySourceAccess::Load,
+        KEYED_LOAD_RECEIVER,
+        None,
+        [1, 7, 8, 0],
+        Some(0),
+        false,
         generic,
         loaded,
         loaded,
@@ -338,6 +359,33 @@ fn emit_keyed_load(
         ; ret);
 }
 
+/// Replace an Array receiver in `Rq(receiver)` with its named bag, the
+/// storage its own named properties live in; jump to `object` for any other
+/// receiver (the register untouched) and to `miss` for an Array without a
+/// bag. Clobbers `r10`, `r11`.
+fn emit_array_bag(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    object: DynamicLabel,
+    miss: DynamicLabel,
+) {
+    emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64
+        ; test Rq(receiver), r11 ; jnz =>object
+        ; test Rq(receiver), Rq(receiver) ; jz =>object
+        ; cmp BYTE [Rq(receiver)], view.array_layout.type_tag as i8 ; jne =>object
+        ; mov r11d, [Rq(receiver) + view.array_layout.expando_byte as i32]
+        ; test r11d, r11d ; jz =>miss
+    );
+    emit_load_u64(ops, 10, 0xffff_ffff_0000_0000);
+    dynasm!(ops ; .arch x64
+        ; and r10, Rq(receiver)
+        ; add r11, r10
+        ; mov Rq(receiver), r11
+    );
+}
+
 /// `rdx == 0` once the value is stored with its barriers, else `rdx == 1`
 /// and nothing written.
 fn emit_keyed_store(
@@ -350,8 +398,28 @@ fn emit_keyed_store(
     let stored = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     // Realign for the barrier calls.
+    let object = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>label ; sub rsp, 8);
     emit_key_atom(ops, relocations, view, KEYED_STORE_KEY, 9, true, miss, miss);
+    // An Array's own named data lives in its bag, written in place.
+    emit_array_bag(ops, view, KEYED_STORE_RECEIVER, object, miss);
+    emit_action_probe(
+        ops,
+        relocations,
+        view,
+        view.property_action_cache,
+        9,
+        PropertySourceAccess::Store,
+        KEYED_STORE_RECEIVER,
+        Some(KEYED_STORE_VALUE),
+        [0, 7, 8, 1],
+        None,
+        true,
+        miss,
+        stored,
+        appended,
+    );
+    dynasm!(ops ; .arch x64 ; =>object);
     // The probe's identity temporary (`rdi`) carries an appended child.
     emit_action_probe(
         ops,
@@ -364,6 +432,7 @@ fn emit_keyed_store(
         Some(KEYED_STORE_VALUE),
         [0, 7, 8, 1],
         None,
+        false,
         miss,
         stored,
         appended,
@@ -457,6 +526,7 @@ fn emit_load_handlers(
         None,
         [1, 7, 8, 0],
         Some(0),
+        false,
         miss,
         loaded,
         loaded,
@@ -587,6 +657,7 @@ fn emit_store(
         Some(STORE_VALUE),
         [0, 7, 8, 1],
         None,
+        false,
         miss,
         stored,
         appended,

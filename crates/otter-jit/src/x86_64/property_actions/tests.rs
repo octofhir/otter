@@ -340,6 +340,7 @@ impl Fixture {
             (!load).then_some(6),
             [1, 2, 8, 9],
             load.then_some(0),
+            false,
             miss,
             done,
             appended,

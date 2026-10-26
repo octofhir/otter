@@ -286,6 +286,30 @@ fn emit_key_atom(
     );
 }
 
+/// Replace an Array receiver in `X(receiver)` with its named bag, the
+/// storage its own named properties live in; branch to `object` for any
+/// other receiver (the register untouched) and to `miss` for an Array
+/// without a bag. Clobbers `x16`, `x17`.
+fn emit_array_bag(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    object: DynamicLabel,
+    miss: DynamicLabel,
+) {
+    emit_cell_test(ops, receiver, CellTest::IsNotCell, object);
+    dynasm!(ops ; .arch aarch64
+        ; cbz X(receiver), =>object
+        ; ldrb w16, [X(receiver)]
+        ; cmp w16, u32::from(view.array_layout.type_tag)
+        ; b.ne =>object
+        ; ldr w16, [X(receiver), view.array_layout.expando_byte]
+        ; cbz w16, =>miss
+        ; and x17, X(receiver), #0xffff_ffff_0000_0000
+        ; add X(receiver), x17, x16
+    );
+}
+
 /// `x1 == 0` with the value in `x0`, else `x1 != 0` and nothing observed.
 /// Nothing allocates; the only calls are the interning leaf and, for a
 /// dictionary-mode receiver the table does not hold or a key the interner
@@ -298,8 +322,10 @@ fn emit_keyed_load(
 ) {
     let miss = ops.new_dynamic_label();
     let generic = ops.new_dynamic_label();
+    let object = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label);
     emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 11, generic, miss);
+    emit_array_bag(ops, view, KEYED_LOAD_RECEIVER, object, miss);
     property_actions::emit_load(
         ops,
         relocations,
@@ -308,6 +334,19 @@ fn emit_keyed_load(
         KEYED_LOAD_RECEIVER,
         [13, 14, 15, 3],
         0,
+        true,
+        miss,
+    );
+    dynasm!(ops ; .arch aarch64 ; mov x1, xzr ; ret ; =>object);
+    property_actions::emit_load(
+        ops,
+        relocations,
+        view,
+        11,
+        KEYED_LOAD_RECEIVER,
+        [13, 14, 15, 3],
+        0,
+        false,
         generic,
     );
     dynasm!(ops ; .arch aarch64
@@ -349,8 +388,26 @@ fn emit_keyed_store(
 ) {
     let stored = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
+    let object = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]!);
     emit_key_atom(ops, relocations, view, KEYED_STORE_KEY, 3, miss, miss);
+    // An Array's own named data lives in its bag, written in place.
+    emit_array_bag(ops, view, KEYED_STORE_RECEIVER, object, miss);
+    property_actions::emit_store(
+        ops,
+        relocations,
+        view,
+        3,
+        [STORE_RECEIVER, STORE_VALUE],
+        [15, 11, 13, 14],
+        true,
+        miss,
+    );
+    // The overwrite left zero in w11; the bag takes the barriers.
+    dynasm!(ops ; .arch aarch64
+        ; mov X(STORE_SLOT), X(STORE_RECEIVER)
+        ; b =>stored
+        ; =>object);
     emit_table_store(ops, relocations, view, stored, miss);
     dynasm!(ops ; .arch aarch64
         ; =>miss
@@ -378,6 +435,7 @@ fn emit_table_store(
         3,
         [STORE_RECEIVER, STORE_VALUE],
         [15, 11, 13, 14],
+        false,
         miss,
     );
     // Both paths leave the compressed child (zero for an overwrite) in w11.
@@ -476,6 +534,7 @@ fn emit_load_handlers(
         LOAD_RECEIVER,
         [13, 14, 15, 3],
         0,
+        false,
         miss,
     );
     dynasm!(ops ; .arch aarch64 ; b =>loaded);

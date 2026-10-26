@@ -324,6 +324,29 @@ impl Interpreter {
         Some((atom, None, Some(symbol.handle())))
     }
 
+    /// The named bag an Array keeps its own properties in, with the atom of
+    /// a keyed access's name key, when the key is one the bag can own: a
+    /// symbol, or an interned string that is neither an index nor `length`.
+    pub(crate) fn array_bag_name_key(
+        &mut self,
+        receiver: Value,
+        key: Value,
+    ) -> Option<(
+        object::JsObject,
+        crate::property_atom::AtomId,
+        Option<std::sync::Arc<str>>,
+        Option<crate::symbol::SymbolHandle>,
+    )> {
+        let bag = crate::array::expando_object(receiver.as_array()?, &self.gc_heap)?;
+        let (atom, name, symbol) = self.keyed_property_atom(key)?;
+        if let Some(name) = name.as_deref()
+            && (name == "length" || object::array_index_property_name(name).is_some())
+        {
+            return None;
+        }
+        Some((bag, atom, name, symbol))
+    }
+
     /// A runtime spelling as an atomized key: shape walks compare its interned
     /// id instead of string contents at every link. A spelling nothing has
     /// interned carries [`crate::property_atom::AtomId::NONE`], which no shape

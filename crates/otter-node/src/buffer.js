@@ -8,7 +8,12 @@
 const kMaxLength = 0x7fffffff;
 let inspectMaxBytes = 50;
 
-let Buffer = (typeof globalThis !== 'undefined' && globalThis.Buffer) || null;
+// The global's accessor loads this module; only an already-defined class is
+// reused, without running it.
+let Buffer = (() => {
+  const global = Object.getOwnPropertyDescriptor(globalThis, 'Buffer');
+  return global && 'value' in global ? global.value : null;
+})();
 
 if (!Buffer) {
   // ---- encoding helpers ----
@@ -177,106 +182,16 @@ if (!Buffer) {
     }
   }
 
-  function utf8ToBytes(str) {
-    const out = [];
-    for (let i = 0; i < str.length; i++) {
-      let code = str.charCodeAt(i);
-      if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
-        const next = str.charCodeAt(i + 1);
-        if (next >= 0xdc00 && next <= 0xdfff) {
-          code = 0x10000 + ((code - 0xd800) << 10) + (next - 0xdc00);
-          i++;
-        } else {
-          code = 0xfffd;
-        }
-      } else if (code >= 0xd800 && code <= 0xdfff) {
-        code = 0xfffd;
-      }
-      if (code < 0x80) out.push(code);
-      else if (code < 0x800) out.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
-      else if (code < 0x10000) out.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
-      else out.push(0xf0 | (code >> 18), 0x80 | ((code >> 12) & 0x3f), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
-    }
-    return out;
-  }
-
-  function utf8WriteLength(bytes, max) {
-    let n = 0;
-    while (n < bytes.length && n < max) {
-      const b = bytes[n];
-      let size;
-      if (b < 0x80) size = 1;
-      else if ((b & 0xe0) === 0xc0) size = 2;
-      else if ((b & 0xf0) === 0xe0) size = 3;
-      else size = 4;
-      if (n + size > max) break;
-      n += size;
-    }
-    return n;
-  }
-
-  // WHATWG utf-8 decode: second-byte ranges are per-lead (overlongs,
-  // surrogates, and > U+10FFFF are impossible by construction), an invalid
-  // byte is never consumed by the failed sequence (maximal subpart resync),
-  // and each failure yields exactly one replacement.
-  // The host half of this module, loaded the first time text is asked for.
-  let bytesToText = null;
+  // The host half of this module, loaded the first time it is needed: text
+  // to bytes and back.
+  let hostCodec = null;
   function decoder() {
-    bytesToText ??= require('__bufdecode');
-    return bytesToText;
+    hostCodec ??= require('__bufcodec');
+    return hostCodec;
   }
 
 
   const hexChars = '0123456789abcdef';
-  function hexNibble(code) {
-    if (code >= 48 && code <= 57) return code - 48; // 0-9
-    if (code >= 97 && code <= 102) return code - 87; // a-f
-    if (code >= 65 && code <= 70) return code - 55; // A-F
-    return -1;
-  }
-  function hexToBytes(str) {
-    const clean = String(str);
-    const out = [];
-    for (let i = 0; i + 1 < clean.length; i += 2) {
-      const hi = hexNibble(clean.charCodeAt(i));
-      const lo = hexNibble(clean.charCodeAt(i + 1));
-      // Node's hex decoder stops at the first byte it cannot fully decode.
-      if (hi === -1 || lo === -1) break;
-      out.push((hi << 4) | lo);
-    }
-    return out;
-  }
-
-  function base64ToBytes(str, url) {
-    const input = String(str);
-    let s = '';
-    for (let i = 0; i < input.length; i++) {
-      const ch = input[i];
-      if (ch === '=') break;
-      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch === '+' || ch === '/') s += ch;
-      else if (ch === '-') s += '+';
-      else if (ch === '_') s += '/';
-    }
-    const bin = (typeof atob === 'function') ? atob(s) : '';
-    const out = new Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i) & 0xff;
-    return out;
-  }
-
-  function base64ByteLength(str) {
-    let len = 0;
-    for (let i = 0; i < str.length; i++) {
-      const ch = str[i];
-      if (ch === '=') break;
-      if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-          (ch >= '0' && ch <= '9') || ch === '+' || ch === '/' ||
-          ch === '-' || ch === '_') {
-        len++;
-      }
-    }
-    return Math.floor((len * 3) / 4);
-  }
-
   function bytesFromArrayBufferInput(input) {
     try {
       if (input instanceof ArrayBuffer) return new Uint8Array(input);
@@ -379,17 +294,7 @@ if (!Buffer) {
   }
 
   function bytesFromString(str, encoding) {
-    const e = enc.normalize(encoding) || 'utf8';
-    switch (e) {
-      case 'utf8': return utf8ToBytes(str);
-      case 'ascii': { const o = []; for (let i = 0; i < str.length; i++) o.push(str.charCodeAt(i) & 0xff); return o; }
-      case 'latin1': { const o = []; for (let i = 0; i < str.length; i++) o.push(str.charCodeAt(i) & 0xff); return o; }
-      case 'utf16le': { const o = []; for (let i = 0; i < str.length; i++) { const c = str.charCodeAt(i); o.push(c & 0xff, c >> 8); } return o; }
-      case 'hex': return hexToBytes(str);
-      case 'base64': return base64ToBytes(str, false);
-      case 'base64url': return base64ToBytes(str, true);
-      default: return utf8ToBytes(str);
-    }
+    return new Uint8Array(decoder().encode(String(str), enc.normalize(encoding) || 'utf8'));
   }
 
   const BufferImpl = class extends Uint8Array {
@@ -509,13 +414,8 @@ if (!Buffer) {
       offset = offset | 0;
       const e = enc.normalize(encoding);
       if (e === undefined) throw unknownEncoding(encoding);
-      const bytes = bytesFromString(string, e);
       const max = length === undefined ? this.length - offset : Math.min(length | 0, this.length - offset);
-      let n = Math.min(bytes.length, max);
-      if (e === 'utf8') n = utf8WriteLength(bytes, n);
-      else if (e === 'utf16le' && (n & 1)) n--;
-      for (let i = 0; i < n; i++) this[offset + i] = bytes[i];
-      return n;
+      return decoder().write(this, String(string), offset, Math.max(max, 0), e);
     }
 
     // Internal single-encoding writers. Unlike `write`, an out-of-bounds
@@ -684,11 +584,7 @@ if (!Buffer) {
     if (offset < 0 || offset > buf.length || length < 0 || length > remaining) {
       throw bufferOutOfBounds();
     }
-    const bytes = bytesFromString(string, encoding);
-    let n = Math.min(bytes.length, length);
-    if (encoding === 'utf8') n = utf8WriteLength(bytes, n);
-    for (let i = 0; i < n; i++) buf[offset + i] = bytes[i];
-    return n;
+    return decoder().write(buf, string, offset, length, encoding);
   }
 
   // ` Received ...` suffix matching Node's `invalidArgTypeHelper`.
@@ -1007,7 +903,7 @@ if (!Buffer) {
           e = enc.normalize(encodingOrOffset);
           if (e === undefined) throw unknownEncoding(encodingOrOffset);
         }
-        return new Buffer(bytesFromString(value, e));
+        return new Buffer(decoder().encode(value, e));
       }
       if (typeof value === 'object' && value !== null) {
         if (isArrayBufferLike(value) || isSharedArrayBufferLike(value)) {
@@ -1062,10 +958,7 @@ if (!Buffer) {
       if (typeof value !== 'string') {
         throw invalidArgType('string', 'string or an instance of Buffer or ArrayBuffer', value);
       }
-      const e = enc.normalize(encoding) || 'utf8';
-      if (e === 'base64' || e === 'base64url') return base64ByteLength(value);
-      if (e === 'hex') return value.length >>> 1;
-      return bytesFromString(value, e).length;
+      return decoder().byteLength(value, enc.normalize(encoding) || 'utf8');
     },
     concat(list, totalLength) {
       if (!Array.isArray(list)) throw argTypeError('list', 'an instance of Array', list);

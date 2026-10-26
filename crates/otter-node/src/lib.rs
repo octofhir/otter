@@ -33,7 +33,7 @@
 //! - [`otter_runtime::CommonJsAddonLoader`]
 
 pub mod async_hooks;
-mod buffer_decode;
+mod buffer_codec;
 pub mod child_process;
 pub mod crypto;
 pub mod dgram;
@@ -423,7 +423,7 @@ pub const HOSTED_MODULES: &[HostedModule] = &[
     HostedModule::cjs_only("node:child_process", nodelib::node_child_process),
     HostedModule::cjs_only("child_process", nodelib::node_child_process),
     HostedModule::cjs_only("__cpnative", child_process::child_process_native_cjs_value),
-    HostedModule::cjs_only("__bufdecode", buffer_decode::decode_native_cjs_value),
+    HostedModule::cjs_only("__bufcodec", buffer_codec::codec_native_cjs_value),
     HostedModule::cjs_only("internal/bootstrap/realm", nodelib::bootstrap_realm),
     HostedModule::cjs_only("internal/util", nodelib::internal_util),
     HostedModule::cjs_only("internal/util/types", nodelib::internal_util_types),

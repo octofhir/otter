@@ -1,5 +1,6 @@
 //! Node-specific globals: `global`, `process` additions, the lazy Node
-//! console, `process.openStdin`, Node timers and promise-rejection reporting.
+//! console, `process.openStdin`, Node timers, the lazy `Buffer` and
+//! promise-rejection reporting.
 //!
 //! # Contents
 //! - [`node_globals_installer`] runs the one build-produced realm-installer
@@ -21,8 +22,9 @@ use otter_runtime::{ExtensionJs, OtterError, RuntimeGlobalInstaller, RuntimeReal
 
 /// The Node realm installer, compiled at product build time from
 /// `node_process_globals.js`, `node_console_global.js`,
-/// `process_stdio_global.js`, `node_timers_global.js` and
-/// `node_promise_rejection_global.js`, concatenated as written.
+/// `process_stdio_global.js`, `node_timers_global.js`,
+/// `node_buffer_global.js` and `node_promise_rejection_global.js`,
+/// concatenated as written.
 const NODE_REALM_INSTALLER: ExtensionJs = ExtensionJs {
     source: include_str!(concat!(env!("OUT_DIR"), "/node-realm-installer.js")),
     bytecode: include_bytes!(concat!(env!("OUT_DIR"), "/node-realm-installer.bytecode")),

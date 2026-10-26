@@ -60,6 +60,8 @@ impl Codegen<'_> {
         dynasm!(self.ops ; .arch x64
             ; test Rq(receiver), r10 ; jnz =>other
             ; cmp BYTE [Rq(receiver)], storage.type_tag as i8 ; jne =>other
+            // A name key reads the array's named bag through the table.
+            ; test Rq(key), r10 ; jz =>other
             ; test BYTE [Rq(receiver) + storage.own_guard_byte as i32], (1 << storage.own_exotic_bit) as i8 ; jne =>runtime
         );
         crate::x86_64::index::emit_number_index(&mut self.ops, key, index, double, runtime);

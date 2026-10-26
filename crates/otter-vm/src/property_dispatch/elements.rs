@@ -164,6 +164,23 @@ impl Interpreter {
         {
             return Ok(value);
         }
+        // An Array's own named data property is its bag's slot, which the
+        // shared table records for keyed code.
+        if let Some((bag, atom, name, symbol)) = self.array_bag_name_key(recv, idx_value_raw) {
+            let key = match symbol {
+                Some(symbol) => crate::property_atom::AtomizedPropertyKey::symbol(atom, symbol),
+                None => crate::property_atom::AtomizedPropertyKey::new(
+                    crate::property_atom::PropertyAtom::new(atom),
+                    name.as_deref().unwrap_or_default(),
+                ),
+            };
+            if let crate::property_cache::PropertyLoad::Data(resolved) =
+                self.resolve_property_load(bag, key)
+                && resolved.hops == 0
+            {
+                return Ok(resolved.value);
+            }
+        }
         let mut idx_value = Value::undefined();
         let mut result = Value::undefined();
         let mut roots = otter_gc::RootScope::new(&mut self.gc_heap);

@@ -197,6 +197,8 @@ pub(super) fn bank_of_shape(
 
 /// Complete one own/inherited data load or branch before effects. The result
 /// may alias the receiver and is written only after every guard succeeds.
+/// `own_only` accepts an own data slot alone: a projected storage object's
+/// chain is not its source receiver's.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_load(
     ops: &mut Assembler,
@@ -206,6 +208,7 @@ pub(crate) fn emit_load(
     receiver: u8,
     temps @ [holder, slot, entry, base]: [u8; 4],
     destination: u8,
+    own_only: bool,
     miss: DynamicLabel,
 ) {
     registers(&[receiver], temps);
@@ -230,6 +233,18 @@ pub(crate) fn emit_load(
     let undefined = ops.new_dynamic_label();
     let canonical = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
+    if own_only {
+        // A projected storage object answers its own slots only: its chain
+        // is not the source receiver's.
+        dynasm!(ops ; .arch aarch64
+            ; ldrb w16, [X(entry), cache.load_action_byte]
+            ; cmp w16, #PropertyLoadAction::OwnData as u32 ; b.ne =>miss
+            ; ldrh W(slot), [X(entry), cache.load_slot_byte]);
+        bank_of_shape(ops, view, receiver, holder, slot, base, miss);
+        dynasm!(ops ; .arch aarch64
+            ; ldr X(destination), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]);
+        return;
+    }
     dynasm!(ops ; .arch aarch64
         ; ldrb w16, [X(entry), cache.load_action_byte]
         ; cmp w16, #PropertyLoadAction::OwnData as u32 ; b.eq =>own
@@ -281,7 +296,8 @@ pub(crate) fn emit_load(
 
 /// Complete an own writable store or no-allocation append. W(slot) is the
 /// child shape, zero for overwrite. The caller owns both required barriers;
-/// no branch to miss follows the first store.
+/// no branch to miss follows the first store. `own_only` accepts the
+/// overwrite alone, for a projected storage object.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_store(
     ops: &mut Assembler,
@@ -290,6 +306,7 @@ pub(crate) fn emit_store(
     atom: u8,
     [receiver, value]: [u8; 2],
     temps @ [holder, slot, entry, base]: [u8; 4],
+    own_only: bool,
     miss: DynamicLabel,
 ) {
     registers(&[receiver, value], temps);
@@ -314,6 +331,11 @@ pub(crate) fn emit_store(
     let own = ops.new_dynamic_label();
     let chain = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
+    if own_only {
+        dynasm!(ops ; .arch aarch64
+            ; ldrb w16, [X(entry), cache.store_action_byte]
+            ; cmp w16, #PropertyStoreAction::OwnWritable as u32 ; b.ne =>miss);
+    }
     dynasm!(ops ; .arch aarch64
         ; ldrb w16, [X(entry), cache.store_action_byte]
         ; cmp w16, #PropertyStoreAction::OwnWritable as u32 ; b.eq =>own

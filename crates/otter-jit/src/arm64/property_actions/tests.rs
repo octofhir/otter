@@ -246,6 +246,7 @@ fn executable(view: &JitCompileSnapshot, store: bool, alias: bool) -> CompiledCo
             14,
             [12, 9],
             [10, 11, 13, 15],
+            false,
             miss,
         );
         dynasm!(ops ; .arch aarch64 ; mov x0, #1);
@@ -259,6 +260,7 @@ fn executable(view: &JitCompileSnapshot, store: bool, alias: bool) -> CompiledCo
             9,
             [10, 11, 13, 15],
             9,
+            false,
             miss,
         );
         dynasm!(ops ; .arch aarch64 ; mov x0, x9);
@@ -271,6 +273,7 @@ fn executable(view: &JitCompileSnapshot, store: bool, alias: bool) -> CompiledCo
             12,
             [10, 11, 13, 15],
             0,
+            false,
             miss,
         );
     }

@@ -82,6 +82,9 @@ impl Codegen<'_> {
             ; ldrb w17, [X(receiver)]
             ; cmp w17, u32::from(storage.type_tag)
             ; b.ne =>not_array
+            // A name key writes the array's named bag through the table.
+            ; tst X(key), #0xfffe_0000_0000_0007
+            ; b.eq =>other
             ; ldrb w17, [X(receiver), storage.own_guard_byte]
             ; cbnz w17, =>runtime
         );

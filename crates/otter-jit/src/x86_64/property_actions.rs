@@ -54,6 +54,7 @@ pub(crate) fn emit_action_probe(
     value: Option<u8>,
     [shape, identity, entry, base]: [u8; 4],
     destination: Option<u8>,
+    own_only: bool,
     miss: DynamicLabel,
     done: DynamicLabel,
     appended: DynamicLabel,
@@ -150,6 +151,16 @@ pub(crate) fn emit_action_probe(
         ; add Rq(entry), cache.entry_bytes as i32
         ; dec Rd(base) ; jnz =>way ; jmp =>miss
         ; =>found);
+    // A projected storage object answers its own slots only: its chain is
+    // not the source receiver's.
+    if own_only {
+        match access {
+            PropertySourceAccess::Load => dynasm!(ops ; .arch x64
+                ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::OwnData as i8 ; jne =>miss),
+            PropertySourceAccess::Store => dynasm!(ops ; .arch x64
+                ; cmp BYTE [Rq(entry) + cache.store_action_byte as i32], PropertyStoreAction::OwnWritable as i8 ; jne =>miss),
+        }
+    }
 
     match access {
         PropertySourceAccess::Load => {

@@ -1632,6 +1632,18 @@ pub struct JitCacheIrProgram {
     pub ops: Box<[JitCacheIrOp]>,
 }
 
+impl JitCacheIrProgram {
+    /// Whether the program reads an Array receiver's prototype.
+    #[must_use]
+    pub fn reads_array_receiver(&self) -> bool {
+        matches!(
+            self.ops.first(),
+            Some(JitCacheIrOp::LoadIntrinsicPrototype { target, .. })
+                if target.type_tag == crate::array::ARRAY_BODY_TYPE_TAG
+        )
+    }
+}
+
 /// One monomorphic native leaf call selected from ordinary-call feedback.
 ///
 /// The declared entry id is the target's whole identity: it selects the machine

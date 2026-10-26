@@ -7,6 +7,9 @@
 //!   own `lastIndex`.
 //! - Primitive string receiver proofs composed with the `%String.prototype%`
 //!   dictionary-layout guard, for every name a primitive string cannot own.
+//! - Array receiver proofs (no rare state, no named bag) composed with the
+//!   default realm's `%Array.prototype%` slot guards, for every name but
+//!   `length` and the indices.
 //! - Ordinary closure proofs (no bag, no prototype override, plain kind, the
 //!   compiling realm active) composed with `%Function.prototype%` slot guards.
 //! - A closure's own `prototype`, read from its rare record's slot.
@@ -97,6 +100,25 @@ impl Interpreter {
                         guard: Some(crate::method_ops::regexp_guard()),
                         proto_offset,
                         active_realm: Some(active_realm),
+                    }
+                }),
+            );
+        }
+        // An array without rare state or a named bag owns only `length` and
+        // its elements; every other name resolves on the default realm's
+        // retained `%Array.prototype%` — the reads behind `a.includes(…)`,
+        // `a.slice(…)`, `a.join(…)`.
+        if key.name() != "length"
+            && object::array_index_property_name(key.name()).is_none()
+            && let Some(prototype) = self.default_array_prototype()
+        {
+            programs.extend(
+                self.shaped_prototype_program(prototype, key, |proto_offset| {
+                    JitIntrinsicPrototype {
+                        type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
+                        guard: Some(crate::method_ops::array_named_lookup_guard()),
+                        proto_offset,
+                        active_realm: None,
                     }
                 }),
             );

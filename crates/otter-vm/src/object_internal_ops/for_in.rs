@@ -102,6 +102,28 @@ impl Interpreter {
         Ok(false)
     }
 
+    /// `Object.keys(obj)` for an object whose hidden class alone fixes its
+    /// string keys and attributes: a fresh array copied from the class's
+    /// cached key array. `None` for any other object.
+    pub(crate) fn shaped_object_keys(&mut self, obj: JsObject) -> Result<Option<Value>, VmError> {
+        let Some(shape) = plain_shape(obj, &self.gc_heap) else {
+            return Ok(None);
+        };
+        let cached = self.shape_for_in_keys(shape)?;
+        let Some(mut keys) = array::with_plain_dense_values(cached, &self.gc_heap, |values| {
+            values.collect::<Vec<_>>()
+        }) else {
+            return Ok(None);
+        };
+        let keys = array::from_values_with_roots(
+            &mut self.gc_heap,
+            &mut keys,
+            otter_gc::SitePlacement::Young(0),
+            &mut |_| {},
+        )?;
+        Ok(Some(Value::array(keys)))
+    }
+
     /// `shape`'s enumerable string keys as its cached array.
     fn shape_for_in_keys(&mut self, shape: ShapeHandle) -> Result<JsArray, VmError> {
         if let Some(keys) = shape_body::enum_cache_of(shape).as_array() {

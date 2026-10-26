@@ -59,10 +59,11 @@ let checkRefed = true;
 
 // A monotonic clock in whole milliseconds. Node's lists only ever compare and
 // subtract these, so what matters is that it never goes backwards — which the
-// wall clock does not promise.
-const origin = process.hrtime.bigint();
+// wall clock does not promise. `performance.now()` is that clock, read
+// natively without a BigInt round trip.
+const { now: performanceNow } = performance;
 function getLibuvNow() {
-  return Number((process.hrtime.bigint() - origin) / 1000000n);
+  return Math.floor(performanceNow.call(performance));
 }
 
 // Arm the one timer standing for the next expiry, `msecs` from now.

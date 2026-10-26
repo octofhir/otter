@@ -1,7 +1,8 @@
 //! Typed per-realm intrinsic slots.
 //!
 //! The original `%Array.prototype.values%` callable is also retained for
-//! arguments creation. The original Array, Boolean, Number, and Object callables
+//! arguments creation, and `%Promise%` with `%Promise.prototype.then%` for
+//! the promise operations that must not observe the global binding. The original Array, Boolean, Number, and Object callables
 //! are retained for exact resolved-call feedback and generation-owned proofs.
 //!
 //! Every well-known prototype that the
@@ -276,10 +277,16 @@ impl Intrinsic {
 pub(crate) struct RealmIntrinsics {
     slots: [JsObject; Intrinsic::COUNT],
     array_values: crate::native_function::NativeFunction,
+    /// `%Promise%`, independent of the mutable global binding.
+    promise: crate::native_function::NativeFunction,
+    /// `%Promise.prototype.then%`, independent of mutable properties.
+    promise_then: crate::native_function::NativeFunction,
     /// The original callable of every intrinsic call kind, by kind.
     callables: [crate::native_function::NativeFunction; crate::IntrinsicCallKind::COUNT],
     /// Whether this realm's `%RegExp.prototype%` is built-in, while proven.
     pub(crate) regexp_protocol: Option<crate::regexp_fast::RegExpProtocolProof>,
+    /// Whether this realm's `%Promise.prototype%` is built-in, while proven.
+    pub(crate) promise_protocol: Option<crate::promise_protocol::PromiseProtocolProof>,
     /// Which iteration reads have built-in answers in this realm, while proven.
     pub(crate) iteration: crate::iteration_protocol::IterationProofs,
     /// Whether this realm's `%Object.prototype%` answers the conversion reads
@@ -295,9 +302,12 @@ impl Default for RealmIntrinsics {
         Self {
             slots: [JsObject::null(); Intrinsic::COUNT],
             array_values: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
+            promise: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
+            promise_then: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
             callables: [crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null());
                 crate::IntrinsicCallKind::COUNT],
             regexp_protocol: None,
+            promise_protocol: None,
             iteration: crate::iteration_protocol::IterationProofs::default(),
             object_conversion: None,
             iterator_result: None,
@@ -350,6 +360,16 @@ impl RealmIntrinsics {
             .then(|| crate::Value::native_function(self.array_values))
     }
 
+    /// Original `%Promise%`.
+    pub(crate) fn promise(&self) -> Option<crate::native_function::NativeFunction> {
+        (!self.promise.raw().is_null()).then_some(self.promise)
+    }
+
+    /// Original `%Promise.prototype.then%`.
+    pub(crate) fn promise_then(&self) -> Option<crate::native_function::NativeFunction> {
+        (!self.promise_then.raw().is_null()).then_some(self.promise_then)
+    }
+
     fn callable_slot(
         &self,
         kind: crate::IntrinsicCallKind,
@@ -395,6 +415,14 @@ impl RealmIntrinsics {
                     crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
                 })
         };
+        self.promise = callable(heap, "Promise");
+        self.promise_then = self
+            .get(Intrinsic::PromisePrototype)
+            .and_then(|prototype| object::get(prototype, heap, "then"))
+            .and_then(|value| value.as_native_function())
+            .unwrap_or_else(|| {
+                crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
+            });
         let (regexp_prototype, string_prototype) =
             (self.regexp_prototype(), self.string_prototype());
         for kind in crate::IntrinsicCallKind::ALL {
@@ -428,6 +456,8 @@ impl RealmIntrinsics {
             visitor(p);
         }
         self.array_values.trace_gc_roots(visitor);
+        self.promise.trace_gc_roots(visitor);
+        self.promise_then.trace_gc_roots(visitor);
         for callable in &self.callables {
             callable.trace_gc_roots(visitor);
         }
@@ -440,8 +470,10 @@ impl RealmIntrinsics {
                 handle.trace_gc_roots(visitor);
             }
         }
-        if !self.array_values.raw().is_null() {
-            self.array_values.trace_gc_roots(visitor);
+        for native in [&self.array_values, &self.promise, &self.promise_then] {
+            if !native.raw().is_null() {
+                native.trace_gc_roots(visitor);
+            }
         }
         for kind in crate::IntrinsicCallKind::ALL {
             let slot = self.callable_slot(kind);
@@ -456,6 +488,8 @@ impl RealmIntrinsics {
     pub(crate) fn is_empty(&self) -> bool {
         self.slots.iter().all(|handle| handle.is_null())
             && self.array_values.raw().is_null()
+            && self.promise.raw().is_null()
+            && self.promise_then.raw().is_null()
             && crate::IntrinsicCallKind::ALL
                 .into_iter()
                 .all(|kind| self.callable(kind).is_none())
@@ -540,7 +574,7 @@ mod tests {
         empty.visit_slots(&mut |_| visited += 1);
         assert_eq!(
             visited,
-            Intrinsic::COUNT + 1 + crate::IntrinsicCallKind::ALL.len(),
+            Intrinsic::COUNT + 3 + crate::IntrinsicCallKind::ALL.len(),
             "a fixed-shape walk must not depend on which slots are filled"
         );
         let mut traced = 0usize;

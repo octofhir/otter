@@ -121,6 +121,18 @@ pub enum MicrotaskKind {
     /// `queueMicrotask(callee, args...)`. Default for both plain
     /// `queueMicrotask` calls and promise-reaction handlers.
     Call,
+    /// A reaction without a handler on a bare capability: settle the
+    /// capability's promise with `args[0]` as fulfillment (`true`) or
+    /// rejection reason.
+    PassThrough {
+        /// Which side of the reaction ran.
+        fulfilled: bool,
+    },
+    /// §27.2.2.2 PromiseResolveThenableJob: `callee` is `then`,
+    /// `this_value` the thenable and `args[0]` the promise to resolve. The
+    /// resolving functions are created only when `then` is not the
+    /// built-in one on a pristine promise.
+    ResolveThenable,
     /// Host cleanup callback queued after a `FinalizationRegistry`
     /// cell's target was found dead by GC. Dispatch is identical to
     /// [`Self::Call`], but the distinct kind keeps finalization jobs
@@ -173,10 +185,23 @@ pub enum MicrotaskKind {
 /// of the promise module.
 #[derive(Debug, Clone)]
 pub struct MicrotaskCapability {
-    /// Native callable: `resolve(v)` settles the downstream as fulfilled.
+    /// The downstream promise.
+    pub promise: Value,
+    /// `resolve(v)` settles the downstream as fulfilled; `undefined` for a
+    /// bare capability over a native promise.
     pub resolve: Value,
-    /// Native callable: `reject(reason)` settles the downstream as rejected.
+    /// `reject(reason)` settles the downstream as rejected; `undefined` for a
+    /// bare capability.
     pub reject: Value,
+}
+
+impl MicrotaskCapability {
+    /// A bare capability: the native promise is settled by the promise
+    /// operations themselves.
+    #[must_use]
+    pub fn is_bare(&self) -> bool {
+        self.resolve.is_undefined()
+    }
 }
 
 /// Sync deque + optional async inbox + drain bookkeeping.
@@ -316,11 +341,15 @@ impl Microtask {
             crate::code_liveness::visit_value(value, visitor);
         }
         if let Some(capability) = &self.result_capability {
+            crate::code_liveness::visit_value(&capability.promise, visitor);
             crate::code_liveness::visit_value(&capability.resolve, visitor);
             crate::code_liveness::visit_value(&capability.reject, visitor);
         }
         match &self.kind {
-            MicrotaskKind::Call | MicrotaskKind::FinalizationCallback => {}
+            MicrotaskKind::Call
+            | MicrotaskKind::FinalizationCallback
+            | MicrotaskKind::PassThrough { .. }
+            | MicrotaskKind::ResolveThenable => {}
             MicrotaskKind::AsyncResume { frame, cold, .. }
             | MicrotaskKind::AsyncGenResume { frame, cold, .. } => {
                 frame.visit_function_ids(visitor);
@@ -340,11 +369,15 @@ impl Microtask {
             arg.trace_value_slots(visitor);
         }
         if let Some(capability) = &self.result_capability {
+            capability.promise.trace_value_slots(visitor);
             capability.resolve.trace_value_slots(visitor);
             capability.reject.trace_value_slots(visitor);
         }
         match &self.kind {
-            MicrotaskKind::Call | MicrotaskKind::FinalizationCallback => {}
+            MicrotaskKind::Call
+            | MicrotaskKind::FinalizationCallback
+            | MicrotaskKind::PassThrough { .. }
+            | MicrotaskKind::ResolveThenable => {}
             MicrotaskKind::AsyncResume { frame, cold, .. } => {
                 frame.trace_slots(visitor);
                 if let Some(c) = cold {

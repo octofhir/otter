@@ -744,6 +744,11 @@ impl Interpreter {
         // Resolve callee → function_id + SELF. Mirrors the
         // unwrap loop inside `invoke`, but for a top-level call
         // (no caller frame to write back into).
+        let job = match task.kind {
+            MicrotaskKind::PassThrough { fulfilled } => MicrotaskJob::PassThrough { fulfilled },
+            MicrotaskKind::ResolveThenable => MicrotaskJob::ResolveThenable,
+            _ => MicrotaskJob::Call,
+        };
         let mut result_capability = task.result_capability.clone();
         let mut current = task.callee;
         let mut effective_this = task.this_value;
@@ -771,6 +776,7 @@ impl Interpreter {
             let (interp, stack) = turn.into_parts();
             let result = interp.invoke_microtask_rooted(
                 context,
+                job,
                 &mut result_capability,
                 &mut current,
                 &mut effective_this,
@@ -789,6 +795,7 @@ impl Interpreter {
     fn invoke_microtask_rooted(
         &mut self,
         context: Option<&ExecutionContext>,
+        job: MicrotaskJob,
         result_capability: &mut Option<crate::microtask::MicrotaskCapability>,
         current: &mut Value,
         effective_this: &mut Value,
@@ -801,6 +808,33 @@ impl Interpreter {
         let callee = *current;
         let this_value = *effective_this;
         let args = std::mem::take(effective_args);
+        let argument = args.first().copied().unwrap_or(Value::UNDEFINED);
+        match job {
+            MicrotaskJob::Call => {}
+            MicrotaskJob::PassThrough { fulfilled } => {
+                let outcome = if fulfilled {
+                    Ok(argument)
+                } else {
+                    Err(argument)
+                };
+                return self.settle_microtask_capability(
+                    context,
+                    stack,
+                    result_capability.take(),
+                    outcome,
+                );
+            }
+            MicrotaskJob::ResolveThenable => {
+                return crate::promise_dispatch::run_resolve_thenable_job(
+                    self, stack, context, argument, this_value, callee,
+                )
+                .map_err(|error| RunError {
+                    error,
+                    frames: self.take_uncaught_frames_or_snapshot(context),
+                    detail: self.take_error_detail(),
+                });
+            }
+        }
         match self.run_callable_sync_rooted(stack, context, &callee, this_value, args) {
             Ok(value) => self.settle_microtask_capability(
                 context,
@@ -853,6 +887,26 @@ impl Interpreter {
         let Some(cap) = cap else {
             return Ok(());
         };
+        if cap.is_bare() {
+            let promise = cap
+                .promise
+                .as_promise()
+                .ok_or_else(|| RunError::bare(VmError::InvalidOperand))?;
+            let settled = match outcome {
+                Ok(value) => {
+                    crate::promise_dispatch::resolve_promise(self, stack, promise, value, context)
+                }
+                Err(reason) => {
+                    crate::promise_dispatch::reject_promise(self, promise, reason, context);
+                    Ok(())
+                }
+            };
+            return settled.map_err(|error| RunError {
+                error,
+                frames: self.take_uncaught_frames_or_snapshot(context),
+                detail: self.take_error_detail(),
+            });
+        }
         let (callee, args): (Value, SmallVec<[Value; 8]>) = match outcome {
             Ok(v) => (cap.resolve, smallvec::smallvec![v]),
             Err(reason) => (cap.reject, smallvec::smallvec![reason]),
@@ -1153,6 +1207,17 @@ impl Interpreter {
     }
 }
 
+/// What a non-resume microtask runs once its locals are rooted.
+#[derive(Clone, Copy)]
+enum MicrotaskJob {
+    /// Call the callee; settle the capability with its completion.
+    Call,
+    /// Settle the bare capability with the argument.
+    PassThrough { fulfilled: bool },
+    /// PromiseResolveThenableJob over (promise, thenable, then).
+    ResolveThenable,
+}
+
 /// Live root over [`Interpreter::invoke_microtask`]'s
 /// callee/this/argument locals: the values leave the traced microtask
 /// queue before the staged request owns them. Raw pointers because the
@@ -1177,6 +1242,7 @@ impl otter_gc::ExtraRootSource for MicrotaskLocalsRoot {
                 value.trace_value_slots(visitor);
             }
             if let Some(capability) = &*self.result_capability {
+                capability.promise.trace_value_slots(visitor);
                 capability.resolve.trace_value_slots(visitor);
                 capability.reject.trace_value_slots(visitor);
             }

@@ -33,7 +33,7 @@ use crate::activation_stack::{ActivationFloor, ActivationStack, ThrowSite};
 
 use crate::promise::JsPromise;
 use crate::runtime_activation::CommittedValueError;
-use crate::{ExecutionContext, Frame, Interpreter, RunError, Value, VmError, promise_dispatch};
+use crate::{ExecutionContext, Frame, Interpreter, RunError, Value, VmError};
 
 impl Interpreter {
     /// §27.7.5.3 Await step 2 — `PromiseResolve(%Promise%, value)`.
@@ -120,20 +120,32 @@ impl Interpreter {
             // before the frame parks.
             let async_context = vm.scoped_value(scope, vm.async_context());
             let realm_id = vm.active_host_realm_id();
+            // A non-object awaits a promise fulfilled with it, whose reaction
+            // PerformPromiseThen queues at once: queue the resume itself.
+            if !awaited.is_object_type() {
+                let async_context = vm.escape_scoped(async_context);
+                vm.queue_async_resume(
+                    stack,
+                    context,
+                    dst,
+                    (awaited, true),
+                    realm_id,
+                    async_context,
+                );
+                return Ok(());
+            }
             let promise = vm.await_promise_resolve(context, stack, awaited)?;
-            // The capability and parked-frame allocations below move the awaited
-            // promise; it rides an anchor slot and is re-read before the resume
-            // reactions register, so they land on the live promise rather than
-            // its vacated slot.
+            if let Some(settled) = promise.handle_settled(&mut vm.gc_heap) {
+                let async_context = vm.escape_scoped(async_context);
+                vm.queue_async_resume(stack, context, dst, settled, realm_id, async_context);
+                return Ok(());
+            }
+            // The parked-frame allocation below moves the awaited promise; it
+            // rides an anchor slot and is re-read before the resume reactions
+            // register, so they land on the live promise rather than its
+            // vacated slot.
             let promise_slot = vm.push_iteration_anchor(Value::promise(promise)) - 1;
             let outcome = (|this: &mut Self| -> Result<(), CommittedValueError> {
-                let capability =
-                    promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                        .capability_stack_rooted(this, stack, &mut [], &mut [])
-                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-                let capability_promise = this.scoped_value(scope, capability.promise);
-                let capability_resolve = this.scoped_value(scope, capability.resolve);
-                let capability_reject = this.scoped_value(scope, capability.reject);
                 let parked = stack.pop().expect("top frame existed");
                 let detached_cold = this.frame_detach_cold(parked);
                 let parked = this.park_active_frame(parked);
@@ -144,18 +156,12 @@ impl Interpreter {
                     .iteration_anchor(promise_slot)
                     .as_promise()
                     .expect("anchored awaited promise survives the park allocations");
-                let capability = crate::promise::PromiseCapability {
-                    promise: this.escape_scoped(capability_promise),
-                    resolve: this.escape_scoped(capability_resolve),
-                    reject: this.escape_scoped(capability_reject),
-                    context: capability.context,
-                };
                 let async_context = this.escape_scoped(async_context);
                 let outcome = promise.perform_async_resume_then(
                     &mut this.gc_heap,
                     parked,
                     dst,
-                    capability,
+                    crate::promise::PromiseCapability::none(),
                     None,
                     Some(context.clone()),
                     async_context,
@@ -169,6 +175,39 @@ impl Interpreter {
             vm.pop_iteration_anchors_to(promise_slot);
             outcome
         })
+    }
+
+    /// Park the awaiting top frame and queue its resumption with an already
+    /// known settlement `(value, fulfilled)`: the reaction job of an `await`
+    /// whose promise is settled, without the promise or a managed parked
+    /// frame in between.
+    fn queue_async_resume(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        dst: u16,
+        (value, fulfilled): (Value, bool),
+        realm_id: u32,
+        async_context: Value,
+    ) {
+        let parked = stack.pop().expect("top frame existed");
+        let cold = self.frame_detach_cold(parked);
+        let frame = Box::new(self.park_active_frame(parked));
+        self.microtasks.enqueue(crate::microtask::Microtask {
+            callee: Value::undefined(),
+            this_value: Value::undefined(),
+            args: smallvec::smallvec![value],
+            context: Some(context.clone()),
+            realm_id,
+            result_capability: None,
+            kind: crate::microtask::MicrotaskKind::AsyncResume {
+                frame,
+                cold,
+                await_dst: dst,
+                fulfilled,
+            },
+            async_context,
+        });
     }
 
     /// §27.6.3 — `Op::Await` inside an async-generator body. Parks
@@ -198,19 +237,6 @@ impl Interpreter {
             // Same anchoring as the regular-await path: the park allocations
             // below move the awaited promise.
             let promise_slot = vm.push_iteration_anchor(Value::promise(promise)) - 1;
-            let capability =
-                match promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-                    .capability_stack_rooted(vm, stack, &mut [], &mut [])
-                {
-                    Ok(capability) => capability,
-                    Err(err) => {
-                        vm.pop_iteration_anchors_to(promise_slot);
-                        return Err(CommittedValueError::JavaScript(err.into()));
-                    }
-                };
-            let capability_promise = vm.scoped_value(scope, capability.promise);
-            let capability_resolve = vm.scoped_value(scope, capability.resolve);
-            let capability_reject = vm.scoped_value(scope, capability.reject);
             let parked = stack.pop().expect("top frame existed");
             let detached_cold = vm.frame_detach_cold(parked);
             let parked = vm.park_active_frame(parked);
@@ -230,12 +256,6 @@ impl Interpreter {
                 .as_promise()
                 .expect("anchored awaited promise survives the park allocations");
             vm.pop_iteration_anchors_to(promise_slot);
-            let capability = crate::promise::PromiseCapability {
-                promise: vm.escape_scoped(capability_promise),
-                resolve: vm.escape_scoped(capability_resolve),
-                reject: vm.escape_scoped(capability_reject),
-                context: capability.context,
-            };
             let owner = vm
                 .escape_scoped(owner_root)
                 .as_generator()
@@ -246,7 +266,7 @@ impl Interpreter {
                 &mut vm.gc_heap,
                 parked,
                 dst,
-                capability,
+                crate::promise::PromiseCapability::none(),
                 Some(owner),
                 Some(context.clone()),
                 async_context,
@@ -666,7 +686,7 @@ mod tests {
         Box<ParkedFrameState>,
         Option<Box<crate::cold_frame::ColdFrame>>,
     ) {
-        let result_promise = promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
+        let result_promise = crate::promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
             .pending_runtime_rooted(interp, &mut [], &mut [])
             .unwrap();
         interp.frame_set_async_state(&mut frame, AsyncFrameState { result_promise });

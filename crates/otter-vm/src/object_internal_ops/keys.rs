@@ -636,26 +636,41 @@ impl Interpreter {
         if let Some(function_id) = fid {
             let owner = target.as_closure(&self.gc_heap);
             let names = self.ordinary_function_own_property_keys(context, owner, function_id);
-            let mut keys: Vec<Value> = Vec::with_capacity(names.len());
+            // §10.1.11 — the bag's symbol keys follow the string keys.
+            // Symbols are not moved by collection.
+            let mut symbols = self
+                .callable_bag_read(owner, function_id)
+                .map_or_else(Vec::new, |bag| {
+                    object::own_symbol_key_values(bag, &self.gc_heap)
+                });
+            let mut keys: Vec<Value> = Vec::with_capacity(names.len() + symbols.len());
             self.push_own_key_strings(
                 &mut keys,
                 &mut target,
-                &mut [],
+                &mut symbols,
                 names.iter().map(String::as_str),
             )
             .map_err(CommittedValueError::JavaScript)?;
+            keys.extend(symbols);
             return Ok(keys);
         }
         if let Some(native) = target.as_native_function() {
             let names = native.own_property_keys(&self.gc_heap);
-            let mut keys: Vec<Value> = Vec::with_capacity(names.len());
+            let bag = native.own_properties_bag(&self.gc_heap);
+            let mut symbols = if bag.is_null() {
+                Vec::new()
+            } else {
+                object::own_symbol_key_values(bag, &self.gc_heap)
+            };
+            let mut keys: Vec<Value> = Vec::with_capacity(names.len() + symbols.len());
             self.push_own_key_strings(
                 &mut keys,
                 &mut target,
-                &mut [],
+                &mut symbols,
                 names.iter().map(String::as_str),
             )
             .map_err(CommittedValueError::JavaScript)?;
+            keys.extend(symbols);
             return Ok(keys);
         }
         if let Some(bound) = target.as_bound_function() {

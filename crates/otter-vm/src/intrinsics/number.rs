@@ -130,7 +130,10 @@ fn pin_number_data_and_globals(
 // Constructor body — §21.1.1.1.
 // ---------------------------------------------------------------
 
-pub(crate) fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
+pub(crate) fn number_ctor_call(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let value = if args.is_empty() {
         crate::number::NumberValue::from_i32(0)
     } else {

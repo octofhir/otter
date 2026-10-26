@@ -99,17 +99,28 @@ impl Interpreter {
                 visitor(slot);
             }
         };
-        let next_shape = self
-            .shape_runtime
-            .child_with_roots(
+        let next_shape = match key.symbol_handle() {
+            Some(symbol) => {
+                let symbol = crate::symbol::JsSymbol::from_handle(&self.gc_heap, symbol);
+                self.shape_runtime.symbol_child_with_roots(
+                    &mut self.gc_heap,
+                    parent,
+                    symbol,
+                    object::PropertyFlags::data_default(),
+                    false,
+                    &mut external_visit,
+                )
+            }
+            None => self.shape_runtime.child_with_roots(
                 &mut self.gc_heap,
                 parent,
                 key.name(),
                 object::PropertyFlags::data_default(),
                 false,
                 &mut external_visit,
-            )
-            .map_err(VmError::from)?;
+            ),
+        }
+        .map_err(VmError::from)?;
         object::capture_store_property_transition_with_shape(
             obj,
             &mut self.gc_heap,
@@ -491,7 +502,8 @@ impl Interpreter {
             // keys fall through to OrdinaryDelete.
             let namespace_env = crate::object::module_namespace_env(obj, &self.gc_heap);
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
-                crate::object::delete_symbol(obj, &mut self.gc_heap, sym)
+                crate::object::delete_symbol(&mut { obj }, &mut self.gc_heap, sym)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_key_spelling(&self.gc_heap);
                 match namespace_env {
@@ -527,7 +539,8 @@ impl Interpreter {
         } else if let Some(class) = receiver.as_class_constructor() {
             let statics = class.statics(&self.gc_heap);
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
-                crate::object::delete_symbol(statics, &mut self.gc_heap, sym)
+                crate::object::delete_symbol(&mut { statics }, &mut self.gc_heap, sym)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else if let Some(name) = idx
                 .as_string(&self.gc_heap)
                 .map(|s| s.to_key_spelling(&self.gc_heap))
@@ -577,7 +590,9 @@ impl Interpreter {
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 let deleted = self
                     .callable_bag_read(owner, function_id)
-                    .map(|bag| crate::object::delete_symbol(bag, &mut self.gc_heap, sym))
+                    .map(|bag| crate::object::delete_symbol(&mut { bag }, &mut self.gc_heap, sym))
+                    .transpose()
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     .unwrap_or(true);
                 if deleted && let Some(owner) = owner {
                     owner.release_empty_own_props(&mut self.gc_heap);
@@ -600,7 +615,9 @@ impl Interpreter {
             }
         } else if let Some(native) = receiver.as_native_function() {
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
-                native.delete_own_symbol_property(&mut self.gc_heap, sym)
+                native
+                    .delete_own_symbol_property(&mut self.gc_heap, sym)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else if let Some(s) = idx.as_string(&self.gc_heap) {
                 let name = s.to_key_spelling(&self.gc_heap);
                 native
@@ -627,7 +644,8 @@ impl Interpreter {
                     Some(sym) => {
                         let bag =
                             crate::function_metadata::bound_own_properties(&bound, &self.gc_heap);
-                        crate::object::delete_symbol(bag, &mut self.gc_heap, sym)
+                        crate::object::delete_symbol(&mut { bag }, &mut self.gc_heap, sym)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     }
                     None => true,
                 },
@@ -658,7 +676,8 @@ impl Interpreter {
                     || typed_array_valid_index(&t, &self.gc_heap, f).is_none()
             } else if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 if let Some(bag) = t.expando(&self.gc_heap) {
-                    crate::object::delete_symbol(bag, &mut self.gc_heap, sym)
+                    crate::object::delete_symbol(&mut { bag }, &mut self.gc_heap, sym)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else {
                     true
                 }
@@ -671,7 +690,8 @@ impl Interpreter {
             // vacuously.
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 if let Some(bag) = r.expando(&self.gc_heap) {
-                    crate::object::delete_symbol(bag, &mut self.gc_heap, sym)
+                    crate::object::delete_symbol(&mut { bag }, &mut self.gc_heap, sym)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else {
                     true
                 }
@@ -695,7 +715,8 @@ impl Interpreter {
             // a missing name deletes vacuously.
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
                 match dv.expando(&self.gc_heap) {
-                    Some(bag) => crate::object::delete_symbol(bag, &mut self.gc_heap, sym),
+                    Some(bag) => crate::object::delete_symbol(&mut { bag }, &mut self.gc_heap, sym)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                     None => true,
                 }
             } else if let Some(s) = idx.as_string(&self.gc_heap) {
@@ -719,7 +740,8 @@ impl Interpreter {
             // Any other object keeps its ordinary own properties in its
             // expando: delete from there.
             if let Some(sym) = idx.as_symbol(&self.gc_heap) {
-                crate::object::delete_symbol(bag, &mut self.gc_heap, sym)
+                crate::object::delete_symbol(&mut { bag }, &mut self.gc_heap, sym)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
                 let name = match (idx.as_string(&self.gc_heap), idx.as_number()) {
                     (Some(s), _) => s.to_key_spelling(&self.gc_heap),

@@ -3392,8 +3392,9 @@ fn resolve_native_body(
     let resolution = args.first().copied().unwrap_or(Value::UNDEFINED);
     ctx.cx
         .with_parts(|interp, stack| {
-            resolve_promise(interp, stack, promise, resolution, context.as_ref())
-                .map_err(|error| crate::native_function::vm_to_native_error(interp, error, "Promise resolve"))
+            resolve_promise(interp, stack, promise, resolution, context.as_ref()).map_err(|error| {
+                crate::native_function::vm_to_native_error(interp, error, "Promise resolve")
+            })
         })
         .map(|()| Value::undefined())
 }
@@ -3597,13 +3598,16 @@ pub(crate) fn run_resolve_thenable_job(
         );
         match call {
             Ok(_) => Ok(()),
-            Err(error) if error.is_fatal() || matches!(error, crate::VmError::OutOfMemory { .. }) => {
+            Err(error)
+                if error.is_fatal() || matches!(error, crate::VmError::OutOfMemory { .. }) =>
+            {
                 Err(error)
             }
             Err(error) => {
                 // §27.2.2.2 step 1.c — an abrupt `then` call rejects through
                 // the fresh reject function, keeping the thrown value.
-                let reason = interp.vm_error_to_throwable_with_stack_roots(context, stack, &error)?;
+                let reason =
+                    interp.vm_error_to_throwable_with_stack_roots(context, stack, &error)?;
                 interp
                     .run_callable_sync_rooted(
                         stack,

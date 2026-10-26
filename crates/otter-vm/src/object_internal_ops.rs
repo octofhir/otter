@@ -304,6 +304,26 @@ impl Interpreter {
         ))
     }
 
+    /// The atom a keyed access's property key names hidden-class slots by:
+    /// an interned string's, with its spelling, or a symbol's, minted on
+    /// first use, with the symbol. `None` for any other key.
+    pub(crate) fn keyed_property_atom(
+        &mut self,
+        key: Value,
+    ) -> Option<(
+        crate::property_atom::AtomId,
+        Option<std::sync::Arc<str>>,
+        Option<crate::symbol::SymbolHandle>,
+    )> {
+        if let Some(string) = key.as_string(&self.gc_heap) {
+            let (atom, name) = self.interned_string_key(string)?;
+            return Some((atom, Some(name), None));
+        }
+        let symbol = key.as_symbol(&self.gc_heap)?;
+        let atom = symbol.property_atom(&mut self.gc_heap);
+        Some((atom, None, Some(symbol.handle())))
+    }
+
     /// A runtime spelling as an atomized key: shape walks compare its interned
     /// id instead of string contents at every link. A spelling nothing has
     /// interned carries [`crate::property_atom::AtomId::NONE`], which no shape

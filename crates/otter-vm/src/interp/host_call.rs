@@ -637,7 +637,7 @@ fn native_construct_with(
     // declares an ordinary receiver gets one created here.
     if !native.takes_ordinary_receiver(&turn.vm.gc_heap) {
         return invoke_native_construct(turn, ctx, native, &Value::UNDEFINED, &new_target, false)
-        .map_err(CommittedValueError::Fatal);
+            .map_err(CommittedValueError::Fatal);
     }
     let proto = turn
         .vm

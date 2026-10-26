@@ -151,7 +151,7 @@ fn symbol_sidecars_preserve_ordinary_named_lookup() {
         )
         .expect("descriptor fixture allocation")
     );
-    assert!(heap.read_payload(object, |body| !body.exotic.is_null()));
+    assert!(has_own_symbol(object, &heap, symbol));
     assert_prototype_changes_preserve_opacity(&mut object, prototype, &mut heap, false);
 }
 
@@ -198,9 +198,20 @@ fn own_data_hits_allow_symbols_and_retire_when_descriptor_authority_changes() {
         )
         .expect("descriptor fixture allocation")
     );
-    assert!(interpreter.gc_heap().read_payload(object, |body| {
-        !body.exotic.is_null() && !body.chain_link_opaque()
-    }));
+    assert!(
+        interpreter
+            .gc_heap()
+            .read_payload(object, |body| !body.chain_link_opaque())
+    );
+    // The symbol appended a hidden-class slot: the old hit declines, the
+    // string slot keeps its offset under the child class.
+    assert_eq!(
+        load_own_data_slot_by_shape(object, interpreter.gc_heap(), hit),
+        None,
+    );
+    let hit = lookup_own_atom(object, interpreter.gc_heap(), key)
+        .hit
+        .expect("own slot under the child class");
     assert_eq!(
         load_own_data_slot_by_shape(object, interpreter.gc_heap(), hit),
         Some(Value::number_i32(7)),

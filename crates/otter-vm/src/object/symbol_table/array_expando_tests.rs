@@ -96,6 +96,8 @@ fn full_bag_symbol_growth_moves_exact_edges_and_rejects_or_commits_atomically() 
             });
             let old_keys = [symbol(vm, scope), symbol(vm, scope)];
             let mut current = array::expando_object(vm.escape_scoped(owner).as_array().unwrap(), &vm.gc_heap).unwrap();
+            // Dictionary storage keeps symbols in the side table under test.
+            crate::object::materialize_slots(&mut current, &mut vm.gc_heap).unwrap();
             for (index, key) in old_keys.iter().copied().enumerate() {
                 let key = vm.escape_scoped(key).as_symbol(&vm.gc_heap).unwrap();
                 assert!(

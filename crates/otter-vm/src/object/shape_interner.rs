@@ -19,6 +19,7 @@
 //! - `crate::isolate_names` owns this value and dispatches its GC callbacks.
 
 use super::descriptor::PropertyFlags;
+use super::shape_body::ShapeKey;
 use super::shape_body::{self, ShapeBody, ShapeHandle};
 use super::{ShapeId, ShapeState};
 use crate::isolate_names::IsolateNames;
@@ -378,7 +379,29 @@ impl ShapeInterner {
         Self::child_atom_with_roots(
             heap,
             parent.get(),
-            key,
+            ShapeKey::string(key),
+            atom,
+            flags,
+            is_accessor,
+            external_visit,
+        )
+    }
+
+    /// Intern one symbol-keyed append on its exact parent: the symbol keys
+    /// the slot by its own atom.
+    pub(crate) fn symbol_child_with_roots(
+        heap: &mut GcHeap,
+        parent: ShapeHandle,
+        key: crate::symbol::JsSymbol,
+        flags: PropertyFlags,
+        is_accessor: bool,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<(ShapeHandle, bool), otter_gc::OutOfMemory> {
+        let atom = key.property_atom(heap);
+        Self::child_atom_with_roots(
+            heap,
+            parent,
+            ShapeKey::symbol(key.handle()),
             atom,
             flags,
             is_accessor,
@@ -390,7 +413,7 @@ impl ShapeInterner {
     pub(crate) fn child_atom_with_roots(
         heap: &mut GcHeap,
         parent: ShapeHandle,
-        key: JsStringHandle,
+        key: ShapeKey,
         atom: AtomId,
         flags: PropertyFlags,
         is_accessor: bool,
@@ -402,7 +425,7 @@ impl ShapeInterner {
     fn child_exact_with_roots(
         heap: &mut GcHeap,
         parent: ShapeHandle,
-        key: JsStringHandle,
+        key: ShapeKey,
         atom: AtomId,
         flags: PropertyFlags,
         is_accessor: bool,
@@ -414,15 +437,22 @@ impl ShapeInterner {
         // SAFETY: the stable stack survives collecting key-table/body allocations.
         let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
         let parent = scope.local(parent);
-        let key = scope.local(key);
+        // The key is traced in place across the collecting allocations.
+        let mut key = key;
+        let key_slot = &mut key as *mut ShapeKey;
+        let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            external_visit(visitor);
+            // SAFETY: `key` outlives the allocation this visit roots.
+            visitor(unsafe { (*key_slot).slot() });
+        };
         let child = shape_body::alloc_child_shape_body_with_roots(
             heap,
             parent.get(),
-            key.get(),
+            key,
             atom,
             flags,
             is_accessor,
-            external_visit,
+            &mut visit,
         )?;
         let mut tables = Self::of(heap).tables.borrow_mut();
         Self::register_child(heap, &mut tables, child);
@@ -511,7 +541,9 @@ impl ShapeInterner {
         }
         let isolate = IsolateNames::of_mut(heap);
         for (atom, key) in keys {
-            if isolate.key_string(atom).is_none() {
+            if let Some(key) = key.as_string()
+                && isolate.key_string(atom).is_none()
+            {
                 isolate.set_key_string(atom, key);
             }
         }

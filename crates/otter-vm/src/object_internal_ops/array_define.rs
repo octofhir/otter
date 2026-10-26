@@ -170,7 +170,7 @@ impl Interpreter {
                         .ok_or(VmError::InvalidOperand)?;
                     let deleted = match key {
                         VmPropertyKey::Symbol(symbol) => {
-                            object::delete_symbol(bag, &mut interp.gc_heap, *symbol)
+                            object::delete_symbol(&mut bag, &mut interp.gc_heap, *symbol)?
                         }
                         _ => object::delete(
                             &mut bag,

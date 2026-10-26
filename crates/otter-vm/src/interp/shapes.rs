@@ -367,7 +367,7 @@ impl Interpreter {
     pub(crate) fn rebuild_shape_from_slots(
         &mut self,
         obj: &mut object::JsObject,
-        ordered: &[(String, object::PropertyFlags, bool)],
+        ordered: &[(object::SlotName, object::PropertyFlags, bool)],
         state: object::ShapeState,
         extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<object::ShapeHandle, VmError> {
@@ -400,7 +400,7 @@ impl Interpreter {
         &mut self,
         shape: object::ShapeHandle,
         obj: &mut object::JsObject,
-        ordered: &[(String, object::PropertyFlags, bool)],
+        ordered: &[(object::SlotName, object::PropertyFlags, bool)],
         extra_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
     ) -> Result<object::ShapeHandle, VmError> {
         let _runtime_roots = self.scope_runtime_roots_guard();
@@ -414,17 +414,25 @@ impl Interpreter {
                 visitor(p);
                 extra_visit(visitor);
             };
-            let next = self
-                .shape_runtime
-                .child_with_roots(
+            let next = match key {
+                object::SlotName::Str(key) => self.shape_runtime.child_with_roots(
                     &mut self.gc_heap,
                     current.get(),
                     key,
                     *flags,
                     *is_accessor,
                     &mut external_visit,
-                )
-                .map_err(VmError::from)?;
+                ),
+                object::SlotName::Symbol(key) => self.shape_runtime.symbol_child_with_roots(
+                    &mut self.gc_heap,
+                    current.get(),
+                    *key,
+                    *flags,
+                    *is_accessor,
+                    &mut external_visit,
+                ),
+            }
+            .map_err(VmError::from)?;
             current = scope.local(next);
         }
         Ok(current.get())
@@ -447,7 +455,10 @@ impl Interpreter {
                 return Ok(());
             }
             let mut ordered = object::shape_ordered_slot_attrs(&this.gc_heap, shape);
-            for (_, flags, is_accessor) in &mut ordered {
+            for (name, flags, is_accessor) in &mut ordered {
+                if name.is_private_name() {
+                    continue;
+                }
                 *flags = flags.with_configurable(false);
                 if !*is_accessor {
                     *flags = flags.with_writable(false);
@@ -477,9 +488,10 @@ impl Interpreter {
                 return Ok(());
             }
             let mut ordered = object::shape_ordered_slot_attrs(&this.gc_heap, shape);
-            for (_, flags, is_accessor) in &mut ordered {
-                *flags = flags.with_configurable(false);
-                let _ = is_accessor;
+            for (name, flags, _) in &mut ordered {
+                if !name.is_private_name() {
+                    *flags = flags.with_configurable(false);
+                }
             }
             let target = object::shape_body::state_of(shape).with_extensible(false);
             let new_shape =

@@ -1113,7 +1113,8 @@ impl Interpreter {
             if bag.is_null() {
                 return None;
             }
-            let object::PropertyLookup::Data { value, .. } = object::lookup_own(bag, heap, "prototype")
+            let object::PropertyLookup::Data { value, .. } =
+                object::lookup_own(bag, heap, "prototype")
             else {
                 return None;
             };

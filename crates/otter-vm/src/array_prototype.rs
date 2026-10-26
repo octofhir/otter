@@ -1096,22 +1096,20 @@ pub(crate) fn array_linear_search(
         // A plain array whose `len` first elements are all present answers
         // every HasProperty with `true` and every Get with its element: one
         // scan of the storage is the whole loop.
-        let packed_scan = |interp: &Interpreter,
-                           scan: &mut dyn FnMut(
-            &mut dyn Iterator<Item = Value>,
-            &otter_gc::GcHeap,
-        ) -> i64|
-         -> Option<i64> {
-            let o = interp.iteration_anchor(anchor_base);
-            let array = o.as_array()?;
-            let heap = interp.gc_heap();
-            crate::array::with_plain_dense_values(array, heap, |values| {
-                let (present, exact) = values.size_hint();
-                (exact == Some(present) && present >= len)
-                    .then(|| scan(&mut values.take(len), heap))
-            })
-            .flatten()
-        };
+        let packed_scan =
+            |interp: &Interpreter,
+             scan: &mut dyn FnMut(&mut dyn Iterator<Item = Value>, &otter_gc::GcHeap) -> i64|
+             -> Option<i64> {
+                let o = interp.iteration_anchor(anchor_base);
+                let array = o.as_array()?;
+                let heap = interp.gc_heap();
+                crate::array::with_plain_dense_values(array, heap, |values| {
+                    let (present, exact) = values.size_hint();
+                    (exact == Some(present) && present >= len)
+                        .then(|| scan(&mut values.take(len), heap))
+                })
+                .flatten()
+            };
         if name == "indexOf" {
             let n = from.map_or(0.0, |v| to_int(&v, interp.gc_heap()));
             let mut k = if n >= len as f64 {
@@ -1152,7 +1150,9 @@ pub(crate) fn array_linear_search(
                 values
                     .take(end)
                     .enumerate()
-                    .filter(|(_, value)| crate::abstract_ops::is_strictly_equal(value, &search, heap))
+                    .filter(|(_, value)| {
+                        crate::abstract_ops::is_strictly_equal(value, &search, heap)
+                    })
                     .last()
                     .map_or(-1, |(index, _)| index as i64)
             }) {

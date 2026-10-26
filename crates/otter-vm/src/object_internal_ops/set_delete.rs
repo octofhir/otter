@@ -130,7 +130,8 @@ impl Interpreter {
                 object::delete(&mut { obj }, &mut self.gc_heap, key)
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else if let VmPropertyKey::Symbol(sym) = key {
-                object::delete_symbol(obj, &mut self.gc_heap, *sym)
+                object::delete_symbol(&mut { obj }, &mut self.gc_heap, *sym)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
                 true
             });
@@ -154,7 +155,9 @@ impl Interpreter {
             } else if let VmPropertyKey::Symbol(sym) = key {
                 let deleted = self
                     .callable_bag_read(owner, function_id)
-                    .map(|bag| object::delete_symbol(bag, &mut self.gc_heap, *sym))
+                    .map(|bag| object::delete_symbol(&mut { bag }, &mut self.gc_heap, *sym))
+                    .transpose()
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     .unwrap_or(true);
                 if deleted && let Some(owner) = owner {
                     owner.release_empty_own_props(&mut self.gc_heap);
@@ -169,9 +172,9 @@ impl Interpreter {
                 Some(key) => native
                     .delete_own_property(&mut self.gc_heap, key)
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
-                None if let VmPropertyKey::Symbol(sym) = key => {
-                    native.delete_own_symbol_property(&mut self.gc_heap, *sym)
-                }
+                None if let VmPropertyKey::Symbol(sym) = key => native
+                    .delete_own_symbol_property(&mut self.gc_heap, *sym)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
                 None => true,
             });
         }
@@ -185,7 +188,8 @@ impl Interpreter {
                     VmPropertyKey::Symbol(sym) => {
                         let bag =
                             crate::function_metadata::bound_own_properties(&bound, &self.gc_heap);
-                        object::delete_symbol(bag, &mut self.gc_heap, *sym)
+                        object::delete_symbol(&mut { bag }, &mut self.gc_heap, *sym)
+                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                     }
                     _ => true,
                 },
@@ -202,7 +206,8 @@ impl Interpreter {
                     object::delete(&mut { bag }, &mut self.gc_heap, name)
                         .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else if let VmPropertyKey::Symbol(sym) = key {
-                    object::delete_symbol(bag, &mut self.gc_heap, *sym)
+                    object::delete_symbol(&mut { bag }, &mut self.gc_heap, *sym)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else {
                     true
                 });
@@ -222,7 +227,8 @@ impl Interpreter {
                     object::delete(&mut { bag }, &mut self.gc_heap, name)
                         .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else if let VmPropertyKey::Symbol(sym) = key {
-                    object::delete_symbol(bag, &mut self.gc_heap, *sym)
+                    object::delete_symbol(&mut { bag }, &mut self.gc_heap, *sym)
+                        .map_err(|error| CommittedValueError::JavaScript(error.into()))?
                 } else {
                     true
                 });
@@ -234,7 +240,8 @@ impl Interpreter {
                 object::delete(&mut { bag }, &mut self.gc_heap, name)
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else if let VmPropertyKey::Symbol(sym) = key {
-                object::delete_symbol(bag, &mut self.gc_heap, *sym)
+                object::delete_symbol(&mut { bag }, &mut self.gc_heap, *sym)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?
             } else {
                 true
             });

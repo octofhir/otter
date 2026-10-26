@@ -23,8 +23,8 @@
 //! # See also
 //! - `property_ic` for guarded store completion and allocation-failure handling.
 
-use crate::property_ic::LoadHit;
 use crate::native_abi::CommittedValueError;
+use crate::property_ic::LoadHit;
 use smallvec::SmallVec;
 
 use crate::activation_stack::ActivationStack;

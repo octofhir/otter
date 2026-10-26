@@ -3854,6 +3854,12 @@ impl<'a> Codegen<'a> {
                 ; ldr w16, [X(rare), layout.own_props_byte]
                 ; cbz w16, =>symbols_absent
                 ; add x16, X(cage), x16
+                // A symbol key in the bag's hidden class or side table may
+                // be `@@hasInstance`.
+                ; ldr w17, [x16, view.object_shape_byte]
+                ; add x17, X(cage), x17
+                ; ldrb w17, [x17, otter_vm::object::SHAPE_SYMBOL_KEYS_BYTE]
+                ; cbnz w17, =>miss
                 ; ldr w16, [x16, view.object_exotic_handle_byte]
                 ; cbz w16, =>proved
                 ; add x16, X(cage), x16

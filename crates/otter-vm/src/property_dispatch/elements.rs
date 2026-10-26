@@ -53,9 +53,8 @@ impl Interpreter {
         let Some(index) = key.as_number().and_then(crate::array::index_from_number) else {
             return false;
         };
-        recv.as_array().is_some_and(|array| {
-            crate::array::is_plain_dense_absent(array, &self.gc_heap, index)
-        })
+        recv.as_array()
+            .is_some_and(|array| crate::array::is_plain_dense_absent(array, &self.gc_heap, index))
     }
 
     /// Whether an indexed store to `recv` at `key` reaches past the
@@ -94,21 +93,20 @@ impl Interpreter {
             .map_err(CommittedValueError::Fatal)
     }
 
-    /// Ordinary `[[Get]]` of a string key answered from data properties
+    /// Ordinary `[[Get]]` of a string or symbol key answered from data properties
     /// alone: shaped links through the shared `(shape, atom)` table,
     /// dictionary links by their own lookup. No rooting, coercion or decoded
     /// key. `None` when an accessor, an exotic link or a never-interned key
     /// needs the full `[[Get]]`.
-    fn ordinary_string_key_load(
-        &mut self,
-        obj: object::JsObject,
-        key: crate::string::JsString,
-    ) -> Option<Value> {
-        let (atom, name) = self.interned_string_key(key)?;
-        let key = crate::property_atom::AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(atom),
-            &name,
-        );
+    fn ordinary_keyed_load(&mut self, obj: object::JsObject, key: Value) -> Option<Value> {
+        let (atom, name, symbol) = self.keyed_property_atom(key)?;
+        let key = match symbol {
+            Some(symbol) => crate::property_atom::AtomizedPropertyKey::symbol(atom, symbol),
+            None => crate::property_atom::AtomizedPropertyKey::new(
+                crate::property_atom::PropertyAtom::new(atom),
+                name.as_deref().unwrap_or_default(),
+            ),
+        };
         let mut current = obj;
         for _ in 0..object::PROTO_CHAIN_HARD_CAP {
             if !object::is_dictionary(current, &self.gc_heap) {
@@ -162,8 +160,7 @@ impl Interpreter {
             return Ok(Value::undefined());
         }
         if let Some(obj) = recv.as_object()
-            && let Some(key) = idx_value_raw.as_string(&self.gc_heap)
-            && let Some(value) = self.ordinary_string_key_load(obj, key)
+            && let Some(value) = self.ordinary_keyed_load(obj, idx_value_raw)
         {
             return Ok(value);
         }

@@ -43,11 +43,10 @@ pub(crate) fn append_shaped_data_for_fixture(
     let (child, _) = super::shape_interner::ShapeInterner::child_atom_with_roots(
         heap,
         shape(receiver.get(), heap),
-        name.get(),
+        super::shape_body::ShapeKey::string(name.get()),
         key.atom().id(),
         PropertyFlags::data_default(),
         false,
-
         &mut |_| {},
     )
     .expect("actual child shape");

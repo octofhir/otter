@@ -709,6 +709,10 @@ pub const NATIVE_FRAME_MACHINE_ROOTS_OFFSET: u32 =
 pub const NATIVE_FRAME_FUNCTION_ID_OFFSET: u32 =
     (std::mem::offset_of!(Frame, header) + std::mem::offset_of!(VmFrameHeader, function_id)) as u32;
 
+/// Byte offset of the header's [`NativeFrameFlags`] byte.
+pub const NATIVE_FRAME_FLAGS_OFFSET: u32 =
+    (std::mem::offset_of!(Frame, header) + std::mem::offset_of!(VmFrameHeader, flags)) as u32;
+
 /// Byte offset of the header's owning tier, a [`NativeFrameKind`] byte.
 pub const NATIVE_FRAME_KIND_OFFSET: u32 =
     (std::mem::offset_of!(Frame, header) + std::mem::offset_of!(VmFrameHeader, kind)) as u32;

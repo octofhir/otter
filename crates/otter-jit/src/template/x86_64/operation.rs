@@ -1162,6 +1162,21 @@ pub(crate) fn emit_operation(
                 emit_store_reg(ops, 8, result);
                 dynasm!(ops ; .arch x64 ; jmp =>done);
             }
+            // A derived constructor's first `super()` binds its frame's
+            // `this`, which still holds the hole; a second binding or any
+            // other frame throws in the runtime.
+            if let (abi::ScalarValueOp::BindThisValue, Some(src)) = (operation, value0) {
+                emit_load_reg(ops, 9, src);
+                dynasm!(ops ; .arch x64
+                    ; mov r10, QWORD crate::entry::VALUE_HOLE as i64
+                    ; cmp [r14 + abi::NATIVE_FRAME_THIS_OFFSET as i32], r10 ; jne =>slow
+                    ; test BYTE [r14 + abi::NATIVE_FRAME_FLAGS_OFFSET as i32],
+                        abi::NativeFrameFlags::DERIVED_CONSTRUCTOR as i8
+                    ; jz =>slow
+                    ; mov [r14 + abi::NATIVE_FRAME_THIS_OFFSET as i32], r9);
+                emit_store_reg(ops, 9, result);
+                dynasm!(ops ; .arch x64 ; jmp =>done);
+            }
             dynasm!(ops ; .arch x64 ; =>slow);
             emit_scalar_value(
                 ops,

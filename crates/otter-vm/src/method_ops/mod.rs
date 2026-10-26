@@ -2505,8 +2505,8 @@ impl Interpreter {
             match name {
                 "forEach" => {
                     for i in 0..len {
-                        let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
-                        let t = ta_value
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
                             .map_err(CommittedValueError::Fatal)?;
@@ -2522,7 +2522,7 @@ impl Interpreter {
                             ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
-                                ta_value,
+                                interp.iteration_anchor(anchor_base + RECEIVER),
                             ]),
                         )?;
                     }
@@ -2543,8 +2543,8 @@ impl Interpreter {
                     let target_kind = a.kind();
                     let output_anchor = interp.push_iteration_anchor(a_value) - 1;
                     for i in 0..len {
-                        let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
-                        let t = ta_value
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
                             .map_err(CommittedValueError::Fatal)?;
@@ -2560,7 +2560,7 @@ impl Interpreter {
                             ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
-                                ta_value,
+                                interp.iteration_anchor(anchor_base + RECEIVER),
                             ]),
                         )?;
                         interp.set_iteration_anchor(anchor_base + CARRIED, mapped);
@@ -2591,8 +2591,8 @@ impl Interpreter {
                     // rewritten by a moving collection.
                     let kept_base = interp.iteration_anchors_for_trace().len();
                     for i in 0..len {
-                        let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
-                        let t = ta_value
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
                             .map_err(CommittedValueError::Fatal)?;
@@ -2608,7 +2608,7 @@ impl Interpreter {
                             ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
-                                ta_value,
+                                interp.iteration_anchor(anchor_base + RECEIVER),
                             ]),
                         )?;
                         if selected.to_boolean(&interp.gc_heap) {
@@ -2648,8 +2648,8 @@ impl Interpreter {
                 "find" => {
                     let mut found = Value::undefined();
                     for i in 0..len {
-                        let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
-                        let t = ta_value
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
                             .map_err(CommittedValueError::Fatal)?;
@@ -2665,7 +2665,7 @@ impl Interpreter {
                             ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
-                                ta_value,
+                                interp.iteration_anchor(anchor_base + RECEIVER),
                             ]),
                         )?;
                         if hit.to_boolean(&interp.gc_heap) {
@@ -2678,8 +2678,8 @@ impl Interpreter {
                 "findIndex" => {
                     let mut idx: i32 = -1;
                     for i in 0..len {
-                        let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
-                        let t = ta_value
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
                             .map_err(CommittedValueError::Fatal)?;
@@ -2695,7 +2695,7 @@ impl Interpreter {
                             ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
-                                ta_value,
+                                interp.iteration_anchor(anchor_base + RECEIVER),
                             ]),
                         )?;
                         if hit.to_boolean(&interp.gc_heap) {
@@ -2708,8 +2708,8 @@ impl Interpreter {
                 "findLast" => {
                     let mut found = Value::undefined();
                     for i in (0..len).rev() {
-                        let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
-                        let t = ta_value
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
                             .map_err(CommittedValueError::Fatal)?;
@@ -2725,7 +2725,7 @@ impl Interpreter {
                             ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
-                                ta_value,
+                                interp.iteration_anchor(anchor_base + RECEIVER),
                             ]),
                         )?;
                         if hit.to_boolean(&interp.gc_heap) {
@@ -2738,8 +2738,8 @@ impl Interpreter {
                 "findLastIndex" => {
                     let mut idx: i32 = -1;
                     for i in (0..len).rev() {
-                        let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
-                        let t = ta_value
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
                             .map_err(CommittedValueError::Fatal)?;
@@ -2755,7 +2755,7 @@ impl Interpreter {
                             ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
-                                ta_value,
+                                interp.iteration_anchor(anchor_base + RECEIVER),
                             ]),
                         )?;
                         if hit.to_boolean(&interp.gc_heap) {
@@ -2768,8 +2768,8 @@ impl Interpreter {
                 "every" => {
                     let mut all = true;
                     for i in 0..len {
-                        let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
-                        let t = ta_value
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
                             .map_err(CommittedValueError::Fatal)?;
@@ -2785,7 +2785,7 @@ impl Interpreter {
                             ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
-                                ta_value,
+                                interp.iteration_anchor(anchor_base + RECEIVER),
                             ]),
                         )?;
                         if !hit.to_boolean(&interp.gc_heap) {
@@ -2798,8 +2798,8 @@ impl Interpreter {
                 "some" => {
                     let mut any = false;
                     for i in 0..len {
-                        let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
-                        let t = ta_value
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
                             .map_err(CommittedValueError::Fatal)?;
@@ -2815,7 +2815,7 @@ impl Interpreter {
                             ValueWindow::from(&[
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
-                                ta_value,
+                                interp.iteration_anchor(anchor_base + RECEIVER),
                             ]),
                         )?;
                         if hit.to_boolean(&interp.gc_heap) {
@@ -2849,8 +2849,8 @@ impl Interpreter {
                     };
                     let mut i = start_idx;
                     while i >= 0 && (i as usize) < len {
-                        let ta_value = interp.iteration_anchor(anchor_base + RECEIVER);
-                        let t = ta_value
+                        let t = interp
+                            .iteration_anchor(anchor_base + RECEIVER)
                             .as_typed_array(&interp.gc_heap)
                             .ok_or(VmError::InvalidOperand)
                             .map_err(CommittedValueError::Fatal)?;
@@ -2867,7 +2867,7 @@ impl Interpreter {
                                 interp.iteration_anchor(anchor_base + CARRIED),
                                 interp.iteration_anchor(anchor_base + ELEMENT),
                                 Value::number(NumberValue::from_i32(i as i32)),
-                                ta_value,
+                                interp.iteration_anchor(anchor_base + RECEIVER),
                             ]),
                         )?;
                         interp.set_iteration_anchor(anchor_base + CARRIED, next_acc);

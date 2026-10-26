@@ -84,8 +84,8 @@ impl Interpreter {
             &mut self.gc_heap,
             &mut external_visit,
         )?;
-        // Both the buffer body and the view body live in old space, so
-        // `buffer` cannot be moved by the view allocation.
+        // The buffer body lives in old space, so the view allocation cannot
+        // move `buffer`.
         let view = JsTypedArray::new(&mut self.gc_heap, buffer, kind, 0, length)?;
         Ok(self.scoped_value(scope, Value::typed_array(view)))
     }

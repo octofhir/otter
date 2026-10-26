@@ -81,13 +81,14 @@ pub async fn resolve_installed_project(
             id: package_id.clone(),
             name: package.name.clone(),
             version: package.version.clone(),
-            root: package_root,
+            root: package_root.clone(),
             manifest: manifest.clone(),
         });
         insert_existing_linked_bins_for_manifest(
             &mut resolution.graph,
             &package_id,
             project_root,
+            &package_root,
             &manifest,
         )
         .await?;
@@ -226,6 +227,7 @@ async fn insert_existing_linked_bins_for_manifest(
     graph: &mut PackageGraph,
     package_id: &PackageId,
     project_root: &Path,
+    package_root: &Path,
     manifest: &PackageManifest,
 ) -> Result<(), PackageManagerError> {
     let Some(bin) = &manifest.bin else {
@@ -236,32 +238,51 @@ async fn insert_existing_linked_bins_for_manifest(
         PackageBinManifest::Path(_) => {
             if let Some(name) = &manifest.name {
                 let binary_name = binary_name_from_package_name(name);
-                insert_existing_linked_bin(graph, package_id, binary_name, &bin_root).await?;
+                insert_existing_linked_bin(graph, package_id, binary_name, &bin_root, package_root)
+                    .await?;
             }
         }
         PackageBinManifest::Map(bins) => {
             for name in bins.keys() {
-                insert_existing_linked_bin(graph, package_id, name, &bin_root).await?;
+                insert_existing_linked_bin(graph, package_id, name, &bin_root, package_root)
+                    .await?;
             }
         }
     }
     Ok(())
 }
 
+/// Record `name` as `package_id`'s bin when the project's bin of that name
+/// is this package's: a link leads into its root. Two versions of a package
+/// declare the same bin, and only one of them owns the project's link.
 async fn insert_existing_linked_bin(
     graph: &mut PackageGraph,
     package_id: &PackageId,
     name: &str,
     bin_root: &Path,
+    package_root: &Path,
 ) -> Result<(), PackageManagerError> {
     let path = bin_root.join(name);
-    if tokio::fs::try_exists(&path)
-        .await
-        .map_err(|err| PackageManagerError::Io {
-            path: path.clone(),
-            message: err.to_string(),
-        })?
-    {
+    let owned = match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            match (
+                tokio::fs::canonicalize(&path).await,
+                tokio::fs::canonicalize(package_root).await,
+            ) {
+                (Ok(target), Ok(root)) => target.starts_with(root),
+                _ => false,
+            }
+        }
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Err(PackageManagerError::Io {
+                path,
+                message: err.to_string(),
+            });
+        }
+    };
+    if owned {
         graph.insert_bin(PackageBin {
             package: package_id.clone(),
             name: name.to_string(),

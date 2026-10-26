@@ -2059,6 +2059,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_package_archive_may_name_its_root_directory_anything() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = "https://registry.npmjs.org/@types/estree/-/estree-1.0.9.tgz";
+        let fixture = tmp.path().join("tarballs");
+        let tarball = npm_tgz(&[
+            ("estree/package.json", r#"{"name":"@types/estree"}"#),
+            ("estree/index.d.ts", "export {};\n"),
+        ]);
+        write_bytes(&fixture.join(cache_key(url)), &tarball).await;
+        let source = TarballSource {
+            url: url.to_string(),
+            integrity: None,
+        };
+
+        let extracted = FsPackageStore::new(tmp.path().join("cache"))
+            .get_or_fetch_and_extract(&source, &FileTarballClient::new(&fixture))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            extracted.index.files.keys().collect::<Vec<_>>(),
+            ["index.d.ts", "package.json"]
+        );
+    }
+
+    #[tokio::test]
     async fn a_tarball_that_misses_its_integrity_stores_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         let url = "https://registry.npmjs.org/pkg/-/pkg-1.0.0.tgz";
@@ -2618,13 +2644,12 @@ mod tests {
         let project = tmp.path().join("project");
         let registry = tmp.path().join("registry");
         let tarballs = tmp.path().join("tarballs");
-        let versions =
-            |name: &str, entries: &[(&str, &str, &str)]| {
-                entries
+        let versions = |name: &str, entries: &[(&str, &str, &str)]| {
+            entries
                 .iter()
                 .map(|(version, dependencies, body)| {
                     let manifest = format!(
-                        r#"{{"name":"{name}","version":"{version}","dependencies":{dependencies}}}"#
+                        r#"{{"name":"{name}","version":"{version}","bin":{{"{name}":"index.js"}},"dependencies":{dependencies}}}"#
                     );
                     (
                         format!("https://registry.example.test/{name}/-/{name}-{version}.tgz"),
@@ -2632,7 +2657,7 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>()
-            };
+        };
         let ms = versions(
             "ms",
             &[
@@ -2712,6 +2737,16 @@ mod tests {
             read(stored_a.parent().unwrap().join("ms/index.js")),
             "module.exports = 'ms1';\n"
         );
+        // Both versions declare the bin `ms`: the project's own dependency
+        // holds the name, and it is that package's alone.
+        assert_eq!(
+            read(project.join("node_modules/.bin/ms")),
+            "module.exports = 'ms2';\n"
+        );
+        let graph = resolve_installed_project(&project).await.unwrap().graph;
+        let bins = graph.resolve_bin("ms");
+        assert_eq!(bins.len(), 1);
+        assert_eq!(bins[0].package, PackageId::registry_version("ms", "2.0.0"));
     }
 
     #[tokio::test]

@@ -461,7 +461,7 @@ fn native_is(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Na
 /// §20.1.2.12 `Object.getPrototypeOf(O)` — `[[Prototype]]` of `O`
 /// after ToObject coercion. Primitive operands resolve to their
 /// respective `%X.prototype%` per §7.1.18.
-fn native_get_prototype_of(
+pub(crate) fn native_get_prototype_of(
     ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {

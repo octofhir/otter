@@ -130,7 +130,7 @@ fn pin_number_data_and_globals(
 // Constructor body — §21.1.1.1.
 // ---------------------------------------------------------------
 
-fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
+pub(crate) fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let value = if args.is_empty() {
         crate::number::NumberValue::from_i32(0)
     } else {
@@ -166,7 +166,7 @@ fn number_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Va
 // Static predicates / parsers — §21.1.2.{3-9}.
 // ---------------------------------------------------------------
 
-fn number_is_nan_native(
+pub(crate) fn number_is_nan_native(
     _ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
@@ -177,7 +177,7 @@ fn number_is_nan_native(
     Ok(Value::boolean(result))
 }
 
-fn number_is_finite_native(
+pub(crate) fn number_is_finite_native(
     _ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
@@ -188,7 +188,7 @@ fn number_is_finite_native(
     Ok(Value::boolean(result))
 }
 
-fn number_is_integer_native(
+pub(crate) fn number_is_integer_native(
     _ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
@@ -196,7 +196,7 @@ fn number_is_integer_native(
     Ok(Value::boolean(crate::number::parse::is_integer(&v)))
 }
 
-fn number_is_safe_integer_native(
+pub(crate) fn number_is_safe_integer_native(
     _ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {

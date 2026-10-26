@@ -699,6 +699,48 @@ pub const MATH_EXP_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: math_exp_leaf,
 };
 
+/// Callable ABI entry: leaf `Number.isNaN`: no coercion, every argument answers.
+pub const NUMBER_IS_NAN_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_NUMBER_IS_NAN_LEAF,
+    entry: number_is_nan_leaf,
+};
+
+/// Callable ABI entry: leaf `Number.isFinite`: no coercion, every argument answers.
+pub const NUMBER_IS_FINITE_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_NUMBER_IS_FINITE_LEAF,
+    entry: number_is_finite_leaf,
+};
+
+/// Callable ABI entry: leaf `Number.isInteger`: no coercion, every argument answers.
+pub const NUMBER_IS_INTEGER_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_NUMBER_IS_INTEGER_LEAF,
+    entry: number_is_integer_leaf,
+};
+
+/// Callable ABI entry: leaf `Number.isSafeInteger`: no coercion, every argument answers.
+pub const NUMBER_IS_SAFE_INTEGER_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_NUMBER_IS_SAFE_INTEGER_LEAF,
+    entry: number_is_safe_integer_leaf,
+};
+
+/// Callable ABI entry: leaf `Array.isArray`; a Proxy misses.
+pub const ARRAY_IS_ARRAY_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_ARRAY_IS_ARRAY_LEAF,
+    entry: array_is_array_leaf,
+};
+
+/// Callable ABI entry: leaf `Object.getPrototypeOf` of an ordinary object; anything else misses.
+pub const OBJECT_GET_PROTOTYPE_OF_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_OBJECT_GET_PROTOTYPE_OF_LEAF,
+    entry: object_get_prototype_of_leaf,
+};
+
+/// Callable ABI entry: leaf `Number(value)` call of a non-string primitive; anything else misses.
+pub const NUMBER_CALL_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_NUMBER_CALL_LEAF,
+    entry: number_call_leaf,
+};
+
 /// Callable ABI entry for `Math.log`.
 pub const MATH_LOG_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: STUB_MATH_LOG_LEAF,
@@ -1084,6 +1126,13 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_MATH_CEIL_LEAF.id => Some(MATH_CEIL_LEAF),
         id if id == STUB_MATH_ROUND_LEAF.id => Some(MATH_ROUND_LEAF),
         id if id == STUB_MATH_TRUNC_LEAF.id => Some(MATH_TRUNC_LEAF),
+        id if id == crate::native_abi::STUB_NUMBER_IS_NAN_LEAF.id => Some(NUMBER_IS_NAN_LEAF),
+        id if id == crate::native_abi::STUB_NUMBER_IS_FINITE_LEAF.id => Some(NUMBER_IS_FINITE_LEAF),
+        id if id == crate::native_abi::STUB_NUMBER_IS_INTEGER_LEAF.id => Some(NUMBER_IS_INTEGER_LEAF),
+        id if id == crate::native_abi::STUB_NUMBER_IS_SAFE_INTEGER_LEAF.id => Some(NUMBER_IS_SAFE_INTEGER_LEAF),
+        id if id == crate::native_abi::STUB_ARRAY_IS_ARRAY_LEAF.id => Some(ARRAY_IS_ARRAY_LEAF),
+        id if id == crate::native_abi::STUB_OBJECT_GET_PROTOTYPE_OF_LEAF.id => Some(OBJECT_GET_PROTOTYPE_OF_LEAF),
+        id if id == crate::native_abi::STUB_NUMBER_CALL_LEAF.id => Some(NUMBER_CALL_LEAF),
         id if id == STUB_MATH_ATAN2_LEAF.id => Some(MATH_ATAN2_LEAF),
         id if id == STUB_MATH_POW_LEAF.id => Some(MATH_POW_LEAF),
         id if id == STUB_PARSE_INT_I32_LEAF.id => Some(PARSE_INT_I32_LEAF),
@@ -2320,6 +2369,116 @@ pub extern "C" fn parse_int_i32_leaf(
     } else {
         NativeResultPair::miss()
     }
+}
+
+/// Leaf `Number.isNaN`.
+pub extern "C" fn number_is_nan_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    number_predicate_leaf(arg_bits, f64::is_nan)
+}
+
+/// Leaf `Number.isFinite`.
+pub extern "C" fn number_is_finite_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    number_predicate_leaf(arg_bits, f64::is_finite)
+}
+
+/// Leaf `Number.isInteger`.
+pub extern "C" fn number_is_integer_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    number_predicate_leaf(arg_bits, |x| x.is_finite() && x.trunc() == x)
+}
+
+/// Leaf `Number.isSafeInteger`.
+pub extern "C" fn number_is_safe_integer_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    number_predicate_leaf(arg_bits, |x| {
+        x.is_finite() && x.trunc() == x && x.abs() <= 9_007_199_254_740_991.0
+    })
+}
+
+/// §21.1.2.{2,3,4,5}: a non-Number argument answers `false`; a Number
+/// answers `test`.
+fn number_predicate_leaf(arg_bits: u64, test: fn(f64) -> bool) -> NativeResultPair {
+    let value = Value::from_abi_bits(arg_bits);
+    NativeResultPair::success(Value::boolean(value.as_f64().is_some_and(test)))
+}
+
+/// Leaf `Array.isArray` (§7.2.2 IsArray); a Proxy, whose answer may throw,
+/// misses.
+pub extern "C" fn array_is_array_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let value = Value::from_abi_bits(arg_bits);
+    if value.is_proxy() {
+        return NativeResultPair::miss();
+    }
+    NativeResultPair::success(Value::boolean(value.as_array().is_some()))
+}
+
+/// Leaf `Object.getPrototypeOf` of an ordinary object whose
+/// `[[GetPrototypeOf]]` is its stored prototype; anything else misses.
+pub extern "C" fn object_get_prototype_of_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return NativeResultPair::miss();
+    };
+    let Some(object) = Value::from_abi_bits(arg_bits).as_object() else {
+        return NativeResultPair::miss();
+    };
+    if crate::object::state(object, heap).is_opaque()
+        || crate::interp::helpers::object_has_construct_slot(&Value::object(object), heap)
+    {
+        return NativeResultPair::miss();
+    }
+    NativeResultPair::success(crate::object::prototype_value(object, heap).unwrap_or(Value::NULL))
+}
+
+/// Leaf `Number(value)` called on a Number, Boolean, `undefined` or `null`:
+/// §21.1.1.1 ToNumeric without user code. Strings, BigInts, Symbols and
+/// objects miss.
+pub extern "C" fn number_call_leaf(
+    heap: *const otter_gc::GcHeap,
+    arg_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let value = Value::from_abi_bits(arg_bits);
+    let number = if value.as_f64().is_some() {
+        return NativeResultPair::success_bits(arg_bits);
+    } else if let Some(flag) = value.as_boolean() {
+        Value::number_i32(i32::from(flag))
+    } else if value.is_undefined() {
+        Value::number(crate::NumberValue::from_f64(f64::NAN))
+    } else if value.is_null() {
+        Value::number_i32(0)
+    } else {
+        return NativeResultPair::miss();
+    };
+    NativeResultPair::success(number)
 }
 
 /// Leaf `Map.prototype.get` probe.

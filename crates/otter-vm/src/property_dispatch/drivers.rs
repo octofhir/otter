@@ -162,6 +162,11 @@ impl Interpreter {
                 atomized_key,
                 crate::property_ic::PropertyStorageProjection::Receiver,
             ) {
+                // The handler now answers this receiver class here and in
+                // generated code; an optimizing caller calls the getter
+                // directly once it knows the target.
+                let (function_id, pc) = (stack[top_idx].function_id, stack[top_idx].pc);
+                self.note_accessor_target(context, function_id, pc, obj, atomized_key, false);
                 return self.drive_getter(stack, context, obj_reg, dst, getter);
             }
             let key = VmPropertyKey::atom(atomized_key);

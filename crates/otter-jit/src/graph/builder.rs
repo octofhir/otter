@@ -4044,12 +4044,26 @@ impl<'a> Builder<'a> {
             return false;
         }
         let view: &'a JitCompileSnapshot = self.view;
-        let Some((target, method, target_callee)) = view
-            .method_targets
-            .get(&byte_pc)
-            .and_then(|methods| single_method_target(methods))
-        else {
+        let Some(methods) = view.method_targets.get(&byte_pc) else {
             return false;
+        };
+        let Some((target, method, target_callee)) = single_method_target(methods) else {
+            // A getter several receiver classes reach: each class's arm
+            // calls (or splices) the getter its guard proves.
+            let accessors = methods.iter().filter(|method| method.callee.is_some());
+            if value.is_some()
+                || instruction.writes.is_empty()
+                || accessors.clone().count() < 2
+                || accessors
+                    .clone()
+                    .any(|method| method.guard.accessor_byte.is_none())
+            {
+                return false;
+            }
+            let receiver = self.read(instruction.reads[0]);
+            let receiver = self.tagged(receiver);
+            self.emit_polymorphic_method_call(instruction, receiver, &[], methods, false);
+            return true;
         };
         if method.guard.accessor_byte.is_none() {
             return false;
@@ -4612,7 +4626,13 @@ impl<'a> Builder<'a> {
             );
         }
         if let Some(methods) = polymorphic {
-            return self.emit_polymorphic_method_call(instruction, receiver, &arguments, methods);
+            return self.emit_polymorphic_method_call(
+                instruction,
+                receiver,
+                &arguments,
+                methods,
+                true,
+            );
         }
         let callee = self.named_lookup(byte_pc, receiver);
         self.emit_call_with_receiver(instruction, callee, receiver, &arguments, None);
@@ -4707,15 +4727,18 @@ impl<'a> Builder<'a> {
 
     /// A method call whose receivers had several observed shapes: the
     /// receiver's shape selects one arm per target, which reads that
-    /// target's guarded method and runs it inline or calls it directly; a
-    /// receiver of no listed shape leaves optimized code. The arms meet with
-    /// the call's result in its register.
+    /// target's guarded method and runs it inline (when `splice` admits it)
+    /// or calls it directly; a receiver of no listed shape leaves optimized
+    /// code. The arms meet with the call's result in its register. A getter
+    /// read through a named load is called, never spliced: its frame resumes
+    /// only through a call instruction.
     fn emit_polymorphic_method_call(
         &mut self,
         instruction: &Instruction,
         receiver: NodeId,
         arguments: &[NodeId],
         methods: &'a [otter_vm::jit::JitMethodTarget],
+        splice: bool,
     ) {
         let byte_pc = instruction.byte_pc;
         let destination = instruction.writes[0];
@@ -4769,10 +4792,11 @@ impl<'a> Builder<'a> {
             );
             self.prove_receiver_shape(receiver, method.guard.recv_shape);
             let plan = target.plan;
-            let inlined = method.body.as_ref().is_some_and(|body| {
-                (!body.code_block.observes_this() || !body.code_block.is_arrow())
-                    && self.inline_call(instruction, body, plan, callee, receiver, arguments)
-            });
+            let inlined = splice
+                && method.body.as_ref().is_some_and(|body| {
+                    (!body.code_block.observes_this() || !body.code_block.is_arrow())
+                        && self.inline_call(instruction, body, plan, callee, receiver, arguments)
+                });
             if !inlined {
                 self.emit_call_with_receiver(
                     instruction,

@@ -801,6 +801,10 @@ pub(crate) enum Kind {
         function_id: u32,
         cell: u64,
     },
+    /// The constructor body of the class wrapper input0: `new C(...)`
+    /// enters it with `C` as new.target. Eager deopt unless input0 is a
+    /// class wrapper.
+    LoadClassConstructor,
     /// Eager deopt unless input0 is the value the identity cell at this
     /// address holds; the collector keeps the cell's value current.
     CheckCellValue(u64),
@@ -1085,6 +1089,7 @@ impl Kind {
             | Self::LoadActualArgument
             | Self::SelectArgument { .. }
             | Self::CheckFunction { .. }
+            | Self::LoadClassConstructor
             | Self::CheckCellValue(_)
             | Self::CheckNotHole
             | Self::LoadGuardedMethod { .. }
@@ -1532,6 +1537,7 @@ impl Kind {
             | Self::CheckCellValue(_)
             | Self::CheckNotHole
             | Self::CheckNative(_) => simple(1, ResultPolicy::None),
+            Self::LoadClassConstructor => simple(1, ResultPolicy::Register),
             Self::CheckArgumentsElided => simple(0, ResultPolicy::None),
             Self::LoadArgumentCount => simple(0, ResultPolicy::Register),
             Self::LoadActualArgument => simple(1, ResultPolicy::Register),

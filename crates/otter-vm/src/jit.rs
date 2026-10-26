@@ -445,6 +445,8 @@ pub struct JitClassConstructorLayout {
     pub type_tag: u8,
     /// Byte offset from the wrapper body to its traced exact-family head.
     pub constructor_layouts_byte: u32,
+    /// Header-inclusive byte offset of the wrapper's constructor body value.
+    pub ctor_byte: u32,
 }
 
 /// One VM-owned layout of the traced constructor family cell. Every offset

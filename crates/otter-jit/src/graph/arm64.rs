@@ -2529,6 +2529,17 @@ impl<'a> Codegen<'a> {
                 let (function_id, cell) = (*function_id, *cell);
                 self.emit_check_function(node, function_id, cell, value);
             }
+            Kind::LoadClassConstructor => {
+                let value = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a class constructor result"));
+                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                let class = self.view_of(node).class_constructor_layout;
+                self.emit_cell_receiver(value, exit);
+                dynasm!(self.ops ; .arch aarch64
+                    ; ldrb w16, [X(value)]
+                    ; cmp w16, u32::from(class.type_tag) ; b.ne =>exit
+                    ; ldr X(destination), [X(value), class.ctor_byte]);
+            }
             Kind::AllocationGroup(index) => self.emit_allocation_group(node, *index)?,
             Kind::AllocationProjection(byte) => self.emit_allocation_projection(node, *byte),
             Kind::PrimitiveAdd => self.emit_primitive_add(node)?,

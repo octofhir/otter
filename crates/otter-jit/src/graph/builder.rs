@@ -666,8 +666,10 @@ const MAX_SELECTED_ARGUMENTS: usize = 8;
 enum InlineThis {
     /// A call's actual receiver.
     Bound(NodeId),
-    /// A construct's receiver, allocated in place as this plan describes.
-    Construct(otter_vm::jit::JitReceiverAllocationPlan),
+    /// A construct's receiver, allocated in place as this plan describes,
+    /// with this new.target: the constructed closure itself, or the class
+    /// wrapper whose constructor body runs.
+    Construct(otter_vm::jit::JitReceiverAllocationPlan, NodeId),
 }
 
 /// The call an inlined body runs for.
@@ -1120,9 +1122,10 @@ impl<'a> Builder<'a> {
         plan: otter_vm::jit::JitDirectCallPlan,
         allocation: otter_vm::jit::JitReceiverAllocationPlan,
         closure: NodeId,
+        new_target: NodeId,
         arguments: &[NodeId],
     ) -> bool {
-        let this = InlineThis::Construct(allocation);
+        let this = InlineThis::Construct(allocation, new_target);
         self.inline_frame(instruction, body, plan, closure, this, arguments)
     }
 
@@ -1214,8 +1217,9 @@ impl<'a> Builder<'a> {
         // or refill resumes the whole construct.
         let (this, new_target, receiver) = match this {
             InlineThis::Bound(this) => (this, self.undefined, None),
-            InlineThis::Construct(allocation) => {
-                let receiver = self.add(Kind::NewReceiver(allocation), &[closure], Repr::Tagged);
+            InlineThis::Construct(allocation, new_target) => {
+                let receiver =
+                    self.add(Kind::NewReceiver(allocation), &[new_target], Repr::Tagged);
                 let shape = match allocation.receiver_shape {
                     0 => allocation.prototype_root,
                     shape => shape,
@@ -1227,7 +1231,7 @@ impl<'a> Builder<'a> {
                 // A failed bump resumes the construct elsewhere: the node only
                 // ever yields a buffer cell.
                 self.known.fresh.insert(receiver);
-                (receiver, closure, Some(receiver))
+                (receiver, new_target, Some(receiver))
             }
         };
         let destination = instruction.writes[0];
@@ -3858,11 +3862,11 @@ impl<'a> Builder<'a> {
                 return;
             }
         }
-        // A closure constructing itself allocates its receiver in place when
-        // generated code may allocate at all.
+        // A closure or class constructing itself allocates its receiver in
+        // place when generated code may allocate at all. A class runs its
+        // constructor body with the class as new.target.
         if let Some(plan) = plan
             && let Some(allocation) = allocation
-            && !allocation.new_target_is_class
             && self.view.literal_allocations.group_allowed
             && let Some(body) = self.inline_body(instruction.byte_pc, plan.function_id)
         {
@@ -3870,8 +3874,19 @@ impl<'a> Builder<'a> {
                 .iter()
                 .map(|&register| self.read(register))
                 .collect();
-            if self.inline_construct(instruction, body, plan, allocation, callee, &values) {
+            let checkpoint = self.current.map(|block| self.graph.checkpoint(block));
+            let closure = if allocation.new_target_is_class {
+                self.add(Kind::LoadClassConstructor, &[callee], Repr::Tagged)
+            } else {
+                callee
+            };
+            if self.inline_construct(instruction, body, plan, allocation, closure, callee, &values) {
                 return;
+            }
+            if let Some(checkpoint) = checkpoint
+                && closure != callee
+            {
+                self.graph.rollback(checkpoint);
             }
         }
         let mut inputs: SmallVec<[NodeId; 4]> = SmallVec::new();

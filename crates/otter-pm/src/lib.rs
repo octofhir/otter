@@ -76,7 +76,6 @@ pub use registry::{
 };
 pub use resolve::{Announced, Prefetch, enrich_resolution_with_registry_metadata};
 pub use script_sniff::{ScriptFinding, suspicious_script_findings};
-pub use store::{ContentStore, PackageIndex, StoredFile};
 pub use tarball::{FileTarballClient, HttpTarballClient, TarballFetchClient, TarballSource};
 pub use warning::InstallWarning;
 
@@ -2078,10 +2077,13 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            extracted.index.files.keys().collect::<Vec<_>>(),
-            ["index.d.ts", "package.json"]
-        );
+        let tree = tmp.path().join("cache/store/trees").join(&extracted.key);
+        let mut files: Vec<String> = std::fs::read_dir(&tree)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        assert_eq!(files, ["index.d.ts", "package.json"]);
     }
 
     #[tokio::test]
@@ -2108,14 +2110,7 @@ mod tests {
             refused,
             Err(PackageManagerError::Integrity { .. })
         ));
-        assert!(
-            store
-                .content_store()
-                .read_index(&tarball::tarball_cache_key(&source))
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(!store.has_package(&source));
     }
 
     #[tokio::test]

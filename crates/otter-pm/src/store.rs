@@ -1,494 +1,285 @@
-//! Content-addressed package store.
+//! Package store: one unpacked tree per package tarball, shared by every
+//! project on the machine.
 //!
-//! A package's files are stored once, by content hash, and every project that
-//! installs that package links to the same bytes. Two checkouts of the same
-//! dependency cost one copy on disk, not two; a version bump that touches one
-//! file re-stores one file. The alternative — a full copy of every package
-//! into every `node_modules` — pays the whole tree again each time.
-//!
-//! What a package *is* becomes an index: a map from relative path to the
-//! content hash holding that path's bytes. Materializing is then a walk over
-//! that index creating links, with no archive reading and no byte copying in
-//! the common case.
+//! A tarball is unpacked once, into a directory named by the tarball's
+//! integrity, and that directory never changes again. Installing a package is
+//! a copy of its tree into the project: one copy-on-write clone where the
+//! filesystem clones directories (APFS), a hard link per file where it does
+//! not, and a byte copy where the store and the project share no filesystem.
+//! No step reads, hashes or rewrites a stored file.
 //!
 //! # Contents
-//! - [`ContentStore`] — the hashed file store and its package indexes.
-//! - [`PackageIndex`] — what one package's tree contains.
-//! - [`StoredFile`] — one file's hash, size, and executable bit.
+//! - [`TreeStore`] — the store, its trees and their materialization.
+//! - [`StagedFile`] — one file of a tree being unpacked.
 //!
 //! # Invariants
-//! - Stored content is immutable. A path under the store is named by the hash
-//!   of its bytes, so writing it twice writes the same thing, and nothing ever
-//!   updates a stored file in place.
-//! - Writes land through a temporary path and a rename, so a reader never
-//!   observes a partially written file or index.
-//! - Materialization clones a package's stored tree where the filesystem
-//!   clones directories, and otherwise prefers a hard link per file and falls
-//!   back to a copy. A link is free; a copy is correct on a filesystem that
-//!   cannot link across its layout. All leave the same tree behind.
-//! - A stored tree, like stored content, is written once through a temporary
-//!   directory and never changed; a clone of it is the project's own copy.
-//! - Index maps are ordered, so a fingerprint over an index is stable across
-//!   platforms and runs.
+//! - A tree is written into a staging directory private to its writer and
+//!   published by one rename: a published tree is complete, and its existence
+//!   is its only record.
+//! - A published tree is immutable; a project's copy of it is the project's
+//!   own (a clone shares blocks until written, a hard link shares the inode
+//!   with every other project's link).
+//! - A staged file is written once, already carrying its final mode; files
+//!   of one tree may be written from several threads, each into a directory
+//!   created before it.
 //!
 //! # See also
-//! - [`crate::install`] for extraction into this store and materialization out
-//!   of it.
+//! - [`crate::install`] for unpacking tarballs into the store and installing
+//!   from it.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::PackageManagerError;
 
-/// One file inside a stored package.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredFile {
-    /// Content hash naming this file's bytes in the store.
-    pub hash: String,
-    /// File size in bytes.
-    pub size: u64,
-    /// Whether the file carries an executable bit.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub executable: bool,
+/// Files a single thread writes before another one is worth starting.
+const FILES_PER_WRITER: usize = 128;
+
+/// The most threads one tree is written by.
+const MAX_WRITERS: usize = 8;
+
+/// One file of a tree being unpacked.
+#[derive(Debug)]
+pub(crate) struct StagedFile {
+    /// Package-relative path, `/`-separated.
+    pub(crate) path: String,
+    /// The file's bytes.
+    pub(crate) bytes: Vec<u8>,
+    /// Whether it carries an executable bit.
+    pub(crate) executable: bool,
 }
 
-/// What one package's tree contains.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PackageIndex {
-    /// Files keyed by package-relative path, always `/`-separated.
-    pub files: BTreeMap<String, StoredFile>,
-}
-
-impl PackageIndex {
-    /// Stable fingerprint of this index's contents.
-    ///
-    /// Two indexes fingerprint alike exactly when they would materialize the
-    /// same tree, which is what makes it usable as an "already installed"
-    /// marker.
-    #[must_use]
-    pub fn fingerprint(&self) -> String {
-        let mut hasher = Sha256::new();
-        for (path, file) in &self.files {
-            hasher.update(path.as_bytes());
-            hasher.update([0]);
-            hasher.update(file.hash.as_bytes());
-            hasher.update([0]);
-            hasher.update(u8::from(file.executable).to_le_bytes());
-            hasher.update([0]);
-        }
-        hex_digest(&hasher.finalize())
-    }
-}
-
-/// Hashed file store plus the package indexes that describe trees over it.
+/// The unpacked trees of every package tarball this machine installed.
 #[derive(Debug, Clone)]
-pub struct ContentStore {
-    files_root: PathBuf,
-    index_root: PathBuf,
+pub(crate) struct TreeStore {
     trees_root: PathBuf,
 }
 
-impl ContentStore {
-    /// Create a store rooted at `root`.
+impl TreeStore {
+    /// A store rooted at `root`.
     #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        let root = root.into();
+    pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         Self {
-            files_root: root.join("files"),
-            index_root: root.join("index"),
-            trees_root: root.join("trees"),
+            trees_root: root.into().join("trees"),
         }
     }
 
-    /// Path holding the bytes named by `hash`.
-    ///
-    /// Content is split one level by hash prefix so a large store does not put
-    /// every file in one directory.
+    /// The tree of the tarball filed under `key`.
     #[must_use]
-    pub fn file_path(&self, hash: &str) -> PathBuf {
-        let (prefix, rest) = hash.split_at(hash.len().min(2));
-        self.files_root.join(prefix).join(rest)
+    pub(crate) fn tree(&self, key: &str) -> PathBuf {
+        self.trees_root.join(key)
     }
 
-    /// Path holding the index for `key`.
+    /// Whether the tarball filed under `key` is already unpacked.
     #[must_use]
-    pub fn index_path(&self, key: &str) -> PathBuf {
-        self.index_root.join(format!("{key}.json"))
+    pub(crate) fn has_tree(&self, key: &str) -> bool {
+        self.tree(key).is_dir()
     }
 
-    /// Read a package index, if one was stored for `key`.
-    pub async fn read_index(&self, key: &str) -> Result<Option<PackageIndex>, PackageManagerError> {
-        let path = self.index_path(key);
-        let text = match tokio::fs::read_to_string(&path).await {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => {
-                return Err(PackageManagerError::Io {
-                    path,
-                    message: err.to_string(),
-                });
-            }
-        };
-        serde_json::from_str(&text)
-            .map(Some)
-            .map_err(|err| PackageManagerError::Archive {
-                path,
-                message: err.to_string(),
-            })
-    }
-
-    /// Store `bytes` under their content hash and describe the result.
+    /// Unpack `files` as the tree of `key`, unless another writer published
+    /// it first.
     ///
-    /// Already-stored content is left untouched: the bytes cannot differ,
-    /// because the path is named after them.
-    pub fn add_file(
-        &self,
-        bytes: &[u8],
-        executable: bool,
-    ) -> Result<StoredFile, PackageManagerError> {
-        let hash = hex_digest(&Sha256::digest(bytes));
-        let path = self.file_path(&hash);
-        if !path.exists() {
-            let parent = path.parent().unwrap_or(&self.files_root);
-            create_dir_all(parent)?;
-            // Packages store concurrently and often share a file: the
-            // temporary name is the writing thread's own.
-            let temporary = parent.join(format!(
-                ".tmp-{hash}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            std::fs::write(&temporary, bytes).map_err(|err| PackageManagerError::Io {
-                path: temporary.clone(),
-                message: err.to_string(),
-            })?;
-            set_executable(&temporary, executable)?;
-            // A concurrent writer may have landed the same content first; the
-            // bytes are identical either way, so a lost race is a success.
-            match std::fs::rename(&temporary, &path) {
-                Ok(()) => {}
-                Err(_) if path.exists() => {
-                    let _ = std::fs::remove_file(&temporary);
-                }
-                Err(err) => {
-                    return Err(PackageManagerError::Io {
-                        path,
-                        message: err.to_string(),
-                    });
-                }
-            }
-        }
-        Ok(StoredFile {
-            hash,
-            size: bytes.len() as u64,
-            executable,
-        })
-    }
-
-    /// Write the index describing one package tree.
-    pub fn write_index(&self, key: &str, index: &PackageIndex) -> Result<(), PackageManagerError> {
-        create_dir_all(&self.index_root)?;
-        let path = self.index_path(key);
-        let text = serde_json::to_string(index).map_err(|err| PackageManagerError::Archive {
-            path: path.clone(),
-            message: err.to_string(),
-        })?;
-        let temporary = self
-            .index_root
-            .join(format!(".tmp-{key}-{}.json", std::process::id()));
-        std::fs::write(&temporary, text).map_err(|err| PackageManagerError::Io {
-            path: temporary.clone(),
-            message: err.to_string(),
-        })?;
-        std::fs::rename(&temporary, &path).map_err(|err| PackageManagerError::Io {
-            path,
-            message: err.to_string(),
-        })
-    }
-
-    /// Materialize the package filed under `key` into `target_root`, a path
-    /// that does not exist yet.
-    ///
-    /// Where the filesystem clones directories (APFS), the package's tree is
-    /// built once in the store and every install clones it whole: one call
-    /// per package, its files sharing the stored blocks until written.
-    /// Elsewhere every file is linked as [`Self::materialize`] links it.
-    pub fn materialize_package(
+    /// # Errors
+    /// A filesystem failure writing the staged tree or publishing it.
+    pub(crate) fn store_tree(
         &self,
         key: &str,
-        index: &PackageIndex,
-        target_root: &Path,
+        files: Vec<StagedFile>,
     ) -> Result<(), PackageManagerError> {
-        #[cfg(target_os = "macos")]
-        {
-            // A clone creates its target, not the directories above it.
-            if let Some(parent) = target_root.parent() {
-                create_dir_all(parent)?;
-            }
-            if self.ensure_tree(key, index).is_ok()
-                && clone_tree(&self.trees_root.join(key), target_root).is_ok()
-            {
-                return Ok(());
-            }
-        }
-        self.materialize(index, target_root)
-    }
-
-    /// The stored tree of the package filed under `key`, built from its
-    /// index when its extraction did not build it.
-    #[cfg(target_os = "macos")]
-    fn ensure_tree(&self, key: &str, index: &PackageIndex) -> Result<(), PackageManagerError> {
-        if self.trees_root.join(key).exists() {
-            return Ok(());
-        }
-        let staging = self.tree_staging(key)?;
-        self.materialize(index, &staging)?;
-        self.publish_tree(key, &staging)
-    }
-
-    /// An empty directory an extraction builds the tree of `key` in, private
-    /// to the calling thread.
-    pub(crate) fn tree_staging(&self, key: &str) -> Result<PathBuf, PackageManagerError> {
         let staging = self.trees_root.join(format!(
             ".tmp-{key}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         if staging.exists() {
-            std::fs::remove_dir_all(&staging).map_err(|err| PackageManagerError::Io {
-                path: staging.clone(),
-                message: err.to_string(),
-            })?;
+            std::fs::remove_dir_all(&staging).map_err(|err| io_error(&staging, &err))?;
         }
         create_dir_all(&staging)?;
-        Ok(staging)
-    }
-
-    /// Write one file of a tree being staged.
-    pub(crate) fn stage_tree_file(
-        staging: &Path,
-        relative: &str,
-        bytes: &[u8],
-        executable: bool,
-    ) -> Result<(), PackageManagerError> {
-        let target = relative
-            .split('/')
-            .fold(staging.to_path_buf(), |path, part| path.join(part));
-        if let Some(parent) = target.parent()
-            && parent != staging
-        {
-            create_dir_all(parent)?;
-        }
-        std::fs::write(&target, bytes).map_err(|err| PackageManagerError::Io {
-            path: target.clone(),
-            message: err.to_string(),
-        })?;
-        set_executable(&target, executable)
-    }
-
-    /// Make a staged tree the stored tree of `key`.
-    pub(crate) fn publish_tree(
-        &self,
-        key: &str,
-        staging: &Path,
-    ) -> Result<(), PackageManagerError> {
-        let tree = self.trees_root.join(key);
-        // A concurrent install may have landed the same tree first.
-        match std::fs::rename(staging, &tree) {
+        write_files(&staging, files)?;
+        let tree = self.tree(key);
+        match std::fs::rename(&staging, &tree) {
             Ok(()) => Ok(()),
-            Err(_) if tree.exists() => {
-                let _ = std::fs::remove_dir_all(staging);
+            // A concurrent install landed the same tree first.
+            Err(_) if tree.is_dir() => {
+                let _ = std::fs::remove_dir_all(&staging);
                 Ok(())
             }
-            Err(err) => Err(PackageManagerError::Io {
-                path: tree,
-                message: err.to_string(),
-            }),
+            Err(err) => Err(io_error(&tree, &err)),
         }
     }
 
-    /// Whether this platform keeps stored trees to clone.
-    #[must_use]
-    pub(crate) const fn keeps_trees() -> bool {
-        cfg!(target_os = "macos")
-    }
-
-    /// Materialize `index` into `target_root`, linking to stored content.
-    pub fn materialize(
-        &self,
-        index: &PackageIndex,
-        target_root: &Path,
-    ) -> Result<(), PackageManagerError> {
-        create_dir_all(target_root)?;
-        for (relative, file) in &index.files {
-            let target = relative
-                .split('/')
-                .fold(target_root.to_path_buf(), |path, part| path.join(part));
-            if let Some(parent) = target.parent() {
-                create_dir_all(parent)?;
-            }
-            match std::fs::remove_file(&target) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(PackageManagerError::Io {
-                        path: target,
-                        message: err.to_string(),
-                    });
-                }
-            }
-            let source = self.file_path(&file.hash);
-            if std::fs::hard_link(&source, &target).is_ok() {
-                continue;
-            }
-            // A filesystem that cannot link the store into this tree still has
-            // to end up with the same file.
-            std::fs::copy(&source, &target).map_err(|err| PackageManagerError::Io {
-                path: target.clone(),
-                message: err.to_string(),
-            })?;
-            set_executable(&target, file.executable)?;
+    /// Copy the tree of `key` to `target`, a path that does not exist yet.
+    ///
+    /// # Errors
+    /// A missing tree, or a filesystem failure creating the copy.
+    pub(crate) fn materialize(&self, key: &str, target: &Path) -> Result<(), PackageManagerError> {
+        let tree = self.tree(key);
+        if let Some(parent) = target.parent() {
+            create_dir_all(parent)?;
         }
-        Ok(())
+        #[cfg(target_os = "macos")]
+        if reflink_copy::reflink(&tree, target).is_ok() {
+            return Ok(());
+        }
+        link_tree(&tree, target)
     }
 }
 
-/// Clone directory `source` to `target` with one copy-on-write call.
-#[cfg(target_os = "macos")]
-fn clone_tree(source: &Path, target: &Path) -> std::io::Result<()> {
-    reflink_copy::reflink(source, target)
-}
-
-fn create_dir_all(path: &Path) -> Result<(), PackageManagerError> {
-    std::fs::create_dir_all(path).map_err(|err| PackageManagerError::Io {
-        path: path.to_path_buf(),
-        message: err.to_string(),
+/// Write `files` under `root`, splitting a large tree across threads.
+fn write_files(root: &Path, files: Vec<StagedFile>) -> Result<(), PackageManagerError> {
+    let directories: BTreeSet<PathBuf> = files
+        .iter()
+        .filter_map(|file| Path::new(&file.path).parent().map(Path::to_path_buf))
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .collect();
+    for directory in &directories {
+        create_dir_all(&root.join(directory))?;
+    }
+    let writers = files.len().div_ceil(FILES_PER_WRITER).clamp(1, MAX_WRITERS);
+    if writers == 1 {
+        return files.iter().try_for_each(|file| write_file(root, file));
+    }
+    let chunk = files.len().div_ceil(writers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .chunks(chunk)
+            .map(|files| {
+                scope.spawn(move || files.iter().try_for_each(|file| write_file(root, file)))
+            })
+            .collect();
+        handles.into_iter().try_for_each(|handle| {
+            handle
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
     })
 }
 
-#[cfg(unix)]
-fn set_executable(path: &Path, executable: bool) -> Result<(), PackageManagerError> {
-    use std::os::unix::fs::PermissionsExt;
+fn write_file(root: &Path, file: &StagedFile) -> Result<(), PackageManagerError> {
+    use std::io::Write as _;
 
-    let mode = if executable { 0o755 } else { 0o644 };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(|err| {
-        PackageManagerError::Io {
-            path: path.to_path_buf(),
-            message: err.to_string(),
-        }
-    })
+    let target = file
+        .path
+        .split('/')
+        .fold(root.to_path_buf(), |path, part| path.join(part));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(if file.executable { 0o755 } else { 0o644 });
+    }
+    options
+        .open(&target)
+        .and_then(|mut out| out.write_all(&file.bytes))
+        .map_err(|err| io_error(&target, &err))
 }
 
-#[cfg(not(unix))]
-fn set_executable(_path: &Path, _executable: bool) -> Result<(), PackageManagerError> {
+/// Recreate `source`'s directories under `target` and hard-link its files,
+/// copying a file where the filesystem refuses the link.
+fn link_tree(source: &Path, target: &Path) -> Result<(), PackageManagerError> {
+    create_dir_all(target)?;
+    let entries = std::fs::read_dir(source).map_err(|err| io_error(source, &err))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| io_error(source, &err))?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let kind = entry.file_type().map_err(|err| io_error(&from, &err))?;
+        if kind.is_dir() {
+            link_tree(&from, &to)?;
+        } else if std::fs::hard_link(&from, &to).is_err() {
+            std::fs::copy(&from, &to).map_err(|err| io_error(&to, &err))?;
+        }
+    }
     Ok(())
 }
 
-fn hex_digest(digest: &[u8]) -> String {
-    let mut out = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+fn create_dir_all(path: &Path) -> Result<(), PackageManagerError> {
+    std::fs::create_dir_all(path).map_err(|err| io_error(path, &err))
+}
+
+fn io_error(path: &Path, err: &std::io::Error) -> PackageManagerError {
+    PackageManagerError::Io {
+        path: path.to_path_buf(),
+        message: err.to_string(),
     }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn identical_content_is_stored_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ContentStore::new(tmp.path());
-        let first = store.add_file(b"same bytes", false).unwrap();
-        let second = store.add_file(b"same bytes", false).unwrap();
-        assert_eq!(first, second);
-        assert!(store.file_path(&first.hash).is_file());
+    fn staged(path: &str, bytes: &[u8], executable: bool) -> StagedFile {
+        StagedFile {
+            path: path.to_string(),
+            bytes: bytes.to_vec(),
+            executable,
+        }
     }
 
     #[test]
-    fn a_materialized_tree_shares_bytes_with_the_store() {
+    fn a_stored_tree_materializes_with_its_files_and_modes() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ContentStore::new(tmp.path().join("store"));
-        let mut index = PackageIndex::default();
-        index.files.insert(
-            "index.js".to_string(),
-            store.add_file(b"body", false).unwrap(),
-        );
-        index.files.insert(
-            "bin/tool.js".to_string(),
-            store.add_file(b"#!/usr/bin/env otter\n", true).unwrap(),
-        );
+        let store = TreeStore::new(tmp.path().join("store"));
+        store
+            .store_tree(
+                "pkg",
+                vec![
+                    staged("index.js", b"body", false),
+                    staged("bin/tool.js", b"#!/usr/bin/env otter\n", true),
+                ],
+            )
+            .unwrap();
+        assert!(store.has_tree("pkg"));
 
         let target = tmp.path().join("node_modules/tool");
-        store.materialize(&index, &target).unwrap();
+        store.materialize("pkg", &target).unwrap();
         assert_eq!(std::fs::read(target.join("index.js")).unwrap(), b"body");
-        assert!(target.join("bin/tool.js").is_file());
-
-        let stored = store.file_path(&index.files["index.js"].hash);
-        assert_eq!(
-            std::fs::metadata(&stored).unwrap().len(),
-            std::fs::metadata(target.join("index.js")).unwrap().len()
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&target.join("bin/tool.js")), 0o755);
+            assert_eq!(mode(&target.join("index.js")), 0o644);
+        }
     }
 
     #[test]
-    fn materializing_twice_ends_at_the_same_tree() {
+    fn a_large_tree_written_by_several_threads_is_whole() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ContentStore::new(tmp.path().join("store"));
-        let mut index = PackageIndex::default();
-        index.files.insert(
-            "index.js".to_string(),
-            store.add_file(b"one", false).unwrap(),
-        );
+        let store = TreeStore::new(tmp.path().join("store"));
+        let files = (0..FILES_PER_WRITER * 3)
+            .map(|n| {
+                staged(
+                    &format!("lib/{}/f{n}.js", n % 7),
+                    n.to_string().as_bytes(),
+                    false,
+                )
+            })
+            .collect();
+        store.store_tree("big", files).unwrap();
+
         let target = tmp.path().join("out");
-        store.materialize(&index, &target).unwrap();
-
-        let mut next = PackageIndex::default();
-        next.files.insert(
-            "index.js".to_string(),
-            store.add_file(b"two", false).unwrap(),
-        );
-        store.materialize(&next, &target).unwrap();
-        assert_eq!(std::fs::read(target.join("index.js")).unwrap(), b"two");
-    }
-
-    #[tokio::test]
-    async fn an_index_round_trips_through_the_store() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = ContentStore::new(tmp.path());
-        let mut index = PackageIndex::default();
-        index
-            .files
-            .insert("a.js".to_string(), store.add_file(b"a", false).unwrap());
-        store.write_index("tool-1.0.0", &index).unwrap();
-        assert_eq!(
-            store.read_index("tool-1.0.0").await.unwrap(),
-            Some(index.clone())
-        );
-        assert_eq!(store.read_index("absent").await.unwrap(), None);
+        store.materialize("big", &target).unwrap();
+        for n in 0..FILES_PER_WRITER * 3 {
+            let path = target.join(format!("lib/{}/f{n}.js", n % 7));
+            assert_eq!(std::fs::read_to_string(path).unwrap(), n.to_string());
+        }
     }
 
     #[test]
-    fn a_fingerprint_follows_the_contents_not_the_order_they_were_added() {
+    fn a_tree_published_twice_keeps_the_first() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = ContentStore::new(tmp.path());
-        let a = store.add_file(b"a", false).unwrap();
-        let b = store.add_file(b"b", false).unwrap();
-
-        let mut one = PackageIndex::default();
-        one.files.insert("a.js".to_string(), a.clone());
-        one.files.insert("b.js".to_string(), b.clone());
-        let mut two = PackageIndex::default();
-        two.files.insert("b.js".to_string(), b);
-        two.files.insert("a.js".to_string(), a);
-        assert_eq!(one.fingerprint(), two.fingerprint());
-
-        let mut different = one.clone();
-        different.files.remove("a.js");
-        assert_ne!(one.fingerprint(), different.fingerprint());
+        let store = TreeStore::new(tmp.path().join("store"));
+        store
+            .store_tree("pkg", vec![staged("a.js", b"first", false)])
+            .unwrap();
+        store
+            .store_tree("pkg", vec![staged("a.js", b"second", false)])
+            .unwrap();
+        assert_eq!(
+            std::fs::read(store.tree("pkg").join("a.js")).unwrap(),
+            b"first"
+        );
     }
 }

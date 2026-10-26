@@ -1,34 +1,31 @@
 //! Package extraction and project materialization.
 //!
-//! This module owns the install layout side of package management. It consumes
-//! already enriched lockfile registry tarball sources, reuses the tarball
-//! cache, extracts package archives into the content-addressed store,
-//! materializes `node_modules` by linking to stored content, and links package
-//! binaries.
+//! This module owns the install layout side of package management. It
+//! fetches the tarballs a lockfile names, unpacks each once into the
+//! machine's package store, materializes the project's package directories
+//! from the stored trees, and links package binaries.
 //!
-//! Extraction happens once per tarball across every project on the machine:
-//! the archive becomes hashed files plus an index describing the tree, and
-//! installing is then a walk over that index. A second project installing the
-//! same package writes no package bytes at all.
+//! A tarball is unpacked once across every project on the machine: a second
+//! project installing the same package reads no archive and writes no byte of
+//! it, only its own copy of the stored tree.
 //!
 //! # Contents
-//! - [`FsPackageStore`] is the tarball cache, content store, and materializer.
-//! - [`ExtractedPackage`] describes a package's stored tree.
+//! - [`FsPackageStore`] is the package store and materializer.
+//! - [`ExtractedPackage`] names a package's stored tree.
 //! - [`InstalledPackage`] describes one project-local materialized package.
 //!
 //! # Invariants
 //! - Lifecycle scripts are not executed.
 //! - Install roots are refreshed through temporary directories before rename.
 //! - Archive paths are normalized and may not escape the package root.
-//! - A materialized file is a link to stored content wherever the filesystem
-//!   allows it, and a copy of the same bytes where it does not.
+//! - A tarball is verified before it is unpacked, and unpacked from memory.
 //! - Bin links point at the project-local `node_modules/.bin` layout.
 //! - A package version materializes into its one directory of
 //!   [`crate::layout`]; no two packages share a directory or a temporary one.
 //!
 //! # See also
 //! - [`crate::install_local_project`] for the full resolve/fetch/write flow.
-//! - [`crate::store`] for the content store and package index.
+//! - [`crate::store`] for the package store.
 //! - [`crate::tarball`] for byte fetch and integrity verification.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -41,7 +38,7 @@ use flate2::read::GzDecoder;
 use otter_pm_lockfile::{LockedPackage, Lockfile, ResolvedSource, ResolvedSourceKind};
 use otter_pm_manifest::{PACKAGE_JSON, PackageBinManifest, PackageManifest};
 
-use crate::store::{ContentStore, PackageIndex};
+use crate::store::{StagedFile, TreeStore};
 use crate::tarball::{tarball_cache_key, verify_tarball_integrity};
 use crate::{
     PackageBin, PackageId, PackageManagerError, TarballFetchClient, TarballSource,
@@ -54,10 +51,11 @@ pub const FETCH_CONCURRENCY: usize = 64;
 /// Package directories materialized at once.
 pub const MATERIALIZE_CONCURRENCY: usize = 16;
 
-/// Content-addressed package store and project materializer.
+/// The machine's store of unpacked package tarballs, and the project
+/// materializer over it.
 #[derive(Debug, Clone)]
 pub struct FsPackageStore {
-    content: ContentStore,
+    trees: TreeStore,
 }
 
 impl FsPackageStore {
@@ -66,29 +64,29 @@ impl FsPackageStore {
     pub fn new(cache_root: impl Into<PathBuf>) -> Self {
         let cache_root = cache_root.into();
         Self {
-            content: ContentStore::new(cache_root.join("store")),
+            trees: TreeStore::new(cache_root.join("store")),
         }
     }
 
     /// Create the package store shared by every project for this user.
     ///
-    /// Sharing is the point: a package extracted for one checkout is already
-    /// stored for the next one, and the two trees link to the same bytes.
+    /// Sharing is the point: a package unpacked for one checkout is already
+    /// stored for the next one, and their copies share its bytes.
     #[must_use]
     pub fn user_default() -> Self {
         Self::new(crate::user_cache_root())
     }
 
-    /// Borrow the content store backing this package store.
+    /// Whether the tarball `source` names is already unpacked in the store.
     #[must_use]
-    pub fn content_store(&self) -> &ContentStore {
-        &self.content
+    pub fn has_package(&self, source: &TarballSource) -> bool {
+        self.trees.has_tree(&tarball_cache_key(source))
     }
 
-    /// Fetch, verify, and extract one package into the content store.
+    /// Fetch, verify, and unpack one package into the store.
     ///
-    /// A package already in the store is reused without its tarball: the
-    /// index is named by the tarball's integrity. A fetched tarball is
+    /// A package already in the store is reused without its tarball: its
+    /// tree is named by the tarball's integrity. A fetched tarball is
     /// verified and unpacked from memory; it is never written to disk.
     pub async fn get_or_fetch_and_extract(
         &self,
@@ -96,41 +94,25 @@ impl FsPackageStore {
         client: &impl TarballFetchClient,
     ) -> Result<ExtractedPackage, PackageManagerError> {
         let key = tarball_cache_key(source);
-        if let Some(index) = self.content.read_index(&key).await? {
-            return Ok(ExtractedPackage {
-                index,
-                reused: true,
-            });
+        if self.trees.has_tree(&key) {
+            return Ok(ExtractedPackage { key, reused: true });
         }
         let bytes = client.fetch_tarball(&source.url).await?;
-        let content = self.content.clone();
+        let trees = self.trees.clone();
         let source = source.clone();
         let url = source.url.clone();
-        let index = tokio::task::spawn_blocking(move || {
+        let stored_key = key.clone();
+        tokio::task::spawn_blocking(move || {
             verify_tarball_integrity(&source, &bytes)?;
-            // Where installs clone a stored tree, the extraction builds it
-            // in the same pass that stores the files.
-            let staging = if ContentStore::keeps_trees() {
-                Some(content.tree_staging(&key)?)
-            } else {
-                None
-            };
-            let index = store_tgz_package(&content, &bytes, &source.url, staging.as_deref())?;
-            content.write_index(&key, &index)?;
-            if let Some(staging) = &staging {
-                content.publish_tree(&key, staging)?;
-            }
-            Ok::<_, PackageManagerError>(index)
+            let files = unpack_tgz(&bytes, &source.url)?;
+            trees.store_tree(&stored_key, files)
         })
         .await
         .map_err(|err| PackageManagerError::Archive {
             path: PathBuf::from(&url),
             message: err.to_string(),
         })??;
-        Ok(ExtractedPackage {
-            index,
-            reused: false,
-        })
+        Ok(ExtractedPackage { key, reused: false })
     }
 
     /// Fetch and extract into the store every tarball announced on
@@ -190,16 +172,16 @@ impl FsPackageStore {
                     .join("node_modules")
                     .join(".otter-state")
                     .join(format!("{}.source", cache_key(&id)));
-                let fingerprint = extracted.index.fingerprint();
+                // The tarball's integrity names exactly what it unpacks to.
+                let fingerprint = &extracted.key;
                 let reused_install =
-                    existing_install_matches(&install_root, &marker, &fingerprint).await?;
+                    existing_install_matches(&install_root, &marker, fingerprint).await?;
                 if !reused_install {
                     self.materialize_install_root(
-                        &tarball_cache_key(&source),
-                        &extracted.index,
+                        &extracted.key,
                         &install_root,
                         &marker,
-                        &fingerprint,
+                        fingerprint,
                     )
                     .await?;
                 }
@@ -246,14 +228,12 @@ impl FsPackageStore {
     async fn materialize_install_root(
         &self,
         key: &str,
-        index: &PackageIndex,
         install_root: &Path,
         marker: &Path,
         fingerprint: &str,
     ) -> Result<(), PackageManagerError> {
-        let content = self.content.clone();
+        let trees = self.trees.clone();
         let key = key.to_string();
-        let index = index.clone();
         let install_root = install_root.to_path_buf();
         let install_root_for_error = install_root.clone();
         let marker = marker.to_path_buf();
@@ -271,7 +251,7 @@ impl FsPackageStore {
                     message: err.to_string(),
                 })?;
             }
-            content.materialize_package(&key, &index, &temporary)?;
+            trees.materialize(&key, &temporary)?;
             replace_directory(&temporary, &install_root)?;
             write_marker(&marker, &fingerprint)
         })
@@ -329,9 +309,9 @@ fn materialization_tarball_url(
 /// One package's stored tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedPackage {
-    /// Package tree, with npm's leading `package/` prefix stripped.
-    pub index: PackageIndex,
-    /// `true` when the package was already in the content store.
+    /// The store key its tree is filed under.
+    pub key: String,
+    /// `true` when the package was already in the store.
     pub reused: bool,
 }
 
@@ -414,64 +394,49 @@ fn replace_directory(temporary: &Path, install_root: &Path) -> Result<(), Packag
     })
 }
 
-/// Read a package archive into the content store and describe its tree.
-///
-/// Directory entries are not recorded: a file's path implies every directory
-/// above it, and materialization creates them.
-fn store_tgz_package(
-    content: &ContentStore,
-    archive: &[u8],
-    url: &str,
-    tree: Option<&Path>,
-) -> Result<PackageIndex, PackageManagerError> {
+/// The regular files of a package archive, with npm's leading root directory
+/// stripped. Directory entries are not kept: a file's path implies every
+/// directory above it. An archive naming a path twice keeps its last entry,
+/// as unpacking it in order would.
+fn unpack_tgz(archive: &[u8], url: &str) -> Result<Vec<StagedFile>, PackageManagerError> {
     let archive_path = Path::new(url);
-    let decoder = GzDecoder::new(archive);
-    let mut archive = tar::Archive::new(decoder);
-    let entries = archive
-        .entries()
-        .map_err(|err| PackageManagerError::Archive {
-            path: archive_path.to_path_buf(),
-            message: err.to_string(),
-        })?;
-    let mut index = PackageIndex::default();
-    let mut bytes = Vec::new();
-    for entry in entries {
-        let mut entry = entry.map_err(|err| PackageManagerError::Archive {
-            path: archive_path.to_path_buf(),
-            message: err.to_string(),
-        })?;
+    let archive_error = |err: std::io::Error| PackageManagerError::Archive {
+        path: archive_path.to_path_buf(),
+        message: err.to_string(),
+    };
+    let mut archive = tar::Archive::new(GzDecoder::new(archive));
+    let mut files: Vec<StagedFile> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for entry in archive.entries().map_err(archive_error)? {
+        let mut entry = entry.map_err(archive_error)?;
         if !entry.header().entry_type().is_file() {
             continue;
         }
-        let path = entry.path().map_err(|err| PackageManagerError::Archive {
-            path: archive_path.to_path_buf(),
-            message: err.to_string(),
-        })?;
-        let relative = archive_relative_path(&path)?;
+        let relative = archive_relative_path(&entry.path().map_err(archive_error)?)?;
         if relative.as_os_str().is_empty() {
             continue;
         }
         let executable = entry.header().mode().is_ok_and(|mode| mode & 0o111 != 0);
-        bytes.clear();
-        entry
-            .read_to_end(&mut bytes)
-            .map_err(|err| PackageManagerError::Archive {
-                path: archive_path.to_path_buf(),
-                message: err.to_string(),
-            })?;
-        let stored = content.add_file(&bytes, executable)?;
-        let key = index_key(&relative);
-        if let Some(tree) = tree {
-            ContentStore::stage_tree_file(tree, &key, &bytes, executable)?;
+        let mut bytes = Vec::with_capacity(entry.size() as usize);
+        entry.read_to_end(&mut bytes).map_err(archive_error)?;
+        let file = StagedFile {
+            path: package_path(&relative),
+            bytes,
+            executable,
+        };
+        match at.get(&file.path) {
+            Some(&index) => files[index] = file,
+            None => {
+                at.insert(file.path.clone(), files.len());
+                files.push(file);
+            }
         }
-        index.files.insert(key, stored);
     }
-    Ok(index)
+    Ok(files)
 }
 
-/// Package-relative path as an index key, always `/`-separated so an index
-/// written on one platform materializes the same tree on another.
-fn index_key(relative: &Path) -> String {
+/// A package-relative path, always `/`-separated.
+fn package_path(relative: &Path) -> String {
     relative
         .components()
         .filter_map(|component| match component {

@@ -164,6 +164,8 @@ pub enum VmIntrinsicFunction {
     FunctionPrototypeToString,
     /// `Function.prototype[@@hasInstance]` — §20.2.3.6.
     FunctionPrototypeSymbolHasInstance,
+    /// `Reflect.apply` — §28.1.1.
+    ReflectApply,
 }
 
 impl VmIntrinsicFunction {
@@ -174,7 +176,7 @@ impl VmIntrinsicFunction {
     /// builtin's.
     fn identity_address(self) -> usize {
         // One byte per variant; the last variant bounds the table.
-        const COUNT: usize = VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance as usize + 1;
+        const COUNT: usize = VmIntrinsicFunction::ReflectApply as usize + 1;
         static IDENTITIES: [u8; COUNT] = [0; COUNT];
         std::ptr::from_ref(&IDENTITIES[self as usize]) as usize
     }
@@ -1509,6 +1511,7 @@ impl VmIntrinsicFunction {
             Self::FunctionPrototypeBind => "bind",
             Self::FunctionPrototypeToString => "toString",
             Self::FunctionPrototypeSymbolHasInstance => "[Symbol.hasInstance]",
+            Self::ReflectApply => "apply",
         }
     }
 }

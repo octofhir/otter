@@ -202,6 +202,7 @@ impl NativeCallHeader {
             2 => VmIntrinsicFunction::FunctionPrototypeBind,
             3 => VmIntrinsicFunction::FunctionPrototypeToString,
             4 => VmIntrinsicFunction::FunctionPrototypeSymbolHasInstance,
+            5 => VmIntrinsicFunction::ReflectApply,
             _ => unreachable!("native intrinsic payload was initialized by allocation"),
         })
     }

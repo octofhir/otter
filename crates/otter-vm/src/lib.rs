@@ -47,7 +47,7 @@ pub mod __macro_support {
     pub use crate::{
         AccessorSpec, Attr, ConstSpec, ConstValue, ConstructorSpec, JsObject, JsSurfaceError,
         MethodSpec, NamespaceBuilder, NamespaceSpec, NativeCall, NativeCtx, NativeError,
-        ObjectBuilder, Value, ValueWindow,
+        ObjectBuilder, Value, ValueWindow, VmIntrinsicFunction,
     };
     pub use crate::{bootstrap, groom, intrinsic_install, marshal, object, pelt, rooting, string};
 }

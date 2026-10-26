@@ -388,6 +388,53 @@ pub(crate) extern "C" fn host_call_entry(ctx: *mut JitCtx) -> NativeResultPair {
     })
 }
 
+/// Stage an argument list's elements as a child's actuals. A plain array
+/// or an unmodified arguments object answers from its own storage: nothing
+/// observable runs, so no caller context is resolved. Any other array-like
+/// is read through `length` and its indices, which may run code.
+fn stage_argument_list(
+    turn: &mut HostTurn<'_>,
+    list: Value,
+) -> Result<(*const Value, usize), CommittedValueError> {
+    let (vm, stack) = (&*turn.vm, &mut *turn.stack);
+    let direct = match list.as_array() {
+        Some(array) => crate::array::with_plain_dense_values(array, &vm.gc_heap, |values| {
+            stack.stage_arguments(values)
+        })
+        .flatten(),
+        None => vm
+            .arguments_object_direct_list(list)
+            .and_then(|values| stack.stage_arguments(values)),
+    };
+    let (pointer, staged) = match direct {
+        Some(staged) => staged,
+        None => {
+            let caller = CallerContext::new(turn);
+            let context = caller
+                .get(turn.vm)
+                .ok_or(VmError::InvalidOperand)
+                .map_err(CommittedValueError::Fatal)?;
+            // The target and receiver stay in this frame's slots while the
+            // array-like's getters run and collect.
+            let values = turn
+                .vm
+                .create_list_from_array_like(turn.stack, context, list)?;
+            turn.stack
+                .stage_arguments(values)
+                .ok_or(VmError::InvalidOperand)
+                .map_err(CommittedValueError::Fatal)?
+        }
+    };
+    Ok((pointer, staged as usize))
+}
+
+/// The frame's actual at `index`, when the caller passed one.
+fn frame_actual(turn: &HostTurn<'_>, index: usize) -> Option<Value> {
+    let count = turn.frame().argument_count as usize;
+    // SAFETY: `index` is below the initialized actual count.
+    (index < count).then(|| unsafe { *turn.actuals_ptr().add(index) })
+}
+
 /// §20.2.3.1 `Function.prototype.apply`: the receiver is the target, the
 /// first actual its receiver, and the second an array-like whose elements
 /// become its actuals. The list is staged on the stack and entered as this
@@ -399,55 +446,47 @@ fn forward_apply(
     if !turn.vm.is_callable_runtime(&turn.frame().this_value) {
         return Err(CommittedValueError::JavaScript(VmError::NotCallable));
     }
-    let count = turn.frame().argument_count as usize;
-    let actual = |turn: &HostTurn<'_>, index: usize| {
-        // SAFETY: `index` is below the initialized actual count.
-        (index < count).then(|| unsafe { *turn.actuals_ptr().add(index) })
-    };
-    let list = actual(turn, 1).filter(|list| !list.is_nullish());
-    let (arguments, argument_count) = match list {
+    let (arguments, argument_count) = match frame_actual(turn, 1).filter(|list| !list.is_nullish())
+    {
         None => (turn.actuals_ptr(), 0),
-        Some(list) => {
-            // A plain array or an unmodified arguments object answers from
-            // its own storage: nothing observable runs, so no caller context
-            // is resolved.
-            let (vm, stack) = (&*turn.vm, &mut *turn.stack);
-            let direct = match list.as_array() {
-                Some(array) => {
-                    crate::array::with_plain_dense_values(array, &vm.gc_heap, |values| {
-                        stack.stage_arguments(values)
-                    })
-                    .flatten()
-                }
-                None => vm
-                    .arguments_object_direct_list(list)
-                    .and_then(|values| stack.stage_arguments(values)),
-            };
-            let (pointer, staged) = match direct {
-                Some(staged) => staged,
-                None => {
-                    let caller = CallerContext::new(turn);
-                    let context = caller
-                        .get(turn.vm)
-                        .ok_or(VmError::InvalidOperand)
-                        .map_err(CommittedValueError::Fatal)?;
-                    // An array-like's `length` and indexed getters may run
-                    // code and collect; the target and receiver stay in this
-                    // frame's slots.
-                    let values = turn
-                        .vm
-                        .create_list_from_array_like(turn.stack, context, list)?;
-                    turn.stack
-                        .stage_arguments(values)
-                        .ok_or(VmError::InvalidOperand)
-                        .map_err(CommittedValueError::Fatal)?
-                }
-            };
-            (pointer, staged as usize)
-        }
+        Some(list) => stage_argument_list(turn, list)?,
     };
     let target = turn.frame().this_value;
-    let receiver = actual(turn, 0).unwrap_or(Value::UNDEFINED);
+    let receiver = frame_actual(turn, 0).unwrap_or(Value::UNDEFINED);
+    request_child(
+        ctx,
+        turn,
+        target,
+        receiver,
+        None,
+        arguments,
+        argument_count,
+        HOST_FORWARD_CHILD,
+    )
+}
+
+/// §28.1.1 `Reflect.apply(target, thisArgument, argumentsList)`: the list
+/// must be an object; its elements are staged and the target entered as this
+/// frame's child, as `Function.prototype.apply` enters its own.
+fn forward_reflect_apply(
+    turn: &mut HostTurn<'_>,
+    ctx: &mut JitCtx,
+) -> Result<HostStep, CommittedValueError> {
+    let target = frame_actual(turn, 0).unwrap_or(Value::UNDEFINED);
+    if !turn.vm.is_callable_runtime(&target) {
+        return Err(CommittedValueError::JavaScript(VmError::NotCallable));
+    }
+    let list = frame_actual(turn, 2).unwrap_or(Value::UNDEFINED);
+    if !list.is_object_type() {
+        return Err(CommittedValueError::JavaScript(turn.vm.err_type(
+            "Reflect.apply: the argument list is not an object".into(),
+        )));
+    }
+    let (arguments, argument_count) = stage_argument_list(turn, list)?;
+    // The list's getters may have run: read the target and receiver from
+    // this frame's actuals again.
+    let target = frame_actual(turn, 0).unwrap_or(Value::UNDEFINED);
+    let receiver = frame_actual(turn, 1).unwrap_or(Value::UNDEFINED);
     request_child(
         ctx,
         turn,
@@ -501,6 +540,9 @@ fn native_call(
         }
         if intrinsic == VmIntrinsicFunction::FunctionPrototypeApply {
             return forward_apply(turn, ctx);
+        }
+        if intrinsic == VmIntrinsicFunction::ReflectApply {
+            return forward_reflect_apply(turn, ctx);
         }
         let receiver = turn.frame().this_value;
         let args = turn.actuals();

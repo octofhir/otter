@@ -479,7 +479,7 @@ otter_macros::holt! {
     feature = CORE,
     link_object_prototype = true,
     methods = {
-        "apply"                    / 3 => native_apply,
+        "apply"                    / 3 => intrinsic ReflectApply,
         "construct"                / 2 => native_construct,
         "defineProperty"           / 3 => native_define_property,
         "deleteProperty"           / 2 => native_delete_property,
@@ -493,10 +493,6 @@ otter_macros::holt! {
         "set"                      / 3 => native_set,
         "setPrototypeOf"           / 2 => native_set_prototype_of,
     },
-}
-
-fn native_apply(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    invoke(ctx, otter_bytecode::method_id::ReflectMethod::Apply, args)
 }
 
 fn native_construct(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {

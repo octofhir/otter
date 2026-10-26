@@ -581,28 +581,28 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     let static_entries = statics.iter().map(|m| {
         let js_name = &m.js_name;
         let length = m.length;
-        let call = &m.call;
+        let call = m.native_call();
         let attrs_path = crate::holt::attrs_factory_path(m.attrs.as_ref(), "builtin_function");
         quote! {
             ::otter_vm::__macro_support::MethodSpec {
                 name: #js_name,
                 length: #length,
                 attrs: #attrs_path,
-                call: ::otter_vm::__macro_support::NativeCall::Static(#call),
+                call: #call,
             }
         }
     });
     let prototype_method_entries = prototype.methods.iter().map(|m| {
         let js_name = &m.js_name;
         let length = m.length;
-        let call = &m.call;
+        let call = m.native_call();
         let attrs_path = crate::holt::attrs_factory_path(m.attrs.as_ref(), "builtin_function");
         quote! {
             ::otter_vm::__macro_support::MethodSpec {
                 name: #js_name,
                 length: #length,
                 attrs: #attrs_path,
-                call: ::otter_vm::__macro_support::NativeCall::Static(#call),
+                call: #call,
             }
         }
     });

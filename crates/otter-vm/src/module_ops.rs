@@ -1074,6 +1074,9 @@ impl Interpreter {
                             let interp = scope.context().interp_mut();
                             let jobs =
                                 crate::JsPromise::reject(&pending, &mut interp.gc_heap, reason);
+                            // The import's own promise: nobody may be
+                            // waiting on it.
+                            interp.note_settle_rejection(&jobs, Some(&job_context));
                             for job in jobs.jobs {
                                 interp.microtasks.enqueue(job);
                             }
@@ -1151,11 +1154,15 @@ impl Interpreter {
                     smallvec::smallvec![downstream_value],
                     &mut |_visitor| {},
                     move |ncx, args, captures| {
+                        let context = ncx.execution_context().cloned();
                         let interp = ncx.interp_mut();
                         if let Some(downstream) = captures.first().and_then(|v| v.as_promise()) {
                             let reason = args.first().copied().unwrap_or_else(Value::undefined);
                             let jobs =
                                 crate::JsPromise::reject(&downstream, &mut interp.gc_heap, reason);
+                            // The import's own promise: nobody may be
+                            // waiting on it.
+                            interp.note_settle_rejection(&jobs, context.as_ref());
                             for j in jobs.jobs {
                                 interp.microtasks.enqueue(j);
                             }

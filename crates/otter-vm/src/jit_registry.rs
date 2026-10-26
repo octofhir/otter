@@ -147,6 +147,9 @@ pub struct JitCodeRegistry {
     account: otter_resource::ResourceAccount,
     /// Installed code objects by unique code-object id.
     codes: rustc_hash::FxHashMap<u64, RegisteredCode>,
+    /// Invalidated generations still in [`Self::codes`]: the only candidates
+    /// a retirement epoch has to look at.
+    invalid_generations: Vec<u64>,
     /// Address-stable entry cells by code generation. Cells are tombstoned on
     /// invalidation and intentionally survive executable retirement so a baked
     /// pointer can never observe freed or repurposed metadata.
@@ -197,6 +200,7 @@ impl JitCodeRegistry {
             },
             account: otter_resource::ResourceAccount::default(),
             codes: rustc_hash::FxHashMap::default(),
+            invalid_generations: Vec::new(),
             entry_cells: rustc_hash::FxHashMap::default(),
             counting_generations: Vec::new(),
             counting_members: rustc_hash::FxHashSet::default(),
@@ -957,37 +961,47 @@ impl JitCodeRegistry {
     ///
     /// Returns how many objects retired.
     pub(crate) fn retire_unreferenced(&mut self) -> usize {
+        if self.invalid_generations.is_empty() {
+            return 0;
+        }
         let before = self.codes.len();
+        let codes = &mut self.codes;
         let entry_cells = &self.entry_cells;
         let retained_bytes = &mut self.retained_bytes;
         let subscriptions = &mut self.subscriptions;
         let contexts = &mut self.contexts;
         let closure_contexts = &mut self.closure_contexts;
-        self.codes.retain(|code_object_id, registered| {
-            let keep = registered.state != CodeLifetimeState::Invalid
-                || Arc::strong_count(&registered.code) > 1
+        self.invalid_generations.retain(|code_object_id| {
+            let Some(registered) = codes.get(code_object_id) else {
+                return false;
+            };
+            let keep = Arc::strong_count(&registered.code) > 1
                 || entry_cells
                     .get(code_object_id)
                     .is_some_and(|entry| !entry.cell.can_retire());
-            if !keep {
-                *retained_bytes -= registered.generated_code_lease.amount();
-                // The roots dropped with this entry keep the shapes alive
-                // until here.
-                if let Some(flag) = &registered.dependency_flag {
-                    for dependency in registered.dependencies.iter() {
-                        if let Some((shape, _)) = shape_fact(dependency) {
-                            subscriptions.unwatch(shape, flag);
-                        } else if let Some(cell) = validity_cell(dependency, &registered.roots) {
-                            cell.unsubscribe(flag);
-                        } else if let Some((context, _)) = context_slot(dependency) {
-                            contexts.unsubscribe(context, flag);
-                        } else if dependency.kind == CodeDependencyKind::ClosureContext {
-                            closure_contexts.unsubscribe(dependency.identity, flag);
-                        }
+            if keep {
+                return true;
+            }
+            let registered = codes
+                .remove(code_object_id)
+                .expect("candidate generation is registered");
+            *retained_bytes -= registered.generated_code_lease.amount();
+            // The roots dropped with this entry keep the shapes alive
+            // until here.
+            if let Some(flag) = &registered.dependency_flag {
+                for dependency in registered.dependencies.iter() {
+                    if let Some((shape, _)) = shape_fact(dependency) {
+                        subscriptions.unwatch(shape, flag);
+                    } else if let Some(cell) = validity_cell(dependency, &registered.roots) {
+                        cell.unsubscribe(flag);
+                    } else if let Some((context, _)) = context_slot(dependency) {
+                        contexts.unsubscribe(context, flag);
+                    } else if dependency.kind == CodeDependencyKind::ClosureContext {
+                        closure_contexts.unsubscribe(dependency.identity, flag);
                     }
                 }
             }
-            keep
+            false
         });
         before - self.codes.len()
     }
@@ -1301,6 +1315,7 @@ impl JitCodeRegistry {
                 && registered.state == CodeLifetimeState::Installed
             {
                 registered.state = CodeLifetimeState::Invalid;
+                self.invalid_generations.push(code_object_id);
                 affected.insert(registered.code.metadata().code_block_id);
                 if let Some(entry) = self.entry_cells.get(&code_object_id) {
                     entry.cell.unlink();

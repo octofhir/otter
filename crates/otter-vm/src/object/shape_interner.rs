@@ -86,13 +86,16 @@ impl ShapeInterner {
     }
 
     /// Register a rooted ordinary lineage, pinning each identity once this turn.
+    ///
+    /// An interned shape's whole lineage is interned with it (a live child
+    /// keeps its ancestors), so registering it again only pins it for the
+    /// current turn.
     pub(crate) fn register_shape(heap: &GcHeap, shape: ShapeHandle) {
         if !shape_body::is_dictionary_of(shape) {
             let id = heap.read_payload(shape, ShapeBody::id);
-            let tables = Self::of(heap).tables.borrow();
-            if tables.pinned.get(&id) == Some(&shape)
-                && tables.handles_by_id.get(&id) == Some(&shape)
-            {
+            let mut tables = Self::of(heap).tables.borrow_mut();
+            if tables.handles_by_id.get(&id) == Some(&shape) {
+                tables.pinned.entry(id).or_insert(shape);
                 return;
             }
         }

@@ -331,6 +331,34 @@ impl Interpreter {
         });
     }
 
+    /// Prepare `obj`'s lookup path after an inline-cache miss
+    /// (MakePrototypesFast): every dictionary object on its prototype chain
+    /// gets its hidden class, and `obj` itself only when it already acts as a
+    /// prototype.
+    ///
+    /// An ordinary dictionary receiver stays a dictionary. Objects reach
+    /// dictionary mode by deletes or by outgrowing their shape, and such
+    /// objects are typically created over and over; migrating each one on its
+    /// first missed load builds and registers a new hidden class per object.
+    /// The loads on it complete through the generic lookup instead.
+    pub(crate) fn make_prototypes_fast(&mut self, obj: &mut object::JsObject) {
+        if object::state(*obj, &self.gc_heap).is_prototype() {
+            self.migrate_slow_to_fast(obj);
+            return;
+        }
+        let Some(mut prototype) = object::prototype(*obj, &self.gc_heap) else {
+            return;
+        };
+        self.with_handle_scope(|interp, scope| {
+            let receiver = interp.scoped_value(scope, Value::object(*obj));
+            interp.migrate_slow_to_fast(&mut prototype);
+            *obj = interp
+                .escape_scoped(receiver)
+                .as_object()
+                .expect("receiver stays an object");
+        });
+    }
+
     /// Replay `ordered` `(key, flags, is_accessor)` slots from the root of
     /// `obj`'s lineage, returning the attribute-encoding hidden class they
     /// describe. The replay reuses shared transitions, so objects modified the

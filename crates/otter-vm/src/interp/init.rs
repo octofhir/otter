@@ -338,6 +338,29 @@ impl Interpreter {
         Ok(interp)
     }
 
+    /// Give every namespace object on a realm's global (`Math`, `JSON`,
+    /// `Reflect`, …) its hidden class. Installers build them in dictionary
+    /// storage, and an inline-cache miss on an ordinary receiver leaves it a
+    /// dictionary. `global` reads the realm's rooted global, which each
+    /// migration may relocate.
+    fn make_namespaces_fast(&mut self, global: impl Fn(&Self) -> object::JsObject) {
+        let names: Vec<String> = object::with_properties(global(self), &self.gc_heap, |properties| {
+            properties
+                .iter()
+                .filter(|(_, value)| value.as_object().is_some())
+                .map(|(name, _)| name.to_string())
+                .collect()
+        });
+        for name in names {
+            if let Some(mut namespace) =
+                object::get(global(self), &self.gc_heap, &name).and_then(|v| v.as_object())
+                && object::state(namespace, &self.gc_heap).is_dictionary()
+            {
+                self.migrate_slow_to_fast(&mut namespace);
+            }
+        }
+    }
+
     /// Post-bootstrap realm cache priming, shared by the ordinary
     /// constructor: populate the typed
     /// intrinsic slots from the global graph, build the per-kind
@@ -359,6 +382,9 @@ impl Interpreter {
                 interp.migrate_slow_to_fast(&mut prototype);
             }
         }
+        // So do the namespace objects the installers built in dictionary
+        // storage.
+        interp.make_namespaces_fast(|interp| interp.global_this);
         let extra_roots = otter_gc::ExtraRoots::new(&*interp);
         let extra_roots_guard = interp.gc_heap.register_extra_roots(extra_roots);
         let mut iterator_roots = [Value::undefined(); 7];
@@ -644,6 +670,7 @@ impl Interpreter {
         let global_this = self.extra_realms[state_index].global_this;
         realm_intrinsics.populate(&mut self.gc_heap, global_this);
         self.extra_realms[state_index].realm_intrinsics = realm_intrinsics;
+        self.make_namespaces_fast(|interp| interp.extra_realms[state_index].global_this);
         if let Some(iter_proto) = object::get(global_this, &self.gc_heap, "Iterator")
             .and_then(|ctor| {
                 if let Some(obj) = ctor.as_object() {

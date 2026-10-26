@@ -23,6 +23,7 @@
 //! # See also
 //! - `property_ic` for guarded store completion and allocation-failure handling.
 
+use crate::property_ic::LoadHit;
 use crate::native_abi::CommittedValueError;
 use smallvec::SmallVec;
 
@@ -37,6 +38,27 @@ use crate::{
 };
 
 impl Interpreter {
+    /// Complete a `LoadProperty` whose inline cache named a getter: call it
+    /// with the receiver register as `this`, the result landing in `dst`.
+    fn drive_getter(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        obj_reg: u16,
+        dst: u16,
+        getter: Value,
+    ) -> Result<bool, CommittedValueError> {
+        let top_idx = stack.len() - 1;
+        stack[top_idx]
+            .advance_pc()
+            .map_err(CommittedValueError::Fatal)?;
+        let receiver =
+            *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
+        self.invoke(stack, context, &getter, receiver, SmallVec::new(), dst)
+            .map_err(CommittedValueError::JavaScript)?;
+        Ok(true)
+    }
+
     /// Drive one tick of [`Op::LoadProperty`] when the receiver is
     /// an object and the resolved property is an accessor descriptor.
     /// Returns `Ok(true)` when an accessor was dispatched (frame
@@ -73,21 +95,34 @@ impl Interpreter {
         let receiver =
             *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
         slot.record_length_receiver(name, receiver);
-        if let Some(value) = self.projected_load(slot, receiver, atomized_key) {
-            Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
-                .map_err(CommittedValueError::Fatal)?;
-            return Ok(true);
+        match self.projected_load(slot, receiver, atomized_key) {
+            Some(LoadHit::Value(value)) => {
+                Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
+                    .map_err(CommittedValueError::Fatal)?;
+                return Ok(true);
+            }
+            Some(LoadHit::Getter(getter)) => {
+                return self.drive_getter(stack, context, obj_reg, dst, getter);
+            }
+            None => {}
         }
         // Preparing a function's bag can scavenge; re-read the rooted register.
         let receiver =
             *read_register(&stack[top_idx], obj_reg).map_err(CommittedValueError::Fatal)?;
         if let Some(obj) = receiver.as_object() {
             // The site's handlers: one shape compare selects the entry.
-            if let Some(value) = slot.probe_load(obj, &self.gc_heap) {
-                slot.record_hit();
-                Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
-                    .map_err(CommittedValueError::Fatal)?;
-                return Ok(true);
+            match slot.probe_load_hit(obj, &self.gc_heap) {
+                Some(LoadHit::Value(value)) => {
+                    slot.record_hit();
+                    Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
+                        .map_err(CommittedValueError::Fatal)?;
+                    return Ok(true);
+                }
+                Some(LoadHit::Getter(getter)) => {
+                    slot.record_hit();
+                    return self.drive_getter(stack, context, obj_reg, dst, getter);
+                }
+                None => {}
             }
             slot.record_miss();
             // Miss bookkeeping can scavenge, relocating the receiver; re-read
@@ -97,17 +132,15 @@ impl Interpreter {
                 .map_err(CommittedValueError::Fatal)?
                 .as_object()
                 .unwrap_or(obj);
-            // Prepare bootstrap namespaces before the first optimizing/OSR
-            // snapshot, just as the compiled cold load does. Otherwise the
-            // interpreter repeatedly resolves an unshaped receiver and the
-            // first native generation permanently snapshots an empty IC bank.
+            // Prepare the prototypes on the lookup path before the first
+            // optimizing/OSR snapshot, just as the compiled cold load does.
             // Migration visits a bounded prototype chain, skips already-shaped
             // or ineligible objects, and adopts each eligible dictionary only
             // after its exact descriptor shape is ready. It roots and refreshes
             // `obj` across allocation; the runtime turn's roots refresh
             // the original register and every other live operand at the same
             // collection. Failed optional preparation keeps the ordinary get.
-            self.migrate_slow_to_fast(&mut obj);
+            self.make_prototypes_fast(&mut obj);
             // The shared table answers first, so a site re-learning after a
             // miss pays a probe instead of another chain walk; a megamorphic
             // site walks at most once per receiver class and name.
@@ -122,6 +155,14 @@ impl Interpreter {
                 Self::finish_property_fast_path_value(&mut stack[top_idx], dst, value)
                     .map_err(CommittedValueError::Fatal)?;
                 return Ok(true);
+            }
+            if let Some(getter) = self.cache_inherited_getter(
+                slot,
+                obj,
+                atomized_key,
+                crate::property_ic::PropertyStorageProjection::Receiver,
+            ) {
+                return self.drive_getter(stack, context, obj_reg, dst, getter);
             }
             let key = VmPropertyKey::atom(atomized_key);
             stack[top_idx]

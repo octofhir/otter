@@ -30,8 +30,8 @@ use super::{
 use crate::activation_stack::ActivationStack;
 use crate::{
     ExecutionContext, Interpreter, Value, VmGetOutcome, VmPropertyKey, abstract_ops, binary,
-    function_metadata, object, property_atom::AtomizedPropertyKey, read_register,
-    temporal, value_kind_name, write_register,
+    function_metadata, object, property_atom::AtomizedPropertyKey, read_register, temporal,
+    value_kind_name, write_register,
 };
 
 impl Interpreter {
@@ -446,7 +446,9 @@ impl Interpreter {
                 // receiver; its methods, the `description` getter and any
                 // user property all resolve there.
                 let proto = interp
-                    .primitive_wrapper_prototype(crate::realm_intrinsics::Intrinsic::SymbolPrototype)
+                    .primitive_wrapper_prototype(
+                        crate::realm_intrinsics::Intrinsic::SymbolPrototype,
+                    )
                     .map_err(CommittedValueError::JavaScript)?;
                 let key = VmPropertyKey::String(name);
                 match interp.ordinary_get_value(

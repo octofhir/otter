@@ -34,7 +34,6 @@
 
 pub mod async_hooks;
 mod buffer_codec;
-mod http_scan;
 pub mod child_process;
 pub mod crypto;
 pub mod dgram;
@@ -47,6 +46,7 @@ mod fs_cp;
 pub mod fs_events;
 mod fs_watch;
 pub mod globals;
+mod http_scan;
 pub mod misc_modules;
 pub mod napi;
 pub mod net;

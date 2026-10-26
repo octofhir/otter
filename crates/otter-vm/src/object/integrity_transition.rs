@@ -41,6 +41,13 @@ pub(super) fn apply(
     unsafe {
         roots.add_object(object);
     }
+    // Symbol-keyed slots leave the hidden class for the side table first.
+    if heap.read_payload(*object, |body| {
+        super::symbol_slots::shaped_symbol_count(heap, body)
+    }) > 0
+    {
+        super::materialize_slots(object, heap)?;
+    }
     // SAFETY: the collector handle arena outlives this cold operation; no Local
     // escapes, and every returned old handle is published without allocation.
     let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };

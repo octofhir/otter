@@ -1406,9 +1406,9 @@ impl NativeFunction {
         &self,
         heap: &mut otter_gc::GcHeap,
         key: crate::symbol::JsSymbol,
-    ) -> bool {
-        let own_properties = heap.read_payload(self.inner, |body| body.own_properties);
-        crate::object::delete_symbol(own_properties, heap, key)
+    ) -> Result<bool, otter_gc::OutOfMemory> {
+        let mut own_properties = heap.read_payload(self.inner, |body| body.own_properties);
+        crate::object::delete_symbol(&mut own_properties, heap, key)
     }
 
     /// Clone the call target so the caller can invoke it after

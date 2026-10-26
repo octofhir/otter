@@ -438,7 +438,7 @@ fn collecting_symbol_append_traces_current_key_description_and_distinct_payloads
             let description = key.description().unwrap();
             assert_ne!(description.handle().offset(), description_before, "exact fresh key description relocated");
             assert_eq!(description.to_lossy_string(&vm.gc_heap), "ordinary Set key");
-            assert_eq!(object::shape(current, &vm.gc_heap), source, "symbol key does not alter named geometry");
+            assert_eq!(object::shape_body::parent_of(object::shape(current, &vm.gc_heap)), source, "a symbol key appends one hidden-class slot");
             for (index, child) in children.into_iter().enumerate() {
                 let child = vm.escape_scoped(child).as_object().unwrap();
                 assert_ne!(child.offset(), before[index], "exact bank/pending child relocated");

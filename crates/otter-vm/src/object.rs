@@ -124,6 +124,7 @@ pub mod field_type;
 mod ordinary_set;
 mod own_slot_cache;
 pub(crate) use own_slot_cache::OwnSlotCache;
+mod symbol_slots;
 pub(crate) mod symbol_table;
 pub use field_location::{FieldLayout, FieldLocation};
 use symbol_table::{SymbolPropsBody, SymbolPropsHandle, body_of as symbol_props_body_of};
@@ -1732,6 +1733,8 @@ fn error_stack_body_of(handle: ErrorStackHandle) -> Option<*mut ErrorStackBody> 
     })
 }
 
+pub use shape_body::SHAPE_SYMBOL_KEYS_BYTE;
+
 /// Byte offset, from the sidecar's cell header, of the symbol-keyed
 /// property table handle in [`ExoticSlots`]. Generated proofs that no
 /// symbol-keyed own property exists read it through the object's sidecar.
@@ -1877,7 +1880,7 @@ fn slot_meta_table_from(
     Ok(table)
 }
 
-/// Make room for one more symbol property on `object`.
+/// Make room for `additional` more symbol properties on `object`.
 ///
 /// Ensures the sidecar and grows the symbol table when it is full, with
 /// `object` and the caller's pending values rooted across both
@@ -1890,6 +1893,7 @@ fn slot_meta_table_from(
 fn reserve_symbol_prop_capacity(
     object: &mut JsObject,
     heap: &mut otter_gc::GcHeap,
+    additional: usize,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
     ensure_exotic_with_roots(object, heap, external_visit)?;
@@ -1902,7 +1906,7 @@ fn reserve_symbol_prop_capacity(
         external_visit(visitor);
         visitor(owner_slot);
     };
-    symbol_table::reserve_table(&mut table, heap, &mut visit)?;
+    symbol_table::reserve_table(&mut table, heap, additional, &mut visit)?;
     if table != old {
         let sidecar = heap.read_payload(*object, |body| body.exotic.get());
         heap.with_payload(sidecar, |exotic| exotic.symbol_props = table);
@@ -2326,6 +2330,28 @@ impl ObjectBody {
                 "shaped append at {index} under a shape of {count} slots"
             );
         }
+    }
+
+    /// Slide the string-keyed words at `offsets` (ascending) down to
+    /// `0..offsets.len()` and clear the rest: the dictionary layout of an
+    /// object whose symbol-keyed slots just moved to its side table.
+    fn compact_dictionary_slots(&mut self, offsets: &[usize]) {
+        debug_assert!(
+            self.is_dictionary(),
+            "only dictionary objects compact slots"
+        );
+        let len = self.slot_count();
+        for (index, &offset) in offsets.iter().enumerate() {
+            debug_assert!(index <= offset, "compaction only slides words down");
+            let value = self.slot_word(offset);
+            // SAFETY: both indices are below the current slot count.
+            unsafe { *self.field_ptr(self.location_for_slot(index)) = value };
+        }
+        for index in offsets.len()..len {
+            // SAFETY: as above.
+            unsafe { *self.field_ptr(self.location_for_slot(index)) = Value::undefined() };
+        }
+        self.set_dictionary_slot_count(offsets.len());
     }
 
     /// Remove a dictionary slot and shift later words across the inline/suffix
@@ -3923,7 +3949,9 @@ pub fn state(obj: JsObject, heap: &GcHeap) -> ShapeState {
 /// - <https://tc39.es/ecma262/#sec-ordinaryownpropertykeys>
 #[must_use]
 pub fn len(obj: JsObject, heap: &otter_gc::GcHeap) -> usize {
-    heap.read_payload(obj, |body| body_property_count(heap, body))
+    heap.read_payload(obj, |body| {
+        body_property_count(heap, body) - symbol_slots::shaped_symbol_count(heap, body)
+    })
 }
 
 /// `true` when the object has no string-keyed own properties.
@@ -4059,6 +4087,9 @@ pub(super) fn body_offset_of_atom(
         debug_assert_object_shape_handle(body.shape, "property offset lookup");
         return shape_body::shape_offset_of_atom(heap, body.shape, key.atom().id());
     }
+    if key.symbol_handle().is_some() {
+        return None;
+    }
     body.dictionary_index_get(key.name())
 }
 
@@ -4108,7 +4139,21 @@ pub(super) fn dict_clear_keys(body: &mut ObjectBody) {
     }
 }
 
-fn body_key_matches(heap: &otter_gc::GcHeap, body: &ObjectBody, offset: usize, key: &str) -> bool {
+fn body_key_matches(
+    heap: &otter_gc::GcHeap,
+    body: &ObjectBody,
+    offset: usize,
+    key: AtomizedPropertyKey<'_>,
+) -> bool {
+    if let Some(symbol) = key.symbol_handle() {
+        return !body.is_dictionary()
+            && u32::try_from(offset).ok().is_some_and(|offset| {
+                shape_body::shape_key_at_offset(heap, body.shape, offset)
+                    .and_then(shape_body::ShapeKey::as_symbol)
+                    == Some(symbol)
+            });
+    }
+    let key = key.name();
     if !body.is_dictionary() {
         return u32::try_from(offset).ok().is_some_and(|offset| {
             shape_body::shape_key_matches_str(heap, body.shape, offset, key)
@@ -4287,6 +4332,9 @@ pub(crate) fn lookup_own_atom_with(
     slot_of: impl FnOnce(ShapeHandle, crate::property_atom::AtomId) -> Option<shape_body::ShapeSlot>,
 ) -> AtomPropertyLookup {
     heap.read_payload(obj, |body| {
+        if let Some(symbol) = key.symbol_handle() {
+            return symbol_slots::lookup_atom(heap, body, key, symbol, slot_of);
+        }
         let resolved = if body.is_dictionary() {
             body.dictionary_index_get(key.name()).map(|offset| {
                 let (flags, is_accessor) = body.slot_attrs(heap, offset as usize);
@@ -4360,11 +4408,11 @@ pub(crate) fn load_own_data_slot_atom(
             return None;
         }
         let offset = hit.slot as usize;
-        if !shaped && !body_key_matches(heap, body, offset, key.name()) {
+        if !shaped && !body_key_matches(heap, body, offset, key) {
             return None;
         }
         debug_assert!(
-            body_key_matches(heap, body, offset, key.name()),
+            body_key_matches(heap, body, offset, key),
             "shape-id hit resolved to a slot whose key differs from the request"
         );
         // Use the same immutable ordinary-state proof as generated named loads. Symbol
@@ -4580,6 +4628,14 @@ pub fn get_jsstring(obj: JsObject, heap: &otter_gc::GcHeap, key: JsString) -> Op
 #[must_use]
 pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> Option<Value> {
     heap.read_payload(obj, |body| {
+        if let Some(index) = symbol_slots::shaped_slot(heap, body, key) {
+            let (_, is_accessor) = body.slot_attrs(heap, index);
+            return Some(if is_accessor {
+                Value::undefined()
+            } else {
+                body.data_value(heap, index)
+            });
+        }
         body.symbol_props()
             .iter()
             .find(|(k, _)| k.ptr_eq(key))
@@ -4597,6 +4653,9 @@ pub fn get_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> 
 #[must_use]
 pub fn lookup_own_symbol(obj: JsObject, heap: &otter_gc::GcHeap, key: JsSymbol) -> PropertyLookup {
     heap.read_payload(obj, |body| {
+        if let Some(index) = symbol_slots::shaped_slot(heap, body, key) {
+            return body.slot_lookup_at(heap, index);
+        }
         body.symbol_props()
             .iter()
             .find(|(k, _)| k.ptr_eq(key))
@@ -4613,9 +4672,13 @@ pub(crate) fn has_own_well_known_symbol(
     tag: crate::symbol::WellKnown,
 ) -> bool {
     heap.read_payload(obj, |body| {
-        body.symbol_props()
+        symbol_slots::shaped_symbols(heap, body)
             .iter()
             .any(|(key, _)| key.well_known_tag() == Some(tag))
+            || body
+                .symbol_props()
+                .iter()
+                .any(|(key, _)| key.well_known_tag() == Some(tag))
     })
 }
 
@@ -4681,6 +4744,9 @@ pub fn get_own_symbol_descriptor(
     key: JsSymbol,
 ) -> Option<PropertyDescriptor> {
     heap.read_payload(obj, |body| {
+        if let Some(index) = symbol_slots::shaped_slot(heap, body, key) {
+            return Some(body.slot_descriptor_at(heap, index));
+        }
         body.symbol_props()
             .iter()
             .find(|(k, _)| k.ptr_eq(key))
@@ -5198,7 +5264,9 @@ pub(crate) fn error_stack_top_frame(
         let record = unsafe { *stack.records_ptr() };
         Some((
             stack.str_at(record.name_offset, record.name_len).to_owned(),
-            stack.str_at(record.module_offset, record.module_len).to_owned(),
+            stack
+                .str_at(record.module_offset, record.module_len)
+                .to_owned(),
             record
                 .has_source
                 .then_some((record.line_number, record.start_column)),
@@ -5499,8 +5567,10 @@ pub fn is_sealed(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
         if body.extensible() {
             return false;
         }
-        if !(0..body_property_count(heap, body)).all(|i| !body.slot_attrs(heap, i).0.configurable())
-        {
+        if !(0..body_property_count(heap, body)).all(|i| {
+            !body.slot_attrs(heap, i).0.configurable()
+                || symbol_slots::is_private_slot(heap, body, i)
+        }) {
             return false;
         }
         // §7.3.16 — symbol-keyed own properties count too (Private
@@ -5525,6 +5595,9 @@ pub fn is_frozen(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
         }
         for i in 0..body_property_count(heap, body) {
             let (flags, is_accessor) = body.slot_attrs(heap, i);
+            if symbol_slots::is_private_slot(heap, body, i) {
+                continue;
+            }
             if flags.configurable() {
                 return false;
             }
@@ -6057,6 +6130,10 @@ pub fn delete(
     // Non-final deletion compacts actual key/value/descriptor order. All tables
     // are prepared with the receiver rooted; no state latch survives migration.
     materialize_slots(obj, heap)?;
+    // Dictionary storage holds only string-keyed slots: reread the index.
+    let offset = heap
+        .read_payload(*obj, |body| body_offset_of(heap, body, key))
+        .expect("conversion keeps the key");
     let mut keys = heap.read_payload(*obj, |body| string_keys_in_shape_order(heap, body));
     keys.remove(offset as usize);
     let table = dict_keys_table_for_install(obj, heap, &Some(keys), "", &mut [])?
@@ -6114,6 +6191,10 @@ pub(crate) fn delete_if_same_data(
         return Ok(false);
     }
     materialize_slots(obj, heap)?;
+    // Dictionary storage holds only string-keyed slots: reread the index.
+    let offset = heap
+        .read_payload(*obj, |body| body_offset_of(heap, body, key))
+        .expect("conversion keeps the key");
 
     let replacement_keys = heap.read_payload(*obj, |body| {
         let mut keys = string_keys_in_shape_order(heap, body);
@@ -6155,8 +6236,35 @@ pub fn ordinary_set_symbol_data_property(
 }
 
 /// Remove a symbol-keyed own property.
-pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol) -> bool {
-    heap.with_payload(obj, |body| {
+pub fn delete_symbol(
+    obj: &mut JsObject,
+    heap: &mut otter_gc::GcHeap,
+    key: JsSymbol,
+) -> Result<bool, otter_gc::OutOfMemory> {
+    if let Some(index) = heap.read_payload(*obj, |body| symbol_slots::shaped_slot(heap, body, key))
+    {
+        let (flags, _) = heap.read_payload(*obj, |body| body.slot_attrs(heap, index));
+        if !flags.configurable() {
+            return Ok(false);
+        }
+        let source = shape(*obj, heap);
+        if index + 1 == shape_body::property_count_of(source) as usize {
+            let parent = heap.read_payload(source, shape_body::ShapeBody::parent);
+            heap.with_payload(*obj, |body| {
+                body.invalidate_prototype_proofs();
+                // No counted slot can ever retain the deleted moving child.
+                unsafe {
+                    *body.field_ptr(body.location_for_slot(index)) = Value::undefined();
+                }
+                body.adopt_shape(parent);
+                body.debug_verify_field_layout();
+            });
+            heap.record_write(*obj, &parent);
+            return Ok(true);
+        }
+        materialize_slots(obj, heap)?;
+    }
+    Ok(heap.with_payload(*obj, |body| {
         if let Some(pos) = body.symbol_props().iter().position(|(k, _)| k.ptr_eq(key)) {
             if !body.symbol_props()[pos].1.flags.configurable() {
                 return false;
@@ -6169,7 +6277,7 @@ pub fn delete_symbol(obj: JsObject, heap: &mut otter_gc::GcHeap, key: JsSymbol) 
         } else {
             true
         }
-    })
+    }))
 }
 
 // ---------- descriptor surface --------------------------------------------
@@ -6309,6 +6417,9 @@ pub(crate) fn resolve_set_atomized(
     heap: &otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
 ) -> SetOutcome {
+    if let Some(symbol) = key.symbol_handle() {
+        return resolve_symbol_set(obj, heap, JsSymbol::from_handle(heap, symbol));
+    }
     resolve_set_inner(obj, heap, key.name(), Some(key))
 }
 
@@ -6641,7 +6752,9 @@ impl<'a> Properties<'a> {
     /// Used by `Object.getOwnPropertySymbols` (§20.1.2.13) and
     /// `Reflect.ownKeys` (§28.1.16) to surface symbol keys.
     pub fn symbol_keys(&self) -> impl Iterator<Item = JsSymbol> + '_ {
-        self.body.symbol_props().iter().map(|(k, _)| *k)
+        symbol_slots::own_symbol_entries(self.heap, self.body)
+            .into_iter()
+            .map(|(k, _)| k)
     }
 
     /// Iterate `(key, data-value)` pairs in ordinary own-key order,
@@ -6698,16 +6811,18 @@ impl<'a> Properties<'a> {
     /// `Object.assign` (§20.1.2.1 step 4.c.ii) which copies every
     /// enumerable own string *and* symbol key from the source.
     pub fn enumerable_symbol_data_iter(&self) -> impl Iterator<Item = (JsSymbol, Value)> + '_ {
-        self.body.symbol_props().iter().filter_map(|(sym, slot)| {
-            if !slot.flags.enumerable() {
-                return None;
-            }
-            if slot.kind.is_data() {
-                Some((*sym, slot.value))
-            } else {
-                None
-            }
-        })
+        symbol_slots::own_symbol_entries(self.heap, self.body)
+            .into_iter()
+            .filter_map(|(sym, slot)| {
+                if !slot.flags.enumerable() {
+                    return None;
+                }
+                if slot.kind.is_data() {
+                    Some((sym, slot.value))
+                } else {
+                    None
+                }
+            })
     }
 
     /// Return dense own data values for integer indices `0..len`.
@@ -6748,11 +6863,11 @@ fn ordinary_string_key_entries(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Ve
     let insertion_order = if !body.is_dictionary() {
         shape_body::shape_keys_ordered(heap, body.shape)
             .into_iter()
-            .map(|(key, offset)| {
-                (
-                    JsString::from_handle(key, heap).to_key_spelling(heap),
+            .filter_map(|(key, offset)| {
+                Some((
+                    JsString::from_handle(key.as_string()?, heap).to_key_spelling(heap),
                     offset as usize,
-                )
+                ))
             })
             .collect()
     } else {
@@ -6791,6 +6906,23 @@ pub(crate) fn redefine_merged_attrs(
     Some((merged.flags, !merged.kind.is_data(), offset))
 }
 
+/// The key a replayed hidden-class slot is added under.
+#[derive(Debug, Clone)]
+pub(crate) enum SlotName {
+    /// A string key, by its spelling.
+    Str(String),
+    /// A symbol key.
+    Symbol(JsSymbol),
+}
+
+impl SlotName {
+    /// Whether this key is a Private Name, which no integrity level touches.
+    #[must_use]
+    pub(crate) fn is_private_name(&self) -> bool {
+        matches!(self, Self::Symbol(key) if key.is_private_name())
+    }
+}
+
 /// Ordered `(key, flags, is_accessor)` for every own string-keyed slot of a
 /// dictionary-mode object, in slot order, when its storage can be described by
 /// a hidden class instead.
@@ -6803,7 +6935,7 @@ pub(crate) fn redefine_merged_attrs(
 pub(crate) fn dictionary_ordered_slot_attrs(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
-) -> Option<Vec<(String, PropertyFlags, bool)>> {
+) -> Option<Vec<(SlotName, PropertyFlags, bool)>> {
     heap.read_payload(obj, |body| {
         if !body.is_dictionary() || body.state().is_opaque() {
             return None;
@@ -6821,7 +6953,7 @@ pub(crate) fn dictionary_ordered_slot_attrs(
                         .key_at(offset)
                         .to_string();
                     let (flags, is_accessor) = body.slot_attrs(heap, offset);
-                    (key.clone(), flags, is_accessor)
+                    (SlotName::Str(key), flags, is_accessor)
                 })
                 .collect(),
         )
@@ -6874,7 +7006,7 @@ pub(crate) fn adopt_fast_shape(obj: JsObject, heap: &mut otter_gc::GcHeap, shape
 pub(crate) fn shape_ordered_slot_attrs(
     heap: &otter_gc::GcHeap,
     shape: ShapeHandle,
-) -> Vec<(String, PropertyFlags, bool)> {
+) -> Vec<(SlotName, PropertyFlags, bool)> {
     let mut keyed = shape_body::shape_keys_ordered(heap, shape);
     keyed.sort_by_key(|(_, offset)| *offset);
     keyed
@@ -6882,11 +7014,15 @@ pub(crate) fn shape_ordered_slot_attrs(
         .map(|(key, offset)| {
             let (flags, is_accessor) = shape_body::shape_slot_attrs(heap, shape, offset)
                 .unwrap_or((PropertyFlags::data_default(), false));
-            (
-                JsString::from_handle(key, heap).to_key_spelling(heap),
-                flags,
-                is_accessor,
-            )
+            let name = match key.as_string() {
+                Some(key) => SlotName::Str(JsString::from_handle(key, heap).to_key_spelling(heap)),
+                None => SlotName::Symbol(JsSymbol::from_handle(
+                    heap,
+                    key.as_symbol()
+                        .expect("a shape key is a string or a symbol"),
+                )),
+            };
+            (name, flags, is_accessor)
         })
         .collect()
 }
@@ -6895,7 +7031,9 @@ fn string_keys_in_shape_order(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec
     if !body.is_dictionary() {
         return shape_body::shape_keys_ordered(heap, body.shape)
             .into_iter()
-            .map(|(key, _)| JsString::from_handle(key, heap).to_key_spelling(heap))
+            .filter_map(|(key, _)| {
+                Some(JsString::from_handle(key.as_string()?, heap).to_key_spelling(heap))
+            })
             .collect();
     }
     body.dict_keys().map_or_else(Vec::new, |table| {
@@ -6941,8 +7079,9 @@ fn slot_metas_for_shape_transition(
 /// Read every current slot's `(flags, is_accessor)` from the authoritative
 /// source into an index-aligned [`SlotMeta`] vector.
 fn materialized_slot_metas(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Vec<SlotMeta> {
-    let count = body_property_count(heap, body);
-    (0..count)
+    let (strings, _) = symbol_slots::spill_entries(heap, body);
+    strings
+        .into_iter()
         .map(|i| {
             let (flags, is_accessor) = body.slot_attrs(heap, i);
             SlotMeta {
@@ -6967,17 +7106,44 @@ fn materialize_slots_with_pending_values(
     heap: &mut GcHeap,
     pending: &mut [Value],
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let Some((slots, keys)) = prepare_dictionary_tables(obj, heap, pending)? else {
+    let Some((mut slots, mut keys)) = prepare_dictionary_tables(obj, heap, pending)? else {
         return Ok(());
     };
+    let spilled = heap.read_payload(*obj, |body| symbol_slots::shaped_symbol_count(heap, body));
+    if spilled > 0 {
+        let mut roots = otter_gc::RootScope::new(heap);
+        // SAFETY: the prepared tables and pending values stay in their slots
+        // through the side-table reservation; publication rereads them.
+        unsafe {
+            roots.add_raw_slot(std::ptr::addr_of_mut!(slots).cast::<RawGc>());
+            roots.add_raw_slot(std::ptr::addr_of_mut!(keys).cast::<RawGc>());
+            for value in pending.iter_mut() {
+                crate::rooting::RootScopeExt::add_value(&mut roots, value);
+            }
+        }
+        reserve_symbol_prop_capacity(obj, heap, spilled, &mut |_| {})?;
+    }
+    // Read after the last allocation: the values below are current.
+    let (strings, symbols) =
+        heap.read_payload(*obj, |body| symbol_slots::spill_entries(heap, body));
+    let published = symbols.clone();
     heap.with_payload(*obj, |body| {
         body.enter_dictionary_mode(false);
         body.exotic_mut().slots = slots;
         body.exotic_mut().dictionary_keys = keys;
+        if !symbols.is_empty() {
+            body.compact_dictionary_slots(&strings);
+            body.symbol_props_mut()
+                .expect("symbol table reserved before publication")
+                .prepend(symbols);
+        }
     });
     let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
     heap.record_write(sidecar, &slots);
     heap.record_write(sidecar, &keys);
+    for (key, slot) in &published {
+        record_symbol_entry_write(heap, *obj, key, &slot.to_descriptor());
+    }
     Ok(())
 }
 
@@ -6992,13 +7158,13 @@ fn prepare_dictionary_tables(
         return Ok(None);
     }
     ensure_exotic_with_pending_values(obj, heap, pending)?;
-    let (keys, metas, count) = heap.read_payload(*obj, |body| {
+    let (keys, metas) = heap.read_payload(*obj, |body| {
         (
             string_keys_in_shape_order(heap, body),
             materialized_slot_metas(heap, body),
-            body_property_count(heap, body),
         )
     });
+    let count = metas.len();
     let mut slots = slot_meta_table_for_install(obj, heap, &Some(metas), count, pending)?
         .expect("Some metadata always prepares a table");
     let mut prepared = otter_gc::RootScope::new(heap);
@@ -7049,7 +7215,7 @@ pub(crate) fn shaped_string_key_values(obj: JsObject, heap: &GcHeap) -> Option<V
         let keys = shape_body::shape_keys_ordered(heap, body.shape);
         let mut indices = Vec::new();
         let mut names = Vec::with_capacity(keys.len());
-        for (key, _) in keys {
+        for key in keys.into_iter().filter_map(|(key, _)| key.as_string()) {
             let index = crate::string::gc_body::with_latin1(
                 heap,
                 key,
@@ -7083,9 +7249,9 @@ pub(crate) fn shaped_string_key_values(obj: JsObject, heap: &GcHeap) -> Option<V
 /// insertion order.
 pub(crate) fn own_symbol_key_values(obj: JsObject, heap: &GcHeap) -> Vec<Value> {
     heap.read_payload(obj, |body| {
-        body.symbol_props()
-            .iter()
-            .map(|(key, _)| *key)
+        symbol_slots::own_symbol_entries(heap, body)
+            .into_iter()
+            .map(|(key, _)| key)
             .filter(|key| !key.is_private_name())
             .map(Value::symbol)
             .collect()
@@ -8837,7 +9003,7 @@ mod tests {
         let mut heap = fresh_heap();
         let o = alloc_object_old_for_fixture(&mut heap).unwrap();
         let sym = JsSymbol::new(&mut heap, None).unwrap();
-        assert!(delete_symbol(o, &mut heap, sym));
+        assert!(delete_symbol(&mut { o }, &mut heap, sym).expect("delete"));
     }
 }
 

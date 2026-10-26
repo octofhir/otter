@@ -260,7 +260,7 @@ impl Codegen<'_> {
 
     /// A name key's store through the code object's keyed table routine:
     /// to `stored` when it stored, else to `missed` with every register as
-    /// it was. Only a string key is offered.
+    /// it was. Only a string or symbol key is offered.
     fn emit_keyed_table_store(
         &mut self,
         node: NodeId,
@@ -272,10 +272,13 @@ impl Codegen<'_> {
             KEYED_STORE_KEY, KEYED_STORE_RECEIVER, KEYED_STORE_VALUE,
         };
         let string_tag = self.view.string_layout.string_type_tag;
+        let name = self.ops.new_dynamic_label();
         self.load_immediate(10, tag::NOT_CELL_MASK);
         dynasm!(self.ops ; .arch x64
             ; test Rq(key), r10 ; jnz =>missed
-            ; cmp BYTE [Rq(key)], string_tag as i8 ; jne =>missed
+            ; cmp BYTE [Rq(key)], string_tag as i8 ; je =>name
+            ; cmp BYTE [Rq(key)], otter_vm::symbol::SYMBOL_BODY_TYPE_TAG as i8 ; jne =>missed
+            ; =>name
         );
         let live = self.allocation.node(node).live_registers.clone();
         // The operands may sit in registers the routine's inputs name: park

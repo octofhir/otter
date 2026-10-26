@@ -137,8 +137,11 @@ impl Interpreter {
             safepoint_id,
             argument_count,
             grow,
-            holder_validity: crate::object::prototype_validity::chain_validity(proto, &self.gc_heap)
-                .and_then(|cell| self.bake_prototype_validity(&cell)),
+            holder_validity: crate::object::prototype_validity::chain_validity(
+                proto,
+                &self.gc_heap,
+            )
+            .and_then(|cell| self.bake_prototype_validity(&cell)),
         })
     }
 

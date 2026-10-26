@@ -11,7 +11,8 @@
 //! linked into an interpreter.
 //!
 //! # Contents
-//! - [`AtomId`] — isolate-global string-key id.
+//! - [`AtomId`] — isolate-global property-key id: a string spelling's, or
+//!   from [`SYMBOL_ATOM_BASE`] on, a symbol's.
 //! - [`NameInterner`] — append-only name → id map owned by one isolate.
 //! - [`PropertyAtom`] — compact identity for one property name.
 //! - [`AtomizedPropertyKey`] — borrowed runtime view: atom id plus text.
@@ -35,7 +36,8 @@
 //!   of carrying foreign ids into its shapes.
 //! - The atom text is borrowed from a frozen [`AtomTable`], which lives as long
 //!   as its linked chunk.
-//! - Computed property keys and symbols do not pass through this layer.
+//! - A symbol mints its atom the first time it keys a hidden-class slot and
+//!   keeps it in its body; symbol atoms have no spelling.
 //! - Decoded atom arrays and spellings are prepared fallibly after the owning
 //!   payload admits their physical geometry; allocator refusal publishes no IDs.
 //!
@@ -76,6 +78,10 @@ impl AtomId {
     }
 }
 
+/// First id of the symbol atoms: a symbol used as a property key gets the
+/// next id of this range, which no string spelling ever reaches.
+pub(crate) const SYMBOL_ATOM_BASE: u32 = 1 << 31;
+
 /// Append-only property-name interner owned by one isolate.
 ///
 /// Interning happens off the hot path: at chunk link time for bytecode string
@@ -94,6 +100,9 @@ pub(crate) struct NameInterner {
     names: Vec<Arc<str>>,
     /// Id → content hash, so growing the table rehashes no spelling.
     hashes: Vec<u64>,
+    /// Symbol atoms minted so far; the next is `SYMBOL_ATOM_BASE` plus this.
+    /// A symbol keeps its atom in its own body.
+    symbols: u32,
 }
 
 /// One code-unit view of a candidate spelling.
@@ -177,6 +186,30 @@ impl NameInterner {
         AtomId(id)
     }
 
+    /// A fresh symbol atom.
+    #[must_use]
+    pub(crate) fn mint_symbol(&mut self) -> AtomId {
+        let id = SYMBOL_ATOM_BASE + self.symbols;
+        assert!(
+            id < AtomId::UNRESOLVED,
+            "isolate exhausted the symbol atom range"
+        );
+        self.symbols += 1;
+        AtomId(id)
+    }
+
+    /// How many symbol atoms were minted, for an image to replay.
+    #[must_use]
+    pub(crate) fn symbol_atom_count(&self) -> u32 {
+        self.symbols
+    }
+
+    /// Continue minting symbol atoms after the `count` an image's symbols
+    /// already hold.
+    pub(crate) fn restore_symbol_atoms(&mut self, count: u32) {
+        self.symbols = count;
+    }
+
     /// The spelling `atom` was minted for.
     #[must_use]
     pub(crate) fn spelling(&self, atom: AtomId) -> Option<&Arc<str>> {
@@ -249,13 +282,36 @@ impl PropertyAtom {
 pub(crate) struct AtomizedPropertyKey<'a> {
     atom: PropertyAtom,
     text: &'a str,
+    /// The symbol a symbol atom names; null for a string key.
+    symbol: crate::symbol::SymbolHandle,
 }
 
 impl<'a> AtomizedPropertyKey<'a> {
     /// Create a borrowed atomized key view.
     #[must_use]
     pub(crate) const fn new(atom: PropertyAtom, text: &'a str) -> Self {
-        Self { atom, text }
+        Self {
+            atom,
+            text,
+            symbol: crate::symbol::SymbolHandle::null(),
+        }
+    }
+
+    /// A symbol key by the atom its hidden-class slots use. It has no
+    /// spelling: dictionary storage never holds it under a name.
+    #[must_use]
+    pub(crate) const fn symbol(atom: AtomId, symbol: crate::symbol::SymbolHandle) -> Self {
+        Self {
+            atom: PropertyAtom::new(atom),
+            text: "",
+            symbol,
+        }
+    }
+
+    /// The symbol this key names, when it is a symbol key.
+    #[must_use]
+    pub(crate) fn symbol_handle(self) -> Option<crate::symbol::SymbolHandle> {
+        (!self.symbol.is_null()).then_some(self.symbol)
     }
 
     /// Isolate-global atom identity.
@@ -264,7 +320,8 @@ impl<'a> AtomizedPropertyKey<'a> {
         self.atom
     }
 
-    /// String spelling used for dictionary-mode and non-atomized lookups.
+    /// String spelling used for dictionary-mode and non-atomized lookups;
+    /// empty for a symbol key.
     #[must_use]
     pub(crate) const fn name(self) -> &'a str {
         self.text

@@ -150,6 +150,27 @@ impl ShapeRuntime {
         Ok(child)
     }
 
+    pub(crate) fn symbol_child_with_roots(
+        &mut self,
+        heap: &mut GcHeap,
+        parent: ShapeHandle,
+        key: crate::symbol::JsSymbol,
+        flags: PropertyFlags,
+        is_accessor: bool,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<ShapeHandle, otter_gc::OutOfMemory> {
+        let (child, reused) = ShapeInterner::symbol_child_with_roots(
+            heap,
+            parent,
+            key,
+            flags,
+            is_accessor,
+            external_visit,
+        )?;
+        self.notify_observer(heap, parent, child, &key.descriptive_string(heap), reused);
+        Ok(child)
+    }
+
     fn notify_observer(
         &mut self,
         heap: &GcHeap,

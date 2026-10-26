@@ -3,7 +3,8 @@
 //! # Contents
 //! - Full descriptors enter the same partial validation algorithm.
 //! - String installs prepare accessor cells, banks and dictionary metadata.
-//! - Symbol installs keep the key and incoming values rooted across table growth.
+//! - Symbol installs take a hidden-class slot first (`super::symbol_slots`), then
+//!   keep the key and incoming values rooted across table growth.
 //!
 //! # Invariants
 //! - `Ok(false)` means an ECMAScript descriptor rejection, never allocation failure.
@@ -19,7 +20,7 @@
 use super::*;
 use crate::rooting::RootScopeExt;
 
-fn identical(existing: &SlotData, updated: &SlotData, heap: &GcHeap) -> bool {
+pub(super) fn identical(existing: &SlotData, updated: &SlotData, heap: &GcHeap) -> bool {
     if existing.flags != updated.flags {
         return false;
     }
@@ -113,6 +114,12 @@ pub(super) fn define_string(
             body.set_slot(offset.unwrap() as usize, meta, stored, None)
         });
     } else {
+        if heap.read_payload(*object, |body| {
+            symbol_slots::shaped_symbol_count(heap, body)
+        }) > 0
+        {
+            materialize_slots_with_pending_values(object, heap, std::slice::from_mut(&mut stored))?;
+        }
         let index = heap.read_payload(*object, |body| body_property_count(heap, body));
         let keys = dictionary_keys_for_shape_transition(heap, *object, None);
         let metas = slot_metas_for_shape_transition(heap, *object, None);
@@ -228,6 +235,9 @@ pub(super) fn define_symbol(
     key: JsSymbol,
     mut descriptor: PartialPropertyDescriptor,
 ) -> Result<bool, otter_gc::OutOfMemory> {
+    if let Some(outcome) = symbol_slots::define_shaped(object, heap, key, &mut descriptor)? {
+        return Ok(outcome);
+    }
     let existing = heap.read_payload(*object, |body| {
         body.symbol_props()
             .iter()
@@ -273,7 +283,7 @@ pub(super) fn define_symbol(
         roots.add_pelt(&mut descriptor);
     }
     if append {
-        reserve_symbol_prop_capacity(object, heap, &mut |_| {})?;
+        reserve_symbol_prop_capacity(object, heap, 1, &mut |_| {})?;
     }
     let current_key = key.as_symbol(heap).expect("rooted key stays a Symbol");
     let existing = heap.read_payload(*object, |body| {

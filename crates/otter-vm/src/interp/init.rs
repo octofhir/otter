@@ -344,13 +344,14 @@ impl Interpreter {
     /// dictionary. `global` reads the realm's rooted global, which each
     /// migration may relocate.
     fn make_namespaces_fast(&mut self, global: impl Fn(&Self) -> object::JsObject) {
-        let names: Vec<String> = object::with_properties(global(self), &self.gc_heap, |properties| {
-            properties
-                .iter()
-                .filter(|(_, value)| value.as_object().is_some())
-                .map(|(name, _)| name.to_string())
-                .collect()
-        });
+        let names: Vec<String> =
+            object::with_properties(global(self), &self.gc_heap, |properties| {
+                properties
+                    .iter()
+                    .filter(|(_, value)| value.as_object().is_some())
+                    .map(|(name, _)| name.to_string())
+                    .collect()
+            });
         for name in names {
             if let Some(mut namespace) =
                 object::get(global(self), &self.gc_heap, &name).and_then(|v| v.as_object())

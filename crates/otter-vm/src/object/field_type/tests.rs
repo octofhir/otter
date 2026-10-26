@@ -45,7 +45,7 @@ fn child(heap: &mut GcHeap, parent: ShapeHandle, index: u32, accessor: bool) -> 
     shape_body::alloc_child_shape_body_with_roots(
         heap,
         parent.get(),
-        key.get(),
+        shape_body::ShapeKey::string(key.get()),
         AtomId::from_global(index + 1000),
         PropertyFlags::data_default(),
         accessor,

@@ -137,7 +137,8 @@ impl Codegen<'_> {
 
     /// A name key's load through the code object's keyed table routine:
     /// the value in `X(destination)` and on to `loaded` on a hit, else to
-    /// `missed` with every register as it was. Only a string key is offered.
+    /// `missed` with every register as it was. Only a string or symbol key is
+    /// offered.
     fn emit_keyed_table_load(
         &mut self,
         node: NodeId,
@@ -148,13 +149,17 @@ impl Codegen<'_> {
     ) {
         use crate::template::arm64::shared_property::{KEYED_LOAD_KEY, KEYED_LOAD_RECEIVER};
         let string_tag = self.view.string_layout.string_type_tag;
+        let name = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
             ; tst X(key), #0xfffe_0000_0000_0007
             ; b.ne =>missed
             ; ldrb w16, [X(key)]
             ; cmp w16, u32::from(string_tag)
+            ; b.eq =>name
+            ; cmp w16, u32::from(otter_vm::symbol::SYMBOL_BODY_TYPE_TAG)
             ; b.ne =>missed
+            ; =>name
         );
         let live = self.allocation.node(node).live_registers.clone();
         // The operands may sit in registers the routine's inputs name: park

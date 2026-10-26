@@ -206,9 +206,10 @@ impl TestResult {
         if let Outcome::Skipped {
             reason: SkipReason::SourceTooLarge { bytes, limit },
         } = &self.outcome
-            && bytes <= limit {
-                return Err("source-too-large reason must exceed its stated limit".to_owned());
-            }
+            && bytes <= limit
+        {
+            return Err("source-too-large reason must exceed its stated limit".to_owned());
+        }
         Ok(())
     }
 }

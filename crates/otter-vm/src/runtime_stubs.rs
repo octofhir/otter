@@ -1128,10 +1128,16 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         id if id == STUB_MATH_TRUNC_LEAF.id => Some(MATH_TRUNC_LEAF),
         id if id == crate::native_abi::STUB_NUMBER_IS_NAN_LEAF.id => Some(NUMBER_IS_NAN_LEAF),
         id if id == crate::native_abi::STUB_NUMBER_IS_FINITE_LEAF.id => Some(NUMBER_IS_FINITE_LEAF),
-        id if id == crate::native_abi::STUB_NUMBER_IS_INTEGER_LEAF.id => Some(NUMBER_IS_INTEGER_LEAF),
-        id if id == crate::native_abi::STUB_NUMBER_IS_SAFE_INTEGER_LEAF.id => Some(NUMBER_IS_SAFE_INTEGER_LEAF),
+        id if id == crate::native_abi::STUB_NUMBER_IS_INTEGER_LEAF.id => {
+            Some(NUMBER_IS_INTEGER_LEAF)
+        }
+        id if id == crate::native_abi::STUB_NUMBER_IS_SAFE_INTEGER_LEAF.id => {
+            Some(NUMBER_IS_SAFE_INTEGER_LEAF)
+        }
         id if id == crate::native_abi::STUB_ARRAY_IS_ARRAY_LEAF.id => Some(ARRAY_IS_ARRAY_LEAF),
-        id if id == crate::native_abi::STUB_OBJECT_GET_PROTOTYPE_OF_LEAF.id => Some(OBJECT_GET_PROTOTYPE_OF_LEAF),
+        id if id == crate::native_abi::STUB_OBJECT_GET_PROTOTYPE_OF_LEAF.id => {
+            Some(OBJECT_GET_PROTOTYPE_OF_LEAF)
+        }
         id if id == crate::native_abi::STUB_NUMBER_CALL_LEAF.id => Some(NUMBER_CALL_LEAF),
         id if id == STUB_MATH_ATAN2_LEAF.id => Some(MATH_ATAN2_LEAF),
         id if id == STUB_MATH_POW_LEAF.id => Some(MATH_POW_LEAF),

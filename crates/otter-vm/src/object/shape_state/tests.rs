@@ -80,7 +80,7 @@ fn state_preparation_moves_keys_and_distinct_bank_children_without_changing_sour
             assert_ne!(child_offsets[0], child_offsets[1]);
             let key_offsets: Vec<_> = shape_body::shape_keys_ordered(&vm.gc_heap, source)
                 .into_iter()
-                .map(|(key, _)| key.offset())
+                .map(|(key, _)| key.as_string().expect("string key").offset())
                 .collect();
             let locations: Vec<_> = (0..count)
                 .map(|index| {
@@ -133,7 +133,7 @@ fn state_preparation_moves_keys_and_distinct_bank_children_without_changing_sour
             let keys = shape_body::shape_keys_ordered(&vm.gc_heap, source);
             for ((key, _), before) in keys.into_iter().zip(key_offsets) {
                 assert_eq!(
-                    key.offset(),
+                    key.as_string().expect("string key").offset(),
                     before,
                     "interned source keys live in old space and never move"
                 );
@@ -315,7 +315,7 @@ fn collecting_prototype_change_roots_receiver_prototype_keys_and_both_banks() {
                 .map(|value| vm.escape_scoped(value).as_object().unwrap().offset());
             let keys: Vec<_> = shape_body::shape_keys_ordered(&vm.gc_heap, source)
                 .into_iter()
-                .map(|(key, _)| key.offset())
+                .map(|(key, _)| key.as_string().expect("string key").offset())
                 .collect();
             let locations: Vec<_> = (0..count)
                 .map(|index| {
@@ -371,7 +371,11 @@ fn collecting_prototype_change_roots_receiver_prototype_keys_and_both_banks() {
                 .into_iter()
                 .zip(keys)
             {
-                assert_eq!(key.offset(), old, "interned lineage keys never move");
+                assert_eq!(
+                    key.as_string().expect("string key").offset(),
+                    old,
+                    "interned lineage keys never move"
+                );
             }
             for (slot, child) in [(0, first), (capacity.max(4), last)] {
                 assert_eq!(

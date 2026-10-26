@@ -102,6 +102,8 @@ pub struct IsolateSnapshot {
     pub(crate) external_ref_addrs: Vec<usize>,
     /// The property-name atom table, in id order.
     pub(crate) atom_names: Vec<Box<str>>,
+    /// Symbol atoms the image's symbols already hold.
+    pub(crate) symbol_atoms: u32,
     /// Global lexical bindings: name, cell handle, `is_const`.
     pub(crate) global_lexicals: Vec<(Box<str>, RawGc, bool)>,
     /// The global symbol registry: key and symbol handle, in registration
@@ -272,6 +274,7 @@ impl crate::Interpreter {
             .as_ref()
             .map(crate::ExecutionContext::function_base);
         let atom_names = self.snapshot_atom_names();
+        let symbol_atoms = crate::isolate_names::names(&self.gc_heap).symbol_atom_count();
         let mut global_lexicals: Vec<(Box<str>, RawGc, bool)> = self
             .snapshot_global_lexicals()
             .into_iter()
@@ -289,6 +292,7 @@ impl crate::Interpreter {
             function_kind_prototype_roots,
             external_ref_addrs,
             atom_names,
+            symbol_atoms,
             global_lexicals,
             registered_symbols,
             regexp_payloads,
@@ -362,6 +366,7 @@ impl IsolateSnapshot {
         for name in &self.atom_names {
             out.str(name);
         }
+        out.u32(self.symbol_atoms);
         out.len(self.global_lexicals.len());
         for (name, cell, is_const) in &self.global_lexicals {
             out.str(name);
@@ -451,6 +456,7 @@ impl IsolateSnapshot {
         let atom_names = (0..len)
             .map(|_| input.str().map(Box::<str>::from))
             .collect::<Option<Vec<_>>>()?;
+        let symbol_atoms = input.u32()?;
         let len = input.len()?;
         let mut global_lexicals = Vec::with_capacity(len);
         for _ in 0..len {
@@ -502,6 +508,7 @@ impl IsolateSnapshot {
             function_kind_prototype_roots,
             external_ref_addrs,
             atom_names,
+            symbol_atoms,
             global_lexicals,
             registered_symbols,
             regexp_payloads,

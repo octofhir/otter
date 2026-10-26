@@ -23,9 +23,9 @@
 //! - `property_ic` and `object::shape_transition` own the complete store guards.
 //! - `handles` owns reusable operand storage and scope cleanup.
 
-use crate::property_ic::LoadHit;
 use crate::activation_stack::ActivationStack;
 use crate::native_abi::CommittedValueError;
+use crate::property_ic::LoadHit;
 use crate::{
     ActiveFrameMut, ActiveFrameRef, ExecutionContext, Interpreter, Value, VmError, VmPropertyKey,
     object, property_atom::AtomizedPropertyKey, property_ic::PropertyIcKind, read_register,
@@ -207,8 +207,14 @@ impl Interpreter {
         getter: Value,
     ) -> Result<Value, CommittedValueError> {
         let receiver = self.escape_scoped(receiver);
-        self.run_callable_sync_rooted(stack, Some(context), &getter, receiver, smallvec::SmallVec::new())
-            .map_err(CommittedValueError::completed_call)
+        self.run_callable_sync_rooted(
+            stack,
+            Some(context),
+            &getter,
+            receiver,
+            smallvec::SmallVec::new(),
+        )
+        .map_err(CommittedValueError::completed_call)
     }
 
     /// Complete the exact published `StoreProperty` over boxed receiver/value
@@ -703,15 +709,17 @@ impl Interpreter {
         // recorded for its class, completes without rooting or `[[Set]]`
         // resolution, as a megamorphic named store does.
         if let Some(mut obj) = receiver.as_object()
-            && let Some(string) = key_value.as_string(&self.gc_heap)
             && object::supports_fast_property_ic(obj, &self.gc_heap)
             && !object::state(obj, &self.gc_heap).is_prototype()
-            && let Some((atom, name)) = self.interned_string_key(string)
+            && let Some((atom, name, symbol)) = self.keyed_property_atom(key_value)
         {
-            let key = crate::property_atom::AtomizedPropertyKey::new(
-                crate::property_atom::PropertyAtom::new(atom),
-                &name,
-            );
+            let key = match symbol {
+                Some(symbol) => crate::property_atom::AtomizedPropertyKey::symbol(atom, symbol),
+                None => crate::property_atom::AtomizedPropertyKey::new(
+                    crate::property_atom::PropertyAtom::new(atom),
+                    name.as_deref().unwrap_or_default(),
+                ),
+            };
             if self
                 .property_cache
                 .replay_store(obj, &mut self.gc_heap, key, &value)

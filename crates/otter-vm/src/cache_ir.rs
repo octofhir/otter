@@ -67,7 +67,8 @@ pub(crate) fn resolve_atom_data_slot(
         return None;
     }
     let own = object::lookup_own_atom(obj, heap, key);
-    if let (Some(hit), object::PropertyLookup::Data { value, flags }) = (own.hit, own.lookup) {
+    if let (Some(hit), object::PropertyLookup::Data { value, flags }) = (own.hit, &own.lookup) {
+        let (value, flags) = (*value, *flags);
         return Some(ResolvedDataSlot {
             hops: 0,
             validity: None,
@@ -78,7 +79,12 @@ pub(crate) fn resolve_atom_data_slot(
             is_writable: flags.writable(),
         });
     }
-    if own.hit.is_some() || object::state(obj, heap).is_opaque() {
+    // An own property without a cacheable slot (a symbol in the side table)
+    // shadows the chain.
+    if own.hit.is_some()
+        || !matches!(own.lookup, object::PropertyLookup::Absent)
+        || object::state(obj, heap).is_opaque()
+    {
         return None;
     }
     resolve_inherited_atom_data_slot(object::prototype(obj, heap)?, heap, key)

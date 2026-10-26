@@ -218,11 +218,13 @@ fn emit_load_probe(
     );
 }
 
-/// Leave the atom of the string `key` in `W(atom)`, or branch to `miss` for
-/// any other key or a string no property key has interned. A string whose
-/// atom is not yet recorded asks the interning leaf and records the answer
-/// in its atom word, so the same string probes directly next time. The
-/// routine inputs, `x9`, `x10` and `x12`, survive the leaf call.
+/// Leave the atom of the string or symbol `key` in `W(atom)`, or branch to
+/// `miss` for any other key, to `uninterned` for a string no property key
+/// has interned or a symbol that never keyed a slot. A string whose atom is
+/// not yet recorded asks the interning leaf and records the answer in its
+/// atom word, so the same string probes directly next time; a symbol carries
+/// its atom from the slot it first keyed. The routine inputs, `x9`, `x10`
+/// and `x12`, survive the leaf call.
 fn emit_key_atom(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -234,13 +236,14 @@ fn emit_key_atom(
 ) {
     let unrecorded = ops.new_dynamic_label();
     let ready = ops.new_dynamic_label();
+    let symbol = ops.new_dynamic_label();
     let atom_byte = view.string_layout.atom_byte;
     emit_cell_test(ops, key, CellTest::IsNotCell, miss);
     dynasm!(ops ; .arch aarch64
         ; cbz X(key), =>miss
         ; ldrb w16, [X(key)]
         ; cmp w16, u32::from(view.string_layout.string_type_tag)
-        ; b.ne =>miss
+        ; b.ne =>symbol
         // The body records the atom plus one; zero is unrecorded.
         ; ldr W(atom), [X(key), atom_byte]
         ; cbz W(atom), =>unrecorded
@@ -272,6 +275,13 @@ fn emit_key_atom(
         ; mov W(atom), w0
         ; add w16, w0, #1
         ; str w16, [X(key), atom_byte]
+        ; b =>ready
+        ; =>symbol
+        ; cmp w16, u32::from(otter_vm::symbol::SYMBOL_BODY_TYPE_TAG)
+        ; b.ne =>miss
+        ; ldr W(atom), [X(key), otter_vm::symbol::SYMBOL_ATOM_BYTE]
+        ; cmn WSP(atom), #1
+        ; b.eq =>uninterned
         ; =>ready
     );
 }

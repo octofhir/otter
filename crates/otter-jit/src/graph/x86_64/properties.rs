@@ -989,7 +989,12 @@ impl Codegen<'_> {
                 ; cmp BYTE [Rq(rare) + layout.prototype_ordinary_byte as i32], 0 ; je =>miss
                 ; mov Rq(prototype), [Rq(rare) + layout.prototype_byte as i32]
                 ; mov r10d, [Rq(rare) + layout.own_props_byte as i32] ; test r10d, r10d ; jz =>symbols_absent
-                ; add r10, Rq(cage) ; mov r10d, [r10 + view.object_exotic_handle_byte as i32]
+                ; add r10, Rq(cage)
+                // A symbol key in the bag's hidden class or side table may
+                // be `@@hasInstance`.
+                ; mov r11d, [r10 + view.object_shape_byte as i32] ; add r11, Rq(cage)
+                ; cmp BYTE [r11 + otter_vm::object::SHAPE_SYMBOL_KEYS_BYTE as i32], 0 ; jne =>miss
+                ; mov r10d, [r10 + view.object_exotic_handle_byte as i32]
                 ; test r10d, r10d ; jz =>proved ; add r10, Rq(cage)
                 ; cmp DWORD [r10 + otter_vm::object::EXOTIC_SLOTS_SYMBOL_PROPS_BYTE as i32], 0 ; jne =>miss
                 ; jmp =>proved

@@ -95,6 +95,12 @@ pub(crate) fn capture_store_property_transition(
     key: AtomizedPropertyKey<'_>,
     value: &Value,
 ) -> Option<StorePropertyTransition> {
+    // Symbol-keyed slots leave the hidden class through the ordinary
+    // dictionary conversion, not this replay.
+    if key.symbol_handle().is_some() || super::shape_body::has_symbol_keys(super::shape(obj, heap))
+    {
+        return None;
+    }
     let mut obj = obj;
     let mut stored = *value;
     // A store can demote this object to dictionary mode, and demotion
@@ -311,6 +317,13 @@ pub(crate) fn replay_store_property_transition(
     let mut slot_meta_table = None;
     let mut dict_table = None;
     if to_shape.is_null() {
+        // Symbol-keyed slots leave the hidden class through the ordinary
+        // dictionary conversion, not this replay.
+        if key.symbol_handle().is_some()
+            || super::shape_body::has_symbol_keys(super::shape(obj, heap))
+        {
+            return Ok(None);
+        }
         // The dictionary arm below appends through `dict_push_key`,
         // which writes the sidecar and materializes per-slot metadata;
         // the shape-append arm never touches either and allocates none.

@@ -75,6 +75,7 @@ pub fn alloc_symbol(
         well_known,
         registered,
         private_name: false,
+        atom: crate::property_atom::AtomId::NONE.raw(),
     })?;
     // The collecting old allocation may rewrite the pending body's young
     // description. Its completed body owns the current barrier operand.
@@ -97,6 +98,7 @@ pub fn alloc_private_name_symbol(
         well_known: None,
         registered: false,
         private_name: true,
+        atom: crate::property_atom::AtomId::NONE.raw(),
     })?;
     // The collecting old allocation may rewrite the pending body's young
     // description. Its completed body owns the current barrier operand.
@@ -144,7 +146,17 @@ pub struct SymbolBody {
     /// through Proxy traps and gate the §7.3.28 extensibility check.
     #[pelt(skip)]
     pub private_name: bool,
+    /// The property atom this symbol keys hidden-class slots by, minted on
+    /// first use as a key; [`crate::property_atom::AtomId::NONE`]'s raw id
+    /// until then.
+    #[pelt(skip)]
+    pub(crate) atom: u32,
 }
+
+/// Cell byte of [`SymbolBody`]'s property atom (raw `u32`; all ones until
+/// the symbol first keys a hidden-class slot), for generated keyed access.
+pub const SYMBOL_ATOM_BYTE: u32 =
+    (otter_gc::header::HEADER_SIZE + std::mem::offset_of!(SymbolBody, atom)) as u32;
 
 /// Heap handle for [`Value::Symbol`].
 ///
@@ -293,6 +305,32 @@ impl JsSymbol {
     #[must_use]
     pub fn identity_addr(&self) -> usize {
         self.inner.offset() as usize
+    }
+
+    /// The atom this symbol keys hidden-class slots by, minting it on first
+    /// use.
+    pub(crate) fn property_atom(
+        &self,
+        heap: &mut otter_gc::GcHeap,
+    ) -> crate::property_atom::AtomId {
+        if let Some(atom) = self.minted_atom(heap) {
+            return atom;
+        }
+        let atom = crate::isolate_names::names_mut(heap).mint_symbol();
+        heap.with_payload(self.inner, |body| body.atom = atom.raw());
+        atom
+    }
+
+    /// The atom this symbol keys slots by, when it ever keyed one: a symbol
+    /// without one names no hidden-class slot.
+    #[must_use]
+    pub(crate) fn minted_atom(
+        &self,
+        heap: &otter_gc::GcHeap,
+    ) -> Option<crate::property_atom::AtomId> {
+        let raw = heap.read_payload(self.inner, |body| body.atom);
+        let atom = crate::property_atom::AtomId::from_global(raw);
+        (atom != crate::property_atom::AtomId::NONE).then_some(atom)
     }
 
     /// Raw GC handle — used by tracing and write barriers.

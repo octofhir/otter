@@ -413,11 +413,12 @@ pub(crate) fn build_shape_transition_snapshot(
                     body.own_offset(),
                 )
             });
-        let key = if transition_key_handle.is_null() {
-            String::new()
+        let key = if let Some(key) = transition_key_handle.as_string() {
+            String::from_utf16_lossy(&to_utf16_vec(heap, key))
+        } else if let Some(symbol) = transition_key_handle.as_symbol() {
+            crate::symbol::JsSymbol::from_handle(heap, symbol).descriptive_string(heap)
         } else {
-            let units = to_utf16_vec(heap, transition_key_handle);
-            String::from_utf16_lossy(&units)
+            String::new()
         };
         raw.push((parent_id.raw(), child_id.raw(), key, property_count));
     }

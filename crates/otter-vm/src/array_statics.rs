@@ -55,7 +55,10 @@ pub static ARRAY_STATIC_METHODS: &[MethodSpec] = &[
     },
 ];
 
-pub(crate) fn native_is_array(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
+pub(crate) fn native_is_array(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let value = args.first().copied().unwrap_or_else(Value::undefined);
     // §7.2.2 IsArray includes Proxy recursion and revoked-Proxy TypeError.
     let result = ctx.cx.interp.is_array(&value).map_err(|err| {

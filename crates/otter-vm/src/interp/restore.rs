@@ -101,6 +101,7 @@ impl Interpreter {
                 "atom replay must re-mint identical ids"
             );
         }
+        names.restore_symbol_atoms(snapshot.symbol_atoms);
         let code_space = snapshot.code_space.restore(&mut names, account)?;
         let mut gc_heap = otter_gc::GcHeap::with_max_heap_bytes(max_heap_bytes)?;
         gc_heap.set_external_bytes_account(account)?;

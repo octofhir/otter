@@ -103,6 +103,29 @@ impl SymbolPropsBody {
         self.len += 1;
     }
 
+    /// Insert `entries` before every current record, sliding those up. The
+    /// caller reserved room for all of them.
+    pub(super) fn prepend(&mut self, entries: Vec<SymbolProp>) {
+        let len = self.len();
+        let count = entries.len();
+        assert!(
+            len + count <= self.capacity(),
+            "symbol prop prepend without a reservation"
+        );
+        // SAFETY: every index below `len + count` is inside the table; the
+        // shift runs from the top so no record is overwritten before it moves.
+        unsafe {
+            for i in (0..len).rev() {
+                let entry = self.entries_ptr().add(i).read();
+                self.entries_ptr().add(i + count).write(entry);
+            }
+            for (i, entry) in entries.into_iter().enumerate() {
+                self.entries_ptr().add(i).write(entry);
+            }
+        }
+        self.len += u32::try_from(count).expect("symbol prop count exceeds u32");
+    }
+
     /// Remove the record at `index`, sliding later records down.
     pub(super) fn remove(&mut self, index: usize) {
         let len = self.len();
@@ -210,22 +233,24 @@ impl SymbolPropsBody {
     }
 }
 
-/// Prepare one append slot, preserving the old table on actual allocator failure.
+/// Prepare `additional` append slots, preserving the old table on actual
+/// allocator failure.
 /// The caller roots its receiver and pending key/descriptor through external_visit
 /// or the heap's normal root providers. This owner roots the actual table slot.
 pub(crate) fn reserve_table(
     handle: &mut SymbolPropsHandle,
     heap: &mut GcHeap,
+    additional: usize,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
     let (len, capacity) = body_of(*handle).map_or((0, 0), |body| {
         // SAFETY: the caller's live typed handle owns this immutable lookup.
         unsafe { ((*body).len(), (*body).capacity()) }
     });
-    if len < capacity {
+    if len + additional <= capacity {
         return Ok(());
     }
-    let grown = (capacity * 2).max(2);
+    let grown = (capacity * 2).max(2).max(len + additional);
     let old = *handle;
     let handle_slot = std::ptr::from_mut(handle).cast::<RawGc>();
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {

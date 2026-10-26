@@ -115,8 +115,8 @@ pub struct ShapeBody {
     field_type: AtomicU64,
     /// Parent shape, or `Gc::null()` for root.
     parent: ShapeHandle,
-    /// Key added by this transition, or `Gc::null()` for root.
-    transition_key: JsStringHandle,
+    /// Key added by this transition, or [`ShapeKey::NULL`] for root.
+    transition_key: ShapeKey,
     /// Isolate-global atom of [`Self::transition_key`], or [`AtomId::NONE`]
     /// for the root. This is the identity every chain walk compares: one
     /// `u32` per link instead of a string content compare per link.
@@ -138,6 +138,8 @@ pub struct ShapeBody {
     /// Number of persistent in-object words; fixed except when slack tracking
     /// finishes a provisional lineage.
     inline_capacity: u8,
+    /// Whether this shape or an ancestor keys a slot by a symbol.
+    symbol_keys: bool,
     /// Previous root for this prototype, capacity and state cache; roots only.
     previous_layout_root: ShapeHandle,
     /// Immutable storage, lookup, extensibility, prototype-role and sampling facts.
@@ -199,6 +201,10 @@ pub(crate) const SHAPE_BODY_STATE_OFFSET: usize = std::mem::offset_of!(ShapeBody
 pub(crate) const SHAPE_BODY_PROTOTYPE_OFFSET: usize = std::mem::offset_of!(ShapeBody, prototype);
 
 pub(crate) const SHAPE_BODY_KEYS_OFFSET: usize = std::mem::offset_of!(ShapeBody, keys);
+/// Cell byte of a shape's symbol-keys flag (nonzero when the shape or an
+/// ancestor keys a slot by a symbol), for generated code.
+pub const SHAPE_SYMBOL_KEYS_BYTE: u32 =
+    (otter_gc::header::HEADER_SIZE + std::mem::offset_of!(ShapeBody, symbol_keys)) as u32;
 pub(crate) const SHAPE_BODY_PARENT_OFFSET: usize = std::mem::offset_of!(ShapeBody, parent);
 pub(crate) const SHAPE_BODY_ATOM_OFFSET: usize = std::mem::offset_of!(ShapeBody, transition_atom);
 pub(crate) const SHAPE_BODY_FIELD_OFFSET: usize = std::mem::offset_of!(ShapeBody, own_field);
@@ -228,13 +234,14 @@ impl ShapeBody {
             id,
             field_type: AtomicU64::new(0),
             parent: ShapeHandle::null(),
-            transition_key: JsStringHandle::null(),
+            transition_key: ShapeKey::NULL,
             transition_atom: AtomId::NONE,
             property_count: 0,
             own_field: super::FieldLocation::for_slot(0, inline_capacity),
             own_flags: PropertyFlags::data_default(),
             own_is_accessor: false,
             inline_capacity: inline_capacity as u8,
+            symbol_keys: false,
 
             previous_layout_root,
             state,
@@ -253,7 +260,7 @@ impl ShapeBody {
     fn child(
         parent_handle: ShapeHandle,
         parent: &ShapeBody,
-        key: JsStringHandle,
+        key: ShapeKey,
         atom: AtomId,
         own_flags: PropertyFlags,
         own_is_accessor: bool,
@@ -265,7 +272,7 @@ impl ShapeBody {
             parent_handle
         );
         debug_assert!(
-            key.is_null() || key.offset().is_multiple_of(8),
+            key.is_null() || key.0.0.is_multiple_of(8),
             "misaligned shape key at child creation: key={:?}",
             key
         );
@@ -292,6 +299,7 @@ impl ShapeBody {
             own_flags,
             own_is_accessor,
             inline_capacity: parent.inline_capacity,
+            symbol_keys: parent.symbol_keys || key.as_symbol().is_some(),
             previous_layout_root: ShapeHandle::null(),
             state: parent.state,
             prototype: parent.prototype,
@@ -317,9 +325,9 @@ impl ShapeBody {
         self.parent
     }
 
-    /// Property key added by this transition, or `Gc::null()` for root.
+    /// Property key added by this transition, or [`ShapeKey::NULL`] for root.
     #[must_use]
-    pub(crate) const fn transition_key(&self) -> JsStringHandle {
+    pub(crate) const fn transition_key(&self) -> ShapeKey {
         self.transition_key
     }
 
@@ -433,7 +441,7 @@ impl otter_gc::SafeTraceable for ShapeBody {
             visitor(p);
         }
         if !self.transition_key.is_null() {
-            let p = &mut self.transition_key as *mut JsStringHandle as *mut RawGc;
+            let p = &mut self.transition_key.0 as *mut RawGc;
             visitor(p);
         }
         if !self.prototype.is_null() {
@@ -777,6 +785,12 @@ pub(crate) fn root_for_layout(
     None
 }
 
+/// Whether `shape` keys any slot by a symbol.
+#[must_use]
+pub(crate) fn has_symbol_keys(shape: ShapeHandle) -> bool {
+    body_of(shape).symbol_keys
+}
+
 /// The root of a live, non-null `shape`'s lineage.
 #[must_use]
 pub(crate) fn lineage_root_of(heap: &GcHeap, shape: ShapeHandle) -> ShapeHandle {
@@ -818,7 +832,7 @@ fn remember_prototype(heap: &mut GcHeap, shape: ShapeHandle, prototype: ShapePro
 pub(crate) fn alloc_child_shape_body_with_roots(
     heap: &mut GcHeap,
     parent: ShapeHandle,
-    key: JsStringHandle,
+    key: ShapeKey,
     atom: AtomId,
     own_flags: PropertyFlags,
     own_is_accessor: bool,
@@ -846,6 +860,8 @@ pub(crate) fn alloc_child_shape_body_with_roots(
         )
     });
     let child = heap.alloc_old_with_roots(body, external_visit)?;
+    let key = heap.read_payload(child, ShapeBody::transition_key);
+    heap.record_write_edge(child, key.raw());
     // The table's last entry is the slot this child adds.
     let keys = heap.read_payload(child, |body| body.keys);
     if !keys.is_null() {
@@ -865,7 +881,7 @@ pub(crate) fn alloc_child_shape_body_with_roots(
 fn child_keys(
     heap: &mut GcHeap,
     parent: ShapeHandle,
-    key: &mut JsStringHandle,
+    key: &mut ShapeKey,
     atom: AtomId,
     flags: PropertyFlags,
     is_accessor: bool,
@@ -877,7 +893,7 @@ fn child_keys(
     if parent_count + 1 < SHAPE_KEYS_MIN {
         return Ok(ShapeKeysHandle::null());
     }
-    let Some(hash) = crate::string::gc_body::spelling_hash_in_place(heap, *key) else {
+    let Some(hash) = key.spelling_hash(heap) else {
         return Ok(ShapeKeysHandle::null());
     };
     let Some(prefix) = chain_key_entries(heap, parent, parent_keys, parent_count) else {
@@ -891,12 +907,12 @@ fn child_keys(
         is_accessor,
         owner: ShapeHandle::null(),
     };
-    let key_slot = key as *mut JsStringHandle;
+    let key_slot = key as *mut ShapeKey;
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         external_visit(visitor);
         // SAFETY: the caller's key outlives the allocation.
         if unsafe { !(*key_slot).is_null() } {
-            visitor(key_slot.cast::<RawGc>());
+            visitor(unsafe { &mut (*key_slot).0 } as *mut RawGc);
         }
     };
     keys_for_child(
@@ -930,8 +946,7 @@ fn chain_key_entries(
             entries.push(super::shape_keys::KeyEntry {
                 key: body.transition_key,
                 atom: body.transition_atom,
-                hash: crate::string::gc_body::spelling_hash_in_place(heap, body.transition_key)?
-                    as u32,
+                hash: body.transition_key.spelling_hash(heap)? as u32,
                 flags: body.own_flags,
                 is_accessor: body.own_is_accessor,
                 owner: shape,
@@ -952,6 +967,7 @@ pub(crate) fn shape_offset_of_key(
     mut shape: ShapeHandle,
     key: JsStringHandle,
 ) -> Option<u32> {
+    let key = ShapeKey::string(key);
     while !shape.is_null() {
         debug_assert_eq!(
             unsafe { (*shape.as_header_ptr()).type_tag() },
@@ -1020,15 +1036,9 @@ pub(crate) fn shape_offset_of_str(heap: &GcHeap, mut shape: ShapeHandle, key: &s
         let (parent, transition_key, own_offset) = heap.read_payload(shape, |body| {
             (body.parent(), body.transition_key(), body.own_offset())
         });
-        debug_assert!(
-            transition_key.is_null() || transition_key.offset().is_multiple_of(8),
-            "misaligned shape transition key: shape={:?} swept={} parent={:?} key={:?}",
-            shape,
-            unsafe { (*shape.as_header_ptr()).is_swept() },
-            parent,
-            transition_key
-        );
-        if !transition_key.is_null() && eq_str(heap, transition_key, key) {
+        if let Some(transition_key) = transition_key.as_string()
+            && eq_str(heap, transition_key, key)
+        {
             return Some(own_offset);
         }
         shape = parent;
@@ -1152,7 +1162,7 @@ pub(crate) fn shape_key_at_offset(
     heap: &GcHeap,
     mut shape: ShapeHandle,
     offset: u32,
-) -> Option<JsStringHandle> {
+) -> Option<ShapeKey> {
     if let Some((keys, count)) = keys_of(shape) {
         return (offset < count).then(|| heap.read_payload(keys, |table| table.entry(offset).key));
     }
@@ -1250,7 +1260,72 @@ pub(crate) fn shape_slot_of_atom(
     None
 }
 
-/// One string-keyed slot of a shape: its offset and attributes.
+/// The key a transition adds: a string or a symbol cell. Both are
+/// identity-traced through the same slot; readers that need a spelling ask
+/// for the string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct ShapeKey(pub(super) RawGc);
+
+impl ShapeKey {
+    /// The root's key.
+    pub(crate) const NULL: Self = Self(RawGc::NULL);
+
+    /// A string key.
+    #[must_use]
+    pub(crate) fn string(key: JsStringHandle) -> Self {
+        Self(key.raw())
+    }
+
+    /// A symbol key.
+    #[must_use]
+    pub(crate) fn symbol(key: crate::symbol::SymbolHandle) -> Self {
+        Self(key.raw())
+    }
+
+    /// Whether this is the root's key.
+    #[must_use]
+    pub(crate) const fn is_null(self) -> bool {
+        self.0.is_null()
+    }
+
+    /// The key cell, for barriers.
+    #[must_use]
+    pub(crate) const fn raw(self) -> RawGc {
+        self.0
+    }
+
+    /// The traced slot of a key held in place.
+    pub(crate) fn slot(&mut self) -> *mut RawGc {
+        &mut self.0
+    }
+
+    /// The key as a string, when it is one.
+    #[must_use]
+    pub(crate) fn as_string(self) -> Option<JsStringHandle> {
+        self.0
+            .checked_cast::<crate::string::gc_body::JsStringBody>()
+    }
+
+    /// The key as a symbol, when it is one.
+    #[must_use]
+    pub(crate) fn as_symbol(self) -> Option<crate::symbol::SymbolHandle> {
+        self.0.checked_cast::<crate::symbol::SymbolBody>()
+    }
+
+    /// The interner hash a key table indexes this key's spelling by; zero
+    /// for a symbol, which no spelling looks up. `None` when a string's
+    /// spelling is not read in place.
+    #[must_use]
+    pub(crate) fn spelling_hash(self, heap: &GcHeap) -> Option<u64> {
+        match self.as_string() {
+            Some(key) => crate::string::gc_body::spelling_hash_in_place(heap, key),
+            None => Some(0),
+        }
+    }
+}
+
+/// One keyed slot of a shape: its offset and attributes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ShapeSlot {
     pub(crate) offset: u32,
@@ -1266,18 +1341,14 @@ pub(crate) fn shape_key_matches_str(
     offset: u32,
     key: &str,
 ) -> bool {
-    let Some(actual) = shape_key_at_offset(heap, shape, offset) else {
-        return false;
-    };
-    !actual.is_null() && eq_str(heap, actual, key)
+    shape_key_at_offset(heap, shape, offset)
+        .and_then(ShapeKey::as_string)
+        .is_some_and(|actual| eq_str(heap, actual, key))
 }
 
 /// Return transition keys in ordinary insertion order with their slot offsets.
 #[must_use]
-pub(crate) fn shape_keys_ordered(
-    heap: &GcHeap,
-    mut shape: ShapeHandle,
-) -> Vec<(JsStringHandle, u32)> {
+pub(crate) fn shape_keys_ordered(heap: &GcHeap, mut shape: ShapeHandle) -> Vec<(ShapeKey, u32)> {
     let mut reversed = Vec::new();
     while !shape.is_null() {
         let (parent, transition_key, own_offset, is_root) = heap.read_payload(shape, |body| {
@@ -1332,8 +1403,10 @@ pub(crate) fn shape_enumerable_keys(heap: &GcHeap, mut shape: ShapeHandle) -> Ve
     let mut reversed = Vec::new();
     while !shape.is_null() {
         let body = body_of(shape);
-        if !body.is_root() && body.own_flags.enumerable() {
-            reversed.push(body.transition_key);
+        if let Some(key) = body.transition_key.as_string()
+            && body.own_flags.enumerable()
+        {
+            reversed.push(key);
         }
         shape = body.parent;
     }
@@ -1431,11 +1504,26 @@ mod tests {
         let flags = PropertyFlags::data_default();
         let atom_x = AtomId::from_global(1);
         let atom_y = AtomId::from_global(2);
-        sx =
-            alloc_child_shape_body_with_roots(&mut heap, root, x, atom_x, flags, false, &mut roots)
-                .expect("sx");
-        sxy = alloc_child_shape_body_with_roots(&mut heap, sx, y, atom_y, flags, false, &mut roots)
-            .expect("sxy");
+        sx = alloc_child_shape_body_with_roots(
+            &mut heap,
+            root,
+            ShapeKey::string(x),
+            atom_x,
+            flags,
+            false,
+            &mut roots,
+        )
+        .expect("sx");
+        sxy = alloc_child_shape_body_with_roots(
+            &mut heap,
+            sx,
+            ShapeKey::string(y),
+            atom_y,
+            flags,
+            false,
+            &mut roots,
+        )
+        .expect("sxy");
 
         assert_eq!(shape_offset_of_key(&heap, sxy, x), Some(0));
         assert_eq!(shape_offset_of_key(&heap, sxy, y), Some(1));
@@ -1448,8 +1536,14 @@ mod tests {
 
         let keys = shape_keys_ordered(&heap, sxy);
         assert_eq!(keys.len(), 2);
-        assert_eq!(to_utf16_vec(&heap, keys[0].0), vec![b'x' as u16]);
-        assert_eq!(to_utf16_vec(&heap, keys[1].0), vec![b'y' as u16]);
+        assert_eq!(
+            to_utf16_vec(&heap, keys[0].0.as_string().unwrap()),
+            vec![b'x' as u16]
+        );
+        assert_eq!(
+            to_utf16_vec(&heap, keys[1].0.as_string().unwrap()),
+            vec![b'y' as u16]
+        );
         assert_eq!(keys[0].1, 0);
         assert_eq!(keys[1].1, 1);
     }

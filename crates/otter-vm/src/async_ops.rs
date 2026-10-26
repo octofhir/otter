@@ -686,9 +686,10 @@ mod tests {
         Box<ParkedFrameState>,
         Option<Box<crate::cold_frame::ColdFrame>>,
     ) {
-        let result_promise = crate::promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
-            .pending_runtime_rooted(interp, &mut [], &mut [])
-            .unwrap();
+        let result_promise =
+            crate::promise_dispatch::PromiseBuilder::with_context(Some(context.clone()))
+                .pending_runtime_rooted(interp, &mut [], &mut [])
+                .unwrap();
         interp.frame_set_async_state(&mut frame, AsyncFrameState { result_promise });
         let cold = interp.frame_detach_cold(&mut frame);
         let parked = Box::new(interp.park_active_frame(&frame));

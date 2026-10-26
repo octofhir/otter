@@ -51,7 +51,7 @@ use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::property_atom::AtomId;
-use crate::string::{JsStringHandle, eq_str};
+use crate::string::eq_str;
 
 use super::descriptor::PropertyFlags;
 
@@ -69,7 +69,7 @@ pub(crate) const SHAPE_KEYS_MIN: u32 = 8;
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub(crate) struct KeyEntry {
-    pub(crate) key: JsStringHandle,
+    pub(crate) key: super::shape_body::ShapeKey,
     pub(crate) atom: AtomId,
     /// Low bits of the spelling's interner hash
     /// ([`crate::property_atom::spelling_hash`]).
@@ -173,7 +173,11 @@ impl ShapeKeysBody {
     ) -> Option<u32> {
         (0..count).find(|&slot| {
             let entry = self.entry(slot);
-            entry.hash == hash && eq_str(heap, entry.key, key)
+            entry.hash == hash
+                && entry
+                    .key
+                    .as_string()
+                    .is_some_and(|entry_key| eq_str(heap, entry_key, key))
         })
     }
 
@@ -216,7 +220,7 @@ impl otter_gc::SafeTraceable for ShapeKeysBody {
             // SAFETY: entries `0..len` are initialized and live with the body.
             let entry = unsafe { &mut *self.entries_ptr().add(slot) };
             if !entry.key.is_null() {
-                visitor((&mut entry.key as *mut JsStringHandle).cast::<RawGc>());
+                visitor(entry.key.slot());
             }
             if !entry.owner.is_null() {
                 visitor((&mut entry.owner as *mut super::shape_body::ShapeHandle).cast::<RawGc>());
@@ -266,7 +270,7 @@ pub(crate) fn keys_for_child(
     let capacity = (2 * count).next_power_of_two();
     let base = entries.as_mut_ptr();
     let len = entries.len();
-    let entry_key = &mut entry.key as *mut JsStringHandle;
+    let entry_key = entry.key.slot();
     let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
         external_visit(visitor);
         // SAFETY: `entries` and `entry` outlive the allocation; their key
@@ -275,7 +279,7 @@ pub(crate) fn keys_for_child(
             for slot in 0..len {
                 let entry = &mut *base.add(slot);
                 if !entry.key.is_null() {
-                    visitor((&mut entry.key as *mut JsStringHandle).cast::<RawGc>());
+                    visitor(entry.key.slot());
                 }
                 if !entry.owner.is_null() {
                     visitor(
@@ -382,7 +386,7 @@ mod tests {
 
     fn entry(atom: u32) -> KeyEntry {
         KeyEntry {
-            key: JsStringHandle::null(),
+            key: super::super::shape_body::ShapeKey::NULL,
             atom: AtomId::from_global(atom),
             hash: atom,
             flags: PropertyFlags::data_default(),

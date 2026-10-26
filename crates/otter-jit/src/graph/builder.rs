@@ -1218,8 +1218,7 @@ impl<'a> Builder<'a> {
         let (this, new_target, receiver) = match this {
             InlineThis::Bound(this) => (this, self.undefined, None),
             InlineThis::Construct(allocation, new_target) => {
-                let receiver =
-                    self.add(Kind::NewReceiver(allocation), &[new_target], Repr::Tagged);
+                let receiver = self.add(Kind::NewReceiver(allocation), &[new_target], Repr::Tagged);
                 let shape = match allocation.receiver_shape {
                     0 => allocation.prototype_root,
                     shape => shape,
@@ -3880,7 +3879,15 @@ impl<'a> Builder<'a> {
             } else {
                 callee
             };
-            if self.inline_construct(instruction, body, plan, allocation, closure, callee, &values) {
+            if self.inline_construct(
+                instruction,
+                body,
+                plan,
+                allocation,
+                closure,
+                callee,
+                &values,
+            ) {
                 return;
             }
             if let Some(checkpoint) = checkpoint

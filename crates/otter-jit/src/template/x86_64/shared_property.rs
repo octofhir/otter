@@ -201,10 +201,11 @@ fn emit_load_probe(
     );
 }
 
-/// Leave the atom of the string `key` in `Rd(atom)`, or branch to `miss`
-/// for any other key or a string no property key has interned. A string
-/// whose atom is not yet recorded asks the interning leaf and records the
-/// answer in its atom word. The routine inputs, `rsi`, `rcx` and `rdx`,
+/// Leave the atom of the string or symbol `key` in `Rd(atom)`, or branch to
+/// `miss` for any other key, to `uninterned` for a string no property key has
+/// interned or a symbol that never keyed a slot. A string whose atom is not
+/// yet recorded asks the interning leaf and records the answer in its atom
+/// word. The routine inputs, `rsi`, `rcx` and `rdx`,
 /// survive the leaf call; `aligned` says whether `rsp` is 16-byte aligned
 /// here.
 fn emit_key_atom(
@@ -218,13 +219,14 @@ fn emit_key_atom(
     miss: DynamicLabel,
 ) {
     let ready = ops.new_dynamic_label();
+    let symbol = ops.new_dynamic_label();
     let atom_byte = view.string_layout.atom_byte as i32;
     emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
     dynasm!(ops ; .arch x64
         ; test Rq(key), r11 ; jnz =>miss
         ; test Rq(key), Rq(key) ; jz =>miss
         ; movzx r11d, BYTE [Rq(key)]
-        ; cmp r11d, i32::from(view.string_layout.string_type_tag) ; jne =>miss
+        ; cmp r11d, i32::from(view.string_layout.string_type_tag) ; jne =>symbol
         // The body records the atom plus one; zero is unrecorded.
         ; mov Rd(atom), [Rq(key) + atom_byte]
         ; sub Rd(atom), 1 ; jae =>ready
@@ -257,6 +259,13 @@ fn emit_key_atom(
         ; cmp Rd(atom), -1 ; je =>uninterned
         ; lea r11d, [Rq(atom) + 1]
         ; mov [Rq(key) + atom_byte], r11d
+        ; jmp =>ready
+        // A symbol carries the atom of the slot it first keyed, all ones
+        // before.
+        ; =>symbol
+        ; cmp r11d, i32::from(otter_vm::symbol::SYMBOL_BODY_TYPE_TAG) ; jne =>miss
+        ; mov Rd(atom), [Rq(key) + otter_vm::symbol::SYMBOL_ATOM_BYTE as i32]
+        ; cmp Rd(atom), -1 ; je =>uninterned
         ; =>ready
     );
 }

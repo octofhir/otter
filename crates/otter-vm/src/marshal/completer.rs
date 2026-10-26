@@ -213,11 +213,12 @@ fn settle_from_root_in_active_realm<R: IntoJs>(
                     .ok_or_else(|| JsError::Native(crate::NativeError::InvalidOperand))?;
                 let interp = cx.ctx().interp_mut();
                 if fulfil {
-                    crate::promise_dispatch::resolve_promise_from_interpreter(
+                    crate::promise_dispatch::resolve_promise(
                         interp,
+                        &mut crate::activation_stack::ActivationStack::new(),
                         promise,
                         raw_out,
-                        context.clone(),
+                        context.as_ref(),
                     )
                     .map_err(|error| JsError::from_vm(interp, error))?;
                 } else {

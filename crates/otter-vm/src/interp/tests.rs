@@ -4646,7 +4646,7 @@ fn promise_fulfilled_of_allocates_the_body_in_old_space() {
 }
 
 #[test]
-fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
+fn await_non_promise_queues_its_resumption_at_once() {
     let mut function = test_function(0, "async_body", 0, 1, Vec::new());
     function.is_async = true;
     let module = BytecodeModule {
@@ -4676,18 +4676,17 @@ fn await_non_promise_uses_stack_rooted_wrapper_allocation() {
     let context = interp
         .link_module(module, crate::source_registry::SourceRegistry::default())
         .expect("valid bytecode fixture");
-    let before = interp.gc_heap_mut().stats().new_allocated_bytes;
-
     with_test_runtime_turn(&mut interp, &mut stack, |interp, stack| {
         interp
             .do_await(stack, &context, 0, Value::number(NumberValue::Smi(307)))
             .expect("await");
     });
 
-    let after = interp.gc_heap_mut().stats().new_allocated_bytes;
+    // The wrapper promise would be fulfilled at once, so its reaction job is
+    // the resumption itself, queued without the promise.
     assert!(
-        after > before,
-        "Await of a non-promise should wrap through stack-rooted young allocation"
+        interp.microtasks.has_pending_sync(),
+        "Await of a non-promise queues its resumption at once"
     );
     assert!(stack.is_empty(), "await should park the active frame");
 }

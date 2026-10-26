@@ -770,8 +770,9 @@ impl Interpreter {
             // The activation's completion is its result promise, rooted across
             // settlement.
             let anchor = self.push_iteration_anchor(Value::promise(state.result_promise)) - 1;
-            let settled = crate::promise_dispatch::resolve_promise_from_interpreter(
+            let settled = crate::promise_dispatch::resolve_promise(
                 self,
+                &mut crate::activation_stack::ActivationStack::new(),
                 state.result_promise,
                 resolved,
                 None,

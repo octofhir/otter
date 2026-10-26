@@ -226,6 +226,14 @@ pub enum ReactionKind {
 /// execution context owned it at creation time — needed when
 /// settlement work runs in a later mutator turn (e.g. host-driven
 /// cross-thread resolution).
+///
+/// `NewPromiseCapability(%Promise%)` never exposes its resolving functions,
+/// so the engine's own capabilities over a native promise are *bare*
+/// ([`Self::bare`]): `resolve` and `reject` stay `undefined` and settlement
+/// runs the promise resolve/reject operations directly. An `await` reaction
+/// settles no capability at all ([`Self::none`]). A capability built by
+/// NewPromiseCapability always holds callables, so neither form is
+/// ambiguous.
 #[derive(Debug, Clone)]
 pub struct PromiseCapability {
     /// `[[Promise]]` — the promise this capability settles.
@@ -236,6 +244,30 @@ pub struct PromiseCapability {
     pub reject: Value,
     /// Otter-specific: VM context captured when the capability was created.
     pub context: Option<ExecutionContext>,
+}
+
+impl PromiseCapability {
+    /// A capability over the native `promise` with no resolving functions.
+    #[must_use]
+    pub fn bare(promise: JsPromiseHandle, context: Option<ExecutionContext>) -> Self {
+        Self {
+            promise: Value::promise(promise),
+            resolve: Value::undefined(),
+            reject: Value::undefined(),
+            context,
+        }
+    }
+
+    /// The `undefined` capability of an `await` reaction.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            promise: Value::undefined(),
+            resolve: Value::undefined(),
+            reject: Value::undefined(),
+            context: None,
+        }
+    }
 }
 
 impl otter_gc::GcStore for PromiseCapability {
@@ -791,6 +823,24 @@ impl JsPromiseHandle {
         }
     }
 
+    /// PerformPromiseThen's settled-promise step for a reaction about to be
+    /// queued directly: mark the promise handled and return its result with
+    /// `true` for fulfillment, or `None` while it is pending.
+    pub(crate) fn handle_settled(&self, heap: &mut otter_gc::GcHeap) -> Option<(Value, bool)> {
+        let PromiseRepr::Pure(promise) = self.inner;
+        heap.with_payload(promise.inner, |body| match body.state {
+            PromiseState::Pending => None,
+            PromiseState::Fulfilled(value) => {
+                body.is_handled = true;
+                Some((value, true))
+            }
+            PromiseState::Rejected(reason) => {
+                body.is_handled = true;
+                Some((reason, false))
+            }
+        })
+    }
+
     /// Read the lazy expando bag — only populated by user
     /// installations such as `promise.then = fn`.
     #[must_use]
@@ -1038,17 +1088,25 @@ pub fn new_promise_reaction_job(
     let async_context = reaction.async_context;
     match reaction.handler {
         PromiseReactionHandler::Call(handler) => {
-            let (callee, result_capability) = match handler {
-                Some(h) => (
-                    h,
-                    Some(MicrotaskCapability {
-                        resolve: reaction.capability.resolve,
-                        reject: reaction.capability.reject,
-                    }),
-                ),
-                None => match reaction.kind {
-                    ReactionKind::Fulfill => (reaction.capability.resolve, None),
-                    ReactionKind::Reject => (reaction.capability.reject, None),
+            let capability = reaction.capability;
+            let target = (!capability.promise.is_undefined()).then_some(MicrotaskCapability {
+                promise: capability.promise,
+                resolve: capability.resolve,
+                reject: capability.reject,
+            });
+            let fulfilled = reaction.kind == ReactionKind::Fulfill;
+            let (callee, result_capability, kind) = match handler {
+                Some(h) => (h, target, MicrotaskKind::Call),
+                // Identity / thrower: a bare capability settles its promise
+                // directly; resolving functions are called with the value.
+                None => match target {
+                    Some(target) if target.is_bare() => (
+                        Value::undefined(),
+                        Some(target),
+                        MicrotaskKind::PassThrough { fulfilled },
+                    ),
+                    _ if fulfilled => (capability.resolve, None, MicrotaskKind::Call),
+                    _ => (capability.reject, None, MicrotaskKind::Call),
                 },
             };
             Some(Microtask {
@@ -1058,7 +1116,7 @@ pub fn new_promise_reaction_job(
                 context: reaction.context,
                 realm_id: reaction.realm_id,
                 result_capability,
-                kind: MicrotaskKind::Call,
+                kind,
                 async_context,
             })
         }
@@ -1209,11 +1267,16 @@ mod tests {
             job.context.is_none(),
             "native-only reaction retains explicit None"
         );
-        // The capability keeps its own context; a handler-less pass-through
-        // settles that capability directly instead of adopting its context.
+        // The capability keeps its own context; a handler-less reaction on a
+        // bare capability settles that capability's promise directly.
         assert!(
-            job.result_capability.is_none(),
-            "handler-less pass-through settles the capability directly"
+            matches!(job.kind, MicrotaskKind::PassThrough { fulfilled: true })
+                && job.callee.is_undefined()
+                && job
+                    .result_capability
+                    .as_ref()
+                    .is_some_and(crate::microtask::MicrotaskCapability::is_bare),
+            "handler-less reaction on a bare capability passes its value through"
         );
         let cap = cap_for(&mut heap);
         let outcome = p.perform_then_with_context(

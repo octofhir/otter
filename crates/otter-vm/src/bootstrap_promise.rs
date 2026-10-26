@@ -118,7 +118,7 @@ pub fn install_promise_well_knowns_post_bootstrap(
 ///
 /// # See also
 /// - <https://tc39.es/ecma262/#sec-get-promise-@@species>
-fn promise_species_get(
+pub(crate) fn promise_species_get(
     ctx: &mut NativeCtx<'_>,
     _args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {

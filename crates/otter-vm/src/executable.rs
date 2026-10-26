@@ -533,6 +533,8 @@ impl CodeBlock {
                 type_tag: crate::class_constructor::CLASS_CONSTRUCTOR_BODY_TYPE_TAG,
                 constructor_layouts_byte: gc_header_bytes
                     + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_LAYOUTS_OFFSET as u32,
+                ctor_byte: gc_header_bytes
+                    + crate::class_constructor::CLASS_CONSTRUCTOR_BODY_CTOR_OFFSET as u32,
             },
             constructor_layout: crate::jit::JitConstructorLayout {
                 family_id_byte: gc_header_bytes

@@ -161,6 +161,7 @@ fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
         | Kind::Int32Mod
         | Kind::Int32ShiftRightLogical => &[R::Int32Overflow, R::NegativeZero, R::TypeMismatch],
         Kind::CheckFunction { .. }
+        | Kind::LoadClassConstructor
         | Kind::CheckCellValue(_)
         | Kind::CheckNative(_)
         | Kind::CheckFunctionPrototypeCall(_)

@@ -144,6 +144,15 @@ impl Codegen<'_> {
                     exit,
                 );
             }
+            Kind::LoadClassConstructor => {
+                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                let destination = Self::gp(self.loc(node).result.expect("a result"));
+                let class = self.view_of(node).class_constructor_layout;
+                self.emit_cell_guard(input(0), exit);
+                dynasm!(self.ops ; .arch x64
+                    ; cmp BYTE [Rq(input(0))], class.type_tag as i8 ; jne =>exit
+                    ; mov Rq(destination), [Rq(input(0)) + class.ctor_byte as i32]);
+            }
             Kind::CheckCellValue(cell) => {
                 let exit = self.eager_exit(node, DeoptReason::WrongValue);
                 let target = RelocationTarget::CalleeIdentityCell {

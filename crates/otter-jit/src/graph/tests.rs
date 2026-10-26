@@ -827,6 +827,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
             function_id: 1,
             cell: 0,
         },
+        Kind::LoadClassConstructor,
         Kind::CheckCellValue(0),
         Kind::LoadCellValue(0),
         Kind::CheckClosureContext(0),
@@ -1018,6 +1019,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::LoadActualArgument
         | K::SelectArgument { .. }
         | K::CheckFunction { .. }
+        | K::LoadClassConstructor
         | K::CheckCellValue(_)
         | K::LoadCellValue(_)
         | K::CheckClosureContext(_)

@@ -31,7 +31,7 @@
 //! - [`crate::store`] for the content store and package index.
 //! - [`crate::tarball`] for byte fetch and integrity verification.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -216,16 +216,30 @@ impl FsPackageStore {
             .buffer_unordered(MATERIALIZE_CONCURRENCY)
             .try_collect()
             .await?;
-        installed.sort_by(|a, b| a.package_id.cmp(&b.package_id));
+        // The project's own dependencies name its bins first; another
+        // package's bin takes a name only while no earlier one holds it.
+        let direct: BTreeSet<&str> = lockfile
+            .packages
+            .iter()
+            .filter(|(id, _)| !crate::layout::is_stored(lockfile, id))
+            .flat_map(|(_, package)| package.dependencies.values().map(String::as_str))
+            .collect();
+        installed.sort_by(|a, b| {
+            (!direct.contains(a.package_id.as_str()), &a.package_id)
+                .cmp(&(!direct.contains(b.package_id.as_str()), &b.package_id))
+        });
+        let mut taken = BTreeSet::new();
         for package in &mut installed {
             package.linked_bins = link_package_bins(
                 project_root,
                 &PackageId::new(&package.package_id),
                 &package.installed_root,
+                &mut taken,
             )
             .await?
             .len();
         }
+        installed.sort_by(|a, b| a.package_id.cmp(&b.package_id));
         Ok(installed)
     }
 
@@ -468,11 +482,15 @@ fn index_key(relative: &Path) -> String {
         .join("/")
 }
 
+/// An entry's path inside the package. The archive's first directory is the
+/// package root whatever it is called: `package/` by convention, the bare
+/// name in some (`@types/*` ship `node/`, `estree/`, ...), as npm unpacks it.
 fn archive_relative_path(path: &Path) -> Result<PathBuf, PackageManagerError> {
     let mut out = PathBuf::new();
+    let mut root = true;
     for component in path.components() {
         match component {
-            Component::Normal(part) if part == "package" && out.as_os_str().is_empty() => {}
+            Component::Normal(_) if root => root = false,
             Component::Normal(part) => out.push(part),
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
@@ -486,10 +504,13 @@ fn archive_relative_path(path: &Path) -> Result<PathBuf, PackageManagerError> {
     Ok(out)
 }
 
+/// Link the bins of the package at `package_root` whose names are not in
+/// `taken`, and take them.
 async fn link_package_bins(
     project_root: &Path,
     package_id: &PackageId,
     package_root: &Path,
+    taken: &mut BTreeSet<String>,
 ) -> Result<Vec<PackageBin>, PackageManagerError> {
     let manifest_path = package_root.join(PACKAGE_JSON);
     if !tokio::fs::try_exists(&manifest_path)
@@ -512,7 +533,8 @@ async fn link_package_bins(
             path: bin_root.clone(),
             message: err.to_string(),
         })?;
-    let bins = bin_entries(package_id, package_root, &manifest, bin_manifest);
+    let mut bins = bin_entries(package_id, package_root, &manifest, bin_manifest);
+    bins.retain(|bin| taken.insert(bin.name.clone()));
     for bin in &bins {
         link_bin_file(&bin.path, &bin_root.join(&bin.name)).await?;
     }

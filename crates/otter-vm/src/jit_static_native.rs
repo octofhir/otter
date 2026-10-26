@@ -126,6 +126,41 @@ const JIT_LEAF_BUILTINS: &[JitLeafBuiltin] = {
             abi::STUB_PARSE_INT_I32_LEAF.id,
             1,
         ),
+        argument_leaf(
+            crate::intrinsics::number::number_is_nan_native,
+            abi::STUB_NUMBER_IS_NAN_LEAF.id,
+            1,
+        ),
+        argument_leaf(
+            crate::intrinsics::number::number_is_finite_native,
+            abi::STUB_NUMBER_IS_FINITE_LEAF.id,
+            1,
+        ),
+        argument_leaf(
+            crate::intrinsics::number::number_is_integer_native,
+            abi::STUB_NUMBER_IS_INTEGER_LEAF.id,
+            1,
+        ),
+        argument_leaf(
+            crate::intrinsics::number::number_is_safe_integer_native,
+            abi::STUB_NUMBER_IS_SAFE_INTEGER_LEAF.id,
+            1,
+        ),
+        argument_leaf(
+            crate::intrinsics::number::number_ctor_call,
+            abi::STUB_NUMBER_CALL_LEAF.id,
+            1,
+        ),
+        argument_leaf(
+            crate::array_statics::native_is_array,
+            abi::STUB_ARRAY_IS_ARRAY_LEAF.id,
+            1,
+        ),
+        argument_leaf(
+            crate::object_statics::native_get_prototype_of,
+            abi::STUB_OBJECT_GET_PROTOTYPE_OF_LEAF.id,
+            1,
+        ),
         receiver_leaf(
             string::bridge_char_code_at,
             abi::STUB_STRING_CHAR_CODE_AT_LEAF.id,

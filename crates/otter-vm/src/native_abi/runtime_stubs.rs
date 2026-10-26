@@ -1911,6 +1911,13 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_CONTEXT_SLOT_WRITTEN.id => "context_slot_written",
         id if id == STUB_MATH_F64_LEAF.id => "math_f64_leaf",
         id if id == STUB_JIT_STRING_METHOD.id => "jit_string_method",
+        id if id == STUB_NUMBER_IS_NAN_LEAF.id => "number_is_nan_leaf",
+        id if id == STUB_NUMBER_IS_FINITE_LEAF.id => "number_is_finite_leaf",
+        id if id == STUB_NUMBER_IS_INTEGER_LEAF.id => "number_is_integer_leaf",
+        id if id == STUB_NUMBER_IS_SAFE_INTEGER_LEAF.id => "number_is_safe_integer_leaf",
+        id if id == STUB_ARRAY_IS_ARRAY_LEAF.id => "array_is_array_leaf",
+        id if id == STUB_OBJECT_GET_PROTOTYPE_OF_LEAF.id => "object_get_prototype_of_leaf",
+        id if id == STUB_NUMBER_CALL_LEAF.id => "number_call_leaf",
 
         _ => "unknown_runtime_stub",
     }
@@ -2171,6 +2178,90 @@ pub const STUB_JIT_STRING_METHOD: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Committed,
 );
 
+/// Leaf `Number.isNaN`: no coercion, every argument answers.
+pub const STUB_NUMBER_IS_NAN_LEAF: RuntimeStubDescriptor = descriptor(
+    120,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Number.isFinite`: no coercion, every argument answers.
+pub const STUB_NUMBER_IS_FINITE_LEAF: RuntimeStubDescriptor = descriptor(
+    121,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Number.isInteger`: no coercion, every argument answers.
+pub const STUB_NUMBER_IS_INTEGER_LEAF: RuntimeStubDescriptor = descriptor(
+    122,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Number.isSafeInteger`: no coercion, every argument answers.
+pub const STUB_NUMBER_IS_SAFE_INTEGER_LEAF: RuntimeStubDescriptor = descriptor(
+    123,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Array.isArray`; a Proxy misses.
+pub const STUB_ARRAY_IS_ARRAY_LEAF: RuntimeStubDescriptor = descriptor(
+    124,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Object.getPrototypeOf` of an ordinary object; anything else misses.
+pub const STUB_OBJECT_GET_PROTOTYPE_OF_LEAF: RuntimeStubDescriptor = descriptor(
+    125,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Number(value)` call of a non-string primitive; anything else misses.
+pub const STUB_NUMBER_CALL_LEAF: RuntimeStubDescriptor = descriptor(
+    126,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2292,6 +2383,13 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_CONTEXT_SLOT_WRITTEN,
     STUB_MATH_F64_LEAF,
     STUB_JIT_STRING_METHOD,
+    STUB_NUMBER_IS_NAN_LEAF,
+    STUB_NUMBER_IS_FINITE_LEAF,
+    STUB_NUMBER_IS_INTEGER_LEAF,
+    STUB_NUMBER_IS_SAFE_INTEGER_LEAF,
+    STUB_ARRAY_IS_ARRAY_LEAF,
+    STUB_OBJECT_GET_PROTOTYPE_OF_LEAF,
+    STUB_NUMBER_CALL_LEAF,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

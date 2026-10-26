@@ -29,7 +29,7 @@ use crate::{NativeCtx, NativeError, Value};
 otter_macros::couch! {
     name = "String",
     feature = CORE,
-    constructor = (length = 1, call = string_ctor_call),
+    constructor = (length = 1, call = string_ctor_call, ordinary_receiver = true),
     static_method_specs = [super::statics::STRING_STATIC_METHODS],
     prototype = {
         method_specs = [super::prototype::STRING_PROTOTYPE_METHODS],

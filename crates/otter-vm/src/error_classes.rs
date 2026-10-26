@@ -250,7 +250,7 @@ fn native_static_with_roots(
     NativeFunction::new_static_with_roots(gc_heap, name, length, call, &mut external_visit)
 }
 
-fn native_constructor_static_with_roots(
+fn native_receiver_constructor_static_with_roots(
     gc_heap: &mut otter_gc::GcHeap,
     name: &'static str,
     length: u8,
@@ -260,7 +260,7 @@ fn native_constructor_static_with_roots(
     let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
         trace_value_roots(roots, visitor);
     };
-    NativeFunction::new_constructor_static_with_roots(
+    NativeFunction::new_receiver_constructor_static_with_roots(
         gc_heap,
         name,
         length,
@@ -1312,7 +1312,7 @@ impl ErrorClassRegistry {
             PropertyDescriptor::data(Value::object(error_ctor), true, false, true),
         )?;
         error_proto_root = Value::object(error_proto);
-        native_root = Value::native_function(native_constructor_static_with_roots(
+        native_root = Value::native_function(native_receiver_constructor_static_with_roots(
             gc_heap,
             "Error",
             1,
@@ -1598,7 +1598,7 @@ impl ErrorClassRegistry {
                 ErrorKind::WasmLinkError => ctor_wasm_link,
                 ErrorKind::WasmRuntimeError => ctor_wasm_runtime,
             };
-            native_root = Value::native_function(native_constructor_static_with_roots(
+            native_root = Value::native_function(native_receiver_constructor_static_with_roots(
                 gc_heap,
                 kind.class_name(),
                 length as u8,

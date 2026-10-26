@@ -23,7 +23,7 @@ use crate::{NativeCtx, NativeError, Value, object_statics};
 otter_macros::couch! {
     name = "Object",
     feature = CORE,
-    constructor = (length = 1, call = object_ctor_call),
+    constructor = (length = 1, call = object_ctor_call, ordinary_receiver = true),
     static_method_specs = [object_statics::OBJECT_STATIC_METHODS],
     prototype = {
         method_specs = [object_statics::OBJECT_PROTOTYPE_METHODS],

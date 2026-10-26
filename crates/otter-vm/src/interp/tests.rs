@@ -5722,11 +5722,12 @@ fn native_construct_context_walks_the_live_caller_stack() {
     let module = module_with(vec![], 2);
     let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
     let callee = Value::native_function(
-        NativeFunction::new_constructor_static(
+        NativeFunction::new_receiver_constructor_static_with_roots(
             interp.gc_heap_mut(),
             "recordDepth",
             0,
             record_depth,
+            &mut |_: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {},
         )
         .expect("native constructor"),
     );

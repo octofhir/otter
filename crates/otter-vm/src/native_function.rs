@@ -102,6 +102,7 @@ struct NativeFunctionMetadata {
     length_configurable: bool,
     constructable: bool,
     extensible: bool,
+    ordinary_receiver: bool,
 }
 
 impl NativeFunctionMetadata {
@@ -110,6 +111,7 @@ impl NativeFunctionMetadata {
         length_configurable: true,
         constructable: false,
         extensible: true,
+        ordinary_receiver: false,
     };
 
     const CONSTRUCTOR: Self = Self {
@@ -117,6 +119,12 @@ impl NativeFunctionMetadata {
         length_configurable: true,
         constructable: true,
         extensible: true,
+        ordinary_receiver: false,
+    };
+
+    const RECEIVER_CONSTRUCTOR: Self = Self {
+        ordinary_receiver: true,
+        ..Self::CONSTRUCTOR
     };
 
     const THROW_TYPE_ERROR: Self = Self {
@@ -124,6 +132,7 @@ impl NativeFunctionMetadata {
         length_configurable: false,
         constructable: false,
         extensible: false,
+        ordinary_receiver: false,
     };
 }
 
@@ -783,6 +792,28 @@ impl NativeFunction {
         )
     }
 
+    /// [`Self::new_constructor_static_with_roots`] for a constructor whose
+    /// body fills in the ordinary object `[[Construct]]` creates from
+    /// `new.target` (the primitive wrappers, `Date`, `Object` and the error
+    /// classes).
+    pub(crate) fn new_receiver_constructor_static_with_roots(
+        heap: &mut otter_gc::GcHeap,
+        name: &'static str,
+        length: u8,
+        call: NativeFastFn,
+        external_visit: &mut RootSlotVisitor<'_>,
+    ) -> Result<Self, otter_gc::OutOfMemory> {
+        Self::allocate_with_roots(
+            heap,
+            name,
+            length,
+            NativeCallStorage::Static(call),
+            SmallVec::new(),
+            NativeFunctionMetadata::RECEIVER_CONSTRUCTOR,
+            external_visit,
+        )
+    }
+
     /// Build a native function from an already-classified call
     /// target.
     pub fn from_call(
@@ -1019,6 +1050,13 @@ impl NativeFunction {
     #[must_use]
     pub(crate) fn is_constructable(&self, heap: &otter_gc::GcHeap) -> bool {
         heap.read_payload(self.inner, |body| body.call_header.constructable())
+    }
+
+    /// Whether `[[Construct]]` creates the ordinary receiver this body fills
+    /// in, rather than leaving the result's allocation to the body.
+    #[must_use]
+    pub(crate) fn takes_ordinary_receiver(&self, heap: &otter_gc::GcHeap) -> bool {
+        heap.read_payload(self.inner, |body| body.call_header.ordinary_receiver())
     }
 
     /// Native callable `[[IsExtensible]]`.

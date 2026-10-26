@@ -860,6 +860,14 @@ impl Interpreter {
         if !stack.is_runtime_rooted_by(self) {
             return Err(VmError::InvalidOperand);
         }
+        if let Some(native) = callee.as_native_function()
+            && !matches!(
+                native.call_target(&self.gc_heap),
+                crate::native_function::NativeCallTarget::VmIntrinsic(_)
+            )
+        {
+            return self.run_native_sync_rooted(stack, context, native, this_value, args);
+        }
         let source = self.callable_context(context, *callee)?;
         self.enter_sync_reentry()?;
         let floor = stack.floor();
@@ -868,6 +876,55 @@ impl Interpreter {
         self.release_frames_above(stack, floor);
         self.leave_sync_reentry();
         result
+    }
+
+    /// [`Self::run_callable_sync_rooted`] of a native body: the body runs
+    /// directly over the runtime turn, with no staged request, classifier
+    /// pass or host frame. A body that runs JavaScript enters it through the
+    /// same turn. `args` stays in place for the call and is traced there.
+    fn run_native_sync_rooted(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: Option<&ExecutionContext>,
+        native: NativeFunction,
+        this_value: Value,
+        args: SmallVec<[Value; 8]>,
+    ) -> Result<Value, VmError> {
+        self.record_runtime_native_call()?;
+        self.enter_sync_reentry()?;
+        let call = native.call_target(&self.gc_heap);
+        let realm_global = self.native_target_realm_global(&native);
+        let invoke = |vm: &mut Interpreter| {
+            let call_info = NativeCallInfo::call(this_value);
+            let window = ValueWindow::from(args.as_slice());
+            let windows = [window];
+            let roots = NativeCallRoots::new(&call_info, &windows);
+            let _roots_guard = vm
+                .gc_heap
+                .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+            let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(vm, stack);
+            let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, context);
+            let result = call.invoke(&mut ctx, window);
+            let (vm, stack) = ctx.cx.into_parts();
+            // A failure projects once at this boundary, as a native body's
+            // completion does in its host frame.
+            Ok(result.map_err(|error| {
+                let error = match crate::error_ops::native_error_to_committed_with_stack(
+                    vm, stack, context, error,
+                ) {
+                    crate::CommittedValueError::JavaScript(error)
+                    | crate::CommittedValueError::Fatal(error) => error,
+                };
+                vm.record_throw_site();
+                error
+            }))
+        };
+        let result = match realm_global {
+            Some(global) => self.with_host_realm_global(global, invoke),
+            None => invoke(self),
+        };
+        self.leave_sync_reentry();
+        result?
     }
 
     /// Synchronously construct above the current rooted activation floor.

@@ -543,6 +543,14 @@ impl<'a> PropertyFeedbackSlot<'a> {
         self.slot.probe_load(obj, heap)
     }
 
+    pub(crate) fn probe_load_hit(
+        self,
+        obj: crate::object::JsObject,
+        heap: &otter_gc::GcHeap,
+    ) -> Option<crate::property_ic::LoadHit> {
+        self.slot.probe_load_hit(obj, heap)
+    }
+
     pub(crate) fn probe_has(
         self,
         obj: crate::object::JsObject,

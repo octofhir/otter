@@ -4444,6 +4444,13 @@ pub(crate) fn load_proven_data_slot(obj: JsObject, heap: &GcHeap, slot: u16) -> 
     heap.read_payload(obj, |body| body.data_value(heap, usize::from(slot)))
 }
 
+/// The getter of the accessor a proven own slot of `obj` holds.
+pub(crate) fn load_proven_getter(obj: JsObject, heap: &GcHeap, slot: u16) -> Option<Value> {
+    heap.read_payload(obj, |body| {
+        read_accessor_cell(heap, body.data_value(heap, usize::from(slot))).0
+    })
+}
+
 /// The value of the live own slot `obj`'s current layout stores at `field`,
 /// or `None` when no slot of that layout sits there.
 pub(crate) fn load_slot_at_field(

@@ -325,7 +325,8 @@ impl Interpreter {
         if value.is_object() || value.is_proxy() {
             return None;
         }
-        let constructor_name = if let Some(arr) = value.as_array() {
+        use crate::realm_intrinsics::Intrinsic as I;
+        let slot = if let Some(arr) = value.as_array() {
             return self.array_prototype_value(arr).as_object();
         } else if let Some(regexp) = value.as_regexp() {
             if let Some(proto) = regexp
@@ -334,35 +335,35 @@ impl Interpreter {
             {
                 return Some(proto);
             }
-            "RegExp"
+            I::RegExpPrototype
         } else if let Some(map) = value.as_map() {
             if let Some(proto) = crate::collections::map_prototype_override(map, &self.gc_heap)
                 .and_then(|v| v.as_object())
             {
                 return Some(proto);
             }
-            "Map"
+            I::MapPrototype
         } else if let Some(set) = value.as_set() {
             if let Some(proto) = crate::collections::set_prototype_override(set, &self.gc_heap)
                 .and_then(|v| v.as_object())
             {
                 return Some(proto);
             }
-            "Set"
+            I::SetPrototype
         } else if let Some(map) = value.as_weak_map() {
             if let Some(proto) = crate::collections::weak_map_prototype_override(map, &self.gc_heap)
                 .and_then(|v| v.as_object())
             {
                 return Some(proto);
             }
-            "WeakMap"
+            I::WeakMapPrototype
         } else if let Some(set) = value.as_weak_set() {
             if let Some(proto) = crate::collections::weak_set_prototype_override(set, &self.gc_heap)
                 .and_then(|v| v.as_object())
             {
                 return Some(proto);
             }
-            "WeakSet"
+            I::WeakSetPrototype
         } else if let Some(weak_ref) = value.as_weak_ref() {
             if let Some(proto) =
                 crate::weak_refs::weak_ref_prototype_override(weak_ref, &self.gc_heap)
@@ -370,7 +371,7 @@ impl Interpreter {
             {
                 return Some(proto);
             }
-            "WeakRef"
+            I::WeakRefPrototype
         } else if let Some(registry) = value.as_finalization_registry() {
             if let Some(proto) =
                 crate::weak_refs::finalization_registry_prototype_override(registry, &self.gc_heap)
@@ -378,7 +379,7 @@ impl Interpreter {
             {
                 return Some(proto);
             }
-            "FinalizationRegistry"
+            I::FinalizationRegistryPrototype
         } else if let Some(promise) = value.as_promise() {
             if let Some(proto) = promise
                 .prototype_override(&self.gc_heap)
@@ -386,7 +387,7 @@ impl Interpreter {
             {
                 return Some(proto);
             }
-            "Promise"
+            I::PromisePrototype
         } else if let Some(b) = value.as_array_buffer() {
             if let Some(proto) = self
                 .non_gc_exotic_prototype_override(value)
@@ -395,9 +396,9 @@ impl Interpreter {
                 return Some(proto);
             }
             if b.is_shared() {
-                "SharedArrayBuffer"
+                I::SharedArrayBufferPrototype
             } else {
-                "ArrayBuffer"
+                I::ArrayBufferPrototype
             }
         } else if value.as_data_view().is_some() {
             if let Some(proto) = self
@@ -406,7 +407,7 @@ impl Interpreter {
             {
                 return Some(proto);
             }
-            "DataView"
+            I::DataViewPrototype
         } else if let Some(t) = value.as_typed_array(&self.gc_heap) {
             if let Some(proto) = self
                 .non_gc_exotic_prototype_override(value)
@@ -414,7 +415,7 @@ impl Interpreter {
             {
                 return Some(proto);
             }
-            t.kind().name()
+            I::typed_array_prototype(t.kind())
         } else if let Some(handle) = value.as_iterator() {
             // §22.1.5 / §23.1.5 / §24.1.5 / §24.2.5 — per-kind
             // iterator prototypes inherit from `%IteratorPrototype%`
@@ -433,7 +434,7 @@ impl Interpreter {
             {
                 return Some(proto);
             }
-            "Iterator"
+            I::IteratorPrototype
         } else if let Some(generator) = value.as_generator() {
             // §9.1.14 GetPrototypeFromConstructor fallback — a
             // generator whose function's `.prototype` was replaced
@@ -443,25 +444,25 @@ impl Interpreter {
             if let Some(shared) = self.shared_generator_object_prototype(is_async) {
                 return Some(shared);
             }
-            "Iterator"
+            I::IteratorPrototype
         } else if let Some(t) = value.as_temporal(&self.gc_heap) {
             return self.temporal_prototype_object(t.kind());
         } else if value.is_symbol() {
-            "Symbol"
+            I::SymbolPrototype
         } else if value.is_string() {
-            "String"
+            I::StringPrototype
         } else if value.is_number() {
-            "Number"
+            I::NumberPrototype
         } else if value.is_boolean() {
-            "Boolean"
+            I::BooleanPrototype
         } else if value.is_big_int() {
-            "BigInt"
+            I::BigIntPrototype
         } else {
             return None;
         };
-        self.constructor_prototype_value(constructor_name)
-            .ok()?
-            .as_object()
+        // [[Prototype]] is fixed at creation: the realm's intrinsic, never
+        // whatever the global constructor binding holds now.
+        self.realm_intrinsics.get(slot)
     }
 
     /// §7.1.1.1 step 4.a — `func = ? Get(O, name)`.

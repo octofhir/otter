@@ -242,6 +242,11 @@ pub enum IcEntryVariant {
     OwnData,
     /// An inherited holder owns the matched data slot.
     InheritedData,
+    /// An inherited holder owns the matched accessor; the load calls its
+    /// getter.
+    InheritedAccessor,
+    /// The receiver owns the matched accessor; the load calls its getter.
+    OwnAccessor,
     /// The key is absent from the receiver and its whole chain.
     NonExistent,
     /// Append transition that adds a slot on store.

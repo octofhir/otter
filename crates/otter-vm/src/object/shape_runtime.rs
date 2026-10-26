@@ -244,8 +244,10 @@ mod tests {
 
         runtime.unpin_turn_shapes(&heap);
         assert!(pinned().is_empty());
+        // An interned shape only re-pins itself: its parent and dictionary
+        // links keep the rest of its lineage reachable.
         runtime.register_shape(&heap, child);
-        assert_eq!(pinned(), expected);
+        assert_eq!(pinned(), vec![child]);
     }
 
     #[test]

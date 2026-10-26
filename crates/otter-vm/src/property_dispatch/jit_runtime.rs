@@ -23,6 +23,7 @@
 //! - `property_ic` and `object::shape_transition` own the complete store guards.
 //! - `handles` owns reusable operand storage and scope cleanup.
 
+use crate::property_ic::LoadHit;
 use crate::activation_stack::ActivationStack;
 use crate::native_abi::CommittedValueError;
 use crate::{
@@ -107,8 +108,12 @@ impl Interpreter {
         // complete through the full resolution cascade below; the IC layers
         // only serve cache-representable ordinary-object loads.
         let Some(obj) = receiver.as_object() else {
-            if let Some(value) = self.projected_load(slot, receiver, atomized_key) {
-                return Ok(value);
+            match self.projected_load(slot, receiver, atomized_key) {
+                Some(LoadHit::Value(value)) => return Ok(value),
+                Some(LoadHit::Getter(getter)) => {
+                    return self.call_ic_getter(stack, context, receiver_root, getter);
+                }
+                None => {}
             }
             let receiver = self.escape_scoped(receiver_root);
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
@@ -132,17 +137,23 @@ impl Interpreter {
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
             return Ok(result);
         }
-        if let Some(value) = slot.probe_load(obj, &self.gc_heap) {
-            slot.record_hit();
-            return Ok(value);
+        match slot.probe_load_hit(obj, &self.gc_heap) {
+            Some(LoadHit::Value(value)) => {
+                slot.record_hit();
+                return Ok(value);
+            }
+            Some(LoadHit::Getter(getter)) => {
+                slot.record_hit();
+                return self.call_ic_getter(stack, context, receiver_root, getter);
+            }
+            None => {}
         }
         slot.record_miss();
-        // A dictionary-mode receiver has no hidden class for a guard to name, so
-        // no handler can describe an access on it. Bootstrap namespace objects
-        // are built that way; migrate the receiver onto the shaped path, then
-        // re-read it — the migration allocates and may relocate it.
+        // Prototypes on the lookup path get their hidden classes so a handler
+        // can describe the access; the preparation allocates and may relocate
+        // the receiver, so re-read it.
         let mut migrating = obj;
-        self.migrate_slow_to_fast(&mut migrating);
+        self.make_prototypes_fast(&mut migrating);
         receiver = Value::object(migrating);
         self.set_scoped(receiver_root, receiver);
         let obj = migrating;
@@ -152,6 +163,24 @@ impl Interpreter {
             crate::property_cache::PropertyLoad::Data(resolved) => return Ok(resolved.value),
             crate::property_cache::PropertyLoad::Absent(_) => return Ok(Value::undefined()),
             crate::property_cache::PropertyLoad::Other => {}
+        }
+        if let Some(getter) = self.cache_inherited_getter(
+            slot,
+            obj,
+            atomized_key,
+            crate::property_ic::PropertyStorageProjection::Receiver,
+        ) {
+            // An inherited getter is what an optimizing caller can call
+            // directly.
+            self.note_accessor_target(
+                context,
+                function_id,
+                instruction_pc,
+                obj,
+                atomized_key,
+                false,
+            );
+            return self.call_ic_getter(stack, context, receiver_root, getter);
         }
         // An inherited getter is what an optimizing caller can call directly.
         self.note_accessor_target(
@@ -166,6 +195,20 @@ impl Interpreter {
         // place through the full cascade.
         let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
         Ok(result)
+    }
+
+    /// Call the getter an inline cache named, with the rooted receiver as
+    /// `this`.
+    fn call_ic_getter(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        receiver: crate::handles::Local<'_>,
+        getter: Value,
+    ) -> Result<Value, CommittedValueError> {
+        let receiver = self.escape_scoped(receiver);
+        self.run_callable_sync_rooted(stack, Some(context), &getter, receiver, smallvec::SmallVec::new())
+            .map_err(CommittedValueError::completed_call)
     }
 
     /// Complete the exact published `StoreProperty` over boxed receiver/value

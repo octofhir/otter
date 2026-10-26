@@ -123,6 +123,12 @@ pub enum IcHandlerKind {
     StoreField = 4,
     /// Append the field and publish the target shape `aux`.
     StoreTransition = 5,
+    /// Call the getter of the accessor the holder `prototype(aux)` owns,
+    /// authorized by the entry's chain proof.
+    PrototypeAccessor = 6,
+    /// Call the getter of the receiver's own accessor slot, which its shape
+    /// guarantees holds an accessor.
+    OwnAccessor = 7,
 }
 
 impl IcHandlerKind {
@@ -133,6 +139,8 @@ impl IcHandlerKind {
             3 => Self::NonExistent,
             4 => Self::StoreField,
             5 => Self::StoreTransition,
+            6 => Self::PrototypeAccessor,
+            7 => Self::OwnAccessor,
             _ => Self::Empty,
         }
     }
@@ -369,6 +377,27 @@ impl IcEntry {
     }
 }
 
+/// What a load handler answered.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum LoadHit {
+    /// The property's value.
+    Value(Value),
+    /// The getter of an inherited accessor, for the caller to call with the
+    /// original receiver.
+    Getter(Value),
+}
+
+impl LoadHit {
+    /// The value of a data or absent answer.
+    #[must_use]
+    pub(crate) fn value(self) -> Option<Value> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Getter(_) => None,
+        }
+    }
+}
+
 /// A handler ready to install: what an [`IcEntry`] holds, owned by Rust.
 #[derive(Debug, Clone)]
 pub(crate) struct IcHandler {
@@ -434,6 +463,57 @@ impl IcHandler {
             owner: ShapeHandle::null(),
 
             validity: Some(resolved.validity.clone()?),
+            transition: TransitionGuard::OwnAdd,
+        })
+    }
+
+    /// The load handler for a getter a prototype of the receiver owns.
+    #[must_use]
+    pub(crate) fn load_inherited_accessor(
+        receiver_shape: ShapeHandle,
+        resolved: &crate::cache_ir::ResolvedAccessorSlot,
+    ) -> Option<Self> {
+        if !Self::eligible_receiver(receiver_shape)
+            || resolved.hit.shape.is_null()
+            || resolved.holder_root.is_null()
+            || resolved.getter.is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            receiver_shape,
+            projection: PropertyStorageProjection::Receiver,
+            kind: IcHandlerKind::PrototypeAccessor,
+            field: object::field_location(resolved.hit.shape, u32::from(resolved.hit.slot)),
+            slot: resolved.hit.slot,
+            aux: resolved.holder_root,
+            owner: ShapeHandle::null(),
+
+            validity: Some(resolved.validity.clone()),
+            transition: TransitionGuard::OwnAdd,
+        })
+    }
+
+    /// The load handler for an accessor the receiver owns at `hit`, read
+    /// from the slot on every hit.
+    #[must_use]
+    pub(crate) fn load_own_accessor(
+        receiver_shape: ShapeHandle,
+        hit: &crate::object::AtomOwnPropertyHit,
+    ) -> Option<Self> {
+        if !Self::eligible_receiver(receiver_shape) || hit.shape != receiver_shape {
+            return None;
+        }
+        Some(Self {
+            receiver_shape,
+            projection: PropertyStorageProjection::Receiver,
+            kind: IcHandlerKind::OwnAccessor,
+            field: object::field_location(hit.shape, u32::from(hit.slot)),
+            slot: hit.slot,
+            aux: ShapeHandle::null(),
+            owner: ShapeHandle::null(),
+
+            validity: None,
             transition: TransitionGuard::OwnAdd,
         })
     }
@@ -867,6 +947,13 @@ impl PropertyIcSlot {
     /// Run the load handler of `obj`'s shape. `None` on a miss.
     #[must_use]
     pub(crate) fn probe_load(&self, obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
+        self.probe_load_hit(obj, heap).and_then(LoadHit::value)
+    }
+
+    /// Run the load handler of `obj`'s shape, including one that names an
+    /// inherited getter for the caller to call. `None` on a miss.
+    #[must_use]
+    pub(crate) fn probe_load_hit(&self, obj: JsObject, heap: &otter_gc::GcHeap) -> Option<LoadHit> {
         self.probe_load_from(obj, object::shape(obj, heap).offset(), heap)
     }
 
@@ -879,7 +966,10 @@ impl PropertyIcSlot {
         let entry = self.matching(object::shape(obj, heap).offset())?;
         match entry.kind() {
             IcHandlerKind::OwnField => Some(true),
-            IcHandlerKind::PrototypeField => entry.proof_holds().then_some(true),
+            IcHandlerKind::OwnAccessor => Some(true),
+            IcHandlerKind::PrototypeField | IcHandlerKind::PrototypeAccessor => {
+                entry.proof_holds().then_some(true)
+            }
             IcHandlerKind::NonExistent => entry.proof_holds().then_some(false),
             _ => None,
         }
@@ -893,7 +983,7 @@ impl PropertyIcSlot {
         start: JsObject,
         projection: PropertyStorageProjection,
         heap: &otter_gc::GcHeap,
-    ) -> Option<Value> {
+    ) -> Option<LoadHit> {
         let shape = object::keyed_shape(start, heap);
         if shape.is_null() {
             return None;
@@ -925,27 +1015,35 @@ impl PropertyIcSlot {
     }
 
     /// Run the load handler keyed `key` with `obj` as lookup-start object.
-    fn probe_load_from(&self, obj: JsObject, key: u32, heap: &otter_gc::GcHeap) -> Option<Value> {
+    fn probe_load_from(&self, obj: JsObject, key: u32, heap: &otter_gc::GcHeap) -> Option<LoadHit> {
         let entry = self.matching(key)?;
         if entry.projection() == PropertyStorageProjection::ArrayExpando
             && entry.kind() != IcHandlerKind::OwnField
         {
             return None;
         }
+        let holder = || match object::shape_body::prototype_of(entry.aux()) {
+            object::shape_body::ShapePrototype::Object(holder) => Some(holder),
+            _ => None,
+        };
         match entry.kind() {
-            IcHandlerKind::OwnField => Some(object::load_proven_data_slot(obj, heap, entry.slot())),
-            IcHandlerKind::PrototypeField => {
-                if !entry.proof_holds() {
-                    return None;
-                }
-                let object::shape_body::ShapePrototype::Object(holder) =
-                    object::shape_body::prototype_of(entry.aux())
-                else {
-                    return None;
-                };
-                Some(object::load_proven_data_slot(holder, heap, entry.slot()))
+            IcHandlerKind::OwnField => Some(LoadHit::Value(object::load_proven_data_slot(
+                obj,
+                heap,
+                entry.slot(),
+            ))),
+            IcHandlerKind::PrototypeField if entry.proof_holds() => Some(LoadHit::Value(
+                object::load_proven_data_slot(holder()?, heap, entry.slot()),
+            )),
+            IcHandlerKind::OwnAccessor => {
+                object::load_proven_getter(obj, heap, entry.slot()).map(LoadHit::Getter)
             }
-            IcHandlerKind::NonExistent => entry.proof_holds().then(Value::undefined),
+            IcHandlerKind::PrototypeAccessor if entry.proof_holds() => {
+                object::load_proven_getter(holder()?, heap, entry.slot()).map(LoadHit::Getter)
+            }
+            IcHandlerKind::NonExistent if entry.proof_holds() => {
+                Some(LoadHit::Value(Value::undefined()))
+            }
             _ => None,
         }
     }
@@ -1165,6 +1263,8 @@ impl PropertyIcSlot {
                         IcEntryVariant::OwnData
                     }
                     (IcHandlerKind::PrototypeField, _) => IcEntryVariant::InheritedData,
+                    (IcHandlerKind::PrototypeAccessor, _) => IcEntryVariant::InheritedAccessor,
+                    (IcHandlerKind::OwnAccessor, _) => IcEntryVariant::OwnAccessor,
                     (IcHandlerKind::NonExistent, _) => IcEntryVariant::NonExistent,
                     (IcHandlerKind::StoreTransition, TransitionGuard::OwnAdd) => {
                         IcEntryVariant::OwnAddTransition
@@ -1310,7 +1410,10 @@ impl PropertyIcSlot {
                     });
                     ops
                 }
-                IcHandlerKind::NonExistent | IcHandlerKind::Empty => continue,
+                IcHandlerKind::NonExistent
+                | IcHandlerKind::PrototypeAccessor
+                | IcHandlerKind::OwnAccessor
+                | IcHandlerKind::Empty => continue,
             };
             if entry.projection() == PropertyStorageProjection::LookupStart {
                 for op in &mut ops {

@@ -1,4 +1,4 @@
-use super::{IcHandler, IcHandlerKind, InstallOutcome, PropertyIcKind, PropertyIcSlot};
+use super::{IcHandler, IcHandlerKind, InstallOutcome, LoadHit, PropertyIcKind, PropertyIcSlot};
 use crate::object::{self, PropertyDescriptor};
 use crate::property_atom::{AtomId, AtomizedPropertyKey, PropertyAtom};
 use crate::{Value, jit::JitCacheIrOp};
@@ -888,7 +888,7 @@ fn storage_projection_codec_and_own_array_domain_are_disjoint() {
     );
     assert_eq!(
         slot.probe_projected_load(bag, Projection::ArrayExpando, &heap),
-        Some(Value::number_i32(9))
+        Some(LoadHit::Value(Value::number_i32(9)))
     );
     assert!(
         slot.mono_own_field().is_none(),

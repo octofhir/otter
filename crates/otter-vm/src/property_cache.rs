@@ -674,8 +674,8 @@ impl crate::Interpreter {
         slot: crate::feedback::PropertyFeedbackSlot<'_>,
         receiver: crate::Value,
         key: AtomizedPropertyKey<'_>,
-    ) -> Option<crate::Value> {
-        use crate::property_ic::PropertyStorageProjection as Projection;
+    ) -> Option<crate::property_ic::LoadHit> {
+        use crate::property_ic::{LoadHit, PropertyStorageProjection as Projection};
         let (start, projection) = if let Some(array) = receiver.as_array()
             && let Some(bag) = crate::array::expando_object(array, &self.gc_heap)
         {
@@ -683,12 +683,12 @@ impl crate::Interpreter {
         } else {
             (self.lookup_start_object(receiver)?, Projection::LookupStart)
         };
-        if let Some(value) = slot
+        if let Some(hit) = slot
             .native()
             .probe_projected_load(start, projection, &self.gc_heap)
         {
             slot.record_hit();
-            return Some(value);
+            return Some(hit);
         }
         slot.record_miss();
         let start = if projection == Projection::ArrayExpando {
@@ -712,7 +712,11 @@ impl crate::Interpreter {
                 crate::property_ic::IcHandler::load_nonexistent(shape, proof),
                 crate::Value::undefined(),
             ),
-            PropertyLoad::Other => return None,
+            PropertyLoad::Other => {
+                return self
+                    .cache_inherited_getter(slot, start, key, projection)
+                    .map(LoadHit::Getter);
+            }
         };
         if !slot.is_megamorphic()
             && let Some(handler) = handler
@@ -720,7 +724,55 @@ impl crate::Interpreter {
         {
             slot.install(handler);
         }
-        Some(value)
+        Some(LoadHit::Value(value))
+    }
+
+    /// The getter of an accessor the lookup-start object `start` or one of
+    /// its prototypes owns, with the site's handler for it installed: the
+    /// next load calls the getter without walking the chain. `None` when the
+    /// key is not such an accessor or it has no getter.
+    pub(crate) fn cache_inherited_getter(
+        &self,
+        slot: crate::feedback::PropertyFeedbackSlot<'_>,
+        start: JsObject,
+        key: AtomizedPropertyKey<'_>,
+        projection: crate::property_ic::PropertyStorageProjection,
+    ) -> Option<crate::Value> {
+        let own = object::lookup_own_atom(start, &self.gc_heap, key);
+        if let (Some(hit), object::PropertyLookup::Accessor { getter, .. }) = (own.hit, own.lookup)
+        {
+            let getter = getter?;
+            if object::supports_fast_property_ic(start, &self.gc_heap) {
+                self.shape_runtime
+                    .register_shape(&self.gc_heap, object::shape(start, &self.gc_heap));
+                if !slot.is_megamorphic()
+                    && let Some(handler) = crate::property_ic::IcHandler::load_own_accessor(
+                        object::keyed_shape(start, &self.gc_heap),
+                        &hit,
+                    )
+                    && let Some(handler) = handler.projected(projection)
+                {
+                    slot.install(handler);
+                }
+            }
+            return Some(getter);
+        }
+        let resolved = cache_ir::resolve_atom_inherited_accessor(start, &self.gc_heap, key)?;
+        let getter = resolved.getter?;
+        self.shape_runtime
+            .register_shape(&self.gc_heap, object::shape(start, &self.gc_heap));
+        self.shape_runtime
+            .register_shape(&self.gc_heap, resolved.holder_root);
+        if !slot.is_megamorphic()
+            && let Some(handler) = crate::property_ic::IcHandler::load_inherited_accessor(
+                object::keyed_shape(start, &self.gc_heap),
+                &resolved,
+            )
+            && let Some(handler) = handler.projected(projection)
+        {
+            slot.install(handler);
+        }
+        Some(getter)
     }
 
     /// `[[Set]]` of `key` on an array, closure or native function whose property

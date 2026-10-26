@@ -8,6 +8,7 @@
 // boundaries (bodyHead = d.slice(ret)).
 
 const { Buffer } = require('buffer');
+const { scanHead } = require('__httpscan');
 const { internalBinding } = require('internal/bootstrap/realm');
 const {
   streamBaseState,
@@ -23,7 +24,6 @@ const methods = [
   'PATCH', 'PURGE', 'MKCALENDAR', 'LINK', 'UNLINK', 'SOURCE',
 ];
 const allMethods = [...methods, 'PRI', 'QUERY'];
-const methodIndex = new Map(allMethods.map((m, i) => [m, i]));
 
 const kOnMessageBegin = 0;
 const kOnHeaders = 1;
@@ -46,8 +46,6 @@ function parseError(code, reason) {
   err.bytesParsed = 0;
   return err;
 }
-
-const TOKEN = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
 
 class ConnectionsList {
   constructor() {
@@ -109,7 +107,6 @@ class HTTPParser {
     // 'line' → 'headers' → one of the body states → back to 'line'.
     this._state = 'line';
     this._rawHeaders = [];
-    this._headerBytes = 0;
     this._versionMajor = 0;
     this._versionMinor = 0;
     this._method = -1;
@@ -280,87 +277,46 @@ class HTTPParser {
   _step() {
     const state = this._state;
     if (state === 'line') {
-      if (this._stash.length === 0) return 'wait';
-      // llhttp rejects an impossible method byte-by-byte, without waiting
-      // for the line to complete.
-      if (this._type === HTTPParser.REQUEST && this._stash[0] !== 13) {
-        const err = this._checkMethodPrefix();
-        if (err) return err;
-      }
-      const idx = this._lineEnd();
-      if (idx instanceof Error) return idx;
-      if (idx === -1) {
-        if (this._stash.length > this._maxHeaderSize) {
-          return parseError('HPE_HEADER_OVERFLOW', 'Header overflow');
+      // The start line and the whole header block in one native pass.
+      const scanned = scanHead(this._stash, this._type, this._maxHeaderSize,
+                               this.maxHeaderPairs);
+      if (typeof scanned === 'number') {
+        // Blank lines ahead of a request do not start a message, so the
+        // header-timeout clock stays unarmed until other bytes arrive.
+        if (scanned > 0) {
+          this._stash = this._stash.subarray(scanned);
+          this._messageStart = 0;
         }
         if (this._stash.length > 0 && this._messageStart === 0) {
           this._messageStart = Date.now();
         }
         return 'wait';
       }
-      // llhttp skips blank lines before a request line; they do not start
-      // a message, so the header-timeout clock stays unarmed.
-      if (idx === 0) {
-        this._stash = this._stash.subarray(2);
-        this._messageStart = 0;
-        return 'more';
+      if (typeof scanned[0] === 'string') {
+        this._stash = this._stash.subarray(scanned[2]);
+        if (scanned[3]) {
+          const onBegin = this[kOnMessageBegin];
+          if (typeof onBegin === 'function') onBegin.call(this);
+        }
+        return parseError(scanned[0], scanned[1]);
       }
       if (this._messageStart === 0) this._messageStart = Date.now();
-      const line = this._stash.subarray(0, idx).toString('latin1');
-      const err = this._type === HTTPParser.RESPONSE
-        ? this._parseStatusLine(line)
-        : this._parseRequestLine(line);
-      if (err) return err;
-      this._stash = this._stash.subarray(idx + 2);
-      this._headerBytes = idx + 2;
+      this._versionMajor = scanned[1];
+      this._versionMinor = scanned[2];
+      if (this._type === HTTPParser.RESPONSE) {
+        this._statusCode = scanned[3];
+        this._statusMessage = scanned[4];
+      } else {
+        this._method = scanned[3];
+        this._urlValue = scanned[4];
+      }
+      const raw = this._rawHeaders;
+      for (let i = 5; i < scanned.length; i++) raw.push(scanned[i]);
+      this._stash = this._stash.subarray(scanned[0]);
       this._state = 'headers';
       const onBegin = this[kOnMessageBegin];
       if (typeof onBegin === 'function') onBegin.call(this);
-      return 'more';
-    }
-    if (state === 'headers') {
-      const idx = this._lineEnd();
-      if (idx instanceof Error) return idx;
-      if (idx === -1) {
-        if (this._headerBytes + this._stash.length > this._maxHeaderSize) {
-          return parseError('HPE_HEADER_OVERFLOW', 'Header overflow');
-        }
-        return 'wait';
-      }
-      this._headerBytes += idx + 2;
-      if (this._headerBytes > this._maxHeaderSize) {
-        return parseError('HPE_HEADER_OVERFLOW', 'Header overflow');
-      }
-      const line = this._stash.subarray(0, idx).toString('latin1');
-      this._stash = this._stash.subarray(idx + 2);
-      if (line.length === 0) {
-        return this._headersComplete();
-      }
-      if (line[0] === ' ' || line[0] === '\t') {
-        // obs-fold: continuation joins the previous value.
-        const n = this._rawHeaders.length;
-        if (n === 0) {
-          return parseError('HPE_INVALID_HEADER_TOKEN', 'Invalid header token');
-        }
-        this._rawHeaders[n - 1] += ` ${line.trim()}`;
-        return 'more';
-      }
-      const colon = line.indexOf(':');
-      if (colon <= 0) {
-        return parseError('HPE_INVALID_HEADER_TOKEN', 'Invalid header token');
-      }
-      const name = line.slice(0, colon);
-      if (!TOKEN.test(name)) {
-        return parseError('HPE_INVALID_HEADER_TOKEN', 'Invalid header token');
-      }
-      // `maxHeaderPairs` caps how much of the header block is kept — the
-      // rest still parses, it is simply not collected, which is what
-      // `server.maxHeadersCount` bounds.
-      if (this.maxHeaderPairs <= 0 ||
-          this._rawHeaders.length < this.maxHeaderPairs) {
-        this._rawHeaders.push(name, line.slice(colon + 1).trim());
-      }
-      return 'more';
+      return this._headersComplete();
     }
     if (state === 'body-length') {
       if (this._stash.length === 0) return 'wait';
@@ -442,57 +398,6 @@ class HTTPParser {
       return 'more';
     }
     return 'wait';
-  }
-
-  // The method token seen so far (up to the first space or end of buffered
-  // data) must be a prefix of some known method.
-  _checkMethodPrefix() {
-    const stash = this._stash;
-    const limit = Math.min(stash.length, 24);
-    let end = limit;
-    for (let i = 0; i < limit; i++) {
-      if (stash[i] === 32) { end = i; break; }
-    }
-    const token = stash.subarray(0, end).toString('latin1');
-    for (const method of allMethods) {
-      if (method.startsWith(token)) return null;
-    }
-    return parseError('HPE_INVALID_METHOD', 'Invalid method encountered');
-  }
-
-  _parseRequestLine(line) {
-    const parts = line.split(' ');
-    if (parts.length < 3) {
-      return parseError('HPE_INVALID_METHOD', 'Invalid method encountered');
-    }
-    const method = parts[0];
-    const version = parts[parts.length - 1];
-    const url = parts.slice(1, -1).join(' ');
-    const index = methodIndex.get(method);
-    if (index === undefined) {
-      return parseError('HPE_INVALID_METHOD', 'Invalid method encountered');
-    }
-    const m = /^HTTP\/(\d)\.(\d)$/.exec(version);
-    if (m === null) {
-      return parseError('HPE_INVALID_VERSION', 'Invalid HTTP version');
-    }
-    this._method = index;
-    this._urlValue = url;
-    this._versionMajor = Number(m[1]);
-    this._versionMinor = Number(m[2]);
-    return null;
-  }
-
-  _parseStatusLine(line) {
-    const m = /^HTTP\/(\d)\.(\d) (\d{3})(?: (.*))?$/.exec(line);
-    if (m === null) {
-      return parseError('HPE_INVALID_CONSTANT', 'Expected HTTP/');
-    }
-    this._versionMajor = Number(m[1]);
-    this._versionMinor = Number(m[2]);
-    this._statusCode = Number(m[3]);
-    this._statusMessage = m[4] ?? '';
-    return null;
   }
 
   _headersComplete() {

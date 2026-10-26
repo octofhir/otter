@@ -297,19 +297,12 @@ if (!Buffer) {
     return new Uint8Array(decoder().encode(String(str), enc.normalize(encoding) || 'utf8'));
   }
 
-  const BufferImpl = class extends Uint8Array {
-    constructor(arg, byteOffset, length) {
-      if (typeof arg === 'number') {
-        super(checkedBufferSize(arg));
-      } else if (isArrayBufferLike(arg) || isSharedArrayBufferLike(arg)) {
-        const range = arrayBufferSliceArgs(arg, byteOffset, length);
-        if (range[1] === undefined) super(arg, range[0]);
-        else super(arg, range[0], range[1]);
-      } else if (arg && (Array.isArray(arg) || ArrayBuffer.isView(arg) || typeof arg[Symbol.iterator] === 'function')) {
-        super(Uint8Array.from(arg));
-      } else {
-        super(0);
-      }
+  // Node's FastBuffer: a Uint8Array subclass constructed exactly like its
+  // parent, the constructor every internal caller and the species use.
+  // Argument validation belongs to the public `Buffer` entry points.
+  const BufferImpl = class FastBuffer extends Uint8Array {
+    constructor(bufferOrLength, byteOffset, length) {
+      super(bufferOrLength, byteOffset, length);
     }
 
     get [Symbol.toStringTag]() { return 'Uint8Array'; }
@@ -530,11 +523,6 @@ if (!Buffer) {
 
     slice(start, end) { return this.subarray(start, end); }
 
-    subarray(start, end) {
-      const sub = Uint8Array.prototype.subarray.call(this, start, end);
-      Object.setPrototypeOf(sub, Buffer.prototype);
-      return sub;
-    }
 
     indexOf(value, byteOffset, encoding) {
       return bidirectionalIndexOf(this, value, byteOffset, encoding, true);
@@ -708,10 +696,28 @@ if (!Buffer) {
     if (typeof arg === 'number' && typeof byteOffset === 'string') {
       throw invalidArgType('string', 'string', arg);
     }
-    return new BufferImpl(arg, byteOffset, length);
+    return createBuffer(arg, byteOffset, length);
   };
+  // The public constructor's validation, ahead of a plain FastBuffer.
+  function createBuffer(arg, byteOffset, length) {
+    if (typeof arg === 'number') return new BufferImpl(checkedBufferSize(arg));
+    if (isArrayBufferLike(arg) || isSharedArrayBufferLike(arg)) {
+      const range = arrayBufferSliceArgs(arg, byteOffset, length);
+      return new BufferImpl(arg, range[0], range[1]);
+    }
+    if (arg && (Array.isArray(arg) || ArrayBuffer.isView(arg) || typeof arg[Symbol.iterator] === 'function')) {
+      return new BufferImpl(Uint8Array.from(arg));
+    }
+    return new BufferImpl(0);
+  }
   Buffer.prototype = BufferImpl.prototype;
   Object.setPrototypeOf(Buffer, BufferImpl);
+  // §23.2.2.4: TypedArray methods that create (subarray, slice, map, …)
+  // construct through the species, which is FastBuffer as in node.
+  Object.defineProperty(Buffer, Symbol.species, {
+    get() { return BufferImpl; },
+    configurable: true,
+  });
   Object.defineProperty(Buffer.prototype, 'constructor', {
     value: Buffer,
     writable: true,

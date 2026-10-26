@@ -66,7 +66,7 @@ use crate::runtime_activity::{
 use crate::{
     DiagnosticCode, DynamicImportBegin, ExecutionAttempt, ExecutionResult, OtterError,
     ResourceAccount, ResourceClass, ResourceLease, ResourceSnapshot, Runtime, RuntimeConfig,
-    RuntimeModuleLoaderState, RuntimePackageManagerHandle, SourceInput, TimerFireOutcome,
+    RuntimeModuleLoaderState, SourceInput, TimerFireOutcome,
 };
 use otter_vm::{
     DynamicImportAdmission, DynamicImportLoader, TimerAdmission, TimerScheduler, WorkBudget,
@@ -202,7 +202,6 @@ impl Drop for IsolateExitGuard {
 struct ModulePreparation {
     loader: RuntimeModuleLoaderState,
     hosted_modules: Vec<crate::HostedModule>,
-    package_manager: RuntimePackageManagerHandle,
     capabilities: crate::CapabilitySet,
     hooks: crate::RuntimeHooks,
     capability_evaluator: crate::RuntimeCapabilityEvaluator,
@@ -255,9 +254,6 @@ impl ModulePreparation {
         Self {
             loader: RuntimeModuleLoaderState::new(config.loader.clone(), config.expose_internals),
             hosted_modules: config.hosted_modules.clone(),
-            package_manager: RuntimePackageManagerHandle::from_loader_config(
-                config.loader.as_ref(),
-            ),
             capabilities: config.capabilities.clone(),
             hooks: config.hooks.clone(),
             capability_evaluator: crate::RuntimeCapabilityEvaluator::from_refs(
@@ -275,7 +271,6 @@ impl ModulePreparation {
             .for_entry(
                 entry,
                 &self.hosted_modules,
-                &self.package_manager,
                 &self.capabilities,
                 &self.hooks,
                 &self.resource_account,

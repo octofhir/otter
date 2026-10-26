@@ -8,6 +8,8 @@
 //! # Invariants
 //! - The native scope retains the prototype, receiver and message across every
 //!   allocation and descriptor publication.
+//! - The value is a real error instance (`[[ErrorData]]`, so it has a
+//!   `stack`), as every error Node rejects an import with is.
 //! - A failure Node gives a code (`ERR_UNKNOWN_BUILTIN_MODULE`,
 //!   `ERR_MODULE_NOT_FOUND`) carries it as an own enumerable `code`, as Node's
 //!   own errors do.
@@ -29,18 +31,9 @@ pub(super) fn allocate(
     code: Option<&str>,
     message: &str,
 ) -> Result<Value, OtterError> {
-    let prototype = Value::object(interp.error_classes_for_trace().prototype(kind));
     NativeCtx::with_host_context(interp, NativeCallInfo::default_call(), None, |native| {
         native.scope(|mut scope| {
-            let prototype = scope.value(prototype);
-            let object = scope.object_with_prototype(prototype)?;
-            let message = scope.string(message)?;
-            scope.define(
-                object,
-                "message",
-                message,
-                otter_vm::object::PropertyFlags::new(true, false, true),
-            )?;
+            let object = scope.error(kind, message)?;
             if let Some(code) = code {
                 let code = scope.string(code)?;
                 scope.define(

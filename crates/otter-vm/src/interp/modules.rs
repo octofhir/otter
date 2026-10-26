@@ -45,6 +45,9 @@ impl Interpreter {
             Ok(value) => crate::JsPromise::fulfill(&entry.promise, &mut self.gc_heap, value),
             Err(reason) => crate::JsPromise::reject(&entry.promise, &mut self.gc_heap, reason),
         };
+        // An `import()` nobody awaits rejects like any other promise nobody
+        // handles.
+        self.note_settle_rejection(&jobs, Some(&entry.context));
         for j in jobs.jobs {
             self.microtasks.enqueue(j);
         }

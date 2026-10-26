@@ -22,12 +22,22 @@ pub const WRAPPER_PREFIX: &str = "(function (exports, require, module, __filenam
 pub const WRAPPER_SUFFIX: &str = "\n})";
 
 /// The source of the function a CommonJS module body runs in.
+///
+/// A hashbang line is a comment only at the very start of a script; inside
+/// the wrapper it becomes a line comment of the same length, so every
+/// position after it is unchanged.
 #[must_use]
 pub fn wrapper_source(body: &str) -> String {
     let mut source =
         String::with_capacity(WRAPPER_PREFIX.len() + body.len() + WRAPPER_SUFFIX.len());
     source.push_str(WRAPPER_PREFIX);
-    source.push_str(body);
+    match body.strip_prefix("#!") {
+        Some(rest) => {
+            source.push_str("//");
+            source.push_str(rest);
+        }
+        None => source.push_str(body),
+    }
     source.push_str(WRAPPER_SUFFIX);
     source
 }
@@ -39,6 +49,14 @@ mod tests {
         assert_eq!(
             super::wrapper_source("a;\nb;"),
             "(function (exports, require, module, __filename, __dirname) { a;\nb;\n})"
+        );
+    }
+
+    #[test]
+    fn a_hashbang_line_becomes_a_comment_of_the_same_length() {
+        assert_eq!(
+            super::wrapper_source("#!/usr/bin/env node\na;"),
+            "(function (exports, require, module, __filename, __dirname) { ///usr/bin/env node\na;\n})"
         );
     }
 }

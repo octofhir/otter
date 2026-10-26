@@ -114,6 +114,17 @@ pub fn detect_source_kind(path: &Path) -> Option<SourceKind> {
     })
 }
 
+/// The source kind of a file to run or `require`: by extension, and
+/// JavaScript for a file with none, as Node treats the extensionless scripts
+/// packages ship as their binaries.
+#[must_use]
+pub fn detect_file_source_kind(path: &Path) -> Option<SourceKind> {
+    if path.extension().is_none() {
+        return Some(SourceKind::JavaScript);
+    }
+    detect_source_kind(path)
+}
+
 /// Decide source kind from an HTTP `Content-Type` header value.
 ///
 /// Remote modules (http/https) carry no meaningful path extension, so the
@@ -501,6 +512,11 @@ mod tests {
             Some(SourceKind::JavaScriptJsx)
         );
         assert_eq!(detect_source_kind(Path::new("x.foo")), None);
+        assert_eq!(detect_file_source_kind(Path::new("x.foo")), None);
+        assert_eq!(
+            detect_file_source_kind(Path::new("bin/tsc")),
+            Some(SourceKind::JavaScript)
+        );
     }
 
     #[test]

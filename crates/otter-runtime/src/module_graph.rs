@@ -2098,15 +2098,16 @@ fn load_program_inner(
     // the entry path is malformed before any specifier-resolution
     // logic runs.
     let resolve_started = timings.is_some().then(Instant::now);
-    let entry_kind =
-        otter_syntax::detect_source_kind(entry_path).ok_or_else(|| LoaderError::Extension {
+    let entry_kind = otter_syntax::detect_file_source_kind(entry_path).ok_or_else(|| {
+        LoaderError::Extension {
             url: format!("file://{}", entry_path.display()),
             extension: entry_path
                 .extension()
                 .and_then(|e| e.to_str())
                 .unwrap_or("")
                 .to_string(),
-        })?;
+        }
+    })?;
     let entry_url = format!(
         "file://{}",
         std::fs::canonicalize(entry_path)

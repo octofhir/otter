@@ -4175,6 +4175,40 @@ if (process.argv[3] !== "two words") throw new Error("missing second arg");
     }
 
     #[tokio::test]
+    async fn an_import_nobody_awaits_reports_its_rejection() {
+        let tmp = tempfile::tempdir().unwrap();
+        tokio::fs::write(tmp.path().join("broken.mjs"), "import './missing.mjs';\n")
+            .await
+            .unwrap();
+        // The import rejects directly, or because a module it loads does.
+        for target in ["./absent.mjs", "./broken.mjs"] {
+            let entry = tmp.path().join("entry.mjs");
+            tokio::fs::write(
+                &entry,
+                format!(
+                    "process.on('unhandledRejection', () => process.exit(7));\nimport('{target}');\n"
+                ),
+            )
+            .await
+            .unwrap();
+            let code = run_file(
+                &entry,
+                &[],
+                false,
+                None,
+                &CapabilitySet::default(),
+                &CliExecutionConfig::default(),
+                &CliStartupTimer::from_env(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(code, ExitCode::from(7), "import({target})");
+        }
+    }
+
+    #[tokio::test]
     async fn run_file_returns_process_exit_code() {
         let tmp = tempfile::tempdir().unwrap();
         let entry = tmp.path().join("exit.ts");

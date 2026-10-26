@@ -79,15 +79,31 @@ fn has_property(ctx: &mut NativeCtx<'_>, object: Value, key: &str) -> Result<boo
 }
 
 fn validate_and_canon(tag: &str) -> Result<String, NativeError> {
+    // A 5-8 letter language subtag parses in `und`'s place and comes back
+    // on the canonical string.
+    let long_language = super::locale::split_long_language(tag);
     let mut loc = match Locale::try_from_str(tag) {
         Ok(loc) => loc,
-        Err(_) => {
-            return canonicalize_legacy_language_tag(tag)
-                .ok_or_else(|| range_err("invalid language tag"));
-        }
+        Err(_) => match long_language
+            .as_ref()
+            .and_then(|(_, patched)| Locale::try_from_str(patched).ok())
+        {
+            Some(loc) => loc,
+            None => {
+                return canonicalize_legacy_language_tag(tag)
+                    .ok_or_else(|| range_err("invalid language tag"));
+            }
+        },
     };
     LocaleCanonicalizer::new_extended().canonicalize(&mut loc);
-    Ok(canonicalize_locale_aliases(loc.to_string()))
+    let mut canonical = loc.to_string();
+    if let Some((language, _)) = long_language
+        && loc.id.language.is_unknown()
+        && let Some(rest) = canonical.strip_prefix("und")
+    {
+        canonical = format!("{language}{rest}");
+    }
+    Ok(canonicalize_locale_aliases(canonical))
 }
 
 fn canonicalize_legacy_language_tag(tag: &str) -> Option<String> {

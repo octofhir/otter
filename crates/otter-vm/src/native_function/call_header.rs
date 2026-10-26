@@ -66,6 +66,11 @@ impl NativeCallHeader {
     /// A `[[Prototype]]` override is installed; without one the callable
     /// inherits from `%Function.prototype%`.
     pub(super) const PROTOTYPE_OVERRIDE: u8 = 1 << 4;
+    /// `[[Construct]]` hands the body an ordinary object created from
+    /// `new.target` as its receiver. Without it the body allocates its own
+    /// result, the way every built-in constructor specifies its own
+    /// OrdinaryCreateFromConstructor step.
+    pub(super) const ORDINARY_RECEIVER: u8 = 1 << 5;
 
     pub(super) fn allocate(
         heap: &mut otter_gc::GcHeap,
@@ -113,7 +118,8 @@ impl NativeCallHeader {
             flags: (u8::from(metadata.name_configurable) * Self::NAME_CONFIGURABLE)
                 | (u8::from(metadata.length_configurable) * Self::LENGTH_CONFIGURABLE)
                 | (u8::from(metadata.constructable) * Self::CONSTRUCTABLE)
-                | (u8::from(metadata.extensible) * Self::EXTENSIBLE),
+                | (u8::from(metadata.extensible) * Self::EXTENSIBLE)
+                | (u8::from(metadata.ordinary_receiver) * Self::ORDINARY_RECEIVER),
             length,
             reserved: 0,
             payload,
@@ -134,6 +140,10 @@ impl NativeCallHeader {
 
     pub(super) const fn extensible(self) -> bool {
         self.flags & Self::EXTENSIBLE != 0
+    }
+
+    pub(super) const fn ordinary_receiver(self) -> bool {
+        self.flags & Self::ORDINARY_RECEIVER != 0
     }
 
     pub(super) fn prevent_extensions(&mut self) {

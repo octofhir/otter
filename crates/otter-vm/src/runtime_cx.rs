@@ -185,6 +185,10 @@ pub struct NativeCallInfo {
     /// a different intrinsic default (Error subclasses in particular) replace
     /// only this proven fallback, never an explicit `%Object.prototype%`.
     used_object_prototype_fallback: bool,
+    /// `new.target` is the constructor being run. A built-in constructor's
+    /// `prototype` is non-writable and non-configurable, so its
+    /// GetPrototypeFromConstructor is the intrinsic default without a read.
+    new_target_is_callee: bool,
 }
 
 impl NativeCallInfo {
@@ -195,6 +199,7 @@ impl NativeCallInfo {
             this_value,
             new_target: None,
             used_object_prototype_fallback: false,
+            new_target_is_callee: false,
         }
     }
 
@@ -205,6 +210,7 @@ impl NativeCallInfo {
             this_value,
             new_target,
             used_object_prototype_fallback: false,
+            new_target_is_callee: false,
         }
     }
 
@@ -215,11 +221,13 @@ impl NativeCallInfo {
         this_value: Value,
         new_target: Option<Value>,
         used_object_prototype_fallback: bool,
+        new_target_is_callee: bool,
     ) -> Self {
         Self {
             this_value,
             new_target,
             used_object_prototype_fallback,
+            new_target_is_callee,
         }
     }
 
@@ -573,6 +581,16 @@ impl<'rt> NativeCtx<'rt> {
     #[must_use]
     pub fn is_construct_call(&self) -> bool {
         self.call_info.new_target.is_some()
+    }
+
+    /// Whether this construct call's `new.target` is the running native
+    /// constructor itself (`new Map()`, not a subclass or
+    /// `Reflect.construct` with another target). Its
+    /// GetPrototypeFromConstructor then yields the intrinsic default, so
+    /// the result needs no prototype override and no property read.
+    #[must_use]
+    pub fn constructs_itself(&self) -> bool {
+        self.call_info.new_target_is_callee
     }
 
     /// Whether the VM-created construct receiver used generic

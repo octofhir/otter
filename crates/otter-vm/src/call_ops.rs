@@ -381,7 +381,7 @@ impl Interpreter {
     pub(crate) fn invoke_native_construct_rooted(
         &mut self,
         stack: &mut ActivationStack,
-        context: &ExecutionContext,
+        context: crate::runtime_cx::NativeContext<'_>,
         native: NativeFunction,
         this_value: &Value,
         new_target: &Value,
@@ -389,24 +389,24 @@ impl Interpreter {
         args: ValueWindow<'_>,
     ) -> Result<Value, crate::NativeError> {
         let call = native.call_target(&self.gc_heap);
+        let new_target_is_callee = new_target
+            .as_native_function()
+            .is_some_and(|target| target.ptr_eq(&native));
         let call_info = NativeCallInfo::construct_with_receiver(
             *this_value,
             Some(*new_target),
             used_object_prototype_fallback,
+            new_target_is_callee,
         );
-        // Same root coverage as the call path (`invoke_native_call_with_roots`):
-        // trace the interpreter's full root set (crucially the scope-handle
-        // arena, so a native constructor's `Local` handles stay live) and
-        // pin `this`, `new.target`, and the argument slice across every
-        // scavenge the constructor triggers. Without this a native `new X(…)`
-        // ran fully unrooted — e.g. `new Set([...])` stranded its iterable.
-        let slice_roots = [args];
-        let roots = NativeCallRoots::new(&call_info, &slice_roots);
+        // `this` and `new.target` stay pinned across every collection the
+        // constructor triggers; `args` is the published host frame's window,
+        // which that frame traces in place.
+        let roots = NativeCallRoots::new(&call_info, &[]);
         let _roots_guard = self
             .gc_heap
             .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
         let turn = crate::runtime_cx::RuntimeTurn::from_rooted_parts(self, stack);
-        let mut ctx = NativeCtx::from_runtime_turn(turn, &call_info, Some(context));
+        let mut ctx = NativeCtx::with_native_context(turn, &call_info, context);
         let raw = call.invoke(&mut ctx, args);
         let rooted_this = *ctx.this_value();
         let (interp, _) = ctx.cx.into_parts();
@@ -995,59 +995,6 @@ impl Interpreter {
         })();
         self.pop_iteration_anchors_to(anchor_base);
         result
-    }
-
-    /// Native constructors that must NOT receive a pre-allocated
-    /// receiver whose prototype is read from `new.target` before the
-    /// constructor body runs. `Promise` builds its own object, and the
-    /// dynamic-function constructors (`Function` and friends) parse
-    /// their source and only then run `GetPrototypeFromConstructor`
-    /// (§20.2.1.1.1) — an eager `new.target.prototype` read here would
-    /// be observable before the SyntaxError a bad body must throw. The
-    /// buffer, view and typed-array constructors validate their arguments
-    /// before `OrdinaryCreateFromConstructor` (§25.1.4.1, §25.3.2.1,
-    /// §23.2.5.1) and allocate their own exotic result.
-    pub(crate) fn native_receiverless_constructor(&self, callee: &Value) -> Option<NativeFunction> {
-        let native = if let Some(native) = callee.as_native_function() {
-            native
-        } else {
-            let obj = callee.as_object()?;
-            crate::object::constructor_native(obj, &self.gc_heap)
-                .and_then(|v| v.as_native_function())?
-        };
-        [
-            "Promise",
-            "Function",
-            "GeneratorFunction",
-            "AsyncFunction",
-            "AsyncGeneratorFunction",
-            // §22.2.4.1 RegExp and §26.1.* WeakRef /
-            // FinalizationRegistry allocate their own exotic result and
-            // resolve `new.target.prototype` themselves. Pre-allocating
-            // an ordinary receiver here would read that property a
-            // second time, and the getter is observable.
-            "RegExp",
-            "WeakRef",
-            "FinalizationRegistry",
-            "ArrayBuffer",
-            "SharedArrayBuffer",
-            "DataView",
-            "Int8Array",
-            "Uint8Array",
-            "Uint8ClampedArray",
-            "Int16Array",
-            "Uint16Array",
-            "Int32Array",
-            "Uint32Array",
-            "Float16Array",
-            "Float32Array",
-            "Float64Array",
-            "BigInt64Array",
-            "BigUint64Array",
-        ]
-        .iter()
-        .any(|expected| native.name(&self.gc_heap).eq_str(expected, &self.gc_heap))
-        .then_some(native)
     }
 
     /// Handle `Op::CallForwardArguments`: `callee.apply(this_arg, arguments)`

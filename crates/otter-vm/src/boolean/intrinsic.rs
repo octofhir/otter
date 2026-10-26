@@ -20,7 +20,7 @@ use crate::{NativeCtx, NativeError, Value};
 otter_macros::couch! {
     name = "Boolean",
     feature = CORE,
-    constructor = (length = 1, call = boolean_ctor_call),
+    constructor = (length = 1, call = boolean_ctor_call, ordinary_receiver = true),
     prototype = {
         method_specs = [super::prototype::BOOLEAN_PROTOTYPE_METHODS],
     },

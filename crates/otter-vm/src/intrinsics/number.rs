@@ -26,7 +26,7 @@ use crate::{NativeCtx, NativeError, Value};
 otter_macros::couch! {
     name = "Number",
     feature = CORE,
-    constructor = (length = 1, call = number_ctor_call),
+    constructor = (length = 1, call = number_ctor_call, ordinary_receiver = true),
     statics = {
         "isNaN"         / 1 => number_is_nan_native,
         "isFinite"      / 1 => number_is_finite_native,

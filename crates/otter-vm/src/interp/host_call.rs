@@ -625,19 +625,12 @@ fn native_construct_with(
     turn.vm
         .record_runtime_construct_call()
         .map_err(CommittedValueError::Fatal)?;
-    let callee = turn.frame().self_value;
     let new_target = turn.frame().new_target_value;
-    if turn.vm.native_receiverless_constructor(&callee).is_some() {
-        let args = turn.actuals();
-        return invoke_native_construct(
-            turn,
-            ctx,
-            native,
-            &Value::UNDEFINED,
-            &new_target,
-            false,
-            ValueWindow::from(args.as_slice()),
-        )
+    // A built-in constructor specifies its own OrdinaryCreateFromConstructor
+    // step (and when it reads `new.target.prototype`), so only a body that
+    // declares an ordinary receiver gets one created here.
+    if !native.takes_ordinary_receiver(&turn.vm.gc_heap) {
+        return invoke_native_construct(turn, ctx, native, &Value::UNDEFINED, &new_target, false)
         .map_err(CommittedValueError::Fatal);
     }
     let proto = turn
@@ -685,7 +678,6 @@ fn native_construct_with(
         })
         .ok_or(VmError::InvalidOperand)
         .map_err(CommittedValueError::Fatal)?;
-    let args = turn.actuals();
     invoke_native_construct(
         turn,
         ctx,
@@ -693,13 +685,14 @@ fn native_construct_with(
         &this_value,
         &new_target,
         used_object_prototype_fallback,
-        ValueWindow::from(args.as_slice()),
     )
     .map_err(CommittedValueError::Fatal)
 }
 
 /// Only the body and its error projection enter the native creation realm.
 /// Receiver/prototype preparation above retains its own ordinary VM semantics.
+/// The body reads its actuals in place from the published frame, and the
+/// caller's source owner is resolved only if the body or its failure asks.
 fn invoke_native_construct(
     turn: &mut HostTurn<'_>,
     ctx: &mut JitCtx,
@@ -707,24 +700,28 @@ fn invoke_native_construct(
     this_value: &Value,
     new_target: &Value,
     used_object_prototype_fallback: bool,
-    args: ValueWindow<'_>,
 ) -> Result<HostStep, VmError> {
     turn.vm.record_runtime_native_call()?;
     let realm_global = turn.vm.native_target_realm_global(&native);
+    let args = turn.frame_actuals();
     let caller = CallerContext::new(turn);
-    let context = caller.get(turn.vm).ok_or(VmError::InvalidOperand)?;
     let (vm, stack) = (&mut *turn.vm, &mut *turn.stack);
     let mut invoke = |vm: &mut Interpreter| {
         let result = vm.invoke_native_construct_rooted(
             stack,
-            context,
+            NativeContext::Caller(&caller),
             native,
             this_value,
             new_target,
             used_object_prototype_fallback,
             args,
         );
-        Ok(finish_native_result(vm, stack, Some(context), ctx, result))
+        let context = if result.is_err() {
+            caller.get(vm)
+        } else {
+            None
+        };
+        Ok(finish_native_result(vm, stack, context, ctx, result))
     };
     if let Some(global) = realm_global {
         vm.with_host_realm_global(global, invoke)

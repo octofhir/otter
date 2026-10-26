@@ -46,10 +46,7 @@ use crate::collections::{self, CollectionError};
 use crate::handles::Local;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, JsObject, PartialPropertyDescriptor};
-use crate::{
-    NativeCtx, NativeError, NativeScope, Value, VmError, VmGetOutcome, VmPropertyKey,
-    descriptor_value,
-};
+use crate::{NativeCtx, NativeError, NativeScope, Value, VmError, VmGetOutcome, VmPropertyKey};
 
 // ---------------------------------------------------------------
 // Public bootstrap install entry points
@@ -427,7 +424,7 @@ fn construct_collection(
         });
     }
     let target = alloc_collection(ctx, kind)?;
-    apply_collection_new_target_prototype(ctx, &target, kind)?;
+    let target = apply_collection_new_target_prototype(ctx, target, kind)?;
     let iterable = args.first().cloned().unwrap_or(Value::undefined());
     if iterable.is_undefined() || iterable.is_null() {
         return Ok(target);
@@ -463,31 +460,22 @@ fn alloc_collection(ctx: &mut NativeCtx<'_>, kind: CollectionKind) -> Result<Val
 
 fn apply_collection_new_target_prototype(
     ctx: &mut NativeCtx<'_>,
-    target: &Value,
+    target: Value,
     kind: CollectionKind,
-) -> Result<(), NativeError> {
-    let Some(new_target) = ctx.new_target().cloned() else {
-        return Ok(());
-    };
-    let proto = if let Some(class) = new_target.as_class_constructor() {
-        Some(Value::object(class.prototype(ctx.heap())))
-    } else if let Some(obj) = new_target.as_object() {
-        object::get(obj, ctx.heap(), "prototype")
-            .filter(|value| value.is_object_type() || value.is_proxy())
-    } else if let Some(native) = new_target.as_native_function() {
-        native
-            .own_property_descriptor(ctx.heap_mut(), "prototype")
-            .map_err(|err| NativeError::TypeError {
-                name: kind.name(),
-                reason: err.to_string(),
-            })?
-            .map(|descriptor| descriptor_value(&descriptor))
-            .filter(|value| value.is_object_type() || value.is_proxy())
-    } else {
-        None
-    };
+) -> Result<Value, NativeError> {
+    if ctx.new_target().is_none() || ctx.constructs_itself() {
+        return Ok(target);
+    }
+    // GetPrototypeFromConstructor may run a `prototype` getter that
+    // collects; the fresh collection rides the scope across it.
+    let (target, proto) = ctx.scope(|mut scope| {
+        let target = scope.value(target);
+        let proto =
+            crate::intrinsics::shared::native_new_target_prototype(scope.context(), kind.name())?;
+        Ok::<_, NativeError>((scope.raw(target), proto))
+    })?;
     let Some(proto) = proto else {
-        return Ok(());
+        return Ok(target);
     };
     // Record the override only when `new.target`'s prototype is a genuinely
     // different object than the realm's canonical collection prototype.
@@ -515,7 +503,7 @@ fn apply_collection_new_target_prototype(
     } else if let Some(set) = target.as_weak_set() {
         collections::set_weak_set_prototype_override(set, ctx.heap_mut(), Some(proto));
     }
-    Ok(())
+    Ok(target)
 }
 
 /// §24.1.1.2 AddEntriesFromIterable — fetch the adder method via

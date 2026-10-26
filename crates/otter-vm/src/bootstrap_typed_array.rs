@@ -1063,11 +1063,7 @@ fn resolve_typed_array_new_target_proto<'scope>(
     scope: &mut NativeScope<'scope, '_>,
     kind: TypedArrayKind,
 ) -> Result<Option<Local<'scope>>, NativeError> {
-    if scope
-        .context()
-        .new_target()
-        .is_some_and(|target| target.is_native_function())
-    {
+    if scope.context().constructs_itself() {
         return Ok(None);
     }
     Ok(

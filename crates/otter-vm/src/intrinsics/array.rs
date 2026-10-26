@@ -23,7 +23,7 @@
 use crate::ValueWindow;
 use crate::js_surface::JsSurfaceError;
 use crate::object::{self, PropertyDescriptor};
-use crate::{NativeCtx, NativeError, Value, descriptor_value};
+use crate::{NativeCtx, NativeError, Value};
 
 otter_macros::couch! {
     name = "Array",
@@ -102,40 +102,5 @@ fn array_ctor_call(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Val
 /// or `None` for a call without `new.target` or one whose `prototype` is not
 /// an object.
 fn array_new_target_prototype(ctx: &mut NativeCtx<'_>) -> Result<Option<Value>, NativeError> {
-    let Some(new_target) = ctx.new_target().cloned() else {
-        return Ok(None);
-    };
-    let proto = if let Some(class) = new_target.as_class_constructor() {
-        Some(Value::object(class.prototype(ctx.heap())))
-    } else if let Some(obj) = new_target.as_object() {
-        object::get(obj, ctx.heap(), "prototype")
-            .filter(|value| value.is_object_type() || value.is_proxy())
-    } else if let Some(native) = new_target.as_native_function() {
-        native
-            .own_property_descriptor(ctx.heap_mut(), "prototype")
-            .map_err(|err| NativeError::TypeError {
-                name: "Array",
-                reason: err.to_string(),
-            })?
-            .map(|descriptor| descriptor_value(&descriptor))
-            .filter(|value| value.is_object_type() || value.is_proxy())
-    } else if new_target.is_function()
-        || new_target.is_closure()
-        || new_target.is_bound_function()
-        || new_target.is_proxy()
-    {
-        // §10.1.13 OrdinaryCreateFromConstructor over an ordinary
-        // script function (`Reflect.construct(Array, [], f)`): the
-        // `prototype` read is the ordinary observable one.
-        Some(crate::regexp_prototype::get_property_runtime(
-            ctx,
-            &new_target,
-            "prototype",
-            "Array",
-        )?)
-        .filter(|value| value.is_object_type() || value.is_proxy())
-    } else {
-        None
-    };
-    Ok(proto)
+    crate::intrinsics::shared::native_new_target_prototype(ctx, "Array")
 }

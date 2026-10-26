@@ -28,7 +28,11 @@
 //!
 //! - `constructor = (length = N, call = path
 //!     [, callable_only = true]
-//!     [, is_abstract = true])` — `callable_only = true` drops the
+//!     [, is_abstract = true]
+//!     [, ordinary_receiver = true])` — `ordinary_receiver = true` makes
+//!   `[[Construct]]` create an ordinary receiver from `new.target` for
+//!   the body to fill in (primitive wrappers, `Date`, `Object`); every
+//!   other constructor allocates its own result. `callable_only = true` drops the
 //!   `[[Construct]]` slot so `new Foo(x)` throws via §10.1.10
 //!   (Symbol / BigInt / Number / Boolean / String). `is_abstract`
 //!   documents intent for things like `%TypedArray%`; the install
@@ -135,7 +139,8 @@ use syn::{
 use crate::holt::{AccessorEntry, ConstantEntry, MethodEntry};
 
 /// Parsed `constructor = (length = N, call = path
-/// [, is_abstract = true] [, callable_only = true])` tuple.
+/// [, is_abstract = true] [, callable_only = true] [, ordinary_receiver = true])`
+/// tuple.
 pub(crate) struct ConstructorSpecArgs {
     pub(crate) length: u8,
     pub(crate) call: Path,
@@ -149,6 +154,10 @@ pub(crate) struct ConstructorSpecArgs {
     /// (`Boolean`) shape where `new Foo(x)` throws "is not a
     /// constructor" via §10.1.10.
     pub(crate) callable_only: bool,
+    /// When `true`, `[[Construct]]` creates the ordinary receiver the
+    /// body fills in; the install body allocates the function through
+    /// `bootstrap::native_receiver_constructor_static_with_value_roots`.
+    pub(crate) ordinary_receiver: bool,
 }
 
 impl Parse for ConstructorSpecArgs {
@@ -159,6 +168,7 @@ impl Parse for ConstructorSpecArgs {
         let mut call: Option<Path> = None;
         let mut is_abstract = false;
         let mut callable_only = false;
+        let mut ordinary_receiver = false;
         while !body.is_empty() {
             let key: Ident = body.parse()?;
             body.parse::<Token![=]>()?;
@@ -178,12 +188,17 @@ impl Parse for ConstructorSpecArgs {
                     let lit: LitBool = body.parse()?;
                     callable_only = lit.value;
                 }
+                "ordinary_receiver" => {
+                    let lit: LitBool = body.parse()?;
+                    ordinary_receiver = lit.value;
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "couch!: unknown constructor field `{other}` — expected \
-                             `length`, `call`, `is_abstract`, or `callable_only` \
+                             `length`, `call`, `is_abstract`, `callable_only`, or \
+                             `ordinary_receiver` \
                              (Rust reserves the bare `abstract` keyword)"
                         ),
                     ));
@@ -208,6 +223,7 @@ impl Parse for ConstructorSpecArgs {
             })?,
             is_abstract,
             callable_only,
+            ordinary_receiver,
         })
     }
 }
@@ -759,6 +775,8 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     // BigInt(x)` throws via §10.1.10 instead of via the body.
     let ctor_alloc_path = if constructor.callable_only {
         quote! { ::otter_vm::__macro_support::bootstrap::native_static_with_value_roots }
+    } else if constructor.ordinary_receiver {
+        quote! { ::otter_vm::__macro_support::bootstrap::native_receiver_constructor_static_with_value_roots }
     } else {
         quote! { ::otter_vm::__macro_support::bootstrap::native_constructor_static_with_value_roots }
     };

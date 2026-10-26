@@ -216,7 +216,7 @@ fn coerce_number_args(
 otter_macros::couch! {
     name = "Date",
     feature = CORE,
-    constructor = (length = 7, call = date_ctor_call),
+    constructor = (length = 7, call = date_ctor_call, ordinary_receiver = true),
     statics = {
         "now"   / 0 => date_now_call,
         "parse" / 1 => date_parse_call,

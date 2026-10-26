@@ -80,6 +80,30 @@ pub fn native_constructor_static_with_value_roots(
     )
 }
 
+/// [`native_constructor_static_with_value_roots`] for a constructor whose
+/// body fills in the ordinary receiver `[[Construct]]` creates from
+/// `new.target`; `couch!` emits it for `ordinary_receiver = true`.
+pub fn native_receiver_constructor_static_with_value_roots(
+    heap: &mut otter_gc::GcHeap,
+    name: &'static str,
+    length: u8,
+    call: crate::native_function::NativeFastFn,
+    value_roots: &mut [&mut Value],
+) -> Result<crate::native_function::NativeFunction, otter_gc::OutOfMemory> {
+    let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+        for value in value_roots.iter_mut() {
+            value.trace_value_slot_mut(visitor);
+        }
+    };
+    crate::native_function::NativeFunction::new_receiver_constructor_static_with_roots(
+        heap,
+        name,
+        length,
+        call,
+        &mut external_visit,
+    )
+}
+
 /// Allocate a static native non-constructor with `value_roots` kept live.
 ///
 /// `pub` for the same reason as
@@ -147,6 +171,9 @@ pub(crate) fn native_new_target_prototype(
     let Some(new_target) = ctx.new_target().cloned() else {
         return Ok(None);
     };
+    if ctx.constructs_itself() {
+        return Ok(None);
+    }
     let exec = ctx.execution_context().cloned();
     ctx.scope(|mut scope| {
         let new_target = scope.value(new_target);

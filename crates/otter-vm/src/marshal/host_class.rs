@@ -302,7 +302,9 @@ fn prototype_for_construction<'s>(
     cx: &mut MarshalCx<'_, '_, 's>,
     class_name: &str,
 ) -> Option<Local<'s>> {
-    if let Some(new_target) = cx.ctx().new_target().copied() {
+    if let Some(new_target) = cx.ctx().new_target().copied()
+        && !cx.ctx().constructs_itself()
+    {
         let target_handle = cx.park(new_target);
         if let Some(proto) = constructor_prototype_read(cx, target_handle)
             && proto.is_object_type()

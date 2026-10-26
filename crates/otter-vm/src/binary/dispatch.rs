@@ -354,10 +354,9 @@ pub(crate) fn typed_array_from_values_with_roots(
                 .into(),
         )
     })?;
-    let view = JsTypedArray::new(interp.gc_heap_mut(), new_buf, kind, 0, values.len())
-        .map_err(oom_to_vm)?;
-    interp.register_typed_array_realm_proto(view);
-    interp.register_exotic_realm_proto(&Value::array_buffer(new_buf));
+    // The values are rooted only through the buffer allocation, so they are
+    // encoded into the (old, unmoving) buffer before the view allocation
+    // can move a BigInt among them.
     let mut encoded = vec![0u8; byte_len];
     for (i, value) in values.iter().enumerate() {
         kind.write(interp.gc_heap_mut(), &mut encoded, i * bpe, value);
@@ -365,6 +364,10 @@ pub(crate) fn typed_array_from_values_with_roots(
     new_buf.with_bytes_mut(interp.gc_heap_mut(), |bytes| {
         bytes.copy_from_slice(&encoded)
     });
+    let view = JsTypedArray::new(interp.gc_heap_mut(), new_buf, kind, 0, values.len())
+        .map_err(oom_to_vm)?;
+    interp.register_typed_array_realm_proto(view);
+    interp.register_exotic_realm_proto(&Value::array_buffer(new_buf));
     Ok(Value::typed_array(view))
 }
 

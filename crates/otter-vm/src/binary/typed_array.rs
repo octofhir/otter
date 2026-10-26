@@ -574,7 +574,9 @@ pub fn alloc_typed_array(
         .map_or(std::ptr::null_mut(), |base| unsafe {
             base.add(byte_offset)
         });
-    heap.alloc_old(TypedArrayBodyGc {
+    // A view is as short-lived as the code that makes it: born young, it
+    // dies in the next scavenge unless something keeps it.
+    heap.alloc(TypedArrayBodyGc {
         map: otter_gc::cell_map::TypeMap::NEW,
         buffer,
         kind,
@@ -849,6 +851,41 @@ impl JsTypedArray {
         buffer.with_bytes_mut(heap, |bytes| {
             if offset + bpe <= bytes.len() {
                 bytes[offset..offset + bpe].copy_from_slice(&staging[..bpe]);
+            }
+        });
+    }
+
+    /// Element `index` as its raw little-endian bytes, zero-extended to 64
+    /// bits, or `None` when the view does not cover the index. Unlike
+    /// [`Self::get`] it decodes nothing, so a BigInt element allocates no
+    /// body.
+    #[must_use]
+    pub fn element_bits(self, heap: &otter_gc::GcHeap, index: usize) -> Option<u64> {
+        if self.buffer(heap).is_detached(heap) || index >= self.length(heap) {
+            return None;
+        }
+        let bpe = self.cached_kind.bytes_per_element();
+        let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
+        let offset = off + index * bpe;
+        buffer.with_bytes(heap, |bytes| {
+            let mut raw = [0u8; 8];
+            raw[..bpe].copy_from_slice(bytes.get(offset..offset + bpe)?);
+            Some(u64::from_le_bytes(raw))
+        })
+    }
+
+    /// Store the low `bytes_per_element()` bytes of `bits` at element
+    /// `index`, dropping the write where [`Self::set`] would.
+    pub fn set_element_bits(self, heap: &mut otter_gc::GcHeap, index: usize, bits: u64) {
+        if self.buffer(heap).is_detached(heap) || index >= self.length(heap) {
+            return;
+        }
+        let bpe = self.cached_kind.bytes_per_element();
+        let (buffer, off) = heap.read_payload(self.handle, |body| (body.buffer, body.byte_offset));
+        let offset = off + index * bpe;
+        buffer.with_bytes_mut(heap, |bytes| {
+            if let Some(slot) = bytes.get_mut(offset..offset + bpe) {
+                slot.copy_from_slice(&bits.to_le_bytes()[..bpe]);
             }
         });
     }

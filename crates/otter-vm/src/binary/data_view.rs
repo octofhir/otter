@@ -103,7 +103,7 @@ pub fn alloc_data_view(
     byte_offset: usize,
     byte_length: usize,
 ) -> Result<DataViewHandle, otter_gc::OutOfMemory> {
-    heap.alloc_old(DataViewBodyGc {
+    heap.alloc(DataViewBodyGc {
         map: otter_gc::cell_map::TypeMap::NEW,
         buffer,
         byte_offset,

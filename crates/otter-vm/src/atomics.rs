@@ -321,6 +321,35 @@ fn range_err(name: &'static str, reason: String) -> NativeError {
 // lookup path resolves `Atomics.<method>` to a native function.
 // =====================================================================
 
+/// The validated view argument, read again from its live slot. A view is a
+/// young cell, so every coercion since the last read may have moved it.
+fn view_arg(args: ValueWindow<'_>, heap: &otter_gc::GcHeap) -> Result<JsTypedArray, NativeError> {
+    args.first()
+        .and_then(|value| value.as_typed_array(heap))
+        .ok_or(NativeError::InvalidOperand)
+}
+
+/// `value` as one element of `kind` would store it (NumericToRawBytes),
+/// zero-extended to 64 bits. Read-modify-write operations combine these
+/// bits: `add`, `sub`, `and`, `or` and `xor` modulo 2^n depend only on the
+/// low n bits of their operands, and `compareExchange` / `wait` compare raw
+/// element bytes.
+fn raw_element(heap: &mut otter_gc::GcHeap, kind: TypedArrayKind, value: &Value) -> u64 {
+    let mut raw = [0u8; 8];
+    kind.write(heap, &mut raw, 0, value);
+    u64::from_le_bytes(raw)
+}
+
+/// The element value whose raw bytes are `bits`.
+fn element_value(
+    heap: &mut otter_gc::GcHeap,
+    kind: TypedArrayKind,
+    bits: u64,
+) -> Result<Value, NativeError> {
+    kind.read(heap, &bits.to_le_bytes()[..kind.bytes_per_element()], 0)
+        .map_err(NativeError::from)
+}
+
 fn native_load(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let ta = validate_integer_typed_array(
         args.first().unwrap_or(&Value::UNDEFINED),
@@ -335,6 +364,7 @@ fn native_load(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, 
         args.get(1).unwrap_or(&Value::UNDEFINED),
         "Atomics.load",
     )?;
+    let ta = view_arg(args, ctx.heap())?;
     revalidate_atomic_access(&ta, ctx.heap(), idx, "Atomics.load")?;
     let heap = ctx.interp_mut().gc_heap_mut();
     ta.get(heap, idx).map_err(NativeError::from)
@@ -348,6 +378,7 @@ fn native_store(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value,
         false,
         "Atomics.store",
     )?;
+    let kind = ta.kind();
     let idx = validate_atomic_access(
         ctx,
         &ta,
@@ -356,198 +387,131 @@ fn native_store(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value,
     )?;
     let value = coerce_element_value(
         ctx,
-        ta.kind(),
+        kind,
         args.get(2).unwrap_or(&Value::UNDEFINED),
         "Atomics.store",
     )?;
+    // Nothing allocates between the coercion and the return, so `value`
+    // stays current.
+    let bits = raw_element(ctx.interp_mut().gc_heap_mut(), kind, &value);
+    let ta = view_arg(args, ctx.heap())?;
     revalidate_atomic_access(&ta, ctx.heap(), idx, "Atomics.store")?;
-    ta.set(ctx.interp_mut().gc_heap_mut(), idx, &value);
+    ta.set_element_bits(ctx.interp_mut().gc_heap_mut(), idx, bits);
     Ok(value)
+}
+
+/// Validate the view and index, coerce the operand at `args[2]` and return
+/// the re-read view, the index and the operand's element bits.
+fn rmw_operands(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+    method_name: &'static str,
+) -> Result<(JsTypedArray, usize, u64), NativeError> {
+    let ta = validate_integer_typed_array(
+        args.first().unwrap_or(&Value::UNDEFINED),
+        ctx.heap(),
+        false,
+        false,
+        method_name,
+    )?;
+    let kind = ta.kind();
+    let idx = validate_atomic_access(
+        ctx,
+        &ta,
+        args.get(1).unwrap_or(&Value::UNDEFINED),
+        method_name,
+    )?;
+    let operand = coerce_element_value(
+        ctx,
+        kind,
+        args.get(2).unwrap_or(&Value::UNDEFINED),
+        method_name,
+    )?;
+    let operand = raw_element(ctx.interp_mut().gc_heap_mut(), kind, &operand);
+    let ta = view_arg(args, ctx.heap())?;
+    revalidate_atomic_access(&ta, ctx.heap(), idx, method_name)?;
+    Ok((ta, idx, operand))
 }
 
 fn modify_op(
     ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
     method_name: &'static str,
-    op: fn(i64, i64) -> i64,
-    op_big: fn(&num_bigint::BigInt, &num_bigint::BigInt) -> num_bigint::BigInt,
+    op: fn(u64, u64) -> u64,
 ) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::UNDEFINED),
-        ctx.heap(),
-        false,
-        false,
-        method_name,
-    )?;
-    let idx = validate_atomic_access(
-        ctx,
-        &ta,
-        args.get(1).unwrap_or(&Value::UNDEFINED),
-        method_name,
-    )?;
-    let coerced = coerce_element_value(
-        ctx,
-        ta.kind(),
-        args.get(2).unwrap_or(&Value::UNDEFINED),
-        method_name,
-    )?;
-    revalidate_atomic_access(&ta, ctx.heap(), idx, method_name)?;
+    let (ta, idx, operand) = rmw_operands(ctx, args, method_name)?;
     let heap = ctx.interp_mut().gc_heap_mut();
-    let _atomic_guard = ATOMICS_RMW_LOCK
-        .lock()
-        .expect("Atomics read-modify-write mutex poisoned");
-    let prev = ta.get(heap, idx).map_err(NativeError::from)?;
-    if ta.kind().is_bigint() {
-        let prev_b = prev
-            .as_big_int()
-            .map(|b| b.to_num(heap))
-            .unwrap_or_else(|| num_bigint::BigInt::from(0));
-        let v_b = coerced
-            .as_big_int()
-            .map(|b| b.to_num(heap))
-            .unwrap_or_else(|| num_bigint::BigInt::from(0));
-        let new_b = op_big(&prev_b, &v_b);
-        let handle = BigIntValue::from_num(heap, &new_b).map_err(NativeError::from)?;
-        ta.set(heap, idx, &Value::big_int(handle));
-    } else {
-        // An integer element keeps the low bits of the operand's ToInt32.
-        let prev_n = prev.as_number().map(|n| n.as_f64() as i64).unwrap_or(0);
-        let v_n = coerced
-            .as_number()
-            .map(|n| i64::from(crate::number::bitwise::to_int32(n)))
-            .unwrap_or(0);
-        let new_n = op(prev_n, v_n);
-        ta.set(
-            heap,
-            idx,
-            &Value::number(NumberValue::from_f64(new_n as f64)),
-        );
-    }
-    Ok(prev)
+    let prev = {
+        let _atomic_guard = ATOMICS_RMW_LOCK
+            .lock()
+            .expect("Atomics read-modify-write mutex poisoned");
+        let prev = ta.element_bits(heap, idx).unwrap_or(0);
+        ta.set_element_bits(heap, idx, op(prev, operand));
+        prev
+    };
+    element_value(heap, ta.kind(), prev)
 }
 
 fn native_add(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    modify_op(
-        ctx,
-        args,
-        "Atomics.add",
-        |a, b| a.wrapping_add(b),
-        |a, b| a + b,
-    )
+    modify_op(ctx, args, "Atomics.add", u64::wrapping_add)
 }
 
 fn native_sub(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    modify_op(
-        ctx,
-        args,
-        "Atomics.sub",
-        |a, b| a.wrapping_sub(b),
-        |a, b| a - b,
-    )
+    modify_op(ctx, args, "Atomics.sub", u64::wrapping_sub)
 }
 
 fn native_and(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    modify_op(ctx, args, "Atomics.and", |a, b| a & b, |a, b| a & b)
+    modify_op(ctx, args, "Atomics.and", |a, b| a & b)
 }
 
 fn native_or(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    modify_op(ctx, args, "Atomics.or", |a, b| a | b, |a, b| a | b)
+    modify_op(ctx, args, "Atomics.or", |a, b| a | b)
 }
 
 fn native_xor(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    modify_op(ctx, args, "Atomics.xor", |a, b| a ^ b, |a, b| a ^ b)
+    modify_op(ctx, args, "Atomics.xor", |a, b| a ^ b)
 }
 
 fn native_exchange(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    let ta = validate_integer_typed_array(
-        args.first().unwrap_or(&Value::UNDEFINED),
-        ctx.heap(),
-        false,
-        false,
-        "Atomics.exchange",
-    )?;
-    let idx = validate_atomic_access(
-        ctx,
-        &ta,
-        args.get(1).unwrap_or(&Value::UNDEFINED),
-        "Atomics.exchange",
-    )?;
-    let value = coerce_element_value(
-        ctx,
-        ta.kind(),
-        args.get(2).unwrap_or(&Value::UNDEFINED),
-        "Atomics.exchange",
-    )?;
-    revalidate_atomic_access(&ta, ctx.heap(), idx, "Atomics.exchange")?;
-    let heap = ctx.interp_mut().gc_heap_mut();
-    let _atomic_guard = ATOMICS_RMW_LOCK
-        .lock()
-        .expect("Atomics read-modify-write mutex poisoned");
-    let prev = ta.get(heap, idx).map_err(NativeError::from)?;
-    ta.set(heap, idx, &value);
-    Ok(prev)
+    modify_op(ctx, args, "Atomics.exchange", |_, replacement| replacement)
 }
 
 fn native_compare_exchange(
     ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
+    const NAME: &str = "Atomics.compareExchange";
     let ta = validate_integer_typed_array(
         args.first().unwrap_or(&Value::UNDEFINED),
         ctx.heap(),
         false,
         false,
-        "Atomics.compareExchange",
+        NAME,
     )?;
-    let idx = validate_atomic_access(
-        ctx,
-        &ta,
-        args.get(1).unwrap_or(&Value::UNDEFINED),
-        "Atomics.compareExchange",
-    )?;
-    let expected = coerce_element_value(
-        ctx,
-        ta.kind(),
-        args.get(2).unwrap_or(&Value::UNDEFINED),
-        "Atomics.compareExchange",
-    )?;
-    let replacement = coerce_element_value(
-        ctx,
-        ta.kind(),
-        args.get(3).unwrap_or(&Value::UNDEFINED),
-        "Atomics.compareExchange",
-    )?;
-    revalidate_atomic_access(&ta, ctx.heap(), idx, "Atomics.compareExchange")?;
-    // §25.4.3.5 step 8 — expected must be narrowed through the
-    // element-type's RawBytes round-trip before the comparison
-    // against the raw current value (e.g. an Int16 view stores
-    // `123456789` as `-13035`, so expected `123456789` must compare
-    // against `-13035`, not the original Number).
+    let kind = ta.kind();
+    let idx = validate_atomic_access(ctx, &ta, args.get(1).unwrap_or(&Value::UNDEFINED), NAME)?;
+    // §25.4.3.5 step 8 — `expected` compares as the element bytes it would
+    // store (an Int16 view stores `123456789` as `-13035`), so both
+    // operands are encoded as soon as they are coerced.
+    let expected = coerce_element_value(ctx, kind, args.get(2).unwrap_or(&Value::UNDEFINED), NAME)?;
+    let expected = raw_element(ctx.interp_mut().gc_heap_mut(), kind, &expected);
+    let replacement =
+        coerce_element_value(ctx, kind, args.get(3).unwrap_or(&Value::UNDEFINED), NAME)?;
+    let replacement = raw_element(ctx.interp_mut().gc_heap_mut(), kind, &replacement);
+    let ta = view_arg(args, ctx.heap())?;
+    revalidate_atomic_access(&ta, ctx.heap(), idx, NAME)?;
     let heap = ctx.interp_mut().gc_heap_mut();
-    let _atomic_guard = ATOMICS_RMW_LOCK
-        .lock()
-        .expect("Atomics read-modify-write mutex poisoned");
-    let expected_narrow =
-        narrow_through_kind(heap, ta.kind(), &expected).map_err(NativeError::from)?;
-    let current = ta.get(heap, idx).map_err(NativeError::from)?;
-    if values_equal_strict(&current, &expected_narrow, heap) {
-        ta.set(heap, idx, &replacement);
-    }
-    Ok(current)
-}
-
-/// Round-trip `value` through the element type so the result matches
-/// what the buffer would read back after a store. Used by
-/// `compareExchange` to spec-equate `expected` with `current` per
-/// §25.4.3.5.
-fn narrow_through_kind(
-    heap: &mut otter_gc::GcHeap,
-    kind: TypedArrayKind,
-    value: &Value,
-) -> Result<Value, otter_gc::OutOfMemory> {
-    let mut scratch = [0u8; 8];
-    kind.write(heap, &mut scratch, 0, value);
-    kind.read(heap, &scratch, 0)
+    let current = {
+        let _atomic_guard = ATOMICS_RMW_LOCK
+            .lock()
+            .expect("Atomics read-modify-write mutex poisoned");
+        let current = ta.element_bits(heap, idx).unwrap_or(0);
+        if current == expected {
+            ta.set_element_bits(heap, idx, replacement);
+        }
+        current
+    };
+    element_value(heap, kind, current)
 }
 
 fn native_is_lock_free(
@@ -634,13 +598,16 @@ fn do_wait(
         args.get(1).unwrap_or(&Value::UNDEFINED),
         method_name,
     )?;
-    // Coerce expected `value` before timeout for spec-faithful order.
+    // Coerce expected `value` before timeout for spec-faithful order; it
+    // compares as the element bytes it would store.
+    let kind = ta.kind();
     let expected = coerce_element_value(
         ctx,
-        ta.kind(),
+        kind,
         args.get(2).unwrap_or(&Value::UNDEFINED),
         method_name,
     )?;
+    let expected = raw_element(ctx.interp_mut().gc_heap_mut(), kind, &expected);
     // §25.4.3.13 step 11 — timeout is `ToNumber(q)`; NaN → +∞;
     // observable side-effects fire even on a single-threaded VM.
     let timeout = match args.get(3) {
@@ -668,10 +635,9 @@ fn do_wait(
             "Atomics.wait cannot block on this runtime".to_string(),
         ));
     }
-    let heap = ctx.interp_mut().gc_heap_mut();
-    let current = ta.get(heap, idx).map_err(NativeError::from)?;
+    let current = view_arg(args, ctx.heap())?.element_bits(ctx.heap(), idx);
     if is_async {
-        if !values_equal_strict(&current, &expected, heap) {
+        if current != Some(expected) {
             return wait_async_result(ctx, false, "not-equal");
         }
         if timeout == 0.0 {
@@ -680,7 +646,7 @@ fn do_wait(
         return wait_async_parked(ctx, method_name, buf_id, idx, timeout);
     }
 
-    let label = if !values_equal_strict(&current, &expected, heap) {
+    let label = if current != Some(expected) {
         "not-equal"
     } else {
         // §25.4.3.13 — block the calling thread on the shared-buffer
@@ -1123,7 +1089,10 @@ fn native_notify(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value
             }
         }
     };
-    let woken = match ta.buffer(ctx.heap()).shared_id(ctx.heap()) {
+    let woken = match view_arg(args, ctx.heap())?
+        .buffer(ctx.heap())
+        .shared_id(ctx.heap())
+    {
         Some(buf_id) => {
             let sync_woken = atomics_wait::notify_waiters(buf_id, idx, count);
             let async_woken =
@@ -1133,16 +1102,6 @@ fn native_notify(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value
         None => 0,
     };
     Ok(Value::number(NumberValue::from_f64(woken as f64)))
-}
-
-fn values_equal_strict(a: &Value, b: &Value, heap: &otter_gc::GcHeap) -> bool {
-    if let (Some(x), Some(y)) = (a.as_number(), b.as_number()) {
-        crate::number::equals(x, y)
-    } else if let (Some(x), Some(y)) = (a.as_big_int(), b.as_big_int()) {
-        x.numeric_eq(y, heap)
-    } else {
-        false
-    }
 }
 
 #[cfg(test)]

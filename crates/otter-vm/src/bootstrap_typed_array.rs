@@ -1151,83 +1151,15 @@ fn ta_proto_dispatch(
     args: ValueWindow<'_>,
     method_name: &str,
 ) -> Result<Value, NativeError> {
-    const NAME: &str = "TypedArray.prototype";
     let impl_fn =
         typed_array_prototype::method_impl(method_name).ok_or_else(|| NativeError::TypeError {
-            name: NAME,
+            name: "TypedArray.prototype",
             reason: format!("method {method_name} missing"),
         })?;
-    ctx.scope(|mut scope| {
-        let receiver = scope.this();
-        let mut arg_handles: SmallVec<[crate::Local<'_>; 4]> =
-            args.iter().map(|value| scope.value(*value)).collect();
-
-        // Some relative-index operands are coerced in the wrapper before
-        // calling shared implementations. Methods whose spec first reads
-        // TypedArray length, such as `fill`, `copyWithin`, `includes`,
-        // `indexOf`, and `lastIndexOf`, do their coercions inside the impl
-        // so user side effects cannot pre-empt the length snapshot.
-        let int_coerce: &[usize] = match method_name {
-            // §23.2.3.1 / §23.2.3.36 / §23.2.3.27/.28 — relative-index
-            // operands run ToIntegerOrInfinity (firing valueOf /
-            // toString) before the impl reads them as numbers.
-            // `at` coerces its index inside impl_at AFTER ValidateTypedArray
-            // so a resize during ToIntegerOrInfinity is observed in the
-            // correct order (it must not throw, only read out of range).
-            "with" => &[0],
-            "slice" | "subarray" => &[0, 1],
-            _ => &[],
-        };
-        if !int_coerce.is_empty() {
-            // §23.2.4.4 ValidateTypedArray runs BEFORE the argument
-            // coercions for these methods — a non-TypedArray or detached
-            // receiver throws before any user valueOf fires. `subarray`
-            // (§23.2.3.30) only requires the internal slot and operates
-            // on detached views.
-            match scope.raw(receiver).as_typed_array(scope.context().heap()) {
-                None => {
-                    return Err(NativeError::TypeError {
-                        name: NAME,
-                        reason: "method called on a non-TypedArray receiver".to_string(),
-                    });
-                }
-                Some(t)
-                    if method_name != "subarray"
-                        && t.buffer(scope.context().heap())
-                            .is_detached(scope.context().heap()) =>
-                {
-                    return Err(NativeError::TypeError {
-                        name: NAME,
-                        reason: "expected non-detached typedarray".to_string(),
-                    });
-                }
-                Some(_) => {}
-            }
-            if let Some(context) = scope.context().execution_context().cloned() {
-                for &idx in int_coerce {
-                    let Some(value_handle) = arg_handles.get(idx).copied() else {
-                        continue;
-                    };
-                    let value = scope.raw(value_handle);
-                    if value.is_number() || value.is_undefined() {
-                        continue;
-                    }
-                    let number = scope.with_turn_parts(|interp, stack| {
-                        interp
-                            .coerce_to_number(stack, &context, &value)
-                            .map_err(|error| error.into_native(interp, NAME))
-                    })?;
-                    arg_handles[idx] = scope.value(Value::number(number));
-                }
-            }
-        }
-
-        let current_args: SmallVec<[Value; 4]> =
-            arg_handles.iter().map(|value| scope.raw(*value)).collect();
-        let result = impl_fn(scope.context(), ValueWindow::from(&current_args))?;
-        let result = scope.value(result);
-        Ok(scope.finish(result))
-    })
+    // The impl reads its arguments from the caller's window, which the
+    // collector rewrites in place, and runs every coercion itself in spec
+    // order.
+    impl_fn(ctx, args)
 }
 
 // §23.2.3 callback-driven prototype methods re-enter the interpreter to

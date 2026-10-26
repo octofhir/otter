@@ -12,6 +12,13 @@
 //! access to the engine to drive synchronous callbacks. This module
 //! covers the pure-functional surface.
 //!
+//! # Invariants
+//! - A view is a young cell that a scavenge moves, and a BigInt element
+//!   read allocates. A `JsTypedArray` copy is therefore good only until
+//!   the next allocation or JS call: methods re-read the receiver from
+//!   `this` after either, and any value that must outlive one rides the
+//!   traced iteration-anchor stack ([`with_anchors`]).
+//!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarrayprototype%25-object>
 
@@ -55,74 +62,12 @@ fn validate_typed_array(t: &JsTypedArray, heap: &otter_gc::GcHeap) -> Result<(),
     Ok(())
 }
 
-/// §22.1.3.27 / §23.2.3.34 helper — clamp a relative integer to
-/// `[0, len]` per §7.1.5 ToIntegerOrInfinity then offset-from-end
-/// for negative values.
-fn relative_index(arg: Option<&Value>, default: i64, len: i64) -> i64 {
-    let Some(v) = arg else {
-        return default;
-    };
-    if v.is_undefined() {
-        return default;
-    }
-    let n = if let Some(num) = v.as_number() {
-        num.as_f64()
-    } else if let Some(b) = v.as_boolean() {
-        if b { 1.0 } else { 0.0 }
-    } else if v.is_null() {
-        0.0
-    } else {
-        return default;
-    };
-    if n.is_nan() {
-        return 0;
-    }
-    if !n.is_finite() {
-        return if n.is_sign_positive() { len } else { 0 };
-    }
-    let truncated = n.trunc() as i64;
-    if truncated < 0 {
-        (len + truncated).max(0)
-    } else {
-        truncated.min(len)
-    }
-}
-
 fn clamp_relative_index(index: i64, len: i64) -> i64 {
     if index < 0 {
         (len + index).max(0)
     } else {
         index.min(len)
     }
-}
-
-fn integer_arg(arg: Option<&Value>, default: i64) -> i64 {
-    let Some(v) = arg else {
-        return default;
-    };
-    if v.is_undefined() {
-        return default;
-    }
-    let n = if let Some(num) = v.as_number() {
-        num.as_f64()
-    } else if let Some(b) = v.as_boolean() {
-        if b { 1.0 } else { 0.0 }
-    } else if v.is_null() {
-        0.0
-    } else {
-        return default;
-    };
-    if n.is_nan() {
-        return 0;
-    }
-    if !n.is_finite() {
-        return if n.is_sign_positive() {
-            i64::MAX
-        } else {
-            i64::MIN
-        };
-    }
-    n.trunc() as i64
 }
 
 fn to_integer_or_infinity_arg(
@@ -204,11 +149,30 @@ fn integer_index_arg(
 /// backing buffer, `align-detached-buffer-semantics-with-web-reality`
 /// makes the index read yield `undefined` rather than throwing, so the
 /// search loops keep running against the length captured before coercion.
-fn ta_element_or_undefined(t: &JsTypedArray, ctx: &mut NativeCtx<'_>, i: usize) -> Value {
+fn ta_element_or_undefined(ctx: &mut NativeCtx<'_>, i: usize) -> Result<Value, NativeError> {
+    let t = receiver(ctx)?;
     if t.buffer(ctx.heap()).is_detached(ctx.heap()) || i >= t.length(ctx.heap_mut()) {
-        return Value::undefined();
+        return Ok(Value::undefined());
     }
-    t.get(ctx.heap_mut(), i).unwrap_or(Value::undefined())
+    Ok(t.get(ctx.heap_mut(), i).unwrap_or(Value::undefined()))
+}
+
+/// The first argument, read from its live slot: an allocation or a JS call
+/// since the last read may have moved it.
+fn first_arg(args: ValueWindow<'_>) -> Value {
+    args.first().copied().unwrap_or(Value::undefined())
+}
+
+/// Run `body` with the iteration-anchor depth it starts at, popping every
+/// anchor it pushed however it returns.
+fn with_anchors<R>(
+    ctx: &mut NativeCtx<'_>,
+    body: impl FnOnce(&mut NativeCtx<'_>, usize) -> Result<R, NativeError>,
+) -> Result<R, NativeError> {
+    let base = ctx.cx.interp.iteration_anchors_for_trace().len();
+    let result = body(ctx, base);
+    ctx.cx.interp.pop_iteration_anchors_to(base);
+    result
 }
 
 /// §23.2.3.26 step 5 — `ToIntegerOrInfinity(offset)` for
@@ -236,29 +200,21 @@ fn native_oom(_: otter_gc::OutOfMemory) -> NativeError {
     type_error("out of memory")
 }
 
-fn copy_view(
-    t: &JsTypedArray,
-    heap: &mut otter_gc::GcHeap,
-) -> Result<Vec<Value>, otter_gc::OutOfMemory> {
-    let len = t.length(heap);
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        out.push(t.get(heap, i)?);
-    }
-    Ok(out)
-}
-
-fn build_subarray(
-    t: &JsTypedArray,
-    heap: &mut otter_gc::GcHeap,
-    start: usize,
-    len: usize,
-) -> Result<Value, NativeError> {
-    let bpe = t.kind().bytes_per_element();
-    let buffer = t.buffer(heap);
-    let byte_offset = t.byte_offset(heap) + start * bpe;
-    let view = JsTypedArray::new(heap, buffer, t.kind(), byte_offset, len).map_err(native_oom)?;
-    Ok(Value::typed_array(view))
+/// The receiver's current elements. Each BigInt read may move the view and
+/// the elements read before it, so the elements gather on the anchor stack
+/// and leave it together; the result is good until the next allocation.
+fn copy_view(ctx: &mut NativeCtx<'_>) -> Result<Vec<Value>, NativeError> {
+    let len = receiver(ctx)?.length(ctx.heap());
+    with_anchors(ctx, |ctx, base| {
+        for i in 0..len {
+            let t = receiver(ctx)?;
+            let value = t.get(ctx.heap_mut(), i).map_err(native_oom)?;
+            ctx.cx.interp.push_iteration_anchor(value);
+        }
+        Ok((0..len)
+            .map(|i| ctx.cx.interp.iteration_anchor(base + i))
+            .collect())
+    })
 }
 
 fn build_new_typed_array(
@@ -309,48 +265,9 @@ fn impl_at(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Nati
     // `get` re-checks the current length / out-of-bounds state, so a
     // resize during the index coercion yields `undefined` rather than a
     // stale element.
-    t.get(ctx.heap_mut(), resolved as usize).map_err(native_oom)
-}
-
-fn impl_subarray(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    let t = receiver(ctx)?;
-    let len = t.length(ctx.heap_mut()) as i64;
-    let start = relative_index(args.first(), 0, len);
-    let end = relative_index(args.get(1), len, len);
-    let final_start = start.clamp(0, len) as usize;
-    let final_end = end.clamp(start, len) as usize;
-    let new_len = final_end.saturating_sub(final_start);
-    build_subarray(&t, ctx.heap_mut(), final_start, new_len)
-}
-
-fn impl_slice(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    let t = receiver(ctx)?;
-    validate_typed_array(&t, ctx.heap())?;
-    let len = t.length(ctx.heap_mut()) as i64;
-    let start = relative_index(args.first(), 0, len);
-    let end = relative_index(args.get(1), len, len);
-    let final_start = start.clamp(0, len) as usize;
-    let final_end = end.clamp(start, len) as usize;
-    let new_len = final_end.saturating_sub(final_start);
-    let bpe = t.kind().bytes_per_element();
-    let byte_len = new_len
-        .checked_mul(bpe)
-        .ok_or_else(|| range_error("byte length overflow"))?;
-    let new_buf = ctx
-        .alloc_array_buffer_zeroed(byte_len, &mut [], &mut [])
-        .map_err(native_oom)?
-        .ok_or_else(|| type_error("allocation failed"))?;
-    {
-        let abs_offset = t.byte_offset(ctx.heap()) + final_start * bpe;
-        let buffer = t.buffer(ctx.heap());
-        let snapshot: Vec<u8> = buffer.with_bytes(ctx.heap(), |b| {
-            b[abs_offset..abs_offset + new_len * bpe].to_vec()
-        });
-        new_buf.with_bytes_mut(ctx.heap_mut(), |dst| dst.copy_from_slice(&snapshot));
-    }
-    let view =
-        JsTypedArray::new(ctx.heap_mut(), new_buf, t.kind(), 0, new_len).map_err(native_oom)?;
-    Ok(Value::typed_array(view))
+    receiver(ctx)?
+        .get(ctx.heap_mut(), resolved as usize)
+        .map_err(native_oom)
 }
 
 fn impl_fill(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
@@ -360,26 +277,29 @@ fn impl_fill(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Na
     let len = t.length(ctx.heap_mut()) as i64;
     let raw_value = args.first().cloned().unwrap_or(Value::undefined());
     let value = ta_coerce_value(ctx, t.kind(), &raw_value)?;
-    let start = to_integer_or_infinity_arg(ctx, args.get(1), 0, name)?;
-    let end = to_integer_or_infinity_arg(ctx, args.get(2), len, name)?;
-    let s = clamp_relative_index(start, len) as usize;
-    let e = clamp_relative_index(end, len) as usize;
-    // §23.2.3.9 steps 13-16: the buffer witness is re-taken after every
-    // coercion and validated unconditionally, so an empty fill range still
-    // reports a buffer that a `valueOf` hook detached or shrank.
-    if t.buffer(ctx.heap()).is_detached(ctx.heap())
-        || (!t.is_length_tracking(ctx.heap()) && t.is_out_of_bounds(ctx.heap()))
-    {
-        return Err(type_error("typedarray is detached or out of bounds"));
-    }
-    let e = e.min(t.length(ctx.heap_mut()));
-    if s >= e {
-        return Ok(Value::typed_array(t));
-    }
-    for i in s..e {
-        t.set(ctx.heap_mut(), i, &value);
-    }
-    Ok(Value::typed_array(t))
+    with_anchors(ctx, |ctx, base| {
+        // A BigInt fill value must survive the index coercions below.
+        ctx.cx.interp.push_iteration_anchor(value);
+        let start = to_integer_or_infinity_arg(ctx, args.get(1), 0, name)?;
+        let end = to_integer_or_infinity_arg(ctx, args.get(2), len, name)?;
+        let s = clamp_relative_index(start, len) as usize;
+        let e = clamp_relative_index(end, len) as usize;
+        // §23.2.3.9 steps 13-16: the buffer witness is re-taken after every
+        // coercion and validated unconditionally, so an empty fill range
+        // still reports a buffer that a `valueOf` hook detached or shrank.
+        let t = receiver(ctx)?;
+        if t.buffer(ctx.heap()).is_detached(ctx.heap())
+            || (!t.is_length_tracking(ctx.heap()) && t.is_out_of_bounds(ctx.heap()))
+        {
+            return Err(type_error("typedarray is detached or out of bounds"));
+        }
+        let e = e.min(t.length(ctx.heap_mut()));
+        let value = ctx.cx.interp.iteration_anchor(base);
+        for i in s..e {
+            t.set(ctx.heap_mut(), i, &value);
+        }
+        Ok(Value::typed_array(t))
+    })
 }
 
 fn impl_copy_within(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
@@ -394,6 +314,7 @@ fn impl_copy_within(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Va
     let from = clamp_relative_index(start, len);
     let final_end = clamp_relative_index(end, len);
     let mut count = (final_end - from).min(len - to).max(0) as usize;
+    let t = receiver(ctx)?;
     if count == 0 {
         return Ok(Value::typed_array(t));
     }
@@ -427,16 +348,22 @@ fn impl_reverse(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut());
     if len > 1 {
-        let mut i = 0usize;
-        let mut j = len - 1;
-        while i < j {
-            let a = t.get(ctx.heap_mut(), i).map_err(native_oom)?;
-            let b = t.get(ctx.heap_mut(), j).map_err(native_oom)?;
-            t.set(ctx.heap_mut(), i, &b);
-            t.set(ctx.heap_mut(), j, &a);
-            i += 1;
-            j -= 1;
-        }
+        // Reversing moves whole elements, so it swaps their bytes: no
+        // element is decoded, and no BigInt is allocated.
+        let bpe = t.kind().bytes_per_element();
+        let start = t.byte_offset(ctx.heap());
+        let buffer = t.buffer(ctx.heap());
+        buffer.with_bytes_mut(ctx.heap_mut(), |bytes| {
+            if let Some(view) = bytes.get_mut(start..start + len * bpe) {
+                let (mut i, mut j) = (0usize, len - 1);
+                while i < j {
+                    let (head, tail) = view.split_at_mut(j * bpe);
+                    head[i * bpe..(i + 1) * bpe].swap_with_slice(&mut tail[..bpe]);
+                    i += 1;
+                    j -= 1;
+                }
+            }
+        });
     }
     Ok(Value::typed_array(t))
 }
@@ -451,7 +378,6 @@ fn impl_index_of(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value
     if len == 0 {
         return Ok(smi(-1));
     }
-    let target = args.first().cloned().unwrap_or(Value::undefined());
     let start = integer_index_arg(ctx, args.get(1), 0)?;
     let from = if start < 0 {
         (len + start).max(0)
@@ -459,7 +385,8 @@ fn impl_index_of(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value
         start.min(len)
     } as usize;
     for i in from..(len as usize) {
-        if values_equal_strict(&ta_element_or_undefined(&t, ctx, i), &target, ctx.heap()) {
+        let element = ta_element_or_undefined(ctx, i)?;
+        if values_equal_strict(&element, &first_arg(args), ctx.heap()) {
             return Ok(smi(i as i32));
         }
     }
@@ -476,7 +403,6 @@ fn impl_last_index_of(
     if len == 0 {
         return Ok(smi(-1));
     }
-    let target = args.first().cloned().unwrap_or(Value::undefined());
     // §23.2.3.20 — a PRESENT-but-undefined fromIndex still runs
     // ToIntegerOrInfinity (yielding +0); only an absent argument
     // defaults to len-1.
@@ -492,11 +418,8 @@ fn impl_last_index_of(
     };
     let mut i = from;
     while i >= 0 {
-        if values_equal_strict(
-            &ta_element_or_undefined(&t, ctx, i as usize),
-            &target,
-            ctx.heap(),
-        ) {
+        let element = ta_element_or_undefined(ctx, i as usize)?;
+        if values_equal_strict(&element, &first_arg(args), ctx.heap()) {
             return Ok(smi(i as i32));
         }
         i -= 1;
@@ -511,7 +434,6 @@ fn impl_includes(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value
     if len == 0 {
         return Ok(Value::boolean(false));
     }
-    let target = args.first().cloned().unwrap_or(Value::undefined());
     let start = integer_index_arg(ctx, args.get(1), 0)?;
     let from = if start < 0 {
         (len + start).max(0)
@@ -519,7 +441,8 @@ fn impl_includes(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value
         start.min(len)
     } as usize;
     for i in from..(len as usize) {
-        if values_equal_zero(&ta_element_or_undefined(&t, ctx, i), &target, ctx.heap()) {
+        let element = ta_element_or_undefined(ctx, i)?;
+        if values_equal_zero(&element, &first_arg(args), ctx.heap()) {
             return Ok(Value::boolean(true));
         }
     }
@@ -552,18 +475,16 @@ fn impl_join(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Na
             })?
         }
     };
-    let t = receiver(ctx)?;
-    join_into_string(&t, len, &separator, ctx.heap_mut())
+    join_into_string(ctx, len, &separator)
 }
 
 fn join_into_string(
-    t: &crate::binary::JsTypedArray,
+    ctx: &mut NativeCtx<'_>,
     len: usize,
     separator: &str,
-    gc_heap: &mut otter_gc::GcHeap,
 ) -> Result<Value, NativeError> {
     let mut out = String::new();
-    let live_len = t.length(gc_heap);
+    let live_len = receiver(ctx)?.length(ctx.heap());
     for i in 0..len {
         if i > 0 {
             out.push_str(separator);
@@ -573,19 +494,19 @@ fn join_into_string(
             // (empty), only the separators remain.
             continue;
         }
-        let v = t.get(gc_heap, i).map_err(native_oom)?;
+        let v = receiver(ctx)?.get(ctx.heap_mut(), i).map_err(native_oom)?;
         if !(v.is_undefined() || v.is_null()) {
-            out.push_str(&v.display_string(gc_heap));
+            out.push_str(&v.display_string(ctx.heap()));
         }
     }
-    Ok(Value::string(JsString::from_str(&out, gc_heap)?))
+    Ok(Value::string(JsString::from_str(&out, ctx.heap_mut())?))
 }
 
 fn impl_to_string(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut());
-    join_into_string(&t, len, ",", ctx.heap_mut())
+    join_into_string(ctx, len, ",")
 }
 
 fn impl_to_locale_string(
@@ -605,18 +526,25 @@ fn impl_to_locale_string(
     let len = t.length(ctx.heap_mut());
     let mut parts: Vec<String> = Vec::new();
     for i in 0..len {
+        let t = receiver(ctx)?;
         if i >= t.length(ctx.heap()) {
             parts.push(String::new());
             continue;
         }
         let element = t.get(ctx.heap_mut(), i).map_err(native_oom)?;
-        let method = ta_get(ctx, element, crate::VmPropertyKey::String("toLocaleString"))?;
-        if !ctx.cx.interp.is_callable_runtime(&method) {
-            return Err(type_error("element toLocaleString is not callable"));
-        }
-        // ECMA-402 §18.5.1 — forward the locales and options arguments.
-        let forwarded: Vec<Value> = args.iter().take(2).copied().collect();
-        let rendered = ctx.call(method, element, ValueWindow::from(&forwarded))?;
+        let rendered = with_anchors(ctx, |ctx, base| {
+            // The element is the call's receiver after the method lookup
+            // has run user code.
+            ctx.cx.interp.push_iteration_anchor(element);
+            let method = ta_get(ctx, element, crate::VmPropertyKey::String("toLocaleString"))?;
+            if !ctx.cx.interp.is_callable_runtime(&method) {
+                return Err(type_error("element toLocaleString is not callable"));
+            }
+            // ECMA-402 §18.5.1 — forward the locales and options arguments.
+            let forwarded: Vec<Value> = args.iter().take(2).copied().collect();
+            let element = ctx.cx.interp.iteration_anchor(base);
+            ctx.call(method, element, ValueWindow::from(&forwarded))
+        })?;
         let s = ctx.with_turn_parts(|interp, stack| {
             crate::coerce::to_string_or_throw(interp, stack, &exec, &rendered)
                 .map_err(|e| e.into_native(interp, NAME))
@@ -643,7 +571,7 @@ fn ta_set_target_offset(
 }
 
 fn impl_set(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    let t = receiver(ctx)?;
+    receiver(ctx)?;
     // §23.2.3.26 step 5 — `targetOffset = ToIntegerOrInfinity(offset)`
     // runs before the detached / range checks, so its `valueOf` fires
     // (and may detach the buffer), its abrupt completion propagates,
@@ -652,6 +580,7 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Nat
     if offset_f < 0.0 {
         return Err(range_error("Start offset is out of bounds"));
     }
+    let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let target_len = t.length(ctx.heap_mut());
     let source = args.first().cloned().unwrap_or(Value::undefined());
@@ -686,7 +615,9 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Nat
         // instead of one boxed `Value` per element. The intermediate copy is
         // what the spec itself prescribes when both views share a buffer, and
         // it keeps an overlapping copy correct here for the same reason.
-        if src.kind() == kind {
+        // BigInt64 and BigUint64 share it too: ToBigInt64 / ToBigUint64 of
+        // the other kind's element is its own 64 bits.
+        if src.kind() == kind || (kind.is_bigint() && src.kind().is_bigint()) {
             let width = kind.bytes_per_element();
             let byte_len = src_len * width;
             let src_start = src.byte_offset(ctx.heap());
@@ -713,18 +644,24 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Nat
                 }
             }
         }
-        // Snapshot first to handle aliasing of the same buffer.
-        let snapshot: Vec<Value> = {
-            let mut tmp = Vec::with_capacity(src_len);
+        // Snapshot first to handle aliasing of the same buffer. The snapshot
+        // rides the anchor stack: a BigInt element read moves both views
+        // and every element read before it.
+        with_anchors(ctx, |ctx, base| {
             for i in 0..src_len {
-                tmp.push(src.get(ctx.heap_mut(), i).map_err(native_oom)?);
+                let src = first_arg(args)
+                    .as_typed_array(ctx.heap())
+                    .ok_or_else(|| type_error("expected typedarray"))?;
+                let value = src.get(ctx.heap_mut(), i).map_err(native_oom)?;
+                ctx.cx.interp.push_iteration_anchor(value);
             }
-            tmp
-        };
-        for (i, v) in snapshot.iter().enumerate() {
-            let coerced = coerce(kind, v, ctx.heap_mut())?;
-            t.set(ctx.heap_mut(), off + i, &coerced);
-        }
+            for i in 0..src_len {
+                let value = ctx.cx.interp.iteration_anchor(base + i);
+                let coerced = coerce(kind, &value, ctx.heap_mut())?;
+                receiver(ctx)?.set(ctx.heap_mut(), off + i, &coerced);
+            }
+            Ok(())
+        })?;
     } else {
         // §23.2.3.26.2 SetTypedArrayFromArrayLike — every non-TypedArray
         // source is coerced through ToObject, then `length` and each
@@ -737,15 +674,18 @@ fn impl_set(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Nat
         let src_len = ta_array_like_length(ctx, source)?;
         let off = ta_set_target_offset(offset_f, src_len, target_len)?;
         for i in 0..src_len {
+            // Each read runs user code, so the source and the target are
+            // re-read from their argument and `this` slots.
             let v = ta_get(
                 ctx,
-                source,
+                first_arg(args),
                 crate::VmPropertyKey::OwnedString(i.to_string()),
             )?;
             let coerced = ta_coerce_value(ctx, kind, &v)?;
             // A getter may have detached the target mid-loop; §23.2.3.26.2
             // step 6 still converts every value but a store into a
             // detached view is a no-op.
+            let t = receiver(ctx)?;
             if !t.buffer(ctx.heap()).is_detached(ctx.heap()) {
                 t.set(ctx.heap_mut(), off + i, &coerced);
             }
@@ -838,7 +778,7 @@ fn ta_coerce_value(
 fn impl_to_reversed(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
-    let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
+    let mut snapshot = copy_view(ctx)?;
     snapshot.reverse();
     build_new_typed_array(ctx, t.kind(), ValueWindow::from(&snapshot))
 }
@@ -860,10 +800,11 @@ fn impl_to_sorted_default(
     }
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
-    let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
+    let mut snapshot = copy_view(ctx)?;
     match comparefn {
         None => sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut()),
-        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp, false)?,
+        // The element reads may have moved the comparator.
+        Some(_) => sort_with_comparefn(ctx, &mut snapshot, &first_arg(args), false)?,
     }
     // A comparator may have moved the receiver; re-read it.
     let t = receiver(ctx)?;
@@ -884,10 +825,11 @@ fn impl_sort_default(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<V
     }
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
-    let mut snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
+    let mut snapshot = copy_view(ctx)?;
     match comparefn {
         None => sort_default(&mut snapshot, t.kind().is_bigint(), ctx.heap_mut()),
-        Some(cmp) => sort_with_comparefn(ctx, &mut snapshot, &cmp, true)?,
+        // The element reads may have moved the comparator.
+        Some(_) => sort_with_comparefn(ctx, &mut snapshot, &first_arg(args), true)?,
     }
     // A comparator may have moved the receiver; re-read it.
     let t = receiver(ctx)?;
@@ -994,7 +936,9 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Na
     let t = receiver(ctx)?;
     validate_typed_array(&t, ctx.heap())?;
     let len = t.length(ctx.heap_mut()) as i64;
-    let raw_idx = integer_arg(args.first(), 0);
+    // §23.2.3.36 step 4 — ToIntegerOrInfinity(index) runs after the
+    // length read and before the value coercion.
+    let raw_idx = to_integer_or_infinity_arg(ctx, args.first(), 0, "TypedArray.prototype.with")?;
     let resolved = if raw_idx < 0 { len + raw_idx } else { raw_idx };
     // §23.2.3.36 step 5 — the VALUE coerces (ToBigInt / ToNumber,
     // firing user valueOf) BEFORE the step-6 RangeError for an
@@ -1026,7 +970,12 @@ fn impl_with(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Na
     // length and filled by reading O[k] for each k < len (a now
     // out-of-bounds index reads as `undefined`, coerced on store),
     // substituting numericValue at actualIndex.
-    let cur_snapshot = copy_view(&t, ctx.heap_mut()).map_err(native_oom)?;
+    let (cur_snapshot, value) = with_anchors(ctx, |ctx, base| {
+        // A BigInt replacement must survive the element reads.
+        ctx.cx.interp.push_iteration_anchor(value);
+        let snapshot = copy_view(ctx)?;
+        Ok((snapshot, ctx.cx.interp.iteration_anchor(base)))
+    })?;
     let mut out: Vec<Value> = Vec::with_capacity(len.max(0) as usize);
     for k in 0..len {
         if k == resolved {
@@ -1155,8 +1104,6 @@ type TypedArrayNativeFn = fn(&mut NativeCtx<'_>, ValueWindow<'_>) -> Result<Valu
 pub fn method_impl(name: &str) -> Option<TypedArrayNativeFn> {
     Some(match name {
         "at" => impl_at,
-        "subarray" => impl_subarray,
-        "slice" => impl_slice,
         "fill" => impl_fill,
         "copyWithin" => impl_copy_within,
         "reverse" => impl_reverse,
@@ -1234,55 +1181,5 @@ mod tests {
             "TypedArray.prototype.entries should allocate its iterator state in non-moving old space"
         );
         assert!(result.is_iterator());
-    }
-
-    #[test]
-    fn typed_array_slice_uses_native_rooted_backing_store() {
-        let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
-        let receiver = {
-            let heap = interp.gc_heap_mut();
-            let buffer = JsArrayBuffer::new(heap, 4).expect("array buffer");
-            let source =
-                JsTypedArray::new(heap, buffer, TypedArrayKind::Int16, 0, 2).expect("typed array");
-            source.set(heap, 0, &smi(7));
-            source.set(heap, 1, &smi(11));
-            Value::typed_array(source)
-        };
-
-        let result = NativeCtx::with_host_context(
-            &mut interp,
-            NativeCallInfo::call(receiver),
-            None,
-            |ctx| impl_slice(ctx, ValueWindow::from(&[])).expect("slice"),
-        );
-
-        assert!(result.is_typed_array());
-        let result_view = result
-            .as_typed_array(interp.gc_heap())
-            .expect("slice result typed array");
-        assert_eq!(result_view.length(interp.gc_heap()), 2);
-        assert_eq!(
-            result_view
-                .get(interp.gc_heap_mut(), 0)
-                .expect("first element")
-                .as_number()
-                .expect("number")
-                .as_smi(),
-            Some(7)
-        );
-        assert_eq!(
-            result_view
-                .get(interp.gc_heap_mut(), 1)
-                .expect("second element")
-                .as_number()
-                .expect("number")
-                .as_smi(),
-            Some(11)
-        );
-        let _ = result;
-        interp
-            .gc_heap_mut()
-            .collect_full(&mut |_| {})
-            .expect("full GC");
     }
 }

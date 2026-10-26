@@ -163,6 +163,21 @@ pub(super) fn emit_scalar_value(
         emit_store_reg(ops, 16, result)?;
         dynasm!(ops ; .arch aarch64 ; b =>done);
     }
+    // A derived constructor's first `super()` binds its frame's `this`,
+    // which still holds the hole; a second binding or any other frame
+    // throws in the runtime.
+    if let (abi::ScalarValueOp::BindThisValue, Some(src)) = (operation, value0) {
+        emit_load_reg(ops, 9, src)?;
+        crate::template::arm64::emit_load_u64(ops, 10, crate::entry::VALUE_HOLE);
+        dynasm!(ops ; .arch aarch64
+            ; ldr x11, [x21, abi::NATIVE_FRAME_THIS_OFFSET]
+            ; cmp x11, x10 ; b.ne =>slow
+            ; ldrb w11, [x21, abi::NATIVE_FRAME_FLAGS_OFFSET]
+            ; tst w11, abi::NativeFrameFlags::DERIVED_CONSTRUCTOR as u32 ; b.eq =>slow
+            ; str x9, [x21, abi::NATIVE_FRAME_THIS_OFFSET]);
+        emit_store_reg(ops, 9, result)?;
+        dynasm!(ops ; .arch aarch64 ; b =>done);
+    }
     if view.cage_base != 0 {
         match (operation, value0) {
             (abi::ScalarValueOp::LoadLength, Some(src)) => {

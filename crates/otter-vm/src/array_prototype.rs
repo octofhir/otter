@@ -1229,6 +1229,26 @@ pub(crate) fn array_includes(
         } else {
             (len_i + n as i64).max(0)
         };
+        // A plain array whose `len` first elements are all present answers
+        // every Get with its element: one scan of the storage is the loop.
+        {
+            let o = interp.iteration_anchor(anchor_base);
+            let search = interp.iteration_anchor(search_anchor);
+            let heap = interp.gc_heap();
+            if let Some(found) = o.as_array().and_then(|array| {
+                crate::array::with_plain_dense_values(array, heap, |values| {
+                    let (present, exact) = values.size_hint();
+                    (exact == Some(present) && present >= len).then(|| {
+                        values.take(len).skip(k as usize).any(|value| {
+                            crate::abstract_ops::same_value_zero(&value, &search, heap)
+                        })
+                    })
+                })
+                .flatten()
+            }) {
+                return Ok(found);
+            }
+        }
         while k < len_i {
             let o = interp.iteration_anchor(anchor_base);
             let string_data = if let Some(obj) = o.as_object() {

@@ -146,6 +146,19 @@ fn native_call(
     ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
+    // §20.1.2.18 Object.keys of an object its hidden class describes: the
+    // class's cached key array, copied. No internal method of such an object
+    // runs code.
+    if matches!(method, otter_bytecode::method_id::ObjectMethod::Keys)
+        && let Some(target) = args.first().and_then(|value| value.as_object())
+        && let Some(keys) = ctx
+            .cx
+            .interp
+            .shaped_object_keys(target)
+            .map_err(|err| object_native_error(ctx.cx.interp, method.name(), err))?
+    {
+        return Ok(keys);
+    }
     let context = ctx.execution_context().cloned();
 
     // Accessor-aware spec helpers route through the shared

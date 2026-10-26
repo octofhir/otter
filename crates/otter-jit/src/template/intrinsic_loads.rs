@@ -9,9 +9,9 @@
 //! - Every read proves a receiver that is not an ordinary object, so a site
 //!   with any read skips them all at once for an immediate or an ordinary
 //!   object, and a site with none emits nothing before its IC.
-//! - A method lookup reads only for a primitive string or a RegExp: the
-//!   committed resolution of any other receiver records call feedback the
-//!   optimizer consumes.
+//! - A method lookup reads only for a primitive string, a RegExp or an Array
+//!   (never for the Array mutation methods): the committed resolution of any
+//!   other receiver records call feedback the optimizer consumes.
 //!
 //! # See also
 //! - `super::arm64::properties` and `super::x86_64` emit the reads.
@@ -56,13 +56,16 @@ pub(crate) fn intrinsic_loads(
 }
 
 /// Whether `ops` read a method for a receiver whose committed resolution
-/// records no call feedback: a primitive string or a RegExp.
+/// records no call feedback the optimizer needs: a primitive string, a
+/// RegExp, or an Array (whose snapshot leaves out the mutation methods a
+/// guarded leaf is built from).
 pub(crate) fn feedback_free_method_program(ops: &[Op]) -> bool {
     matches!(
         ops.first(),
         Some(Op::LoadIntrinsicPrototype { target, .. })
             if target.type_tag == otter_vm::string::JS_STRING_BODY_TYPE_TAG
                 || target.type_tag == otter_vm::regexp::REGEXP_BODY_TYPE_TAG
+                || target.type_tag == otter_vm::array::ARRAY_BODY_TYPE_TAG
     )
 }
 

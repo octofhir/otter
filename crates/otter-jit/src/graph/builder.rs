@@ -3145,7 +3145,12 @@ impl<'a> Builder<'a> {
         let receivers = (!self.exited_for(ExitReason::ShapeGuard))
             .then(|| self.known_shapes(object))
             .flatten();
-        let programs = (!self.exited_for(ExitReason::ShapeGuard))
+        let shared = self
+            .view
+            .property_accesses
+            .get(&byte_pc)
+            .is_some_and(|site| site.shared);
+        let programs = (!self.exited_for(ExitReason::ShapeGuard) && !shared)
             .then(|| super::feedback::named_load_programs(self.view, byte_pc, receivers.as_deref()))
             .flatten()
             .is_some();
@@ -3221,7 +3226,15 @@ impl<'a> Builder<'a> {
         let receivers = (!self.exited_for(ExitReason::ShapeGuard))
             .then(|| self.known_shapes(object))
             .flatten();
+        // A megamorphic site's programs read intrinsic receivers only; the
+        // shared table answers every ordinary one.
+        let shared = self
+            .view
+            .property_accesses
+            .get(&byte_pc)
+            .is_some_and(|site| site.shared);
         if !self.exited_for(ExitReason::ShapeGuard)
+            && !shared
             && let Some(programs) =
                 super::feedback::named_load_programs(self.view, byte_pc, receivers.as_deref())
         {

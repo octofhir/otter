@@ -1709,6 +1709,15 @@ impl Interpreter {
                 continue;
             };
             if shared {
+                // A megamorphic site still reads an intrinsic receiver's
+                // prototype directly ahead of the shared table, which never
+                // holds a non-ordinary receiver.
+                if op != Op::StoreProperty {
+                    let programs = self.jit_intrinsic_property_programs(key);
+                    if !programs.is_empty() {
+                        view.property_programs.insert(byte_pc, programs);
+                    }
+                }
                 continue;
             }
             let mut programs = slot
@@ -1734,7 +1743,16 @@ impl Interpreter {
                         key, false,
                     ));
                 }
-                _ => programs.extend(self.jit_intrinsic_property_programs(key)),
+                // A dense-array mutation keeps its committed resolution, which
+                // records the call feedback its guarded leaf is built from.
+                _ => programs.extend(
+                    self.jit_intrinsic_property_programs(key)
+                        .into_iter()
+                        .filter(|program| {
+                            !matches!(key.name(), "push" | "pop" | "shift" | "unshift")
+                                || !program.reads_array_receiver()
+                        }),
+                ),
             }
             if !programs.is_empty() {
                 view.property_programs.insert(byte_pc, programs);

@@ -876,6 +876,31 @@ impl Interpreter {
                 self.run_callable_sync_rooted(stack, Some(context), &target, receiver, forwarded)
                     .map_err(CommittedValueError::completed_call)
             }
+            VmIntrinsicFunction::ReflectApply => {
+                // §28.1.1: target, its receiver, and an argument list that
+                // must be an object.
+                let mut inputs = roots.take_args().into_iter();
+                let target = inputs.next().unwrap_or(Value::undefined());
+                let receiver = inputs.next().unwrap_or(Value::undefined());
+                let list = inputs.next().unwrap_or(Value::undefined());
+                if !self.is_callable_runtime(&target) {
+                    return Err(CommittedValueError::JavaScript(VmError::NotCallable));
+                }
+                if !list.is_object_type() {
+                    return Err(CommittedValueError::JavaScript(self.err_type(
+                        "Reflect.apply: the argument list is not an object".into(),
+                    )));
+                }
+                roots.set_receiver(receiver);
+                roots.set_scratch(0, list);
+                roots.set_scratch(1, target);
+                let forwarded =
+                    self.create_list_from_array_like(stack, context, roots.scratch(0))?;
+                let target = roots.scratch(1);
+                let receiver = roots.receiver_value();
+                self.run_callable_sync_rooted(stack, Some(context), &target, receiver, forwarded)
+                    .map_err(CommittedValueError::completed_call)
+            }
             VmIntrinsicFunction::FunctionPrototypeBind => {
                 if !self.is_callable_runtime(&roots.target()) {
                     return Err(CommittedValueError::JavaScript(VmError::NotCallable));

@@ -42,12 +42,30 @@ use syn::{
 };
 
 /// Single `"name" / length => path [attrs = <ident>]` row of a
-/// `holt!` / `couch!` method table.
+/// `holt!` / `couch!` method table. `=> intrinsic <Variant>` names a
+/// `VmIntrinsicFunction` the call loop runs instead of a native body.
 pub(crate) struct MethodEntry {
     pub(crate) js_name: LitStr,
     pub(crate) length: u8,
     pub(crate) call: Path,
+    pub(crate) intrinsic: bool,
     pub(crate) attrs: Option<Ident>,
+}
+
+impl MethodEntry {
+    /// The `NativeCall` this row installs.
+    pub(crate) fn native_call(&self) -> proc_macro2::TokenStream {
+        let call = &self.call;
+        if self.intrinsic {
+            quote! {
+                ::otter_vm::__macro_support::NativeCall::VmIntrinsic(
+                    ::otter_vm::__macro_support::VmIntrinsicFunction::#call
+                )
+            }
+        } else {
+            quote! { ::otter_vm::__macro_support::NativeCall::Static(#call) }
+        }
+    }
 }
 
 impl Parse for MethodEntry {
@@ -56,6 +74,13 @@ impl Parse for MethodEntry {
         input.parse::<Token![/]>()?;
         let length_lit: LitInt = input.parse()?;
         input.parse::<Token![=>]>()?;
+        let intrinsic = input.peek(syn::Ident) && input.peek2(syn::Ident) && {
+            let fork = input.fork();
+            fork.parse::<Ident>().is_ok_and(|word| word == "intrinsic")
+        };
+        if intrinsic {
+            input.parse::<Ident>()?;
+        }
         let call: Path = input.parse()?;
         let attrs = if input.peek(syn::Ident) {
             // Optional `attrs = <factory_ident>` suffix.
@@ -78,6 +103,7 @@ impl Parse for MethodEntry {
             js_name,
             length: length_lit.base10_parse()?,
             call,
+            intrinsic,
             attrs,
         })
     }
@@ -414,14 +440,14 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     let method_entries = methods.iter().map(|m| {
         let js_name = &m.js_name;
         let length = m.length;
-        let call = &m.call;
+        let call = m.native_call();
         let attrs_path = attrs_factory_path(m.attrs.as_ref(), "builtin_function");
         quote! {
             ::otter_vm::__macro_support::MethodSpec {
                 name: #js_name,
                 length: #length,
                 attrs: #attrs_path,
-                call: ::otter_vm::__macro_support::NativeCall::Static(#call),
+                call: #call,
             }
         }
     });

@@ -97,7 +97,7 @@ pub(crate) async fn launcher_source_path(target: &DlxTarget) -> Option<PathBuf> 
         .join(".bin")
         .join(&target.bin);
     let resolved = tokio::fs::canonicalize(launcher).await.ok()?;
-    otter_syntax::detect_source_kind(&resolved)
+    otter_syntax::detect_file_source_kind(&resolved)
         .is_some()
         .then_some(resolved)
 }

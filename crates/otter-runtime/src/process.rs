@@ -52,6 +52,14 @@
 //! # See also
 //! - [`crate::RuntimeBuilder::process_argv`]
 
+/// The Node.js release whose API the runtime presents, as
+/// `process.versions.node` reports it: packages gate features on it.
+/// Otter's own version is `process.versions.otter`.
+const NODE_COMPAT_VERSION: &str = "24.16.0";
+
+/// [`NODE_COMPAT_VERSION`] as `process.version` spells it.
+const NODE_COMPAT_TAG: &str = "v24.16.0";
+
 use otter_vm::ValueWindow;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -173,7 +181,7 @@ pub(crate) fn install_global(
                 for (name, value) in [
                     ("platform", node_platform()),
                     ("arch", node_arch()),
-                    ("version", concat!("v", env!("CARGO_PKG_VERSION"))),
+                    ("version", NODE_COMPAT_TAG),
                 ] {
                     let value = scope.string(value)?;
                     scope.set(process, name, value)?;
@@ -182,7 +190,7 @@ pub(crate) fn install_global(
                 let versions = scope.bare_object()?;
                 for (name, value) in [
                     ("otter", env!("CARGO_PKG_VERSION")),
-                    ("node", env!("CARGO_PKG_VERSION")),
+                    ("node", NODE_COMPAT_VERSION),
                     ("openssl", "3.0.0"),
                     ("v8", "12.0.0"),
                 ] {

@@ -88,8 +88,14 @@ struct Cli {
     #[arg(short = 'p', long = "print", value_name = "code")]
     print_source: Option<String>,
 
-    /// Shorthand: positional file path.
-    #[arg(global = false, num_args = 0..)]
+    /// Shorthand: positional file path, then its arguments: everything
+    /// after the file, flags included, belongs to the script.
+    #[arg(
+        global = false,
+        num_args = 0..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
     args: Vec<String>,
 
     /// Print the bytecode disassembly for the script and exit.
@@ -845,8 +851,9 @@ struct RunArgs {
     /// built-in limit. Surfaces a catchable `RangeError` when exceeded.
     #[arg(long)]
     max_heap_bytes: Option<u64>,
-    /// Forwarded target arguments.
-    #[arg(trailing_var_arg = true)]
+    /// Forwarded target arguments: everything after the target, flags
+    /// included, belongs to it.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
 
@@ -1282,7 +1289,7 @@ async fn run_file_with_cwd(
     //
     let mut builder = cli_otter_builder(caps, execution)
         .process_argv(process_argv_for_file(path, args))
-        .module_loader(cli_loader_config_for_entry(path).await)
+        .module_loader(cli_loader_config_for_entry(path))
         .cpu_profile_interval(cpu_profile.map(|profile| profile.interval));
     if let Some(bytes) = max_heap_bytes {
         builder = builder.max_heap_bytes(bytes);
@@ -1944,7 +1951,7 @@ async fn run_script_file_sequence(
     let first = &paths[0];
     let mut builder = cli_otter_builder(caps, execution)
         .process_argv(process_argv_for_file_sequence(paths, args))
-        .module_loader(cli_loader_config_for_entry(first).await);
+        .module_loader(cli_loader_config_for_entry(first));
     if let Some(bytes) = max_heap_bytes {
         builder = builder.max_heap_bytes(bytes);
     }
@@ -2508,100 +2515,15 @@ fn project_env_files() -> Vec<(String, String)> {
     variables
 }
 
-async fn cli_loader_config_for_entry(path: &Path) -> otter_runtime::module_loader::LoaderConfig {
+/// The loader an entry runs with: requests without a referrer resolve from
+/// the entry's directory, and packages resolve through the `node_modules`
+/// tree on disk.
+fn cli_loader_config_for_entry(path: &Path) -> otter_runtime::module_loader::LoaderConfig {
     let base_dir = path
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-    let mut config = otter_runtime::module_loader::LoaderConfig::new(base_dir);
-    if let Some(project_root) = find_project_root_for_entry(path).await
-        && let Ok(resolution) = otter_pm::resolve_installed_project(project_root).await
-    {
-        config.package_graph = Some(loader_graph_from_pm(&resolution.graph));
-    }
-    config
-}
-
-async fn find_project_root_for_entry(path: &Path) -> Option<PathBuf> {
-    let mut cursor = match tokio::fs::metadata(path).await {
-        Ok(metadata) if metadata.is_dir() => path.to_path_buf(),
-        _ => path
-            .parent()
-            .map(Path::to_path_buf)
-            .or_else(|| std::env::current_dir().ok())?,
-    };
-    loop {
-        let manifest = cursor.join(PACKAGE_JSON);
-        match tokio::fs::try_exists(&manifest).await {
-            Ok(true) => return Some(cursor),
-            Ok(false) => {}
-            Err(_) => return None,
-        }
-        if !cursor.pop() {
-            return std::env::current_dir().ok();
-        }
-    }
-}
-
-fn loader_graph_from_pm(
-    graph: &otter_pm::PackageGraph,
-) -> otter_runtime::module_loader::LoaderPackageGraph {
-    let mut loader_graph = otter_runtime::module_loader::LoaderPackageGraph::new();
-    for package in graph.packages.values() {
-        loader_graph.insert_package(otter_runtime::module_loader::LoaderPackageRoot {
-            id: package.id.as_str().to_string(),
-            name: package.name.clone(),
-            version: package.version.clone(),
-            root: package.root.clone(),
-            main: package.manifest.main.clone(),
-            module: package.manifest.module.clone(),
-            exports: package.manifest.exports.clone(),
-            imports: package.manifest.imports.clone(),
-            package_type: package
-                .manifest
-                .package_type
-                .map(|package_type| match package_type {
-                    PackageType::Module => otter_runtime::module_loader::LoaderPackageType::Module,
-                    PackageType::CommonJs => {
-                        otter_runtime::module_loader::LoaderPackageType::CommonJs
-                    }
-                }),
-        });
-    }
-    for (from, dependencies) in &graph.dependencies {
-        for (name, target) in dependencies {
-            let kind = graph
-                .dependency_kind(from, name)
-                .map(loader_dependency_kind_from_pm)
-                .unwrap_or(otter_runtime::module_loader::LoaderPackageDependencyKind::Runtime);
-            loader_graph.insert_dependency_with_kind(
-                from.as_str().to_string(),
-                name.clone(),
-                target.as_str().to_string(),
-                kind,
-            );
-        }
-    }
-    loader_graph
-}
-
-fn loader_dependency_kind_from_pm(
-    kind: otter_pm::PackageDependencyKind,
-) -> otter_runtime::module_loader::LoaderPackageDependencyKind {
-    match kind {
-        otter_pm::PackageDependencyKind::Runtime => {
-            otter_runtime::module_loader::LoaderPackageDependencyKind::Runtime
-        }
-        otter_pm::PackageDependencyKind::Development => {
-            otter_runtime::module_loader::LoaderPackageDependencyKind::Development
-        }
-        otter_pm::PackageDependencyKind::Peer => {
-            otter_runtime::module_loader::LoaderPackageDependencyKind::Peer
-        }
-        otter_pm::PackageDependencyKind::Optional => {
-            otter_runtime::module_loader::LoaderPackageDependencyKind::Optional
-        }
-    }
+    otter_runtime::module_loader::LoaderConfig::new(base_dir)
 }
 
 async fn run_check(
@@ -2611,7 +2533,7 @@ async fn run_check(
     execution: &CliExecutionConfig,
 ) -> Result<ExitCode, OtterError> {
     let otter = cli_otter_builder(caps, execution)
-        .module_loader(cli_loader_config_for_entry(path).await)
+        .module_loader(cli_loader_config_for_entry(path))
         .build()?;
     otter.check_file(path).await?;
     if json {
@@ -2676,7 +2598,7 @@ async fn run_dump(
         .with_node_apis()
         .with_otter_modules()
         .with_web_apis()
-        .module_loader(cli_loader_config_for_entry(path).await)
+        .module_loader(cli_loader_config_for_entry(path))
         .build()?;
     startup_timer.mark("runtime_build");
     let compiled = runtime.dump_file(path)?;
@@ -3747,40 +3669,6 @@ mod tests {
     }
 
     #[test]
-    fn pm_graph_adapter_preserves_dependency_edge_kinds() {
-        let mut graph = otter_pm::PackageGraph::new();
-        let app_id = otter_pm::PackageId::root_workspace("app");
-        let dev_id = otter_pm::PackageId::registry("dev-tool", "^1.0.0");
-        graph.insert_package(otter_pm::PackageRoot {
-            id: app_id.clone(),
-            name: "app".to_string(),
-            version: "0.1.0".to_string(),
-            root: PathBuf::from("/app"),
-            manifest: PackageManifest::default(),
-        });
-        graph.insert_package(otter_pm::PackageRoot {
-            id: dev_id.clone(),
-            name: "dev-tool".to_string(),
-            version: "1.0.0".to_string(),
-            root: PathBuf::from("/app/node_modules/dev-tool"),
-            manifest: PackageManifest::default(),
-        });
-        graph.insert_dependency_with_kind(
-            app_id.clone(),
-            "dev-tool",
-            dev_id,
-            otter_pm::PackageDependencyKind::Development,
-        );
-
-        let loader_graph = loader_graph_from_pm(&graph);
-
-        assert_eq!(
-            loader_graph.dependency_kind(app_id.as_str(), "dev-tool"),
-            Some(otter_runtime::module_loader::LoaderPackageDependencyKind::Development)
-        );
-    }
-
-    #[test]
     fn outdated_semver_report_distinguishes_wanted_latest_and_bump() {
         let manifest =
             PackageManifest::parse_json(r#"{"dependencies":{"alpha":"^1.0.0","beta":"~1.2.0"}}"#)
@@ -4431,7 +4319,7 @@ if (process.argv[3] !== "from-cli") fail();
     }
 
     #[tokio::test]
-    async fn check_uses_installed_package_graph_for_bare_imports() {
+    async fn check_resolves_bare_imports_through_node_modules() {
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::write(
             tmp.path().join(PACKAGE_JSON),
@@ -4635,119 +4523,6 @@ export let value = internal;
     }
 
     #[tokio::test]
-    async fn pm_graph_blocks_undeclared_disk_package_imports() {
-        let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(tmp.path().join(PACKAGE_JSON), r#"{"name":"app"}"#)
-            .await
-            .unwrap();
-        tokio::fs::write(tmp.path().join("entry.ts"), r#"import "hidden";"#)
-            .await
-            .unwrap();
-        tokio::fs::create_dir_all(tmp.path().join("node_modules/hidden"))
-            .await
-            .unwrap();
-        tokio::fs::write(
-            tmp.path().join("node_modules/hidden/package.json"),
-            r#"{"name":"hidden","version":"1.0.0","main":"index.js"}"#,
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(
-            tmp.path().join("node_modules/hidden/index.js"),
-            "undefined;\n",
-        )
-        .await
-        .unwrap();
-
-        let err = run_check(
-            &tmp.path().join("entry.ts"),
-            false,
-            &CapabilitySet::default(),
-        )
-        .await
-        .expect_err("undeclared disk package must be blocked by PM graph");
-
-        match err {
-            OtterError::Compile { diagnostics } => {
-                assert!(diagnostics.iter().any(|diagnostic| {
-                    diagnostic
-                        .message
-                        .contains("does not declare dependency `hidden`")
-                }));
-            }
-            other => panic!("expected compile diagnostic, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn optional_dependency_missing_reports_pm_diagnostic() {
-        let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(
-            tmp.path().join(PACKAGE_JSON),
-            r#"{"name":"app","optionalDependencies":{"maybe-native":"^1.0.0"}}"#,
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(tmp.path().join("entry.ts"), r#"import "maybe-native";"#)
-            .await
-            .unwrap();
-
-        let err = run_check(
-            &tmp.path().join("entry.ts"),
-            false,
-            &CapabilitySet::default(),
-        )
-        .await
-        .expect_err("missing optional dependency should report PM diagnostic");
-
-        match err {
-            OtterError::Compile { diagnostics } => {
-                assert!(
-                    diagnostics
-                        .iter()
-                        .any(|diagnostic| diagnostic.message.contains(
-                            "optional dependency `maybe-native` for package `app` is not installed"
-                        ))
-                );
-            }
-            other => panic!("expected compile diagnostic, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn peer_dependency_missing_reports_pm_diagnostic() {
-        let tmp = tempfile::tempdir().unwrap();
-        tokio::fs::write(
-            tmp.path().join(PACKAGE_JSON),
-            r#"{"name":"app","peerDependencies":{"react":"^19.0.0"}}"#,
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(tmp.path().join("entry.ts"), r#"import "react";"#)
-            .await
-            .unwrap();
-
-        let err = run_check(
-            &tmp.path().join("entry.ts"),
-            false,
-            &CapabilitySet::default(),
-        )
-        .await
-        .expect_err("missing peer dependency should report PM diagnostic");
-
-        match err {
-            OtterError::Compile { diagnostics } => {
-                assert!(diagnostics.iter().any(|diagnostic| {
-                    diagnostic
-                        .message
-                        .contains("peer dependency `react` for package `app` is not installed")
-                }));
-            }
-            other => panic!("expected compile diagnostic, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
     async fn installed_package_peer_dependency_uses_available_project_package() {
         let tmp = tempfile::tempdir().unwrap();
         tokio::fs::write(
@@ -4922,6 +4697,16 @@ export let value = inner;
         let cli = Cli::try_parse_from(["otter", "app.ts"]).expect("parse shorthand");
         assert!(cli.command.is_none());
         assert_eq!(cli.args, vec!["app.ts".to_string()]);
+        // Flags after the script are the script's, as Node passes them.
+        let cli = Cli::try_parse_from(["otter", "app.ts", "--version", "-x"])
+            .expect("parse shorthand with script flags");
+        assert_eq!(cli.args, ["app.ts", "--version", "-x"]);
+        let cli = Cli::try_parse_from(["otter", "run", "tsc", "--version"])
+            .expect("parse run with target flags");
+        match cli.command {
+            Some(Command::Run(args)) => assert_eq!(args.args, ["--version"]),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     #[test]
@@ -5009,6 +4794,7 @@ export let value = inner;
         );
         write_fixture(&tool.join("otter.js"), "export const installedValue = 2;\n");
         write_fixture(&root.join("node_modules/.bin/fixture-tool"), "undefined;\n");
+        link_installed(&root, "workspace-lib", "packages/workspace-lib");
         let entry = root.join("entry.ts");
 
         assert_eq!(
@@ -5081,6 +4867,11 @@ export let value = inner;
                 .join("bad-export/packages/bad-export/dist/index.js"),
             "export const value = 1;\n",
         );
+        link_installed(
+            &tmp.path().join("bad-export"),
+            "bad-export",
+            "packages/bad-export",
+        );
         let bad_export = run_check(
             &tmp.path().join("bad-export/entry.ts"),
             false,
@@ -5088,7 +4879,12 @@ export let value = inner;
         )
         .await
         .unwrap_err();
-        assert_error_snapshot(&bad_export, "bad export", "compile", "must start with `./`");
+        assert_error_snapshot(
+            &bad_export,
+            "bad export",
+            "compile",
+            "target \\\"dist/index.js\\\" defined for '.'",
+        );
 
         write_fixture(
             &tmp.path().join("condition-miss/package.json"),
@@ -5108,6 +4904,11 @@ export let value = inner;
                 .join("condition-miss/packages/conditioned/browser.js"),
             "export const value = 1;\n",
         );
+        link_installed(
+            &tmp.path().join("condition-miss"),
+            "conditioned",
+            "packages/conditioned",
+        );
         let condition_miss = run_check(
             &tmp.path().join("condition-miss/entry.ts"),
             false,
@@ -5119,7 +4920,7 @@ export let value = inner;
             &condition_miss,
             "condition miss",
             "compile",
-            "no matching export condition",
+            "is not exported under the conditions",
         );
 
         write_fixture(&tmp.path().join("syntax.ts"), "function {\n");
@@ -5187,6 +4988,15 @@ export let value = inner;
             text.contains(expected_text) || json.contains(expected_text),
             "{label} diagnostic changed\ntext: {text}\njson: {json}"
         );
+    }
+
+    /// Link `node_modules/<name>` to the project's own `target` directory,
+    /// as an install links a workspace or `file:` dependency.
+    fn link_installed(root: &Path, name: &str, target: &str) {
+        let link = root.join("node_modules").join(name);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(Path::new("..").join(target), &link).unwrap();
     }
 
     /// Recursively copy a committed fixture directory into a scratch

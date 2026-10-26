@@ -52,9 +52,9 @@
 //! - `otter-vm` receives bytecode, runtime surface builders, and capability
 //!   decisions only through `otter-runtime`; it never sees package-manager
 //!   lockfiles, registries, or graph mutation APIs.
-//! - Package-manager data enters this crate only as the read-only
-//!   [`module_loader::LoaderPackageGraph`] DTO.
-//! - Loader, module-graph, source-map, diagnostics, and package-manager DTO
+//! - No package-manager data enters this crate: modules resolve through
+//!   the `node_modules` tree on disk, as Node resolves them.
+//! - Loader, module-graph, source-map, and diagnostics
 //!   state are owned by the `Runtime` session; no hidden global resolver state
 //!   is used by the active runtime path.
 //! - Fresh runtime construction completes trusted realm and extension
@@ -103,7 +103,6 @@ pub mod ipc;
 pub mod module_graph;
 pub mod module_loader;
 mod module_records;
-mod package_graph_resolver;
 mod process;
 mod process_control;
 mod process_env;
@@ -153,7 +152,9 @@ use otter_compiler::{
     compile_script_program, compile_script_source, compile_script_source_with_top_level_await,
 };
 use otter_gc::GcStats;
-use otter_syntax::{SourceKind, SyntaxDiagnostic, SyntaxError, detect_source_kind, with_program};
+use otter_syntax::{
+    SourceKind, SyntaxDiagnostic, SyntaxError, detect_file_source_kind, with_program,
+};
 use otter_vm::{EvalCompileOptions, ExecutionContext, Interpreter, InterruptFlag, NativeCallInfo};
 use serde::{Deserialize, Serialize};
 
@@ -703,7 +704,7 @@ impl SourceInput {
     /// - [`OtterError::Io`] when the file cannot be read.
     pub fn from_path(path: impl AsRef<Path>) -> Result<Self, OtterError> {
         let path = path.as_ref();
-        let kind = detect_source_kind(path).ok_or_else(|| OtterError::SourceKind {
+        let kind = detect_file_source_kind(path).ok_or_else(|| OtterError::SourceKind {
             path: path.to_path_buf(),
             extension: path
                 .extension()
@@ -2201,7 +2202,6 @@ impl RuntimeModuleLoaderState {
         &self,
         entry_path: &Path,
         hosted_modules: &[HostedModule],
-        package_manager: &RuntimePackageManagerHandle,
         capabilities: &CapabilitySet,
         hooks: &RuntimeHooks,
         resource_account: &ResourceAccount,
@@ -2213,7 +2213,6 @@ impl RuntimeModuleLoaderState {
         self.for_base_dir(
             base_dir,
             hosted_modules,
-            package_manager,
             capabilities,
             hooks,
             resource_account,
@@ -2226,7 +2225,6 @@ impl RuntimeModuleLoaderState {
         &self,
         base_dir: PathBuf,
         hosted_modules: &[HostedModule],
-        package_manager: &RuntimePackageManagerHandle,
         capabilities: &CapabilitySet,
         hooks: &RuntimeHooks,
         resource_account: &ResourceAccount,
@@ -2247,7 +2245,6 @@ impl RuntimeModuleLoaderState {
                 })
                 .map(|module| module.specifier().to_string()),
         );
-        package_manager.apply_to_loader_config(&mut cfg);
         // Keep module resolution on the same capability boundary as every
         // other host API. Hooks receive complete URL + initiator data while
         // the default policy remains the configured host allowlist.
@@ -2298,7 +2295,6 @@ fn surface_fingerprint(config: &RuntimeConfig) -> Option<u64> {
 fn commonjs_config(
     config: &RuntimeConfig,
     module_loader: &RuntimeModuleLoaderState,
-    package_manager: &RuntimePackageManagerHandle,
     runtime_task_spawner: Option<RuntimeTaskSpawner>,
 ) -> Arc<commonjs::CjsConfig> {
     Arc::new(commonjs::CjsConfig {
@@ -2311,7 +2307,6 @@ fn commonjs_config(
         resolver: module_loader.for_base_dir(
             config.process_cwd.clone(),
             &config.hosted_modules,
-            package_manager,
             &config.capabilities,
             &config.hooks,
             &config.resource_account,
@@ -2488,25 +2483,6 @@ impl RuntimeDiagnosticsSink {
         self.emitted.borrow_mut().push(diagnostic.clone());
         if let Some(hook) = hooks.diagnostic_hook() {
             hook.emit_diagnostic(diagnostic);
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-struct RuntimePackageManagerHandle {
-    graph: Option<module_loader::LoaderPackageGraph>,
-}
-
-impl RuntimePackageManagerHandle {
-    fn from_loader_config(config: Option<&module_loader::LoaderConfig>) -> Self {
-        Self {
-            graph: config.and_then(|cfg| cfg.package_graph.clone()),
-        }
-    }
-
-    fn apply_to_loader_config(&self, config: &mut module_loader::LoaderConfig) {
-        if config.package_graph.is_none() {
-            config.package_graph = self.graph.clone();
         }
     }
 }
@@ -3278,14 +3254,7 @@ impl Runtime {
             config.resource_account.clone(),
             config.completion_capacities,
         );
-        let package_manager =
-            RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
-        let commonjs = commonjs_config(
-            &config,
-            &module_loader,
-            &package_manager,
-            runtime_task_spawner.clone(),
-        );
+        let commonjs = commonjs_config(&config, &module_loader, runtime_task_spawner.clone());
         let mut interp = Interpreter::from_isolate_snapshot_capped(
             snapshot,
             config.max_heap_bytes,
@@ -3366,7 +3335,6 @@ impl Runtime {
             module_records: module_records::RuntimeModuleRecords::default(),
             source_maps: RuntimeSourceMapTable::default(),
             diagnostics: RuntimeDiagnosticsSink::default(),
-            package_manager,
             layer_a_dynamic_imports,
             web_dynamic_imports: Vec::new(),
             runtime_task_spawner,
@@ -3482,14 +3450,7 @@ impl Runtime {
             config.resource_account.clone(),
             config.completion_capacities,
         );
-        let package_manager =
-            RuntimePackageManagerHandle::from_loader_config(config.loader.as_ref());
-        let commonjs = commonjs_config(
-            &config,
-            &module_loader,
-            &package_manager,
-            runtime_task_spawner.clone(),
-        );
+        let commonjs = commonjs_config(&config, &module_loader, runtime_task_spawner.clone());
         let code_cache_hook = hooks::CodeCacheSlot::default();
         // The interpreter owns both per-isolate heaps; the string and GC
         // allocators honor the configured cap.
@@ -3632,7 +3593,6 @@ impl Runtime {
             module_records: module_records::RuntimeModuleRecords::default(),
             source_maps: RuntimeSourceMapTable::default(),
             diagnostics: RuntimeDiagnosticsSink::default(),
-            package_manager,
             layer_a_dynamic_imports,
             web_dynamic_imports: Vec::new(),
             runtime_task_spawner,
@@ -3788,7 +3748,6 @@ pub struct Runtime {
     module_records: module_records::RuntimeModuleRecords,
     source_maps: RuntimeSourceMapTable,
     diagnostics: RuntimeDiagnosticsSink,
-    package_manager: RuntimePackageManagerHandle,
     /// Direct-mode (Layer A) dynamic-import requests. The default
     /// loader installed at construction queues `import()` calls whose
     /// target the linked graph cannot resolve; `run_script` /
@@ -6943,7 +6902,6 @@ impl Runtime {
         self.module_loader.for_entry(
             entry_path,
             &self.config.hosted_modules,
-            &self.package_manager,
             &self.config.capabilities,
             &self.config.hooks,
             &self.config.resource_account,
@@ -8378,7 +8336,7 @@ fn unresolved_import(
         None => (
             otter_vm::ErrorKind::TypeError,
             None,
-            format!("dynamic import: cannot resolve \"{specifier}\": {error:?}"),
+            format!("dynamic import: cannot resolve \"{specifier}\": {error}"),
         ),
     }
 }
@@ -9633,168 +9591,6 @@ mod tests {
     }
 
     #[test]
-    fn module_program_imports_package_from_loader_graph() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let dep = dir.path().join("store/dep");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::create_dir_all(&dep).unwrap();
-        std::fs::write(dep.join("index.js"), "export let value = 11;\n").unwrap();
-        std::fs::write(
-            app.join("entry.ts"),
-            "import { value } from \"dep\";\nfunction fail() { return undefined.x; }\nif (value !== 11) fail();\n",
-        )
-        .unwrap();
-
-        let mut graph = module_loader::LoaderPackageGraph::new();
-        graph.insert_package(module_loader::LoaderPackageRoot {
-            id: "app@workspace:.".into(),
-            name: "app".into(),
-            version: "0.1.0".into(),
-            root: app.clone(),
-            main: None,
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: None,
-        });
-        graph.insert_package(module_loader::LoaderPackageRoot {
-            id: "dep@npm:^1.0.0".into(),
-            name: "dep".into(),
-            version: "1.0.0".into(),
-            root: dep,
-            main: Some("index.js".into()),
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: None,
-        });
-        graph.insert_dependency("app@workspace:.", "dep", "dep@npm:^1.0.0");
-
-        let mut loader = module_loader::LoaderConfig::new(app.clone());
-        loader.enable_node_modules = false;
-        loader.package_graph = Some(graph);
-        let otter = Otter::builder().module_loader(loader).build().unwrap();
-        otter.blocking_run_file(app.join("entry.ts")).unwrap();
-    }
-
-    #[test]
-    fn module_program_imports_package_import_alias_from_loader_graph() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        std::fs::create_dir_all(app.join("src")).unwrap();
-        std::fs::write(app.join("src/alias.ts"), "export let value = 19;\n").unwrap();
-        std::fs::write(
-            app.join("entry.ts"),
-            "import { value } from \"#alias\";\nfunction fail() { return undefined.x; }\nif (value !== 19) fail();\n",
-        )
-        .unwrap();
-
-        let mut graph = module_loader::LoaderPackageGraph::new();
-        graph.insert_package(module_loader::LoaderPackageRoot {
-            id: "app@workspace:.".into(),
-            name: "app".into(),
-            version: "0.1.0".into(),
-            root: app.clone(),
-            main: None,
-            module: None,
-            exports: None,
-            imports: Some(serde_json::json!({ "#alias": "./src/alias.ts" })),
-            package_type: None,
-        });
-
-        let mut loader = module_loader::LoaderConfig::new(app.clone());
-        loader.enable_node_modules = false;
-        loader.package_graph = Some(graph);
-        let otter = Otter::builder().module_loader(loader).build().unwrap();
-        otter.blocking_run_file(app.join("entry.ts")).unwrap();
-    }
-
-    #[tokio::test]
-    async fn commonjs_package_type_forces_script_parse_for_ambiguous_js() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::write(app.join("dep.js"), "export let value = 1;\n").unwrap();
-        std::fs::write(
-            app.join("entry.js"),
-            "import { value } from \"./dep.js\";\nvalue;\n",
-        )
-        .unwrap();
-
-        let mut graph = module_loader::LoaderPackageGraph::new();
-        graph.insert_package(module_loader::LoaderPackageRoot {
-            id: "app@workspace:.".into(),
-            name: "app".into(),
-            version: "0.1.0".into(),
-            root: app.clone(),
-            main: None,
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: Some(module_loader::LoaderPackageType::CommonJs),
-        });
-
-        let mut loader = module_loader::LoaderConfig::new(app.clone());
-        loader.enable_node_modules = false;
-        loader.package_graph = Some(graph);
-        let otter = Otter::builder().module_loader(loader).build().unwrap();
-
-        let err = otter
-            .check_file(app.join("entry.js"))
-            .await
-            .expect_err("commonjs package type should parse ambiguous .js as script");
-        assert!(matches!(err, OtterError::Compile { .. }));
-    }
-
-    #[tokio::test]
-    async fn check_file_imports_package_from_loader_graph_without_running_entry() {
-        let dir = tempfile::tempdir().unwrap();
-        let app = dir.path().join("app");
-        let dep = dir.path().join("store/dep");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::create_dir_all(&dep).unwrap();
-        std::fs::write(dep.join("index.js"), "export let value = 13;\n").unwrap();
-        std::fs::write(
-            app.join("entry.ts"),
-            "import { value } from \"dep\";\nfunction fail() { return undefined.x; }\nfail();\nvalue;\n",
-        )
-        .unwrap();
-
-        let mut graph = module_loader::LoaderPackageGraph::new();
-        graph.insert_package(module_loader::LoaderPackageRoot {
-            id: "app@workspace:.".into(),
-            name: "app".into(),
-            version: "0.1.0".into(),
-            root: app.clone(),
-            main: None,
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: None,
-        });
-        graph.insert_package(module_loader::LoaderPackageRoot {
-            id: "dep@npm:^1.0.0".into(),
-            name: "dep".into(),
-            version: "1.0.0".into(),
-            root: dep,
-            main: Some("index.js".into()),
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: None,
-        });
-        graph.insert_dependency("app@workspace:.", "dep", "dep@npm:^1.0.0");
-
-        let mut loader = module_loader::LoaderConfig::new(app.clone());
-        loader.enable_node_modules = false;
-        loader.package_graph = Some(graph);
-        let otter = Otter::builder().module_loader(loader).build().unwrap();
-
-        otter.check_file(app.join("entry.ts")).await.unwrap();
-    }
-
-    #[test]
     fn module_program_propagates_live_binding_writes() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -10400,6 +10196,30 @@ mod tests {
             .blocking_run_typescript("interface I { x: number; } undefined;")
             .unwrap();
         assert_eq!(result.completion_string(), "undefined");
+    }
+
+    #[tokio::test]
+    async fn commonjs_package_type_forces_script_parse_for_ambiguous_js() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("package.json"), r#"{"type":"commonjs"}"#).unwrap();
+        std::fs::write(app.join("dep.js"), "export let value = 1;\n").unwrap();
+        std::fs::write(
+            app.join("entry.js"),
+            "import { value } from \"./dep.js\";\nvalue;\n",
+        )
+        .unwrap();
+
+        let mut loader = module_loader::LoaderConfig::new(app.clone());
+        loader.enable_node_modules = false;
+        let otter = Otter::builder().module_loader(loader).build().unwrap();
+
+        let err = otter
+            .check_file(app.join("entry.js"))
+            .await
+            .expect_err("commonjs package type should parse ambiguous .js as script");
+        assert!(matches!(err, OtterError::Compile { .. }));
     }
 
     #[test]

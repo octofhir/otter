@@ -4,9 +4,9 @@
 //! Relative specifiers (`./x`, `../x`), bare specifiers (`import x from
 //! "lodash"`), `@scope/pkg` packages, conditional `exports` maps, package
 //! `imports` maps, `node_modules` walk-up, and workspace cross-references go
-//! through [`oxc_resolver`]. Absolute `file://` URLs are canonicalised by the
-//! host loader. Package-manager-aware runs first consult the installed package
-//! graph DTO to enforce declared dependency edges and PM diagnostics.
+//! through [`oxc_resolver`]: Node's own algorithm over the `node_modules`
+//! tree on disk, whichever package manager laid it out. Absolute `file://`
+//! URLs are canonicalised by the host loader.
 //!
 //! # Contents
 //! - [`ModuleLoader`] — resolves + reads a specifier's source.
@@ -19,9 +19,7 @@
 //!   identity is canonical URL string equality.
 //! - Every network resolution passes through the runtime capability boundary
 //!   with both target and initiator URLs before any host I/O.
-//! - Package-scope lookup for graph-backed packages is indexed at loader
-//!   construction time. Filesystem package scopes are memoized by importer
-//!   directory as they are observed.
+//! - Package scopes are memoized by importer directory as they are observed.
 //! - Remote source caching and concurrent fetch scheduling are owned by the
 //!   higher-level async graph driver. This loader only reads its completed
 //!   cache while CPU-bound graph construction runs on a blocking worker.
@@ -45,7 +43,6 @@ use std::sync::{Arc, RwLock};
 use otter_syntax::{SourceKind, remote_source_kind};
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
 
-use crate::package_graph_resolver;
 use crate::{CapabilityRequest, CapabilitySet, RuntimeCapability, RuntimeHooks};
 
 /// One remote module fetched over http/https.
@@ -373,9 +370,48 @@ impl LoaderError {
                 "ERR_MODULE_NOT_FOUND",
                 format!("Cannot find package '{package}' imported from {importer}"),
             )),
+            // A relative or absolute specifier naming no file: Node names the
+            // path it looked for.
+            Self::Resolve {
+                specifier,
+                referrer,
+                ..
+            } if specifier.starts_with("./")
+                || specifier.starts_with("../")
+                || specifier.starts_with('/') =>
+            {
+                let importer = referrer.strip_prefix("file://").unwrap_or(referrer);
+                let wanted = Path::new(importer)
+                    .parent()
+                    .map_or_else(|| PathBuf::from(specifier), |dir| dir.join(specifier));
+                let wanted = normalize_lexically(&wanted);
+                Some((
+                    "ERR_MODULE_NOT_FOUND",
+                    format!(
+                        "Cannot find module '{}' imported from {importer}",
+                        wanted.display()
+                    ),
+                ))
+            }
             _ => None,
         }
     }
+}
+
+/// `path` with `.` and `..` segments folded away, without touching the
+/// filesystem.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// The package a bare specifier names: its first path segment, or the first
@@ -524,103 +560,6 @@ pub struct ResolvedSource {
     pub text: otter_resource::SharedSource,
 }
 
-/// Runtime-local read-only package graph used by [`ModuleLoader`].
-///
-/// This is a deliberately small DTO, not the package-manager model. Product
-/// crates and the CLI adapt their richer install graph into this shape so
-/// `otter-runtime` does not depend on registry/cache/install code.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LoaderPackageGraph {
-    /// Packages keyed by stable package id.
-    pub packages: BTreeMap<String, LoaderPackageRoot>,
-    /// Dependency edges keyed by source package id, then dependency name.
-    pub dependencies: BTreeMap<String, BTreeMap<String, String>>,
-    /// Dependency edge kinds keyed by source package id, then dependency name.
-    pub dependency_kinds: BTreeMap<String, BTreeMap<String, LoaderPackageDependencyKind>>,
-}
-
-impl LoaderPackageGraph {
-    /// Construct an empty package graph.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Insert or replace a package root.
-    pub fn insert_package(&mut self, package: LoaderPackageRoot) {
-        self.packages.insert(package.id.clone(), package);
-    }
-
-    /// Insert a dependency edge.
-    pub fn insert_dependency(
-        &mut self,
-        from: impl Into<String>,
-        name: impl Into<String>,
-        target: impl Into<String>,
-    ) {
-        self.insert_dependency_with_kind(from, name, target, LoaderPackageDependencyKind::Runtime);
-    }
-
-    /// Insert a dependency edge with its package-manager dependency kind.
-    pub fn insert_dependency_with_kind(
-        &mut self,
-        from: impl Into<String>,
-        name: impl Into<String>,
-        target: impl Into<String>,
-        kind: LoaderPackageDependencyKind,
-    ) {
-        let from = from.into();
-        let name = name.into();
-        self.dependencies
-            .entry(from.clone())
-            .or_default()
-            .insert(name.clone(), target.into());
-        self.dependency_kinds
-            .entry(from)
-            .or_default()
-            .insert(name, kind);
-    }
-
-    /// Resolve one package by id.
-    #[must_use]
-    pub fn package(&self, id: &str) -> Option<&LoaderPackageRoot> {
-        self.packages.get(id)
-    }
-
-    /// Return the dependency kind for one edge, if the product adapter
-    /// supplied it.
-    #[must_use]
-    pub fn dependency_kind(&self, from: &str, name: &str) -> Option<LoaderPackageDependencyKind> {
-        self.dependency_kinds
-            .get(from)
-            .and_then(|dependencies| dependencies.get(name))
-            .copied()
-    }
-}
-
-/// One package root in [`LoaderPackageGraph`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LoaderPackageRoot {
-    /// Stable package id.
-    pub id: String,
-    /// Package name.
-    pub name: String,
-    /// Package version.
-    pub version: String,
-    /// Materialized package root.
-    pub root: PathBuf,
-    /// `package.json#main`, when known.
-    pub main: Option<String>,
-    /// `package.json#module`, when known.
-    pub module: Option<String>,
-    /// `package.json#exports`, when known.
-    pub exports: Option<serde_json::Value>,
-    /// `package.json#imports`, when known.
-    pub imports: Option<serde_json::Value>,
-    /// `package.json#type`, when known.
-    pub package_type: Option<LoaderPackageType>,
-}
-
 /// JavaScript package module mode from `package.json#type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoaderPackageType {
@@ -687,19 +626,6 @@ fn read_filesystem_package_type(start_dir: &Path) -> Option<LoaderPackageType> {
         dir = current.parent();
     }
     None
-}
-
-/// Package-manager dependency edge kind mirrored into the runtime DTO.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoaderPackageDependencyKind {
-    /// `dependencies`.
-    Runtime,
-    /// `devDependencies`.
-    Development,
-    /// `peerDependencies`.
-    Peer,
-    /// `optionalDependencies`.
-    Optional,
 }
 
 /// Resolve / load failure modes. The runtime maps these onto the
@@ -824,8 +750,6 @@ pub struct LoaderConfig {
     pub enable_node_modules: bool,
     /// Runtime-provided hosted module specifiers such as `otter:kv`.
     pub hosted_specifiers: Vec<String>,
-    /// Optional read-only installed package graph.
-    pub package_graph: Option<LoaderPackageGraph>,
     /// Ledger charged for every retained module source byte this loader
     /// reads or synthesizes. Defaults to a private unlimited account;
     /// runtime construction installs the shared runtime account.
@@ -877,7 +801,6 @@ impl LoaderConfig {
             ],
             enable_node_modules: true,
             hosted_specifiers: Vec::new(),
-            package_graph: None,
             resource_account: otter_resource::ResourceAccount::default(),
             capabilities: CapabilitySet::sandbox(),
             capability_hooks: RuntimeHooks::default(),
@@ -898,8 +821,7 @@ impl LoaderConfig {
 /// 4. If it starts with `npm:`, strip the prefix and treat as
 ///    a bare specifier (common runtime sugar).
 /// 5. If it starts with `#`, resolve through the containing
-///    package's `package.json#imports` map when a package graph is
-///    configured, otherwise let the filesystem resolver try.
+///    package's `package.json#imports` map.
 /// 6. Otherwise (bare name, `@scope/name`, …): hand off to
 ///    [`oxc_resolver`]. The resolver walks `node_modules`
 ///    upward from the importer's directory, respects
@@ -914,7 +836,6 @@ pub struct ModuleLoader {
     config: LoaderConfig,
     esm_resolver: Resolver,
     cjs_resolver: Resolver,
-    package_scope_cache: Option<package_graph_resolver::PackageScopeCache>,
     filesystem_package_scope_cache: FilesystemPackageScopeCache,
     remote_fetch: Option<Arc<dyn RemoteModuleFetch>>,
 }
@@ -968,15 +889,10 @@ impl ModuleLoader {
             tsconfig: Some(TsconfigDiscovery::Auto),
             ..ResolveOptions::default()
         };
-        let package_scope_cache = config
-            .package_graph
-            .as_ref()
-            .map(package_graph_resolver::PackageScopeCache::from_graph);
         Self {
             config,
             esm_resolver: Resolver::new(esm_options),
             cjs_resolver: Resolver::new(cjs_options),
-            package_scope_cache,
             filesystem_package_scope_cache: FilesystemPackageScopeCache::default(),
             remote_fetch: None,
         }
@@ -1014,26 +930,12 @@ impl ModuleLoader {
 
     /// Return the nearest package type for `path`, if known.
     ///
-    /// Graph-backed package roots are consulted first through the same
-    /// longest-containing-root scope cache as `exports` / `imports`
-    /// resolution. When no graph scope supplies a type, the loader walks parent
-    /// directories for the nearest `package.json#type` and memoizes that result
-    /// by importer directory. File extensions such as `.mjs` and `.cjs` are
-    /// still handled by the caller as hard overrides.
+    /// The loader walks parent directories for the nearest
+    /// `package.json#type` and memoizes that result by importer directory.
+    /// File extensions such as `.mjs` and `.cjs` are still handled by the
+    /// caller as hard overrides.
     #[must_use]
     pub fn package_type_for_path(&self, path: &Path) -> Option<LoaderPackageType> {
-        let dir = path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.config.base_dir.clone());
-        if let Some(graph) = self.config.package_graph.as_ref()
-            && let Some(scope_cache) = self.package_scope_cache.as_ref()
-            && let Some(package_type) = scope_cache
-                .containing_package(graph, &dir)
-                .and_then(|package| package.package_type)
-        {
-            return Some(package_type);
-        }
         self.filesystem_package_scope_cache
             .package_type_for_path(path, &self.config.base_dir)
     }
@@ -1140,8 +1042,7 @@ impl ModuleLoader {
     /// Resolve `require(specifier)` from a CommonJS module in `dir` by Node's
     /// CommonJS algorithm under the `require` conditions: relative (including
     /// `.` and `..`), absolute and bare specifiers, `package.json#exports` and
-    /// `#imports`, and the installed package graph. `referrer_file` is the
-    /// requiring module when it is a file.
+    /// `#imports`. `referrer_file` is the requiring module when it is a file.
     ///
     /// # Errors
     /// See [`LoaderError`].
@@ -1208,42 +1109,9 @@ impl ModuleLoader {
         // importer's directory using oxc_resolver. Unwrap the
         // `npm:` sugar prefix first.
         let bare = specifier.strip_prefix("npm:").unwrap_or(specifier);
-        if bare.starts_with('#')
-            && let Some(graph) = &self.config.package_graph
-            && let Some(scope_cache) = &self.package_scope_cache
-            && let Some(path) =
-                package_graph_resolver::resolve_imports_from_package_graph_with_scope_cache(
-                    graph,
-                    scope_cache,
-                    bare,
-                    dir,
-                    conditions,
-                    &self.config.extensions,
-                )
-                .map_err(|message| {
-                    resolve_error_with_context(specifier, referrer, kind, conditions, message)
-                })?
-        {
-            return Ok(path);
-        }
-        if let Some(graph) = &self.config.package_graph
-            && let Some(scope_cache) = &self.package_scope_cache
-            && let Some(path) = package_graph_resolver::resolve_from_package_graph_with_scope_cache(
-                graph,
-                scope_cache,
-                bare,
-                dir,
-                kind,
-                conditions,
-                &self.config.extensions,
-            )
-            .map_err(|message| {
-                resolve_error_with_context(specifier, referrer, kind, conditions, message)
-            })?
-        {
-            return Ok(path);
-        }
-        if !self.config.enable_node_modules {
+        // A package's own `#imports` never leave it, so they resolve even
+        // where `node_modules` lookups are off.
+        if !self.config.enable_node_modules && !bare.starts_with('#') {
             return Err(LoaderError::UnsupportedSpecifier {
                 specifier: specifier.to_string(),
             });
@@ -1405,7 +1273,7 @@ impl ModuleLoader {
             });
         }
         let jsx = self.compiler_options_jsx_for_path(Path::new(path));
-        let kind = otter_syntax::detect_source_kind(Path::new(path)).ok_or_else(|| {
+        let kind = otter_syntax::detect_file_source_kind(Path::new(path)).ok_or_else(|| {
             LoaderError::Extension {
                 url: url.clone(),
                 extension: extension.to_string(),
@@ -1488,51 +1356,6 @@ fn canonicalise(path: &Path) -> Result<PathBuf, String> {
     std::fs::canonicalize(path).map_err(|e| format!("canonicalise `{}`: {e}", path.display()))
 }
 
-/// Resolve a candidate path with a caller-supplied extension probing list.
-///
-/// `extensions` accepts either `.ts` or `ts` spelling; probes preserve the
-/// caller's order.
-pub(crate) fn resolve_with_configured_extensions<S: AsRef<str>>(
-    candidate: &Path,
-    extensions: &[S],
-) -> Result<PathBuf, String> {
-    if candidate.is_file() {
-        return canonicalise(candidate);
-    }
-    if candidate.is_dir() {
-        for extension in extensions {
-            let probe = candidate.join(format!("index{}", extension_suffix(extension.as_ref())));
-            if probe.is_file() {
-                return canonicalise(&probe);
-            }
-        }
-        let extension_labels = extensions.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-        return Err(format!(
-            "directory `{}` has no index.<ext> in {:?}",
-            candidate.display(),
-            extension_labels
-        ));
-    }
-    if candidate.extension().is_none() {
-        for extension in extensions {
-            let mut probe = candidate.to_path_buf();
-            probe.set_extension(extension.as_ref().trim_start_matches('.'));
-            if probe.is_file() {
-                return canonicalise(&probe);
-            }
-        }
-    }
-    Err(format!("no candidate file for `{}`", candidate.display()))
-}
-
-fn extension_suffix(extension: &str) -> String {
-    if extension.starts_with('.') {
-        extension.to_string()
-    } else {
-        format!(".{extension}")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1602,54 +1425,6 @@ mod tests {
     }
 
     #[test]
-    fn package_graph_resolution_uses_configured_extension_order() {
-        let dir = temp_dir();
-        let app = dir.path().join("app");
-        let dep = dir.path().join("store/dep");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::create_dir_all(&dep).unwrap();
-        std::fs::write(app.join("entry.ts"), "// entry\n").unwrap();
-        std::fs::write(dep.join("main.ts"), "export let answer = 1;\n").unwrap();
-        std::fs::write(dep.join("main.js"), "export let answer = 2;\n").unwrap();
-
-        let mut graph = LoaderPackageGraph::new();
-        graph.insert_package(LoaderPackageRoot {
-            id: "app@workspace:.".into(),
-            name: "app".into(),
-            version: "0.1.0".into(),
-            root: app.clone(),
-            main: None,
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: None,
-        });
-        graph.insert_package(LoaderPackageRoot {
-            id: "dep@npm:^1.0.0".into(),
-            name: "dep".into(),
-            version: "1.0.0".into(),
-            root: dep,
-            main: Some("main".into()),
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: None,
-        });
-        graph.insert_dependency("app@workspace:.", "dep", "dep@npm:^1.0.0");
-
-        let mut config = LoaderConfig::new(app);
-        config.enable_node_modules = false;
-        config.extensions = vec![".js".to_string(), ".ts".to_string()];
-        config.package_graph = Some(graph);
-        let loader = ModuleLoader::with_config(config);
-
-        let entry = loader.resolve("./entry.ts", None).unwrap();
-        let dep = loader.resolve("dep", Some(&entry)).unwrap();
-
-        assert!(dep.ends_with("main.js"));
-    }
-
-    #[test]
     fn bare_specifier_unknown_resolves_with_error_message() {
         let dir = temp_dir();
         let loader = ModuleLoader::new(dir.path().to_path_buf());
@@ -1711,217 +1486,6 @@ mod tests {
             LoaderError::UnsupportedSpecifier {
                 specifier: "lodash".to_string(),
             }
-        );
-    }
-
-    #[test]
-    fn bare_specifier_can_resolve_from_package_graph_without_node_modules_walk() {
-        let dir = temp_dir();
-        let app = dir.path().join("app");
-        let dep = dir.path().join("store/dep");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::create_dir_all(&dep).unwrap();
-        std::fs::write(app.join("entry.ts"), "// entry\n").unwrap();
-        std::fs::write(dep.join("main.js"), "export let answer = 1;\n").unwrap();
-
-        let mut graph = LoaderPackageGraph::new();
-        graph.insert_package(LoaderPackageRoot {
-            id: "app@workspace:.".into(),
-            name: "app".into(),
-            version: "0.1.0".into(),
-            root: app.clone(),
-            main: None,
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: None,
-        });
-        graph.insert_package(LoaderPackageRoot {
-            id: "dep@npm:^1.0.0".into(),
-            name: "dep".into(),
-            version: "1.0.0".into(),
-            root: dep.clone(),
-            main: Some("main.js".into()),
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: None,
-        });
-        graph.insert_dependency("app@workspace:.", "dep", "dep@npm:^1.0.0");
-
-        let mut config = LoaderConfig::new(app.clone());
-        config.enable_node_modules = false;
-        config.package_graph = Some(graph);
-        let loader = ModuleLoader::with_config(config);
-        let entry = loader.resolve("./entry.ts", None).unwrap();
-        let resolved = loader.resolve("dep", Some(&entry)).unwrap();
-
-        assert!(resolved.ends_with("main.js"), "got {resolved}");
-    }
-
-    #[test]
-    fn package_graph_blocks_undeclared_bare_dependency_when_node_modules_off() {
-        let dir = temp_dir();
-        let app = dir.path().join("app");
-        let dep = dir.path().join("store/dep");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::create_dir_all(&dep).unwrap();
-        std::fs::write(app.join("entry.ts"), "// entry\n").unwrap();
-        std::fs::write(dep.join("main.js"), "export let answer = 1;\n").unwrap();
-
-        let mut graph = LoaderPackageGraph::new();
-        graph.insert_package(LoaderPackageRoot {
-            id: "app@workspace:.".into(),
-            name: "app".into(),
-            version: "0.1.0".into(),
-            root: app.clone(),
-            main: None,
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: None,
-        });
-        graph.insert_package(LoaderPackageRoot {
-            id: "dep@npm:^1.0.0".into(),
-            name: "dep".into(),
-            version: "1.0.0".into(),
-            root: dep,
-            main: Some("main.js".into()),
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: None,
-        });
-
-        let mut config = LoaderConfig::new(app.clone());
-        config.enable_node_modules = false;
-        config.package_graph = Some(graph);
-        let loader = ModuleLoader::with_config(config);
-        let entry = loader.resolve("./entry.ts", None).unwrap();
-        let err = loader
-            .resolve("dep", Some(&entry))
-            .expect_err("undeclared package edge must not resolve through graph");
-
-        match err {
-            LoaderError::Resolve { message, .. } => {
-                assert!(message.contains("package `app` does not declare dependency `dep`"));
-                assert!(message.contains("importer `file://"));
-                assert!(message.contains("specifier `dep`"));
-                assert!(message.contains("conditions [otter, import, node, default]"));
-            }
-            other => panic!("expected graph-gated resolve error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn package_import_specifier_resolves_from_loader_graph() {
-        let dir = temp_dir();
-        let app = dir.path().join("app");
-        std::fs::create_dir_all(app.join("src")).unwrap();
-        std::fs::write(app.join("entry.ts"), "// entry\n").unwrap();
-        std::fs::write(app.join("src/alias.ts"), "export let answer = 1;\n").unwrap();
-
-        let mut graph = LoaderPackageGraph::new();
-        graph.insert_package(LoaderPackageRoot {
-            id: "app@workspace:.".into(),
-            name: "app".into(),
-            version: "0.1.0".into(),
-            root: app.clone(),
-            main: None,
-            module: None,
-            exports: None,
-            imports: Some(serde_json::json!({ "#alias": "./src/alias.ts" })),
-            package_type: None,
-        });
-
-        let mut config = LoaderConfig::new(app.clone());
-        config.enable_node_modules = false;
-        config.package_graph = Some(graph);
-        let loader = ModuleLoader::with_config(config);
-        let entry = loader.resolve("./entry.ts", None).unwrap();
-        let resolved = loader.resolve("#alias", Some(&entry)).unwrap();
-
-        assert!(resolved.ends_with("src/alias.ts"), "got {resolved}");
-    }
-
-    #[test]
-    fn missing_package_import_reports_resolver_diagnostic() {
-        let dir = temp_dir();
-        let app = dir.path().join("app");
-        std::fs::create_dir_all(&app).unwrap();
-        std::fs::write(app.join("entry.ts"), "// entry\n").unwrap();
-
-        let mut graph = LoaderPackageGraph::new();
-        graph.insert_package(LoaderPackageRoot {
-            id: "app@workspace:.".into(),
-            name: "app".into(),
-            version: "0.1.0".into(),
-            root: app.clone(),
-            main: None,
-            module: None,
-            exports: None,
-            imports: Some(serde_json::json!({ "#known": "./known.ts" })),
-            package_type: None,
-        });
-
-        let mut config = LoaderConfig::new(app.clone());
-        config.enable_node_modules = false;
-        config.package_graph = Some(graph);
-        let loader = ModuleLoader::with_config(config);
-        let entry = loader.resolve("./entry.ts", None).unwrap();
-        let err = loader
-            .resolve("#missing", Some(&entry))
-            .expect_err("missing package import should be a stable resolve error");
-
-        match err {
-            LoaderError::Resolve { message, .. } => {
-                assert!(message.contains("package `app` imports map has no entry for `#missing`"));
-                assert!(message.contains("importer `file://"));
-                assert!(message.contains("specifier `#missing`"));
-                assert!(message.contains("conditions [otter, import, node, default]"));
-            }
-            other => panic!("expected resolve error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn package_type_lookup_uses_longest_package_scope() {
-        let dir = temp_dir();
-        let app = dir.path().join("app");
-        let nested = app.join("packages/nested");
-        std::fs::create_dir_all(&nested).unwrap();
-
-        let mut graph = LoaderPackageGraph::new();
-        graph.insert_package(LoaderPackageRoot {
-            id: "app@workspace:.".into(),
-            name: "app".into(),
-            version: "0.1.0".into(),
-            root: app.clone(),
-            main: None,
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: Some(LoaderPackageType::Module),
-        });
-        graph.insert_package(LoaderPackageRoot {
-            id: "nested@workspace:packages/nested".into(),
-            name: "nested".into(),
-            version: "0.1.0".into(),
-            root: nested.clone(),
-            main: None,
-            module: None,
-            exports: None,
-            imports: None,
-            package_type: Some(LoaderPackageType::CommonJs),
-        });
-
-        let mut config = LoaderConfig::new(app);
-        config.package_graph = Some(graph);
-        let loader = ModuleLoader::with_config(config);
-
-        assert_eq!(
-            loader.package_type_for_path(&nested.join("entry.js")),
-            Some(LoaderPackageType::CommonJs)
         );
     }
 

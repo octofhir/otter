@@ -82,6 +82,7 @@ const NAPI_OK: napi_status = 0;
 const NAPI_INVALID_ARG: napi_status = 1;
 const NAPI_OBJECT_EXPECTED: napi_status = 2;
 const NAPI_STRING_EXPECTED: napi_status = 3;
+const NAPI_NAME_EXPECTED: napi_status = 4;
 const NAPI_FUNCTION_EXPECTED: napi_status = 5;
 const NAPI_NUMBER_EXPECTED: napi_status = 6;
 const NAPI_BOOLEAN_EXPECTED: napi_status = 7;
@@ -1243,6 +1244,43 @@ pub unsafe extern "C" fn napi_has_property(
     }
     let env = unsafe { &mut *env };
     unsafe { *result = env.value(value).is_some_and(|value| !value.is_undefined()) };
+    NAPI_OK
+}
+
+/// Whether `object` has an own property named by `key`, a string or a
+/// symbol.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn napi_has_own_property(
+    env: napi_env,
+    object: napi_value,
+    key: napi_value,
+    result: *mut bool,
+) -> napi_status {
+    if env.is_null() || object.is_null() || key.is_null() || result.is_null() {
+        return NAPI_INVALID_ARG;
+    }
+    let env = unsafe { &mut *env };
+    let (Some(object), Some(key)) = (unsafe { env.value(object) }, unsafe { env.value(key) })
+    else {
+        return NAPI_INVALID_ARG;
+    };
+    if !object.is_object_type() && !object.is_callable() {
+        return NAPI_OBJECT_EXPECTED;
+    }
+    let heap = unsafe { env.ctx() }.heap();
+    let own = if let Some(symbol) = key.as_symbol(heap) {
+        object
+            .as_object()
+            .is_some_and(|object| otter_vm::object::has_own_symbol(object, heap, symbol))
+    } else if key.is_string() {
+        let name = key.display_string(heap);
+        object.as_object().is_some_and(|object| {
+            otter_vm::object::get_own_descriptor(object, heap, &name).is_some()
+        })
+    } else {
+        return NAPI_NAME_EXPECTED;
+    };
+    unsafe { *result = own };
     NAPI_OK
 }
 
@@ -2970,6 +3008,7 @@ pub fn keep_napi_exports() {
         napi_set_property as *const (),
         napi_get_property as *const (),
         napi_has_property as *const (),
+        napi_has_own_property as *const (),
         napi_define_properties as *const (),
         napi_set_element as *const (),
         napi_get_element as *const (),

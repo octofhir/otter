@@ -1093,6 +1093,25 @@ pub(crate) fn array_linear_search(
             }
         };
         let from = has_from_arg.then(|| interp.iteration_anchor(from_anchor));
+        // A plain array whose `len` first elements are all present answers
+        // every HasProperty with `true` and every Get with its element: one
+        // scan of the storage is the whole loop.
+        let packed_scan = |interp: &Interpreter,
+                           scan: &mut dyn FnMut(
+            &mut dyn Iterator<Item = Value>,
+            &otter_gc::GcHeap,
+        ) -> i64|
+         -> Option<i64> {
+            let o = interp.iteration_anchor(anchor_base);
+            let array = o.as_array()?;
+            let heap = interp.gc_heap();
+            crate::array::with_plain_dense_values(array, heap, |values| {
+                let (present, exact) = values.size_hint();
+                (exact == Some(present) && present >= len)
+                    .then(|| scan(&mut values.take(len), heap))
+            })
+            .flatten()
+        };
         if name == "indexOf" {
             let n = from.map_or(0.0, |v| to_int(&v, interp.gc_heap()));
             let mut k = if n >= len as f64 {
@@ -1102,6 +1121,16 @@ pub(crate) fn array_linear_search(
             } else {
                 (len_i + n as i64).max(0)
             };
+            let search = interp.iteration_anchor(search_anchor);
+            if let Some(found) = packed_scan(interp, &mut |values, heap| {
+                values
+                    .enumerate()
+                    .skip(k as usize)
+                    .find(|(_, value)| crate::abstract_ops::is_strictly_equal(value, &search, heap))
+                    .map_or(-1, |(index, _)| index as i64)
+            }) {
+                return Ok(found);
+            }
             while k < len_i {
                 if let Some(idx) = probe(interp, stack, k)? {
                     return Ok(idx);
@@ -1117,6 +1146,18 @@ pub(crate) fn array_linear_search(
             } else {
                 len_i + n as i64
             };
+            let search = interp.iteration_anchor(search_anchor);
+            if let Some(found) = packed_scan(interp, &mut |values, heap| {
+                let end = usize::try_from(k + 1).unwrap_or(0);
+                values
+                    .take(end)
+                    .enumerate()
+                    .filter(|(_, value)| crate::abstract_ops::is_strictly_equal(value, &search, heap))
+                    .last()
+                    .map_or(-1, |(index, _)| index as i64)
+            }) {
+                return Ok(found);
+            }
             while k >= 0 {
                 if let Some(idx) = probe(interp, stack, k)? {
                     return Ok(idx);

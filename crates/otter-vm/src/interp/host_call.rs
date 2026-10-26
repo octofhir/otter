@@ -142,7 +142,10 @@ impl HostTurn<'_> {
 pub(crate) struct CallerContext<'a> {
     admitted: Option<&'a ExecutionContext>,
     frame: *mut Frame,
-    resolved: std::cell::OnceCell<Option<ExecutionContext>>,
+    /// The caller's owner from the isolate's stable owner cache, which keeps
+    /// its address while any execution is in progress; `None` for the
+    /// admitted context.
+    resolved: std::cell::OnceCell<Option<*const ExecutionContext>>,
 }
 
 impl<'a> CallerContext<'a> {
@@ -156,13 +159,16 @@ impl<'a> CallerContext<'a> {
 
     /// The source owner, or the admitted context.
     pub(crate) fn get(&self, vm: &Interpreter) -> Option<&ExecutionContext> {
-        self.resolved
-            .get_or_init(|| self.resolve(vm))
-            .as_ref()
-            .or(self.admitted)
+        match self.resolved.get_or_init(|| self.resolve(vm)) {
+            // SAFETY: the stable owner cache keeps a cached owner's address
+            // until it releases retired owners, which happens only when no
+            // execution is in progress; this native call is one.
+            Some(owner) => Some(unsafe { &**owner }),
+            None => self.admitted,
+        }
     }
 
-    fn resolve(&self, vm: &Interpreter) -> Option<ExecutionContext> {
+    fn resolve(&self, vm: &Interpreter) -> Option<*const ExecutionContext> {
         let mut child = self.frame;
         loop {
             // SAFETY: the host frame stays published for the whole native
@@ -192,7 +198,7 @@ impl<'a> CallerContext<'a> {
             {
                 return None;
             }
-            return vm.function_context(self.admitted, function_id).ok();
+            return vm.stable_foreign_owner(function_id).ok();
         }
     }
 }

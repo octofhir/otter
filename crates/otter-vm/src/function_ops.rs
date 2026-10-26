@@ -1069,6 +1069,90 @@ impl Interpreter {
         self.value_has_proxy_aware_prototype(stack, context, object, &prototype)
     }
 
+    /// §13.10.2 InstanceofOperator for a target whose `@@hasInstance` is the
+    /// inherited, non-writable %Function.prototype%[@@hasInstance] and whose
+    /// `prototype` is fixed data: OrdinaryHasInstance then reads internal
+    /// slots only, so it is answered without a property read or call.
+    ///
+    /// Built-in constructors without a `[[Prototype]]` override and classes
+    /// (through their static chain) qualify. A Proxy anywhere on the
+    /// receiver's chain, or any other target, returns `None` for the full
+    /// algorithm.
+    fn instanceof_fixed_target(&mut self, value: &Value, target: &Value) -> Option<bool> {
+        let prototype = self.fixed_has_instance_prototype(target)?;
+        if !value.is_object_type() {
+            return Some(false);
+        }
+        let mut current = *value;
+        for _ in 0..object::PROTO_CHAIN_HARD_CAP {
+            if current.is_proxy() {
+                return None;
+            }
+            let next = self.get_prototype_for_op(&current).ok()?;
+            if next.is_null() {
+                return Some(false);
+            }
+            if next == prototype {
+                return Some(true);
+            }
+            current = next;
+        }
+        None
+    }
+
+    /// The fixed `prototype` of a target that inherits the built-in
+    /// `@@hasInstance`, walking a class's `extends` chain to its base.
+    fn fixed_has_instance_prototype(&self, target: &Value) -> Option<Value> {
+        let heap = &self.gc_heap;
+        let has_instance = crate::symbol::WellKnown::HasInstance;
+        let own_prototype = if let Some(class) = target.as_class_constructor() {
+            Value::object(class.prototype(heap))
+        } else {
+            let native = target.as_native_function()?;
+            let bag = native.own_properties_bag(heap);
+            if bag.is_null() {
+                return None;
+            }
+            let object::PropertyLookup::Data { value, .. } = object::lookup_own(bag, heap, "prototype")
+            else {
+                return None;
+            };
+            value
+        };
+        if !own_prototype.is_object_type() || own_prototype.is_proxy() {
+            return None;
+        }
+        let mut current = *target;
+        for _ in 0..object::PROTO_CHAIN_HARD_CAP {
+            if let Some(class) = current.as_class_constructor() {
+                if object::has_own_well_known_symbol(class.statics(heap), heap, has_instance) {
+                    return None;
+                }
+                let parent = class.ctor_proto(heap);
+                if parent.is_undefined() {
+                    return Some(own_prototype);
+                }
+                current = parent;
+                continue;
+            }
+            let native = current.as_native_function()?;
+            let bag = native.own_properties_bag(heap);
+            if bag.is_null() || object::has_own_well_known_symbol(bag, heap, has_instance) {
+                return None;
+            }
+            match native.prototype_override(heap) {
+                None => return Some(own_prototype),
+                Some(parent)
+                    if parent.as_object() == self.realm_intrinsics.function_prototype() =>
+                {
+                    return Some(own_prototype);
+                }
+                Some(parent) => current = parent,
+            }
+        }
+        None
+    }
+
     /// ECMA-262 §13.10.2 `InstanceofOperator(V, target)`.
     ///
     /// # See also
@@ -1097,6 +1181,9 @@ impl Interpreter {
             return Err(CommittedValueError::JavaScript(self.err_type(
                 ("Right-hand side of instanceof is not an object".to_string()).into(),
             )));
+        }
+        if let Some(answer) = self.instanceof_fixed_target(&value, &target) {
+            return Ok(answer);
         }
         let has_instance_sym = self.well_known_symbols.get(symbol::WellKnown::HasInstance);
         let key = VmPropertyKey::Symbol(has_instance_sym);

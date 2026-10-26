@@ -1,8 +1,9 @@
 'use strict';
 // NODE_DEBUG-gated section loggers. The optimization callback receives the
-// logger on FIRST USE, never synchronously — callers assign the result to
-// the same `let` binding the callback writes, so an eager call lands in its
-// temporal dead zone. `enabled` is a getter on every handed-out logger.
+// resolved logger on FIRST USE, never synchronously — callers assign the
+// result to the same `let` binding the callback writes, so an eager call
+// lands in its temporal dead zone. `enabled` is a getter on every handed-out
+// logger.
 
 // NODE_DEBUG is a comma-separated list of section patterns where `*` is a
 // wildcard; every other character matches literally (sections like `###`
@@ -34,18 +35,30 @@ function debuglogImpl(enabled, set) {
 function debuglog(set, cb) {
   const section = String(set).toUpperCase();
   let impl;
-  function logger(...args) {
+  let enabled;
+  // NODE_DEBUG is read once, at first use; the callback then receives the
+  // resolved logger itself, so a caller that rebinds to it calls the no-op
+  // directly when the section is off.
+  function init() {
     if (impl === undefined) {
-      impl = debuglogImpl(sectionEnabled(section), section);
+      enabled = sectionEnabled(section);
+      impl = debuglogImpl(enabled, section);
       if (typeof cb === 'function') {
-        cb(logger);
+        const callback = cb;
         cb = undefined;
+        callback(impl);
       }
     }
-    return impl(...args);
+    return impl;
+  }
+  function logger(...args) {
+    return init()(...args);
   }
   Object.defineProperty(logger, 'enabled', {
-    get() { return sectionEnabled(section); },
+    get() {
+      init();
+      return enabled;
+    },
     configurable: true,
     enumerable: true,
   });

@@ -456,7 +456,9 @@ fn require_locale(ctx: &NativeCtx<'_>) -> Result<LocalePayload, NativeError> {
 /// ("posix"), which icu_locale's `Language` (2-3 alpha) rejects. Split
 /// such a tag into the long language subtag and an ICU-parseable body
 /// with the language swapped for `und`. `None` for every other shape.
-fn split_long_language(tag: &str) -> Option<(String, String)> {
+/// A tag whose language subtag is 5-8 letters, which BCP 47 allows and the
+/// locale parser does not: the subtag, and the tag with `und` in its place.
+pub(super) fn split_long_language(tag: &str) -> Option<(String, String)> {
     let first = tag.split('-').next().unwrap_or("");
     if (5..=8).contains(&first.len()) && first.bytes().all(|b| b.is_ascii_alphabetic()) {
         let rest = &tag[first.len()..];

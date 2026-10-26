@@ -61,6 +61,7 @@ const INSTALLER_PATHS: &[&str] = &[
     "node_console_global.js",
     "process_stdio_global.js",
     "node_timers_global.js",
+    "node_buffer_global.js",
     "node_promise_rejection_global.js",
 ];
 const INSTALLER_SPECIFIER: &str = "<realm-installer>";

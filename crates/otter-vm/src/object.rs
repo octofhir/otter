@@ -3426,9 +3426,12 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
     )
 }
 
-/// Publish initialized Value words from an already reserved allocation buffer.
-/// No allocation, JavaScript or representation preparation occurs here.
-pub(crate) fn try_alloc_object_with_values_no_collect(
+/// Publish initialized Value words from an already reserved allocation buffer,
+/// for a layout whose field summaries were generalized
+/// ([`field_type::generalize`]): they track nothing, so the values are not
+/// observed. No allocation, JavaScript or representation preparation occurs
+/// here.
+pub(crate) fn try_alloc_generalized_object_no_collect(
     heap: &mut GcHeap,
     shape: ShapeHandle,
     values: &[Value],
@@ -3439,7 +3442,7 @@ pub(crate) fn try_alloc_object_with_values_no_collect(
         return None;
     }
     let PendingObject { body } = empty_object_body(shape);
-    heap.try_alloc_trailing_no_collect_or_return(
+    heap.try_alloc_filled_trailing_no_collect_or_return(
         body,
         FieldLocation::words_bytes(capacity),
         |body| {
@@ -3450,7 +3453,6 @@ pub(crate) fn try_alloc_object_with_values_no_collect(
                     *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) = value
                 };
             }
-            body.seed_field_types(values.len());
         },
     )
     .ok()

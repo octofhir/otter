@@ -434,39 +434,56 @@ impl Interpreter {
     }
 
     /// Final hidden class of an `arguments` object: index keys, `length`,
-    /// and `callee`, built through the ordinary transition table so every
-    /// arguments object of one arity shares a shape and stays IC-cacheable.
-    /// Uncached above the arity cap, but still shaped — the transition chain
-    /// itself is interned by the shape runtime.
+    /// `callee` and `@@iterator`, built through the ordinary transition table
+    /// so every arguments object of one arity shares a shape and stays
+    /// IC-cacheable. Uncached above the arity cap, but still shaped — the
+    /// transition chain itself is interned by the shape runtime.
     ///
     /// `parameter_map` selects the lineage whose state carries the
     /// mapped-arguments lookup fact: a sloppy object that aliases at least one
     /// formal starts from that state's root, so installing its ParameterMap
     /// never re-derives a private shape chain per object.
+    ///
+    /// A cached shape is reused while it still grows from the current realm's
+    /// `%Object.prototype%`, so a hit never resolves the root.
     fn arguments_object_shape(
         &mut self,
         stack: &ActivationStack,
         argc: usize,
         mapped: bool,
         parameter_map: bool,
+        iterator: Option<crate::symbol::JsSymbol>,
     ) -> Result<crate::object::ShapeHandle, VmError> {
         const CACHED_ARGC_MAX: usize = 64;
         // An arguments object's prototype is the realm's `%Object.prototype%`
         // (§10.4.4.6 step 2, §10.4.4.7 step 5); its root starts the chain.
         let object_prototype = self.object_prototype_object_opt();
+        let key = (
+            argc as u32,
+            crate::arguments_object::ArgumentsShapeKind::new(
+                mapped,
+                parameter_map,
+                iterator.is_some(),
+            ),
+        );
+        if argc <= CACHED_ARGC_MAX
+            && let Some(&shape) = self.arguments_shape_cache.get(&key)
+            && match crate::object::shape_body::prototype_of(shape) {
+                crate::object::shape_body::ShapePrototype::Object(prototype) => {
+                    Some(prototype) == object_prototype
+                }
+                _ => object_prototype.is_none(),
+            }
+        {
+            return Ok(shape);
+        }
         let state = crate::object::ShapeState::ORDINARY
             .with_lookup(crate::object::LookupFact::MappedArguments, parameter_map);
         let mut shape = self.object_root(
             object_prototype,
-            crate::object::inline_capacity_for(argc + 2),
+            crate::object::inline_capacity_for(argc + 2 + usize::from(iterator.is_some())),
             state,
         )?;
-        let key = (argc as u32, mapped, crate::object::shape_body::id_of(shape));
-        if argc <= CACHED_ARGC_MAX
-            && let Some(shape) = self.arguments_shape_cache.get(&key)
-        {
-            return Ok(*shape);
-        }
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             for &slot in &roots {
@@ -528,6 +545,19 @@ impl Interpreter {
                     )
                     .map_err(VmError::from)?
             };
+        }
+        if let Some(symbol) = iterator {
+            shape = self
+                .shape_runtime
+                .symbol_child_with_roots(
+                    &mut self.gc_heap,
+                    shape,
+                    symbol,
+                    hidden,
+                    false,
+                    &mut external_visit,
+                )
+                .map_err(VmError::from)?;
         }
         if argc <= CACHED_ARGC_MAX {
             self.arguments_shape_cache.insert(key, shape);
@@ -661,7 +691,7 @@ impl Interpreter {
             return None;
         }
         let mut context_register = None;
-        let entries: Vec<_> = function
+        let entries: SmallVec<[_; 4]> = function
             .mapped_argument_bindings
             .iter()
             .filter_map(|binding| {
@@ -673,7 +703,7 @@ impl Interpreter {
                 };
                 context_register = Some(reg);
                 Some(crate::object::MappedArgumentEntry {
-                    key: binding.argument_index.to_string(),
+                    index: u32::from(binding.argument_index),
                     slot,
                 })
             })
@@ -717,8 +747,13 @@ impl Interpreter {
                 let parameter_map = mapped
                     .as_ref()
                     .is_some_and(|(_, entries)| !entries.is_empty());
-                let shape =
-                    interp.arguments_object_shape(stack, elements_len, true, parameter_map)?;
+                let shape = interp.arguments_object_shape(
+                    stack,
+                    elements_len,
+                    true,
+                    parameter_map,
+                    iterator_method.map(|_| iterator_symbol),
+                )?;
                 let obj = interp.allocate_arguments_receiver(stack, shape)?;
                 // Allocation can relocate every pending argument. Read the
                 // canonical anchors only after the receiver exists.
@@ -728,7 +763,7 @@ impl Interpreter {
                     ..elements_start + elements_len)
                     .map(|index| interp.iteration_anchor(index))
                     .collect();
-                let iterator_descriptor = iterator_method.map(|_| (iterator_symbol, iterator_root));
+                let iterator_root = iterator_method.map(|_| iterator_root);
                 let mapped = match &mapped {
                     Some((anchor, entries)) => Some(crate::object::MappedArguments {
                         context: interp
@@ -745,27 +780,33 @@ impl Interpreter {
                     elements,
                     callee,
                     mapped,
-                    iterator_descriptor,
+                    iterator_root,
                     shape,
                 )?
             } else {
-                let shape = interp.arguments_object_shape(stack, elements_len, false, false)?;
-                let thrower = interp.restricted_throw_type_error()?;
-                let thrower_anchor = interp.push_iteration_anchor(thrower) - 1;
+                let shape = interp.arguments_object_shape(
+                    stack,
+                    elements_len,
+                    false,
+                    false,
+                    iterator_method.map(|_| iterator_symbol),
+                )?;
+                let callee = interp.restricted_callee_cell(stack)?;
+                let callee_cell_anchor = interp.push_iteration_anchor(callee) - 1;
                 let obj = interp.allocate_arguments_receiver(stack, shape)?;
-                let thrower = interp.iteration_anchor(thrower_anchor);
+                let callee = interp.iteration_anchor(callee_cell_anchor);
                 let iterator_root = interp.iteration_anchor(iterator_anchor);
                 let elements: SmallVec<[Value; 4]> = (elements_start
                     ..elements_start + elements_len)
                     .map(|index| interp.iteration_anchor(index))
                     .collect();
-                let iterator_descriptor = iterator_method.map(|_| (iterator_symbol, iterator_root));
+                let iterator_root = iterator_method.map(|_| iterator_root);
                 crate::arguments_object::initialize_unmapped(
                     obj,
                     &mut interp.gc_heap,
                     elements,
-                    thrower,
-                    iterator_descriptor,
+                    callee,
+                    iterator_root,
                     shape,
                 )?
             };
@@ -774,6 +815,30 @@ impl Interpreter {
         let result = collect(self);
         self.pop_iteration_anchors_to(anchor_base);
         result
+    }
+
+    /// The realm's shared `callee` accessor cell for unmapped arguments
+    /// objects, built on first use.
+    fn restricted_callee_cell(&mut self, stack: &ActivationStack) -> Result<Value, VmError> {
+        if let Some(cell) = self.realm_intrinsics.restricted_callee() {
+            return Ok(cell);
+        }
+        let thrower = self.restricted_throw_type_error()?;
+        let roots = self.collect_allocation_roots(stack);
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+        };
+        let cell = self.gc_heap.alloc_with_roots(
+            crate::object::AccessorCellBody {
+                getter: thrower,
+                setter: thrower,
+            },
+            &mut external_visit,
+        )?;
+        self.realm_intrinsics.set_restricted_callee(cell);
+        Ok(Value::from_object_gc(cell.raw()))
     }
 
     /// Allocate the slotless receiver whose footprint the arguments shape owns.
@@ -1043,7 +1108,7 @@ mod tests {
                     interp
                         .gc_heap()
                         .read_payload(object, crate::object::ObjectBody::inline_capacity),
-                    argc + 2,
+                    argc + 3,
                 );
                 assert_eq!(
                     crate::object::get_own(object, interp.gc_heap(), "length"),
@@ -1084,7 +1149,7 @@ mod tests {
                     interp
                         .gc_heap()
                         .read_payload(object, crate::object::ObjectBody::inline_capacity),
-                    argc + 2,
+                    argc + 3,
                 );
             });
         }

@@ -1345,8 +1345,13 @@ mod tests {
             crate::object::prototype_validity::chain_validity(prototype, vm.gc_heap()).unwrap();
         // Argument counts and shape identities are shared cache domains, even
         // when their numeric value happens to lie in the evicted fid range.
-        vm.arguments_shape_cache
-            .insert((first_evicted, false, shape_id), shape);
+        vm.arguments_shape_cache.insert(
+            (
+                first_evicted,
+                crate::arguments_object::ArgumentsShapeKind::new(false, false, true),
+            ),
+            shape,
+        );
 
         let mut method_sites = Vec::new();
         for context in [&before, &dynamic, &after] {
@@ -1531,8 +1536,10 @@ mod tests {
             surviving.map(|fid| (fid, 8)).into()
         );
         assert!(
-            vm.arguments_shape_cache
-                .contains_key(&(first_evicted, false, shape_id))
+            vm.arguments_shape_cache.contains_key(&(
+                first_evicted,
+                crate::arguments_object::ArgumentsShapeKind::new(false, false, true),
+            ))
         );
         for (base, site) in method_sites {
             if base == first_evicted {

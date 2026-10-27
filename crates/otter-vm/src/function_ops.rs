@@ -1327,22 +1327,13 @@ impl Interpreter {
     ) -> Option<SmallVec<[Value; 8]>> {
         let obj = value.as_object()?;
         let (shape, argc) = crate::object::arguments_direct_snapshot(obj, &self.gc_heap)?;
-        // The cached shapes grow from `%Object.prototype%` roots, which the
-        // prototype itself caches.
-        let crate::object::shape_body::ShapePrototype::Object(prototype) =
-            crate::object::shape_body::prototype_of(shape)
-        else {
-            return None;
-        };
-        let root = crate::object::shape_body::root_for_layout(
-            crate::object::cached_instance_root(prototype, &self.gc_heap)?,
-            crate::object::shape_body::inline_capacity_of(shape),
-            crate::object::ShapeState::ORDINARY,
-        )?;
-        let root_id = crate::object::shape_body::id_of(root);
-        let canonical = [true, false].into_iter().any(|mapped| {
+        // Only a cached final shape is canonical; argc names its arity.
+        let canonical = [false, true].into_iter().any(|mapped| {
             self.arguments_shape_cache
-                .get(&(argc as u32, mapped, root_id))
+                .get(&(
+                    argc as u32,
+                    crate::arguments_object::ArgumentsShapeKind::new(mapped, false, true),
+                ))
                 .is_some_and(|cached| cached.offset() == shape.offset())
         });
         if !canonical {

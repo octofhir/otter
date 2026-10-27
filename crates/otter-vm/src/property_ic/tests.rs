@@ -70,10 +70,7 @@ fn install_mapped_lookup(obj: &mut object::JsObject, heap: &mut otter_gc::GcHeap
         heap,
         object::MappedArguments {
             context,
-            entries: vec![object::MappedArgumentEntry {
-                key: "virtual".into(),
-                slot: 0,
-            }],
+            entries: smallvec::smallvec![object::MappedArgumentEntry { index: 7, slot: 0 }],
         },
     )
     .expect("actual mapped lookup installation");
@@ -859,13 +856,14 @@ fn storage_projection_codec_and_own_array_domain_are_disjoint() {
         Projection::Receiver,
         Projection::LookupStart,
         Projection::ArrayExpando,
+        Projection::TypedArrayStart,
     ] {
         assert_eq!(
             Projection::decode_key(projection.encode_key(128)),
             Some((projection, 128))
         );
     }
-    for invalid in [0, 1, 2, 3, 4, 127, 131, super::EMPTY_SHAPE] {
+    for invalid in [0, 1, 2, 3, 4, 127, 132, super::EMPTY_SHAPE] {
         assert_eq!(Projection::decode_key(invalid), None);
     }
     let mut heap = fresh_heap();

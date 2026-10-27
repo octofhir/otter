@@ -310,10 +310,7 @@ fn mapped_own_value_equal_write_through_and_rejection_do_not_allocate() {
             &mut vm.gc_heap,
             object::MappedArguments {
                 context: context_handle,
-                entries: vec![object::MappedArgumentEntry {
-                    key: "0".to_owned(),
-                    slot: 0,
-                }],
+                entries: smallvec::smallvec![object::MappedArgumentEntry { index: 0, slot: 0 }],
             },
         )
         .unwrap();

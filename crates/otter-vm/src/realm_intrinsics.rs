@@ -293,6 +293,10 @@ pub(crate) struct RealmIntrinsics {
     typed_array_constructors: [crate::native_function::NativeFunction; TYPED_ARRAY_KINDS],
     /// The original `get %TypedArray%[@@species]`.
     typed_array_species: crate::native_function::NativeFunction,
+    /// The accessor pair of every unmapped arguments object's `callee`:
+    /// `%ThrowTypeError%` as getter and setter. The property is
+    /// non-configurable, so the pair never changes and one cell serves all.
+    restricted_callee: otter_gc::Gc<crate::object::AccessorCellBody>,
     /// Whether this realm's `%RegExp.prototype%` is built-in, while proven.
     pub(crate) regexp_protocol: Option<crate::regexp_fast::RegExpProtocolProof>,
     /// Whether this realm's `%Promise.prototype%` is built-in, while proven.
@@ -322,6 +326,7 @@ impl Default for RealmIntrinsics {
             typed_array_species: crate::native_function::NativeFunction::from_gc(
                 otter_gc::Gc::null(),
             ),
+            restricted_callee: otter_gc::Gc::null(),
             regexp_protocol: None,
             promise_protocol: None,
             iteration: crate::iteration_protocol::IterationProofs::default(),
@@ -408,6 +413,20 @@ impl RealmIntrinsics {
         &self,
     ) -> Option<crate::native_function::NativeFunction> {
         (!self.typed_array_species.raw().is_null()).then_some(self.typed_array_species)
+    }
+
+    /// The shared `callee` accessor cell of unmapped arguments objects, once
+    /// built.
+    pub(crate) fn restricted_callee(&self) -> Option<crate::Value> {
+        (!self.restricted_callee.raw().is_null())
+            .then(|| crate::Value::from_object_gc(self.restricted_callee.raw()))
+    }
+
+    pub(crate) fn set_restricted_callee(
+        &mut self,
+        cell: otter_gc::Gc<crate::object::AccessorCellBody>,
+    ) {
+        self.restricted_callee = cell;
     }
 
     /// Original canonical callable, independent of mutable global properties.
@@ -527,6 +546,11 @@ impl RealmIntrinsics {
             constructor.trace_gc_roots(visitor);
         }
         self.typed_array_species.trace_gc_roots(visitor);
+        visitor(
+            std::ptr::from_ref(&self.restricted_callee)
+                .cast_mut()
+                .cast(),
+        );
     }
 
     /// Trace cached prototype handles as root slots.
@@ -555,6 +579,13 @@ impl RealmIntrinsics {
             if !native.raw().is_null() {
                 native.trace_gc_roots(visitor);
             }
+        }
+        if !self.restricted_callee.raw().is_null() {
+            visitor(
+                std::ptr::from_ref(&self.restricted_callee)
+                    .cast_mut()
+                    .cast(),
+            );
         }
     }
 

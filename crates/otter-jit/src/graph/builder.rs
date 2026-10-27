@@ -1923,6 +1923,23 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Whether `SetPrototype` sets `null` on an object this body just
+    /// allocated empty that nothing has read yet: the literal's own object,
+    /// before its first property.
+    fn null_prototype_literal(&self, instruction: &Instruction) -> bool {
+        let [target, prototype] = [instruction.reads[0], instruction.reads[1]]
+            .map(|register| self.frame[usize::from(register)]);
+        self.view.literal_allocations.null_object.is_some()
+            && self.graph.node(target).kind == Kind::NewObject
+            && self.graph.node(prototype).kind
+                == Kind::ConstTagged(otter_vm::Value::null().to_bits())
+            && !self
+                .graph
+                .nodes
+                .iter()
+                .any(|node| node.inputs.contains(&target))
+    }
+
     fn constant_tagged(&mut self, bits: u64) -> NodeId {
         self.graph.constant(Kind::ConstTagged(bits))
     }
@@ -2160,6 +2177,13 @@ impl<'a> Builder<'a> {
                 let value = self.add(Kind::NewObject, &[], Repr::Tagged);
                 self.prove_ordinary_object(value);
                 self.write(instruction.writes[0], value);
+            }
+            // `{ __proto__: null, ... }`: the literal's fresh, still empty
+            // object takes the null-prototype root shape at allocation.
+            Op::SetPrototype if self.null_prototype_literal(instruction) => {
+                let value = self.add(Kind::NewNullPrototypeObject, &[], Repr::Tagged);
+                self.prove_ordinary_object(value);
+                self.write(instruction.reads[0], value);
             }
             // A rest parameter of the physical activation: a spliced body's
             // actuals are its caller's values, which the baseline operation

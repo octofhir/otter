@@ -2083,10 +2083,11 @@ pub extern "C" fn strict_eq_leaf(
     NativeResultPair::success(Value::boolean(eq))
 }
 
-/// §13.10.2 InstanceofOperator for a native-function target without running
-/// JavaScript. Its `@@hasInstance` is `%Function.prototype%`'s, which is
-/// non-writable and non-configurable, when the target has no own
-/// `@@hasInstance` and no `[[Prototype]]` override; then a primitive
+/// §13.10.2 InstanceofOperator for a native-function or closure target
+/// without running JavaScript. Its `@@hasInstance` is `%Function.prototype%`'s,
+/// which is non-writable and non-configurable, when no function on its
+/// `[[Prototype]]` chain owns one: a native without an override, or closures
+/// re-parented onto closures down to an ordinary one; then a primitive
 /// is no instance, and an ordinary object is one when its chain of ordinary
 /// objects reaches the target's own data `prototype`, any object. A proxy or
 /// other exotic link before it, an accessor or a non-object `prototype`
@@ -2102,29 +2103,38 @@ pub extern "C" fn instanceof_leaf(
         return NativeResultPair::miss();
     };
     let value = Value::from_abi_bits(value_bits);
-    let Some(native) = Value::from_abi_bits(target_bits).as_native_function() else {
-        return NativeResultPair::miss();
+    let target = Value::from_abi_bits(target_bits);
+    let prototype = if let Some(closure) = target.as_closure(heap) {
+        let Some(prototype) = default_has_instance_prototype(heap, closure) else {
+            return NativeResultPair::miss();
+        };
+        prototype
+    } else {
+        let Some(native) = target.as_native_function() else {
+            return NativeResultPair::miss();
+        };
+        let bag = native.own_properties_bag(heap);
+        if native.has_prototype_override(heap)
+            || bag.is_null()
+            || crate::object::has_own_well_known_symbol(
+                bag,
+                heap,
+                crate::symbol::WellKnown::HasInstance,
+            )
+        {
+            return NativeResultPair::miss();
+        }
+        let crate::object::PropertyLookup::Data {
+            value: prototype, ..
+        } = crate::object::lookup_own(bag, heap, "prototype")
+        else {
+            return NativeResultPair::miss();
+        };
+        prototype
     };
-    let bag = native.own_properties_bag(heap);
-    if native.has_prototype_override(heap)
-        || bag.is_null()
-        || crate::object::has_own_well_known_symbol(
-            bag,
-            heap,
-            crate::symbol::WellKnown::HasInstance,
-        )
-    {
-        return NativeResultPair::miss();
-    }
     if !value.is_object_type() {
         return NativeResultPair::success(Value::boolean(false));
     }
-    let crate::object::PropertyLookup::Data {
-        value: prototype, ..
-    } = crate::object::lookup_own(bag, heap, "prototype")
-    else {
-        return NativeResultPair::miss();
-    };
     // `Array.prototype` and its kin are exotic objects: the target's
     // prototype is compared by identity, whatever object it is.
     let (true, Some(mut current)) = (prototype.is_object_type(), value.as_object()) else {
@@ -2143,6 +2153,42 @@ pub extern "C" fn instanceof_leaf(
         current = next;
     }
     NativeResultPair::miss()
+}
+
+/// The `prototype` an `instanceof` with the closure `target` searches for,
+/// when its `@@hasInstance` is the default: no closure on the function chain
+/// owns one, and the chain ends at a closure whose [[Prototype]] is the
+/// ordinary `%Function.prototype%`, whose `@@hasInstance` is non-writable and
+/// non-configurable. Its `prototype` must be an allocated object; anything
+/// else is `None` and completes in the runtime.
+fn default_has_instance_prototype(
+    heap: &otter_gc::GcHeap,
+    target: crate::closure::JsClosure,
+) -> Option<Value> {
+    let (prototype, _) = target.prototype_slot(heap)?;
+    if !prototype.is_object_type() {
+        return None;
+    }
+    let mut current = target;
+    for _ in 0..crate::object::PROTO_CHAIN_HARD_CAP {
+        if let Some(bag) = current.own_props(heap)
+            && crate::object::has_own_well_known_symbol(
+                bag,
+                heap,
+                crate::symbol::WellKnown::HasInstance,
+            )
+        {
+            return None;
+        }
+        match current.proto_override(heap) {
+            Some(next) => current = next.as_closure(heap)?,
+            None => {
+                let ordinary = current.named_lookup(heap) & crate::closure::CLOSURE_LOOKUP_ORDINARY;
+                return (ordinary != 0).then_some(prototype);
+            }
+        }
+    }
+    None
 }
 
 /// One numeric unary builtin, reached through the declared leaf ABI.

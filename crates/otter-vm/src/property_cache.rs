@@ -840,6 +840,24 @@ impl crate::Interpreter {
         true
     }
 
+    /// The `[[Prototype]]` a closure's own-property bag takes for the
+    /// function's `[[Prototype]]` `prototype`. A closure with a bag or a class
+    /// stands for itself by its bag or statics, so a re-parented constructor's
+    /// lookup is one chain of ordinary objects the property caches walk; the
+    /// keys a function synthesizes (`name`, `length`, `prototype`, `caller`,
+    /// `arguments`) never resolve along it. Any other value is itself.
+    pub(crate) fn function_lookup_parent(&self, prototype: crate::Value) -> crate::Value {
+        if let Some(closure) = prototype.as_closure(&self.gc_heap) {
+            return closure
+                .own_props(&self.gc_heap)
+                .map_or(prototype, crate::Value::object);
+        }
+        if let Some(class) = prototype.as_class_constructor() {
+            return crate::Value::object(class.statics(&self.gc_heap));
+        }
+        prototype
+    }
+
     /// The property bag a closure, native function or class constructor (its
     /// statics) keeps its own named properties in, when present and in the
     /// default realm (for a native, with no `[[Prototype]]` override).
@@ -1040,6 +1058,11 @@ impl crate::Interpreter {
             return Some(start);
         }
         let prototype = self.get_prototype_for_op(&receiver).ok()?;
+        let prototype = if native {
+            prototype
+        } else {
+            self.function_lookup_parent(prototype)
+        };
         let mirrored = match object::prototype_value(start, &self.gc_heap) {
             Some(bag_prototype) => bag_prototype == prototype,
             None => prototype.is_null(),

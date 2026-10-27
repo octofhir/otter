@@ -537,7 +537,9 @@ impl<'a> Codegen<'a> {
             Kind::PrimitiveAdd => self.emit_primitive_add(node)?,
             Kind::BigIntBinary(operator) => self.emit_bigint_binary(node, *operator)?,
             Kind::PrimitiveCompare(condition) => self.emit_primitive_compare(node, *condition)?,
-            Kind::NewObject | Kind::NewArrayEmpty => self.emit_empty_allocation(node)?,
+            Kind::NewObject | Kind::NewNullPrototypeObject | Kind::NewArrayEmpty => {
+                self.emit_empty_allocation(node)?
+            }
             Kind::NewObjectLiteral { .. } | Kind::NewArrayLiteral => {
                 self.emit_literal_allocation(node)?
             }

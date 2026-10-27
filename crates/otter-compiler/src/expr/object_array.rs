@@ -484,6 +484,15 @@ pub(crate) fn compile_object_literal(
                         });
                     }
                     let value_reg = compile_expr(cx, &p.value, key_span)?;
+                    // A literal `null` is always applied.
+                    if matches!(p.value, Expression::NullLiteral(_)) {
+                        cx.emit(
+                            Op::SetPrototype,
+                            [Operand::Register(dst), Operand::Register(value_reg)],
+                            key_span,
+                        );
+                        continue;
+                    }
                     let type_reg = cx.alloc_scratch();
                     cx.emit(
                         Op::TypeOf,

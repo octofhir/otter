@@ -1667,6 +1667,7 @@ impl Interpreter {
                 // closure does not synthesize: property ICs use it as the
                 // function's map.
                 let prototype = interp.get_prototype_for_op(&closure_value)?;
+                let prototype = interp.function_lookup_parent(prototype);
                 let bag = interp.alloc_stack_rooted_object_with_prototype_value(
                     stack,
                     &mut [&mut closure_value],

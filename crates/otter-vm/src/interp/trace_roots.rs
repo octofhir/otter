@@ -188,12 +188,14 @@ impl Interpreter {
                 }
                 None => closure.clear_proto_override(&mut self.gc_heap),
             }
-            // The own-property bag mirrors the function's [[Prototype]]: the
-            // property caches key a function's lookup on the bag's shape.
+            // The own-property bag mirrors the function's [[Prototype]] (see
+            // `function_lookup_parent`): the property caches key a function's
+            // lookup on the bag's shape.
             if let Some(closure) = closure_value.as_closure(&self.gc_heap)
                 && let Some(mut bag) = closure.own_props(&self.gc_heap)
                 && let Ok(prototype) = self.get_prototype_for_op(&closure_value)
             {
+                let prototype = self.function_lookup_parent(prototype);
                 let _ = object::set_prototype_value(&mut bag, &mut self.gc_heap, Some(prototype));
             }
             return;

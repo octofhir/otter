@@ -537,7 +537,11 @@ impl JsClosure {
         let empty = crate::object::with_properties(bag, heap, |properties| {
             properties.keys().next().is_none() && properties.symbol_keys().next().is_none()
         });
-        if !empty || !crate::object::is_extensible(bag, heap) {
+        // Another function's bag may take this one as its prototype.
+        if !empty
+            || !crate::object::is_extensible(bag, heap)
+            || crate::object::state(bag, heap).is_prototype()
+        {
             return;
         }
         let Some(rare) = self.rare(heap) else {

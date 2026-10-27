@@ -914,6 +914,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::AllocationGroup(_)
         | K::AllocationProjection(_)
         | K::NewObject
+        | K::NewNullPrototypeObject
         | K::NewArrayEmpty
         | K::NewObjectLiteral { .. }
         | K::NewArrayLiteral

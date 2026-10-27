@@ -38,6 +38,9 @@ pub struct JitLiteralAllocationPlans {
     pub group_allowed: bool,
     /// Rooted intrinsic ordinary-object shape; absent before VM preparation.
     pub object: Option<JitEmptyObjectAllocationPlan>,
+    /// Rooted empty `null`-prototype shape, prepared for a body that sets an
+    /// object literal's prototype; absent otherwise.
+    pub null_object: Option<JitEmptyObjectAllocationPlan>,
     /// Layout of the default-realm bare empty array shell.
     pub array: JitEmptyArrayAllocationPlan,
     /// Final static object layouts by own logical instruction PC.

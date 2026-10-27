@@ -1465,6 +1465,12 @@ impl Interpreter {
                         .ok()?;
                     view.literal_allocations.object = plan;
                 }
+                Op::SetPrototype if view.literal_allocations.null_object.is_none() => {
+                    let root = self.null_prototype_root();
+                    view.literal_allocations.null_object = self
+                        .bake_shape(root)
+                        .map(jit::JitEmptyObjectAllocationPlan::new);
+                }
                 Op::NewObjectLiteral => {
                     let site = self.jit_allocation_site(view.code_block.allocation_site_at(pc));
                     view.literal_allocations

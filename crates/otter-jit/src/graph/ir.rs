@@ -334,6 +334,9 @@ pub(crate) enum Kind {
     AllocationProjection(u32),
     /// Fresh ordinary empty object in this exact source body's realm.
     NewObject,
+    /// Fresh empty object whose `[[Prototype]]` is `null`: an object literal
+    /// opening with `__proto__: null`.
+    NewNullPrototypeObject,
     /// Fresh empty array shell; extra realms use the committed sidecar allocator.
     NewArrayEmpty,
     /// Static own-property values initialized from canonical tagged homes.
@@ -1167,6 +1170,7 @@ impl Kind {
             // An allocation whose collecting miss can throw only the
             // out-of-memory RangeError.
             Self::NewObject
+            | Self::NewNullPrototypeObject
             | Self::NewArrayEmpty
             | Self::NewObjectLiteral { .. }
             | Self::NewArrayLiteral => Properties {
@@ -1339,6 +1343,7 @@ impl Kind {
             ],
             Self::ArrayPop(_) => &[abi::STUB_ARRAY_POP_LEAF],
             Self::NewObject => &[abi::STUB_JIT_NEW_OBJECT],
+            Self::NewNullPrototypeObject => &[abi::STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT],
             Self::NewArrayEmpty | Self::NewArrayLiteral => &[abi::STUB_JIT_NEW_ARRAY],
             Self::NewObjectLiteral { .. } => &[
                 abi::STUB_JIT_NEW_OBJECT_LITERAL,
@@ -1426,7 +1431,10 @@ impl Kind {
             },
             Self::PrimitiveCompare(_) => simple(2, ResultPolicy::Register),
             Self::AllocationProjection(_) => simple(1, ResultPolicy::Register),
-            Self::AllocationGroup(_) | Self::NewObject | Self::NewArrayEmpty => Constraints {
+            Self::AllocationGroup(_)
+            | Self::NewObject
+            | Self::NewNullPrototypeObject
+            | Self::NewArrayEmpty => Constraints {
                 inputs: SmallVec::new(),
                 result: ResultPolicy::Register,
                 gp_temps: 4,

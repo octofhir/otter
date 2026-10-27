@@ -4679,9 +4679,7 @@ pub(crate) fn has_own_well_known_symbol(
     tag: crate::symbol::WellKnown,
 ) -> bool {
     heap.read_payload(obj, |body| {
-        symbol_slots::shaped_symbols(heap, body)
-            .iter()
-            .any(|(key, _)| key.well_known_tag() == Some(tag))
+        symbol_slots::has_shaped_well_known(heap, body, tag)
             || body
                 .symbol_props()
                 .iter()

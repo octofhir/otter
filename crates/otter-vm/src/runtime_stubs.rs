@@ -2086,12 +2086,12 @@ pub extern "C" fn strict_eq_leaf(
 /// §13.10.2 InstanceofOperator for a native-function or closure target
 /// without running JavaScript. Its `@@hasInstance` is `%Function.prototype%`'s,
 /// which is non-writable and non-configurable, when no function on its
-/// `[[Prototype]]` chain owns one: a native without an override, or closures
-/// re-parented onto closures down to an ordinary one; then a primitive
-/// is no instance, and an ordinary object is one when its chain of ordinary
-/// objects reaches the target's own data `prototype`, any object. A proxy or
-/// other exotic link before it, an accessor or a non-object `prototype`
-/// misses.
+/// `[[Prototype]]` chain owns one: closures, classes and natives re-parented
+/// onto each other down to an ordinary one; then a primitive is no instance, and an
+/// ordinary object, or a typed array with a subclass prototype, is one when
+/// its chain of ordinary objects reaches the target's own data `prototype`,
+/// any object. A proxy or other exotic link before it, an accessor or a
+/// non-object `prototype` misses.
 #[must_use]
 pub extern "C" fn instanceof_leaf(
     heap: *const otter_gc::GcHeap,
@@ -2104,41 +2104,36 @@ pub extern "C" fn instanceof_leaf(
     };
     let value = Value::from_abi_bits(value_bits);
     let target = Value::from_abi_bits(target_bits);
-    let prototype = if let Some(closure) = target.as_closure(heap) {
-        let Some(prototype) = default_has_instance_prototype(heap, closure) else {
-            return NativeResultPair::miss();
-        };
-        prototype
-    } else {
-        let Some(native) = target.as_native_function() else {
-            return NativeResultPair::miss();
-        };
-        let bag = native.own_properties_bag(heap);
-        if native.has_prototype_override(heap)
-            || bag.is_null()
-            || crate::object::has_own_well_known_symbol(
-                bag,
-                heap,
-                crate::symbol::WellKnown::HasInstance,
-            )
-        {
-            return NativeResultPair::miss();
-        }
-        let crate::object::PropertyLookup::Data {
-            value: prototype, ..
-        } = crate::object::lookup_own(bag, heap, "prototype")
-        else {
-            return NativeResultPair::miss();
-        };
-        prototype
+    let Some(prototype) = default_has_instance_prototype(heap, target) else {
+        return NativeResultPair::miss();
     };
     if !value.is_object_type() {
         return NativeResultPair::success(Value::boolean(false));
     }
     // `Array.prototype` and its kin are exotic objects: the target's
     // prototype is compared by identity, whatever object it is.
-    let (true, Some(mut current)) = (prototype.is_object_type(), value.as_object()) else {
+    if !prototype.is_object_type() {
         return NativeResultPair::miss();
+    }
+    // A typed array with a subclass prototype (a Buffer) enters the chain
+    // through that prototype; its realm default stays unknown here.
+    let mut current = match value.as_object() {
+        Some(object) => object,
+        None => {
+            let Some(next) = value
+                .as_typed_array(heap)
+                .and_then(|array| array.custom_proto(heap))
+            else {
+                return NativeResultPair::miss();
+            };
+            if next == prototype {
+                return NativeResultPair::success(Value::boolean(true));
+            }
+            let Some(next) = next.as_object() else {
+                return NativeResultPair::miss();
+            };
+            next
+        }
     };
     for _ in 0..crate::object::PROTO_CHAIN_HARD_CAP {
         let Some(next) = crate::object::prototype_value(current, heap) else {
@@ -2155,38 +2150,85 @@ pub extern "C" fn instanceof_leaf(
     NativeResultPair::miss()
 }
 
-/// The `prototype` an `instanceof` with the closure `target` searches for,
-/// when its `@@hasInstance` is the default: no closure on the function chain
-/// owns one, and the chain ends at a closure whose [[Prototype]] is the
-/// ordinary `%Function.prototype%`, whose `@@hasInstance` is non-writable and
-/// non-configurable. Its `prototype` must be an allocated object; anything
-/// else is `None` and completes in the runtime.
-fn default_has_instance_prototype(
-    heap: &otter_gc::GcHeap,
-    target: crate::closure::JsClosure,
-) -> Option<Value> {
-    let (prototype, _) = target.prototype_slot(heap)?;
-    if !prototype.is_object_type() {
-        return None;
-    }
-    let mut current = target;
-    for _ in 0..crate::object::PROTO_CHAIN_HARD_CAP {
-        if let Some(bag) = current.own_props(heap)
-            && crate::object::has_own_well_known_symbol(
-                bag,
-                heap,
-                crate::symbol::WellKnown::HasInstance,
-            )
-        {
+/// The `prototype` an `instanceof` with the function `target` searches for,
+/// when its `@@hasInstance` is the default: no closure, class or native on
+/// the function chain owns one, and the chain ends at a function whose
+/// [[Prototype]] is the ordinary `%Function.prototype%`, whose `@@hasInstance`
+/// is non-writable and non-configurable. A class's own properties live on
+/// its statics and its link in `ctor_proto`; a builtin constructor's in its
+/// override chain. Any other
+/// link is `None` and completes in the runtime.
+fn default_has_instance_prototype(heap: &otter_gc::GcHeap, target: Value) -> Option<Value> {
+    let prototype = if let Some(closure) = target.as_closure(heap) {
+        closure.prototype_slot(heap)?.0
+    } else if let Some(class) = target.as_class_constructor() {
+        // A class's `prototype` is non-writable and non-configurable.
+        Value::object(class.prototype(heap))
+    } else {
+        let native = target.as_native_function()?;
+        let bag = native.own_properties_bag(heap);
+        if bag.is_null() {
             return None;
         }
-        match current.proto_override(heap) {
-            Some(next) => current = next.as_closure(heap)?,
-            None => {
-                let ordinary = current.named_lookup(heap) & crate::closure::CLOSURE_LOOKUP_ORDINARY;
-                return (ordinary != 0).then_some(prototype);
+        let crate::object::PropertyLookup::Data { value, .. } =
+            crate::object::lookup_own(bag, heap, "prototype")
+        else {
+            return None;
+        };
+        value
+    };
+    let mut current = target;
+    for _ in 0..crate::object::PROTO_CHAIN_HARD_CAP {
+        let next = if let Some(closure) = current.as_closure(heap) {
+            if let Some(bag) = closure.own_props(heap)
+                && crate::object::has_own_well_known_symbol(
+                    bag,
+                    heap,
+                    crate::symbol::WellKnown::HasInstance,
+                )
+            {
+                return None;
             }
-        }
+            match closure.proto_override(heap) {
+                Some(next) => next,
+                None => {
+                    let ordinary =
+                        closure.named_lookup(heap) & crate::closure::CLOSURE_LOOKUP_ORDINARY;
+                    return (ordinary != 0).then_some(prototype);
+                }
+            }
+        } else if let Some(class) = current.as_class_constructor() {
+            if crate::object::has_own_well_known_symbol(
+                class.statics(heap),
+                heap,
+                crate::symbol::WellKnown::HasInstance,
+            ) {
+                return None;
+            }
+            // A base class's [[Prototype]] is `%Function.prototype%`.
+            let next = class.ctor_proto(heap);
+            if next.is_undefined() {
+                return Some(prototype);
+            }
+            next
+        } else {
+            let native = current.as_native_function()?;
+            let bag = native.own_properties_bag(heap);
+            if bag.is_null()
+                || crate::object::has_own_well_known_symbol(
+                    bag,
+                    heap,
+                    crate::symbol::WellKnown::HasInstance,
+                )
+            {
+                return None;
+            }
+            match native.prototype_override(heap) {
+                Some(next) => next,
+                None => return Some(prototype),
+            }
+        };
+        current = next;
     }
     None
 }

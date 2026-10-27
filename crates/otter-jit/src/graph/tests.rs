@@ -820,7 +820,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::CallApplyArray { pc: 0 },
         Kind::CheckFunctionPrototypeCall(0),
         Kind::CheckGuardedMethod(0),
-        Kind::CheckNative(0),
+        Kind::CheckNative(0, DeoptReason::WrongValue),
         Kind::CheckArgumentsElided,
         Kind::LoadArgumentCount,
         Kind::LoadActualArgument,
@@ -1018,7 +1018,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::CallApplyArray { .. }
         | K::CheckFunctionPrototypeCall(_)
         | K::CheckGuardedMethod(_)
-        | K::CheckNative(_)
+        | K::CheckNative(..)
         | K::CheckArgumentsElided
         | K::CheckStackHeadroom
         | K::LoadArgumentCount

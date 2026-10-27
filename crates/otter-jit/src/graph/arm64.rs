@@ -2473,10 +2473,10 @@ impl<'a> Codegen<'a> {
                 self.emit_call_apply_array(node, temps)?;
             }
             Kind::NativeLeaf(stub) => self.emit_native_leaf(node, *stub)?,
-            Kind::CheckNative(native_ref) => {
+            Kind::CheckNative(native_ref, reason) => {
                 let value = Self::gp(input(0));
-                let native_ref = *native_ref;
-                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                let (native_ref, reason) = (*native_ref, *reason);
+                let exit = self.eager_exit(node, reason);
                 self.emit_native_identity(value, native_ref, exit);
             }
             Kind::CheckArgumentsElided => {

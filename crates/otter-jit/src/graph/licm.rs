@@ -163,7 +163,7 @@ fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
         Kind::CheckFunction { .. }
         | Kind::LoadClassConstructor
         | Kind::CheckCellValue(_)
-        | Kind::CheckNative(_)
+        | Kind::CheckNative(..)
         | Kind::CheckFunctionPrototypeCall(_)
         | Kind::CheckGuardedMethod(_)
         | Kind::CheckClosureContext(_) => &[R::IdentityGuard],

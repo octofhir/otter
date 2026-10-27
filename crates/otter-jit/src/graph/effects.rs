@@ -250,7 +250,7 @@ fn proves_inputs(kind: &Kind) -> bool {
         | Kind::CheckFunction { .. }
         | Kind::LoadClassConstructor
         | Kind::CheckCellValue(_)
-        | Kind::CheckNative(_)
+        | Kind::CheckNative(..)
         | Kind::CheckFunctionPrototypeCall(_)
         | Kind::CheckGuardedMethod(_)
         | Kind::CheckClosureContext(_) => true,
@@ -333,7 +333,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::CheckNumber
         | Kind::CheckNotNullish { .. }
         | Kind::CheckBounds
-        | Kind::CheckNative(_)
+        | Kind::CheckNative(..)
         | Kind::CheckFunction { .. }
         | Kind::LoadClassConstructor
         | Kind::CheckCellValue(_)

@@ -126,8 +126,8 @@ impl Codegen<'_> {
                 self.emit_hole_bit(holes, input(0), input(1));
                 dynasm!(self.ops ; .arch x64 ; jc =>exit);
             }
-            Kind::CheckNative(identity) => {
-                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+            Kind::CheckNative(identity, reason) => {
+                let exit = self.eager_exit(node, reason);
                 self.emit_native_identity(input(0), identity, exit);
             }
             Kind::CheckArgumentsElided => {

@@ -191,7 +191,7 @@ fn math_leaves_are_float64_arithmetic_on_the_evaluated_operands() {
             graph
                 .nodes
                 .iter()
-                .any(|node| matches!(node.kind, Kind::CheckNative(73)))
+                .any(|node| matches!(node.kind, Kind::CheckNative(73, _)))
         );
     }
 }
@@ -227,7 +227,7 @@ fn builder_preserves_evaluated_receiver_operands_and_exact_eager_call_pc() {
         graph
             .nodes
             .iter()
-            .any(|node| matches!(node.kind, Kind::CheckNative(73)))
+            .any(|node| matches!(node.kind, Kind::CheckNative(73, _)))
     );
     assert!(
         !graph

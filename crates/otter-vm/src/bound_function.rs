@@ -213,6 +213,23 @@ impl BoundFunction {
     }
 }
 
+/// SetFunctionName(F, targetName, "bound"): an ASCII name is assembled on the
+/// stack, without an intermediate string.
+fn bound_name(
+    target_name: &str,
+    heap: &mut otter_gc::GcHeap,
+) -> Result<crate::string::JsString, otter_gc::OutOfMemory> {
+    const PREFIX: &[u8] = b"bound ";
+    let mut buffer = [0u8; 128];
+    let length = PREFIX.len() + target_name.len();
+    if target_name.is_ascii() && length <= buffer.len() {
+        buffer[..PREFIX.len()].copy_from_slice(PREFIX);
+        buffer[PREFIX.len()..length].copy_from_slice(target_name.as_bytes());
+        return crate::string::JsString::from_latin1(&buffer[..length], heap);
+    }
+    crate::string::JsString::from_str(&format!("bound {target_name}"), heap)
+}
+
 impl Interpreter {
     /// Allocate the fixed-layout bound callable with every input scoped across
     /// property-bag, argument-slab and callable-body allocations.
@@ -221,19 +238,19 @@ impl Interpreter {
         target: Value,
         bound_this: Value,
         bound_args: &[Value],
-        metadata: function_metadata::BoundFunctionCreateMetadata,
+        metadata: function_metadata::BoundFunctionCreateMetadata<'_>,
         prototype: Option<Value>,
     ) -> Result<BoundFunction, VmError> {
         self.with_handle_scope(|interp, scope| {
             let target = interp.scoped_value(scope, target);
             let receiver = interp.scoped_value(scope, bound_this);
             let prototype = prototype.map(|value| interp.scoped_value(scope, value));
-            let args: Vec<_> = bound_args
+            let args: SmallVec<[_; 4]> = bound_args
                 .iter()
                 .copied()
                 .map(|value| interp.scoped_value(scope, value))
                 .collect();
-            let name = crate::string::JsString::from_str(&metadata.name, &mut interp.gc_heap)?;
+            let name = bound_name(&metadata.target_name, &mut interp.gc_heap)?;
             let name = interp.scoped_value(scope, Value::string(name));
             let default_prototype = interp.function_prototype_object().ok().map(Value::object);
             let prototype =
@@ -241,7 +258,8 @@ impl Interpreter {
             let own_properties =
                 object::alloc_dictionary_object_with_roots(&mut interp.gc_heap, &mut |_| {})?;
             let own_properties = interp.scoped_value(scope, Value::object(own_properties));
-            let mut values: Vec<_> = args.iter().map(|arg| interp.escape_scoped(*arg)).collect();
+            let mut values: SmallVec<[Value; 4]> =
+                args.iter().map(|arg| interp.escape_scoped(*arg)).collect();
             let bound_args =
                 crate::value_slab::slab_from_values(&mut interp.gc_heap, &mut values, &mut |_| {})?;
             let body = BoundFunctionBody {

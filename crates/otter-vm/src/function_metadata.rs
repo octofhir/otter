@@ -49,9 +49,10 @@ pub(crate) struct FunctionMetadataContext<'a> {
 }
 
 /// Builtin metadata captured when `Function.prototype.bind` creates a wrapper.
-pub(crate) struct BoundFunctionCreateMetadata {
-    /// Computed `name` value.
-    pub(crate) name: String,
+pub(crate) struct BoundFunctionCreateMetadata<'a> {
+    /// The target's name; the bound function's `name` is `"bound "`
+    /// followed by it.
+    pub(crate) target_name: std::borrow::Cow<'a, str>,
     /// Computed `length` value.
     pub(crate) length: NumberValue,
 }
@@ -396,7 +397,7 @@ pub(crate) fn bound_create_metadata_from_values(
     target_length: &Value,
     bound_arg_count: usize,
     heap: &otter_gc::GcHeap,
-) -> BoundFunctionCreateMetadata {
+) -> BoundFunctionCreateMetadata<'static> {
     let target_name = target_name
         .as_string(heap)
         .map(|s| s.to_lossy_string(heap))
@@ -407,9 +408,56 @@ pub(crate) fn bound_create_metadata_from_values(
         .unwrap_or(0.0);
     let length = (target_len - bound_arg_count as f64).max(0.0);
     BoundFunctionCreateMetadata {
-        name: format!("bound {target_name}"),
+        target_name: target_name.into(),
         length: number_from_length_value(length),
     }
+}
+
+/// §20.2.3.2 steps 3–6 for a closure whose `length` and `name` are still the
+/// intrinsic own data properties of its function record: HasOwnProperty and
+/// both Gets observe nothing, so the bound function's metadata comes straight
+/// from that record. `None` when either was redefined or deleted.
+#[must_use]
+pub(crate) fn intrinsic_closure_bind_metadata<'a>(
+    context: &'a ExecutionContext,
+    heap: &otter_gc::GcHeap,
+    closure: crate::closure::JsClosure,
+    bound_arg_count: usize,
+) -> Option<BoundFunctionCreateMetadata<'a>> {
+    if closure.metadata_deleted(heap, "name") || closure.metadata_deleted(heap, "length") {
+        return None;
+    }
+    if let Some(bag) = closure.own_props(heap)
+        && ["name", "length"].iter().any(|key| {
+            !matches!(
+                object::lookup_own(bag, heap, key),
+                object::PropertyLookup::Absent
+            )
+        })
+    {
+        return None;
+    }
+    let function_id = closure.cached_function_id;
+    // A lazily compiled body keeps its call-visible name and length on the
+    // declaring chunk's record.
+    let (name, length): (std::borrow::Cow<'a, str>, u32) = match context.function(function_id) {
+        Some(function) => (function.name.as_str().into(), u32::from(function.length)),
+        None => {
+            let owner = context.for_function(function_id).ok()?;
+            let function = owner.function(function_id)?;
+            (function.name.clone().into(), u32::from(function.length))
+        }
+    };
+    let name = if is_anon_name_placeholder(&name) {
+        std::borrow::Cow::Borrowed("")
+    } else {
+        name
+    };
+    let length = (f64::from(length) - bound_arg_count as f64).max(0.0);
+    Some(BoundFunctionCreateMetadata {
+        target_name: name,
+        length: number_from_length_value(length),
+    })
 }
 
 fn callable_metadata_value(

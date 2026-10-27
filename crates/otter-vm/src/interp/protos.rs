@@ -475,6 +475,13 @@ impl Interpreter {
                 if let Some(over) = self.ordinary_function_prototype_override(owner, function_id) {
                     return Ok(over);
                 }
+                // A closure records whether its kind is the ordinary one.
+                if owner.is_some_and(|closure| {
+                    closure.named_lookup(&self.gc_heap) & crate::closure::CLOSURE_LOOKUP_ORDINARY
+                        != 0
+                }) {
+                    return Ok(Value::object(self.function_prototype_object()?));
+                }
                 if let crate::code_space::ChunkResolution::Live {
                     function_base,
                     payload,

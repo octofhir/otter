@@ -2487,6 +2487,18 @@ impl<'a> Codegen<'a> {
                     ; cbnz w16, =>exit
                 );
             }
+            Kind::CheckStackHeadroom => {
+                let exit = self.eager_exit(node, DeoptReason::Unsupported);
+                self.load_immediate(17, u64::from(crate::graph::ir::TAIL_CALL_STACK_RESERVE));
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; mov x16, sp
+                    ; sub x16, x16, x17
+                    ; ldr x17, [x20, crate::entry::NATIVE_STACK_LIMIT_OFFSET]
+                    ; cmp x16, x17
+                    ; b.lo =>exit
+                );
+            }
             Kind::LoadArgumentCount => {
                 let destination = Self::gp(result.expect("a result"));
                 dynasm!(self.ops

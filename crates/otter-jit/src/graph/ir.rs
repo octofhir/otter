@@ -139,6 +139,11 @@ impl Condition {
     }
 }
 
+/// Native stack bytes a strict tail call keeps free above the stack limit
+/// when it runs as an ordinary call. Past it the tail call replaces its
+/// frame, so an unbounded chain of tail calls runs in bounded stack.
+pub(crate) const TAIL_CALL_STACK_RESERVE: u32 = 4 << 20;
+
 /// Why an eager deopt leaves optimized code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DeoptReason {
@@ -798,6 +803,10 @@ pub(crate) enum Kind {
     /// Eager deopt once the activation has materialized its arguments
     /// object: its actual arguments are then that object's elements.
     CheckArgumentsElided,
+    /// Eager deopt unless the native stack keeps [`TAIL_CALL_STACK_RESERVE`]
+    /// bytes above its limit: a strict tail call then runs as an ordinary
+    /// call, and past it the baseline replaces the frame.
+    CheckStackHeadroom,
     /// The physical activation's actual argument count, an int32: the
     /// elided `arguments.length`.
     LoadArgumentCount,
@@ -1104,6 +1113,7 @@ impl Kind {
             | Self::CheckGuardedMethod(_)
             | Self::CheckNative(_)
             | Self::CheckArgumentsElided
+            | Self::CheckStackHeadroom
             | Self::LoadActualArgument
             | Self::SelectArgument { .. }
             | Self::CheckFunction { .. }
@@ -1567,7 +1577,7 @@ impl Kind {
             | Self::CheckNotHole
             | Self::CheckNative(_) => simple(1, ResultPolicy::None),
             Self::LoadClassConstructor => simple(1, ResultPolicy::Register),
-            Self::CheckArgumentsElided => simple(0, ResultPolicy::None),
+            Self::CheckArgumentsElided | Self::CheckStackHeadroom => simple(0, ResultPolicy::None),
             Self::LoadArgumentCount => simple(0, ResultPolicy::Register),
             Self::LoadActualArgument => simple(1, ResultPolicy::Register),
             Self::SelectArgument { count } => {

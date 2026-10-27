@@ -601,6 +601,9 @@ struct Builder<'a> {
     view: &'a JitCompileSnapshot,
     analysis: Rc<Analysis>,
     baseline: &'a super::BaselineSupport,
+    /// The strict tail call being lowered as an ordinary call: a fallback
+    /// to the baseline operation runs it, not the call it was rewritten to.
+    tail_call: Option<Instruction>,
     graph: Graph,
     function_id: u32,
     register_count: u16,
@@ -789,6 +792,7 @@ fn build_once(
         view,
         analysis: analysis.clone(),
         baseline,
+        tail_call: None,
         graph,
         function_id: code.id,
         register_count,
@@ -2406,6 +2410,7 @@ impl<'a> Builder<'a> {
             Op::HasNamedProperty => self.visit_has_named_property(instruction),
             Op::StoreProperty | Op::StorePropertyStrict => self.visit_store_property(instruction),
             Op::Call => self.visit_call(instruction, false),
+            Op::TailCall => self.visit_tail_call(instruction),
             Op::New => self.visit_call(instruction, true),
             Op::CallWithThis => self.visit_call_with_this(instruction),
             Op::CallMethodValue => self.visit_call_method(instruction),
@@ -2512,6 +2517,11 @@ impl<'a> Builder<'a> {
     /// The instruction through its baseline operation on the frame window,
     /// or an unconditional deopt when it has none.
     fn generic(&mut self, instruction: &Instruction) {
+        if let Some(original) = self.tail_call.take()
+            && original.pc == instruction.pc
+        {
+            return self.generic(&original);
+        }
         // A baseline operation runs on its own function's window, which an
         // inlined body does not have.
         if let Some(inline) = self.inline.as_mut() {
@@ -2595,7 +2605,14 @@ impl<'a> Builder<'a> {
         let operands_convert = [lhs, rhs]
             .iter()
             .all(|&value| self.graph.node(value).kind.produces_boolean() || self.is_number(value));
-        if bitwise && (numeric || operands_convert) {
+        // `flags & x !== 0` (a precedence slip common in real code): the
+        // boolean converts without a check and the other operand is proved a
+        // Number. A site that left on that proof keeps the generic path.
+        let boolean_operand = !self.exited_before()
+            && [lhs, rhs]
+                .iter()
+                .any(|&value| self.graph.node(value).kind.produces_boolean());
+        if bitwise && (numeric || operands_convert || boolean_operand) {
             let a = self.truncated_int32(lhs, int32);
             let b = self.truncated_int32(rhs, int32);
             // `>>>` is unsigned: once a result left the int32 range here, it
@@ -3814,6 +3831,44 @@ impl<'a> Builder<'a> {
     /// `dst = callee(args...)`, or `dst = new callee(args...)` when
     /// `construct`. A site that never ran leaves to collect its target; a
     /// site with one proven target enters it directly.
+    /// §15.10.3 `return f(args…)` from a strict tail position, to a site's
+    /// one bytecode target: an ordinary call and return, which the callee
+    /// can then be inlined into, while the native stack keeps
+    /// [`super::ir::TAIL_CALL_STACK_RESERVE`] free. Past it the guard resumes the
+    /// baseline operation, which replaces the frame, so an unbounded chain
+    /// of tail calls still runs in bounded stack. Any other site keeps the
+    /// baseline operation.
+    fn visit_tail_call(&mut self, instruction: &Instruction) {
+        let monomorphic = self
+            .view
+            .direct_callees
+            .get(&instruction.byte_pc)
+            .is_some_and(|targets| targets.len() == 1);
+        let Some(destination) = instruction.register(0) else {
+            return self.generic(instruction);
+        };
+        if !monomorphic || self.exited_for(ExitReason::UnsupportedOperation) {
+            return self.generic(instruction);
+        }
+        self.add(Kind::CheckStackHeadroom, &[], Repr::None);
+        let mut call = instruction.clone();
+        call.op = Op::Call;
+        call.writes = smallvec::smallvec![destination];
+        call.flow = Flow::Next;
+        self.tail_call = Some(instruction.clone());
+        self.visit_call(&call, false);
+        self.tail_call = None;
+        if self.current.is_none() {
+            return;
+        }
+        let value = self.read(destination);
+        if self.inline.is_some() {
+            return self.inline_return(value);
+        }
+        let value = self.tagged(value);
+        self.terminate(Kind::Return, &[value]);
+    }
+
     fn visit_call(&mut self, instruction: &Instruction, construct: bool) {
         let (Some(callee), Some(argc)) = (instruction.register(1), instruction.const_index(2))
         else {

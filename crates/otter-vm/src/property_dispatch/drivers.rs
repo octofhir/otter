@@ -725,14 +725,24 @@ impl Interpreter {
         } else {
             return Ok(false);
         };
+        // The bag mirrors the function's [[Prototype]], but the keys a
+        // function synthesizes are its own ahead of the bag: only the bag's
+        // own entry may answer them, and anything else is the full [[Get]].
         let lookup = match &key {
             VmPropertyKey::Symbol(sym) => crate::object::lookup_symbol(obj, &self.gc_heap, *sym),
-            _ => crate::object::lookup(
-                obj,
-                &self.gc_heap,
-                key.string_name()
-                    .expect("non-symbol key has string spelling"),
-            ),
+            _ => {
+                let name = key
+                    .string_name()
+                    .expect("non-symbol key has string spelling");
+                if matches!(
+                    name,
+                    "name" | "length" | "prototype" | "caller" | "arguments"
+                ) {
+                    crate::object::lookup_own(obj, &self.gc_heap, name)
+                } else {
+                    crate::object::lookup(obj, &self.gc_heap, name)
+                }
+            }
         };
         match lookup {
             object::PropertyLookup::Data { value, .. } => {

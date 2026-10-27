@@ -185,6 +185,15 @@ impl Interpreter {
                     if let Some(closure) = closure_value.as_closure(&self.gc_heap) {
                         closure.set_proto_override(&mut self.gc_heap, proto);
                     }
+                    // A re-parented function keeps a bag mirroring its new
+                    // [[Prototype]], so its named lookups stay cacheable.
+                    if closure_value
+                        .as_closure(&self.gc_heap)
+                        .is_some_and(|closure| closure.own_props(&self.gc_heap).is_none())
+                    {
+                        let _ = self.ensure_closure_bag(None, &mut closure_value, &mut [], 0);
+                        return;
+                    }
                 }
                 None => closure.clear_proto_override(&mut self.gc_heap),
             }

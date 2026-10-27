@@ -670,6 +670,9 @@ pub enum JitConstantValue {
         /// Compressed shape handle of an ordinary object whose shape was
         /// stable at the bake, or zero.
         shape: u32,
+        /// The function id of a closure value: the slot's dependency keeps
+        /// that closure its value, so generated code may call it directly.
+        function: Option<u32>,
     },
 }
 

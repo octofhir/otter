@@ -1729,6 +1729,79 @@ impl Interpreter {
         Ok(())
     }
 
+    /// The own-property bag of the closure in `closure`, created on first
+    /// use. The bag inherits the closure's own `[[Prototype]]` (see
+    /// `function_lookup_parent`), so its shape fixes the function's ordinary
+    /// lookup for every key the closure does not synthesize: property ICs use
+    /// it as the function's map. A closure re-parented onto a closure without
+    /// a bag gives that parent its bag first, so every link of the lookup
+    /// chain is an object the caches walk.
+    ///
+    /// The allocations root the frame stack (or, without one, the runtime
+    /// roots), the closure slot and `value_roots`; the caller reads each of
+    /// them back relocated.
+    pub(crate) fn ensure_closure_bag(
+        &mut self,
+        stack: Option<&ActivationStack>,
+        closure: &mut Value,
+        value_roots: &mut [&mut Value],
+        depth: usize,
+    ) -> Result<JsObject, VmError> {
+        let owner = closure
+            .as_closure(&self.gc_heap)
+            .ok_or(VmError::TypeMismatch)?;
+        if let Some(bag) = owner.own_props(&self.gc_heap) {
+            return Ok(bag);
+        }
+        self.ensure_closure_rare(stack, closure, value_roots)?;
+        let mut parent = self.get_prototype_for_op(closure)?;
+        if depth < object::PROTO_CHAIN_HARD_CAP
+            && parent
+                .as_closure(&self.gc_heap)
+                .is_some_and(|parent| parent.own_props(&self.gc_heap).is_none())
+        {
+            let mut roots: SmallVec<[&mut Value; 4]> = SmallVec::new();
+            roots.push(&mut *closure);
+            roots.extend(value_roots.iter_mut().map(|value| &mut **value));
+            self.ensure_closure_bag(stack, &mut parent, &mut roots, depth + 1)?;
+        }
+        let prototype = self.function_lookup_parent(parent);
+        let bag = match stack {
+            Some(stack) => {
+                let mut roots: SmallVec<[&mut Value; 4]> = SmallVec::new();
+                roots.push(&mut *closure);
+                roots.extend(value_roots.iter_mut().map(|value| &mut **value));
+                self.alloc_stack_rooted_object_with_prototype_value(stack, &mut roots, prototype)?
+            }
+            None => {
+                let _runtime_roots_guard = self.scope_runtime_roots_guard();
+                let closure_slot: *mut Value = closure;
+                let mut visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    // SAFETY: the caller's slot outlives the allocation.
+                    unsafe { (*closure_slot).trace_value_slot_mut(visitor) };
+                    for value in value_roots.iter_mut() {
+                        value.trace_value_slot_mut(visitor);
+                    }
+                };
+                let root = object::heap_instance_root(
+                    object::object_prototype_of_value(Some(prototype)),
+                    &mut self.gc_heap,
+                    object::DEFAULT_INLINE_CAPACITY,
+                    object::ShapeState::ORDINARY,
+                    &mut visit,
+                )?;
+                self.shape_runtime.register_shape(&self.gc_heap, root);
+                object::alloc_object_with_shape_roots(&mut self.gc_heap, root, &mut visit)?
+            }
+        };
+        let owner = closure
+            .as_closure(&self.gc_heap)
+            .ok_or(VmError::TypeMismatch)?;
+        self.retire_instanceof_proofs_for(owner);
+        owner.set_own_props(&mut self.gc_heap, bag);
+        Ok(bag)
+    }
+
     pub(crate) fn function_user_bag(
         &mut self,
         stack: &mut ActivationStack,
@@ -1744,33 +1817,8 @@ impl Interpreter {
             }
             let owner = owner.map(|owner| interp.scoped_value(scope, Value::closure(owner)));
             if let Some(owner) = owner {
-                let closure = interp
-                    .escape_scoped(owner)
-                    .as_closure(&interp.gc_heap)
-                    .ok_or(VmError::TypeMismatch)?;
-                if let Some(bag) = closure.own_props(&interp.gc_heap) {
-                    return Ok(bag);
-                }
-                let mut closure_value = Value::closure(closure);
-                interp.ensure_closure_rare(Some(stack), &mut closure_value, &mut [])?;
-                // The bag inherits the closure's own `[[Prototype]]`, so its
-                // shape fixes the function's ordinary lookup for every key the
-                // closure does not synthesize: property ICs use it as the
-                // function's map.
-                let prototype = interp.get_prototype_for_op(&closure_value)?;
-                let prototype = interp.function_lookup_parent(prototype);
-                let bag = interp.alloc_stack_rooted_object_with_prototype_value(
-                    stack,
-                    &mut [&mut closure_value],
-                    prototype,
-                )?;
-                let closure = interp
-                    .escape_scoped(owner)
-                    .as_closure(&interp.gc_heap)
-                    .ok_or(VmError::TypeMismatch)?;
-                interp.retire_instanceof_proofs_for(closure);
-                closure.set_own_props(&mut interp.gc_heap, bag);
-                return Ok(bag);
+                let mut closure_value = interp.escape_scoped(owner);
+                return interp.ensure_closure_bag(Some(stack), &mut closure_value, value_roots, 0);
             }
             match interp.function_user_props.get(&function_id).copied() {
                 Some(bag) => Ok(bag),

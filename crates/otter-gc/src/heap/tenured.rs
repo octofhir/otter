@@ -184,13 +184,7 @@ impl GcHeap {
                 std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
             }
         }
-        let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
-        row.live_bytes = row.live_bytes.wrapping_add(aligned);
-        row.live_count = row.live_count.wrapping_add(1);
-        row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
-        row.alloc_bytes_total = row
-            .alloc_bytes_total
-            .wrapping_add(u64::try_from(aligned).unwrap_or(u64::MAX));
+        self.count_runtime_alloc(T::TYPE_TAG, aligned);
         // SAFETY: offset is the cage offset of a freshly written `T` payload.
         unsafe { Gc::from_offset(offset) }
     }

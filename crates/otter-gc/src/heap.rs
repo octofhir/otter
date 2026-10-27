@@ -278,6 +278,12 @@ pub struct GcHeap {
     /// [`Self::lab_consumed_bytes`] (plus the live buffer's progress) is what
     /// generated code allocated.
     runtime_lab_bytes: u64,
+    /// Sums of the per-type rows' `alloc_count_total`, `alloc_bytes_total`
+    /// and `live_bytes`, kept beside every row update so an accounting
+    /// checkpoint reads them without walking the table.
+    rows_alloc_count: u64,
+    rows_alloc_bytes: u64,
+    rows_live_bytes: usize,
     /// Cap bytes charged for the whole buffer at refill; the unused tail is
     /// refunded at retire. `0` without a cap.
     lab_charged: u64,
@@ -572,6 +578,9 @@ impl GcHeap {
             lab_page_allocated: 0,
             lab_consumed_bytes: 0,
             runtime_lab_bytes: 0,
+            rows_alloc_count: 0,
+            rows_alloc_bytes: 0,
+            rows_live_bytes: 0,
             lab_charged: 0,
             old_lab: LinearAllocationArea::EMPTY,
             old_lab_charged: 0,
@@ -1673,13 +1682,7 @@ impl GcHeap {
             self.new_space.track_cleanup(offset);
         }
         self.runtime_lab_bytes += aligned as u64;
-        let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
-        row.live_bytes = row.live_bytes.wrapping_add(aligned);
-        row.live_count = row.live_count.wrapping_add(1);
-        row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
-        row.alloc_bytes_total = row
-            .alloc_bytes_total
-            .wrapping_add(u64::try_from(aligned).unwrap_or(u64::MAX));
+        self.count_runtime_alloc(T::TYPE_TAG, aligned);
         // SAFETY: offset is the cage offset of a freshly written `T` payload.
         unsafe { Gc::from_offset(offset) }
     }
@@ -2148,13 +2151,7 @@ impl GcHeap {
         // [`Self::gc_stats`] / [`Self::reconcile_live_counts`].
         // Wrapping arithmetic — overflow is unreachable in
         // practice (≥ 1.8 × 10¹⁹ allocs).
-        let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
-        row.live_bytes = row.live_bytes.wrapping_add(aligned);
-        row.live_count = row.live_count.wrapping_add(1);
-        row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
-        row.alloc_bytes_total = row
-            .alloc_bytes_total
-            .wrapping_add(u64::try_from(aligned).unwrap_or(u64::MAX));
+        self.count_runtime_alloc(T::TYPE_TAG, aligned);
         // SAFETY: offset is the cage offset of a freshly-alloc-ed
         // T payload; type tag matches `T::TYPE_TAG`.
         Ok(unsafe { Gc::from_offset(offset) })
@@ -2394,13 +2391,7 @@ impl GcHeap {
             // it: its initialized header must be visible first.
             std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
         }
-        let row = &mut self.gc_stats.by_type[T::TYPE_TAG as usize];
-        row.live_bytes = row.live_bytes.wrapping_add(aligned);
-        row.live_count = row.live_count.wrapping_add(1);
-        row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
-        row.alloc_bytes_total = row
-            .alloc_bytes_total
-            .wrapping_add(u64::try_from(aligned).unwrap_or(u64::MAX));
+        self.count_runtime_alloc(T::TYPE_TAG, aligned);
         // SAFETY: offset references a fresh `T` payload.
         Ok(unsafe { Gc::from_offset(offset) })
     }
@@ -3621,15 +3612,36 @@ impl GcHeap {
     /// collection work.
     #[must_use]
     pub fn allocation_counters(&self) -> (u64, u64, usize) {
-        let mut objects = 0u64;
-        let mut bytes = 0u64;
-        let mut live = 0usize;
-        for row in &self.gc_stats.by_type {
-            objects = objects.saturating_add(row.alloc_count_total);
-            bytes = bytes.saturating_add(row.alloc_bytes_total);
-            live = live.wrapping_add(row.live_bytes);
-        }
-        (objects, bytes.saturating_add(self.generated_bytes()), live)
+        (
+            self.rows_alloc_count,
+            self.rows_alloc_bytes.saturating_add(self.generated_bytes()),
+            self.rows_live_bytes,
+        )
+    }
+
+    /// `(tracked bytes, external reserved bytes)` as [`Self::stats`] reports
+    /// them, without syncing the allocation buffers or walking pages.
+    #[must_use]
+    pub fn byte_counters(&self) -> (u64, u64) {
+        (
+            self.effective_tracked_bytes(),
+            self.effective_reserved_bytes(),
+        )
+    }
+
+    /// Book one runtime allocation of `aligned` bytes under `tag` in its
+    /// per-type row and the row sums.
+    #[inline(always)]
+    pub(crate) fn count_runtime_alloc(&mut self, tag: u8, aligned: usize) {
+        let bytes = u64::try_from(aligned).unwrap_or(u64::MAX);
+        let row = &mut self.gc_stats.by_type[tag as usize];
+        row.live_bytes = row.live_bytes.wrapping_add(aligned);
+        row.live_count = row.live_count.wrapping_add(1);
+        row.alloc_count_total = row.alloc_count_total.wrapping_add(1);
+        row.alloc_bytes_total = row.alloc_bytes_total.wrapping_add(bytes);
+        self.rows_alloc_count = self.rows_alloc_count.wrapping_add(1);
+        self.rows_alloc_bytes = self.rows_alloc_bytes.wrapping_add(bytes);
+        self.rows_live_bytes = self.rows_live_bytes.wrapping_add(aligned);
     }
 
     /// Cumulative collection counters: `(full cycles, minor cycles, slots the
@@ -3923,6 +3935,7 @@ impl GcHeap {
             let row = &mut self.gc_stats.by_type[tag];
             row.live_bytes = row.live_bytes.wrapping_add(bytes);
             row.live_count = row.live_count.wrapping_add(count as u64);
+            self.rows_live_bytes = self.rows_live_bytes.wrapping_add(bytes);
         }
     }
 

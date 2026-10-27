@@ -1883,8 +1883,7 @@ pub extern "C" fn math_f64_leaf(method: u32, left: f64, right: f64) -> f64 {
         Some(MathMethod::Log) => left.ln(),
         Some(MathMethod::Atan2) => left.atan2(right),
         Some(
-            method @ (MathMethod::Atan2
-            | MathMethod::Pow
+            method @ (MathMethod::Pow
             | MathMethod::Max
             | MathMethod::Min
             | MathMethod::Hypot

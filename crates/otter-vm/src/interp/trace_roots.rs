@@ -24,7 +24,7 @@ impl Interpreter {
         for value in self.literal_cells.values() {
             crate::code_liveness::visit_value(value, visitor);
         }
-        for value in self.small_int_string_cache.iter().flatten() {
+        for value in self.small_int_strings_for_trace() {
             crate::code_liveness::visit_value(value, visitor);
         }
         self.handle_arena.visit_function_ids(visitor);

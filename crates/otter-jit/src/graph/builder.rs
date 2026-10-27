@@ -4301,7 +4301,11 @@ impl<'a> Builder<'a> {
         }
         let method = self.read(method);
         let method = self.tagged(method);
-        self.add(Kind::CheckNative(apply), &[method], Repr::None);
+        self.add(
+            Kind::CheckNative(apply, DeoptReason::WrongValue),
+            &[method],
+            Repr::None,
+        );
         self.add(Kind::CheckArgumentsElided, &[], Repr::None);
         let callee = self.read(callee);
         let callee = self.tagged(callee);
@@ -4361,7 +4365,11 @@ impl<'a> Builder<'a> {
     ) {
         let method = self.read(method);
         let method = self.tagged(method);
-        self.add(Kind::CheckNative(apply), &[method], Repr::None);
+        self.add(
+            Kind::CheckNative(apply, DeoptReason::WrongValue),
+            &[method],
+            Repr::None,
+        );
         let callee = self.read(callee);
         let callee = self.tagged(callee);
         let this = self.read(this);
@@ -4481,20 +4489,25 @@ impl<'a> Builder<'a> {
                 &arguments,
             );
         }
-        // A loaded `f.call` called with `f` as receiver calls `f`. Once a
-        // site left on a different `f`, it calls whichever `f` it gets.
+        // A loaded `f.call` called with `f` as receiver calls `f`; once the
+        // site left on a different `f`, whichever `f` it gets.
         if let Some(site) = self.view.function_prototype_calls.get(&instruction.byte_pc)
             && site.proof.lookup.is_none()
+            && !self.exited_for(ExitReason::TypeMismatch)
         {
+            let identity_left = self.exited_for(ExitReason::IdentityGuard);
             let plan = site
                 .callee
-                .filter(|_| !self.exited_for(ExitReason::IdentityGuard))
+                .filter(|_| !identity_left)
                 .map(|callee| callee.plan);
-            self.add(
-                Kind::CheckFunctionPrototypeCall(instruction.byte_pc),
-                &[callee],
-                Repr::None,
-            );
+            // After an identity exit only the intrinsic is checked, with an
+            // exit of its own: a second exit keeps the ordinary call.
+            let check = if identity_left {
+                Kind::CheckNative(site.proof.call_native_ref, DeoptReason::WrongType)
+            } else {
+                Kind::CheckFunctionPrototypeCall(instruction.byte_pc)
+            };
+            self.add(check, &[callee], Repr::None);
             return self.emit_function_prototype_call(instruction, this, &arguments, plan);
         }
         let plan = self
@@ -4536,7 +4549,7 @@ impl<'a> Builder<'a> {
         arguments: &[NodeId],
     ) {
         self.add(
-            Kind::CheckNative(target.builtin_native_ref),
+            Kind::CheckNative(target.builtin_native_ref, DeoptReason::WrongValue),
             &[callee],
             Repr::None,
         );
@@ -4616,23 +4629,42 @@ impl<'a> Builder<'a> {
                 return;
             }
         }
-        // Once the site left on a different applied function, the fold calls
-        // whichever function it gets.
-        let identity_left = self.exited_for(ExitReason::IdentityGuard);
-        let fold = self
-            .view
-            .function_prototype_calls
-            .get(&byte_pc)
+        let fold = (!self.exited_for(ExitReason::IdentityGuard))
+            .then(|| self.view.function_prototype_calls.get(&byte_pc))
+            .flatten()
             .filter(|site| {
                 site.proof
                     .lookup
                     .is_some_and(|lookup| lookup.receiver.is_generated_receiver())
             })
-            .map(|site| {
-                site.callee
-                    .filter(|_| !identity_left)
-                    .map(|callee| callee.plan)
-            });
+            .map(|site| site.callee.map(|callee| callee.plan));
+        // A `f.call(...)` site whose receiver proof left (a function with own
+        // properties, or a different applied function) reads `call` like a
+        // named load and checks it is the intrinsic; that check leaving too
+        // keeps the ordinary method call.
+        if fold.is_none()
+            && self.exited_for(ExitReason::IdentityGuard)
+            && !self.exited_for(ExitReason::TypeMismatch)
+            && let Some(site) = self.view.function_prototype_calls.get(&byte_pc)
+        {
+            let call_native_ref = site.proof.call_native_ref;
+            let function = self.read(receiver);
+            let function = self.tagged(function);
+            let method = self.named_lookup(byte_pc, function);
+            self.add(
+                Kind::CheckNative(call_native_ref, DeoptReason::WrongType),
+                &[method],
+                Repr::None,
+            );
+            let arguments: SmallVec<[NodeId; 8]> = arguments
+                .iter()
+                .map(|&register| {
+                    let value = self.read(register);
+                    self.tagged(value)
+                })
+                .collect();
+            return self.emit_function_prototype_call(instruction, function, &arguments, None);
+        }
         let view: &'a JitCompileSnapshot = self.view;
         let methods = (!self.exited_for(ExitReason::ShapeGuard)
             && !self.exited_for(ExitReason::IdentityGuard))

@@ -799,7 +799,7 @@ pub(crate) enum Kind {
     CheckGuardedMethod(u32),
     /// Eager deopt unless input0 is the native function whose external
     /// reference index is the immediate.
-    CheckNative(u32),
+    CheckNative(u32, DeoptReason),
     /// Eager deopt once the activation has materialized its arguments
     /// object: its actual arguments are then that object's elements.
     CheckArgumentsElided,
@@ -1111,7 +1111,7 @@ impl Kind {
             | Self::CheckBounds
             | Self::CheckFunctionPrototypeCall(_)
             | Self::CheckGuardedMethod(_)
-            | Self::CheckNative(_)
+            | Self::CheckNative(..)
             | Self::CheckArgumentsElided
             | Self::CheckStackHeadroom
             | Self::LoadActualArgument
@@ -1575,7 +1575,7 @@ impl Kind {
             Self::CheckFunction { .. }
             | Self::CheckCellValue(_)
             | Self::CheckNotHole
-            | Self::CheckNative(_) => simple(1, ResultPolicy::None),
+            | Self::CheckNative(..) => simple(1, ResultPolicy::None),
             Self::LoadClassConstructor => simple(1, ResultPolicy::Register),
             Self::CheckArgumentsElided | Self::CheckStackHeadroom => simple(0, ResultPolicy::None),
             Self::LoadArgumentCount => simple(0, ResultPolicy::Register),

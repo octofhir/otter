@@ -1920,6 +1920,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_NUMBER_CALL_LEAF.id => "number_call_leaf",
         id if id == STUB_REST_ARRAY_ALLOC.id => "rest_array_alloc",
         id if id == STUB_JIT_RECORD_CALL_TARGET.id => "jit_record_call_target",
+        id if id == STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT.id => "jit_new_null_prototype_object",
 
         _ => "unknown_runtime_stub",
     }
@@ -2293,6 +2294,20 @@ pub const STUB_JIT_RECORD_CALL_TARGET: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::None,
 );
 
+/// Allocation of an object whose `[[Prototype]]` is `null` (an object
+/// literal opening with `__proto__: null`) from an empty boxed-value span.
+/// The native frame publishes roots; success returns the object.
+pub const STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT: RuntimeStubDescriptor = descriptor(
+    129,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::ReentrantValueSpan,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::allocating(true, false),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2423,6 +2438,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_NUMBER_CALL_LEAF,
     STUB_REST_ARRAY_ALLOC,
     STUB_JIT_RECORD_CALL_TARGET,
+    STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

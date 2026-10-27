@@ -33,6 +33,22 @@ pub(crate) extern "C" fn jit_new_object_stub(
     committed_vm_result(ctx, result)
 }
 
+pub(crate) extern "C" fn jit_new_null_prototype_object_stub(
+    ctx: *mut JitCtx,
+    _values: *const Value,
+    count: u32,
+) -> NativeResultPair {
+    // SAFETY: the caller owns a live published native activation and JitCtx.
+    let ctx = unsafe { &mut *ctx };
+    let result = if count == 0 {
+        ctx.runtime_call()
+            .and_then(|mut runtime| runtime.new_null_prototype_object_value())
+    } else {
+        Err(VmError::InvalidOperand)
+    };
+    committed_vm_result(ctx, result)
+}
+
 pub(crate) extern "C" fn jit_new_array_stub(
     ctx: *mut JitCtx,
     values: *const Value,

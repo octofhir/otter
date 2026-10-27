@@ -46,6 +46,10 @@ impl Codegen<'_> {
                 plans.object.map(EmptyLiteralLayout::Object),
                 abi::STUB_JIT_NEW_OBJECT,
             ),
+            Kind::NewNullPrototypeObject => (
+                plans.null_object.map(EmptyLiteralLayout::Object),
+                abi::STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT,
+            ),
             Kind::NewArrayEmpty => (
                 Some(EmptyLiteralLayout::Array(plans.array)),
                 abi::STUB_JIT_NEW_ARRAY,

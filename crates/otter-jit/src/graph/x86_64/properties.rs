@@ -1037,9 +1037,10 @@ impl Codegen<'_> {
         }
         self.emit_boolean_outcomes([yes, no], destination, done);
         dynasm!(self.ops ; .arch x64 ; =>miss);
-        // A native target (a builtin constructor) answers through the leaf
-        // probe without running JavaScript; any other case completes in the
-        // runtime. The probe keeps every live value and both operands.
+        // A native target (a builtin constructor), or a closure whose
+        // `@@hasInstance` chain is the default (a re-parented constructor),
+        // answers through the leaf probe without running JavaScript; any
+        // other case completes in the runtime. The probe keeps every live value and both operands.
         let mut saved = self.loc(node).live_registers.clone();
         for register in [value, target] {
             if !saved

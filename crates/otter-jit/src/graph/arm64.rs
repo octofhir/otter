@@ -2553,7 +2553,7 @@ impl<'a> Codegen<'a> {
             Kind::PrimitiveAdd => self.emit_primitive_add(node)?,
             Kind::BigIntBinary(operator) => self.emit_bigint_binary(node, *operator)?,
             Kind::PrimitiveCompare(condition) => self.emit_primitive_compare(node, *condition)?,
-            Kind::NewObject | Kind::NewArrayEmpty => {
+            Kind::NewObject | Kind::NewNullPrototypeObject | Kind::NewArrayEmpty => {
                 let destination = Self::gp(result.expect("an allocation result"));
                 self.emit_empty_allocation(node, destination)?;
             }
@@ -3937,9 +3937,10 @@ impl<'a> Codegen<'a> {
         }
         self.emit_boolean_outcomes([yes, no], destination, done);
         dynasm!(self.ops ; .arch aarch64 ; =>miss);
-        // A native target (a builtin constructor) answers through the leaf
-        // probe without running JavaScript; any other case completes in the
-        // runtime. The probe keeps every live value and both operands.
+        // A native target (a builtin constructor), or a closure whose
+        // `@@hasInstance` chain is the default (a re-parented constructor),
+        // answers through the leaf probe without running JavaScript; any
+        // other case completes in the runtime. The probe keeps every live value and both operands.
         let mut saved = self.allocation.node(node).live_registers.clone();
         for register in [value, target] {
             if !saved

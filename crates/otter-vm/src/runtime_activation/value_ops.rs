@@ -451,6 +451,13 @@ impl RuntimeCall<'_> {
         vm.allocate_object_literal_value(function_id)
     }
 
+    /// An empty object whose `[[Prototype]]` is `null`.
+    pub fn new_null_prototype_object_value(&mut self) -> Result<Value, VmError> {
+        // SAFETY: as `new_object_value`.
+        let vm = unsafe { &mut *self.vm.as_ptr() };
+        vm.allocate_null_prototype_object()
+    }
+
     /// Materialize one verified dense virtual-object graph under a single GC
     /// handle scope. Every earlier object remains rooted and is re-read after
     /// each potentially moving allocation.

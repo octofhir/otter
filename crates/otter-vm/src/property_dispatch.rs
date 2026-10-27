@@ -262,6 +262,7 @@ impl Interpreter {
             // fixes the function's ordinary lookup for every key the closure
             // does not synthesize: property ICs use it as the function's map.
             let prototype = self.get_prototype_for_op(&owner_value)?;
+            let prototype = self.function_lookup_parent(prototype);
             let mut roots: smallvec::SmallVec<[&mut Value; 4]> =
                 value_roots.iter_mut().map(|value| &mut **value).collect();
             roots.push(&mut owner_value);

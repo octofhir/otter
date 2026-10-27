@@ -240,6 +240,19 @@ impl Interpreter {
             crate::object::DEFAULT_INLINE_CAPACITY,
             crate::object::ShapeState::ORDINARY,
         )?;
+        self.allocate_empty_object(root)
+    }
+
+    /// An empty object whose `[[Prototype]]` is `null`, in any realm.
+    pub(crate) fn allocate_null_prototype_object(&mut self) -> Result<Value, VmError> {
+        let root = self.null_prototype_root();
+        self.allocate_empty_object(root)
+    }
+
+    fn allocate_empty_object(
+        &mut self,
+        root: crate::object::ShapeHandle,
+    ) -> Result<Value, VmError> {
         let object =
             match crate::object::try_alloc_object_with_shape_no_collect(&mut self.gc_heap, root) {
                 Some(object) => object,

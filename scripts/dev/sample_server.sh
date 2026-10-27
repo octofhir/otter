@@ -11,7 +11,7 @@ for attempt in 1 2 3 4; do
   oha -z 9s -c 50 --no-tui "http://localhost:$PORT/" >/dev/null 2>&1 &
   load=$!
   sleep 2
-  sample "$pid" 4 1 -file "$OUT" >/dev/null 2>&1
+  timeout 30 sample "$pid" 4 1 -file "$OUT" >/dev/null 2>&1
   wait "$load"
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
   n=$(python3 "$(dirname "$0")/isolate_self.py" "$OUT" 1 2>/dev/null | awk '/isolate self samples/ {print $4}')

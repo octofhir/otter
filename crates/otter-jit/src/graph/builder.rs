@@ -604,6 +604,10 @@ struct Builder<'a> {
     /// The strict tail call being lowered as an ordinary call: a fallback
     /// to the baseline operation runs it, not the call it was rewritten to.
     tail_call: Option<Instruction>,
+    /// Rest lists of spliced bodies, built from known values, with the node
+    /// count after each was built: one nothing has written since still holds
+    /// those values.
+    pristine_lists: Vec<(NodeId, usize)>,
     graph: Graph,
     function_id: u32,
     register_count: u16,
@@ -793,6 +797,7 @@ fn build_once(
         analysis: analysis.clone(),
         baseline,
         tail_call: None,
+        pristine_lists: Vec::new(),
         graph,
         function_id: code.id,
         register_count,
@@ -1295,7 +1300,8 @@ impl<'a> Builder<'a> {
                     new_target,
                     arguments: (code.exposes_legacy_arguments()
                         || code.needs_arguments()
-                        || code.forwards_arguments())
+                        || code.forwards_arguments()
+                        || code.takes_rest())
                     .then(|| arguments.iter().copied().collect()),
                 },
                 depth,
@@ -1944,6 +1950,16 @@ impl<'a> Builder<'a> {
                 .any(|node| node.inputs.contains(&target))
     }
 
+    /// The values a rest list built from known values still holds: no node
+    /// added since it was built writes the heap.
+    pub(super) fn pristine_list_values(&self, list: NodeId) -> Option<SmallVec<[NodeId; 8]>> {
+        let &(_, built) = self.pristine_lists.iter().find(|(node, _)| *node == list)?;
+        let untouched = self.graph.nodes[built..]
+            .iter()
+            .all(|node| !node.kind.properties().writes);
+        untouched.then(|| self.graph.node(list).inputs.iter().copied().collect())
+    }
+
     fn constant_tagged(&mut self, bits: u64) -> NodeId {
         self.graph.constant(Kind::ConstTagged(bits))
     }
@@ -2196,6 +2212,26 @@ impl<'a> Builder<'a> {
                 let formals = self.view.code_block.param_count;
                 let value = self.add(Kind::NewRestArray(formals), &[], Repr::Tagged);
                 self.prove_array_body(value);
+                self.write(instruction.writes[0], value);
+            }
+            // A spliced body's rest list holds its call's trailing values.
+            Op::CollectRest => {
+                let formals = usize::from(self.view.code_block.param_count);
+                let Some(arguments) = self
+                    .inline
+                    .as_ref()
+                    .and_then(|inline| inline.caller.arguments.clone())
+                else {
+                    return self.generic(instruction);
+                };
+                let values: SmallVec<[NodeId; 8]> = arguments
+                    .iter()
+                    .skip(formals)
+                    .map(|&value| self.tagged(value))
+                    .collect();
+                let value = self.add(Kind::NewArrayLiteral, &values, Repr::Tagged);
+                self.prove_array_body(value);
+                self.pristine_lists.push((value, self.graph.nodes.len()));
                 self.write(instruction.writes[0], value);
             }
             Op::NewArray if instruction.const_index(1) == Some(0) => {
@@ -2645,6 +2681,35 @@ impl<'a> Builder<'a> {
                 _ => Kind::Int32ShiftRightLogical,
             };
             let result = self.add(kind, &[a, b], Repr::Int32);
+            self.write(instruction.writes[0], result);
+            return;
+        }
+        // `count += a !== b`: a comparison's boolean is the Number 0 or 1,
+        // and the other operand is proved a Number.
+        if boolean_operand
+            && !bitwise
+            && !self.exited_for(ExitReason::TypeMismatch)
+            && matches!(
+                op,
+                Op::Add | Op::AddImm | Op::Sub | Op::SubImm | Op::Mul | Op::Div | Op::Rem
+            )
+        {
+            let [a, b] = [lhs, rhs].map(|value| {
+                if self.graph.node(value).kind.produces_boolean() {
+                    let int = self.add(Kind::BooleanToInt32, &[value], Repr::Int32);
+                    self.add(Kind::Int32ToFloat64, &[int], Repr::Float64)
+                } else {
+                    self.float64(value)
+                }
+            });
+            let kind = match op {
+                Op::Add | Op::AddImm => Kind::Float64Add,
+                Op::Sub | Op::SubImm => Kind::Float64Sub,
+                Op::Mul => Kind::Float64Mul,
+                Op::Div => Kind::Float64Div,
+                _ => Kind::Float64Mod,
+            };
+            let result = self.add(kind, &[a, b], Repr::Float64);
             self.write(instruction.writes[0], result);
             return;
         }

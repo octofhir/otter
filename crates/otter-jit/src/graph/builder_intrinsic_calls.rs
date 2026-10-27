@@ -76,6 +76,11 @@ impl Builder<'_> {
                 self.tagged(value)
             })
             .collect();
+        // A spliced body's untouched rest list: the call of its values.
+        if let Some(values) = self.pristine_list_values(inputs[2]) {
+            self.emit_call_with_receiver(instruction, inputs[0], inputs[1], &values, None);
+            return true;
+        }
         let node = self.add(Kind::CallApplyArray { pc: self.pc }, &inputs, Repr::Tagged);
         let destination = instruction.writes[0];
         let lazy = self.lazy_state(Some((destination, node)));

@@ -284,7 +284,29 @@ fn emit_keyed_load(
     let miss = ops.new_dynamic_label();
     let generic = ops.new_dynamic_label();
     let object = ops.new_dynamic_label();
+    let shaped = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>label);
+    // The table never holds a dictionary-mode object's keys: such a
+    // receiver goes straight to the own-data walk, which reads the key's
+    // spelling without an atom.
+    crate::x86_64::values::emit_load_u64(ops, 10, otter_vm::value::tag::NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64
+        ; test Rq(KEYED_LOAD_RECEIVER), r10 ; jnz =>shaped
+        ; test Rq(KEYED_LOAD_RECEIVER), Rq(KEYED_LOAD_RECEIVER) ; jz =>shaped
+        ; cmp BYTE [Rq(KEYED_LOAD_RECEIVER)], crate::entry::OBJECT_BODY_TYPE_TAG as i8
+        ; jne =>shaped
+        ; mov r11d, [Rq(KEYED_LOAD_RECEIVER) + view.object_shape_byte as i32]
+        ; test r11d, r11d ; jz =>shaped
+    );
+    crate::x86_64::values::emit_load_u64(ops, 10, 0xffff_ffff_0000_0000);
+    dynasm!(ops ; .arch x64
+        ; and r10, Rq(KEYED_LOAD_RECEIVER)
+        ; add r10, r11
+        ; test BYTE [r10 + view.shape_state_byte as i32],
+            otter_vm::object::ShapeState::DICTIONARY_MASK as i8
+        ; jnz =>generic
+        ; =>shaped
+    );
     // Entered by `call`: `rsp` is eight bytes past alignment.
     emit_key_atom(
         ops,

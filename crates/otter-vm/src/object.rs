@@ -1300,6 +1300,8 @@ struct DictKeyEntry {
     byte_len: u32,
     /// Next entry index in the same bucket, or `u32::MAX`.
     next: u32,
+    /// The key hash's high word: a chain walk compares it before the bytes.
+    tag: u32,
 }
 
 /// Header for a dictionary-mode object's insertion-ordered key table.
@@ -1429,16 +1431,20 @@ impl DictKeysBody {
 
     /// Entry index of `key`, or `None`.
     fn find(&self, key: &str) -> Option<u32> {
-        let bucket = (dict_key_hash(key) as u32 & self.bucket_mask) as usize;
+        let hash = dict_key_hash(key);
+        let bucket = (hash as u32 & self.bucket_mask) as usize;
+        let tag = (hash >> 32) as u32;
         // SAFETY: `bucket < bucket_count`; buckets were initialised.
         let mut current = unsafe { *self.buckets_ptr().add(bucket) };
         while current != DICT_CHAIN_END {
             let index = current as usize;
-            if self.key_at(index) == key {
+            // SAFETY: chain indices always name written entries.
+            let entry = unsafe { *self.entries_ptr().add(index) };
+            if entry.tag == tag && entry.byte_len as usize == key.len() && self.key_at(index) == key
+            {
                 return Some(u32::try_from(index).expect("dictionary index exceeds u32"));
             }
-            // SAFETY: chain indices always name written entries.
-            current = unsafe { (*self.entries_ptr().add(index)).next };
+            current = entry.next;
         }
         None
     }
@@ -1465,7 +1471,8 @@ impl DictKeysBody {
             );
         }
         self.byte_len += key.len() as u32;
-        let bucket = (dict_key_hash(key) as u32 & self.bucket_mask) as usize;
+        let hash = dict_key_hash(key);
+        let bucket = (hash as u32 & self.bucket_mask) as usize;
         // SAFETY: `bucket < bucket_count`; `index < capacity`.
         unsafe {
             let head = *self.buckets_ptr().add(bucket);
@@ -1473,6 +1480,7 @@ impl DictKeysBody {
                 byte_offset,
                 byte_len: key.len() as u32,
                 next: head,
+                tag: (hash >> 32) as u32,
             });
             *self.buckets_ptr().add(bucket) = index as u32;
         }

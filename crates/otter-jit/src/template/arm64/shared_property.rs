@@ -21,8 +21,8 @@
 //!   instead of inlining it.
 //! - Keyed load and store, name case: a string key probes the shared action
 //!   table under its atom, recorded in the string or found by the interning
-//!   leaf and then recorded. A load the table misses on a dictionary-mode
-//!   receiver, which the table never holds, runs the generic own-data walk
+//!   leaf and then recorded. A dictionary-mode receiver, which the table
+//!   never holds, and a load the table misses run the generic own-data walk
 //!   leaf; any other key, a shaped receiver's or a store's table miss, or a
 //!   walk the leaf cannot finish returns to the element site, which
 //!   completes through its committed element runtime (which records the
@@ -166,7 +166,7 @@ fn emit_store_tail(
 ) {
     let primitive = ops.new_dynamic_label();
     // The barrier's slow path calls out.
-    dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]!);
+    dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]! ; mov x29, sp);
     crate::arm64::field_type::emit_observe(ops, relocations, view, TAIL_OWNER, TAIL_VALUE);
     emit_cell_test(ops, TAIL_VALUE, CellTest::IsNotCell, primitive);
     super::values::emit_write_barrier(ops, relocations, view, TAIL_RECEIVER, TAIL_VALUE);
@@ -323,7 +323,25 @@ fn emit_keyed_load(
     let miss = ops.new_dynamic_label();
     let generic = ops.new_dynamic_label();
     let object = ops.new_dynamic_label();
+    let shaped = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label);
+    // The table never holds a dictionary-mode object's keys: such a
+    // receiver goes straight to the own-data walk, which reads the key's
+    // spelling without an atom.
+    emit_cell_test(ops, KEYED_LOAD_RECEIVER, CellTest::IsNotCell, shaped);
+    dynasm!(ops ; .arch aarch64
+        ; cbz X(KEYED_LOAD_RECEIVER), =>shaped
+        ; ldrb w16, [X(KEYED_LOAD_RECEIVER)]
+        ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
+        ; b.ne =>shaped
+        ; ldr w16, [X(KEYED_LOAD_RECEIVER), view.object_shape_byte]
+        ; cbz w16, =>shaped
+        ; and x17, X(KEYED_LOAD_RECEIVER), #0xffff_ffff_0000_0000
+        ; add x16, x17, x16
+        ; ldrb w16, [x16, view.shape_state_byte]
+        ; tbnz w16, otter_vm::object::ShapeState::DICTIONARY_MASK.trailing_zeros(), =>generic
+        ; =>shaped
+    );
     emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 11, generic, miss);
     emit_array_bag(ops, view, KEYED_LOAD_RECEIVER, object, miss);
     property_actions::emit_load(
@@ -389,7 +407,7 @@ fn emit_keyed_store(
     let stored = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
     let object = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]!);
+    dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]! ; mov x29, sp);
     emit_key_atom(ops, relocations, view, KEYED_STORE_KEY, 3, miss, miss);
     // An Array's own named data lives in its bag, written in place.
     emit_array_bag(ops, view, KEYED_STORE_RECEIVER, object, miss);
@@ -557,6 +575,7 @@ fn emit_load(
         ; ret
         ; =>miss
         ; stp x29, x30, [sp, #-16]!
+        ; mov x29, sp
         ; mov x0, x20
         ; mov x1, X(LOAD_RECEIVER)
         ; mov x2, X(LOAD_SLOT)
@@ -614,7 +633,7 @@ fn emit_store(
     let miss = ops.new_dynamic_label();
     // The committed barriers' slow paths call out, so the return address is
     // saved for the whole routine.
-    dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]!);
+    dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]! ; mov x29, sp);
     property_ic::emit_slot_store(
         ops,
         relocations,

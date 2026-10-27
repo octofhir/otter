@@ -84,6 +84,13 @@ pub(crate) enum Insn {
         /// what the maximal munch already exposes). Set by lowering's
         /// possessification pass; always `false` for a lazy repeat.
         possessive: bool,
+
+        /// Index into [`Program::follows`] of the code units that can begin
+        /// what follows the repeat, when lowering could characterize it. A
+        /// give-back or give-forward length whose next unit is outside that
+        /// set fails the continuation before it consumes anything, so both
+        /// tiers skip it instead of scheduling it. Code-unit mode only.
+        follow: Option<u32>,
     },
     /// Never matches. Emitted for a counted quantifier whose minimum exceeds
     /// what any subject could supply, which §22.2.1 permits to be written.
@@ -168,6 +175,10 @@ pub(crate) struct Program {
     /// Out-of-line class sets, indexed by [`Insn::Class::class`]. Kept here so
     /// the instruction vector stays small and cache-dense.
     pub(crate) classes: Vec<ClassSet>,
+    /// Follow sets of fused repeats, indexed by [`Insn::Repeat::follow`]:
+    /// byte `u` is nonzero when code unit `u` can begin the repeat's
+    /// continuation. A unit at or above `0x100` always may.
+    pub(crate) follows: Vec<[u8; 256]>,
     /// Number of capturing groups (group 0 excluded).
     pub(crate) group_count: u32,
     /// Resolved capture-group names in source order, the empty string for an
@@ -315,6 +326,13 @@ impl Prefilter {
             canon,
             few_latin1,
         }
+    }
+
+    /// Whether each code unit below `0x100` can begin a match, folded for an
+    /// `i`-flag prefilter, as one byte per unit.
+    #[must_use]
+    pub(crate) fn latin1_table(&self) -> [u8; Self::TABLE] {
+        self.table.map(u8::from)
     }
 
     /// The one to three bytes that can start a match in a one-byte subject.
@@ -516,6 +534,15 @@ impl Program {
     pub(crate) fn slot_count(&self) -> usize {
         self.capture_slot_count() + self.loop_marks
     }
+
+    /// Whether code unit `unit` can begin the continuation of a repeat with
+    /// follow set `follow`; every unit may without one.
+    #[inline]
+    #[must_use]
+    pub(crate) fn may_follow(&self, follow: Option<u32>, unit: u32) -> bool {
+        follow
+            .is_none_or(|follow| unit >= 0x100 || self.follows[follow as usize][unit as usize] != 0)
+    }
 }
 
 impl Program {
@@ -623,8 +650,9 @@ fn describe_insn(insn: &Insn) -> String {
             min,
             greedy,
             possessive,
+            follow,
         } => format!(
-            "repeat {} min={min}{}{}",
+            "repeat {} min={min}{}{}{}",
             match atom {
                 RepeatAtom::Char { cp, ignore_case } =>
                     format!("char U+{cp:04X}{}", if *ignore_case { " /i" } else { "" }),
@@ -642,7 +670,8 @@ fn describe_insn(insn: &Insn) -> String {
                 }
             },
             if *greedy { " greedy" } else { " lazy" },
-            if *possessive { " possessive" } else { "" }
+            if *possessive { " possessive" } else { "" },
+            follow.map_or(String::new(), |follow| format!(" follow#{follow}"))
         ),
         Insn::Fail => "fail".to_string(),
         Insn::Jump(t) => format!("jump {t}"),

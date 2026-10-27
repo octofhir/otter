@@ -201,22 +201,30 @@ impl<U: Unit> Matcher<'_, '_, U> {
                 Resume::At => {}
                 Resume::RepeatGreedy { low } => {
                     if frame.pos != low {
-                        stack.push(Frame {
-                            pc: frame.pc,
-                            pos: self.retreat_rep(frame.pos, backward),
-                            log_mark: frame.log_mark,
-                            resume: Resume::RepeatGreedy { low },
-                        });
+                        let follow = repeat_follow(prog, frame.pc);
+                        let next = self.retreat_rep(frame.pos, backward);
+                        if let Some(pos) = self.give_back(follow, next, low, backward) {
+                            stack.push(Frame {
+                                pc: frame.pc,
+                                pos,
+                                log_mark: frame.log_mark,
+                                resume: Resume::RepeatGreedy { low },
+                            });
+                        }
                     }
                 }
                 Resume::RepeatLazy { high } => {
                     if frame.pos != high {
-                        stack.push(Frame {
-                            pc: frame.pc,
-                            pos: self.advance_rep(frame.pos, backward),
-                            log_mark: frame.log_mark,
-                            resume: Resume::RepeatLazy { high },
-                        });
+                        let follow = repeat_follow(prog, frame.pc);
+                        let next = self.advance_rep(frame.pos, backward);
+                        if let Some(pos) = self.give_forward(follow, next, high, backward) {
+                            stack.push(Frame {
+                                pc: frame.pc,
+                                pos,
+                                log_mark: frame.log_mark,
+                                resume: Resume::RepeatLazy { high },
+                            });
+                        }
                     }
                 }
             }
@@ -269,6 +277,7 @@ impl<U: Unit> Matcher<'_, '_, U> {
                         min,
                         greedy,
                         possessive,
+                        follow,
                     } => {
                         // Tight scan of the whole run, then a single chained
                         // give-back frame rather than a split per character.
@@ -385,20 +394,35 @@ impl<U: Unit> Matcher<'_, '_, U> {
                             // A possessive repeat keeps no give-back frame: the
                             // required atom that follows is disjoint from this
                             // atom, so no shorter length could satisfy it.
-                            if !*possessive && end != low {
+                            if !*possessive
+                                && end != low
+                                && let Some(at) = self.give_back(
+                                    *follow,
+                                    self.retreat_rep(end, backward),
+                                    low,
+                                    backward,
+                                )
+                            {
                                 stack.push(Frame {
                                     pc: pc + 1,
-                                    pos: self.retreat_rep(end, backward),
+                                    pos: at,
                                     log_mark: log.len(),
                                     resume: Resume::RepeatGreedy { low },
                                 });
                             }
                             pos = end;
                         } else {
-                            if end != low {
+                            if end != low
+                                && let Some(at) = self.give_forward(
+                                    *follow,
+                                    self.advance_rep(low, backward),
+                                    end,
+                                    backward,
+                                )
+                            {
                                 stack.push(Frame {
                                     pc: pc + 1,
-                                    pos: self.advance_rep(low, backward),
+                                    pos: at,
                                     log_mark: log.len(),
                                     resume: Resume::RepeatLazy { high: end },
                                 });
@@ -623,6 +647,57 @@ impl<U: Unit> Matcher<'_, '_, U> {
             }
         }
         (count >= min).then_some((end, low))
+    }
+
+    /// The longest length from `at` down to `low` whose continuation may
+    /// begin there by the repeat's follow set; `None` when none can.
+    fn give_back(
+        &self,
+        follow: Option<u32>,
+        mut at: usize,
+        low: usize,
+        backward: bool,
+    ) -> Option<usize> {
+        while !self.may_continue(follow, at, backward) {
+            if at == low {
+                return None;
+            }
+            at = self.retreat_rep(at, backward);
+        }
+        Some(at)
+    }
+
+    /// The shortest length from `at` up to `high` whose continuation may
+    /// begin there by the repeat's follow set; `None` when none can.
+    fn give_forward(
+        &self,
+        follow: Option<u32>,
+        mut at: usize,
+        high: usize,
+        backward: bool,
+    ) -> Option<usize> {
+        while !self.may_continue(follow, at, backward) {
+            if at == high {
+                return None;
+            }
+            at = self.advance_rep(at, backward);
+        }
+        Some(at)
+    }
+
+    /// Whether a repeat's continuation may begin at `at`: some unit is left
+    /// in the run direction and its follow set admits it.
+    fn may_continue(&self, follow: Option<u32>, at: usize, backward: bool) -> bool {
+        if follow.is_none() {
+            return true;
+        }
+        let units = self.units();
+        let unit = if backward {
+            at.checked_sub(1).map(|index| units[index])
+        } else {
+            units.get(at).copied()
+        };
+        unit.is_some_and(|unit| self.program.may_follow(follow, unit.into()))
     }
 
     /// Move `p` one repetition back toward the start of a fused repeat's run —
@@ -871,4 +946,16 @@ pub(crate) fn is_line_terminator(cp: u32) -> bool {
 pub(crate) fn is_word(cp: u32) -> bool {
     matches!(cp,
         0x30..=0x39 | 0x41..=0x5A | 0x61..=0x7A | 0x5F)
+}
+
+/// The follow set of the fused repeat whose give-back frames resume at
+/// `resume_pc`, the instruction after it.
+fn repeat_follow(program: &Program, resume_pc: usize) -> Option<u32> {
+    match resume_pc
+        .checked_sub(1)
+        .and_then(|pc| program.insns.get(pc))
+    {
+        Some(Insn::Repeat { follow, .. }) => *follow,
+        _ => None,
+    }
 }

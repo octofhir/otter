@@ -129,6 +129,12 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
             })
     });
 
+    let follows = if unicode {
+        Vec::new()
+    } else {
+        mark_follows(&mut e.insns, &e.classes, flags.ignore_case)
+    };
+
     let loop_marks = e.next_mark - mark_base;
     let prefilter =
         compute_first_set(&e.insns, &e.classes, flags.ignore_case, unicode).map(|(set, canon)| {
@@ -146,6 +152,7 @@ pub(crate) fn lower(parsed: Parsed, flags: Flags) -> Program {
     Program {
         insns: e.insns,
         classes: e.classes,
+        follows,
         group_count: parsed.group_count,
         names,
         unicode,
@@ -477,6 +484,17 @@ fn compute_first_set(
     ignore_case: bool,
     unicode: bool,
 ) -> Option<(CodePointSet, bool)> {
+    first_set_from(insns, classes, ignore_case, unicode, 0)
+}
+
+/// [`compute_first_set`] of the program run from instruction `entry`.
+fn first_set_from(
+    insns: &[Insn],
+    classes: &[crate::classes::ClassSet],
+    ignore_case: bool,
+    unicode: bool,
+    entry: usize,
+) -> Option<(CodePointSet, bool)> {
     // BFS over the zero-width-passable prefix: follow control flow until the
     // first consuming instruction on every path. Every reachable consuming
     // instruction must be a literal or non-negated class, or the whole filter
@@ -484,7 +502,7 @@ fn compute_first_set(
     let mut out = CodePointSet::new();
     let mut needs_canon = ignore_case;
     let mut visited = vec![false; insns.len()];
-    let mut work = vec![0usize];
+    let mut work = vec![entry];
     while let Some(pc) = work.pop() {
         if pc >= insns.len() || visited[pc] {
             continue;
@@ -610,6 +628,53 @@ fn canonicalize_set(set: &CodePointSet, unicode: bool) -> Option<CodePointSet> {
         }
     }
     Some(out)
+}
+
+/// Attach to every fused [`Insn::Repeat`] that schedules other lengths the
+/// set of code units that can begin its continuation, and return those sets.
+///
+/// The continuation is characterized exactly as a match start is
+/// ([`first_set_from`]): every path from it must consume a literal or class
+/// before it can accept, so a length whose next unit is outside the set (or
+/// that leaves no unit) fails before any effect, and skipping it changes
+/// neither the language nor a capture. A set admitting every low unit filters
+/// nothing and is not attached.
+fn mark_follows(insns: &mut [Insn], classes: &[ClassSet], ignore_case: bool) -> Vec<[u8; 256]> {
+    let mut follows: Vec<[u8; 256]> = Vec::new();
+    for pc in 0..insns.len() {
+        if !matches!(
+            insns[pc],
+            Insn::Repeat {
+                possessive: false,
+                ..
+            }
+        ) {
+            continue;
+        }
+        let Some((set, canon)) = first_set_from(insns, classes, ignore_case, false, pc + 1) else {
+            continue;
+        };
+        let prefilter = if canon {
+            crate::program::Prefilter::from_set_canon(&set, false)
+        } else {
+            crate::program::Prefilter::from_set(&set)
+        };
+        let table = prefilter.latin1_table();
+        if table.iter().all(|&member| member != 0) {
+            continue;
+        }
+        let index = match follows.iter().position(|known| *known == table) {
+            Some(index) => index,
+            None => {
+                follows.push(table);
+                follows.len() - 1
+            }
+        };
+        if let Insn::Repeat { follow, .. } = &mut insns[pc] {
+            *follow = u32::try_from(index).ok();
+        }
+    }
+    follows
 }
 
 /// Mark every greedy fused [`Insn::Repeat`] whose give-back is provably futile
@@ -1042,6 +1107,7 @@ impl Emitter {
                 min,
                 greedy,
                 possessive: false,
+                follow: None,
             });
             return;
         }

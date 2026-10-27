@@ -116,6 +116,7 @@ const SUBJECTS: &[&str] = &[
     "foo bar  baz\nqux\r\nend",
     "aaaaaaaaaaaaaaaaaaaab",
     "http://example.com:8080/path?query=1#frag",
+    "?a=1&bC=42&AB=x",
     "  leading and trailing  ",
     "_word-boundary_ 12 34",
     "\u{e9}t\u{e9} \u{c9}T\u{c9} \u{ff}\u{178}",
@@ -189,6 +190,11 @@ fn repeats_and_alternation() {
         ("(a*)*b", ""),
         ("(?:a|)*b", ""),
         ("\\w+@?", ""),
+        ("[\\w\\W]*(ab|bc)=", "i"),
+        ("[\\w\\W]*(?:ab|B)", "i"),
+        (".*?(?:b|c)a", ""),
+        ("a*?[bc]$", ""),
+        ("(\\w*)(\\W*)", ""),
     ] {
         assert!(agree(pattern, spec, SUBJECTS), "/{pattern}/{spec} compiles");
     }

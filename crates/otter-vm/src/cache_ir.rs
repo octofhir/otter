@@ -63,7 +63,7 @@ pub(crate) fn resolve_atom_data_slot(
     heap: &otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
 ) -> Option<ResolvedDataSlot> {
-    if !object::supports_fast_property_ic(obj, heap) {
+    if !object::supports_fast_own_property_ic(obj, heap) {
         return None;
     }
     let own = object::lookup_own_atom(obj, heap, key);

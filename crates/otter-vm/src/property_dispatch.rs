@@ -261,12 +261,12 @@ impl Interpreter {
             // The bag inherits the closure's own `[[Prototype]]`, so its shape
             // fixes the function's ordinary lookup for every key the closure
             // does not synthesize: property ICs use it as the function's map.
-            let prototype = self.get_prototype_for_op(&owner_value)?.as_object();
+            let prototype = self.get_prototype_for_op(&owner_value)?;
             let mut roots: smallvec::SmallVec<[&mut Value; 4]> =
                 value_roots.iter_mut().map(|value| &mut **value).collect();
             roots.push(&mut owner_value);
             let bag =
-                self.alloc_stack_rooted_object_with_prototype(stack, &mut roots, prototype)?;
+                self.alloc_stack_rooted_object_with_prototype_value(stack, &mut roots, prototype)?;
             drop(roots);
             let owner_now = owner_value
                 .as_closure(&self.gc_heap)

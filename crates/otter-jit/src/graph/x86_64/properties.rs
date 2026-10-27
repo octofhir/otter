@@ -94,16 +94,13 @@ impl Codegen<'_> {
 
     /// `Rq(destination)` = the own-property bag of the closure or native
     /// function `Rq(receiver)`, or the statics of the class constructor, whose
-    /// named lookup starts there: the bag exists, no `[[Prototype]]` override
-    /// is installed and the default realm is active. Anything else jumps to `miss` before `Rq(destination)`
+    /// named lookup starts there: the bag exists, a native has no
+    /// `[[Prototype]]` override and the default realm is active. Anything else jumps to `miss` before `Rq(destination)`
     /// changes. Clobbers r10 and r11.
     fn emit_function_bag(&mut self, receiver: u8, destination: u8, miss: DynamicLabel) {
         let layout = self.view.closure_call_layout;
         let native = self.view.native_call_layout;
-        let qualifying = i32::from(
-            otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
-                | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
-        );
+        // A closure's bag mirrors its [[Prototype]], override or not.
         let class = self.view.class_constructor_layout;
         let native_bag = self.ops.new_dynamic_label();
         let class_statics = self.ops.new_dynamic_label();
@@ -116,10 +113,9 @@ impl Codegen<'_> {
             ; je =>class_statics
             ; cmp BYTE [Rq(receiver)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8
             ; jne =>miss
-            ; movzx r10d, BYTE [Rq(receiver) + otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE as i32]
-            ; and r10d, qualifying
-            ; cmp r10d, i32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
-            ; jne =>miss
+            ; test BYTE [Rq(receiver) + otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE as i32],
+                otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS as i8
+            ; jz =>miss
             ; mov r10d, [Rq(receiver) + layout.rare_byte as i32]
             ; test r10d, r10d ; jz =>miss);
         self.load_immediate(11, 0xffff_ffff_0000_0000);

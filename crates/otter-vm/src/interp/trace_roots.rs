@@ -171,11 +171,11 @@ impl Interpreter {
         // in a table keyed by the shared bytecode template id.
         if let Some(closure) = value.as_closure(&self.gc_heap) {
             self.retire_instanceof_proofs_for(closure);
+            let mut closure_value = Value::closure(closure);
             match proto {
                 Some(proto) => {
                     // The override lives in the closure's rare record; its
                     // allocation roots the closure and the new prototype.
-                    let mut closure_value = Value::closure(closure);
                     let mut proto = proto;
                     let rooted =
                         self.ensure_closure_rare(None, &mut closure_value, &mut [&mut proto]);
@@ -187,6 +187,14 @@ impl Interpreter {
                     }
                 }
                 None => closure.clear_proto_override(&mut self.gc_heap),
+            }
+            // The own-property bag mirrors the function's [[Prototype]]: the
+            // property caches key a function's lookup on the bag's shape.
+            if let Some(closure) = closure_value.as_closure(&self.gc_heap)
+                && let Some(mut bag) = closure.own_props(&self.gc_heap)
+                && let Ok(prototype) = self.get_prototype_for_op(&closure_value)
+            {
+                let _ = object::set_prototype_value(&mut bag, &mut self.gc_heap, Some(prototype));
             }
             return;
         }

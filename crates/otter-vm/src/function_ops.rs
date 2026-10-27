@@ -1666,9 +1666,12 @@ impl Interpreter {
                 // shape fixes the function's ordinary lookup for every key the
                 // closure does not synthesize: property ICs use it as the
                 // function's map.
-                let prototype = interp.get_prototype_for_op(&closure_value)?.as_object();
-                let bag =
-                    interp.alloc_stack_rooted_object_with_prototype(stack, &mut [], prototype)?;
+                let prototype = interp.get_prototype_for_op(&closure_value)?;
+                let bag = interp.alloc_stack_rooted_object_with_prototype_value(
+                    stack,
+                    &mut [&mut closure_value],
+                    prototype,
+                )?;
                 let closure = interp
                     .escape_scoped(owner)
                     .as_closure(&interp.gc_heap)

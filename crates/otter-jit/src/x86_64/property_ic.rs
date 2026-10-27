@@ -135,10 +135,7 @@ pub(crate) fn emit_select_entry(
         let bag = ops.new_dynamic_label();
         let layout = view.closure_call_layout;
         let native_layout = view.native_call_layout;
-        let qualifying = i32::from(
-            otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
-                | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
-        );
+        // A closure's bag mirrors its [[Prototype]], override or not.
         dynasm!(ops ; .arch x64
             ; =>projected
             ; cmp BYTE [Rq(receiver)], view.array_layout.type_tag as i8
@@ -149,10 +146,9 @@ pub(crate) fn emit_select_entry(
             ; je =>class
             ; cmp BYTE [Rq(receiver)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8
             ; jne =>miss
-            ; movzx r10d, BYTE [Rq(receiver) + otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE as i32]
-            ; and r10d, qualifying
-            ; cmp r10d, i32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
-            ; jne =>miss
+            ; test BYTE [Rq(receiver) + otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE as i32],
+                otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS as i8
+            ; jz =>miss
             ; mov r10d, [Rq(receiver) + layout.rare_byte as i32]
             ; test r10d, r10d ; jz =>miss);
         emit_load_u64(ops, 11, CAGE_MASK);

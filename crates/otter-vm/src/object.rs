@@ -4172,6 +4172,13 @@ pub(crate) fn supports_fast_property_ic(obj: JsObject, heap: &otter_gc::GcHeap) 
     heap.read_payload(obj, shape_cache::supports_fast_property_ic)
 }
 
+/// Whether `obj`'s own named slots are ordinary hidden-class storage, whatever
+/// its `[[Prototype]]`.
+#[must_use]
+pub(crate) fn supports_fast_own_property_ic(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, shape_cache::supports_fast_own_property_ic)
+}
+
 /// Read an **own** property with an accessor short-circuit:
 /// returns `Some(value)` for data slots, `Some(undefined)` for
 /// accessor slots (callers that need to invoke the getter must
@@ -6936,8 +6943,11 @@ pub(crate) fn dictionary_ordered_slot_attrs(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
 ) -> Option<Vec<(SlotName, PropertyFlags, bool)>> {
+    // A non-ordinary [[Prototype]] (a function value) leaves own named
+    // storage ordinary; every other lookup fact keeps the dictionary.
+    let facts = ShapeState::OPAQUE_LOOKUP_MASK & !ShapeState::OPAQUE_PROTOTYPE_MASK;
     heap.read_payload(obj, |body| {
-        if !body.is_dictionary() || body.state().is_opaque() {
+        if !body.is_dictionary() || body.state().bits() & facts != 0 {
             return None;
         }
         let count = body.dict_key_count();

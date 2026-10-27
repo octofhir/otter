@@ -422,6 +422,19 @@ impl IcHandler {
         !state.is_dictionary() && !state.is_opaque()
     }
 
+    /// Whether an own named slot of a receiver with `shape` is read and
+    /// written by its layout alone: a non-ordinary `[[Prototype]]` (a
+    /// function value) decides only the keys the receiver lacks.
+    fn eligible_own_receiver(shape: ShapeHandle) -> bool {
+        use object::ShapeState;
+        if shape.is_null() {
+            return false;
+        }
+        let state = object::shape_body::state_of(shape);
+        let facts = ShapeState::OPAQUE_LOOKUP_MASK & !ShapeState::OPAQUE_PROTOTYPE_MASK;
+        !state.is_dictionary() && state.bits() & facts == 0
+    }
+
     /// The load handler for a resolved own or inherited data slot of a
     /// receiver whose layout is `receiver_shape`.
     #[must_use]
@@ -429,7 +442,15 @@ impl IcHandler {
         receiver_shape: ShapeHandle,
         resolved: &crate::cache_ir::ResolvedDataSlot,
     ) -> Option<Self> {
-        if !Self::eligible_receiver(receiver_shape) || resolved.hit.shape.is_null() {
+        if resolved.hit.shape.is_null() {
+            return None;
+        }
+        let eligible = if resolved.hops == 0 {
+            Self::eligible_own_receiver(receiver_shape)
+        } else {
+            Self::eligible_receiver(receiver_shape)
+        };
+        if !eligible {
             return None;
         }
         let field = object::field_location(resolved.hit.shape, u32::from(resolved.hit.slot));
@@ -578,7 +599,7 @@ impl IcHandler {
         key: AtomizedPropertyKey<'_>,
     ) -> Option<(Self, object::AtomOwnPropertyHit)> {
         let receiver_shape = object::keyed_shape(obj, heap);
-        if !Self::eligible_receiver(receiver_shape)
+        if !Self::eligible_own_receiver(receiver_shape)
             || object::shape_body::state_of(receiver_shape).is_prototype()
         {
             return None;

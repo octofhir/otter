@@ -230,6 +230,10 @@ impl JitFunctionCode for TemplateCode {
         Some(unsafe { self.code.ptr_at(0) as u64 })
     }
 
+    fn routine_symbols(&self) -> Vec<(u64, usize, &'static str)> {
+        self.code.routine_symbols()
+    }
+
     fn return_sites(&self) -> &[SafepointEntry] {
         &self.return_sites
     }

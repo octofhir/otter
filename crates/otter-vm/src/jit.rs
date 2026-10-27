@@ -2930,6 +2930,12 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
         None
     }
 
+    /// `(address, length, name)` of every shared routine this code calls
+    /// that has been placed, for naming them to profilers.
+    fn routine_symbols(&self) -> Vec<(u64, usize, &'static str)> {
+        Vec::new()
+    }
+
     /// Make these instructions safe to run on the calling thread. Code a
     /// compiler thread finished is prepared on the isolate thread before it
     /// is installed.

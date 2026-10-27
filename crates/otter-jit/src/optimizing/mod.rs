@@ -206,6 +206,10 @@ impl JitFunctionCode for OptimizedCode {
     fn native_code_address(&self) -> Option<u64> {
         Some(unsafe { self.code.ptr_at(0) as u64 })
     }
+
+    fn routine_symbols(&self) -> Vec<(u64, usize, &'static str)> {
+        self.code.routine_symbols()
+    }
     fn prepare_for_execution(&self) {
         self.code.prepare_for_execution();
     }

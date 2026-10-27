@@ -416,7 +416,8 @@ impl Emitter<'_> {
                 min,
                 greedy,
                 possessive,
-            } => self.repeat(pc, atom, *min, *greedy, *possessive),
+                follow,
+            } => self.repeat(pc, atom, *min, *greedy, *possessive, *follow),
             Insn::Fail => dynasm!(self.ops ; .arch aarch64 ; b =>fail),
             Insn::Jump(target) => {
                 if *target != pc + 1 {
@@ -523,7 +524,15 @@ impl Emitter<'_> {
 
     /// A fused repeat: consume the longest run of the atom, then leave the
     /// give-back (greedy) or give-forward (lazy) frame the interpreter would.
-    fn repeat(&mut self, pc: usize, atom: &RepeatAtom, min: u32, greedy: bool, possessive: bool) {
+    fn repeat(
+        &mut self,
+        pc: usize,
+        atom: &RepeatAtom,
+        min: u32,
+        greedy: bool,
+        possessive: bool,
+        follow: Option<u32>,
+    ) {
         let fail = self.fail;
         let done = self.ops.new_dynamic_label();
         let next = self.ops.new_dynamic_label();
@@ -600,6 +609,7 @@ impl Emitter<'_> {
                     ; b.eq =>skip
                     ; sub x9, x21, #1
                 );
+                self.follow_back(follow, 12, skip);
                 self.push_frame(stub, 9, Some(12));
                 dynasm!(self.ops ; .arch aarch64 ; =>skip);
             }
@@ -610,6 +620,7 @@ impl Emitter<'_> {
                 ; b.eq =>skip
                 ; add x9, x12, #1
             );
+            self.follow_forward(follow, 21, skip);
             self.push_frame(stub, 9, Some(21));
             dynasm!(self.ops
                 ; .arch aarch64
@@ -632,14 +643,91 @@ impl Emitter<'_> {
                 ; cmp x21, x12
                 ; b.eq =>after
             );
+            let follow = match &self.program.insns[pc] {
+                Insn::Repeat { follow, .. } => *follow,
+                _ => None,
+            };
             if greedy {
                 dynasm!(self.ops ; .arch aarch64 ; sub x9, x21, #1);
+                self.follow_back(follow, 12, after);
             } else {
                 dynasm!(self.ops ; .arch aarch64 ; add x9, x21, #1);
+                self.follow_forward(follow, 12, after);
             }
             self.push_frame(stub, 9, Some(12));
             dynasm!(self.ops ; .arch aarch64 ; b =>after);
         }
+    }
+
+    /// Move the give-back length in x9 down to the longest one, at least
+    /// `X(low)`, whose next unit the follow set admits; branch to `none` when
+    /// there is none. Every such length leaves a unit. Clobbers x11 and x13.
+    fn follow_back(&mut self, follow: Option<u32>, low: u8, none: DynamicLabel) {
+        let Some(follow) = follow else {
+            return;
+        };
+        let table = self.table_label(&self.program.follows[follow as usize]);
+        let (scan, admitted) = (self.ops.new_dynamic_label(), self.ops.new_dynamic_label());
+        dynasm!(self.ops ; .arch aarch64 ; adr x13, =>table ; =>scan);
+        self.follow_unit(admitted);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp x9, X(low)
+            ; b.eq =>none
+            ; sub x9, x9, #1
+            ; b =>scan
+            ; =>admitted
+        );
+    }
+
+    /// Move the give-forward length in x9 up to the shortest one, at most
+    /// `X(high)`, that leaves a unit the follow set admits; branch to `none`
+    /// when there is none. Clobbers x11 and x13.
+    fn follow_forward(&mut self, follow: Option<u32>, high: u8, none: DynamicLabel) {
+        let Some(follow) = follow else {
+            return;
+        };
+        let table = self.table_label(&self.program.follows[follow as usize]);
+        let (scan, refused, admitted) = (
+            self.ops.new_dynamic_label(),
+            self.ops.new_dynamic_label(),
+            self.ops.new_dynamic_label(),
+        );
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; adr x13, =>table
+            ; =>scan
+            ; cmp x9, x20
+            ; b.hs =>refused
+        );
+        self.follow_unit(admitted);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; =>refused
+            ; cmp x9, X(high)
+            ; b.eq =>none
+            ; add x9, x9, #1
+            ; b =>scan
+            ; =>admitted
+        );
+    }
+
+    /// Branch to `admitted` when the follow table at x13 admits the unit at
+    /// x9, which lies inside the subject; a unit above the table always is.
+    fn follow_unit(&mut self, admitted: DynamicLabel) {
+        self.load_unit(11, 9);
+        if self.wide {
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cmp w11, 256
+                ; b.hs =>admitted
+            );
+        }
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldrb w11, [x13, x11]
+            ; cbnz w11, =>admitted
+        );
     }
 
     /// `\b` / `\B` in code-unit mode.

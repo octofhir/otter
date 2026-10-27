@@ -4807,11 +4807,23 @@ impl<'a> Builder<'a> {
         // operands, so an inlined body stays inlined. Once an operand was not
         // a Number here, the baseline operation takes the call, as it does
         // for every other leaf method, whose misses it commits.
+        // A guard on the namespace's shape proves the same native the named
+        // read checks; an exotic receiver's guard names a builtin of its own.
+        let exotic_guard = self
+            .view
+            .guarded_method_calls
+            .get(&byte_pc)
+            .is_some_and(|call| {
+                !matches!(
+                    call.receiver,
+                    otter_vm::jit::JitGuardedReceiver::Shape { .. }
+                )
+            });
         if lookup
             && fold.is_none()
             && method.is_none()
             && polymorphic.is_none()
-            && !self.view.guarded_method_calls.contains_key(&byte_pc)
+            && !exotic_guard
             && !self.exited_for(ExitReason::TypeMismatch)
             && let Some((target, _)) = self.admitted_native_leaf(instruction, arguments.len())
             && let Some(op) = super::ir::MathOp::of_leaf(target.leaf_stub_id)

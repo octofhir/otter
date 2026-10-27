@@ -1873,6 +1873,15 @@ pub extern "C" fn math_f64_leaf(method: u32, left: f64, right: f64) -> f64 {
     use otter_bytecode::method_id::MathMethod;
     match MathMethod::from_u32(method) {
         Some(MathMethod::Random) | None => f64::NAN,
+        // The transcendental methods are the platform functions on doubles,
+        // as the call path computes them.
+        Some(MathMethod::Sin) => left.sin(),
+        Some(MathMethod::Cos) => left.cos(),
+        Some(MathMethod::Tan) => left.tan(),
+        Some(MathMethod::Atan) => left.atan(),
+        Some(MathMethod::Exp) => left.exp(),
+        Some(MathMethod::Log) => left.ln(),
+        Some(MathMethod::Atan2) => left.atan2(right),
         Some(
             method @ (MathMethod::Atan2
             | MathMethod::Pow

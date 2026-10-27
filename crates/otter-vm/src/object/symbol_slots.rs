@@ -9,6 +9,7 @@
 //!
 //! # Contents
 //! - [`shaped_slot`] / [`shaped_symbols`] — lookup and slot-order enumeration.
+//! - [`has_shaped_well_known`] — allocation-free well-known key probe.
 //! - [`own_symbol_entries`] — every own symbol property in insertion order.
 //! - [`define_shaped`] — appends and same-attribute writes through the class.
 //! - [`spill_entries`] — the slots a dictionary conversion moves to the table.
@@ -57,6 +58,32 @@ pub(super) fn shaped_symbols(heap: &GcHeap, body: &ObjectBody) -> Vec<(JsSymbol,
             ))
         })
         .collect()
+}
+
+/// Whether a shaped object's hidden class keys a slot by the well-known
+/// symbol `tag`, walking the transition chain without collecting it.
+#[must_use]
+pub(super) fn has_shaped_well_known(
+    heap: &GcHeap,
+    body: &ObjectBody,
+    tag: crate::symbol::WellKnown,
+) -> bool {
+    if body.is_dictionary() || !shape_body::has_symbol_keys(body.shape) {
+        return false;
+    }
+    let mut shape = body.shape;
+    while !shape.is_null() {
+        let (parent, key) =
+            heap.read_payload(shape, |shape| (shape.parent(), shape.transition_key()));
+        if key
+            .as_symbol()
+            .is_some_and(|symbol| JsSymbol::from_handle(heap, symbol).well_known_tag() == Some(tag))
+        {
+            return true;
+        }
+        shape = parent;
+    }
+    false
 }
 
 /// Whether slot `index` of a shaped object holds a Private Name.

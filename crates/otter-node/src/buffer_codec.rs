@@ -6,7 +6,8 @@
 //!   `encode`, `fromString`, `write` and `byteLength` (text to bytes) taking
 //!   the encoding by name. `fromString` returns the bytes as one `Uint8Array`
 //!   view with the caller's prototype, a buffer built without running a
-//!   constructor; `concat` joins views into one such buffer.
+//!   constructor; `fromStringPooled` stores them in a shared pool buffer as
+//!   Node does for short strings, and `concat` joins views into one buffer.
 //!
 //! # Invariants
 //! - A decode reads the view's bytes once and builds one string; an encode
@@ -90,6 +91,15 @@ pub fn codec_native_cjs_value<'scope>(
         },
     )?;
     scope.set(object, "fromString", from_string)?;
+    let from_string_pooled = scope.native_closure(
+        "fromStringPooled",
+        5,
+        &[],
+        |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
+            from_string_pooled(ctx, args)
+        },
+    )?;
+    scope.set(object, "fromStringPooled", from_string_pooled)?;
     let concat = scope.native_closure(
         "concat",
         3,
@@ -171,6 +181,43 @@ fn slice(
     ctx.scope(|mut scope| {
         let text = scope.string(&text)?;
         Ok(scope.finish(text))
+    })
+}
+
+/// `fromStringPooled(string, encoding, prototype, pool, offset)`: the
+/// string's bytes stored in the `ArrayBuffer` `pool` at `offset`, as a
+/// `Uint8Array` view over them with `prototype`; `undefined`, leaving the pool
+/// unchanged, when they do not fit.
+fn from_string_pooled(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
+    let bytes = encoded(ctx, &args);
+    let offset = args
+        .get(4)
+        .and_then(|value| value.as_f64())
+        .unwrap_or(f64::INFINITY);
+    let Some(pool) = args.get(3).and_then(|value| value.as_array_buffer()) else {
+        return Ok(Value::undefined());
+    };
+    let heap = ctx.heap();
+    let capacity = pool.byte_length(heap);
+    // A NaN offset fails the range check too.
+    let fits = (0.0..=capacity as f64 - bytes.len() as f64).contains(&offset);
+    if !fits || pool.is_detached(heap) {
+        return Ok(Value::undefined());
+    }
+    let offset = offset as usize;
+    pool.with_bytes_mut(ctx.heap_mut(), |target| {
+        target[offset..offset + bytes.len()].copy_from_slice(&bytes);
+    });
+    let length = bytes.len();
+    ctx.scope(|mut scope| {
+        let pool = scope.argument(args, 3);
+        let prototype = scope.argument(args, 2);
+        let view = scope.typed_array_view(pool, TypedArrayKind::Uint8, offset, length)?;
+        scope.set_prototype(view, Some(prototype))?;
+        Ok(scope.finish(view))
     })
 }
 
@@ -267,18 +314,18 @@ fn base64(bytes: &[u8], url: bool) -> String {
 
 /// The encoding a shim call names; the shim passes only normalized names.
 fn encoding_arg(ctx: &NativeCtx<'_>, value: Option<Value>) -> Encoding {
-    let name = value
-        .and_then(|value| value.as_string(ctx.heap()))
-        .map(|name| name.to_lossy_string(ctx.heap()));
-    match name.as_deref() {
-        Some("latin1") => Encoding::Latin1,
-        Some("ascii") => Encoding::Ascii,
-        Some("utf16le") => Encoding::Utf16le,
-        Some("hex") => Encoding::Hex,
-        Some("base64") => Encoding::Base64,
-        Some("base64url") => Encoding::Base64Url,
+    let Some(name) = value.and_then(|value| value.as_string(ctx.heap())) else {
+        return Encoding::Utf8;
+    };
+    name.with_code_units(ctx.heap(), |units| match units {
+        CodeUnits::Latin1(b"latin1") => Encoding::Latin1,
+        CodeUnits::Latin1(b"ascii") => Encoding::Ascii,
+        CodeUnits::Latin1(b"utf16le") => Encoding::Utf16le,
+        CodeUnits::Latin1(b"hex") => Encoding::Hex,
+        CodeUnits::Latin1(b"base64") => Encoding::Base64,
+        CodeUnits::Latin1(b"base64url") => Encoding::Base64Url,
         _ => Encoding::Utf8,
-    }
+    })
 }
 
 /// `encode(string, encoding)`'s bytes.

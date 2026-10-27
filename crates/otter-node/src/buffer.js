@@ -19,7 +19,7 @@ if (!Buffer) {
   // ---- encoding helpers ----
   const enc = {
     normalize(encoding) {
-      if (encoding === undefined) return 'utf8';
+      if (encoding === undefined || encoding === 'utf8' || encoding === 'utf-8') return 'utf8';
       const e = String(encoding).toLowerCase();
       switch (e) {
         case 'utf8': case 'utf-8': return 'utf8';
@@ -559,6 +559,37 @@ if (!Buffer) {
       return this;
     }
   };
+  // The prototype every native-built buffer takes, read once.
+  const fastBufferPrototype = BufferImpl.prototype;
+
+  // Node's allocation pool: a short string's bytes go into one shared
+  // `Buffer.poolSize` buffer, 8-byte aligned, instead of each buffer owning
+  // its backing store.
+  let poolSize = 0;
+  let pool = null;
+  let poolOffset = 0;
+  function createPool() {
+    poolSize = Buffer.poolSize;
+    pool = new ArrayBuffer(poolSize);
+    poolOffset = 0;
+  }
+  function fromStringFast(string, encoding) {
+    const codec = decoder();
+    // Four bytes per code unit bound every encoding's output.
+    if (string.length * 4 >= Buffer.poolSize >>> 1) {
+      return codec.fromString(string, encoding, fastBufferPrototype);
+    }
+    if (pool === null) createPool();
+    let b = codec.fromStringPooled(string, encoding, fastBufferPrototype, pool, poolOffset);
+    if (b === undefined) {
+      createPool();
+      b = codec.fromStringPooled(string, encoding, fastBufferPrototype, pool, poolOffset);
+      if (b === undefined) return codec.fromString(string, encoding, fastBufferPrototype);
+    }
+    poolOffset += b.length;
+    if ((poolOffset & 7) !== 0) poolOffset = (poolOffset | 7) + 1;
+    return b;
+  }
 
   function invalidBufferSize(unit) {
     return codedError(RangeError, 'ERR_INVALID_BUFFER_SIZE', `Buffer size must be a multiple of ${unit}`);
@@ -909,7 +940,7 @@ if (!Buffer) {
           e = enc.normalize(encodingOrOffset);
           if (e === undefined) throw unknownEncoding(encodingOrOffset);
         }
-        return decoder().fromString(value, e, BufferImpl.prototype);
+        return fromStringFast(value, e);
       }
       if (typeof value === 'object' && value !== null) {
         if (isArrayBufferLike(value) || isSharedArrayBufferLike(value)) {
@@ -986,7 +1017,7 @@ if (!Buffer) {
           throw outOfRange('length', `>= 0 && <= ${kMaxLength}`, totalLength);
         }
       }
-      return decoder().concat(list, totalLength, BufferImpl.prototype);
+      return decoder().concat(list, totalLength, fastBufferPrototype);
     },
     compare(a, b) {
       if (!(a instanceof Uint8Array)) throw invalidBufferTarget('buf1', a);

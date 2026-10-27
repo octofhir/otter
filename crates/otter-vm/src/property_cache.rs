@@ -659,9 +659,9 @@ impl crate::Interpreter {
     ///   expando bag; without one it owns no named key but the ones its kind
     ///   defines (a TypedArray's numeric keys, a RegExp's `lastIndex`), so
     ///   every other name starts at its `[[Prototype]]`;
-    /// - a closure or native function without a `[[Prototype]]` override, in
-    ///   the default realm, starts at its own-property bag, whose prototype
-    ///   mirrors the function's, for every name it does not synthesize
+    /// - a closure with an own-property bag, or a native function without a
+    ///   `[[Prototype]]` override, in the default realm, starts at that bag,
+    ///   whose prototype mirrors the function's, for every name it does not synthesize
     ///   (`name` and `length` of a native; a closure's `prototype`, and its
     ///   `name`, `length`, `caller` and `arguments` unless the bag owns them);
     /// - a class constructor in the default realm starts at its statics, which
@@ -842,7 +842,7 @@ impl crate::Interpreter {
 
     /// The property bag a closure, native function or class constructor (its
     /// statics) keeps its own named properties in, when present and in the
-    /// default realm with no `[[Prototype]]` override.
+    /// default realm (for a native, with no `[[Prototype]]` override).
     fn function_bag(&self, receiver: crate::Value) -> Option<JsObject> {
         if self.active_realm_id != 0 {
             return None;
@@ -855,11 +855,8 @@ impl crate::Interpreter {
         if let Some(class) = receiver.as_class_constructor() {
             return Some(class.statics(&self.gc_heap));
         }
-        let closure = receiver.as_closure(&self.gc_heap)?;
-        if closure.proto_override(&self.gc_heap).is_some() {
-            return None;
-        }
-        closure.own_props(&self.gc_heap)
+        // A closure's bag mirrors its [[Prototype]], override or not.
+        receiver.as_closure(&self.gc_heap)?.own_props(&self.gc_heap)
     }
 
     /// The object a named lookup on `receiver` starts at, whatever the key,
@@ -886,18 +883,17 @@ impl crate::Interpreter {
             return Some(class.statics(&self.gc_heap));
         }
         let closure = receiver.as_closure(&self.gc_heap)?;
-        if closure.proto_override(&self.gc_heap).is_some() {
-            return None;
+        // A closure's bag mirrors its [[Prototype]], override or not.
+        if let Some(bag) = closure.own_props(&self.gc_heap) {
+            return Some(bag);
         }
         // A closure without an own-property bag owns only its virtual
         // `name`, `length` and `prototype`, which admission refuses: every
         // other key starts at the `%Function.prototype%` an ordinary kind
         // inherits from.
-        closure.own_props(&self.gc_heap).or_else(|| {
-            (closure.named_lookup(&self.gc_heap) == crate::closure::CLOSURE_LOOKUP_ORDINARY)
-                .then(|| self.function_prototype_object().ok())
-                .flatten()
-        })
+        (closure.named_lookup(&self.gc_heap) == crate::closure::CLOSURE_LOOKUP_ORDINARY)
+            .then(|| self.function_prototype_object().ok())
+            .flatten()
     }
 
     /// The lookup start of a bag-backed exotic receiver: `Some(None)` while
@@ -1054,7 +1050,9 @@ impl crate::Interpreter {
                 return None;
             }
         }
-        if native && object::state(start, &self.gc_heap).is_dictionary() {
+        // A native's first miss, or a closure's bag re-seated on a new
+        // [[Prototype]] with properties in it, leaves a dictionary.
+        if object::state(start, &self.gc_heap).is_dictionary() {
             self.migrate_slow_to_fast(&mut start);
         }
         Some(start)

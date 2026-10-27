@@ -13,10 +13,19 @@
 //! - `super::shape_state` owns the only state byte.
 //! - `crate::property_ic` consumes ordinary runtime lookup facts.
 
-use super::ObjectBody;
+use super::{ObjectBody, ShapeState};
 
 #[must_use]
 pub(super) fn supports_fast_property_ic(body: &ObjectBody) -> bool {
     let state = body.state();
     !state.is_dictionary() && !state.is_opaque()
+}
+
+/// Whether `body`'s own named slots are ordinary hidden-class storage: a
+/// non-ordinary `[[Prototype]]` (a function value) decides only the keys the
+/// object lacks.
+pub(super) fn supports_fast_own_property_ic(body: &ObjectBody) -> bool {
+    let state = body.state();
+    let facts = ShapeState::OPAQUE_LOOKUP_MASK & !ShapeState::OPAQUE_PROTOTYPE_MASK;
+    !state.is_dictionary() && state.bits() & facts == 0
 }

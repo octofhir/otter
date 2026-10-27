@@ -641,17 +641,15 @@ impl Interpreter {
         .map_err(VmError::from)
     }
 
-    /// Allocate an ordinary object whose `[[Prototype]]` is `prototype`
-    /// (`None` for `null`), rooting the frame stack and `value_roots`.
-    pub(crate) fn alloc_stack_rooted_object_with_prototype(
+    /// Allocate an ordinary object whose `[[Prototype]]` is the value
+    /// `prototype` (an object, a non-ordinary function value, or `null`),
+    /// rooting the frame stack and `value_roots`.
+    pub(crate) fn alloc_stack_rooted_object_with_prototype_value(
         &mut self,
         stack: &ActivationStack,
         value_roots: &mut [&mut Value],
-        prototype: Option<crate::object::JsObject>,
+        prototype: Value,
     ) -> Result<crate::object::JsObject, VmError> {
-        let Some(prototype) = prototype else {
-            return self.alloc_stack_rooted_object_with_extra_roots(stack, value_roots);
-        };
         let roots = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -662,7 +660,7 @@ impl Interpreter {
             }
         };
         let root = crate::object::heap_instance_root(
-            crate::object::ObjectPrototype::Object(prototype),
+            crate::object::object_prototype_of_value(Some(prototype)),
             &mut self.gc_heap,
             crate::object::DEFAULT_INLINE_CAPACITY,
             crate::object::ShapeState::ORDINARY,

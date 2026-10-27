@@ -72,9 +72,9 @@ pub(crate) fn emit_array_expando(
 /// Select the entry of the receiver's map in the slot at `X(slot)`:
 /// `X(entry)` addresses it on fall-through. An ordinary object's map is its
 /// shape. With `start` given, an Array selects the live expando's shape with
-/// `ArrayExpando`, and a closure or native function whose bag carries its own
-/// `[[Prototype]]` (bag present, no override, default realm active), or a
-/// class constructor's statics in the default realm, selects that shape with
+/// `ArrayExpando`, and a closure with an own-property bag, a native function
+/// whose bag carries its `[[Prototype]]` (no override), or a class
+/// constructor's statics, in the default realm, selects that shape with
 /// `LookupStart`. `X(start)` receives the storage object,
 /// including the receiver itself for an ordinary object. A megamorphic slot
 /// branches to `megamorphic`, anything else to
@@ -138,10 +138,8 @@ pub(crate) fn emit_select_entry(
         let bag = ops.new_dynamic_label();
         let layout = view.closure_call_layout;
         let native_layout = view.native_call_layout;
-        let qualifying = u32::from(
-            otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
-                | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
-        );
+        // A closure's bag mirrors its [[Prototype]], override or not.
+        const OWN_PROPS_BIT: u32 = otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS.trailing_zeros();
         dynasm!(ops ; .arch aarch64
             ; =>projected
             ; cmp w16, u32::from(view.array_layout.type_tag)
@@ -153,9 +151,7 @@ pub(crate) fn emit_select_entry(
             ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
             ; b.ne =>miss
             ; ldrb w16, [X(receiver), otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE]
-            ; and w16, w16, #qualifying
-            ; cmp w16, u32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
-            ; b.ne =>miss
+            ; tbz w16, OWN_PROPS_BIT, =>miss
             ; ldr w16, [X(receiver), layout.rare_byte]
             ; cbz w16, =>miss
             ; and x17, X(receiver), #0xffff_ffff_0000_0000

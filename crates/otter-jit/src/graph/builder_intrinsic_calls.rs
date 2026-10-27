@@ -41,17 +41,29 @@ impl Builder<'_> {
         arguments: &[u16],
         construct: bool,
     ) -> bool {
-        let &[target, this, list] = arguments else {
-            return false;
-        };
-        if construct
-            || proof.identity_cell == 0
-            || proof.realm_id != self.view.literal_allocations.realm_id
-        {
+        if construct {
             return false;
         }
         let callee = self.read(callee);
         let callee = self.tagged(callee);
+        self.emit_reflect_apply_value(instruction, proof, callee, arguments)
+    }
+
+    /// [`Self::emit_reflect_apply`] of an already read callee: a plain call's
+    /// register or the method a `Reflect.apply(...)` call loaded.
+    pub(super) fn emit_reflect_apply_value(
+        &mut self,
+        instruction: &Instruction,
+        proof: otter_vm::JitIntrinsicCallProof,
+        callee: NodeId,
+        arguments: &[u16],
+    ) -> bool {
+        let &[target, this, list] = arguments else {
+            return false;
+        };
+        if proof.identity_cell == 0 || proof.realm_id != self.view.literal_allocations.realm_id {
+            return false;
+        }
         self.add(
             Kind::CheckCellValue(proof.identity_cell),
             &[callee],

@@ -193,6 +193,30 @@ impl Regex {
         self.find_units(text, start, config, scratch)
     }
 
+    /// One leftmost search for the first match at or after `start`, over
+    /// `scratch` in place: whether a match exists, with its group offsets
+    /// written into `out` (see [`crate::NO_OFFSET`]), and the backtrack
+    /// steps explored. `anchored` admits only a match beginning at `start`,
+    /// as [`Matches::anchored`] does. A miss leaves `out` unspecified.
+    #[inline]
+    pub fn first_offsets_into<U: Unit>(
+        &self,
+        text: &[U],
+        start: usize,
+        anchored: bool,
+        config: ExecConfig,
+        scratch: &mut MatchScratch,
+        out: &mut Vec<u32>,
+    ) -> (Result<bool, ExecError>, u64) {
+        let mut matches = self.find_units(text, start, config, std::mem::take(scratch));
+        matches.anchored = anchored;
+        let found = matches.first_offsets(out);
+        let steps = matches.steps_executed;
+        *scratch = matches.into_scratch();
+        (found, steps)
+    }
+
+    #[inline]
     fn find_units<'r, 't, U: Unit>(
         &'r self,
         text: &'t [U],

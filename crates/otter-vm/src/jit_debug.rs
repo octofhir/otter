@@ -951,6 +951,17 @@ impl JitDebugState {
     pub(crate) fn record_perf_map_once(&mut self, address: u64, len: usize, name: &str) {
         if self.request.perf_map_enabled() && self.perf_map_named.insert(address) {
             self.record_perf_map(address, len, name);
+            // A shared routine has no artifact bundle of its own: its bytes
+            // go beside the map, so a profile can be read down to its
+            // instructions.
+            // SAFETY: `address..address + len` is the routine's finalized,
+            // readable code in the isolate's code space, which outlives it.
+            let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, len) };
+            let file = name.replace(':', "-");
+            let _ = std::fs::write(
+                format!("/tmp/perf-{}.{file}.bin", std::process::id()),
+                bytes,
+            );
         }
     }
 

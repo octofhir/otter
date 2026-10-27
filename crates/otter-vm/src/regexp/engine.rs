@@ -232,31 +232,16 @@ pub(crate) fn find_first_offsets(
     let config = otter_regex::ExecConfig {
         step_limit: search.step_limit,
     };
-    let scratch = search.scratch.take();
-    match text {
-        crate::string::CodeUnits::Latin1(bytes) => first_offsets(
-            re.find_latin1_with(bytes, start, config, scratch)
-                .anchored(sticky),
-            search,
-            out,
-        ),
-        crate::string::CodeUnits::Utf16(units) => first_offsets(
-            re.find_utf16_with(units, start, config, scratch)
-                .anchored(sticky),
-            search,
-            out,
-        ),
-    }
-}
-
-fn first_offsets<U: otter_regex::Unit>(
-    mut matches: otter_regex::Matches<'_, '_, U>,
-    search: &super::RegexSearch<'_>,
-    out: &mut Vec<u32>,
-) -> Execution<bool> {
-    let result = matches.first_offsets(out);
-    let steps = matches.steps_executed();
-    search.scratch.set(matches.into_scratch());
+    let mut scratch = search.scratch.take();
+    let (result, steps) = match text {
+        crate::string::CodeUnits::Latin1(bytes) => {
+            re.first_offsets_into(bytes, start, sticky, config, &mut scratch, out)
+        }
+        crate::string::CodeUnits::Utf16(units) => {
+            re.first_offsets_into(units, start, sticky, config, &mut scratch, out)
+        }
+    };
+    search.scratch.set(scratch);
     Execution { result, steps }
 }
 

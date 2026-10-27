@@ -482,6 +482,7 @@ fn main() {
     let mut dump: Option<String> = None;
     let mut flags = String::new();
     let mut input: Option<String> = None;
+    let mut first_on: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -498,6 +499,7 @@ fn main() {
             "--dump" => dump = Some(take(&mut i)),
             "--flags" => flags = take(&mut i),
             "--input" => input = Some(take(&mut i)),
+            "--first-on" => first_on = Some(take(&mut i)),
             "-h" | "--help" => {
                 usage();
                 return;
@@ -521,6 +523,32 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        return;
+    }
+
+    if let (Some(p), Some(subject)) = (&pattern, &first_on) {
+        // Fixed cost of one first-match search over a short one-byte
+        // subject, with buffers reused across calls as a host reuses them.
+        let re = Regex::compile_str(p, parsed_flags).expect("pattern compiles");
+        let bytes: Vec<u8> = subject.bytes().collect();
+        let config = otter_regex::ExecConfig {
+            step_limit: u64::MAX,
+        };
+        let mut scratch = otter_regex::MatchScratch::default();
+        let mut out = Vec::new();
+        let rounds = 20_000_000u32;
+        let mut found = 0u32;
+        let begin = Instant::now();
+        for _ in 0..rounds {
+            let (result, _) =
+                re.first_offsets_into(&bytes, 0, false, config, &mut scratch, &mut out);
+            found += u32::from(result.unwrap_or(false));
+        }
+        let elapsed = begin.elapsed();
+        println!(
+            "first-on {subject:?}: {:.1} ns/search, {found} matched",
+            elapsed.as_nanos() as f64 / f64::from(rounds)
+        );
         return;
     }
 

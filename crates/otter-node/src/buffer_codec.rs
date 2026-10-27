@@ -3,8 +3,10 @@
 //! # Contents
 //! - [`codec_native_cjs_value`] — the `__bufcodec` module the `buffer` shim
 //!   reaches for: one slice (bytes to text) entry point per encoding, and
-//!   `encode`, `write` and `byteLength` (text to bytes) taking the encoding
-//!   by name.
+//!   `encode`, `fromString`, `write` and `byteLength` (text to bytes) taking
+//!   the encoding by name. `fromString` returns the bytes as one `Uint8Array`
+//!   view with the caller's prototype, a buffer built without running a
+//!   constructor; `concat` joins views into one such buffer.
 //!
 //! # Invariants
 //! - A decode reads the view's bytes once and builds one string; an encode
@@ -23,6 +25,7 @@
 
 use otter_runtime::ValueWindow;
 use otter_runtime::{CapabilitySet, RuntimeNativeError as NativeError, RuntimeTaskSpawner};
+use otter_vm::binary::TypedArrayKind;
 use otter_vm::string::CodeUnits;
 use otter_vm::{Local, NativeCtx, NativeScope, Value};
 
@@ -70,6 +73,32 @@ pub fn codec_native_cjs_value<'scope>(
         },
     )?;
     scope.set(object, "encode", encode)?;
+    let from_string = scope.native_closure(
+        "fromString",
+        3,
+        &[],
+        |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
+            let bytes = encoded(ctx, &args);
+            let length = bytes.len();
+            ctx.scope(|mut scope| {
+                let prototype = scope.argument(args, 2);
+                let buffer = scope.array_buffer_from_bytes(bytes)?;
+                let view = scope.typed_array_view(buffer, TypedArrayKind::Uint8, 0, length)?;
+                scope.set_prototype(view, Some(prototype))?;
+                Ok(scope.finish(view))
+            })
+        },
+    )?;
+    scope.set(object, "fromString", from_string)?;
+    let concat = scope.native_closure(
+        "concat",
+        3,
+        &[],
+        |ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>, _captures: ValueWindow<'_>| {
+            concat(ctx, args)
+        },
+    )?;
+    scope.set(object, "concat", concat)?;
     let write = scope.native_closure(
         "write",
         5,
@@ -142,6 +171,36 @@ fn slice(
     ctx.scope(|mut scope| {
         let text = scope.string(&text)?;
         Ok(scope.finish(text))
+    })
+}
+
+/// `concat(list, totalLength, prototype)`: the first `totalLength` bytes of
+/// the typed arrays in `list`, zero-filled past their end, as one `Uint8Array`
+/// view with `prototype`. The shim has checked every element is a view.
+fn concat(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
+    let total = args
+        .get(1)
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
+        .max(0.0) as usize;
+    ctx.scope(|mut scope| {
+        let list = scope.argument(args, 0);
+        let prototype = scope.argument(args, 2);
+        let count = scope.array_length(list)?;
+        let mut bytes = Vec::with_capacity(total);
+        for index in 0..count {
+            let room = total - bytes.len();
+            if room == 0 {
+                break;
+            }
+            let item = scope.index(list, index)?;
+            scope.append_typed_array_bytes(item, &mut bytes, room);
+        }
+        bytes.resize(total, 0);
+        let buffer = scope.array_buffer_from_bytes(bytes)?;
+        let view = scope.typed_array_view(buffer, TypedArrayKind::Uint8, 0, total)?;
+        scope.set_prototype(view, Some(prototype))?;
+        Ok(scope.finish(view))
     })
 }
 

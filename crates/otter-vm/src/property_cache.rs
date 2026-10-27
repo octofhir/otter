@@ -663,7 +663,10 @@ impl crate::Interpreter {
     ///   the default realm, starts at its own-property bag, whose prototype
     ///   mirrors the function's, for every name it does not synthesize
     ///   (`name` and `length` of a native; a closure's `prototype`, and its
-    ///   `name`, `length`, `caller` and `arguments` unless the bag owns them).
+    ///   `name`, `length`, `caller` and `arguments` unless the bag owns them);
+    /// - a class constructor in the default realm starts at its statics, which
+    ///   carry its `[[Prototype]]` chain, for every name but its virtual
+    ///   `prototype`, and `name` and `length` while no static shadows them.
     ///
     /// A native's bag starts as a prototype-less dictionary. Its first miss
     /// gives it the function's prototype and a hidden class, which allocates:
@@ -837,9 +840,9 @@ impl crate::Interpreter {
         true
     }
 
-    /// The property bag a closure or native function keeps its own named
-    /// properties in, when present and in the default realm with no
-    /// `[[Prototype]]` override.
+    /// The property bag a closure, native function or class constructor (its
+    /// statics) keeps its own named properties in, when present and in the
+    /// default realm with no `[[Prototype]]` override.
     fn function_bag(&self, receiver: crate::Value) -> Option<JsObject> {
         if self.active_realm_id != 0 {
             return None;
@@ -848,6 +851,9 @@ impl crate::Interpreter {
             return (!native.has_prototype_override(&self.gc_heap))
                 .then(|| native.own_properties_bag(&self.gc_heap))
                 .filter(|bag| !bag.is_null());
+        }
+        if let Some(class) = receiver.as_class_constructor() {
+            return Some(class.statics(&self.gc_heap));
         }
         let closure = receiver.as_closure(&self.gc_heap)?;
         if closure.proto_override(&self.gc_heap).is_some() {
@@ -875,6 +881,9 @@ impl crate::Interpreter {
         if let Some(native) = receiver.as_native_function() {
             return (!native.has_prototype_override(&self.gc_heap))
                 .then(|| native.own_properties_bag(&self.gc_heap));
+        }
+        if let Some(class) = receiver.as_class_constructor() {
+            return Some(class.statics(&self.gc_heap));
         }
         let closure = receiver.as_closure(&self.gc_heap)?;
         if closure.proto_override(&self.gc_heap).is_some() {
@@ -986,6 +995,28 @@ impl crate::Interpreter {
         }
         if receiver.as_regexp().is_some() {
             return (name != "lastIndex").then_some(start);
+        }
+        if receiver.is_class_constructor() {
+            // A class's statics carry its [[Prototype]] chain; only its
+            // virtual `prototype`, and `name` and `length` while no static
+            // shadows them, live outside.
+            let admitted = match name {
+                "prototype" => false,
+                "name" | "length" => object::lookup_own_atom(start, &self.gc_heap, key)
+                    .hit
+                    .is_some(),
+                _ => true,
+            };
+            if !admitted {
+                return None;
+            }
+            // Re-seating the statics on their [[Prototype]] after the class
+            // body defined members leaves them a dictionary; the first miss
+            // gives them a hidden class, as a native's bag gets one.
+            if object::state(start, &self.gc_heap).is_dictionary() {
+                self.migrate_slow_to_fast(&mut start);
+            }
+            return Some(start);
         }
         if receiver.as_native_function().is_none() && receiver.as_closure(&self.gc_heap).is_none() {
             return Some(start);

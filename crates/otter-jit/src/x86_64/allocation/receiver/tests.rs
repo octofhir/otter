@@ -83,6 +83,7 @@ fn execute(case: Case) {
         type_tag: 0x44,
         constructor_layouts_byte: 32,
         ctor_byte: 24,
+        statics_byte: 40,
     };
     view.constructor_layout = JitConstructorLayout {
         family_id_byte: 8,

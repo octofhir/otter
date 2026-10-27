@@ -447,6 +447,9 @@ pub struct JitClassConstructorLayout {
     pub constructor_layouts_byte: u32,
     /// Header-inclusive byte offset of the wrapper's constructor body value.
     pub ctor_byte: u32,
+    /// Header-inclusive byte offset of the compressed statics object, where
+    /// a named lookup on the class starts.
+    pub statics_byte: u32,
 }
 
 /// One VM-owned layout of the traced constructor family cell. Every offset

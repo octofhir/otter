@@ -909,7 +909,7 @@ if (!Buffer) {
           e = enc.normalize(encodingOrOffset);
           if (e === undefined) throw unknownEncoding(encodingOrOffset);
         }
-        return new Buffer(decoder().encode(value, e));
+        return decoder().fromString(value, e, BufferImpl.prototype);
       }
       if (typeof value === 'object' && value !== null) {
         if (isArrayBufferLike(value) || isSharedArrayBufferLike(value)) {
@@ -978,7 +978,7 @@ if (!Buffer) {
       // getter cannot size the result or expose uninitialized memory.
       if (totalLength === undefined) {
         totalLength = 0;
-        for (const b of list) totalLength += b.byteLength;
+        for (let i = 0; i < list.length; i++) totalLength += list[i].byteLength;
       } else {
         if (typeof totalLength !== 'number') throw invalidArgType('length', 'number', totalLength);
         if (!Number.isInteger(totalLength)) throw outOfRange('length', 'an integer', totalLength);
@@ -986,16 +986,7 @@ if (!Buffer) {
           throw outOfRange('length', `>= 0 && <= ${kMaxLength}`, totalLength);
         }
       }
-      const out = new Buffer(totalLength);
-      let pos = 0;
-      for (const b of list) {
-        if (pos >= totalLength) break;
-        const blen = b.byteLength;
-        const n = Math.min(blen, totalLength - pos);
-        out.set(Uint8Array.prototype.subarray.call(b, 0, n), pos);
-        pos += blen;
-      }
-      return out;
+      return decoder().concat(list, totalLength, BufferImpl.prototype);
     },
     compare(a, b) {
       if (!(a instanceof Uint8Array)) throw invalidBufferTarget('buf1', a);

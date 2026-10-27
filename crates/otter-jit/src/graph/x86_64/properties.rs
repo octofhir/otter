@@ -93,9 +93,9 @@ impl Codegen<'_> {
     }
 
     /// `Rq(destination)` = the own-property bag of the closure or native
-    /// function `Rq(receiver)` whose named lookup starts there: the bag
-    /// exists, no `[[Prototype]]` override is installed and the default realm
-    /// is active. Anything else jumps to `miss` before `Rq(destination)`
+    /// function `Rq(receiver)`, or the statics of the class constructor, whose
+    /// named lookup starts there: the bag exists, no `[[Prototype]]` override
+    /// is installed and the default realm is active. Anything else jumps to `miss` before `Rq(destination)`
     /// changes. Clobbers r10 and r11.
     fn emit_function_bag(&mut self, receiver: u8, destination: u8, miss: DynamicLabel) {
         let layout = self.view.closure_call_layout;
@@ -104,12 +104,16 @@ impl Codegen<'_> {
             otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
                 | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
         );
+        let class = self.view.class_constructor_layout;
         let native_bag = self.ops.new_dynamic_label();
+        let class_statics = self.ops.new_dynamic_label();
         let bag = self.ops.new_dynamic_label();
         self.emit_cell_guard(receiver, miss);
         dynasm!(self.ops ; .arch x64
             ; cmp BYTE [Rq(receiver)], otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG as i8
             ; je =>native_bag
+            ; cmp BYTE [Rq(receiver)], class.type_tag as i8
+            ; je =>class_statics
             ; cmp BYTE [Rq(receiver)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8
             ; jne =>miss
             ; movzx r10d, BYTE [Rq(receiver) + otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE as i32]
@@ -122,6 +126,9 @@ impl Codegen<'_> {
         dynasm!(self.ops ; .arch x64
             ; and r11, Rq(receiver) ; add r10, r11
             ; mov r10d, [r10 + layout.own_props_byte as i32]
+            ; jmp =>bag
+            ; =>class_statics
+            ; mov r10d, [Rq(receiver) + class.statics_byte as i32]
             ; jmp =>bag
             ; =>native_bag
             ; test BYTE [Rq(receiver) + native.flags_byte as i32], native.prototype_override_flag as i8

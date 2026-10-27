@@ -205,6 +205,26 @@ impl ExecutionContext {
             .is_some_and(|local| self.payload.executable.forward(local).is_none())
     }
 
+    /// The chunk holding this chunk's module tables. A lazily compiled body
+    /// links as a chunk of its own with none; its creator — the chunk its
+    /// lazy record was linked in — holds the module's resolutions and
+    /// initializers, through any number of nested lazy bodies.
+    #[must_use]
+    pub(crate) fn module_owner(&self) -> Self {
+        let mut owner = self.clone();
+        while let Some(alias) = owner.payload.executable.alias() {
+            let ChunkResolution::Live {
+                function_base,
+                payload,
+            } = owner.space.resolve_chunk(alias)
+            else {
+                break;
+            };
+            owner = Self::from_chunk_payload(payload, function_base, Arc::clone(&self.space));
+        }
+        owner
+    }
+
     /// Resolve the context owning `function_id`: this chunk on the hot
     /// in-chunk path, otherwise an owned context for the matching live sibling.
     /// Evicted and never-linked ids remain distinct typed failures.

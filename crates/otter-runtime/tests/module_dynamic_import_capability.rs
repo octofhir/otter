@@ -304,11 +304,23 @@ fn dynamic_literal_import_settles_top_level_await() {
     )
     .unwrap();
     std::fs::write(
+        dir.path().join("late.ts"),
+        "globalThis.lateEvaluated = true;\nexport default 42;\n",
+    )
+    .unwrap();
+    // The second import runs from a function body, which compiles on its
+    // first call into a chunk of its own: the target still evaluates.
+    std::fs::write(
         dir.path().join("entry.ts"),
         r#"
             const mod = await import("./dep.ts");
             if (mod.greeting !== "hello") {
                 throw new Error("dynamic import settle broken: " + mod.greeting);
+            }
+            function load() { return import("./late.ts"); }
+            const late = await load();
+            if (late.default !== 42 || globalThis.lateEvaluated !== true) {
+                throw new Error("import from a function body did not evaluate its target");
             }
         "#,
     )

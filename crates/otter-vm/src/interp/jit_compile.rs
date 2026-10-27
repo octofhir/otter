@@ -2959,6 +2959,10 @@ impl Interpreter {
                         // others, a plain call or construction.
                         let form_site = if kind.is_method() {
                             matches!(op, Op::CallMethodValue | Op::CallWithThis)
+                        } else if kind == jit::IntrinsicCallKind::ReflectApply {
+                            // `Reflect.apply(...)` ignores the namespace it
+                            // was read from.
+                            matches!(op, Op::Call | Op::CallMethodValue)
                         } else {
                             matches!(op, Op::Call | Op::New)
                         };

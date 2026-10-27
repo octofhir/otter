@@ -4600,6 +4600,22 @@ impl<'a> Builder<'a> {
             return;
         }
         let byte_pc = instruction.byte_pc;
+        // `Reflect.apply(target, this, list)` with the realm's original
+        // `apply`: the method is read like a named load, proved, and the
+        // call spreads the list.
+        if let Some(&otter_vm::JitNativeCall::Intrinsic(proof)) =
+            self.view.native_calls.get(&byte_pc)
+            && proof.kind == otter_vm::IntrinsicCallKind::ReflectApply
+            && !self.exited_for(ExitReason::IdentityGuard)
+            && arguments.len() == 3
+        {
+            let namespace = self.read(receiver);
+            let namespace = self.tagged(namespace);
+            let method = self.named_lookup(byte_pc, namespace);
+            if self.emit_reflect_apply_value(instruction, proof, method, &arguments) {
+                return;
+            }
+        }
         // Once the site left on a different applied function, the fold calls
         // whichever function it gets.
         let identity_left = self.exited_for(ExitReason::IdentityGuard);

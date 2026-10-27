@@ -62,7 +62,8 @@ pub(crate) struct NamedLoadPrograms {
 }
 
 /// Select programs whose first receiver proof can match an ordinary object
-/// of a known shape. An unrecognized proof stays selected for validation.
+/// of a known shape, at most four, observed receivers ahead of the pinned
+/// intrinsic prototypes. An unrecognized proof stays selected for validation.
 /// A function's bag program stands only with others of its kind: beside an
 /// ordinary receiver's it is left out, as the site's unseen receivers are.
 fn load_program_indices(
@@ -79,7 +80,7 @@ fn load_program_indices(
         )
     };
     let only_bags = programs.iter().all(function_bag);
-    let mut selected = SmallVec::new();
+    let mut candidates: SmallVec<[u32; 8]> = SmallVec::new();
     for (index, program) in programs.iter().enumerate() {
         if function_bag(program) && (!only_bags || receivers.is_some()) {
             // Known ordinary receiver shapes exclude function cells.
@@ -128,11 +129,36 @@ fn load_program_indices(
                 _ => {}
             }
         }
-        if selected.len() == 4 {
+        candidates.push(u32::try_from(index).ok()?);
+    }
+    // The receivers the site's cache observed come first. Pinned intrinsic
+    // prototypes, which every site of a name carries whether or not it met
+    // their receivers, fill the remaining places.
+    let speculative = |index: &u32| {
+        matches!(
+            programs[*index as usize].ops.first(),
+            Some(JitCacheIrOp::LoadIntrinsicPrototype { .. })
+        )
+    };
+    if candidates.len() > 4 {
+        let observed = candidates
+            .iter()
+            .filter(|index| !speculative(index))
+            .count();
+        if observed > 4 {
             return None;
         }
-        selected.push(u32::try_from(index).ok()?);
+        let mut room = 4 - observed;
+        candidates.retain(|index| {
+            if !speculative(index) {
+                return true;
+            }
+            let keep = room > 0;
+            room = room.saturating_sub(1);
+            keep
+        });
     }
+    let selected: SmallVec<[u32; 4]> = candidates.into_iter().collect();
     (!selected.is_empty()).then_some(selected)
 }
 

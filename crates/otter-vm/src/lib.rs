@@ -851,6 +851,10 @@ pub struct Interpreter {
     /// entries are traced from [`RuntimeState::trace_roots`] so a moving
     /// collection rewrites them.
     number_strings: Box<string::number_strings::NumberStrings>,
+    /// Hidden class of RegExp match records, resolved from its fixed layout
+    /// on first use. Shapes never move and the layout cache keeps this one
+    /// rooted, so the handle stays valid for the isolate's lifetime.
+    regexp_match_shape: crate::object::ShapeHandle,
     /// Prepared bytecode callback metadata for native loops that repeatedly
     /// call the same JS function. Entries are a strict stack: acquisition
     /// pushes the exact callable and scalar closure state, release pops it.

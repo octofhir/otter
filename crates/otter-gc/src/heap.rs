@@ -1496,6 +1496,19 @@ impl GcHeap {
         !self.tenure_all && self.gc_stress_stride == 0
     }
 
+    /// Whether [`Self::ensure_machine_allocation_with_roots`] would admit
+    /// `aligned` bytes from the current buffer without any collection, so a
+    /// caller can skip preparing roots for it.
+    #[inline]
+    #[must_use]
+    pub fn machine_allocation_ready(&self, aligned: usize) -> bool {
+        aligned != 0
+            && aligned.is_multiple_of(CELL_SIZE)
+            && self.machine_allocation_allowed()
+            && self.always_allocate_depth == 0
+            && self.lab.remaining() >= aligned
+    }
+
     /// Publish both buffers' progress into their pages, so a page walk sees
     /// every cell handed out so far. Idempotent; the buffers stay live.
     fn sync_lab(&self) {

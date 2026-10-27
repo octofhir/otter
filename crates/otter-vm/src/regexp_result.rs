@@ -7,12 +7,13 @@
 //!
 //! # Invariants
 //! - One reservation admits every cell of the result. No allocation after it
-//!   can collect, so the raw handles the construction holds stay valid. The
-//!   subject and the receiver are rooted across the reservation and the
-//!   record layout, which may collect even when the reservation is declined:
+//!   can collect, so the raw handles the construction holds stay valid. When
+//!   the current buffer cannot hold them, the subject and the receiver are
+//!   rooted across the reservation, which may collect even when it declines:
 //!   the caller's copies are updated in place.
-//! - The immutable layout is only geometry. The rooted canonical record is
-//!   consumed directly after reservation; every valid Value word is admissible.
+//! - The record's hidden class is resolved once per isolate and kept: shapes
+//!   never move and the layout cache roots this one. Its field summaries are
+//!   generalized, so the record is written without observing its values.
 //! - The cells are the ones the scoped builder
 //!   ([`crate::regexp_prototype::build_match_result_native`]) makes: a
 //!   substring per participating group, `undefined` for the others, a dense
@@ -50,47 +51,30 @@ pub(crate) fn build_match_result_folded(
     {
         return Ok(None);
     }
-    let mut roots = otter_gc::RootScope::new(&mut interp.gc_heap);
-    // SAFETY: both slots belong to the caller and outlive the scope.
-    unsafe {
-        roots.add_value(receiver);
-        roots.add_value(input);
-    }
-    let kind = crate::object_layout_cache::RegExpRecordLayout::Match;
-    let layout = match interp.object_layout_cache.regexp(kind) {
-        Some(layout) => layout,
-        None => interp.regexp_record_layout(kind)?,
-    };
-    let Some(mut shape) = interp
-        .shape_runtime
-        .handle_for_id(&interp.gc_heap, layout.shape_id())
-    else {
+    let Some(shape) = interp.regexp_match_shape()? else {
         return Ok(None);
     };
-    let mut record = [
-        Value::number_f64(matched.range().start as f64),
-        *input,
-        Value::undefined(),
-    ];
-    // SAFETY: canonical record words remain stationary through reservation.
-    unsafe {
-        roots.add_raw_slot((&mut shape as *mut crate::object::ShapeHandle).cast());
-        for value in &mut record {
-            roots.add_value(value);
-        }
-    }
     let groups = matched.groups();
     let substrings = 1 + matched.captures().filter(Option::is_some).count();
     let bytes = substrings * crate::string::gc_body::SUBSTRING_CELL_BYTES
         + crate::array::tagged_array_cell_bytes(groups)
         + crate::object::object_cell_bytes(crate::object::shape_body::inline_capacity_of(shape));
-    if !interp
-        .gc_heap
-        .ensure_machine_allocation_with_roots(bytes, &mut |_| {})?
-    {
-        return Ok(None);
+    // A buffer that already holds every cell needs no roots; otherwise the
+    // reservation may collect, which moves the subject and the receiver.
+    if !interp.gc_heap.machine_allocation_ready(bytes) {
+        let mut roots = otter_gc::RootScope::new(&mut interp.gc_heap);
+        // SAFETY: both slots belong to the caller and outlive the scope.
+        unsafe {
+            roots.add_value(receiver);
+            roots.add_value(input);
+        }
+        if !interp
+            .gc_heap
+            .ensure_machine_allocation_with_roots(bytes, &mut |_| {})?
+        {
+            return Ok(None);
+        }
     }
-    drop(roots);
     // Nothing below collects: every cell comes out of the reservation.
     let heap = &mut interp.gc_heap;
     let text = input.as_string(heap).ok_or(VmError::TypeMismatch)?.handle();
@@ -104,11 +88,39 @@ pub(crate) fn build_match_result_folded(
     .ok_or(VmError::TypeMismatch)?;
     let array = crate::array::try_tagged_from_values_no_collect(heap, &elements)
         .ok_or(VmError::TypeMismatch)?;
-    let bag = crate::object::try_alloc_object_with_values_no_collect(heap, shape, &record)
+    let record = [
+        Value::number_f64(matched.range().start as f64),
+        *input,
+        Value::undefined(),
+    ];
+    let bag = crate::object::try_alloc_generalized_object_no_collect(heap, shape, &record)
         .ok_or(VmError::TypeMismatch)?;
     heap.with_payload(array, |body| body.expando = bag);
     heap.record_write(array, &bag);
     Ok(Some(Value::array(array)))
+}
+
+impl Interpreter {
+    /// The hidden class of match records, resolved once from the fixed
+    /// layout, whose field summaries are generalized; `None` when the
+    /// layout names no live class.
+    fn regexp_match_shape(&mut self) -> Result<Option<crate::object::ShapeHandle>, VmError> {
+        if !self.regexp_match_shape.is_null() {
+            return Ok(Some(self.regexp_match_shape));
+        }
+        let kind = crate::object_layout_cache::RegExpRecordLayout::Match;
+        let layout = match self.object_layout_cache.regexp(kind) {
+            Some(layout) => layout,
+            None => self.regexp_record_layout(kind)?,
+        };
+        let shape = self
+            .shape_runtime
+            .handle_for_id(&self.gc_heap, layout.shape_id());
+        if let Some(shape) = shape {
+            self.regexp_match_shape = shape;
+        }
+        Ok(shape)
+    }
 }
 
 #[cfg(test)]

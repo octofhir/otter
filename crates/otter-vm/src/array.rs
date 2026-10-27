@@ -882,7 +882,9 @@ pub(crate) fn try_tagged_from_values_no_collect(
     let slab = if values.is_empty() {
         elements::ElementSlabHandle::null()
     } else {
-        heap.try_alloc_trailing_no_collect_or_return(
+        // The slab is exactly as long as `values`: the copy writes every
+        // trailing byte.
+        heap.try_alloc_filled_trailing_no_collect_or_return(
             elements::ElementSlabBody::new(values.len(), DenseElementKind::Tagged),
             elements::ElementSlabBody::trailing_bytes(values.len(), DenseElementKind::Tagged),
             |slab| slab.init_tagged_prefix(values),

@@ -127,6 +127,32 @@ pub(crate) enum RoutineObject {
 
 impl RoutineObject {
     const COUNT: usize = 9;
+    const ALL: [Self; Self::COUNT] = [
+        Self::Load,
+        Self::Store,
+        Self::Method,
+        Self::Concat,
+        Self::KeyedLoad,
+        Self::KeyedStore,
+        Self::Truthy,
+        Self::StoreTail,
+        Self::FieldObserve,
+    ];
+
+    /// Stable name for profilers.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Load => "routine:load",
+            Self::Store => "routine:store",
+            Self::Method => "routine:method",
+            Self::Concat => "routine:concat",
+            Self::KeyedLoad => "routine:keyedLoad",
+            Self::KeyedStore => "routine:keyedStore",
+            Self::Truthy => "routine:truthy",
+            Self::StoreTail => "routine:storeTail",
+            Self::FieldObserve => "routine:fieldObserve",
+        }
+    }
 }
 
 /// Entry offsets of one routine object: the routine and its second entry,
@@ -141,7 +167,7 @@ pub(crate) struct RoutineOffsets {
 /// One placed routine object.
 #[derive(Debug)]
 struct RoutineCode {
-    _code: CompiledCode,
+    code: CompiledCode,
     entry: u64,
     second: u64,
 }
@@ -153,6 +179,19 @@ pub(crate) struct Routines {
 }
 
 impl Routines {
+    /// `(address, length, name)` of every placed routine object.
+    pub(crate) fn symbols(&self) -> Vec<(u64, usize, &'static str)> {
+        RoutineObject::ALL
+            .into_iter()
+            .filter_map(|object| {
+                let code = self.objects[object as usize].get()?.as_ref().ok()?;
+                // SAFETY: offset zero belongs to the retained mapping.
+                let base = unsafe { code.code.ptr_at(0) } as u64;
+                Some((base, code.code.len(), object.name()))
+            })
+            .collect()
+    }
+
     fn entry(
         &self,
         routine: Routine,
@@ -310,7 +349,7 @@ fn place(
     Ok(RoutineCode {
         entry: entry as u64,
         second: second as u64,
-        _code: code,
+        code,
     })
 }
 

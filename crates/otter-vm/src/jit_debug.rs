@@ -838,6 +838,8 @@ pub(crate) struct JitDebugState {
     request: JitDebugRequest,
     /// The perf map, opened on the first installed code object.
     perf_map: Option<std::fs::File>,
+    /// Shared code objects already named in the perf map.
+    perf_map_named: rustc_hash::FxHashSet<u64>,
     events: Option<Vec<JitDebugEvent>>,
     dropped_events: u64,
     property_runtime: PropertyRuntimeIndices,
@@ -856,6 +858,7 @@ impl JitDebugState {
         Self {
             request,
             perf_map: None,
+            perf_map_named: rustc_hash::FxHashSet::default(),
             events: request.events_enabled().then(Vec::new),
             dropped_events: 0,
             property_runtime: PropertyRuntimeIndices::default(),
@@ -943,6 +946,14 @@ impl JitDebugState {
 }
 
 impl JitDebugState {
+    /// [`Self::record_perf_map`] for a shared code object many installs
+    /// report: named once.
+    pub(crate) fn record_perf_map_once(&mut self, address: u64, len: usize, name: &str) {
+        if self.request.perf_map_enabled() && self.perf_map_named.insert(address) {
+            self.record_perf_map(address, len, name);
+        }
+    }
+
     /// Append one installed code object to the perf map in the
     /// `START SIZE name` form `perf` reads.
     /// A map that cannot be written is skipped: it is a diagnostic.

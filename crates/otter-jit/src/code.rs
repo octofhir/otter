@@ -57,6 +57,14 @@ impl CompiledCode {
         })
     }
 
+    /// `(address, length, name)` of the placed routines this code calls.
+    pub(crate) fn routine_symbols(&self) -> Vec<(u64, usize, &'static str)> {
+        self.routines
+            .as_ref()
+            .map(|routines| routines.symbols())
+            .unwrap_or_default()
+    }
+
     /// Keep `routines` alive for as long as this code, which calls them.
     pub(crate) fn retain_routines(&mut self, routines: Option<Arc<crate::routines::Routines>>) {
         self.routines = routines;

@@ -1268,6 +1268,9 @@ impl Interpreter {
             code.code_len(),
             &format!("JS:{name} [{tier} c{id}]"),
         );
+        for (address, len, routine) in code.routine_symbols() {
+            self.jit_debug.record_perf_map_once(address, len, routine);
+        }
     }
 
     /// Name `shape` in the code being compiled and return the compressed

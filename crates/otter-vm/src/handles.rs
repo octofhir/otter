@@ -473,15 +473,6 @@ impl Interpreter {
         self.record_layout_for_atoms(self.object_prototype_object_opt(), tag, keys)
     }
 
-    /// Resolve a null-prototype record layout in the same strong root-keyed cache.
-    pub(crate) fn null_object_layout_for_atoms(
-        &mut self,
-        tag: &crate::HostAtom,
-        keys: &[&crate::HostAtom],
-    ) -> Result<ObjectLayout, VmError> {
-        self.record_layout_for_atoms(None, tag, keys)
-    }
-
     /// Return the stable neutral token of a fixed null-prototype RegExp record.
     pub(crate) fn regexp_record_layout(
         &mut self,
@@ -554,8 +545,20 @@ impl Interpreter {
         if let Some(bag) = crate::array::expando_object(arr, &self.gc_heap) {
             return Ok(self.scoped_value(scope, Value::object(bag)));
         }
-        let tag = self.host_atom("[[ArrayExpando]]");
-        let layout = self.null_object_layout_for_atoms(&tag, &[])?;
+        let layout = match self.object_layout_cache.array_expando() {
+            Some(layout) => layout,
+            // The null-prototype root with room for a few named keys: the
+            // bag exists to receive them.
+            None => {
+                let root = self.null_prototype_root();
+                let layout = ObjectLayout {
+                    shape: self.shape_runtime.id_for_handle(&self.gc_heap, root),
+                    len: 0,
+                };
+                self.object_layout_cache.insert_array_expando(layout);
+                layout
+            }
+        };
         let bag = self.scoped_object_of_layout(scope, layout)?;
         self.attach_array_expando(scope, array, bag)?;
         Ok(bag)

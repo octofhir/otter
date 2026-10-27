@@ -283,6 +283,13 @@ impl Interpreter {
                     path = Path::Cached;
                     return Ok(());
                 }
+                if self
+                    .try_add_array_expando(receiver, atomized_key, value)
+                    .map_err(CommittedValueError::JavaScript)?
+                {
+                    path = Path::NonObject;
+                    return Ok(());
+                }
                 path = Path::NonObject;
                 self.store_property_value(
                     context,
@@ -765,6 +772,24 @@ impl Interpreter {
                     self.property_cache.record_store(transition);
                     return Ok(());
                 }
+            }
+        }
+        // A first named key on an Array creates its bag.
+        if receiver.as_array().is_some()
+            && let Some((atom, name, symbol)) = self.keyed_property_atom(key_value)
+        {
+            let key = match symbol {
+                Some(symbol) => crate::property_atom::AtomizedPropertyKey::symbol(atom, symbol),
+                None => crate::property_atom::AtomizedPropertyKey::new(
+                    crate::property_atom::PropertyAtom::new(atom),
+                    name.as_deref().unwrap_or_default(),
+                ),
+            };
+            if self
+                .try_add_array_expando(receiver, key, value)
+                .map_err(CommittedValueError::JavaScript)?
+            {
+                return Ok(());
             }
         }
         // An Array's own writable named data property lives in its bag; the

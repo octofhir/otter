@@ -77,6 +77,57 @@ impl Interpreter {
         }
     }
 
+    /// [[Set]] of a named key on an Array with no named storage yet, when
+    /// nothing on its default prototype chain intercepts the key (it is
+    /// absent there, or a writable data property): the key becomes an own
+    /// data property in a new expando bag, as OrdinarySet's
+    /// CreateDataProperty step would. `false` leaves every other case to the
+    /// full [[Set]].
+    pub(crate) fn try_add_array_expando(
+        &mut self,
+        receiver: Value,
+        key: crate::property_atom::AtomizedPropertyKey<'_>,
+        value: Value,
+    ) -> Result<bool, VmError> {
+        let Some(array) = receiver.as_array() else {
+            return Ok(false);
+        };
+        if self.active_realm_id != 0
+            || !array::is_ordinary_dense(array, &self.gc_heap)
+            || !array::is_extensible(array, &self.gc_heap)
+        {
+            return Ok(false);
+        }
+        let vm_key = match key.symbol_handle() {
+            Some(symbol) => {
+                VmPropertyKey::Symbol(crate::symbol::JsSymbol::from_handle(&self.gc_heap, symbol))
+            }
+            None => VmPropertyKey::String(key.name()),
+        };
+        if !matches!(
+            array::classify_property_key(&vm_key),
+            array::ArrayPropertyKey::Expando
+        ) {
+            return Ok(false);
+        }
+        let Some(prototype) = self.default_array_prototype() else {
+            return Ok(false);
+        };
+        match self.resolve_property_load(prototype, key) {
+            crate::property_cache::PropertyLoad::Absent(_) => {}
+            crate::property_cache::PropertyLoad::Data(resolved) if resolved.is_writable => {}
+            _ => return Ok(false),
+        }
+        let descriptor = object::PartialPropertyDescriptor {
+            value: Some(value),
+            writable: Some(true),
+            enumerable: Some(true),
+            configurable: Some(true),
+            ..object::PartialPropertyDescriptor::default()
+        };
+        self.define_array_expando_property(array, &vm_key, descriptor)
+    }
+
     pub(crate) fn define_array_expando_property(
         &mut self,
         target: array::JsArray,

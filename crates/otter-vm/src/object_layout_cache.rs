@@ -65,6 +65,8 @@ struct LayoutEntry {
 pub(crate) struct ObjectLayoutCache {
     layouts: FxHashMap<HostAtomId, Vec<LayoutEntry>>,
     regexp: [Option<ObjectLayout>; 3],
+    /// The empty null-prototype lineage of Array expando bags.
+    array_expando: Option<ObjectLayout>,
 }
 
 impl ObjectLayoutCache {
@@ -75,6 +77,7 @@ impl ObjectLayoutCache {
             .values()
             .flat_map(|entries| entries.iter().map(|entry| entry.layout.shape_id()))
             .chain(self.regexp.iter().flatten().map(ObjectLayout::shape_id))
+            .chain(self.array_expando.iter().map(ObjectLayout::shape_id))
     }
 
     /// Read the fixed slot's immutable geometry without preparation.
@@ -88,6 +91,16 @@ impl ObjectLayoutCache {
         debug_assert!(self.regexp[kind as usize].is_none());
         debug_assert_eq!(layout.len(), kind.keys().len());
         self.regexp[kind as usize] = Some(layout);
+    }
+
+    /// The empty layout of Array expando bags, once learned.
+    pub(crate) fn array_expando(&self) -> Option<ObjectLayout> {
+        self.array_expando
+    }
+
+    /// Publish the Array expando bag layout in its typed slot.
+    pub(crate) fn insert_array_expando(&mut self, layout: ObjectLayout) {
+        self.array_expando = Some(layout);
     }
 
     /// Return the complete layout for `tag + keys`, if already learned.

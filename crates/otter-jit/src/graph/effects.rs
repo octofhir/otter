@@ -470,6 +470,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::CopyContext
         | Kind::NewClosure
         | Kind::NewArrayWithLength
+        | Kind::NewRestArray(_)
         | Kind::NewReceiver(_) => Effects::writes(&[H::Dependencies], &[H::Movement]),
         Kind::PrimitiveAdd
         | Kind::BigIntBinary(_)
@@ -487,6 +488,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::Instanceof
         | Kind::CallJs { .. }
         | Kind::CallForward { .. }
+        | Kind::CallApplyArray { .. }
         | Kind::Generic { .. } => Effects::world(),
         // Control.
         Kind::Jump(_) | Kind::JumpLoop(_) | Kind::Branch { .. } | Kind::Return | Kind::Deopt(_) => {

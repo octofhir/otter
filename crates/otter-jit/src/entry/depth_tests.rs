@@ -78,8 +78,8 @@ unsafe extern "C" fn promote(ctx: *mut JitCtx) -> NativeResultPair {
 
 extern "C" fn body(ctx: *mut JitCtx, _opcode: u64, dst: u64, _arg1: u64, _arg2: u64) -> u64 {
     // This typed construction-op test entry observes the published frame and
-    // supplies an immediate in its destination. It performs no rest allocation;
-    // the runtime rest regressions exercise that operation's JS semantics.
+    // supplies an immediate in its destination. It allocates no weak ref; the
+    // runtime weak-ref regressions exercise that operation's JS semantics.
     unsafe {
         let observation = &mut *observation(ctx);
         let frame = &mut *(*ctx).native_frame;
@@ -123,7 +123,12 @@ fn snapshot() -> JitCompileSnapshot {
         3,
         REGISTER_COUNT,
         vec![
-            JitTestInstruction::new(Op::CollectRest, 0, 0, vec![Operand::Register(3)]),
+            JitTestInstruction::new(
+                Op::NewWeakRef,
+                0,
+                0,
+                vec![Operand::Register(3), Operand::Register(0)],
+            ),
             JitTestInstruction::new(Op::ReturnValue, 1, 4, vec![Operand::Register(3)]),
         ],
     );
@@ -131,7 +136,7 @@ fn snapshot() -> JitCompileSnapshot {
     function.is_strict = true;
     // The feedback-free fixture retains an observable receiver. A strict
     // body binds it without the preparation stub this fixture refuses; the
-    // typed body probe needs no rest-parameter metadata.
+    // typed body probe needs no parameter metadata.
     assert!(function.observes_this());
     snapshot
 }

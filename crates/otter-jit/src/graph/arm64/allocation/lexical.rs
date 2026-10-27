@@ -156,6 +156,16 @@ impl Codegen<'_> {
                 abi::STUB_ARRAY_CONSTRUCT_ALLOC,
                 [inputs[0], undefined, undefined],
             ),
+            Kind::NewRestArray(formals) => (
+                abi::STUB_REST_ARRAY_ALLOC,
+                [
+                    AllocationValue::Constant(
+                        otter_vm::Value::number_i32(i32::from(formals)).to_bits(),
+                    ),
+                    undefined,
+                    undefined,
+                ],
+            ),
             _ => unreachable!("lexical allocation kind"),
         };
         dynasm!(self.ops ; .arch aarch64 ; =>slow);

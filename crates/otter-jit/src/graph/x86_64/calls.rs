@@ -363,6 +363,108 @@ impl Codegen<'_> {
         self.emit_call_completion(node)?;
         Ok(())
     }
+    /// The call of `CallApplyArray` `node`: the callee in `rsi` with the
+    /// receiver in `rdx` and the elements of its list as actual arguments,
+    /// copied into a span of [`APPLY_ARRAY_MAX`] slots. Every proof about
+    /// the list precedes the span: a list that is not a plain dense Array
+    /// of at most that many present elements in tagged or packed numeric
+    /// storage deopts before any effect.
+    pub(super) fn emit_call_apply_array(&mut self, node: NodeId) -> Result<(), Unsupported> {
+        use crate::graph::ir::APPLY_ARRAY_MAX;
+        use crate::x86_64::js_call::emit_forwarded_call;
+        use otter_vm::jit::JitArrayStorage;
+        const SPAN_BYTES: i32 = (APPLY_ARRAY_MAX * 8) as i32;
+        let storage = JitArrayStorage::current();
+        let numeric = storage.numeric;
+        let exit = self.eager_exit(node, DeoptReason::WrongValue);
+        self.node_safepoint(node)?;
+        let allocation = self.loc(node);
+        let [list, base, count] = [
+            allocation.gp_temps[0],
+            allocation.gp_temps[1],
+            allocation.gp_temps[2],
+        ];
+        match allocation.inputs[2] {
+            Location::Gp(register) => dynasm!(self.ops ; .arch x64 ; mov Rq(list), Rq(register)),
+            slot @ (Location::TaggedSlot(_) | Location::UntaggedSlot(_)) => {
+                self.load_slot_gp(list, slot);
+            }
+            Location::Constant(value) => {
+                let bits = self.constant_bits(value);
+                self.load_immediate(list, bits);
+            }
+            Location::Fp(_) => unreachable!("an apply list is tagged"),
+        }
+        let tagged = self.ops.new_dynamic_label();
+        let scan = self.ops.new_dynamic_label();
+        let push_tagged = self.ops.new_dynamic_label();
+        let push_packed = self.ops.new_dynamic_label();
+        let call = self.ops.new_dynamic_label();
+        self.load_immediate(10, tag::NOT_CELL_MASK);
+        dynasm!(self.ops ; .arch x64
+            ; test Rq(list), r10 ; jnz =>exit
+            ; test Rq(list), Rq(list) ; jz =>exit
+            ; cmp BYTE [Rq(list)], storage.type_tag as i8 ; jne =>exit
+            ; cmp BYTE [Rq(list) + storage.own_guard_byte as i32], 0 ; jne =>exit
+            // Every element below the length is in the dense prefix.
+            ; mov Rd(count), [Rq(list) + storage.length_byte as i32]
+            ; cmp Rd(count), [Rq(list) + storage.logical_length_byte as i32] ; jne =>exit
+            ; cmp Rd(count), APPLY_ARRAY_MAX as i32 ; ja =>exit
+            ; mov Rq(base), [Rq(list) + storage.base_byte as i32]
+            ; cmp BYTE [Rq(list) + numeric.kind_byte as i32], storage.tagged_kind as i8 ; je =>tagged
+            ; cmp BYTE [Rq(list) + numeric.kind_byte as i32], numeric.packed_kind as i8 ; jne =>exit
+            ; jmp =>push_packed
+            // A hole reads through the prototype chain.
+            ; =>tagged
+            ; mov r11d, Rd(count)
+        );
+        self.load_immediate(10, tag::VALUE_HOLE);
+        dynasm!(self.ops ; .arch x64
+            ; =>scan
+            ; test r11d, r11d ; jz =>push_tagged
+            ; dec r11d
+            ; cmp [Rq(base) + r11 * 8], r10 ; je =>exit
+            ; jmp =>scan
+        );
+        // Each arm reserves the span past the stack limit check, before which
+        // nothing has an effect, then copies the elements; `list` is the
+        // copy's index.
+        for (arm, packed) in [(push_tagged, false), (push_packed, true)] {
+            let copy = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch x64
+                ; =>arm
+                ; lea r10, [rsp - SPAN_BYTES]
+                ; cmp r10, [r15 + crate::entry::NATIVE_STACK_LIMIT_OFFSET as i32] ; jb =>exit
+                ; mov rsp, r10
+                ; xor Rd(list), Rd(list)
+                ; =>copy
+                ; cmp Rd(list), Rd(count) ; jae =>call
+            );
+            if packed {
+                dynasm!(self.ops ; .arch x64 ; movsd xmm15, [Rq(base) + Rq(list) * 8]);
+                crate::x86_64::field_word::emit_encode_double(&mut self.ops, 15, 10, 11);
+            } else {
+                dynasm!(self.ops ; .arch x64 ; mov r10, [Rq(base) + Rq(list) * 8]);
+            }
+            dynasm!(self.ops ; .arch x64
+                ; mov [rsp + Rq(list) * 8], r10
+                ; inc Rd(list)
+                ; jmp =>copy
+            );
+        }
+        dynasm!(self.ops ; .arch x64 ; =>call ; mov r8d, Rd(count));
+        let return_pc = emit_forwarded_call(
+            &mut self.ops,
+            &mut self.relocations,
+            self.transitions,
+            15,
+            CallTarget::Generic,
+        );
+        self.record_js_return(node, return_pc)?;
+        dynasm!(self.ops ; .arch x64 ; add rsp, SPAN_BYTES);
+        self.emit_call_completion(node)
+    }
+
     pub(super) fn emit_call_completion(&mut self, node: NodeId) -> Result<(), Unsupported> {
         let (threw, committed) = self.throw_targets(node);
         // A callee's Fatal is final: no handler may observe it and its parked

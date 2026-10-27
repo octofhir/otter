@@ -1918,6 +1918,8 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_ARRAY_IS_ARRAY_LEAF.id => "array_is_array_leaf",
         id if id == STUB_OBJECT_GET_PROTOTYPE_OF_LEAF.id => "object_get_prototype_of_leaf",
         id if id == STUB_NUMBER_CALL_LEAF.id => "number_call_leaf",
+        id if id == STUB_REST_ARRAY_ALLOC.id => "rest_array_alloc",
+        id if id == STUB_JIT_RECORD_CALL_TARGET.id => "jit_record_call_target",
 
         _ => "unknown_runtime_stub",
     }
@@ -2262,6 +2264,35 @@ pub const STUB_NUMBER_CALL_LEAF: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Probe,
 );
 
+/// Allocating rest parameter: an Array of the current frame's actual
+/// arguments from the int32 formal count on. A malformed count misses before
+/// allocation; heap refusal is reported through the status pair.
+pub const STUB_REST_ARRAY_ALLOC: RuntimeStubDescriptor = descriptor(
+    127,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::AllocValue3,
+    3,
+    RuntimeStubEffects::allocating(false, false),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Record the callable a baseline call site called while its feedback was
+/// empty: the site's execution count word and the boxed callee. It neither
+/// allocates nor runs JavaScript, and always reports success; it is entered
+/// through the ordinary runtime transition.
+pub const STUB_JIT_RECORD_CALL_TARGET: RuntimeStubDescriptor = descriptor(
+    128,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::Variadic,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::StatusWord,
+    NativeResultDomain::None,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2390,6 +2421,8 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_ARRAY_IS_ARRAY_LEAF,
     STUB_OBJECT_GET_PROTOTYPE_OF_LEAF,
     STUB_NUMBER_CALL_LEAF,
+    STUB_REST_ARRAY_ALLOC,
+    STUB_JIT_RECORD_CALL_TARGET,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

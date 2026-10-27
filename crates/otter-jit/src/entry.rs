@@ -298,6 +298,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
             jit_collect_arguments_stub as *const () as usize,
         ),
         binding(
+            abi::STUB_JIT_RECORD_CALL_TARGET,
+            jit_record_call_target_stub as *const () as usize,
+        ),
+        binding(
             abi::STUB_JIT_NEW_ARRAY,
             jit_new_array_stub as *const () as usize,
         ),

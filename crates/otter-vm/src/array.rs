@@ -1261,6 +1261,18 @@ pub(crate) fn plain_dense_has(
     })
 }
 
+/// The element at `idx` of a plain dense array, which [[Get]] answers with
+/// without consulting anything else: no exotic state, no accessor element,
+/// and a present slot. `None` leaves the ordinary [[Get]] authoritative.
+pub(crate) fn plain_dense_get(arr: JsArray, heap: &otter_gc::GcHeap, idx: usize) -> Option<Value> {
+    heap.read_payload(arr, |body| {
+        if !body.exotic.is_null() || body.accessors().is_some() {
+            return None;
+        }
+        body.dense_value(idx).filter(|value| !value.is_hole())
+    })
+}
+
 /// Replace one slot in a plain dense array without allocation or key creation.
 ///
 /// Existing data slots are always eligible. A hole is eligible only when the

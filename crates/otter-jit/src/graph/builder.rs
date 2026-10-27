@@ -2161,6 +2161,15 @@ impl<'a> Builder<'a> {
                 self.prove_ordinary_object(value);
                 self.write(instruction.writes[0], value);
             }
+            // A rest parameter of the physical activation: a spliced body's
+            // actuals are its caller's values, which the baseline operation
+            // reads.
+            Op::CollectRest if self.inline.is_none() => {
+                let formals = self.view.code_block.param_count;
+                let value = self.add(Kind::NewRestArray(formals), &[], Repr::Tagged);
+                self.prove_array_body(value);
+                self.write(instruction.writes[0], value);
+            }
             Op::NewArray if instruction.const_index(1) == Some(0) => {
                 let value = self.add(Kind::NewArrayEmpty, &[], Repr::Tagged);
                 self.prove_array_body(value);

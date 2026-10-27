@@ -99,8 +99,14 @@ impl Interpreter {
                 && crate::abstract_ops::is_constructor(&constructor, context, &interp.gc_heap);
 
             let items = interp.escape_scoped(items_handle);
+            // An Array whose iteration is the built-in one yields [[Get]] of
+            // each index below its live length.
+            let fast_array = items.as_array().is_some() && interp.fast_array_iterable(items, false);
+            // Proving the iteration may allocate the chain's prototype roles.
+            let items = interp.escape_scoped(items_handle);
             if !has_map
                 && !use_ctor
+                && fast_array
                 && let Some(arr) = items.as_array()
             {
                 let len = crate::array::len(arr, &interp.gc_heap);
@@ -114,7 +120,15 @@ impl Interpreter {
                         .as_array()
                         .ok_or(VmError::InvalidOperand)
                         .map_err(CommittedValueError::Fatal)?;
-                    let value = crate::array::get(arr, &interp.gc_heap, index);
+                    let value = match crate::array::plain_dense_get(arr, &interp.gc_heap, index) {
+                        Some(value) => value,
+                        None => interp.get_property_value_for_call(
+                            stack,
+                            context,
+                            items,
+                            &index.to_string(),
+                        )?,
+                    };
                     interp.set_scoped(value_handle, value);
                     interp
                         .scoped_set_index(scope, result, index, value_handle)
@@ -123,7 +137,10 @@ impl Interpreter {
                 return Ok(interp.escape_scoped(result));
             }
 
-            if !has_map && let Some(arr) = items.as_array() {
+            if !has_map
+                && fast_array
+                && let Some(arr) = items.as_array()
+            {
                 let len = crate::array::len(arr, &interp.gc_heap);
                 let anchor_base = interp.push_iteration_anchor(items) - 1;
                 let result = (|interp: &mut Self| -> Result<Value, CommittedValueError> {
@@ -142,7 +159,16 @@ impl Interpreter {
                             .as_array()
                             .ok_or(VmError::InvalidOperand)
                             .map_err(CommittedValueError::Fatal)?;
-                        let value = crate::array::get(arr, &interp.gc_heap, index);
+                        let value = match crate::array::plain_dense_get(arr, &interp.gc_heap, index)
+                        {
+                            Some(value) => value,
+                            None => interp.get_property_value_for_call(
+                                stack,
+                                context,
+                                items,
+                                &index.to_string(),
+                            )?,
+                        };
                         let target = interp.iteration_anchor(target_anchor);
                         interp.create_data_property_or_throw(
                             stack,

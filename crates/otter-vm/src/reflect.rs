@@ -434,27 +434,14 @@ fn coerce_property_key(
 
 /// §7.3.18 CreateListFromArrayLike for the array-like arguments that
 /// `Reflect.apply` / `Reflect.construct` pass through. Accepts:
-/// `undefined`, `null` (empty), arrays, and ordinary array-likes
-/// with `length` + indexed properties via the shared interpreter helper.
+/// arrays and ordinary array-likes with `length` + indexed properties via
+/// the shared interpreter helper.
 fn create_list_from_array_like(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     arg: Option<&Value>,
 ) -> Result<SmallVec<[Value; 8]>, CommittedValueError> {
-    if let Some(arr) = arg.and_then(|v| v.as_array()) {
-        // §7.3.18 step 4–5 — substitute holes with `undefined`.
-        return Ok(crate::array::with_elements(
-            arr,
-            interp.gc_heap(),
-            |elements| {
-                elements
-                    .iter()
-                    .map(|v| if v.is_hole() { Value::undefined() } else { *v })
-                    .collect()
-            },
-        ));
-    }
     if let Some(v) = arg
         && is_type_object(v)
     {

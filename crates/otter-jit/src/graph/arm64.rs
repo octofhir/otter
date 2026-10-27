@@ -2464,6 +2464,14 @@ impl<'a> Codegen<'a> {
                 let temps = [allocation.gp_temps[0], allocation.gp_temps[1]];
                 self.emit_call_forward(node, plan, &bindings, temps)?;
             }
+            Kind::CallApplyArray { .. } => {
+                let temps = [
+                    allocation.gp_temps[0],
+                    allocation.gp_temps[1],
+                    allocation.gp_temps[2],
+                ];
+                self.emit_call_apply_array(node, temps)?;
+            }
             Kind::NativeLeaf(stub) => self.emit_native_leaf(node, *stub)?,
             Kind::CheckNative(native_ref) => {
                 let value = Self::gp(input(0));
@@ -2573,7 +2581,8 @@ impl<'a> Codegen<'a> {
             Kind::NativeNewContext(_)
             | Kind::CopyContext
             | Kind::NewClosure
-            | Kind::NewArrayWithLength => {
+            | Kind::NewArrayWithLength
+            | Kind::NewRestArray(_) => {
                 let destination = Self::gp(result.expect("lexical allocation result"));
                 self.emit_lexical_allocation(node, destination)?;
             }
@@ -5119,6 +5128,131 @@ impl<'a> Codegen<'a> {
         emit_pop_forwarded(&mut self.ops, 21);
         self.emit_call_completion(node)?;
         Ok(())
+    }
+
+    /// The call of `CallApplyArray` `node`: the callee in `x1` with the
+    /// receiver in `x2` and the elements of its list as actual arguments,
+    /// copied into a span of [`APPLY_ARRAY_MAX`] slots. Every proof about
+    /// the list precedes the span: a list that is not a plain dense Array
+    /// of at most that many present elements in tagged or packed numeric
+    /// storage deopts before any effect.
+    fn emit_call_apply_array(
+        &mut self,
+        node: NodeId,
+        [list, base, count]: [u8; 3],
+    ) -> Result<(), Unsupported> {
+        use crate::arm64::js_call::{CallTarget, emit_call};
+        use otter_vm::jit::JitArrayStorage;
+        const SPAN_BYTES: u32 = super::ir::APPLY_ARRAY_MAX * 8;
+        let storage = JitArrayStorage::current();
+        let numeric = storage.numeric;
+        let exit = self.eager_exit(node, DeoptReason::WrongValue);
+        self.node_safepoint(node)?;
+        let inputs = self.allocation.node(node).inputs.clone();
+        match inputs[2] {
+            Location::Gp(register) => {
+                dynasm!(self.ops ; .arch aarch64 ; mov X(list), X(register));
+            }
+            slot @ (Location::TaggedSlot(_) | Location::UntaggedSlot(_)) => {
+                self.load_slot_gp(list, slot);
+            }
+            Location::Constant(constant) => {
+                let bits = self.constant_bits(constant).0;
+                self.load_immediate(list, bits);
+            }
+            Location::Fp(_) => unreachable!("an apply list is tagged"),
+        }
+        let tagged = self.ops.new_dynamic_label();
+        let scan = self.ops.new_dynamic_label();
+        let push_tagged = self.ops.new_dynamic_label();
+        let push_packed = self.ops.new_dynamic_label();
+        let call = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; tst X(list), #0xfffe_0000_0000_0007
+            ; b.ne =>exit
+            ; cbz X(list), =>exit
+            ; ldrb w16, [X(list)]
+            ; cmp w16, u32::from(storage.type_tag)
+            ; b.ne =>exit
+            ; ldrb w16, [X(list), storage.own_guard_byte]
+            ; cbnz w16, =>exit
+            // Every element below the length is in the dense prefix.
+            ; ldr W(count), [X(list), storage.length_byte]
+            ; ldr w16, [X(list), storage.logical_length_byte]
+            ; cmp w16, W(count)
+            ; b.ne =>exit
+            ; cmp WSP(count), super::ir::APPLY_ARRAY_MAX
+            ; b.hi =>exit
+            ; ldr X(base), [X(list), storage.base_byte]
+            ; ldrb w16, [X(list), numeric.kind_byte]
+            ; cmp w16, u32::from(storage.tagged_kind)
+            ; b.eq =>tagged
+            ; cmp w16, u32::from(numeric.packed_kind)
+            ; b.ne =>exit
+            ; b =>push_packed
+            // A hole reads through the prototype chain.
+            ; =>tagged
+            ; mov w17, W(count)
+        );
+        self.load_immediate(list, VALUE_HOLE);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; =>scan
+            ; cbz w17, =>push_tagged
+            ; sub w17, w17, #1
+            ; ldr x16, [X(base), x17, lsl #3]
+            ; cmp x16, X(list)
+            ; b.eq =>exit
+            ; b =>scan
+        );
+        // Each arm reserves the span past the stack limit check, before which
+        // nothing has an effect, then copies the elements; `list` is the
+        // copy's index.
+        for (arm, packed) in [(push_tagged, false), (push_packed, true)] {
+            let copy = self.ops.new_dynamic_label();
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; =>arm
+                ; mov x17, sp
+                ; sub x16, x17, SPAN_BYTES
+                ; ldr x17, [x20, crate::entry::NATIVE_STACK_LIMIT_OFFSET]
+                ; cmp x16, x17
+                ; b.lo =>exit
+                ; mov sp, x16
+                ; mov W(list), wzr
+                ; =>copy
+                ; cmp W(list), W(count)
+                ; b.hs =>call
+            );
+            if packed {
+                dynasm!(self.ops ; .arch aarch64 ; ldr d31, [X(base), X(list), lsl #3]);
+                self.emit_box_float64(31, 16);
+            } else {
+                dynasm!(self.ops ; .arch aarch64 ; ldr x16, [X(base), X(list), lsl #3]);
+            }
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; str x16, [sp, X(list), lsl #3]
+                ; add WSP(list), WSP(list), #1
+                ; b =>copy
+            );
+        }
+        dynasm!(self.ops ; .arch aarch64 ; =>call ; mov w4, W(count));
+        let return_pc = emit_call(
+            &mut self.ops,
+            &mut self.relocations,
+            self.transitions,
+            20,
+            1,
+            Some(2),
+            None,
+            None,
+            CallTarget::Generic,
+        );
+        self.record_js_return(node, return_pc)?;
+        dynasm!(self.ops ; .arch aarch64 ; add sp, sp, SPAN_BYTES);
+        self.emit_call_completion(node)
     }
 
     /// Route the completion of the JavaScript call `node` made: success

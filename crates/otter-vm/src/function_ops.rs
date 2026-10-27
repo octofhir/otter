@@ -1276,18 +1276,14 @@ impl Interpreter {
         context: &ExecutionContext,
         value: Value,
     ) -> Result<SmallVec<[Value; 8]>, CommittedValueError> {
-        if let Some(arr) = value.as_array() {
-            // §7.3.18 step 4-5 — substitute holes with `undefined`.
-            return Ok(crate::array::with_elements(
-                arr,
-                &self.gc_heap,
-                |elements| {
-                    elements
-                        .iter()
-                        .map(|v| if v.is_hole() { Value::undefined() } else { *v })
-                        .collect()
-                },
-            ));
+        // A plain dense array answers every indexed [[Get]] with its own
+        // element; any other array (holes, accessors, exotic state) walks
+        // the indices below.
+        if let Some(arr) = value.as_array()
+            && let Some(values) =
+                crate::array::with_plain_dense_values(arr, &self.gc_heap, |values| values.collect())
+        {
+            return Ok(values);
         }
         if let Some(values) = self.arguments_object_direct_list(value) {
             return Ok(values);

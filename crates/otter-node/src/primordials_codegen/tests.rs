@@ -472,7 +472,9 @@ fn compact_static_helpers_preserve_single_reads_and_present_undefined() {
         else if (key1 !== null && key1 in holder) key = key1;
         else return __otterPrimordialMissing;
         const member = holder[key];
-        return typeof member === 'function' ? member.bind(holder) : member;
+        return typeof member === 'function' && holder === constructors.Promise
+            ? member.bind(holder)
+            : member;
     "#,
     );
     assert_body(

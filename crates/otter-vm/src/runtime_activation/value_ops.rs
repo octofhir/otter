@@ -402,6 +402,13 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_collect_arguments(context, stack, &mut frame, dst)
     }
 
+    /// Record the callable `callee` a baseline call site with empty feedback
+    /// called; `executions` is the site's execution count word.
+    pub fn record_baseline_call_target(&mut self, executions: u64, callee: Value) {
+        let vm = unsafe { &*self.vm.as_ptr() };
+        vm.record_baseline_call_target(executions, callee);
+    }
+
     /// Allocate the published `Op::NewObjectLiteral` object from boxed values
     /// copied before collection.
     pub fn new_object_literal_value(&mut self, values: &[Value]) -> Result<Value, VmError> {

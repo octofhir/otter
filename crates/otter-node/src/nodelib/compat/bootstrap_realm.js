@@ -98,7 +98,7 @@ const explicit = {
     const match = RegExp.prototype.exec.call(regexp, string);
     return match ? match.index : -1;
   },
-  PromisePrototypeCatch: (promise, onRejected) => promise.catch(onRejected),
+  PromisePrototypeCatch: uncurryThis(Promise.prototype.catch),
   // Pin the pattern's own `Symbol.match`/`replace`/`search`/`split` and its
   // `constructor` to the originals, so a pattern the runtime uses internally
   // keeps behaving as one however `RegExp.prototype` was meddled with.
@@ -997,7 +997,7 @@ function __otterPrimordialStatic(holder,key0,key1) {
   else if(key1!==null && key1 in holder)key=key1;
   else return __otterPrimordialMissing;
   const member=holder[key];
-  return typeof member==='function'?member.bind(holder):member;
+  return typeof member==='function'&&holder===constructors.Promise?member.bind(holder):member;
 }
 
 function __otterPrimordialStaticApply(holder,key0,key1) {

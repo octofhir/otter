@@ -3158,9 +3158,6 @@ fn array_construct_alloc_inner(
     let Some(ctx) = alloc_context_mut(ctx) else {
         return NativeResultPair::miss();
     };
-    let Some(context) = alloc_execution_context(ctx) else {
-        return NativeResultPair::miss();
-    };
     let Some(interp) = alloc_interpreter_mut(ctx) else {
         return NativeResultPair::miss();
     };
@@ -3168,14 +3165,11 @@ fn array_construct_alloc_inner(
     if frame.is_null() {
         return NativeResultPair::miss();
     }
+    // The Array takes the realm of the function the site is in. A body is
+    // inlined only into a caller of its own realm, so the compiled frame's
+    // function answers for every inlined site too.
     // SAFETY: the packet's current frame stays published for this synchronous call.
-    let Ok((function_id, _)) = crate::runtime_activation::semantic_source::frame_semantic_source(
-        interp,
-        context,
-        unsafe { &*frame },
-    ) else {
-        return NativeResultPair::miss();
-    };
+    let function_id = unsafe { (*frame).header.function_id };
     // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
     // table and frame/spill windows stay published for this synchronous call.
     let Ok(roots) = (unsafe {

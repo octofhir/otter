@@ -977,10 +977,12 @@ pub struct Interpreter {
     function_constructor_layouts: rustc_hash::FxHashMap<u32, constructor_layout::ConstructorLayout>,
     /// Weak family-identity index; never a root.
     constructor_families: constructor_layout::ConstructorFamilies,
-    /// Final hidden class of an arguments object, keyed by argument count,
-    /// mapped-ness and the id of the `%Object.prototype%` root it grows from.
-    /// Same tracing contract as the constructor cache above.
-    arguments_shape_cache: rustc_hash::FxHashMap<(u32, bool, object::ShapeId), object::ShapeHandle>,
+    /// Final hidden class of an arguments object, keyed by argument count and
+    /// variant; a hit is reused only while it grows from the current realm's
+    /// `%Object.prototype%`. Same tracing contract as the constructor cache
+    /// above.
+    arguments_shape_cache:
+        rustc_hash::FxHashMap<(u32, arguments_object::ArgumentsShapeKind), object::ShapeHandle>,
     max_stack_depth: u32,
     /// Active synchronous host/interpreter JavaScript re-entry depth. Generated
     /// calls use the immutable effective activation limit computed when their

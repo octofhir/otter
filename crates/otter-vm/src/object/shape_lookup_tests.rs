@@ -110,15 +110,9 @@ fn mapped_argument_lookup_opacity_survives_prototype_changes() {
         &mut heap,
         MappedArguments {
             context,
-            entries: vec![
-                MappedArgumentEntry {
-                    key: "0".into(),
-                    slot: 0,
-                },
-                MappedArgumentEntry {
-                    key: "1".into(),
-                    slot: 1,
-                },
+            entries: smallvec::smallvec![
+                MappedArgumentEntry { index: 0, slot: 0 },
+                MappedArgumentEntry { index: 1, slot: 1 },
             ],
         },
     )
@@ -260,10 +254,7 @@ fn own_data_hits_preserve_mapped_argument_values() {
         interpreter.gc_heap_mut(),
         MappedArguments {
             context,
-            entries: vec![MappedArgumentEntry {
-                key: "0".into(),
-                slot: 0,
-            }],
+            entries: smallvec::smallvec![MappedArgumentEntry { index: 0, slot: 0 }],
         },
     )
     .expect("install_mapped_arguments fixture");

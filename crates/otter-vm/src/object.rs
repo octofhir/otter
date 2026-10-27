@@ -409,9 +409,10 @@ impl HostData {
 
 /// One mapped arguments index aliased to a slot of the parameter-scope
 /// context (§10.4.4.7 CreateMappedArgumentsObject ParameterMap).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct MappedArgumentEntry {
-    pub(crate) key: String,
+    /// The aliased argument index; its key is the index's canonical string.
+    pub(crate) index: u32,
     pub(crate) slot: u16,
 }
 
@@ -420,13 +421,13 @@ pub(crate) struct MappedArgumentEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct MappedArguments {
     pub(crate) context: crate::context::ContextHandle,
-    pub(crate) entries: Vec<MappedArgumentEntry>,
+    pub(crate) entries: SmallVec<[MappedArgumentEntry; 4]>,
 }
 
 #[derive(Debug)]
 struct MappedArgumentsData {
     context: crate::context::ContextHandle,
-    entries: Box<[MappedArgumentEntry]>,
+    entries: SmallVec<[MappedArgumentEntry; 4]>,
 }
 
 /// A mapped argument's aliased binding: the parameter-scope context and slot.
@@ -3795,7 +3796,7 @@ pub fn is_arguments_object(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 /// Snapshot for the apply/spread argv fast path: the current shape and the
 /// arity it encodes, provided the object is an arguments exotic with no
 /// mapped parameter aliases and a live (non-null) shape holding the built
-/// `argc + 2` slots.
+/// `argc + 3` slots: indices, `length`, `callee` and `@@iterator`.
 #[must_use]
 pub(crate) fn arguments_direct_snapshot(
     obj: JsObject,
@@ -3809,7 +3810,7 @@ pub(crate) fn arguments_direct_snapshot(
             return None;
         }
         let count = shape_body::shape_property_count(heap, body.shape) as usize;
-        count.checked_sub(2).map(|argc| (body.shape, argc))
+        count.checked_sub(3).map(|argc| (body.shape, argc))
     })
 }
 
@@ -3837,12 +3838,17 @@ pub(crate) fn install_mapped_arguments(
         roots.add_raw_slot(std::ptr::addr_of_mut!(context).cast::<RawGc>());
     }
     ensure_exotic(obj, heap)?;
-    let target = state(*obj, heap).with_lookup(LookupFact::MappedArguments, true);
-    state_transition::transition_state(obj, heap, target)?;
+    // An arguments object built on the ParameterMap lineage already carries
+    // the lookup fact.
+    let current = state(*obj, heap);
+    let target = current.with_lookup(LookupFact::MappedArguments, true);
+    if target != current {
+        state_transition::transition_state(obj, heap, target)?;
+    }
     heap.with_payload(*obj, |body| {
         body.exotic_mut().host_data = Some(HostData::Untraced(Box::new(MappedArgumentsData {
             context,
-            entries: entries.into_boxed_slice(),
+            entries,
         })));
     });
     let sidecar = heap.read_payload(*obj, |body| body.exotic.get());
@@ -3854,9 +3860,10 @@ fn mapped_argument_cell(body: &ObjectBody, key: &str) -> Option<MappedCell> {
     let data = body
         .host_data_ref()?
         .downcast_ref::<MappedArgumentsData>()?;
+    let index = key_order::array_index_property_name(key)?;
     data.entries
         .iter()
-        .find(|entry| entry.key == key)
+        .find(|entry| entry.index == index)
         .map(|entry| (data.context, entry.slot))
 }
 
@@ -3868,19 +3875,11 @@ fn remove_mapped_argument(body: &mut ObjectBody, key: &str) {
         return;
     };
     match data.into_untraced::<MappedArgumentsData>() {
-        Ok(mapped) => {
-            let retained: Vec<_> = mapped
-                .entries
-                .into_vec()
-                .into_iter()
-                .filter(|entry| entry.key != key)
-                .collect();
-            if !retained.is_empty() {
-                body.exotic_mut().host_data =
-                    Some(HostData::Untraced(Box::new(MappedArgumentsData {
-                        context: mapped.context,
-                        entries: retained.into_boxed_slice(),
-                    })));
+        Ok(mut mapped) => {
+            let index = key_order::array_index_property_name(key);
+            mapped.entries.retain(|entry| Some(entry.index) != index);
+            if !mapped.entries.is_empty() {
+                body.exotic_mut().host_data = Some(HostData::Untraced(mapped));
             }
         }
         Err(other) => {

@@ -286,6 +286,10 @@ impl MathOp {
     }
 }
 
+/// Most elements a [`Kind::CallApplyArray`] passes as actual arguments: its
+/// span is reserved at this fixed size.
+pub(crate) const APPLY_ARRAY_MAX: u32 = 16;
+
 /// Every graph operation.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Kind {
@@ -366,6 +370,9 @@ pub(crate) enum Kind {
     /// with at most one argument: an array of that exact nonnegative int32
     /// length, all holes. Any other length resumes the operation.
     NewArrayWithLength,
+    /// The rest parameter of a body with this many formals: an Array of the
+    /// activation's actual arguments past them.
+    NewRestArray(u16),
 
     /// Number/String primitive addition with a collecting string miss.
     PrimitiveAdd,
@@ -764,6 +771,14 @@ pub(crate) enum Kind {
         plan: crate::call_linkage::CallPlan,
         bindings: Box<[u16]>,
     },
+    /// `[[Call]]` of input0 with input1 as receiver and the elements of
+    /// input2 as actual arguments, as the realm's `Reflect.apply` passes
+    /// them: input2 must be a plain dense Array of at most
+    /// [`APPLY_ARRAY_MAX`] present elements in tagged or packed numeric
+    /// storage, else the node deopts before any effect.
+    CallApplyArray {
+        pc: u32,
+    },
     /// Eager deopt unless the callee of the call site at this byte PC is
     /// `%Function.prototype.call%`: input0 itself for an explicit-receiver
     /// call, or the `call` a method call reads from its closure receiver
@@ -1130,6 +1145,7 @@ impl Kind {
             | Self::CopyContext
             | Self::NewClosure
             | Self::NewArrayWithLength
+            | Self::NewRestArray(_)
             | Self::NewReceiver(_) => Properties {
                 eager_deopt: true,
                 writes: true,
@@ -1210,7 +1226,10 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
-            Self::CallJs { .. } | Self::CallForward { .. } | Self::Generic { .. } => Properties {
+            Self::CallJs { .. }
+            | Self::CallForward { .. }
+            | Self::CallApplyArray { .. }
+            | Self::Generic { .. } => Properties {
                 call: true,
                 eager_deopt: true,
                 lazy_deopt: true,
@@ -1330,9 +1349,10 @@ impl Kind {
             Self::CopyContext => &[abi::STUB_COPY_CONTEXT_ALLOC],
             Self::NewClosure => &[abi::STUB_JIT_MAKE_FN, abi::STUB_JIT_MAKE_CLOSURE],
             Self::NewArrayWithLength => &[abi::STUB_ARRAY_CONSTRUCT_ALLOC],
+            Self::NewRestArray(_) => &[abi::STUB_REST_ARRAY_ALLOC],
             Self::PrimitiveAdd => &[abi::STUB_STRING_CONCAT_ALLOC, abi::STUB_WRITE_BARRIER],
             Self::BigIntBinary(_) => &[abi::STUB_BIGINT_BINARY_ALLOC],
-            Self::CallJs { .. } | Self::CallForward { .. } => &[
+            Self::CallJs { .. } | Self::CallForward { .. } | Self::CallApplyArray { .. } => &[
                 abi::STUB_JIT_CALL,
                 abi::STUB_JIT_CALL_GENERIC,
                 abi::STUB_JIT_CALL_NATIVE,
@@ -1418,6 +1438,7 @@ impl Kind {
             | Self::NativeNewContext(_)
             | Self::CopyContext
             | Self::NewArrayWithLength
+            | Self::NewRestArray(_)
             | Self::NewClosure => Constraints {
                 inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
                 result: ResultPolicy::Register,
@@ -1764,6 +1785,18 @@ impl Kind {
                     fixed_gp_clobbers: SmallVec::new(),
                 }
             }
+            Self::CallApplyArray { .. } => Constraints {
+                inputs: smallvec::smallvec![
+                    FixedGp(target.call_callee),
+                    FixedGp(target.call_receiver),
+                    Any
+                ],
+                result: ResultPolicy::FixedGp(target.call_result),
+                // The list, its element base and the copy cursor.
+                gp_temps: 3,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
             Self::Generic { .. } => Constraints {
                 inputs: (0..input_count).map(|_| Any).collect(),
                 result: ResultPolicy::FixedGp(target.call_result),

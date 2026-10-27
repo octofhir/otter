@@ -255,6 +255,30 @@ struct AtomicCallFeedback {
     executions: AtomicU32,
 }
 
+/// Byte offset of a call site's distribution state from its execution
+/// count word: baseline code that counts the site reads the state there to
+/// find a site no call has recorded yet (state zero).
+pub const CALL_FEEDBACK_STATE_FROM_EXECUTIONS: i32 = std::mem::offset_of!(AtomicCallFeedback, state)
+    as i32
+    - std::mem::offset_of!(AtomicCallFeedback, executions) as i32;
+
+/// Record `target` into the call feedback whose execution count word is at
+/// `executions`.
+///
+/// # Safety
+/// `executions` is [`CallFeedbackSlot::executions_address`] of a slot whose
+/// code block stays alive for the call.
+pub(crate) unsafe fn record_call_at_executions(
+    executions: u64,
+    target: OrdinaryCallTarget,
+) -> CallTargetTransition {
+    let base = (executions as *const u8)
+        .wrapping_sub(std::mem::offset_of!(AtomicCallFeedback, executions))
+        .cast::<AtomicCallFeedback>();
+    // SAFETY: the caller's slot is live; the address names its feedback.
+    unsafe { &*base }.record(target)
+}
+
 impl Default for AtomicCallFeedback {
     fn default() -> Self {
         Self {

@@ -49,11 +49,11 @@ use crate::native_abi::{
     STUB_MATH_MIN_LEAF, STUB_MATH_POW_LEAF, STUB_MATH_ROUND_LEAF, STUB_MATH_SIN_LEAF,
     STUB_MATH_SQRT_LEAF, STUB_MATH_TAN_LEAF, STUB_MATH_TRUNC_LEAF, STUB_NUMBER_POW_F64_LEAF,
     STUB_NUMBER_REM_F64_LEAF, STUB_NUMBER_REM_LEAF, STUB_NUMBER_TO_INT32_F64_LEAF,
-    STUB_PARSE_INT_I32_LEAF, STUB_STRICT_EQ_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
-    STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC, STUB_STRING_ENDS_WITH_LEAF,
-    STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF, STUB_STRING_KEY_ATOM_LEAF,
-    STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF, STUB_TYPEOF_TEST_LEAF, SafepointId,
-    SafepointRecord, validate_stub_descriptor,
+    STUB_PARSE_INT_I32_LEAF, STUB_REST_ARRAY_ALLOC, STUB_STRICT_EQ_LEAF,
+    STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF, STUB_STRING_CONCAT_ALLOC,
+    STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
+    STUB_STRING_KEY_ATOM_LEAF, STUB_STRING_STARTS_WITH_LEAF, STUB_TO_BOOLEAN_LEAF,
+    STUB_TYPEOF_TEST_LEAF, SafepointId, SafepointRecord, validate_stub_descriptor,
 };
 use crate::{Interpreter, Value, collections};
 use std::cell::UnsafeCell;
@@ -951,6 +951,12 @@ pub const ARRAY_CONSTRUCT_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(array_construct_alloc),
 };
 
+/// ABI descriptor for a rest parameter's Array.
+pub const REST_ARRAY_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: STUB_REST_ARRAY_ALLOC,
+    entry: Some(rest_array_alloc),
+};
+
 mod string;
 pub(crate) use string::primitive_string_order;
 pub use string::string_concat_alloc;
@@ -1209,6 +1215,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_STRING_CONCAT_ALLOC.id => Some(STRING_CONCAT_ALLOC),
         id if id == crate::native_abi::STUB_ALLOC_GROUP_ENSURE.id => Some(ALLOC_GROUP_ENSURE),
         id if id == STUB_ARRAY_CONSTRUCT_ALLOC.id => Some(ARRAY_CONSTRUCT_ALLOC),
+        id if id == STUB_REST_ARRAY_ALLOC.id => Some(REST_ARRAY_ALLOC),
         id if id == STUB_JIT_MAKE_FN.id => Some(MAKE_FUNCTION_ALLOC),
         id if id == STUB_JIT_MAKE_CLOSURE.id => Some(MAKE_CLOSURE_ALLOC),
         id if id == STUB_CREATE_CONTEXT_ALLOC.id => Some(CREATE_CONTEXT_ALLOC),
@@ -1468,6 +1475,24 @@ pub extern "C" fn array_construct_alloc(
     record_alloc_value_stub_result(
         ctx,
         array_construct_alloc_inner(ctx, safepoint, length_bits, padding0_bits, padding1_bits),
+    )
+}
+
+/// Rest parameter stub: `(formal count, _, _)` as boxed words. The Array
+/// holds the current frame's actual arguments from the formal count on,
+/// read after the packet's roots are published; the copies ride the
+/// allocation's own roots.
+#[must_use]
+pub extern "C" fn rest_array_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    formals_bits: u64,
+    padding0_bits: u64,
+    padding1_bits: u64,
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
+        ctx,
+        rest_array_alloc_inner(ctx, safepoint, formals_bits, padding0_bits, padding1_bits),
     )
 }
 
@@ -3076,6 +3101,66 @@ fn array_construct_alloc_inner(
         Ok(array) => NativeResultPair::success(array),
         Err(crate::VmError::OutOfMemory { .. }) => NativeResultPair::out_of_memory(),
         Err(_) => NativeResultPair::miss(),
+    }
+}
+
+fn rest_array_alloc_inner(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    formals_bits: u64,
+    padding0_bits: u64,
+    padding1_bits: u64,
+) -> NativeResultPair {
+    let Some(formals) = Value::from_abi_bits(formals_bits)
+        .as_i32()
+        .and_then(|formals| usize::try_from(formals).ok())
+    else {
+        return NativeResultPair::miss();
+    };
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    let Some(interp) = alloc_interpreter_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    let frame = ctx.current_frame();
+    if frame.is_null() {
+        return NativeResultPair::miss();
+    }
+    // SAFETY: `ctx` is the current allocating-stub call packet. Its safepoint
+    // table and frame/spill windows stay published for this synchronous call.
+    let Ok(roots) = (unsafe {
+        alloc_value_stub_call_roots(
+            ctx,
+            safepoint,
+            [
+                Value::from_abi_bits(formals_bits),
+                Value::from_abi_bits(padding0_bits),
+                Value::from_abi_bits(padding1_bits),
+            ],
+        )
+    }) else {
+        return NativeResultPair::miss();
+    };
+    let _call_roots_guard = interp
+        .gc_heap
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    // SAFETY: the packet's current frame stays published for this synchronous call.
+    let frame = crate::ActiveFrameRef::from_frame(unsafe { &*frame });
+    let Ok(mut values) = (formals..frame.incoming_argument_count().max(formals))
+        .map(|index| frame.incoming_argument(index))
+        .collect::<Result<smallvec::SmallVec<[Value; 8]>, _>>()
+    else {
+        return NativeResultPair::miss();
+    };
+    match crate::array::from_values_with_roots(
+        &mut interp.gc_heap,
+        &mut values,
+        otter_gc::SitePlacement::Young(0),
+        &mut |_| {},
+    ) {
+        Ok(array) => NativeResultPair::success(Value::array(array)),
+        Err(_) => NativeResultPair::out_of_memory(),
     }
 }
 

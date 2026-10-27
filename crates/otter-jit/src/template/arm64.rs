@@ -870,20 +870,26 @@ pub(crate) struct OperationContext<'c, 'a> {
 /// operation requires one.
 /// Count one execution of the call at `pc` into its live feedback, the way
 /// the interpreter counts it: optimizing callers weigh their inline
-/// candidates by these counts. Clobbers `x14` and `x16`.
+/// candidates by these counts. An ordinary call whose feedback is still
+/// empty also records the callable in `callee`, as the interpreter would
+/// have: a site first reached in baseline code then has a target for the
+/// optimizer. Clobbers `x14` and `x16`, and the caller-saved registers on
+/// that one recording call.
 fn emit_count_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
     view: &JitCompileSnapshot,
     pc: u32,
-) {
+    callee: Option<u16>,
+) -> Result<(), Unsupported> {
     let Some(cell) = view
         .instructions
         .get(pc as usize)
         .map(|instruction| instruction.call_count_cell)
         .filter(|&cell| cell != 0)
     else {
-        return;
+        return Ok(());
     };
     values::emit_load_symbol_u64(
         ops,
@@ -902,6 +908,26 @@ fn emit_count_call(
         ; csinv w14, w14, wzr, cc
         ; str w14, [x16]
     );
+    if let Some(callee) = callee {
+        let recorded = ops.new_dynamic_label();
+        dynasm!(ops
+            ; .arch aarch64
+            ; ldurb w14, [x16, otter_vm::jit_feedback::CALL_FEEDBACK_STATE_FROM_EXECUTIONS]
+            ; cbnz w14, =>recorded
+            ; mov x1, x16
+            ; mov x0, x20
+        );
+        emit_load_reg(ops, 2, callee)?;
+        values::emit_load_runtime_stub(
+            ops,
+            relocations,
+            16,
+            transitions.variadic_entry(abi::STUB_JIT_RECORD_CALL_TARGET),
+            abi::STUB_JIT_RECORD_CALL_TARGET,
+        );
+        dynasm!(ops ; .arch aarch64 ; blr x16 ; =>recorded);
+    }
+    Ok(())
 }
 
 pub(crate) fn emit_operation<'a>(
@@ -937,7 +963,14 @@ pub(crate) fn emit_operation<'a>(
     };
     let return_sites = &mut call_source;
     super::mark_direct_call_site_reached(direct_call_events.as_mut(), instr.byte_pc);
-    emit_count_call(ops, relocations, view, instr.pc);
+    emit_count_call(
+        ops,
+        relocations,
+        transitions,
+        view,
+        instr.pc,
+        instr.op.plain_call_callee(),
+    )?;
     let OperationExits {
         type_mismatch_exit,
         identity_guard_exit,

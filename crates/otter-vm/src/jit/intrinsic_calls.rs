@@ -41,11 +41,13 @@ pub enum IntrinsicCallKind {
     StringMatch,
     /// The realm's original `%String.prototype.search%`, called as a method.
     StringSearch,
+    /// The realm's original `Reflect.apply`.
+    ReflectApply,
 }
 
 impl IntrinsicCallKind {
     /// Number of kinds.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
 
     /// Every kind, in feedback-payload order.
     pub const ALL: [Self; Self::COUNT] = [
@@ -59,6 +61,7 @@ impl IntrinsicCallKind {
         Self::StringSplit,
         Self::StringMatch,
         Self::StringSearch,
+        Self::ReflectApply,
     ];
 
     /// The scalar code feedback and runtime entries name this kind by.
@@ -90,8 +93,8 @@ impl IntrinsicCallKind {
         )
     }
 
-    /// The prototype a method kind's original callable lives on, and its
-    /// property name there.
+    /// The object a kind's original callable is a property of (a method
+    /// kind's prototype, or `Reflect`), and its property name there.
     pub(crate) const fn method_home(self) -> Option<(MethodHome, &'static str)> {
         Some(match self {
             Self::RegExpExec => (MethodHome::RegExpPrototype, "exec"),
@@ -100,6 +103,7 @@ impl IntrinsicCallKind {
             Self::StringSplit => (MethodHome::StringPrototype, "split"),
             Self::StringMatch => (MethodHome::StringPrototype, "match"),
             Self::StringSearch => (MethodHome::StringPrototype, "search"),
+            Self::ReflectApply => (MethodHome::Reflect, "apply"),
             Self::Array | Self::Boolean | Self::Number | Self::Object => return None,
         })
     }
@@ -110,6 +114,8 @@ impl IntrinsicCallKind {
 pub(crate) enum MethodHome {
     RegExpPrototype,
     StringPrototype,
+    /// The `Reflect` namespace object.
+    Reflect,
 }
 
 /// Exact canonical callable identity retained by one compiled generation.

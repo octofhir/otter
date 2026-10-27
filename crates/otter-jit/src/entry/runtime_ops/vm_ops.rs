@@ -197,6 +197,22 @@ pub(crate) extern "C" fn jit_collect_arguments_stub(ctx: *mut JitCtx, dst: u64) 
     }
 }
 
+/// Runtime stub: record the callable a baseline call site called while its
+/// feedback was empty. `executions` is the site's execution count word.
+/// Neither allocates nor runs JavaScript; it always succeeds.
+pub(crate) extern "C" fn jit_record_call_target_stub(
+    ctx: *mut JitCtx,
+    executions: u64,
+    callee_bits: u64,
+) -> u64 {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    if let Ok(mut runtime) = ctx.runtime_call() {
+        runtime.record_baseline_call_target(executions, Value::from_bits(callee_bits));
+    }
+    NativeResultStatus::Success as u64
+}
+
 /// Materialize a regex literal (`Op::LoadRegExp`) into the frame's
 /// destination register. Allocating; a bad pattern reports `Throw`.
 pub(crate) extern "C" fn jit_load_regexp_stub(ctx: *mut JitCtx, dst: u64, idx: u64) -> u64 {

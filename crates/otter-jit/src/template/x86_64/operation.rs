@@ -42,20 +42,25 @@ pub(crate) struct OperationContext<'c, 'a> {
 
 /// Count one execution of the call at `pc` into its live feedback, the way
 /// the interpreter counts it: optimizing callers weigh their inline
-/// candidates by these counts. Clobbers `r11`.
+/// candidates by these counts. An ordinary call whose feedback is still
+/// empty also records the callable in `callee`, as the interpreter would
+/// have. Clobbers `r11`, and the caller-saved registers on that one
+/// recording call.
 fn emit_count_call(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
     view: &otter_vm::JitCompileSnapshot,
     pc: u32,
-) {
+    callee: Option<u16>,
+) -> Result<(), Unsupported> {
     let Some(cell) = view
         .instructions
         .get(pc as usize)
         .map(|instruction| instruction.call_count_cell)
         .filter(|&cell| cell != 0)
     else {
-        return;
+        return Ok(());
     };
     crate::x86_64::values::emit_load_symbol_u64(
         ops,
@@ -74,6 +79,25 @@ fn emit_count_call(
         ; mov DWORD [r11], -1
         ; =>counted
     );
+    if let Some(callee) = callee {
+        let recorded = ops.new_dynamic_label();
+        dynasm!(ops ; .arch x64
+            ; cmp BYTE [r11 + otter_vm::jit_feedback::CALL_FEEDBACK_STATE_FROM_EXECUTIONS], 0
+            ; jne =>recorded
+            ; mov rsi, r11
+            ; mov rdi, r15
+        );
+        super::emit_load_reg(ops, 2, callee);
+        super::emit_load_runtime_stub(
+            ops,
+            relocations,
+            transitions.variadic_entry(abi::STUB_JIT_RECORD_CALL_TARGET),
+            abi::STUB_JIT_RECORD_CALL_TARGET,
+        );
+        super::emit_variadic_call(ops, abi::STUB_JIT_RECORD_CALL_TARGET, 3);
+        dynasm!(ops ; .arch x64 ; =>recorded);
+    }
+    Ok(())
 }
 
 /// Emit one operation whose label and required canonical PC the caller bound.
@@ -107,7 +131,14 @@ pub(crate) fn emit_operation(
         direct_call_events.as_mut(),
         instruction.byte_pc,
     );
-    emit_count_call(ops, relocations, view, instruction.pc);
+    emit_count_call(
+        ops,
+        relocations,
+        transitions,
+        view,
+        instruction.pc,
+        instruction.op.plain_call_callee(),
+    )?;
     let OperationExits {
         type_mismatch_exit: type_mismatch,
         identity_guard_exit: _,

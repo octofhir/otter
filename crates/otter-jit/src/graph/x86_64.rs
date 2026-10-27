@@ -546,7 +546,8 @@ impl<'a> Codegen<'a> {
             Kind::NativeNewContext(_)
             | Kind::CopyContext
             | Kind::NewClosure
-            | Kind::NewArrayWithLength => {
+            | Kind::NewArrayWithLength
+            | Kind::NewRestArray(_) => {
                 let dst = Self::gp(self.loc(node).result.expect("lexical allocation result"));
                 self.emit_lexical_allocation(node, dst)?;
             }
@@ -571,6 +572,7 @@ impl<'a> Codegen<'a> {
             Kind::CallForward { pc, plan, bindings } => {
                 self.emit_call_forward(node, *pc, *plan, bindings)?
             }
+            Kind::CallApplyArray { .. } => self.emit_call_apply_array(node)?,
             Kind::Generic { pc, registers } => self.emit_generic(node, *pc, registers)?,
             Kind::ConstTagged(_) | Kind::ConstInt32(_) | Kind::ConstFloat64(_) | Kind::Phi => {}
             _ => return Err(Unsupported::OperandShape("graph x86 node")),

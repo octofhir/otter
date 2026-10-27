@@ -425,6 +425,7 @@ impl RealmIntrinsics {
             });
         let (regexp_prototype, string_prototype) =
             (self.regexp_prototype(), self.string_prototype());
+        let reflect = object::get(global, heap, "Reflect").and_then(|value| value.as_object());
         for kind in crate::IntrinsicCallKind::ALL {
             self.callables[kind as usize] = match kind.method_home() {
                 None => callable(heap, kind_constructor_name(kind)),
@@ -432,6 +433,7 @@ impl RealmIntrinsics {
                     let prototype = match home {
                         crate::jit::MethodHome::RegExpPrototype => regexp_prototype,
                         crate::jit::MethodHome::StringPrototype => string_prototype,
+                        crate::jit::MethodHome::Reflect => reflect,
                     };
                     prototype
                         .and_then(|prototype| object::get(prototype, heap, name))
@@ -680,6 +682,7 @@ mod tests {
                 "string-split-root",
                 "string-match-root",
                 "string-search-root",
+                "reflect-apply-root",
             ]) {
                 let callable = crate::native_function::NativeFunction::new_static(
                     &mut vm.gc_heap,

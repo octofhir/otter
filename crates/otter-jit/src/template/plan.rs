@@ -628,6 +628,17 @@ pub(crate) struct TemplateTail {
     pub(crate) len: usize,
 }
 
+impl TemplateOp {
+    /// The callee register of an ordinary call, whose site records the
+    /// callable it calls.
+    pub(crate) const fn plain_call_callee(&self) -> Option<u16> {
+        match *self {
+            Self::Call { callee, .. } | Self::TailCall { callee, .. } => Some(callee),
+            _ => None,
+        }
+    }
+}
+
 /// One template operation at its canonical instruction PC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TemplateInstr {

@@ -649,6 +649,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::CheckReceiverPlan(plan),
         Kind::VirtualObject { shape: 0 },
         Kind::NewArrayWithLength,
+        Kind::NewRestArray(0),
         Kind::PrimitiveAdd,
         Kind::BigIntBinary(otter_vm::bigint::ops::Operator::Add),
         Kind::PrimitiveCompare(condition),
@@ -816,6 +817,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
             plan: crate::call_linkage::CallPlan::Generic,
             bindings: Box::new([]),
         },
+        Kind::CallApplyArray { pc: 0 },
         Kind::CheckFunctionPrototypeCall(0),
         Kind::CheckGuardedMethod(0),
         Kind::CheckNative(0),
@@ -922,6 +924,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::CheckReceiverPlan(_)
         | K::VirtualObject { .. }
         | K::NewArrayWithLength
+        | K::NewRestArray(_)
         | K::PrimitiveAdd
         | K::BigIntBinary(_)
         | K::PrimitiveCompare(_)
@@ -1011,6 +1014,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::NativeLeaf(_)
         | K::CallJs { .. }
         | K::CallForward { .. }
+        | K::CallApplyArray { .. }
         | K::CheckFunctionPrototypeCall(_)
         | K::CheckGuardedMethod(_)
         | K::CheckNative(_)

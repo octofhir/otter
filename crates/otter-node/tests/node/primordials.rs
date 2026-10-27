@@ -1,7 +1,7 @@
 //! Known primordial lookup, cache and realm semantics through the Node loader.
 //!
 //! # Contents
-//! - One grouped program covering live holders, descriptors and callable ABI.
+//! - One grouped program covering captured holders, members and callable ABI.
 //! - Real ESM hosted imports in default and additional realms with distinct
 //!   caches, of `internal/test/binding` under `--expose-internals`: the realm's
 //!   primordials as Node's own tests reach them.
@@ -14,7 +14,7 @@
 //! Rust observations are owned completions after the actual script checkpoint.
 //!
 //! # See also
-//! - `nodelib::bootstrap_realm` owns the current lazy Map/Proxy.
+//! - `nodelib::bootstrap_realm` builds each realm's primordials eagerly.
 //! - `Runtime::run_module_source_in_realm` owns real source/realm admission.
 
 use otter_node::NodeApiBuilderExt;
@@ -35,125 +35,53 @@ const PROGRAM: &str = r#"
   const define = Object.defineProperty;
   const descriptor = Object.getOwnPropertyDescriptor;
   const originalIsView = descriptor(ArrayBuffer, 'isView');
-  const originalPrefix = descriptor(Array, 'bufferIsView');
   const originalSlice = descriptor(Array.prototype, 'slice');
   const originalSize = descriptor(Map.prototype, 'size');
   const originalMax = descriptor(Math, 'max');
   const originalApply = descriptor(Reflect, 'apply');
   const originalCatch = descriptor(Promise.prototype, 'catch');
-  let prefixReads = 0, fallbackReads = 0, sliceReads = 0;
-  let sizeCalls = 0, maxReads = 0;
-  const collision = function collision(a, b) {
-    check(this === Array, 'static bind keeps the selected prefix holder');
-    return a + b;
-  };
-  const prefix = function prefix() {
-    prefixReads++;
-    return mode === 'undefined' ? undefined : collision;
-  };
-  const sliceProbe = function sliceProbe(a, b) {
-    return this[0] + a + b;
-  };
-  const sizeProbe = function sizeProbe() {
-    sizeCalls++;
-    return this.seed;
-  };
-  const maximum = function maximum(a, b) {
-    check(this === Math, 'static Apply supplies Math as this');
-    return a + b;
-  };
+  const replaced = function replaced() { throw new Error('replaced intrinsic ran'); };
   try {
-    define(Array, 'bufferIsView', { get: prefix, configurable: true });
-    define(ArrayBuffer, 'isView', {
-      get() { fallbackReads++; return originalIsView.value; },
-      configurable: true,
-    });
-    const prefixDescriptor = descriptor(Array, 'bufferIsView');
-    check(prefixDescriptor.get === prefix && prefixDescriptor.set === undefined &&
-          prefixDescriptor.enumerable === false && prefixDescriptor.configurable === true,
-          'live accessor descriptor');
-    const selected = bag.ArrayBufferIsView;
-    check(prefixReads === 1 && fallbackReads === 0,
-          'Array prefix precedes ArrayBuffer and undefined stops');
-    if (mode === 'undefined') {
-      check(selected === undefined, 'present undefined is the result');
-    } else {
-      check(typeof selected === 'function' && selected(4, 7) === 11,
-            'selected prefix callable');
-      check(selected.length === 2 && selected.name === 'bound collision',
-            'static bind name and arity');
-    }
-    define(Array, 'bufferIsView', { value: function changed() {}, configurable: true });
-    check(bag.ArrayBufferIsView === selected && prefixReads === 1 && fallbackReads === 0,
-          'cached result identity includes undefined');
-
-    define(Array.prototype, 'slice', {
-      get() { sliceReads++; return sliceProbe; }, configurable: true,
-    });
+    const isView = bag.ArrayBufferIsView;
     const slice = bag.ArrayPrototypeSlice;
-    check(sliceReads === 1 && slice([4], 3, 9) === 16,
-          'uncurried prototype member uses explicit receiver');
-    check(slice.length === 1 && slice.name === 'bound call',
-          'uncurry name and arity');
-    define(Array.prototype, 'slice', { value: function laterSlice() {}, configurable: true });
-    check(bag.ArrayPrototypeSlice === slice && sliceReads === 1,
-          'prototype getter is read live once, then cache owns identity');
-
-    define(Map.prototype, 'size', { get: sizeProbe, configurable: true });
     const getSize = bag.MapPrototypeGetSize;
-    check(sizeCalls === 0 && getSize.length === 1 && getSize.name === 'bound call',
-          'accessor half is captured without invoking it');
-    const map = new Map();
-    map.seed = 23;
-    check(getSize(map) === 23 && sizeCalls === 1 && bag.MapPrototypeGetSize === getSize,
-          'captured getter receiver and identity');
-
-    define(Math, 'max', {
-      get() { maxReads++; return maximum; }, configurable: true,
-    });
     const maxApply = bag.MathMaxApply;
-    check(maxReads === 1 && maxApply.length === 1 && maxApply.name === '' &&
-          maxApply([5, 8]) === 13 && bag.MathMaxApply === maxApply,
-          'static Apply array ABI and cached identity');
+    const reflectApply = bag.ReflectApply;
+    const explicitCatch = bag.PromisePrototypeCatch;
+    define(ArrayBuffer, 'isView', { value: replaced, configurable: true });
+    define(Array.prototype, 'slice', { value: replaced, configurable: true });
+    define(Map.prototype, 'size', { get: replaced, configurable: true });
+    define(Math, 'max', { value: replaced, configurable: true });
+    define(Reflect, 'apply', { value: replaced, configurable: true });
+    define(Promise.prototype, 'catch', { value: replaced, configurable: true });
 
+    check(isView === originalIsView.value && bag.ArrayBufferIsView === isView &&
+          isView(new Uint8Array(1)) === true,
+          'static members are the unbound intrinsics captured before user code');
+    check(slice.length === 1 && slice([4, 5, 6], 1).join(',') === '5,6' &&
+          bag.ArrayPrototypeSlice === slice,
+          'uncurried prototype member uses explicit receiver');
+    check(getSize(new Map([[1, 2]])) === 1 && bag.MapPrototypeGetSize === getSize,
+          'accessor half keeps the captured getter');
+    check(maxApply.length === 1 && maxApply([5, 8]) === 8 && bag.MathMaxApply === maxApply,
+          'static Apply array ABI');
     const pushApply = bag.ArrayPrototypePushApply;
     const pushed = [1];
-    check(pushApply.length === 2 && pushApply.name === '' &&
-          pushApply(pushed, [2, 3]) === 3 && pushed.join(',') === '1,2,3' &&
-          bag.ArrayPrototypePushApply === pushApply,
+    check(pushApply.length === 2 && pushApply(pushed, [2, 3]) === 3 &&
+          pushed.join(',') === '1,2,3',
           'prototype Apply receiver/list ABI');
-
-    const reflectApply = bag.ReflectApply;
-    const reflectedReceiver = { marker: 19 };
-    check(reflectApply !== originalApply.value && reflectApply.length === 3 &&
-          reflectApply.name === 'bound apply' &&
-          reflectApply(function reflected() { return this.marker; }, reflectedReceiver, []) === 19,
-          'ReflectApply is the real bound static member');
-    define(Reflect, 'apply', { value: function replacedApply() { throw new Error('wrong apply'); }, configurable: true });
-    check(bag.ReflectApply === reflectApply,
-          'static ReflectApply retains the cached callable identity');
-
-    let catchReads = 0;
-    define(Promise.prototype, 'catch', {
-      get() { catchReads++; throw new Error('prototype catch derivation ran'); },
-      configurable: true,
-    });
-    const explicitCatch = bag.PromisePrototypeCatch;
-    const promiseReceiver = {
-      catch(handler) {
-        check(this === promiseReceiver, 'explicit catch supplies the actual receiver');
-        return handler(6);
-      },
-    };
-    check(catchReads === 0 && explicitCatch.length === 2 &&
-          explicitCatch(promiseReceiver, (value) => value + 11) === 17 &&
-          bag.PromisePrototypeCatch === explicitCatch,
-          'true explicit PromisePrototypeCatch precedes prototype derivation');
+    check(reflectApply === originalApply.value &&
+          reflectApply(function reflected() { return this.marker; }, { marker: 19 }, []) === 19,
+          'ReflectApply is the unbound intrinsic');
+    check(explicitCatch.length === 1 &&
+          explicitCatch(Promise.reject(6), (value) => value + 11) instanceof Promise,
+          'uncurried PromisePrototypeCatch keeps the captured method');
+    const resolve = bag.PromiseResolve;
+    check(resolve.name === 'bound resolve' && resolve(3) instanceof Promise,
+          'Promise statics are bound to Promise');
     check(bag.SymbolIterator === Symbol.iterator && bag.SymbolFor === Symbol.for,
           'well-known symbol/function priority');
   } finally {
-    if (originalPrefix) define(Array, 'bufferIsView', originalPrefix);
-    else delete Array.bufferIsView;
     define(ArrayBuffer, 'isView', originalIsView);
     define(Array.prototype, 'slice', originalSlice);
     define(Map.prototype, 'size', originalSize);
@@ -162,26 +90,10 @@ const PROGRAM: &str = r#"
     define(Promise.prototype, 'catch', originalCatch);
   }
 
-  // Existing Proxy writes replace its one Map entry. Restore the probed
-  // entries before genuine vendored code imports them below.
-  bag.ArrayBufferIsView = originalIsView.value.bind(ArrayBuffer);
-  bag.ArrayPrototypeSlice = bag.uncurryThis(originalSlice.value);
-  bag.MapPrototypeGetSize = bag.uncurryThis(originalSize.get);
-  bag.MathMaxApply = (args) => originalApply.value(originalMax.value, Math, args);
-  const overridden = { marker: mode };
-  const floor = bag.MathFloor;
-  bag.MathFloor = overridden;
-  check(bag.MathFloor === overridden && 'MathFloor' in bag, 'known cache override');
-  bag.MathFloor = floor;
-  check(bag.__otterUnknownPrimordialProbe__ === undefined &&
-        !('__otterUnknownPrimordialProbe__' in bag), 'closed unknown result');
-  bag.__otterUnknownPrimordialProbe__ = overridden;
-  check(bag.__otterUnknownPrimordialProbe__ === overridden &&
-        '__otterUnknownPrimordialProbe__' in bag, 'unknown cache override uses existing Map');
-  bag.__otterUnknownPrimordialProbe__ = undefined;
-  check(!('__otterUnknownPrimordialProbe__' in bag) && bag[Symbol.iterator] === undefined,
-        'undefined has and non-string read');
-  check(bag.toString === Object.prototype.toString, 'inherited special-name priority');
+  check(Object.getPrototypeOf(bag) === null && bag.toString === undefined &&
+        bag.__otterUnknownPrimordialProbe__ === undefined &&
+        !('__otterUnknownPrimordialProbe__' in bag),
+        'null-prototype bag holds only catalog names');
 
   const safePairs = [
     [bag.SafeMap, Map, 'SafeMap'], [bag.SafeSet, Set, 'SafeSet'],
@@ -235,7 +147,7 @@ const PROGRAM: &str = r#"
 "#;
 
 #[test]
-fn primordial_members_are_live_until_cached_and_remain_owned_by_the_source_realm() {
+fn primordial_members_are_captured_at_bootstrap_and_owned_by_the_source_realm() {
     // No console/timer/rejection getter is entered before this first bootstrap
     // load. The Node installer only installs their lazy functions/descriptors.
     let mut node = Runtime::builder()

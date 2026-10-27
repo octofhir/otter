@@ -11,6 +11,8 @@
 //!   retains the eager call state, including ignored evaluated arguments.
 //! - Allocation nodes keep their source's canonical root/reconstruction contract.
 //! - Admitted allocation forms prove their exact physical body kind.
+//! - `Reflect.apply(target, this, list)` becomes [`Kind::CallApplyArray`],
+//!   which calls `target` with the list's elements.
 //! - A refused proof or form leaves the existing native-kind call path intact.
 //!
 //! # See also
@@ -19,12 +21,57 @@
 //! - `crate::graph::ir::Kind` owns allocation and conversion effects.
 
 use otter_vm::{JitNativeCall, native_abi::ExitReason};
+use smallvec::SmallVec;
+
+use crate::graph::ir::NodeId;
 
 use super::{Builder, Instruction, Kind, Repr};
 use crate::intrinsic_calls::{IntrinsicCallForm, proof_form};
 
 impl Builder<'_> {
     /// Lower an admitted intrinsic without building a call activation or window.
+    /// `Reflect.apply(target, this, list)` with the realm's original
+    /// `Reflect.apply`: the call of `target` with the list's elements, which
+    /// [`Kind::CallApplyArray`] passes from a plain dense Array's storage.
+    fn emit_reflect_apply(
+        &mut self,
+        instruction: &Instruction,
+        proof: otter_vm::JitIntrinsicCallProof,
+        callee: u16,
+        arguments: &[u16],
+        construct: bool,
+    ) -> bool {
+        let &[target, this, list] = arguments else {
+            return false;
+        };
+        if construct
+            || proof.identity_cell == 0
+            || proof.realm_id != self.view.literal_allocations.realm_id
+        {
+            return false;
+        }
+        let callee = self.read(callee);
+        let callee = self.tagged(callee);
+        self.add(
+            Kind::CheckCellValue(proof.identity_cell),
+            &[callee],
+            Repr::None,
+        );
+        let inputs: SmallVec<[NodeId; 3]> = [target, this, list]
+            .into_iter()
+            .map(|register| {
+                let value = self.read(register);
+                self.tagged(value)
+            })
+            .collect();
+        let node = self.add(Kind::CallApplyArray { pc: self.pc }, &inputs, Repr::Tagged);
+        let destination = instruction.writes[0];
+        let lazy = self.lazy_state(Some((destination, node)));
+        self.graph.node_mut(node).lazy = Some(lazy);
+        self.write(destination, node);
+        true
+    }
+
     pub(super) fn emit_intrinsic_call(
         &mut self,
         instruction: &Instruction,
@@ -39,6 +86,9 @@ impl Builder<'_> {
         };
         if self.exited_for(ExitReason::IdentityGuard) {
             return false;
+        }
+        if proof.kind == otter_vm::IntrinsicCallKind::ReflectApply {
+            return self.emit_reflect_apply(instruction, proof, callee, arguments, construct);
         }
         let Some(form) = proof_form(
             proof,

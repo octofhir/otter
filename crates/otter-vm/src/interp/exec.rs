@@ -1535,12 +1535,10 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             surviving.map(|fid| (fid, 8)).into()
         );
-        assert!(
-            vm.arguments_shape_cache.contains_key(&(
-                first_evicted,
-                crate::arguments_object::ArgumentsShapeKind::new(false, false, true),
-            ))
-        );
+        assert!(vm.arguments_shape_cache.contains_key(&(
+            first_evicted,
+            crate::arguments_object::ArgumentsShapeKind::new(false, false, true),
+        )));
         for (base, site) in method_sites {
             if base == first_evicted {
                 assert!(vm.method_target_feedback(site).is_none());

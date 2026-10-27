@@ -3805,6 +3805,9 @@ impl<'a> Builder<'a> {
                 self.known.entry(bag).heap_object = true;
                 bag
             }
+            otter_vm::jit::PropertyStorageProjection::TypedArrayStart => {
+                unreachable!("a typed array's start lowers only through its programs")
+            }
         }
     }
 

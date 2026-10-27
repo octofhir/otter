@@ -683,6 +683,14 @@ impl crate::Interpreter {
             && let Some(bag) = crate::array::expando_object(array, &self.gc_heap)
         {
             (bag, Projection::ArrayExpando)
+        } else if let Some(view) = receiver.as_typed_array(&self.gc_heap) {
+            let start = self.lookup_start_object(receiver)?;
+            // A view on its realm-default prototype records it as its start,
+            // which generated code then reads.
+            if self.active_realm_id == 0 && view.lookup_start(&self.gc_heap).is_none() {
+                view.prove_default_lookup_start(&mut self.gc_heap, start);
+            }
+            (start, Projection::TypedArrayStart)
         } else {
             (self.lookup_start_object(receiver)?, Projection::LookupStart)
         };

@@ -112,6 +112,13 @@ fn load_program_indices(
                     // but never compare those shapes to the bag's shape token.
                     continue;
                 }
+                Some(JitCacheIrOp::LoadTypedArrayStart {
+                    object: 0,
+                    result: 1,
+                }) => {
+                    // Known ordinary receiver shapes exclude typed views.
+                    continue;
+                }
                 Some(
                     JitCacheIrOp::LoadClosurePrototype { object: 0 }
                     | JitCacheIrOp::LoadBodySlot { object: 0, .. },
@@ -327,7 +334,8 @@ pub(crate) fn own_data_store(
 /// The selected load programs of the site at `byte_pc`, when every one
 /// proves its receiver and reads one data slot through generated operations:
 /// the receiver (operand 0) or its holder (operand 1) — a guarded prototype
-/// holder or a pinned intrinsic prototype — ending in one field read, or a
+/// holder, a pinned intrinsic prototype or a typed view's lookup start —
+/// ending in one field read, or a
 /// closure's own `prototype` slot.
 pub(crate) fn named_load_programs(
     view: &JitCompileSnapshot,
@@ -366,6 +374,10 @@ pub(crate) fn named_load_programs(
                     result: 1,
                     ..
                 } if index == 0 => holder = true,
+                JitCacheIrOp::LoadTypedArrayStart {
+                    object: 0,
+                    result: 1,
+                } if index == 0 => holder = true,
                 JitCacheIrOp::LoadPrototypeHolder { result: 1, .. } => holder = true,
                 JitCacheIrOp::GuardPrototypeValidity { .. } => {}
                 JitCacheIrOp::GuardShape { object, .. }
@@ -386,7 +398,9 @@ pub(crate) fn named_load_programs(
         let intrinsic = matches!(
             program.ops.first(),
             Some(
-                JitCacheIrOp::LoadIntrinsicPrototype { .. } | JitCacheIrOp::LoadArrayExpando { .. }
+                JitCacheIrOp::LoadIntrinsicPrototype { .. }
+                    | JitCacheIrOp::LoadArrayExpando { .. }
+                    | JitCacheIrOp::LoadTypedArrayStart { .. }
             )
         );
         if !intrinsic

@@ -179,6 +179,9 @@ pub enum PropertyStorageProjection {
     LookupStart = 1,
     /// The array's live expando owns an existing non-index data slot.
     ArrayExpando = 2,
+    /// A typed array's proven lookup start (its body's `lookup_start`) owns
+    /// the operation: an own data slot of that prototype or one it inherits.
+    TypedArrayStart = 3,
 }
 
 impl PropertyStorageProjection {
@@ -200,7 +203,7 @@ impl PropertyStorageProjection {
             0 => Self::Receiver,
             1 => Self::LookupStart,
             2 => Self::ArrayExpando,
-            _ => return None,
+            _ => Self::TypedArrayStart,
         };
         let shape = key & !Self::KEY_MASK;
         (shape != 0 && shape.is_multiple_of(8)).then_some((projection, shape))
@@ -564,6 +567,11 @@ impl IcHandler {
     pub(crate) fn projected(mut self, projection: PropertyStorageProjection) -> Option<Self> {
         if (projection == PropertyStorageProjection::LookupStart
             && self.kind == IcHandlerKind::StoreTransition)
+            || (projection == PropertyStorageProjection::TypedArrayStart
+                && matches!(
+                    self.kind,
+                    IcHandlerKind::StoreField | IcHandlerKind::StoreTransition
+                ))
             || (projection == PropertyStorageProjection::ArrayExpando
                 && !matches!(
                     self.kind,
@@ -1448,6 +1456,34 @@ impl PropertyIcSlot {
                 ops.insert(
                     0,
                     JitCacheIrOp::LoadFunctionBag {
+                        object: 0,
+                        result: 1,
+                    },
+                );
+            }
+            if entry.projection() == PropertyStorageProjection::TypedArrayStart {
+                // The receiver proof reads the start into operand 1; the
+                // start's own or inherited slot follows as for an object.
+                for op in &mut ops {
+                    match op {
+                        JitCacheIrOp::GuardShape { object, .. }
+                        | JitCacheIrOp::GuardAtomSlot { object, .. }
+                        | JitCacheIrOp::LoadField { object, .. }
+                            if *object == 0 =>
+                        {
+                            *object = 1;
+                        }
+                        JitCacheIrOp::GuardShape { .. }
+                        | JitCacheIrOp::GuardAtomSlot { .. }
+                        | JitCacheIrOp::LoadField { .. }
+                        | JitCacheIrOp::GuardPrototypeValidity { .. }
+                        | JitCacheIrOp::LoadPrototypeHolder { .. } => {}
+                        _ => unreachable!("a typed array's start lowers loaded slots only"),
+                    }
+                }
+                ops.insert(
+                    0,
+                    JitCacheIrOp::LoadTypedArrayStart {
                         object: 0,
                         result: 1,
                     },

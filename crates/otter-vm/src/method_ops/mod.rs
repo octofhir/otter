@@ -2908,6 +2908,80 @@ impl Interpreter {
     /// non-detached TypedArray (plus the `[[ArrayLength]] >= length`
     /// check that only applies when the argument list is a single
     /// Number).
+    /// Whether TypedArraySpeciesCreate's constructor for `exemplar` is the
+    /// intrinsic constructor of its kind, provable without running code:
+    /// `constructor` resolves as data to that constructor (or is absent or
+    /// `undefined`, which selects it as the default), and the constructor's
+    /// `@@species` is still `%TypedArray%`'s original getter, which returns
+    /// it. Only the default realm, whose intrinsics these are, qualifies.
+    fn typed_array_species_is_intrinsic(&self, exemplar: crate::binary::JsTypedArray) -> bool {
+        if self.active_realm_id != 0 {
+            return false;
+        }
+        let heap = &self.gc_heap;
+        let kind = exemplar.kind();
+        let (Some(constructor), Some(species)) = (
+            self.realm_intrinsics.typed_array_constructor(kind),
+            self.realm_intrinsics.typed_array_species_getter(),
+        ) else {
+            return false;
+        };
+        if exemplar.expando(heap).is_some_and(|bag| {
+            !matches!(
+                crate::object::lookup_own(bag, heap, "constructor"),
+                crate::object::PropertyLookup::Absent
+            )
+        }) {
+            return false;
+        }
+        let prototype = match exemplar.custom_proto(heap) {
+            Some(prototype) => prototype.as_object(),
+            None => self.realm_intrinsics.get(
+                crate::realm_intrinsics::Intrinsic::typed_array_prototype(kind),
+            ),
+        };
+        let Some(prototype) = prototype else {
+            return false;
+        };
+        match self.resolve_property_load(prototype, self.atomized_key("constructor")) {
+            crate::property_cache::PropertyLoad::Absent(_) => return true,
+            crate::property_cache::PropertyLoad::Data(resolved)
+                if resolved.value.is_undefined() =>
+            {
+                return true;
+            }
+            crate::property_cache::PropertyLoad::Data(resolved)
+                if resolved
+                    .value
+                    .as_native_function()
+                    .is_some_and(|value| value.raw() == constructor.raw()) => {}
+            _ => return false,
+        }
+        let own = constructor.own_properties_bag(heap);
+        if !own.is_null()
+            && crate::object::has_own_well_known_symbol(
+                own,
+                heap,
+                crate::symbol::WellKnown::Species,
+            )
+        {
+            return false;
+        }
+        let Some(parent) = constructor
+            .prototype_override(heap)
+            .and_then(|parent| parent.as_native_function())
+        else {
+            return false;
+        };
+        let bag = parent.own_properties_bag(heap);
+        !bag.is_null()
+            && matches!(
+                crate::object::lookup_own_well_known_symbol(bag, heap, crate::symbol::WellKnown::Species),
+                crate::object::PropertyLookup::Accessor { getter: Some(getter), .. }
+                    if getter.as_native_function().is_some_and(|getter| getter.raw() == species.raw())
+            )
+    }
+
     fn typed_array_create_via_species(
         &mut self,
         stack: &mut ActivationStack,
@@ -2928,9 +3002,51 @@ impl Interpreter {
                 .as_typed_array(&interp.gc_heap)
                 .ok_or(VmError::InvalidOperand)
                 .map_err(CommittedValueError::Fatal)?;
-            let default_name = exemplar.kind().name();
-            let Some(default_ctor) =
-                crate::object::get(interp.global_this, &interp.gc_heap, default_name)
+            let kind = exemplar.kind();
+            // The intrinsic constructor and its original `@@species`: the
+            // created array is the one that constructor builds, made here
+            // without entering it.
+            if interp.typed_array_species_is_intrinsic(exemplar) {
+                let values: SmallVec<[Value; 8]> = argv_handles
+                    .iter()
+                    .map(|handle| interp.escape_scoped(*handle))
+                    .collect();
+                let values = values.as_slice();
+                let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                    for value in values {
+                        value.trace_value_slots(visitor);
+                    }
+                };
+                let created = crate::binary::dispatch::typed_array_call_with_roots(
+                    kind,
+                    otter_bytecode::method_id::TypedArrayMethod::Construct,
+                    crate::ValueWindow::from_slice(values),
+                    interp,
+                    &mut external_visit,
+                )
+                .map_err(CommittedValueError::JavaScript)?;
+                let created = created
+                    .as_typed_array(&interp.gc_heap)
+                    .ok_or(VmError::InvalidOperand)
+                    .map_err(CommittedValueError::Fatal)?;
+                if let Some(min) = min_length
+                    && created.length(&interp.gc_heap) < min
+                {
+                    return Err(CommittedValueError::JavaScript(
+                        interp.err_type(
+                            ("Species constructor returned a TypedArray smaller than required"
+                                .to_string())
+                            .into(),
+                        ),
+                    ));
+                }
+                return Ok(created);
+            }
+            let default_name = kind.name();
+            let Some(default_ctor) = interp
+                .realm_intrinsics
+                .typed_array_constructor(kind)
+                .map(Value::native_function)
             else {
                 return Err(CommittedValueError::JavaScript(interp.err_type(
                     (format!("%{default_name}% intrinsic is missing")).into(),

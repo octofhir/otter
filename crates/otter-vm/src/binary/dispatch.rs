@@ -306,11 +306,25 @@ pub fn typed_array_call_with_roots(
     external_visit: &mut otter_gc::heap::RootSlotVisitor<'_>,
 ) -> Result<Value, VmError> {
     use otter_bytecode::method_id::TypedArrayMethod as M;
-    match method {
+    let created = match method {
         M::Construct => construct_typed_array_with_roots(kind, args, interp, external_visit),
         M::From => from_static_with_roots(kind, args, interp, external_visit),
         M::Of => of_static_with_roots(kind, args, interp, external_visit),
+    }?;
+    // A fresh view on the default realm's prototype for its kind starts its
+    // named lookups there.
+    if interp.active_realm_id == 0
+        && let Some(view) = created.as_typed_array(&interp.gc_heap)
+        && let Some(prototype) =
+            interp
+                .realm_intrinsics
+                .get(crate::realm_intrinsics::Intrinsic::typed_array_prototype(
+                    view.kind(),
+                ))
+    {
+        view.prove_default_lookup_start(&mut interp.gc_heap, prototype);
     }
+    Ok(created)
 }
 
 fn oom_to_vm(err: otter_gc::OutOfMemory) -> VmError {

@@ -4184,6 +4184,31 @@ impl<'a> Codegen<'a> {
                             ; add X(holder), X(holder), x16
                         );
                     }
+                    Op::LoadTypedArrayStart {
+                        object: 0,
+                        result: 1,
+                    } => {
+                        // A typed view whose body records its lookup start.
+                        let typed = self.view.typed_array_length;
+                        if typed.lookup_start_byte == 0 {
+                            return Err(Unsupported::OperandShape(
+                                "graph typed array start layout",
+                            ));
+                        }
+                        dynasm!(self.ops
+                            ; .arch aarch64
+                            ; tst X(receiver), #0xfffe_0000_0000_0007
+                            ; b.ne =>next
+                            ; cbz X(receiver), =>next
+                            ; ldrb w16, [X(receiver)]
+                            ; cmp w16, u32::from(typed.type_tag)
+                            ; b.ne =>next
+                            ; ldr W(holder), [X(receiver), typed.lookup_start_byte]
+                            ; cbz W(holder), =>next
+                            ; and x16, X(receiver), #0xffff_ffff_0000_0000
+                            ; add X(holder), X(holder), x16
+                        );
+                    }
                     Op::LoadPrototypeHolder { root, .. } => {
                         // The holder the pinned instance-root shape names.
                         self.load_immediate(17, u64::from(root));

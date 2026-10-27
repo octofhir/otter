@@ -1553,6 +1553,16 @@ pub enum JitCacheIrOp {
         /// Tagged ordinary storage operand receiving the bag.
         result: u8,
     },
+    /// Prove a typed array whose body records a lookup start (no expando,
+    /// an ordinary [[Prototype]]) and read that start; any other receiver
+    /// misses. Subsequent ordinary guards validate the start's shape and the
+    /// slot it owns or inherits.
+    LoadTypedArrayStart {
+        /// CacheIR receiver operand to guard.
+        object: u8,
+        /// CacheIR operand receiving the lookup start.
+        result: u8,
+    },
     /// Prove an exotic receiver and read its pinned canonical prototype.
     /// Subsequent ordinary guards validate the prototype's live data slot.
     LoadIntrinsicPrototype {
@@ -1827,14 +1837,16 @@ pub struct JitMethodTarget {
 /// named own property (the only state a `length` read consults besides the
 /// count), its storage is a fixed-length local buffer (non-null cached element
 /// base: neither length-tracking nor shrinkable) and no buffer was ever
-/// detached (the isolate's detach protector). Zero offsets mean no layout was
-/// baked.
+/// detached (the isolate's detach protector). A named lookup reads the view's
+/// proven lookup start. Zero offsets mean no layout was baked.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitTypedArrayLengthLayout {
     /// `GcHeader::type_tag` of a typed view body.
     pub type_tag: u8,
     /// 4-byte expando handle, zero while the view owns no named property.
     pub expando_byte: u32,
+    /// 4-byte lookup-start handle, zero while none is proven.
+    pub lookup_start_byte: u32,
     /// Cached element base, non-null only over a fixed-length local buffer.
     pub data_byte: u32,
     /// `u64` element count.

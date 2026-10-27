@@ -80,7 +80,22 @@ impl Codegen<'_> {
         let realm = source.literal_allocations.realm_id;
         let cage_base = source.cage_base as u64;
         let object = source.literal_allocations.objects.get(&data.pc).cloned();
-        let array = source.literal_allocations.arrays.get(&data.pc).copied();
+        // A spliced body's rest list has no instruction of its own to plan;
+        // its geometry is its count's.
+        let array = source
+            .literal_allocations
+            .arrays
+            .get(&data.pc)
+            .copied()
+            .or_else(|| {
+                (data.kind == Kind::NewArrayLiteral
+                    && !source
+                        .literal_allocations
+                        .boilerplates
+                        .contains_key(&data.pc))
+                .then(|| otter_vm::jit::JitArrayLiteralAllocationPlan::new(data.inputs.len()))
+                .flatten()
+            });
         let boilerplate = source
             .literal_allocations
             .boilerplates

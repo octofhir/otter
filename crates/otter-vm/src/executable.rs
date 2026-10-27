@@ -420,6 +420,12 @@ impl CodeBlock {
         self.needs_arguments || self.has_rest || self.forwards_arguments()
     }
 
+    /// Whether the function takes a rest parameter.
+    #[must_use]
+    pub fn takes_rest(&self) -> bool {
+        self.has_rest
+    }
+
     /// Whether the body forwards its actual arguments to a call
     /// (`f.apply(thisArg, arguments)`).
     #[must_use]
@@ -430,18 +436,17 @@ impl CodeBlock {
     }
 
     /// Whether a body spliced into its caller still serves every read of its
-    /// actual arguments: it has no rest list, never materializes
-    /// `arguments`, and reads it only as an elided `arguments.length` or
-    /// `arguments[i]`, or forwards it to a call, which the splice answers
-    /// from the call's argument values (and a deopt from the recorded
-    /// actuals).
+    /// actual arguments: it never materializes `arguments`, and reads it only
+    /// as an elided `arguments.length` or `arguments[i]`, or forwards it to a
+    /// call, and builds a rest list from the call's trailing values, which
+    /// the splice answers from the call's argument values (and a deopt from
+    /// the recorded actuals).
     #[must_use]
     pub fn splices_without_argument_frame(&self) -> bool {
-        !self.has_rest
-            && !self
-                .code
-                .iter()
-                .any(|instruction| self.op(instruction) == Op::CollectArguments)
+        !self
+            .code
+            .iter()
+            .any(|instruction| self.op(instruction) == Op::CollectArguments)
     }
 
     /// Build JIT feedback/layout metadata over this exact immutable CodeBlock.

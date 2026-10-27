@@ -7,6 +7,9 @@
 //! # Invariants
 //! - Every possible use of the arguments identity is checked, including aliases.
 //! - A join with an ordinary value cannot become an activation argument read.
+//! - A covered instruction may throw before or after its writes, so each
+//!   exception edge carries the join of both states, with the handler's
+//!   exception register ordinary.
 //! - Unsupported control flow or an escaping use retains ordinary construction.
 //! - A closure-context operand still holds its placeholder register until
 //!   `FunctionContext::finish_code` routes it to a fresh register, so it is
@@ -20,7 +23,7 @@
 use std::collections::VecDeque;
 
 use otter_bytecode::opcode_schema::{ControlFlow, SuccessorSpec, opcode_schema, operand_spec_at};
-use otter_bytecode::{Constant, FunctionCodeBuilder, Op, Operand};
+use otter_bytecode::{Constant, ExceptionHandler, FunctionCodeBuilder, Op, Operand};
 
 const ORDINARY: u8 = 1;
 const ARGUMENTS: u8 = 2;
@@ -41,13 +44,14 @@ fn register(operand: Operand) -> Option<usize> {
 }
 
 /// Prove that the implicit object is consumed only by copies, `.length` and
-/// indexed reads. Eligibility for eval, parameter mapping, suspension and
-/// exception handlers is checked by the function compiler before this pass.
+/// indexed reads. Eligibility for eval, parameter mapping and suspension is
+/// checked by the function compiler before this pass.
 pub(crate) fn analyze(
     code: &FunctionCodeBuilder,
     constants: &[Constant],
     registers: u16,
     closure_context_operands: &[(u32, usize)],
+    handlers: &[ExceptionHandler],
 ) -> Option<ArgumentsReadPlan> {
     let width = usize::from(registers);
     let count = code.len();
@@ -88,6 +92,11 @@ pub(crate) fn analyze(
         }
         successors.push(edges);
     }
+    for handler in handlers {
+        if handler.target as usize >= count || usize::from(handler.exception) >= width {
+            return None;
+        }
+    }
     let allocation_pc = allocation?;
     let mut incoming = vec![vec![0u8; width]; count];
     incoming[0].fill(ORDINARY);
@@ -120,9 +129,22 @@ pub(crate) fn analyze(
             let src = register(code.operand(pc as u32, src)?)?;
             *output.get_mut(dst)? = *incoming[pc].get(src)?;
         }
-        for &next in &successors[pc] {
+        let mut flows: Vec<(usize, Vec<u8>)> = successors[pc]
+            .iter()
+            .map(|&next| (next, output.clone()))
+            .collect();
+        for handler in handlers.iter().filter(|handler| handler.covers(pc as u32)) {
+            let mut thrown: Vec<u8> = incoming[pc]
+                .iter()
+                .zip(&output)
+                .map(|(before, after)| before | after)
+                .collect();
+            thrown[usize::from(handler.exception)] = ORDINARY;
+            flows.push((handler.target as usize, thrown));
+        }
+        for (next, state) in flows {
             let mut changed = false;
-            for (before, after) in incoming[next].iter_mut().zip(&output) {
+            for (before, after) in incoming[next].iter_mut().zip(&state) {
                 let joined = *before | after;
                 changed |= joined != *before;
                 *before = joined;
@@ -230,6 +252,7 @@ mod tests {
                     utf16: "length".encode_utf16().collect()
                 }],
                 6,
+                &[],
                 &[]
             ),
             Some(ArgumentsReadPlan {
@@ -256,6 +279,7 @@ mod tests {
                     utf16: "length".encode_utf16().collect()
                 }],
                 3,
+                &[],
                 &[]
             )
             .is_none()
@@ -271,7 +295,7 @@ mod tests {
             (Op::ReturnValue, vec![R(0)]),
         ] {
             let code = body(&[(Op::CollectArguments, &[R(0), R(0)]), (op, &operands)]);
-            assert!(analyze(&code, &[], 3, &[]).is_none(), "{op:?}");
+            assert!(analyze(&code, &[], 3, &[], &[]).is_none(), "{op:?}");
         }
     }
 
@@ -291,6 +315,7 @@ mod tests {
             }],
             3,
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(plan.lengths, vec![3]);
@@ -309,8 +334,26 @@ mod tests {
         let constants = [Constant::String {
             utf16: "length".encode_utf16().collect(),
         }];
-        assert!(analyze(&code, &constants, 3, &[]).is_none());
-        let plan = analyze(&code, &constants, 3, &[(1, 1)]).unwrap();
+        assert!(analyze(&code, &constants, 3, &[], &[]).is_none());
+        let plan = analyze(&code, &constants, 3, &[(1, 1)], &[]).unwrap();
         assert_eq!(plan.lengths, vec![2]);
+    }
+
+    #[test]
+    fn a_use_reached_only_by_a_throw_escapes() {
+        let code = body(&[
+            (Op::CollectArguments, &[R(0), R(0)]),
+            (Op::LoadNull, &[R(1)]),
+            (Op::ReturnValue, &[R(1)]),
+            (Op::ReturnValue, &[R(0)]),
+        ]);
+        let handler = ExceptionHandler {
+            start: 1,
+            end: 2,
+            target: 3,
+            exception: 2,
+        };
+        assert!(analyze(&code, &[], 3, &[], &[]).is_some());
+        assert!(analyze(&code, &[], 3, &[], &[handler]).is_none());
     }
 }

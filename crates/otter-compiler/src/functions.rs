@@ -483,20 +483,20 @@ pub(crate) fn compile_function_impl(
 
     let mut child = parent.pop();
     // No aliased formal, eval or suspension can observe hidden identity in
-    // this admitted family, and without exception handlers every edge is a
-    // normal successor. Alias/escape proof uses lowered register flow.
+    // this admitted family. Alias/escape proof uses lowered register flow,
+    // exception edges included.
     if needs_arguments
         && mapped_argument_bindings.is_empty()
         && !contains_direct_eval
         && !is_async
         && !is_generator
         && !is_async_generator
-        && child.handlers.is_empty()
         && let Some(plan) = crate::arguments_elision::analyze(
             &child.code,
             &module.borrow().constants,
             child.scratch_window(),
             &child.closure_ctx_patches,
+            &child.handlers,
         )
     {
         crate::arguments_elision::lower(&mut child.code, &plan);

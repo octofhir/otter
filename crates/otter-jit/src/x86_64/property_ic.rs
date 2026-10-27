@@ -131,6 +131,7 @@ pub(crate) fn emit_select_entry(
     if let Some(start) = start {
         let array = ops.new_dynamic_label();
         let native = ops.new_dynamic_label();
+        let class = ops.new_dynamic_label();
         let bag = ops.new_dynamic_label();
         let layout = view.closure_call_layout;
         let native_layout = view.native_call_layout;
@@ -144,6 +145,8 @@ pub(crate) fn emit_select_entry(
             ; je =>array
             ; cmp BYTE [Rq(receiver)], otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG as i8
             ; je =>native
+            ; cmp BYTE [Rq(receiver)], view.class_constructor_layout.type_tag as i8
+            ; je =>class
             ; cmp BYTE [Rq(receiver)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8
             ; jne =>miss
             ; movzx r10d, BYTE [Rq(receiver) + otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE as i32]
@@ -156,6 +159,10 @@ pub(crate) fn emit_select_entry(
         dynasm!(ops ; .arch x64
             ; and r11, Rq(receiver) ; add r10, r11
             ; mov Rd(start), [r10 + layout.own_props_byte as i32]
+            ; jmp =>bag
+            // A class's statics carry its [[Prototype]] chain.
+            ; =>class
+            ; mov Rd(start), [Rq(receiver) + view.class_constructor_layout.statics_byte as i32]
             ; jmp =>bag
             ; =>native
             ; test BYTE [Rq(receiver) + native_layout.flags_byte as i32],

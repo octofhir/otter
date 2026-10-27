@@ -3514,9 +3514,9 @@ impl<'a> Codegen<'a> {
     }
 
     /// `X(destination)` = the own-property bag of the closure or native
-    /// function `X(receiver)` whose named lookup starts there: the bag
-    /// exists, no `[[Prototype]]` override is installed and the default realm
-    /// is active. Anything else branches to `miss` before `X(destination)`
+    /// function `X(receiver)`, or the statics of the class constructor, whose
+    /// named lookup starts there: the bag exists, no `[[Prototype]]` override
+    /// is installed and the default realm is active. Anything else branches to `miss` before `X(destination)`
     /// changes. Clobbers x16 and x17.
     fn emit_function_bag(&mut self, receiver: u8, destination: u8, miss: DynamicLabel) {
         let layout = self.view.closure_call_layout;
@@ -3525,13 +3525,17 @@ impl<'a> Codegen<'a> {
             otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS
                 | otter_vm::closure::CLOSURE_LOOKUP_PROTO_OVERRIDE,
         );
+        let class = self.view.class_constructor_layout;
         let native_bag = self.ops.new_dynamic_label();
+        let class_statics = self.ops.new_dynamic_label();
         let bag = self.ops.new_dynamic_label();
         self.emit_cell_receiver(receiver, miss);
         dynasm!(self.ops ; .arch aarch64
             ; ldrb w16, [X(receiver)]
             ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
             ; b.eq =>native_bag
+            ; cmp w16, u32::from(class.type_tag)
+            ; b.eq =>class_statics
             ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
             ; b.ne =>miss
             ; ldrb w16, [X(receiver), otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE]
@@ -3543,6 +3547,9 @@ impl<'a> Codegen<'a> {
             ; and x17, X(receiver), #0xffff_ffff_0000_0000
             ; add x16, x17, x16
             ; ldr w16, [x16, layout.own_props_byte]
+            ; b =>bag
+            ; =>class_statics
+            ; ldr w16, [X(receiver), class.statics_byte]
             ; b =>bag
             ; =>native_bag
             ; ldrb w16, [X(receiver), native.flags_byte]

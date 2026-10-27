@@ -73,8 +73,9 @@ pub(crate) fn emit_array_expando(
 /// `X(entry)` addresses it on fall-through. An ordinary object's map is its
 /// shape. With `start` given, an Array selects the live expando's shape with
 /// `ArrayExpando`, and a closure or native function whose bag carries its own
-/// `[[Prototype]]` (bag present, no override, default realm active) selects
-/// that shape with `LookupStart`. `X(start)` receives the storage object,
+/// `[[Prototype]]` (bag present, no override, default realm active), or a
+/// class constructor's statics in the default realm, selects that shape with
+/// `LookupStart`. `X(start)` receives the storage object,
 /// including the receiver itself for an ordinary object. A megamorphic slot
 /// branches to `megamorphic`, anything else to
 /// `miss`. Clobbers `X(entry)`, `X(scratch)`, `x16`, `x17`.
@@ -133,6 +134,7 @@ pub(crate) fn emit_select_entry(
     if let Some(start) = start {
         let array = ops.new_dynamic_label();
         let native = ops.new_dynamic_label();
+        let class = ops.new_dynamic_label();
         let bag = ops.new_dynamic_label();
         let layout = view.closure_call_layout;
         let native_layout = view.native_call_layout;
@@ -146,6 +148,8 @@ pub(crate) fn emit_select_entry(
             ; b.eq =>array
             ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
             ; b.eq =>native
+            ; cmp w16, u32::from(view.class_constructor_layout.type_tag)
+            ; b.eq =>class
             ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
             ; b.ne =>miss
             ; ldrb w16, [X(receiver), otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE]
@@ -157,6 +161,10 @@ pub(crate) fn emit_select_entry(
             ; and x17, X(receiver), #0xffff_ffff_0000_0000
             ; add x16, x17, x16
             ; ldr W(start), [x16, layout.own_props_byte]
+            ; b =>bag
+            // A class's statics carry its [[Prototype]] chain.
+            ; =>class
+            ; ldr W(start), [X(receiver), view.class_constructor_layout.statics_byte]
             ; b =>bag
             ; =>native
             ; ldrb w16, [X(receiver), native_layout.flags_byte]

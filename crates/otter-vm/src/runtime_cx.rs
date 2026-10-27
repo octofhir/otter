@@ -2738,6 +2738,25 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         Some((kind, buffer, byte_offset, length))
     }
 
+    /// Append at most `limit` of the bytes a typed array covers to `out`;
+    /// the count appended, or `None` when `value` is not a typed array. A
+    /// detached or shrunk view covers no bytes past its current end.
+    pub fn append_typed_array_bytes(
+        &self,
+        value: Local<'_>,
+        out: &mut Vec<u8>,
+        limit: usize,
+    ) -> Option<usize> {
+        let heap = self.ctx.heap();
+        let typed = self.raw(value).as_typed_array(heap)?;
+        let base = typed.byte_offset(heap);
+        let count = typed.byte_length(heap).min(limit);
+        typed.buffer(heap).with_bytes(heap, |bytes| {
+            out.extend_from_slice(&bytes[base..base + count])
+        });
+        Some(count)
+    }
+
     /// Read DataView metadata and immediately park its backing buffer.
     #[must_use]
     pub fn data_view_info(&mut self, value: Local<'_>) -> Option<(Local<'scope>, usize, usize)> {
@@ -3335,12 +3354,22 @@ impl<'scope, 'rt> NativeScope<'scope, 'rt> {
         result.map_err(|error| self.vm_error(error, "NativeScope::set_callable"))
     }
 
-    /// Set an object's prototype; `None` installs a null prototype.
+    /// Set an object's or typed array's prototype; `None` installs a null
+    /// prototype.
     pub fn set_prototype(
         &mut self,
         object: Local<'_>,
         prototype: Option<Local<'_>>,
     ) -> Result<(), NativeError> {
+        let target = self.raw(object);
+        if target.as_typed_array(self.ctx.heap()).is_some() {
+            let prototype = prototype.map_or_else(Value::null, |prototype| self.raw(prototype));
+            self.ctx
+                .cx
+                .interp
+                .set_non_gc_exotic_prototype_override(&target, Some(prototype));
+            return Ok(());
+        }
         let result = self
             .ctx
             .cx

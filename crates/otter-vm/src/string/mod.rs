@@ -52,6 +52,7 @@ pub mod dispatch;
 pub(crate) mod exotic;
 pub mod gc_body;
 pub mod intrinsic;
+pub mod number_strings;
 pub mod ops;
 pub mod prototype;
 pub mod statics;

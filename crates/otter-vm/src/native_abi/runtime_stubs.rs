@@ -1921,6 +1921,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_REST_ARRAY_ALLOC.id => "rest_array_alloc",
         id if id == STUB_JIT_RECORD_CALL_TARGET.id => "jit_record_call_target",
         id if id == STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT.id => "jit_new_null_prototype_object",
+        id if id == STUB_NUMBER_TO_STRING_ALLOC.id => "number_to_string_alloc",
 
         _ => "unknown_runtime_stub",
     }
@@ -2310,6 +2311,19 @@ pub const STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT: RuntimeStubDescriptor = descriptor
     NativeResultDomain::Committed,
 );
 
+/// Allocating `ToString` of a Number: its cached decimal string, converted
+/// and cached on a miss.
+pub const STUB_NUMBER_TO_STRING_ALLOC: RuntimeStubDescriptor = descriptor(
+    130,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::AllocValue3,
+    3,
+    RuntimeStubEffects::allocating(true, false),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2441,6 +2455,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_REST_ARRAY_ALLOC,
     STUB_JIT_RECORD_CALL_TARGET,
     STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT,
+    STUB_NUMBER_TO_STRING_ALLOC,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

@@ -3,6 +3,7 @@
 //! # Contents
 //! - Scoped collecting concatenation over explicit Number/String operands,
 //!   placed for the calling instruction's allocation site.
+//! - A Number's decimal string through the isolate's cache.
 //! - Pure UTF-16 or numeric primitive ordering using canonical VM algorithms.
 //!
 //! # Invariants
@@ -33,6 +34,53 @@ pub extern "C" fn string_concat_alloc(
     site: u64,
 ) -> NativeResultPair {
     record_alloc_value_stub_result(ctx, concat(ctx, safepoint, [lhs, rhs, site]))
+}
+
+/// `(number, _, _)` as boxed words: the Number's decimal string from the
+/// isolate's cache, converted and cached on a miss. Any other value misses
+/// before an effect.
+#[must_use]
+pub extern "C" fn number_to_string_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    number: u64,
+    padding0: u64,
+    padding1: u64,
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
+        ctx,
+        number_to_string(ctx, safepoint, [number, padding0, padding1]),
+    )
+}
+
+fn number_to_string(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    bits: [u64; 3],
+) -> NativeResultPair {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    let Some(vm) = alloc_interpreter_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    let values = bits.map(Value::from_abi_bits);
+    if !values[0].is_number() {
+        return NativeResultPair::miss();
+    }
+    // SAFETY: exact current typed call packet and immutable safepoint remain
+    // published until the conversion's allocation ends.
+    let Ok(roots) = (unsafe { alloc_value_stub_call_roots(ctx, safepoint, values) }) else {
+        return NativeResultPair::miss();
+    };
+    let _roots = vm
+        .gc_heap
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    match vm.generated_number_string(roots.value(0)) {
+        Ok(string) => NativeResultPair::success(Value::string(string)),
+        Err(crate::VmError::OutOfMemory { .. }) => NativeResultPair::out_of_memory(),
+        Err(_) => NativeResultPair::miss(),
+    }
 }
 
 /// Placement of one concatenation at the site `value` names.

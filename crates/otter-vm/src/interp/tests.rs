@@ -1698,7 +1698,7 @@ fn call_method_number_to_string_builtin_fast_path() {
         .expect("string result")
         .to_lossy_string(interp.gc_heap());
     assert_eq!(result, "42");
-    assert!(interp.small_int_string_cache[42].is_some());
+    assert!(!interp.number_strings.small[42].is_undefined());
 }
 
 #[test]

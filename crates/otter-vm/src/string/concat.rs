@@ -23,20 +23,19 @@ use crate::{Interpreter, JsString, Value, VmError, conversion, number};
 
 impl Interpreter {
     /// Upper bound (exclusive) of the cached small-integer decimal strings.
-    pub(crate) const SMALL_INT_STRING_CACHE: i32 = 1024;
-
-    /// Entries of the direct-mapped number-string cache; a power of two.
-    pub(crate) const NUMBER_STRING_CACHE: usize = 1024;
+    pub(crate) const SMALL_INT_STRING_CACHE: i32 =
+        crate::string::number_strings::NUMBER_STRINGS_SMALL as i32;
 
     /// GC-traced cached decimal strings: the small integers' and the other
     /// recently converted numbers'.
     pub(crate) fn small_int_strings_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.small_int_string_cache.iter().flatten().chain(
-            self.number_string_cache
-                .iter()
-                .flatten()
-                .map(|(_, value)| value),
-        )
+        self.number_strings.strings()
+    }
+
+    /// Address of the number-string tables generated code reads.
+    #[must_use]
+    pub fn jit_number_strings_addr(&self) -> *const crate::string::number_strings::NumberStrings {
+        std::ptr::from_ref(&*self.number_strings)
     }
 
     /// Decimal text of `f`, through the number-string cache: a number
@@ -47,10 +46,10 @@ impl Interpreter {
         placement: SitePlacement,
     ) -> Result<JsString, VmError> {
         let bits = f.to_bits();
-        let index = ((bits ^ (bits >> 32)) as usize) & (Self::NUMBER_STRING_CACHE - 1);
-        if let Some((key, value)) = self.number_string_cache[index]
-            && key == bits
-            && let Some(string) = value.as_string(&self.gc_heap)
+        let index = crate::string::number_strings::number_string_index(bits);
+        let entry = self.number_strings.entries[index];
+        if entry.bits == bits
+            && let Some(string) = entry.string.as_string(&self.gc_heap)
         {
             return Ok(string);
         }
@@ -60,8 +59,23 @@ impl Interpreter {
         let string =
             JsString::from_latin1_at(&text[..len], &mut self.gc_heap, placement, &mut roots)
                 .map_err(crate::oom_to_vm)?;
-        self.number_string_cache[index] = Some((bits, Value::string(string)));
+        self.number_strings.entries[index] = crate::string::number_strings::NumberStringEntry {
+            bits,
+            string: Value::string(string),
+        };
         Ok(string)
+    }
+
+    /// Decimal string of a Number as generated code looks it up: an
+    /// int32-tagged small integer by value, every other Number by its bits.
+    pub(crate) fn generated_number_string(&mut self, value: Value) -> Result<JsString, VmError> {
+        if let Some(i) = value.as_i32()
+            && let Some(string) = self.small_int_string(i)?
+        {
+            return Ok(string);
+        }
+        let f = value.as_number().ok_or(VmError::InvalidOperand)?.as_f64();
+        self.cached_number_string(f, SitePlacement::Young(0))
     }
 
     /// Decimal string for a small non-negative integer, served from the
@@ -72,12 +86,12 @@ impl Interpreter {
         if !(0..Self::SMALL_INT_STRING_CACHE).contains(&i) {
             return Ok(None);
         }
-        if let Some(cached) = self.small_int_string_cache[i as usize] {
-            return Ok(cached.as_string(&self.gc_heap));
+        if let Some(cached) = self.number_strings.small[i as usize].as_string(&self.gc_heap) {
+            return Ok(Some(cached));
         }
         let s = number::ecma::number_to_string(f64::from(i), &mut self.gc_heap)
             .map_err(VmError::from)?;
-        self.small_int_string_cache[i as usize] = Some(Value::string(s));
+        self.number_strings.small[i as usize] = Value::string(s);
         Ok(Some(s))
     }
 

@@ -945,6 +945,12 @@ pub const STRING_CONCAT_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(string_concat_alloc),
 };
 
+/// ABI descriptor for a Number's cached decimal string.
+pub const NUMBER_TO_STRING_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: crate::native_abi::STUB_NUMBER_TO_STRING_ALLOC,
+    entry: Some(number_to_string_alloc),
+};
+
 /// ABI descriptor for guarded `Array(length)` allocation.
 pub const ARRAY_CONSTRUCT_ALLOC: AllocValueStub = AllocValueStub {
     descriptor: STUB_ARRAY_CONSTRUCT_ALLOC,
@@ -959,7 +965,7 @@ pub const REST_ARRAY_ALLOC: AllocValueStub = AllocValueStub {
 
 mod string;
 pub(crate) use string::primitive_string_order;
-pub use string::string_concat_alloc;
+pub use string::{number_to_string_alloc, string_concat_alloc};
 mod bigint;
 pub use bigint::bigint_binary_alloc;
 
@@ -1213,6 +1219,9 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_COLLECTION_MAP_DELETE_ALLOC.id => Some(COLLECTION_MAP_DELETE_ALLOC),
         id if id == STUB_COLLECTION_SET_DELETE_ALLOC.id => Some(COLLECTION_SET_DELETE_ALLOC),
         id if id == STUB_STRING_CONCAT_ALLOC.id => Some(STRING_CONCAT_ALLOC),
+        id if id == crate::native_abi::STUB_NUMBER_TO_STRING_ALLOC.id => {
+            Some(NUMBER_TO_STRING_ALLOC)
+        }
         id if id == crate::native_abi::STUB_ALLOC_GROUP_ENSURE.id => Some(ALLOC_GROUP_ENSURE),
         id if id == STUB_ARRAY_CONSTRUCT_ALLOC.id => Some(ARRAY_CONSTRUCT_ALLOC),
         id if id == STUB_REST_ARRAY_ALLOC.id => Some(REST_ARRAY_ALLOC),

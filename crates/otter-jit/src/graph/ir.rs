@@ -389,6 +389,9 @@ pub(crate) enum Kind {
 
     /// Number/String primitive addition with a collecting string miss.
     PrimitiveAdd,
+    /// `ToString` of a Number: its decimal string from the isolate's cache,
+    /// converted through a collecting miss.
+    NumberToString,
     /// A binary operator over two BigInts; any other operand exits.
     BigIntBinary(otter_vm::bigint::ops::Operator),
     /// Primitive Number/String order, including unordered numeric operands.
@@ -1170,6 +1173,7 @@ impl Kind {
             Self::PrimitiveCompare(_) => eager,
             Self::AllocationGroup(_)
             | Self::PrimitiveAdd
+            | Self::NumberToString
             | Self::BigIntBinary(_)
             | Self::NativeNewContext(_)
             | Self::CopyContext
@@ -1383,6 +1387,7 @@ impl Kind {
             Self::NewArrayWithLength => &[abi::STUB_ARRAY_CONSTRUCT_ALLOC],
             Self::NewRestArray(_) => &[abi::STUB_REST_ARRAY_ALLOC],
             Self::PrimitiveAdd => &[abi::STUB_STRING_CONCAT_ALLOC, abi::STUB_WRITE_BARRIER],
+            Self::NumberToString => &[abi::STUB_NUMBER_TO_STRING_ALLOC],
             Self::BigIntBinary(_) => &[abi::STUB_BIGINT_BINARY_ALLOC],
             Self::CallJs { .. } | Self::CallForward { .. } | Self::CallApplyArray { .. } => &[
                 abi::STUB_JIT_CALL,
@@ -1447,6 +1452,13 @@ impl Kind {
                 inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
                 result: ResultPolicy::Register,
                 gp_temps: 4,
+                fp_temps: 1,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::NumberToString => Constraints {
+                inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
+                result: ResultPolicy::Register,
+                gp_temps: 2,
                 fp_temps: 1,
                 fixed_gp_clobbers: SmallVec::new(),
             },

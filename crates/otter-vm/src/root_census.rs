@@ -180,7 +180,7 @@ impl Interpreter {
             }),
         );
         push(
-            "small_int_string_cache",
+            "number_strings",
             count(|v| {
                 for value in self.small_int_strings_for_trace() {
                     value.trace_value_slots(v);

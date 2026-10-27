@@ -467,7 +467,7 @@ impl CodeBlock {
             array_layout: crate::jit::JitArrayLayout::default(),
             typed_array_length: crate::jit::JitTypedArrayLengthLayout::default(),
             element_accesses: rustc_hash::FxHashMap::default(),
-            keyed_symbol_atoms: rustc_hash::FxHashMap::default(),
+            keyed_names: rustc_hash::FxHashMap::default(),
             symbol_layout: crate::jit::JitSymbolLayout::current(),
             array_iteration: None,
             unseen_element_sites: rustc_hash::FxHashSet::default(),

@@ -1527,16 +1527,16 @@ impl Interpreter {
                                 );
                             }
                         }
-                        // A symbol key read from an ordinary object goes through
-                        // the site's cache bound to that symbol.
+                        // A symbol or integer index read from an ordinary object
+                        // goes through the site's cache bound to that key.
                         if let (Some(recv_reg), Some(key_reg)) =
                             (function.register(instr, 1), function.register(instr, 2))
                             && let (Ok(&recv), Ok(&key)) = (
                                 read_register(&(*top_frame!()), recv_reg),
                                 read_register(&(*top_frame!()), key_reg),
                             )
-                            && key.is_symbol()
-                            && let Some(value) = self.keyed_symbol_load(
+                            && (key.is_symbol() || key.as_i32().is_some_and(|index| index >= 0))
+                            && let Some(value) = self.keyed_name_load(
                                 context,
                                 function_id,
                                 instr.instruction_pc,
@@ -1780,8 +1780,10 @@ impl Interpreter {
                                 frame.read(src_reg)?,
                             )
                         };
-                        if key.is_symbol() {
-                            match self.keyed_symbol_store(
+                        if (key.is_symbol() || key.as_i32().is_some_and(|index| index >= 0))
+                            && receiver.as_object().is_some()
+                        {
+                            match self.keyed_name_store(
                                 stack,
                                 context,
                                 function_id,

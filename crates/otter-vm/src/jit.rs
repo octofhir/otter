@@ -769,10 +769,10 @@ pub struct JitCompileSnapshot {
     /// layout never reaches the emitter, so a second element-bearing family
     /// costs a declaration.
     pub element_accesses: rustc_hash::FxHashMap<u32, JitElementAccess>,
-    /// Element sites whose cache serves one symbol key, by byte PC: the
-    /// symbol's atom. Their named programs are in `property_programs`; a
-    /// generated access proves the key's atom first.
-    pub keyed_symbol_atoms: rustc_hash::FxHashMap<u32, u32>,
+    /// Element sites whose cache serves one name key, by byte PC. Their
+    /// named programs are in `property_programs`; a generated access proves
+    /// the key is that name first.
+    pub keyed_names: rustc_hash::FxHashMap<u32, JitKeyedName>,
     /// Where a symbol body keeps its atom, for that proof.
     pub symbol_layout: JitSymbolLayout,
     /// The active realm's Array iteration proof, when the function opens or
@@ -1838,6 +1838,22 @@ pub struct JitMethodTarget {
     pub inline_fields: Option<JitMethodInlineFields>,
 }
 
+/// The one name key an element site's named programs serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitKeyedName {
+    /// A symbol, by the atom its body keys hidden-class slots by.
+    Symbol {
+        /// The symbol's atom.
+        atom: u32,
+    },
+    /// An integer index an ordinary object keys a named slot by; the key is
+    /// that int32.
+    Index {
+        /// The index.
+        index: i32,
+    },
+}
+
 /// A symbol body's type tag and the offset of the atom it keys hidden-class
 /// slots by.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2486,7 +2502,7 @@ impl JitCompileSnapshot {
             array_layout: JitArrayLayout::default(),
             typed_array_length: JitTypedArrayLengthLayout::default(),
             element_accesses: rustc_hash::FxHashMap::default(),
-            keyed_symbol_atoms: rustc_hash::FxHashMap::default(),
+            keyed_names: rustc_hash::FxHashMap::default(),
             symbol_layout: JitSymbolLayout::current(),
             array_iteration: None,
             unseen_element_sites: rustc_hash::FxHashSet::default(),

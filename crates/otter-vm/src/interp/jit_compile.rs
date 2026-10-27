@@ -649,7 +649,7 @@ impl Interpreter {
         self.bake_instanceof_cells(&mut snapshot);
         self.bake_forward_apply(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
-        self.bake_keyed_symbol_sites(&mut snapshot);
+        self.bake_keyed_name_sites(&mut snapshot);
         Self::bake_context_allocations(&mut snapshot);
         self.bake_closure_allocations(&mut snapshot, context);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
@@ -1103,7 +1103,7 @@ impl Interpreter {
         self.bake_guarded_method_calls(&mut view);
         self.bake_forward_apply(&mut view);
         self.bake_element_accesses(&mut view);
-        self.bake_keyed_symbol_sites(&mut view);
+        self.bake_keyed_name_sites(&mut view);
         Self::bake_context_allocations(&mut view);
         self.bake_closure_allocations(&mut view, context);
         self.bake_field_type_tree(&mut view);
@@ -1770,8 +1770,9 @@ impl Interpreter {
     }
 
     /// Export the named programs of each element site whose cache serves one
-    /// symbol key, with that symbol's atom, which the generated access proves.
-    pub(crate) fn bake_keyed_symbol_sites(&mut self, view: &mut jit::JitCompileSnapshot) {
+    /// name key, with that key, which the generated access proves: a symbol
+    /// by its atom, an integer index by its value.
+    pub(crate) fn bake_keyed_name_sites(&mut self, view: &mut jit::JitCompileSnapshot) {
         let sites: Vec<_> = view
             .instructions
             .iter()
@@ -1796,6 +1797,18 @@ impl Interpreter {
             let Some(atom) = slot.native().keyed_atom() else {
                 continue;
             };
+            let names = crate::isolate_names::names(&self.gc_heap);
+            let name = match names.spelling(crate::property_atom::AtomId::from_global(atom)) {
+                None => jit::JitKeyedName::Symbol { atom },
+                Some(spelling) => {
+                    let Some(index) = crate::object::array_index_property_name(spelling)
+                        .and_then(|index| i32::try_from(index).ok())
+                    else {
+                        continue;
+                    };
+                    jit::JitKeyedName::Index { index }
+                }
+            };
             let programs = slot
                 .jit_programs(
                     atom,
@@ -1815,7 +1828,7 @@ impl Interpreter {
                 },
             );
             view.property_programs.insert(byte_pc, programs);
-            view.keyed_symbol_atoms.insert(byte_pc, atom);
+            view.keyed_names.insert(byte_pc, name);
         }
     }
 
@@ -2762,7 +2775,7 @@ impl Interpreter {
             self.bake_instanceof_cells(&mut body);
             self.bake_forward_apply(&mut body);
             self.bake_element_accesses(&mut body);
-            self.bake_keyed_symbol_sites(&mut body);
+            self.bake_keyed_name_sites(&mut body);
             Self::bake_context_allocations(&mut body);
             self.bake_closure_allocations(&mut body, context);
             if tier == jit_debug::JitDebugTier::Optimizing {

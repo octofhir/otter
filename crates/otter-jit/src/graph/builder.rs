@@ -5314,11 +5314,30 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// An element site whose cache serves one symbol key reads it as a named
-    /// load does, after proving the key is that symbol.
-    fn keyed_symbol_load(&mut self, instruction: &Instruction) -> bool {
+    /// Prove the key in `register` is `name`: a symbol by its atom, an index
+    /// by its int32 bits, which a constant key already is.
+    fn check_keyed_name(&mut self, register: u16, name: otter_vm::jit::JitKeyedName) {
+        let key = self.read(register);
+        let key = self.tagged(key);
+        match name {
+            otter_vm::jit::JitKeyedName::Symbol { atom } => {
+                self.add(Kind::CheckSymbolAtom(atom), &[key], Repr::None);
+            }
+            otter_vm::jit::JitKeyedName::Index { index } => {
+                let bits = otter_vm::Value::number_i32(index).to_bits();
+                if !matches!(self.graph.node(key).kind, Kind::ConstTagged(constant) if constant == bits)
+                {
+                    self.add(Kind::CheckTaggedBits(bits), &[key], Repr::None);
+                }
+            }
+        }
+    }
+
+    /// An element site whose cache serves one name key reads it as a named
+    /// load does, after proving the key is that name.
+    fn keyed_name_load(&mut self, instruction: &Instruction) -> bool {
         let byte_pc = instruction.byte_pc;
-        let Some(&atom) = self.view.keyed_symbol_atoms.get(&byte_pc) else {
+        let Some(&name) = self.view.keyed_names.get(&byte_pc) else {
             return false;
         };
         if self.exited_for(ExitReason::ShapeGuard) || self.exited_for(ExitReason::IdentityGuard) {
@@ -5331,19 +5350,17 @@ impl<'a> Builder<'a> {
         {
             return false;
         }
-        let key = self.read(instruction.reads[1]);
-        let key = self.tagged(key);
-        self.add(Kind::CheckSymbolAtom(atom), &[key], Repr::None);
+        self.check_keyed_name(instruction.reads[1], name);
         let value = self.named_lookup(byte_pc, receiver);
         self.write(instruction.writes[0], value);
         true
     }
 
-    /// An element site whose cache serves one symbol key writes it as a
-    /// named store does, after proving the key is that symbol.
-    fn keyed_symbol_store(&mut self, instruction: &Instruction) -> bool {
+    /// An element site whose cache serves one name key writes it as a named
+    /// store does, after proving the key is that name.
+    fn keyed_name_store(&mut self, instruction: &Instruction) -> bool {
         let byte_pc = instruction.byte_pc;
-        let Some(&atom) = self.view.keyed_symbol_atoms.get(&byte_pc) else {
+        let Some(&name) = self.view.keyed_names.get(&byte_pc) else {
             return false;
         };
         if self.exited_for(ExitReason::ShapeGuard) || self.exited_for(ExitReason::IdentityGuard) {
@@ -5352,15 +5369,13 @@ impl<'a> Builder<'a> {
         if super::feedback::named_store_programs(self.view, byte_pc).is_none() {
             return false;
         }
-        let key = self.read(instruction.reads[1]);
-        let key = self.tagged(key);
-        self.add(Kind::CheckSymbolAtom(atom), &[key], Repr::None);
+        self.check_keyed_name(instruction.reads[1], name);
         self.visit_store_property_regs(instruction, instruction.reads[0], instruction.reads[2]);
         true
     }
 
     fn visit_load_element(&mut self, instruction: &Instruction) {
-        if self.keyed_symbol_load(instruction) {
+        if self.keyed_name_load(instruction) {
             return;
         }
         let access = match self.element_access(instruction) {
@@ -5455,7 +5470,7 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_store_element(&mut self, instruction: &Instruction) {
-        if self.keyed_symbol_store(instruction) {
+        if self.keyed_name_store(instruction) {
             return;
         }
         let access = match self.element_access(instruction) {

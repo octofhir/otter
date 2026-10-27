@@ -825,6 +825,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::CheckNative(0, DeoptReason::WrongValue),
         Kind::CheckArgumentsElided,
         Kind::CheckSymbolAtom(0),
+        Kind::CheckTaggedBits(0),
         Kind::LoadArgumentCount,
         Kind::LoadActualArgument,
         Kind::SelectArgument { count: 1 },
@@ -1025,6 +1026,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::CheckNative(..)
         | K::CheckArgumentsElided
         | K::CheckSymbolAtom(_)
+        | K::CheckTaggedBits(_)
         | K::CheckStackHeadroom
         | K::LoadArgumentCount
         | K::LoadActualArgument

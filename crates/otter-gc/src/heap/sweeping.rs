@@ -216,6 +216,11 @@ impl GcHeap {
             row.live_bytes = cycle.totals.live_bytes[tag];
             row.live_count = cycle.totals.live_count[tag];
         }
+        self.rows_live_bytes = cycle
+            .totals
+            .live_bytes
+            .iter()
+            .fold(0usize, |sum, &bytes| sum.wrapping_add(bytes));
         if let Some(before) = cycle.limits {
             self.recompute_allocation_limits(cycle.pause_start, cycle.pause_end, before);
         }

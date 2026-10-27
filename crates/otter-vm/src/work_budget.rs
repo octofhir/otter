@@ -361,7 +361,7 @@ impl RuntimeHeapSnapshot {
     pub(crate) fn from_heap(heap: &mut GcHeap) -> Self {
         // Counters only: a checkpoint runs every turn and must not complete
         // a lazy sweep the way a full statistics read does.
-        let heap_stats = heap.stats();
+        let (tracked_heap_bytes, external_reserved_bytes) = heap.byte_counters();
         let (allocated_objects_total, allocated_bytes_total, live_bytes) =
             heap.allocation_counters();
         let (gc_cycles, minor_gc_cycles, minor_slots_scanned) = heap.collection_counters();
@@ -369,8 +369,8 @@ impl RuntimeHeapSnapshot {
             allocated_objects_total,
             allocated_bytes_total,
             live_bytes: u64::try_from(live_bytes).unwrap_or(u64::MAX),
-            tracked_heap_bytes: heap_stats.tracked_bytes,
-            external_reserved_bytes: heap_stats.reserved_bytes,
+            tracked_heap_bytes,
+            external_reserved_bytes,
             // Full collections have no cumulative visited-slot counter yet;
             // give each cycle a fixed base cost. Minor collections expose the
             // exact slot walk, plus a fixed cycle cost for root processing.

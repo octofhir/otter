@@ -96,10 +96,18 @@ impl Interpreter {
         }
     }
 
+    /// An observing budget never checks: callers on every native call and
+    /// RegExp search pay one test, not a call.
+    #[inline]
     fn poll_work_budget_checkpoint(&mut self) -> Result<WorkBudgetCheckpoint, VmError> {
         if !self.work_budget.enforces_on_exceedance() {
             return Ok(WorkBudgetCheckpoint::Continue);
         }
+        self.poll_enforced_work_budget_checkpoint()
+    }
+
+    #[inline(never)]
+    fn poll_enforced_work_budget_checkpoint(&mut self) -> Result<WorkBudgetCheckpoint, VmError> {
         let Some(started_at) = self.work_budget_slice_started_at else {
             return Ok(WorkBudgetCheckpoint::Continue);
         };
@@ -171,6 +179,7 @@ impl Interpreter {
         self.work_budget_heap_start = Some(RuntimeHeapSnapshot::from_heap(&mut self.gc_heap));
     }
 
+    #[inline]
     pub(crate) fn enforce_work_budget_checkpoint(&mut self) -> Result<(), VmError> {
         if self.poll_work_budget_checkpoint()? == WorkBudgetCheckpoint::Yield {
             self.rotate_work_budget_slice();
@@ -218,6 +227,7 @@ impl Interpreter {
     /// Charge one completed RegExp engine attempt to the current root turn.
     /// The matcher itself is synchronous, so this checkpoint runs immediately
     /// after it returns and before any result becomes JavaScript-visible.
+    #[inline]
     pub(crate) fn charge_regex_backtrack_steps(&mut self, steps: u64) -> Result<(), VmError> {
         self.work_budget_stats.record_regex_backtrack_steps(steps);
         self.enforce_work_budget_checkpoint()

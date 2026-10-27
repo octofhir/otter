@@ -208,12 +208,90 @@ impl Regex {
         scratch: &mut MatchScratch,
         out: &mut Vec<u32>,
     ) -> (Result<bool, ExecError>, u64) {
+        if let Some(found) = self.native_once_into(text, start, anchored, config, scratch, out) {
+            return found;
+        }
         let mut matches = self.find_units(text, start, config, std::mem::take(scratch));
         matches.anchored = anchored;
         let found = matches.first_offsets(out);
         let steps = matches.steps_executed;
         *scratch = matches.into_scratch();
         (found, steps)
+    }
+
+    /// [`Self::first_offsets_into`] of a search the program's machine code
+    /// decides with one window: a sticky search, or a start-anchored program.
+    /// `None` when another execution owns the search (a complete literal,
+    /// no machine code, or several candidate starts). It selects the window
+    /// [`Matches::advance_native_once`] would and runs it over the scratch
+    /// buffers in place.
+    #[inline]
+    fn native_once_into<U: Unit>(
+        &self,
+        text: &[U],
+        start: usize,
+        anchored: bool,
+        config: ExecConfig,
+        scratch: &mut MatchScratch,
+        out: &mut Vec<u32>,
+    ) -> Option<(Result<bool, ExecError>, u64)> {
+        let program = &self.program;
+        if !(anchored || program.start_anchored)
+            || program
+                .required_literal
+                .as_ref()
+                .is_some_and(|lit| lit.is_complete())
+        {
+            return None;
+        }
+        let code = self.native.code::<U>(program)?;
+        code.prepare();
+        let pos = search_start(text, start, program.unicode);
+        let admitted = if anchored {
+            pos <= text.len()
+                && !(program.start_anchored && pos > 0)
+                && program.prefilter.as_ref().is_none_or(|pf| {
+                    pos < text.len() && pf.cp_may_start(decode_at(text, pos, program.unicode).0)
+                })
+        } else {
+            pos == 0
+                && program
+                    .prefilter
+                    .as_ref()
+                    .is_none_or(|pf| pos < text.len() && pf.cp_may_start(text[pos].into()))
+        };
+        if !admitted {
+            return Some((Ok(false), 0));
+        }
+        let buffers = scratch.0.get_or_insert_with(Box::default);
+        let mut budget = config.step_limit;
+        let outcome = native::search(
+            code,
+            program,
+            text,
+            Window {
+                start: pos,
+                end: pos,
+                filter: false,
+            },
+            &mut budget,
+            &mut buffers.native,
+        );
+        let steps = config.step_limit - budget;
+        let found = match outcome {
+            Outcome::Match => {
+                let count = program.capture_slot_count();
+                Slots::Encoded(&buffers.native.captures()[..count]).write_offsets(out);
+                (Ok(true), steps)
+            }
+            Outcome::Exhausted(_) => (Ok(false), steps),
+            // The interpreter counts the step that overran the budget.
+            Outcome::StepLimit => (Err(ExecError::StepLimitExceeded), steps.saturating_add(1)),
+        };
+        if buffers.native.is_oversized() {
+            *scratch = MatchScratch::default();
+        }
+        Some(found)
     }
 
     #[inline]
@@ -421,6 +499,62 @@ impl<U: Unit> Matches<'_, '_, U> {
         }
     }
 
+    /// [`Self::advance_native`] of a search with a single candidate start: a
+    /// sticky search tries only where it stands and a start-anchored program
+    /// only offset 0, so one window decides it, without the scan state the
+    /// general loop keeps.
+    #[inline(never)]
+    fn advance_native_once(&mut self, code: &NativeCode) -> Option<Result<(), ExecError>> {
+        let program = &self.regex.program;
+        let pos = self.next_start;
+        let admitted = if self.anchored {
+            self.may_start_at(pos)
+        } else {
+            pos == 0
+                && program.prefilter.as_ref().is_none_or(|pf| {
+                    pos < self.text.len() && pf.cp_may_start(self.text[pos].into())
+                })
+        };
+        self.done = true;
+        if !admitted {
+            return None;
+        }
+        let window = Window {
+            start: pos,
+            end: pos,
+            filter: false,
+        };
+        let remaining = self.config.step_limit.saturating_sub(self.steps_executed);
+        let mut budget = remaining;
+        let outcome = native::search(
+            code,
+            program,
+            self.text,
+            window,
+            &mut budget,
+            &mut self.scratch.native,
+        );
+        self.steps_executed = self.steps_executed.saturating_add(remaining - budget);
+        match outcome {
+            Outcome::Match => {
+                let range = self.current_slots().range();
+                self.next_start = if range.end > range.start {
+                    range.end
+                } else {
+                    range.start + 1
+                };
+                self.done = false;
+                Some(Ok(()))
+            }
+            Outcome::Exhausted(_) => None,
+            // The interpreter counts the step that overran the budget.
+            Outcome::StepLimit => {
+                self.steps_executed = self.steps_executed.saturating_add(1);
+                Some(Err(ExecError::StepLimitExceeded))
+            }
+        }
+    }
+
     /// The next match by the program's machine code: the leftmost search
     /// picks candidate windows exactly as the interpreter's loop picks
     /// candidates, and the code runs each window.
@@ -585,6 +719,9 @@ impl<U: Unit> Matches<'_, '_, U> {
         }
         match self.execution {
             Execution::Literal(literal) => self.advance_literal(literal),
+            Execution::Native(code) if self.anchored || self.regex.program.start_anchored => {
+                self.advance_native_once(code)
+            }
             Execution::Native(code) => self.advance_native(code),
             Execution::Interpreted => self.advance_interpreted(),
         }

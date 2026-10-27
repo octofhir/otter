@@ -272,17 +272,14 @@ pub(crate) fn exec_direct(
     test: bool,
 ) -> Option<Result<DirectExec, crate::VmError>> {
     let regexp = receiver.as_regexp()?;
-    let heap = &interp.gc_heap;
-    let text = input.as_string(heap)?;
-    if !text.is_contiguous(heap) {
+    let text = input.as_string(&interp.gc_heap)?.handle();
+    // One read of the RegExp body decides admission and the start.
+    let state = regexp.exec_state(&interp.gc_heap);
+    let last_index = state.last_index.as_i32()?;
+    if last_index < 0 || !state.last_index_writable {
         return None;
     }
-    let last_index = regexp.last_index_value(heap).as_i32()?;
-    if last_index < 0 || !regexp.last_index_writable(heap) {
-        return None;
-    }
-    let flags = regexp.flags(heap);
-    let tracks_last_index = flags.global || flags.sticky;
+    let tracks_last_index = state.flags.global || state.flags.sticky;
     let start = if tracks_last_index {
         last_index as usize
     } else {
@@ -293,16 +290,21 @@ pub(crate) fn exec_direct(
     } else {
         Value::NULL
     };
-    if start > text.len() as usize {
-        regexp.set_last_index(heap, 0);
-        return Some(Ok(DirectExec::Done(missed)));
-    }
     let mut offsets = std::mem::take(&mut interp.regexp_offsets);
-    let heap = &interp.gc_heap;
-    let search = interp.regex_search();
-    let execution = text.with_code_units(heap, |units| {
+    let execution = {
+        let heap = &interp.gc_heap;
+        let Some(units) = crate::string::gc_body::contiguous_code_units(heap, text) else {
+            interp.regexp_offsets = offsets;
+            return None;
+        };
+        if start > units.len() {
+            interp.regexp_offsets = offsets;
+            regexp.set_last_index(heap, 0);
+            return Some(Ok(DirectExec::Done(missed)));
+        }
+        let search = interp.regex_search();
         regexp.find_first_offsets(heap, units, start, &search, &mut offsets)
-    });
+    };
     let offsets = crate::regexp::engine::MatchOffsets(offsets);
     if let Err(error) = interp.charge_regex_backtrack_steps(execution.steps) {
         interp.recycle_match_offsets(offsets);
@@ -325,7 +327,7 @@ pub(crate) fn exec_direct(
     if tracks_last_index {
         regexp.set_last_index(heap, offsets.range().end as u32);
     }
-    if regexp.legacy_features_enabled(heap) {
+    if state.legacy_features_enabled {
         interp.regexp_legacy.record_offsets(input, &offsets);
     }
     Some(Ok(if test {

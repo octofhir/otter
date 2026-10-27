@@ -1337,6 +1337,23 @@ impl CodeUnits<'_> {
     }
 }
 
+/// The units of a contiguous body (a sequential one, or a slice of one),
+/// borrowed from the heap; `None` for a rope or an unflattened slice.
+#[inline]
+pub(crate) fn contiguous_code_units(
+    heap: &GcHeap,
+    string: JsStringHandle,
+) -> Option<CodeUnits<'_>> {
+    let (target, start, len) = contiguous_view(heap, string)?;
+    // SAFETY: the body lives in the heap, which the borrow keeps unchanged.
+    let body: &JsStringBody =
+        heap.read_payload(target, |body| unsafe { &*std::ptr::from_ref(body) });
+    Some(match flat_content_range(body, start, len)? {
+        FlatContent::Latin1(bytes) => CodeUnits::Latin1(bytes),
+        FlatContent::Wide(units) => CodeUnits::Utf16(units),
+    })
+}
+
 /// Run `f` over the string's code units at their stored width.
 ///
 /// A contiguous body — flat, a collapsed slice, or one with a filled widened

@@ -43,11 +43,15 @@ impl Slots<'_> {
                 // Every slot is an offset below `u32::MAX` or [`NONE`], whose
                 // low half is [`NO_OFFSET`]; a group the matcher closed
                 // without opening reads as absent from its start.
-                out.extend(slots.iter().map(|&slot| slot as u32));
-                for pair in out.as_chunks_mut::<2>().0 {
-                    if pair[1] == NO_OFFSET {
-                        pair[0] = NO_OFFSET;
-                    }
+                out.reserve(slots.len());
+                for pair in slots.as_chunks::<2>().0 {
+                    let end = pair[1] as u32;
+                    out.push(if end == NO_OFFSET {
+                        NO_OFFSET
+                    } else {
+                        pair[0] as u32
+                    });
+                    out.push(end);
                 }
             }
             Self::Interpreted(slots) => {

@@ -159,14 +159,13 @@ fn native_call(
     {
         return Ok(keys);
     }
-    let context = ctx.execution_context().cloned();
+    // The caller's context outlives this call; no per-call clone.
+    let context = ctx.context_ref();
 
     // Accessor-aware spec helpers route through the shared
     // `do_object_*` paths whenever an ExecutionContext is available;
     // the operands dispatcher uses the same helpers.
-    let coerced_args: Option<smallvec::SmallVec<[Value; 4]>> = if let Some(context) =
-        context.as_ref()
-    {
+    let coerced_args: Option<smallvec::SmallVec<[Value; 4]>> = if let Some(context) = context {
         use otter_bytecode::method_id::ObjectMethod as M;
         match method {
             M::Create => {
@@ -252,14 +251,14 @@ fn native_call(
     // Function / Proxy spec ladders go first so they observe the
     // canonical descriptor / trap behaviour.
     let function_result = ctx.with_turn_parts(|interp, stack| {
-        interp.try_function_object_static_call(stack, context.as_ref(), method, args)
+        interp.try_function_object_static_call(stack, context, method, args)
     });
     if let Some(result) =
         function_result.map_err(|err| err.into_native(ctx.cx.interp, method.name()))?
     {
         return Ok(result);
     }
-    if let Some(context) = context.as_ref() {
+    if let Some(context) = context {
         let proxy_result = ctx.with_turn_parts(|interp, stack| {
             interp.try_proxy_object_static_call(stack, context, method, args)
         });
@@ -274,7 +273,7 @@ fn native_call(
     // enumeration, string-exotic indexed slots, …) lives in the
     // operand-dispatcher helper. Reuse the current turn's exact activation
     // stack so nested calls and allocation root walks share one owner.
-    if let Some(context) = context.as_ref() {
+    if let Some(context) = context {
         let static_result = ctx.cx.with_parts(|interp, stack| {
             interp.object_static_call_stack_rooted(context, stack, method, args)
         });

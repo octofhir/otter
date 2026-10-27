@@ -1,7 +1,8 @@
 //! Scoped arithmetic's primitive concat formatting and cache owner.
 //!
 //! # Contents
-//! - Traced small-integer string cache and canonical primitive conversion.
+//! - Traced small-integer and number string caches and canonical primitive
+//!   conversion.
 //! - One-result short Latin-1/int32 concatenation without a temporary string.
 //! - Allocation-site placement of the strings one concatenation creates.
 //!
@@ -10,8 +11,8 @@
 //! into fixed stack storage before allocation; its integer input cannot move.
 //! The general caller keeps every string operand in its handle arena.
 //! Every string a concatenation creates for its result, including a number's
-//! decimal text, takes the site's placement; cached small-integer strings are
-//! shared and keep theirs.
+//! decimal text, takes the site's placement; cached number strings are shared
+//! and keep the placement of the conversion that made them.
 //!
 //! # See also
 //! - `crate::runtime_stubs::string` owns compiled collecting root publication.
@@ -24,9 +25,43 @@ impl Interpreter {
     /// Upper bound (exclusive) of the cached small-integer decimal strings.
     pub(crate) const SMALL_INT_STRING_CACHE: i32 = 1024;
 
-    /// GC-traced cached small-integer decimal strings.
+    /// Entries of the direct-mapped number-string cache; a power of two.
+    pub(crate) const NUMBER_STRING_CACHE: usize = 1024;
+
+    /// GC-traced cached decimal strings: the small integers' and the other
+    /// recently converted numbers'.
     pub(crate) fn small_int_strings_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.small_int_string_cache.iter().flatten()
+        self.small_int_string_cache.iter().flatten().chain(
+            self.number_string_cache
+                .iter()
+                .flatten()
+                .map(|(_, value)| value),
+        )
+    }
+
+    /// Decimal text of `f`, through the number-string cache: a number
+    /// converted again while its entry stands reuses that string.
+    fn cached_number_string(
+        &mut self,
+        f: f64,
+        placement: SitePlacement,
+    ) -> Result<JsString, VmError> {
+        let bits = f.to_bits();
+        let index = ((bits ^ (bits >> 32)) as usize) & (Self::NUMBER_STRING_CACHE - 1);
+        if let Some((key, value)) = self.number_string_cache[index]
+            && key == bits
+            && let Some(string) = value.as_string(&self.gc_heap)
+        {
+            return Ok(string);
+        }
+        let mut text = [0u8; number::ecma::ECMA_BUF_LEN];
+        let len = number::ecma::f64_to_ecma_string_buf(f, &mut text);
+        let mut roots = crate::string::no_extra_roots;
+        let string =
+            JsString::from_latin1_at(&text[..len], &mut self.gc_heap, placement, &mut roots)
+                .map_err(crate::oom_to_vm)?;
+        self.number_string_cache[index] = Some((bits, Value::string(string)));
+        Ok(string)
     }
 
     /// Decimal string for a small non-negative integer, served from the
@@ -65,16 +100,7 @@ impl Interpreter {
             {
                 return Ok(s);
             }
-            let mut text = [0u8; number::ecma::ECMA_BUF_LEN];
-            let len = number::ecma::f64_to_ecma_string_buf(f, &mut text);
-            let mut roots = crate::string::no_extra_roots;
-            return JsString::from_latin1_at(
-                &text[..len],
-                &mut self.gc_heap,
-                placement,
-                &mut roots,
-            )
-            .map_err(crate::oom_to_vm);
+            return self.cached_number_string(f, placement);
         }
         conversion::to_js_string_primitive(&value, self.gc_heap_mut())
     }

@@ -851,6 +851,11 @@ pub struct Interpreter {
     /// entries are traced from [`RuntimeState::trace_roots`] so a moving
     /// collection rewrites them.
     small_int_string_cache: Box<[Option<Value>]>,
+    /// Decimal text of other numbers recently converted for concatenation,
+    /// by their bits in a direct-mapped table of
+    /// [`Interpreter::NUMBER_STRING_CACHE`] entries: code that keeps joining
+    /// the same number converts it once. Traced like the small-integer cache.
+    number_string_cache: Box<[Option<(u64, Value)>]>,
     /// Prepared bytecode callback metadata for native loops that repeatedly
     /// call the same JS function. Entries are a strict stack: acquisition
     /// pushes the exact callable and scalar closure state, release pops it.

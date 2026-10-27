@@ -213,6 +213,8 @@ impl PropertyStorageProjection {
 const STATE_COUNT_MASK: u32 = 0xff;
 const STATE_ATTEMPTED: u32 = 1 << 8;
 const STATE_MEGAMORPHIC: u32 = 1 << 9;
+/// An element site's cache serves the one name key its `atom` holds.
+const STATE_KEYED_BOUND: u32 = 1 << 13;
 const STATE_LENGTH_NON_ARRAY: u32 = 1 << 10;
 const STATE_LENGTH_NON_TYPED_ARRAY: u32 = 1 << 11;
 const STATE_LENGTH_NON_STRING: u32 = 1 << 12;
@@ -853,6 +855,44 @@ impl PropertyIcSlot {
     #[must_use]
     pub(crate) fn entry_count(&self) -> usize {
         (self.state() & STATE_COUNT_MASK) as usize
+    }
+
+    /// Bind an element site's cache to the one name key it serves, by atom:
+    /// the first key binds it, the same key keeps it, and any other leaves
+    /// the site megamorphic with no entries, which are keyed by shape alone.
+    /// Whether the site still serves `atom` from its own entries.
+    pub(crate) fn bind_keyed_atom(&self, atom: u32) -> bool {
+        let state = self.state();
+        if state & STATE_MEGAMORPHIC != 0 {
+            return false;
+        }
+        if state & STATE_KEYED_BOUND == 0 {
+            self.atom.store(atom, Ordering::Relaxed);
+            self.state
+                .store(state | STATE_KEYED_BOUND, Ordering::Relaxed);
+            return true;
+        }
+        if self.atom.load(Ordering::Relaxed) == atom {
+            return true;
+        }
+        for entry in self.live() {
+            entry.clear();
+        }
+        self.state.store(
+            (state & !STATE_COUNT_MASK) | STATE_MEGAMORPHIC,
+            Ordering::Relaxed,
+        );
+        self.refresh_inline();
+        self.disables.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    /// The name key an element site's cache serves, while it serves one.
+    #[must_use]
+    pub(crate) fn keyed_atom(&self) -> Option<u32> {
+        let state = self.state();
+        (state & STATE_KEYED_BOUND != 0 && state & STATE_MEGAMORPHIC == 0)
+            .then(|| self.atom.load(Ordering::Relaxed))
     }
 
     /// Whether the site overflowed into the shared table.

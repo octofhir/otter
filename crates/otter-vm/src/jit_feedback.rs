@@ -450,6 +450,12 @@ impl TypedFeedbackSlot {
             Op::StoreProperty | Op::StorePropertyStrict => {
                 Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Store)))
             }
+            // An element site keeps a named cache for the one symbol key it
+            // may serve.
+            Op::LoadElement => Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Load))),
+            Op::StoreElement | Op::StoreElementStrict => {
+                Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Store)))
+            }
             Op::CallMethodValue => Self::Method(
                 Box::new(PropertyIcSlot::new(PropertyIcKind::Load)),
                 Box::default(),

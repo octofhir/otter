@@ -140,9 +140,7 @@ impl Interpreter {
             template_objects: rustc_hash::FxHashMap::default(),
             literal_cells: rustc_hash::FxHashMap::default(),
             array_boilerplates: rustc_hash::FxHashMap::default(),
-            small_int_string_cache: vec![None; Self::SMALL_INT_STRING_CACHE as usize]
-                .into_boxed_slice(),
-            number_string_cache: vec![None; Self::NUMBER_STRING_CACHE].into_boxed_slice(),
+            number_strings: crate::string::number_strings::NumberStrings::empty(),
             pending_error_detail: std::cell::RefCell::new(None),
             handle_arena: crate::handles::HandleArena::new(),
             host_atoms: crate::HostAtomInterner::new(),

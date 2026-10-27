@@ -652,6 +652,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::NewArrayWithLength,
         Kind::NewRestArray(0),
         Kind::PrimitiveAdd,
+        Kind::NumberToString,
         Kind::BigIntBinary(otter_vm::bigint::ops::Operator::Add),
         Kind::PrimitiveCompare(condition),
         Kind::Int32Add,
@@ -932,6 +933,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::NewArrayWithLength
         | K::NewRestArray(_)
         | K::PrimitiveAdd
+        | K::NumberToString
         | K::BigIntBinary(_)
         | K::PrimitiveCompare(_)
         | K::Int32Add

@@ -488,6 +488,7 @@ impl Interpreter {
         thread.active_realm_cell = self.jit_active_realm_addr() as u64;
         thread.array_buffer_detach_protector_cell =
             self.jit_array_buffer_detach_protector_addr() as u64;
+        thread.number_strings = self.jit_number_strings_addr() as u64;
         let marker = 0_u8;
         let mut error = None;
         let mut ctx = JitCtx {

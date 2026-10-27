@@ -86,6 +86,10 @@ pub struct VmThread {
     /// 4 GiB-aligned base of the GC cage. Compressed handles decompress as
     /// `cage_base | offset`.
     pub cage_base: u64,
+    /// Address of the isolate's cached Number strings
+    /// ([`crate::string::number_strings::NumberStrings`]). Generated
+    /// `ToString` of a Number reads them before converting.
+    pub number_strings: u64,
 }
 
 impl VmThread {
@@ -106,6 +110,7 @@ impl VmThread {
             active_realm_cell: 0,
             array_buffer_detach_protector_cell: 0,
             cage_base: otter_gc::cage_base() as u64,
+            number_strings: 0,
         }
     }
 }
@@ -661,7 +666,7 @@ impl Frame {
     }
 }
 
-const _: [(); 96] = [(); std::mem::size_of::<VmThread>()];
+const _: [(); 104] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 12] = [(); std::mem::size_of::<VmFrameHeader>()];
 const _: [(); 136] = [(); std::mem::size_of::<Frame>()];
@@ -674,6 +679,7 @@ const _: [(); 56] = [(); std::mem::offset_of!(VmThread, marking_flag_cell)];
 const _: [(); 64] = [(); std::mem::offset_of!(VmThread, array_index_protector_cell)];
 const _: [(); 72] = [(); std::mem::offset_of!(VmThread, active_realm_cell)];
 const _: [(); 80] = [(); std::mem::offset_of!(VmThread, array_buffer_detach_protector_cell)];
+const _: [(); 96] = [(); std::mem::offset_of!(VmThread, number_strings)];
 const _: [(); 4] = [(); std::mem::offset_of!(VmFrameHeader, pc)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmFrameHeader, register_count)];
 const _: [(); 11] = [(); std::mem::offset_of!(VmFrameHeader, flags)];

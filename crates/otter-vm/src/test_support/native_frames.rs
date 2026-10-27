@@ -44,6 +44,7 @@ pub(crate) fn resume_prepared_frame(
     thread.array_index_protector_cell = vm.jit_array_index_protector_addr() as u64;
     thread.active_realm_cell = vm.jit_active_realm_addr() as u64;
     thread.array_buffer_detach_protector_cell = vm.jit_array_buffer_detach_protector_addr() as u64;
+    thread.number_strings = vm.jit_number_strings_addr() as u64;
     thread.frame_cell = unsafe { std::ptr::from_mut(&mut (*ctx).native_frame) as u64 };
     let mut error = None;
     // SAFETY: the fixture's rooted turn retains the published frame and context.

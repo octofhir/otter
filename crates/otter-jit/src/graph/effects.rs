@@ -479,6 +479,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::NewRestArray(_)
         | Kind::NewReceiver(_) => Effects::writes(&[H::Dependencies], &[H::Movement]),
         Kind::PrimitiveAdd
+        | Kind::NumberToString
         | Kind::BigIntBinary(_)
         | Kind::NewObject
         | Kind::NewNullPrototypeObject

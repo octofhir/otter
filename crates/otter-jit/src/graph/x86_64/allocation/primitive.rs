@@ -3,6 +3,7 @@
 //! # Contents
 //! - Native string LAB fits and Number addition on one source operation,
 //!   placed by the `+` instruction's allocation site.
+//! - A Number's decimal string read from the isolate's cache.
 //! - BigInt binary operators through their allocating Probe.
 //! - Typed UTF-16/numeric ordering through the VM's NoAlloc boundary.
 //!
@@ -28,6 +29,13 @@ use otter_vm::jit::JIT_SITE_TENURE;
 
 impl Codegen<'_> {
     fn primitive_inputs(&self, node: NodeId) -> Result<[AllocationValue; 2], crate::Unsupported> {
+        self.primitive_operands::<2>(node)
+    }
+
+    fn primitive_operands<const N: usize>(
+        &self,
+        node: NodeId,
+    ) -> Result<[AllocationValue; N], crate::Unsupported> {
         let mut values = Vec::new();
         for &location in &self.allocation.node(node).inputs {
             values.push(match location {
@@ -52,6 +60,74 @@ impl Codegen<'_> {
         values
             .try_into()
             .map_err(|_| crate::Unsupported::OperandShape("primitive add arity"))
+    }
+
+    /// `ToString` of a Number: a small integer's string by value, any other
+    /// Number's by its bits' entry; an empty or other entry reaches the
+    /// collecting Probe, which converts and fills it.
+    pub(in crate::graph::x86_64) fn emit_number_to_string(
+        &mut self,
+        node: NodeId,
+    ) -> Result<(), crate::Unsupported> {
+        use otter_vm::string::number_strings as table;
+        let [value] = self.primitive_operands::<1>(node)?;
+        let a = self.allocation.node(node);
+        let destination = Self::gp(a.result.expect("number string result"));
+        let (word, strings) = (a.gp_temps[0], a.gp_temps[1]);
+        let float = a.fp_temps[0];
+        let slow = self.ops.new_dynamic_label();
+        let double = self.ops.new_dynamic_label();
+        let found = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        crate::x86_64::allocation::emit_value(&mut self.ops, word, value);
+        dynasm!(self.ops ; .arch x64
+            ; mov Rq(strings), [r15 + crate::entry::THREAD_OFFSET as i32]
+            ; mov Rq(strings), [Rq(strings) + crate::entry::VM_THREAD_NUMBER_STRINGS_OFFSET as i32]
+            ; test Rq(strings), Rq(strings)
+            ; jz =>slow
+            ; mov r10, Rq(word) ; sar r10, 49 ; cmp r10, -1 ; jne =>double
+            ; mov r10d, Rd(word)
+            ; cmp r10d, table::NUMBER_STRINGS_SMALL as i32
+            ; jae =>double
+            ; mov r10, [Rq(strings) + r10 * 8]
+            ; jmp =>found
+            ; =>double
+        );
+        super::super::scalar::conversions::emit_tagged_number_to_float(
+            &mut self.ops,
+            word,
+            float,
+            slow,
+        );
+        dynasm!(self.ops ; .arch x64
+            ; movq r10, Rx(float)
+            ; mov r11, r10 ; shr r11, 32 ; xor r11, r10
+            ; and r11d, (table::NUMBER_STRINGS_ENTRIES - 1) as i32
+            ; shl r11, table::NUMBER_STRING_ENTRY_SHIFT as i8
+            ; add r11, Rq(strings)
+            ; cmp r10, [r11 + table::NUMBER_STRINGS_ENTRIES_BYTE as i32]
+            ; jne =>slow
+            ; mov r10, [r11 + (table::NUMBER_STRINGS_ENTRIES_BYTE
+                + table::NUMBER_STRING_ENTRY_STRING_BYTE) as i32]
+            ; =>found
+        );
+        self.load_immediate(11, crate::entry::VALUE_UNDEFINED);
+        dynasm!(self.ops ; .arch x64
+            ; cmp r10, r11
+            ; je =>slow
+            ; mov Rq(destination), r10
+            ; jmp =>done
+            ; =>slow
+        );
+        let undefined = AllocationValue::Constant(crate::entry::VALUE_UNDEFINED);
+        self.emit_probe_allocation(
+            node,
+            abi::STUB_NUMBER_TO_STRING_ALLOC,
+            [value, undefined, undefined],
+            Some(destination),
+        )?;
+        dynasm!(self.ops ; .arch x64 ; =>done);
+        Ok(())
     }
 
     pub(in crate::graph::x86_64) fn emit_primitive_add(

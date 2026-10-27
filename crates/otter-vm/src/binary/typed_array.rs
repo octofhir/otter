@@ -473,6 +473,10 @@ pub struct TypedArrayBodyGc {
     /// §10.1.2 [[SetPrototypeOf]] override — `None` means the
     /// per-kind `%TypedArray%.prototype` chain applies.
     pub custom_proto: Option<crate::Value>,
+    /// The ordinary object every named lookup on this view starts at, once
+    /// proven: no expando bag, and the view's [[Prototype]] is this object.
+    /// The null handle leaves the lookup to the runtime.
+    pub lookup_start: crate::object::JsObject,
     /// §23.2.5.1 — `true` when constructed over a resizable buffer
     /// without an explicit length: [[ArrayLength]] is AUTO and tracks
     /// the buffer's current byte length.
@@ -517,6 +521,10 @@ pub const TYPED_ARRAY_BODY_LENGTH_OFFSET: usize = std::mem::offset_of!(TypedArra
 /// 4-byte compressed handle that reads zero exactly while the view owns no
 /// named property.
 pub const TYPED_ARRAY_BODY_EXPANDO_OFFSET: usize = std::mem::offset_of!(TypedArrayBodyGc, expando);
+/// Byte offset of [`TypedArrayBodyGc::lookup_start`] from the body start: a
+/// 4-byte compressed handle, zero while no lookup start is proven.
+pub const TYPED_ARRAY_BODY_LOOKUP_START_OFFSET: usize =
+    std::mem::offset_of!(TypedArrayBodyGc, lookup_start);
 /// Byte offset of [`TypedArrayBodyGc::length_tracking`] from the body
 /// start. The JIT bails inline access when this flag is set (the cached
 /// `length` is then stale and the live byte length must be recomputed).
@@ -540,6 +548,11 @@ impl otter_gc::SafeTraceable for TypedArrayBodyGc {
         }
         if let Some(proto) = &self.custom_proto {
             proto.trace_value_slots(visitor);
+        }
+        if !self.lookup_start.is_null() {
+            let p =
+                &mut self.lookup_start as *mut crate::object::JsObject as *mut otter_gc::raw::RawGc;
+            visitor(p);
         }
     }
 }
@@ -585,6 +598,7 @@ pub fn alloc_typed_array(
         length_tracking: false,
         expando: crate::object::JsObject::null(),
         custom_proto: None,
+        lookup_start: crate::object::JsObject::null(),
         data: std::cell::Cell::new(data),
     })
 }
@@ -665,14 +679,54 @@ impl JsTypedArray {
 
     /// Install a [[SetPrototypeOf]] override (object / proxy / null).
     pub fn set_custom_proto(self, heap: &mut otter_gc::GcHeap, proto: crate::Value) {
-        heap.with_payload(self.handle, |body| body.custom_proto = Some(proto));
+        // An ordinary prototype is where named lookups start while no
+        // expando exists; any other [[Prototype]] leaves them to the runtime.
+        let start = proto
+            .as_object()
+            .filter(|_| self.expando(heap).is_none())
+            .unwrap_or_else(crate::object::JsObject::null);
+        heap.with_payload(self.handle, |body| {
+            body.custom_proto = Some(proto);
+            body.lookup_start = start;
+        });
         heap.record_write(self.handle, &proto);
+    }
+
+    /// Record `prototype`, the view's realm-default [[Prototype]], as its
+    /// lookup start, when the view has neither an override nor an expando.
+    pub(crate) fn prove_default_lookup_start(
+        self,
+        heap: &mut otter_gc::GcHeap,
+        prototype: crate::object::JsObject,
+    ) {
+        let proven = heap.with_payload(self.handle, |body| {
+            if body.custom_proto.is_some() || !body.expando.is_null() {
+                return false;
+            }
+            body.lookup_start = prototype;
+            true
+        });
+        if proven {
+            heap.record_write(self.handle, &crate::Value::object(prototype));
+        }
+    }
+
+    /// The proven lookup start, if any.
+    #[must_use]
+    pub(crate) fn lookup_start(self, heap: &otter_gc::GcHeap) -> Option<crate::object::JsObject> {
+        heap.read_payload(self.handle, |body| {
+            (!body.lookup_start.is_null()).then_some(body.lookup_start)
+        })
     }
 
     /// Install / replace the lazy expando bag.
     pub fn set_expando(self, heap: &mut otter_gc::GcHeap, expando: crate::object::JsObject) {
         let barrier = crate::Value::object(expando);
-        heap.with_payload(self.handle, |body| body.expando = expando);
+        heap.with_payload(self.handle, |body| {
+            body.expando = expando;
+            // An own named property ends the shortcut past the view.
+            body.lookup_start = crate::object::JsObject::null();
+        });
         heap.record_write(self.handle, &barrier);
     }
 

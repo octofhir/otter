@@ -4679,11 +4679,32 @@ pub(crate) fn has_own_well_known_symbol(
     tag: crate::symbol::WellKnown,
 ) -> bool {
     heap.read_payload(obj, |body| {
-        symbol_slots::has_shaped_well_known(heap, body, tag)
+        symbol_slots::shaped_well_known(heap, body, tag).is_some()
             || body
                 .symbol_props()
                 .iter()
                 .any(|(key, _)| key.well_known_tag() == Some(tag))
+    })
+}
+
+/// `obj`'s own property keyed by the well-known symbol `tag`, which every
+/// realm shares, found without the symbol's handle.
+#[must_use]
+pub(crate) fn lookup_own_well_known_symbol(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    tag: crate::symbol::WellKnown,
+) -> PropertyLookup {
+    let key = heap.read_payload(obj, |body| {
+        symbol_slots::shaped_well_known(heap, body, tag).or_else(|| {
+            body.symbol_props()
+                .iter()
+                .find(|(key, _)| key.well_known_tag() == Some(tag))
+                .map(|(key, _)| *key)
+        })
+    });
+    key.map_or(PropertyLookup::Absent, |key| {
+        lookup_own_symbol(obj, heap, key)
     })
 }
 

@@ -1640,6 +1640,7 @@ impl Interpreter {
             view.typed_array_length = jit::JitTypedArrayLengthLayout {
                 type_tag: typed::TYPED_ARRAY_BODY_TYPE_TAG,
                 expando_byte: header + typed::TYPED_ARRAY_BODY_EXPANDO_OFFSET as u32,
+                lookup_start_byte: header + typed::TYPED_ARRAY_BODY_LOOKUP_START_OFFSET as u32,
                 data_byte: header + typed::TYPED_ARRAY_BODY_DATA_OFFSET as u32,
                 length_byte: header + typed::TYPED_ARRAY_BODY_LENGTH_OFFSET as u32,
             };

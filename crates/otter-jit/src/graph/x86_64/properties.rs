@@ -584,6 +584,26 @@ impl Codegen<'_> {
                             next,
                             abi::STUB_JIT_LOAD_PROPERTY.id,
                         ),
+                    Op::LoadTypedArrayStart {
+                        object: 0,
+                        result: 1,
+                    } if value.is_none() => {
+                        // A typed view whose body records its lookup start.
+                        let typed = view.typed_array_length;
+                        if typed.lookup_start_byte == 0 {
+                            return Err(Unsupported::OperandShape(
+                                "x86 graph typed array start layout",
+                            ));
+                        }
+                        self.emit_cell_guard(receiver, next);
+                        dynasm!(self.ops ; .arch x64
+                            ; cmp BYTE [Rq(receiver)], typed.type_tag as i8 ; jne =>next
+                            ; mov Rd(holder), [Rq(receiver) + typed.lookup_start_byte as i32]
+                            ; test Rd(holder), Rd(holder) ; jz =>next
+                        );
+                        self.load_immediate(11, 0xffff_ffff_0000_0000);
+                        dynasm!(self.ops ; .arch x64 ; and r11, Rq(receiver) ; add Rq(holder), r11);
+                    }
                     Op::LoadPrototypeHolder { root, .. } => {
                         self.emit_prototype_holder(receiver, holder, root, next)
                     }

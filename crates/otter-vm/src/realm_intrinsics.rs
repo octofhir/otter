@@ -1,9 +1,12 @@
 //! Typed per-realm intrinsic slots.
 //!
 //! The original `%Array.prototype.values%` callable is also retained for
-//! arguments creation, and `%Promise%` with `%Promise.prototype.then%` for
-//! the promise operations that must not observe the global binding. The original Array, Boolean, Number, and Object callables
-//! are retained for exact resolved-call feedback and generation-owned proofs.
+//! arguments creation, the TypedArray constructors with `%TypedArray%`'s
+//! `@@species` getter for TypedArraySpeciesCreate, and `%Promise%` with
+//! `%Promise.prototype.then%` for the promise operations that must not observe
+//! the global binding. The original Array, Boolean, Number, and Object
+//! callables are retained for exact resolved-call feedback and
+//! generation-owned proofs.
 //!
 //! Every well-known prototype that the
 //! dispatch path looks up by name gets a dedicated slot. Bootstrap
@@ -72,6 +75,9 @@ fn resolve_prototype(
         None
     }
 }
+
+/// Number of [`crate::binary::TypedArrayKind`]s.
+const TYPED_ARRAY_KINDS: usize = 12;
 
 /// One cached realm prototype. The discriminant is the slot index, so the
 /// slot order is the declaration order here and nowhere else.
@@ -283,6 +289,10 @@ pub(crate) struct RealmIntrinsics {
     promise_then: crate::native_function::NativeFunction,
     /// The original callable of every intrinsic call kind, by kind.
     callables: [crate::native_function::NativeFunction; crate::IntrinsicCallKind::COUNT],
+    /// `%Int8Array%` … `%Float16Array%`, by [`crate::binary::TypedArrayKind`].
+    typed_array_constructors: [crate::native_function::NativeFunction; TYPED_ARRAY_KINDS],
+    /// The original `get %TypedArray%[@@species]`.
+    typed_array_species: crate::native_function::NativeFunction,
     /// Whether this realm's `%RegExp.prototype%` is built-in, while proven.
     pub(crate) regexp_protocol: Option<crate::regexp_fast::RegExpProtocolProof>,
     /// Whether this realm's `%Promise.prototype%` is built-in, while proven.
@@ -306,6 +316,12 @@ impl Default for RealmIntrinsics {
             promise_then: crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null()),
             callables: [crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null());
                 crate::IntrinsicCallKind::COUNT],
+            typed_array_constructors: [crate::native_function::NativeFunction::from_gc(
+                otter_gc::Gc::null(),
+            ); TYPED_ARRAY_KINDS],
+            typed_array_species: crate::native_function::NativeFunction::from_gc(
+                otter_gc::Gc::null(),
+            ),
             regexp_protocol: None,
             promise_protocol: None,
             iteration: crate::iteration_protocol::IterationProofs::default(),
@@ -377,6 +393,23 @@ impl RealmIntrinsics {
         &self.callables[kind as usize]
     }
 
+    /// The original constructor of a TypedArray kind, independent of the
+    /// mutable global binding.
+    pub(crate) fn typed_array_constructor(
+        &self,
+        kind: crate::binary::TypedArrayKind,
+    ) -> Option<crate::native_function::NativeFunction> {
+        let constructor = *self.typed_array_constructors.get(kind as usize)?;
+        (!constructor.raw().is_null()).then_some(constructor)
+    }
+
+    /// The original `get %TypedArray%[@@species]`.
+    pub(crate) fn typed_array_species_getter(
+        &self,
+    ) -> Option<crate::native_function::NativeFunction> {
+        (!self.typed_array_species.raw().is_null()).then_some(self.typed_array_species)
+    }
+
     /// Original canonical callable, independent of mutable global properties.
     pub(crate) fn callable(
         &self,
@@ -426,6 +459,33 @@ impl RealmIntrinsics {
         let (regexp_prototype, string_prototype) =
             (self.regexp_prototype(), self.string_prototype());
         let reflect = object::get(global, heap, "Reflect").and_then(|value| value.as_object());
+        for (index, constructor) in self.typed_array_constructors.iter_mut().enumerate() {
+            if let Some(kind) = crate::binary::TypedArrayKind::from_u32(index as u32) {
+                *constructor = callable(heap, kind.name());
+            }
+        }
+        self.typed_array_species = self
+            .typed_array_constructor(crate::binary::TypedArrayKind::Uint8)
+            .and_then(|uint8| uint8.prototype_override(heap))
+            .and_then(|parent| parent.as_native_function())
+            .map(|parent| parent.own_properties_bag(heap))
+            .filter(|bag| !bag.is_null())
+            .and_then(|bag| {
+                match object::lookup_own_well_known_symbol(
+                    bag,
+                    heap,
+                    crate::symbol::WellKnown::Species,
+                ) {
+                    object::PropertyLookup::Accessor {
+                        getter: Some(getter),
+                        ..
+                    } => getter.as_native_function(),
+                    _ => None,
+                }
+            })
+            .unwrap_or_else(|| {
+                crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
+            });
         for kind in crate::IntrinsicCallKind::ALL {
             self.callables[kind as usize] = match kind.method_home() {
                 None => callable(heap, kind_constructor_name(kind)),
@@ -463,6 +523,10 @@ impl RealmIntrinsics {
         for callable in &self.callables {
             callable.trace_gc_roots(visitor);
         }
+        for constructor in &self.typed_array_constructors {
+            constructor.trace_gc_roots(visitor);
+        }
+        self.typed_array_species.trace_gc_roots(visitor);
     }
 
     /// Trace cached prototype handles as root slots.
@@ -481,6 +545,15 @@ impl RealmIntrinsics {
             let slot = self.callable_slot(kind);
             if !slot.raw().is_null() {
                 slot.trace_gc_roots(visitor);
+            }
+        }
+        for native in self
+            .typed_array_constructors
+            .iter()
+            .chain(std::iter::once(&self.typed_array_species))
+        {
+            if !native.raw().is_null() {
+                native.trace_gc_roots(visitor);
             }
         }
     }

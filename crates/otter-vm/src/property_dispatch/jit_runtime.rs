@@ -197,13 +197,36 @@ impl Interpreter {
         Ok(result)
     }
 
-    /// The element site at `instruction_pc` reading a symbol key from an
-    /// ordinary object, through the site's named cache bound to that symbol:
-    /// a cached or newly resolved data slot, or `undefined` for a key the
-    /// chain lacks. `None` leaves the access to the full keyed path: another
-    /// receiver, another key at a site bound to one, or an accessor.
-    /// Neither allocates nor runs code.
-    pub(crate) fn keyed_symbol_load(
+    /// The one name an element site's cache may serve for `key`: a symbol,
+    /// or an integer index an ordinary object keys a named slot by (its
+    /// canonical spelling's atom, once some shape has keyed it), with its
+    /// atomized form. Any other key has none.
+    fn keyed_site_name(
+        &mut self,
+        key: Value,
+        digits: &mut itoa::Buffer,
+    ) -> Option<(
+        crate::property_atom::AtomId,
+        Option<crate::symbol::SymbolHandle>,
+    )> {
+        if let Some(symbol) = key.as_symbol(&self.gc_heap) {
+            return Some((
+                symbol.property_atom(&mut self.gc_heap),
+                Some(symbol.handle()),
+            ));
+        }
+        let index = key.as_i32().filter(|&index| index >= 0)?;
+        let atom = crate::isolate_names::names(&self.gc_heap).lookup(digits.format(index));
+        (atom != crate::property_atom::AtomId::NONE).then_some((atom, None))
+    }
+
+    /// The element site at `instruction_pc` reading a symbol or an integer
+    /// index key from an ordinary object, through the site's named cache
+    /// bound to that key: a cached or newly resolved data slot, or
+    /// `undefined` for a key the chain lacks. `None` leaves the access to the
+    /// full keyed path: another receiver, another key at a site bound to one,
+    /// or an accessor. Neither allocates nor runs code.
+    pub(crate) fn keyed_name_load(
         &mut self,
         context: &ExecutionContext,
         function_id: u32,
@@ -211,14 +234,14 @@ impl Interpreter {
         receiver: Value,
         key: Value,
     ) -> Option<Value> {
-        let symbol = key.as_symbol(&self.gc_heap)?;
         let obj = receiver.as_object()?;
         if !object::supports_fast_property_ic(obj, &self.gc_heap) {
             return None;
         }
         let slot =
             context.property_feedback_slot(function_id, instruction_pc, PropertyIcKind::Load)?;
-        let atom = symbol.property_atom(&mut self.gc_heap);
+        let mut digits = itoa::Buffer::new();
+        let (atom, symbol) = self.keyed_site_name(key, &mut digits)?;
         if !slot.native().bind_keyed_atom(atom.raw()) {
             return None;
         }
@@ -227,7 +250,14 @@ impl Interpreter {
             return Some(value);
         }
         slot.record_miss();
-        let key = crate::property_atom::AtomizedPropertyKey::symbol(atom, symbol.handle());
+        let mut spelling = itoa::Buffer::new();
+        let key = match symbol {
+            Some(symbol) => crate::property_atom::AtomizedPropertyKey::symbol(atom, symbol),
+            None => crate::property_atom::AtomizedPropertyKey::new(
+                crate::property_atom::PropertyAtom::new(atom),
+                spelling.format(key.as_i32()?),
+            ),
+        };
         let load = self.resolve_property_load(obj, key);
         self.update_load_ic(slot, obj, &load);
         match load {
@@ -237,13 +267,13 @@ impl Interpreter {
         }
     }
 
-    /// The element site at `instruction_pc` writing a symbol key into an
-    /// ordinary object through its named cache bound to that symbol, as a
-    /// named store does: a cached slot or add, an existing writable own
-    /// slot, or an add the receiver's chain allows. `false` leaves the store
-    /// to the full keyed path, with nothing written. The add may collect; it
-    /// roots the stack and both values.
-    pub(crate) fn keyed_symbol_store(
+    /// The element site at `instruction_pc` writing a symbol or an integer
+    /// index key into an ordinary object through its named cache bound to
+    /// that key, as a named store does: a cached slot or add, an existing
+    /// writable own slot, or an add the receiver's chain allows. `false`
+    /// leaves the store to the full keyed path, with nothing written. The add
+    /// may collect; it roots the stack and both values.
+    pub(crate) fn keyed_name_store(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
@@ -253,8 +283,7 @@ impl Interpreter {
         key: Value,
         mut value: Value,
     ) -> Result<bool, CommittedValueError> {
-        let (Some(symbol), Some(mut obj)) = (key.as_symbol(&self.gc_heap), receiver.as_object())
-        else {
+        let Some(mut obj) = receiver.as_object() else {
             return Ok(false);
         };
         if self.is_array_prototype_object(obj)
@@ -268,11 +297,26 @@ impl Interpreter {
         else {
             return Ok(false);
         };
-        let atom = symbol.property_atom(&mut self.gc_heap);
+        let mut digits = itoa::Buffer::new();
+        let Some((atom, symbol)) = self.keyed_site_name(key, &mut digits) else {
+            return Ok(false);
+        };
         if !slot.native().bind_keyed_atom(atom.raw()) {
             return Ok(false);
         }
-        let key = crate::property_atom::AtomizedPropertyKey::symbol(atom, symbol.handle());
+        let mut spelling = itoa::Buffer::new();
+        let key = match symbol {
+            Some(symbol) => crate::property_atom::AtomizedPropertyKey::symbol(atom, symbol),
+            None => {
+                let Some(index) = key.as_i32() else {
+                    return Ok(false);
+                };
+                crate::property_atom::AtomizedPropertyKey::new(
+                    crate::property_atom::PropertyAtom::new(atom),
+                    spelling.format(index),
+                )
+            }
+        };
         if slot
             .probe_store(obj, &mut self.gc_heap, key, &value)
             .map_err(|error| CommittedValueError::JavaScript(error.into()))?

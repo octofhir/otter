@@ -163,6 +163,11 @@ impl Codegen<'_> {
                     ; cmp BYTE [Rq(input(0))], class.type_tag as i8 ; jne =>exit
                     ; mov Rq(destination), [Rq(input(0)) + class.ctor_byte as i32]);
             }
+            Kind::CheckTaggedBits(bits) => {
+                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                self.load_immediate(11, bits);
+                dynasm!(self.ops ; .arch x64 ; cmp Rq(input(0)), r11 ; jne =>exit);
+            }
             Kind::CheckSymbolAtom(atom) => {
                 let exit = self.eager_exit(node, DeoptReason::WrongValue);
                 let symbol = self.view.symbol_layout;

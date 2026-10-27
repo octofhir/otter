@@ -73,6 +73,12 @@ impl Interpreter {
         {
             return Ok(None);
         }
+        // A symbol takes a hidden-class slot only while the object's symbol
+        // side table is empty: one the class does not name may be an own
+        // property there, and any later symbol must follow those entries.
+        if key.symbol_handle().is_some() && object::has_symbol_side_table(*obj, &self.gc_heap) {
+            return Ok(None);
+        }
         // Normalize to dictionary storage past the fast-property cap:
         // returning `None` routes the caller to `ordinary_set_data_property`
         // (which sets `shape = null`), after which every further add sees

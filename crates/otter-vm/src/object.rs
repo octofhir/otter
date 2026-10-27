@@ -4295,6 +4295,13 @@ pub(crate) fn data_slot_value_at(
     })
 }
 
+/// Whether `obj` keeps symbol-keyed own properties in its side table rather
+/// than in hidden-class slots.
+#[must_use]
+pub(crate) fn has_symbol_side_table(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(obj, |body| !body.symbol_props().is_empty())
+}
+
 /// Atom-aware own-property probe for named property bytecodes.
 #[must_use]
 pub(crate) fn lookup_own_atom(

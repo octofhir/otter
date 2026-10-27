@@ -272,13 +272,15 @@ fn string_protocol_fallbacks_survive_moving_gc() {
         RegExp.prototype[Symbol.match] = originalMatch;
         RegExp.prototype[Symbol.matchAll] = originalMatchAll;
         RegExp.prototype[Symbol.search] = originalSearch;
+        // Assignments replace the prototype's own symbol methods in place.
+        const symbols = Object.getOwnPropertySymbols(RegExp.prototype).length;
 
-        [protocol, functional, match, matchAll.tag, searchResult, calls].join("|");
+        [protocol, functional, match, matchAll.tag, searchResult, calls, symbols].join("|");
         "#,
         "<gc-string-protocol-fallbacks>",
     );
 
-    assert_eq!(completion, "protocol|XbX|match:aba|matchAll:aba|17|6");
+    assert_eq!(completion, "protocol|XbX|match:aba|matchAll:aba|17|6|5");
 }
 
 #[test]

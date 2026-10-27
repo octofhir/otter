@@ -1532,6 +1532,9 @@ impl Interpreter {
             })
             .unwrap_or_default();
         let import_context = context.clone();
+        // A lazily compiled body runs in a chunk of its own; the module's
+        // import table and initializers live in the chunk that created it.
+        let module_context = context.module_owner();
         let promise = match self.coerce_to_string(stack, context, &spec_value) {
             Ok(specifier) => {
                 // Re-read the options register after specifier coercion: the
@@ -1554,7 +1557,7 @@ impl Interpreter {
                             return Ok(());
                         }
                     };
-                if let Some(target) = context.module_resolution_target(
+                if let Some(target) = module_context.module_resolution_target(
                     referrer.as_str(),
                     &specifier,
                     attr_type.as_deref(),
@@ -1573,7 +1576,7 @@ impl Interpreter {
                         .pending_stack_rooted(self, stack, &mut [], &mut [])
                         .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                         self.defer_dynamic_import_evaluation(
-                            context,
+                            &module_context,
                             pending,
                             target,
                             referrer.clone(),
@@ -1587,7 +1590,7 @@ impl Interpreter {
                         return Ok(());
                     }
                     match self
-                        .evaluate_module(stack, context, &target)
+                        .evaluate_module(stack, &module_context, &target)
                         .map_err(CommittedValueError::completed_call)
                     {
                         Ok(Some(gate)) => {
@@ -1602,7 +1605,7 @@ impl Interpreter {
                             .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                             self.settle_promise_on_module_evaluation(
                                 stack,
-                                context,
+                                &module_context,
                                 pending,
                                 gate,
                                 std::sync::Arc::from(target.as_str()),
@@ -1612,7 +1615,11 @@ impl Interpreter {
                         }
                         Ok(None) => {
                             let ns = self
-                                .resolve_module_namespace(context, referrer.as_str(), &specifier)
+                                .resolve_module_namespace(
+                                    &module_context,
+                                    referrer.as_str(),
+                                    &specifier,
+                                )
                                 .ok_or_else(|| {
                                     self.err_unknown_intrinsic(
                                         format!("import \"{specifier}\"").into(),

@@ -4425,14 +4425,14 @@ impl<'a> Builder<'a> {
         instruction: &Instruction,
         function: NodeId,
         arguments: &[NodeId],
-        plan: otter_vm::jit::JitDirectCallPlan,
+        plan: Option<otter_vm::jit::JitDirectCallPlan>,
     ) {
         let (this, rest) = match arguments.split_first() {
             Some((&this, rest)) => (this, rest),
             None => (self.undefined, &[][..]),
         };
         let rest: SmallVec<[NodeId; 8]> = rest.iter().copied().collect();
-        self.emit_call_with_receiver(instruction, function, this, &rest, Some(plan));
+        self.emit_call_with_receiver(instruction, function, this, &rest, plan);
     }
 
     /// `dst = callee.call(this, args...)` as the bytecode spells a call with
@@ -4481,12 +4481,15 @@ impl<'a> Builder<'a> {
                 &arguments,
             );
         }
-        // A loaded `f.call` called with `f` as receiver calls `f`.
-        if !self.exited_for(ExitReason::IdentityGuard)
-            && let Some(site) = self.view.function_prototype_calls.get(&instruction.byte_pc)
+        // A loaded `f.call` called with `f` as receiver calls `f`. Once a
+        // site left on a different `f`, it calls whichever `f` it gets.
+        if let Some(site) = self.view.function_prototype_calls.get(&instruction.byte_pc)
             && site.proof.lookup.is_none()
         {
-            let plan = site.callee.plan;
+            let plan = site
+                .callee
+                .filter(|_| !self.exited_for(ExitReason::IdentityGuard))
+                .map(|callee| callee.plan);
             self.add(
                 Kind::CheckFunctionPrototypeCall(instruction.byte_pc),
                 &[callee],
@@ -4597,15 +4600,23 @@ impl<'a> Builder<'a> {
             return;
         }
         let byte_pc = instruction.byte_pc;
-        let fold = (!self.exited_for(ExitReason::IdentityGuard))
-            .then(|| self.view.function_prototype_calls.get(&byte_pc))
-            .flatten()
+        // Once the site left on a different applied function, the fold calls
+        // whichever function it gets.
+        let identity_left = self.exited_for(ExitReason::IdentityGuard);
+        let fold = self
+            .view
+            .function_prototype_calls
+            .get(&byte_pc)
             .filter(|site| {
                 site.proof
                     .lookup
                     .is_some_and(|lookup| lookup.receiver.is_generated_receiver())
             })
-            .map(|site| site.callee.plan);
+            .map(|site| {
+                site.callee
+                    .filter(|_| !identity_left)
+                    .map(|callee| callee.plan)
+            });
         let view: &'a JitCompileSnapshot = self.view;
         let methods = (!self.exited_for(ExitReason::ShapeGuard)
             && !self.exited_for(ExitReason::IdentityGuard))

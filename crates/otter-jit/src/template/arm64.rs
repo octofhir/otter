@@ -916,6 +916,7 @@ fn emit_count_call(
             ; cbnz w14, =>recorded
             ; mov x1, x16
             ; mov x0, x20
+            ; movz x3, otter_vm::Value::UNDEFINED.to_bits() as u32
         );
         emit_load_reg(ops, 2, callee)?;
         values::emit_load_runtime_stub(
@@ -927,6 +928,58 @@ fn emit_count_call(
         );
         dynasm!(ops ; .arch aarch64 ; blr x16 ; =>recorded);
     }
+    Ok(())
+}
+
+/// Record the method a baseline method call resolved, with its receiver,
+/// while the site's call feedback is still empty, as the interpreter would
+/// have: a `f.call(…)` site then names `f`. The method stays in `x0`.
+/// Clobbers the caller-saved registers on that one recording call.
+pub(super) fn emit_record_method_target(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    view: &JitCompileSnapshot,
+    pc: u32,
+    receiver: u16,
+) -> Result<(), Unsupported> {
+    let Some(cell) = view
+        .instructions
+        .get(pc as usize)
+        .map(|instruction| instruction.call_count_cell)
+        .filter(|&cell| cell != 0)
+    else {
+        return Ok(());
+    };
+    let recorded = ops.new_dynamic_label();
+    values::emit_load_symbol_u64(
+        ops,
+        relocations,
+        16,
+        cell,
+        crate::artifact::relocation::RelocationTarget::CallCountCell {
+            function_id: view.code_block.id,
+            pc,
+        },
+    );
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldurb w14, [x16, otter_vm::jit_feedback::CALL_FEEDBACK_STATE_FROM_EXECUTIONS]
+        ; cbnz w14, =>recorded
+        ; str x0, [sp, #-16]!
+        ; mov x2, x0
+        ; mov x1, x16
+        ; mov x0, x20
+    );
+    emit_load_reg(ops, 3, receiver)?;
+    values::emit_load_runtime_stub(
+        ops,
+        relocations,
+        16,
+        transitions.variadic_entry(abi::STUB_JIT_RECORD_CALL_TARGET),
+        abi::STUB_JIT_RECORD_CALL_TARGET,
+    );
+    dynasm!(ops ; .arch aarch64 ; blr x16 ; ldr x0, [sp], #16 ; =>recorded);
     Ok(())
 }
 

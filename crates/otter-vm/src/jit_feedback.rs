@@ -279,6 +279,28 @@ pub(crate) unsafe fn record_call_at_executions(
     unsafe { &*base }.record(target)
 }
 
+/// Close the call feedback at the slot whose execution count word is at
+/// `executions` to further baseline recording: a site whose callable names no
+/// recordable target (a bound function, a class constructor, a proxy) reads
+/// as megamorphic instead of empty, so its baseline code stops asking.
+///
+/// # Safety
+/// `executions` must be the live `executions` word of an
+/// [`AtomicCallFeedback`] owned by the calling site.
+pub(crate) unsafe fn close_call_feedback_at_executions(executions: u64) {
+    let base = (executions as *const u8)
+        .wrapping_sub(std::mem::offset_of!(AtomicCallFeedback, executions))
+        .cast::<AtomicCallFeedback>();
+    // SAFETY: the caller's slot is live; the address names its feedback.
+    let feedback = unsafe { &*base };
+    let _ = feedback.state.compare_exchange(
+        CALL_DISTRIBUTION_EMPTY,
+        CALL_DISTRIBUTION_MEGAMORPHIC,
+        Ordering::AcqRel,
+        Ordering::Relaxed,
+    );
+}
+
 impl Default for AtomicCallFeedback {
     fn default() -> Self {
         Self {

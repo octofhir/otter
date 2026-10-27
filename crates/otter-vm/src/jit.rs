@@ -1336,8 +1336,10 @@ pub struct JitFunctionPrototypeCall {
 pub struct JitFunctionPrototypeCallSite {
     /// Proof that the callee is the intrinsic.
     pub proof: JitFunctionPrototypeCall,
-    /// Current entry generation of the function the intrinsic runs.
-    pub callee: JitDirectCallee,
+    /// Current entry generation of the function the intrinsic runs, when the
+    /// site called one; `None` for a site that called several, whose call
+    /// still becomes an ordinary call of the function it is applied to.
+    pub callee: Option<JitDirectCallee>,
 }
 
 /// A callee the compiler may splice into a caller's `Op::Call` site.

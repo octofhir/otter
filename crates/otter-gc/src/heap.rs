@@ -3614,6 +3614,35 @@ impl GcHeap {
         (self.gc_stats.minor_gc_cycles, self.gc_stats.gc_cycles)
     }
 
+    /// Cumulative allocation and collection counters for an accounting
+    /// checkpoint: `(objects allocated, bytes allocated, live bytes as of
+    /// the last completed collection)`. Unlike [`Self::gc_stats`] it leaves a
+    /// lazy old-space sweep in progress, so a frequent checkpoint costs no
+    /// collection work.
+    #[must_use]
+    pub fn allocation_counters(&self) -> (u64, u64, usize) {
+        let mut objects = 0u64;
+        let mut bytes = 0u64;
+        let mut live = 0usize;
+        for row in &self.gc_stats.by_type {
+            objects = objects.saturating_add(row.alloc_count_total);
+            bytes = bytes.saturating_add(row.alloc_bytes_total);
+            live = live.wrapping_add(row.live_bytes);
+        }
+        (objects, bytes.saturating_add(self.generated_bytes()), live)
+    }
+
+    /// Cumulative collection counters: `(full cycles, minor cycles, slots the
+    /// minor collections scanned)`.
+    #[must_use]
+    pub fn collection_counters(&self) -> (u64, u64, u64) {
+        (
+            self.gc_stats.gc_cycles,
+            self.gc_stats.minor_gc_cycles,
+            self.gc_stats.minor_slots_scanned,
+        )
+    }
+
     /// Per-heap GC counters and the per-type breakdown. The runtime
     /// allocator updates its type's row; the aggregates `live_objects` and
     /// `live_bytes` are summed from the rows here. `alloc_bytes_total` adds

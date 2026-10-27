@@ -3409,6 +3409,9 @@ impl Interpreter {
         args: ValueWindow<'_>,
         roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
+        if let Some(result) = self.dense_slice(stack, receiver, args) {
+            return result.map_err(CommittedValueError::JavaScript);
+        }
         let o = if receiver.is_object_type() {
             receiver
         } else {
@@ -3457,6 +3460,95 @@ impl Interpreter {
             )?;
             Ok(interp.escape_scoped(a_handle))
         })
+    }
+
+    /// `slice` of a plain array without holes whose `ArraySpeciesCreate` is
+    /// `%Array%`, with Number or absent bounds: nothing observable runs, so
+    /// the result is the dense values' copy. `None` leaves every other case
+    /// to the specification steps.
+    fn dense_slice(
+        &mut self,
+        stack: &ActivationStack,
+        receiver: Value,
+        args: ValueWindow<'_>,
+    ) -> Option<Result<Value, VmError>> {
+        let array = receiver.as_array()?;
+        let heap = &self.gc_heap;
+        if self.active_realm_id != 0
+            || !crate::array::is_ordinary_dense(array, heap)
+            || !self.array_species_is_default()
+        {
+            return None;
+        }
+        let bound = |value: Option<&Value>, default: f64| match value {
+            None => Some(default),
+            Some(value) if value.is_undefined() => Some(default),
+            Some(value) => value.as_f64(),
+        };
+        let values = crate::array::with_plain_dense_values(array, heap, |values| {
+            let values: SmallVec<[Value; 8]> = values.collect();
+            values
+        })?;
+        if values.iter().any(|value| value.is_hole()) {
+            return None;
+        }
+        let len = values.len() as f64;
+        let relative = |value: f64| {
+            let integer = if value.is_nan() { 0.0 } else { value.trunc() };
+            if integer < 0.0 {
+                (len + integer).max(0.0)
+            } else {
+                integer.min(len)
+            }
+        };
+        let start = relative(bound(args.first(), 0.0)?) as usize;
+        let end = relative(bound(args.get(1), len)?) as usize;
+        let copied = values.get(start..end.max(start)).unwrap_or(&[]);
+        Some(
+            self.alloc_stack_rooted_array_from_values(
+                stack,
+                copied.iter().copied(),
+                &mut [],
+                &mut [],
+            )
+            .map(Value::array),
+        )
+    }
+
+    /// Whether `ArraySpeciesCreate` of a plain array of the active realm is
+    /// `%Array%`: `%Array.prototype%.constructor` is `%Array%` and its
+    /// `@@species` is the original getter, which answers `this`.
+    fn array_species_is_default(&self) -> bool {
+        let heap = &self.gc_heap;
+        let (Some(prototype), Some(array)) = (
+            self.realm_intrinsics.array_prototype(),
+            self.realm_intrinsics
+                .callable(crate::IntrinsicCallKind::Array),
+        ) else {
+            return false;
+        };
+        let constructor = matches!(
+            object::lookup_own(prototype, heap, "constructor"),
+            object::PropertyLookup::Data { value, .. } if value == Value::native_function(array)
+        );
+        let species = self
+            .well_known_symbols
+            .get(crate::symbol::WellKnown::Species);
+        constructor
+            && array
+                .own_symbol_property_descriptor(heap, species)
+                .is_some_and(|descriptor| {
+                    matches!(
+                        descriptor.kind,
+                        object::DescriptorKind::Accessor { getter: Some(getter), .. }
+                            if getter.as_native_function().is_some_and(|getter| {
+                                getter.is_static_fn(
+                                    heap,
+                                    crate::intrinsics::symbol::constructor_species_get,
+                                )
+                            })
+                    )
+                })
     }
 
     fn slice_copy_index(

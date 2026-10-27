@@ -139,13 +139,23 @@ impl Interpreter {
     /// Record the callable a baseline call site called while its feedback was
     /// still empty: baseline code counts the site through `executions`, the
     /// slot's execution count word, and reaches here once.
-    pub(crate) fn record_baseline_call_target(&self, executions: u64, callee: crate::Value) {
+    pub(crate) fn record_baseline_call_target(
+        &self,
+        executions: u64,
+        callee: crate::Value,
+        receiver: crate::Value,
+    ) {
         if executions == 0 {
             return;
         }
-        if let Some(target) = self.resolved_call_target(callee, crate::Value::undefined()) {
+        match self.resolved_call_target(callee, receiver) {
             // SAFETY: baseline code passes the count word of its own live site.
-            let _ = unsafe { crate::jit_feedback::record_call_at_executions(executions, target) };
+            Some(target) => {
+                let _ =
+                    unsafe { crate::jit_feedback::record_call_at_executions(executions, target) };
+            }
+            // SAFETY: as above.
+            None => unsafe { crate::jit_feedback::close_call_feedback_at_executions(executions) },
         }
     }
 

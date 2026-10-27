@@ -2892,6 +2892,29 @@ impl Interpreter {
             };
             let targets: Vec<_> = match state {
                 feedback::CallSiteDistribution::Mono(target) => vec![target],
+                // `f.call(...)` applying several functions: the site keeps
+                // the intrinsic's proof and calls whichever function it gets.
+                feedback::CallSiteDistribution::Poly(targets)
+                    if targets.iter().all(|target| {
+                        matches!(
+                            target.target,
+                            feedback::OrdinaryCallTarget::FunctionPrototypeCall(_)
+                        )
+                    }) =>
+                {
+                    if let Some(proof) =
+                        self.function_prototype_call_proof(view, context, op, instruction_pc)
+                    {
+                        view.function_prototype_calls.insert(
+                            call_byte_pc,
+                            jit::JitFunctionPrototypeCallSite {
+                                proof,
+                                callee: None,
+                            },
+                        );
+                    }
+                    continue;
+                }
                 feedback::CallSiteDistribution::Poly(targets) if op == Op::CallForwardArguments => {
                     self.record_jit_inline_candidate(
                         fid,
@@ -3103,10 +3126,15 @@ impl Interpreter {
                         if let Some(proof) =
                             self.function_prototype_call_proof(view, context, op, instruction_pc)
                         {
-                            view.function_prototype_calls.insert(
-                                call_byte_pc,
-                                jit::JitFunctionPrototypeCallSite { proof, callee },
-                            );
+                            // A second applied function leaves the site with
+                            // the proof alone.
+                            view.function_prototype_calls
+                                .entry(call_byte_pc)
+                                .and_modify(|site| site.callee = None)
+                                .or_insert(jit::JitFunctionPrototypeCallSite {
+                                    proof,
+                                    callee: Some(callee),
+                                });
                         }
                     } else {
                         view.direct_callees

@@ -2,7 +2,6 @@
 //!
 //! # Contents
 //! - Object/value and array-element barrier fast paths.
-//! - Published child-shape barriers for named and shared-cache transitions.
 //! - Leaving a shape: its stable byte, or a VM call when code watches it.
 //! - Deferred NoAlloc calls with complete live-register preservation.
 //!
@@ -10,7 +9,6 @@
 //! - A store commits before its barrier; these entries never collect or replay.
 //! - Operands are staged before any platform argument register is overwritten.
 //! - NoAlloc save packets are temporary scalar storage, never collector roots.
-//! - Shape-child temporaries carry no SSA value after the barrier.
 //!
 //! # See also
 //! - `otter_vm::runtime_stubs` owns barrier signatures and NoAlloc effects.
@@ -154,30 +152,6 @@ impl Codegen<'_> {
             codegen.emit_restore_registers(&live, saved);
             dynasm!(codegen.ops ; .arch x64 ; jmp =>done);
         }));
-    }
-
-    pub(super) fn emit_shape_child_barrier(
-        &mut self,
-        node: NodeId,
-        receiver: u8,
-        shape: u32,
-        child: u8,
-    ) {
-        self.load_immediate(child, u64::from(shape));
-        self.emit_dynamic_shape_child_barrier(node, receiver, child, child);
-    }
-
-    pub(super) fn emit_dynamic_shape_child_barrier(
-        &mut self,
-        node: NodeId,
-        receiver: u8,
-        shape: u8,
-        child: u8,
-    ) {
-        self.load_immediate(10, 0xffff_ffff_0000_0000);
-        dynasm!(self.ops ; .arch x64 ; and r10, Rq(receiver)
-            ; mov Rd(child), Rd(shape) ; add Rq(child), r10);
-        self.emit_cell_edge_barrier(node, receiver, child, &[]);
     }
 
     /// The barrier after storing `value` at `index` of the tagged slab whose

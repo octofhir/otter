@@ -662,6 +662,10 @@ struct Builder<'a> {
     /// Contexts of the closure an inlined body was baked against, by node:
     /// that body's snapshot and the parent hops from the closure's context.
     closure_contexts: FxHashMap<NodeId, (*const JitCompileSnapshot, u16)>,
+    /// Constant context-slot reads of a closure, by node: its function id.
+    /// The slot's dependency keeps that closure the value for the code's
+    /// lifetime.
+    constant_closures: FxHashMap<NodeId, u32>,
 }
 
 /// The most actual arguments a spliced body's elided `arguments[i]` selects
@@ -828,6 +832,7 @@ fn build_once(
         required_field_guards: FxHashSet::default(),
         field_nullish_candidates: FxHashMap::default(),
         closure_contexts: FxHashMap::default(),
+        constant_closures: FxHashMap::default(),
     };
     let entry = builder.graph.new_block();
     builder.start_entry(entry);
@@ -1140,7 +1145,21 @@ impl<'a> Builder<'a> {
 
     /// Whether `closure` is a guarded method read of this body whose holder
     /// slot the prototype proof fixes to one heap closure.
+    /// Whether `function` is a constant context-slot closure of the body
+    /// `plan` enters: a call of it needs no identity speculation, so a site
+    /// whose other identity proofs left still calls it directly.
+    fn constant_closure_of(
+        &self,
+        function: NodeId,
+        plan: otter_vm::jit::JitDirectCallPlan,
+    ) -> bool {
+        self.constant_closures.get(&function) == Some(&plan.function_id)
+    }
+
     fn proven_heap_closure(&self, closure: NodeId) -> bool {
+        if self.constant_closures.contains_key(&closure) {
+            return true;
+        }
         let Kind::LoadGuardedMethod {
             byte_pc, target, ..
         } = self.graph.node(closure).kind
@@ -1163,6 +1182,9 @@ impl<'a> Builder<'a> {
     /// [`otter_vm::jit::JitMethodGuard::slot_proven`]): the read's own guard
     /// already proved what a function check would.
     fn proven_method_of(&self, closure: NodeId, function_id: u32) -> bool {
+        if self.constant_closures.get(&closure) == Some(&function_id) {
+            return true;
+        }
         let Kind::LoadGuardedMethod {
             byte_pc, target, ..
         } = self.graph.node(closure).kind
@@ -2506,9 +2528,17 @@ impl<'a> Builder<'a> {
 
     /// The body baked for the plain call at `byte_pc` when it calls
     /// `function_id` and no earlier code left the site on a wrong callee.
-    fn inline_body(&self, byte_pc: u32, function_id: u32) -> Option<&'a Arc<JitCompileSnapshot>> {
+    fn inline_body(
+        &self,
+        byte_pc: u32,
+        function_id: u32,
+        callee: NodeId,
+    ) -> Option<&'a Arc<JitCompileSnapshot>> {
         let view: &'a JitCompileSnapshot = self.view;
-        if self.exited_for(ExitReason::IdentityGuard) {
+        // A constant closure keeps its identity whatever else left here.
+        if self.exited_for(ExitReason::IdentityGuard)
+            && self.constant_closures.get(&callee) != Some(&function_id)
+        {
             return None;
         }
         view.inline_callees
@@ -4014,7 +4044,7 @@ impl<'a> Builder<'a> {
         let callee = self.tagged(callee);
         if !construct
             && let Some(plan) = plan
-            && let Some(body) = self.inline_body(instruction.byte_pc, plan.function_id)
+            && let Some(body) = self.inline_body(instruction.byte_pc, plan.function_id, callee)
         {
             let values: SmallVec<[NodeId; 8]> = arguments
                 .iter()
@@ -4033,7 +4063,7 @@ impl<'a> Builder<'a> {
         if let Some(plan) = plan
             && let Some(allocation) = allocation
             && self.view.literal_allocations.group_allowed
-            && let Some(body) = self.inline_body(instruction.byte_pc, plan.function_id)
+            && let Some(body) = self.inline_body(instruction.byte_pc, plan.function_id, callee)
         {
             let values: SmallVec<[NodeId; 8]> = arguments
                 .iter()
@@ -4111,7 +4141,7 @@ impl<'a> Builder<'a> {
         // Strict non-arrows bind this value as-is; sloppy bodies also do so
         // when this actual receiver already has an Object proof.
         if let Some(plan) = plan
-            && let Some(body) = self.inline_body(instruction.byte_pc, plan.function_id)
+            && let Some(body) = self.inline_body(instruction.byte_pc, plan.function_id, callee)
             && self.binds_this_as_is(body, plan, receiver)
             && self.inline_call(instruction, body, plan, callee, receiver, arguments)
         {
@@ -4563,7 +4593,7 @@ impl<'a> Builder<'a> {
             let identity_left = self.exited_for(ExitReason::IdentityGuard);
             let plan = site
                 .callee
-                .filter(|_| !identity_left)
+                .filter(|callee| !identity_left || self.constant_closure_of(this, callee.plan))
                 .map(|callee| callee.plan);
             // After an identity exit only the intrinsic is checked, with an
             // exit of its own: a second exit keeps the ordinary call.
@@ -4715,6 +4745,10 @@ impl<'a> Builder<'a> {
             let call_native_ref = site.proof.call_native_ref;
             let function = self.read(receiver);
             let function = self.tagged(function);
+            let plan = site
+                .callee
+                .filter(|callee| self.constant_closure_of(function, callee.plan))
+                .map(|callee| callee.plan);
             let method = self.named_lookup(byte_pc, function);
             self.add(
                 Kind::CheckNative(call_native_ref, DeoptReason::WrongType),
@@ -4728,7 +4762,7 @@ impl<'a> Builder<'a> {
                     self.tagged(value)
                 })
                 .collect();
-            return self.emit_function_prototype_call(instruction, function, &arguments, None);
+            return self.emit_function_prototype_call(instruction, function, &arguments, plan);
         }
         let view: &'a JitCompileSnapshot = self.view;
         let methods = (!self.exited_for(ExitReason::ShapeGuard)
@@ -5630,8 +5664,12 @@ impl<'a> Builder<'a> {
                 cell,
                 object,
                 shape,
+                function,
             } => {
                 let value = self.add(Kind::LoadCellValue(cell), &[], Repr::Tagged);
+                if let Some(function) = function {
+                    self.constant_closures.insert(value, function);
+                }
                 let info = self.known.entry(value);
                 info.heap_object = object;
                 if shape != 0 {

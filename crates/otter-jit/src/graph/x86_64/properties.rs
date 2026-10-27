@@ -196,7 +196,7 @@ impl Codegen<'_> {
                 byte_pc,
                 input(0),
                 None,
-                [assigned.gp_temps[0], assigned.gp_temps[1]],
+                assigned.gp_temps[0],
                 Some(result()),
             )?,
             Kind::StoreNamedProperty {
@@ -210,7 +210,7 @@ impl Codegen<'_> {
                 } else {
                     input(1)
                 }),
-                [assigned.gp_temps[0], assigned.gp_temps[1]],
+                assigned.gp_temps[0],
                 None,
             )?,
             Kind::StoreBodySlot(slot) => {
@@ -398,7 +398,7 @@ impl Codegen<'_> {
         pc: u32,
         receiver: u8,
         value: Option<u8>,
-        [holder, scratch]: [u8; 2],
+        holder: u8,
         destination: Option<u8>,
     ) -> Result<(), Unsupported> {
         let (receiver_shape, proved) = match self.graph.node(node).kind {
@@ -717,12 +717,10 @@ impl Codegen<'_> {
                             );
                             owner = 0;
                         }
-                        // A fresh receiver is a young, unmarked buffer cell
-                        // and no marking can have started since: the edge to
-                        // its new shape owes no barrier.
-                        if !fresh {
-                            self.emit_shape_child_barrier(node, receiver, shape, scratch);
-                        }
+                        // The published shape is an old, nonmoving cell the
+                        // installed code retains as a strong root, which every
+                        // marking cycle shades at its start and finish: the
+                        // edge owes neither barrier half.
                     }
                     _ => {
                         return Err(Unsupported::OperandShape(

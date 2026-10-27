@@ -3642,6 +3642,9 @@ impl Interpreter {
                     cell: self.bake_held_identity_cell(value),
                     object: value.is_object_type(),
                     shape,
+                    function: value
+                        .as_closure(&self.gc_heap)
+                        .map(|closure| closure.cached_function_id),
                 }
             } else {
                 jit::JitConstantValue::Bits(value.to_bits())

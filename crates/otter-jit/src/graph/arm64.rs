@@ -50,7 +50,8 @@
 //!   runtime feedback; stores reject prototype role before any effect.
 //! - Shape transitions clear the source shape's stability byte before
 //!   publishing the child shape, through the VM when code subscribed to it;
-//!   allocation stores establish the initial shape.
+//!   allocation stores establish the initial shape. A published shape is a
+//!   strong root of the installed code, so its edge owes no barrier.
 //! - Named loads omit only a receiver shape guard matching their live exact
 //!   proof. Holder, prototype-validity and dictionary guards remain intact;
 //!   an inherited method load relies on its chain proof as a code dependency.
@@ -3440,12 +3441,10 @@ impl<'a> Codegen<'a> {
                             );
                             owner = 0;
                         }
-                        // A fresh receiver is a young, unmarked buffer cell and
-                        // no marking can have started since: the edge to its
-                        // new shape owes no barrier.
-                        if !fresh {
-                            self.emit_shape_child_barrier(node, receiver, shape, scratch);
-                        }
+                        // The published shape is an old, nonmoving cell the
+                        // installed code retains as a strong root, which every
+                        // marking cycle shades at its start and finish: the
+                        // edge owes neither barrier half.
                     }
                     _ => return Err(Unsupported::OperandShape("graph named store operation")),
                 }
@@ -4080,69 +4079,6 @@ impl<'a> Codegen<'a> {
                     16,
                     otter_vm::runtime_stubs::CONTEXT_SLOT_WRITTEN.entry_addr() as u64,
                     RelocationTarget::runtime_stub(abi::STUB_CONTEXT_SLOT_WRITTEN),
-                );
-                dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
-                codegen.emit_restore_registers(&live, saved);
-                dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
-            }));
-    }
-
-    /// The generational and marking barrier for the edge from the receiver
-    /// to the child shape a transition just published.
-    fn emit_shape_child_barrier(&mut self, node: NodeId, receiver: u8, shape: u32, child: u8) {
-        let flags_byte = self.view.gc_barrier.header_flags_byte;
-        let young = self.view.gc_barrier.young_flag;
-        let settled = young | self.view.gc_barrier.remembered_flag;
-        let slow = self.ops.new_dynamic_label();
-        let done = self.ops.new_dynamic_label();
-        self.load_immediate(17, u64::from(shape));
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; and XSP(child), X(receiver), #0xffff_ffff_0000_0000
-            ; add X(child), X(child), x17
-            ; ldr x16, [x20, THREAD_OFFSET]
-            ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
-            ; ldrb w16, [x16]
-            ; cbz w16, >generational
-            // While marking runs, a white old shape owes the insertion barrier.
-            ; ldrb w16, [X(child), flags_byte]
-            ; movz w17, u32::from(young)
-            ; tst w16, w17
-            ; b.ne >generational
-            ; movz w17, self.view.gc_barrier.mark_color_bits
-            ; tst w16, w17
-            ; b.eq =>slow
-            ; generational:
-            ; ldrb w16, [X(receiver), flags_byte]
-            ; movz w17, u32::from(settled)
-            ; tst w16, w17
-            ; b.ne =>done
-            ; ldrb w16, [X(child), flags_byte]
-            ; movz w17, u32::from(young)
-            ; tst w16, w17
-            ; b.ne =>slow
-            ; =>done
-        );
-        let live = self.allocation.node(node).live_registers.clone();
-        self.deferred
-            .push(Box::new(move |codegen: &mut Codegen<'a>| {
-                dynasm!(codegen.ops ; .arch aarch64 ; =>slow);
-                let saved = codegen.emit_save_registers(&live);
-                dynasm!(codegen.ops
-                    ; .arch aarch64
-                    ; mov x16, X(receiver)
-                    ; mov x17, X(child)
-                    ; ldr x0, [x20, THREAD_OFFSET]
-                    ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]
-                    ; mov x1, x16
-                    ; mov x2, x17
-                );
-                emit_load_symbol_u64(
-                    &mut codegen.ops,
-                    &mut codegen.relocations,
-                    16,
-                    otter_vm::runtime_stubs::WRITE_BARRIER_MUTATING.entry_addr() as u64,
-                    RelocationTarget::runtime_stub(abi::STUB_WRITE_BARRIER),
                 );
                 dynasm!(codegen.ops ; .arch aarch64 ; blr x16);
                 codegen.emit_restore_registers(&live, saved);

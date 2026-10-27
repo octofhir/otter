@@ -86,6 +86,7 @@ fn emit_count_call(
             ; jne =>recorded
             ; mov rsi, r11
             ; mov rdi, r15
+            ; mov ecx, otter_vm::Value::UNDEFINED.to_bits() as i32
         );
         super::emit_load_reg(ops, 2, callee);
         super::emit_load_runtime_stub(
@@ -94,9 +95,61 @@ fn emit_count_call(
             transitions.variadic_entry(abi::STUB_JIT_RECORD_CALL_TARGET),
             abi::STUB_JIT_RECORD_CALL_TARGET,
         );
-        super::emit_variadic_call(ops, abi::STUB_JIT_RECORD_CALL_TARGET, 3);
+        super::emit_variadic_call(ops, abi::STUB_JIT_RECORD_CALL_TARGET, 4);
         dynasm!(ops ; .arch x64 ; =>recorded);
     }
+    Ok(())
+}
+
+/// Record the method a baseline method call resolved, with its receiver,
+/// while the site's call feedback is still empty, as the interpreter would
+/// have: a `f.call(…)` site then names `f`. The method stays in `rax`.
+/// Clobbers `r11` and the caller-saved registers on that one recording call.
+pub(super) fn emit_record_method_target(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    transitions: &crate::entry::TransitionTable,
+    view: &otter_vm::JitCompileSnapshot,
+    pc: u32,
+    receiver: u16,
+) -> Result<(), Unsupported> {
+    let Some(cell) = view
+        .instructions
+        .get(pc as usize)
+        .map(|instruction| instruction.call_count_cell)
+        .filter(|&cell| cell != 0)
+    else {
+        return Ok(());
+    };
+    let recorded = ops.new_dynamic_label();
+    crate::x86_64::values::emit_load_symbol_u64(
+        ops,
+        relocations,
+        11,
+        cell,
+        crate::artifact::relocation::RelocationTarget::CallCountCell {
+            function_id: view.code_block.id,
+            pc,
+        },
+    );
+    dynasm!(ops ; .arch x64
+        ; cmp BYTE [r11 + otter_vm::jit_feedback::CALL_FEEDBACK_STATE_FROM_EXECUTIONS], 0
+        ; jne =>recorded
+        ; sub rsp, 16
+        ; mov [rsp], rax
+        ; mov rdx, rax
+        ; mov rsi, r11
+        ; mov rdi, r15
+    );
+    super::emit_load_reg(ops, 1, receiver);
+    super::emit_load_runtime_stub(
+        ops,
+        relocations,
+        transitions.variadic_entry(abi::STUB_JIT_RECORD_CALL_TARGET),
+        abi::STUB_JIT_RECORD_CALL_TARGET,
+    );
+    super::emit_variadic_call(ops, abi::STUB_JIT_RECORD_CALL_TARGET, 4);
+    dynasm!(ops ; .arch x64 ; mov rax, [rsp] ; add rsp, 16 ; =>recorded);
     Ok(())
 }
 

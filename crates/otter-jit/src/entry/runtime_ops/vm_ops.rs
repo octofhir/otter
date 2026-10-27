@@ -204,11 +204,16 @@ pub(crate) extern "C" fn jit_record_call_target_stub(
     ctx: *mut JitCtx,
     executions: u64,
     callee_bits: u64,
+    receiver_bits: u64,
 ) -> u64 {
     // SAFETY: the live `JitCtx` reentry contract.
     let ctx = unsafe { &mut *ctx };
     if let Ok(mut runtime) = ctx.runtime_call() {
-        runtime.record_baseline_call_target(executions, Value::from_bits(callee_bits));
+        runtime.record_baseline_call_target(
+            executions,
+            Value::from_bits(callee_bits),
+            Value::from_bits(receiver_bits),
+        );
     }
     NativeResultStatus::Success as u64
 }

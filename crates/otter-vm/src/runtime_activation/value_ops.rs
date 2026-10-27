@@ -403,10 +403,10 @@ impl RuntimeCall<'_> {
     }
 
     /// Record the callable `callee` a baseline call site with empty feedback
-    /// called; `executions` is the site's execution count word.
-    pub fn record_baseline_call_target(&mut self, executions: u64, callee: Value) {
+    /// called on `receiver`; `executions` is the site's execution count word.
+    pub fn record_baseline_call_target(&mut self, executions: u64, callee: Value, receiver: Value) {
         let vm = unsafe { &*self.vm.as_ptr() };
-        vm.record_baseline_call_target(executions, callee);
+        vm.record_baseline_call_target(executions, callee, receiver);
     }
 
     /// Allocate the published `Op::NewObjectLiteral` object from boxed values

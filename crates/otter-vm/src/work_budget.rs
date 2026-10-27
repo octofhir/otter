@@ -359,26 +359,25 @@ pub(crate) struct RuntimeHeapSnapshot {
 
 impl RuntimeHeapSnapshot {
     pub(crate) fn from_heap(heap: &mut GcHeap) -> Self {
+        // Counters only: a checkpoint runs every turn and must not complete
+        // a lazy sweep the way a full statistics read does.
         let heap_stats = heap.stats();
-        let stats = heap.gc_stats();
-        let allocated_objects_total = stats
-            .by_type
-            .iter()
-            .fold(0_u64, |acc, row| acc.saturating_add(row.alloc_count_total));
+        let (allocated_objects_total, allocated_bytes_total, live_bytes) =
+            heap.allocation_counters();
+        let (gc_cycles, minor_gc_cycles, minor_slots_scanned) = heap.collection_counters();
         Self {
             allocated_objects_total,
-            allocated_bytes_total: stats.alloc_bytes_total,
-            live_bytes: u64::try_from(stats.live_bytes).unwrap_or(u64::MAX),
+            allocated_bytes_total,
+            live_bytes: u64::try_from(live_bytes).unwrap_or(u64::MAX),
             tracked_heap_bytes: heap_stats.tracked_bytes,
             external_reserved_bytes: heap_stats.reserved_bytes,
             // Full collections have no cumulative visited-slot counter yet;
             // give each cycle a fixed base cost. Minor collections expose the
             // exact slot walk, plus a fixed cycle cost for root processing.
-            gc_work_total: stats
-                .gc_cycles
+            gc_work_total: gc_cycles
                 .saturating_mul(1_024)
-                .saturating_add(stats.minor_gc_cycles.saturating_mul(64))
-                .saturating_add(stats.minor_slots_scanned),
+                .saturating_add(minor_gc_cycles.saturating_mul(64))
+                .saturating_add(minor_slots_scanned),
         }
     }
 }

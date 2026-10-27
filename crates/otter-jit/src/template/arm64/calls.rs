@@ -2006,6 +2006,7 @@ pub(super) fn emit_method_call(
         fatal,
     )?;
     dynasm!(ops ; .arch aarch64 ; =>resolved);
+    super::emit_record_method_target(ops, relocations, table, view, logical_pc, receiver)?;
     emit_trampoline_call(
         ops,
         relocations,

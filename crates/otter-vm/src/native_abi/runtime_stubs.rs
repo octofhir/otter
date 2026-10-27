@@ -2280,7 +2280,9 @@ pub const STUB_REST_ARRAY_ALLOC: RuntimeStubDescriptor = descriptor(
 );
 
 /// Record the callable a baseline call site called while its feedback was
-/// empty: the site's execution count word and the boxed callee. It neither
+/// empty: the site's execution count word, the boxed callee and its receiver
+/// (`undefined` for a plain call; a method call's receiver names the function
+/// a `%Function.prototype.call%` method calls). It neither
 /// allocates nor runs JavaScript, and always reports success; it is entered
 /// through the ordinary runtime transition.
 pub const STUB_JIT_RECORD_CALL_TARGET: RuntimeStubDescriptor = descriptor(

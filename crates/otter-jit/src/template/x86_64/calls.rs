@@ -577,8 +577,16 @@ pub(super) fn emit_method_call(
         ; je =>throw_value
         ; jmp =>threw
         ; =>resolved
-        ; mov r9, rax
     );
+    super::operation::emit_record_method_target(
+        ops,
+        relocations,
+        table,
+        view,
+        logical_pc,
+        receiver,
+    )?;
+    dynasm!(ops ; .arch x64 ; mov r9, rax);
     emit_call(
         ops,
         relocations,

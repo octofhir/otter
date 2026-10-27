@@ -163,6 +163,16 @@ impl Codegen<'_> {
                     ; cmp BYTE [Rq(input(0))], class.type_tag as i8 ; jne =>exit
                     ; mov Rq(destination), [Rq(input(0)) + class.ctor_byte as i32]);
             }
+            Kind::CheckSymbolAtom(atom) => {
+                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                let symbol = self.view.symbol_layout;
+                let value = input(0);
+                self.emit_cell_guard(value, exit);
+                dynasm!(self.ops ; .arch x64
+                    ; cmp BYTE [Rq(value)], symbol.type_tag as i8 ; jne =>exit
+                    ; cmp DWORD [Rq(value) + symbol.atom_byte as i32], atom as i32 ; jne =>exit
+                );
+            }
             Kind::CheckCellValue(cell) => {
                 let exit = self.eager_exit(node, DeoptReason::WrongValue);
                 let target = RelocationTarget::CalleeIdentityCell {

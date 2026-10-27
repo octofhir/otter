@@ -1527,6 +1527,29 @@ impl Interpreter {
                                 );
                             }
                         }
+                        // A symbol key read from an ordinary object goes through
+                        // the site's cache bound to that symbol.
+                        if let (Some(recv_reg), Some(key_reg)) =
+                            (function.register(instr, 1), function.register(instr, 2))
+                            && let (Ok(&recv), Ok(&key)) = (
+                                read_register(&(*top_frame!()), recv_reg),
+                                read_register(&(*top_frame!()), key_reg),
+                            )
+                            && key.is_symbol()
+                            && let Some(value) = self.keyed_symbol_load(
+                                context,
+                                function_id,
+                                instr.instruction_pc,
+                                recv,
+                                key,
+                            )
+                            && let Some(dst) = function.register(instr, 0)
+                        {
+                            let frame = &mut (*top_frame!());
+                            write_register(frame, dst, value)?;
+                            frame.advance_pc()?;
+                            continue 'activation;
+                        }
                         if match self.drive_load_element(stack, context, operands) {
                             Ok(value) => value,
                             Err(CommittedValueError::JavaScript(error)) => return Err(error),
@@ -1752,6 +1775,36 @@ impl Interpreter {
                             let frame = ActiveFrameRef::from_frame(&(*top_frame!()));
                             (
                                 frame.function_id(),
+                                frame.read(recv_reg)?,
+                                frame.read(idx_reg)?,
+                                frame.read(src_reg)?,
+                            )
+                        };
+                        if key.is_symbol() {
+                            match self.keyed_symbol_store(
+                                stack,
+                                context,
+                                function_id,
+                                instr.instruction_pc,
+                                receiver,
+                                key,
+                                value,
+                            ) {
+                                Ok(true) => {
+                                    top_frame!().advance_pc()?;
+                                    continue 'activation;
+                                }
+                                Ok(false) => {}
+                                Err(CommittedValueError::JavaScript(error)) => return Err(error),
+                                Err(CommittedValueError::Fatal(error)) => {
+                                    return Ok(DispatchOutcome::Fatal(error));
+                                }
+                            }
+                        }
+                        // The store above may have collected: re-read the operands.
+                        let (receiver, key, value) = {
+                            let frame = ActiveFrameRef::from_frame(&(*top_frame!()));
+                            (
                                 frame.read(recv_reg)?,
                                 frame.read(idx_reg)?,
                                 frame.read(src_reg)?,

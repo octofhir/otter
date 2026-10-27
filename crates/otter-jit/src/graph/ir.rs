@@ -811,6 +811,9 @@ pub(crate) enum Kind {
     /// Eager deopt once the activation has materialized its arguments
     /// object: its actual arguments are then that object's elements.
     CheckArgumentsElided,
+    /// Eager deopt unless input0 is a symbol whose hidden-class atom is the
+    /// immediate: the one key an element site's named programs serve.
+    CheckSymbolAtom(u32),
     /// Eager deopt unless the native stack keeps [`TAIL_CALL_STACK_RESERVE`]
     /// bytes above its limit: a strict tail call then runs as an ordinary
     /// call, and past it the baseline replaces the frame.
@@ -1128,6 +1131,7 @@ impl Kind {
             | Self::CheckFunction { .. }
             | Self::LoadClassConstructor
             | Self::CheckCellValue(_)
+            | Self::CheckSymbolAtom(_)
             | Self::CheckNotHole
             | Self::LoadGuardedMethod { .. }
             | Self::LoadShapedProperty { .. }
@@ -1584,6 +1588,7 @@ impl Kind {
             },
             Self::CheckFunction { .. }
             | Self::CheckCellValue(_)
+            | Self::CheckSymbolAtom(_)
             | Self::CheckNotHole
             | Self::CheckNative(..) => simple(1, ResultPolicy::None),
             Self::LoadClassConstructor => simple(1, ResultPolicy::Register),

@@ -3434,7 +3434,18 @@ impl<'a> Builder<'a> {
         if self.try_accessor_call(instruction, Some(instruction.reads[1])) {
             return;
         }
-        let receiver = self.read(instruction.reads[0]);
+        self.visit_store_property_regs(instruction, instruction.reads[0], instruction.reads[1]);
+    }
+
+    /// The named store of the value in `value_reg` into the object in
+    /// `object_reg`, by the programs of `instruction`'s site.
+    fn visit_store_property_regs(
+        &mut self,
+        instruction: &Instruction,
+        object_reg: u16,
+        value_reg: u16,
+    ) {
+        let receiver = self.read(object_reg);
         let receivers = self.known_shapes(receiver);
         let Some(access) = (!self.exited_for(ExitReason::ShapeGuard))
             .then(|| {
@@ -3446,17 +3457,17 @@ impl<'a> Builder<'a> {
             })
             .flatten()
         else {
-            return self.visit_named_store(instruction);
+            return self.visit_named_store(instruction, object_reg, value_reg);
         };
-        let object = self.read(instruction.reads[0]);
+        let object = self.read(object_reg);
         let object = self.tagged(object);
-        let value = self.read(instruction.reads[1]);
+        let value = self.read(value_reg);
         let double = self.graph.node(value).repr == Repr::Float64;
         let value = if double { value } else { self.tagged(value) };
         let object = self.property_storage(object, access.projection);
         self.check_shapes(object, &access.shapes, true);
         let Some(owners) = self.field_store_owners(&access.shapes, access.field, value) else {
-            return self.visit_named_store(instruction);
+            return self.visit_named_store(instruction, object_reg, value_reg);
         };
         self.add(
             if double {
@@ -3495,10 +3506,11 @@ impl<'a> Builder<'a> {
         layout.writable = true;
     }
 
-    /// A named store that is not one existing own slot: a store through its
+    /// A named store of the value in `value_reg` into the object in
+    /// `object_reg` that is not one existing own slot: a store through its
     /// feedback programs, a deopt for a site that never ran, or the baseline
     /// operation.
-    fn visit_named_store(&mut self, instruction: &Instruction) {
+    fn visit_named_store(&mut self, instruction: &Instruction, object_reg: u16, value_reg: u16) {
         self.known.checked_field_types.clear();
         let byte_pc = instruction.byte_pc;
         // An exotic body's own data slot: the write keeps every ordinary
@@ -3506,9 +3518,9 @@ impl<'a> Builder<'a> {
         if !self.exited_for(ExitReason::ShapeGuard)
             && let Some(slot) = super::feedback::body_slot_store(self.view, byte_pc)
         {
-            let object = self.read(instruction.reads[0]);
+            let object = self.read(object_reg);
             let object = self.tagged(object);
-            let value = self.read(instruction.reads[1]);
+            let value = self.read(value_reg);
             let value = self.tagged(value);
             self.add(Kind::StoreBodySlot(slot), &[object, value], Repr::None);
             self.write_barrier(object, value);
@@ -3522,7 +3534,7 @@ impl<'a> Builder<'a> {
         {
             None
         } else {
-            let object = self.read(instruction.reads[0]);
+            let object = self.read(object_reg);
             let view: &'a JitCompileSnapshot = self.view;
             match self.known_shapes(object).as_deref() {
                 Some(&[shape]) => view
@@ -3542,10 +3554,10 @@ impl<'a> Builder<'a> {
         if let Some((projection, programs)) = site {
             use otter_vm::JitCacheIrOp as Op;
             let proved = proved.is_some();
-            let object = self.read(instruction.reads[0]);
+            let object = self.read(object_reg);
             let object = self.tagged(object);
             let object = self.property_storage(object, projection);
-            let source_value = self.read(instruction.reads[1]);
+            let source_value = self.read(value_reg);
             let receiver_operand =
                 if projection == otter_vm::jit::PropertyStorageProjection::ArrayExpando {
                     1
@@ -3616,7 +3628,7 @@ impl<'a> Builder<'a> {
             } else {
                 self.tagged(source_value)
             };
-            let Some(owners) = self.named_store_owners(programs, projection, instruction, value)
+            let Some(owners) = self.named_store_owners(programs, projection, object_reg, value)
             else {
                 return self.generic(instruction);
             };
@@ -3718,9 +3730,9 @@ impl<'a> Builder<'a> {
         if instruction.op != Op::StoreProperty {
             return self.generic(instruction);
         }
-        let object = self.read(instruction.reads[0]);
+        let object = self.read(object_reg);
         let object = self.tagged(object);
-        let value = self.read(instruction.reads[1]);
+        let value = self.read(value_reg);
         let value = self.tagged(value);
         self.add(
             Kind::StorePropertyCached { pc: self.pc },
@@ -3739,13 +3751,13 @@ impl<'a> Builder<'a> {
         &mut self,
         programs: &[otter_vm::JitCacheIrProgram],
         projection: otter_vm::jit::PropertyStorageProjection,
-        instruction: &Instruction,
+        object_reg: u16,
         value: NodeId,
     ) -> Option<SmallVec<[FieldStoreOwner; 4]>> {
         use otter_vm::JitCacheIrOp as Op;
         let operand =
             u8::from(projection == otter_vm::jit::PropertyStorageProjection::ArrayExpando);
-        let receiver = self.read(instruction.reads[0]);
+        let receiver = self.read(object_reg);
         let aliased = receiver == value;
         let bound = self.store_value_bound(value);
         programs
@@ -5302,7 +5314,55 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// An element site whose cache serves one symbol key reads it as a named
+    /// load does, after proving the key is that symbol.
+    fn keyed_symbol_load(&mut self, instruction: &Instruction) -> bool {
+        let byte_pc = instruction.byte_pc;
+        let Some(&atom) = self.view.keyed_symbol_atoms.get(&byte_pc) else {
+            return false;
+        };
+        if self.exited_for(ExitReason::ShapeGuard) || self.exited_for(ExitReason::IdentityGuard) {
+            return false;
+        }
+        let receiver = self.read(instruction.reads[0]);
+        let receiver = self.tagged(receiver);
+        let receivers = self.known_shapes(receiver);
+        if super::feedback::named_load_programs(self.view, byte_pc, receivers.as_deref()).is_none()
+        {
+            return false;
+        }
+        let key = self.read(instruction.reads[1]);
+        let key = self.tagged(key);
+        self.add(Kind::CheckSymbolAtom(atom), &[key], Repr::None);
+        let value = self.named_lookup(byte_pc, receiver);
+        self.write(instruction.writes[0], value);
+        true
+    }
+
+    /// An element site whose cache serves one symbol key writes it as a
+    /// named store does, after proving the key is that symbol.
+    fn keyed_symbol_store(&mut self, instruction: &Instruction) -> bool {
+        let byte_pc = instruction.byte_pc;
+        let Some(&atom) = self.view.keyed_symbol_atoms.get(&byte_pc) else {
+            return false;
+        };
+        if self.exited_for(ExitReason::ShapeGuard) || self.exited_for(ExitReason::IdentityGuard) {
+            return false;
+        }
+        if super::feedback::named_store_programs(self.view, byte_pc).is_none() {
+            return false;
+        }
+        let key = self.read(instruction.reads[1]);
+        let key = self.tagged(key);
+        self.add(Kind::CheckSymbolAtom(atom), &[key], Repr::None);
+        self.visit_store_property_regs(instruction, instruction.reads[0], instruction.reads[2]);
+        true
+    }
+
     fn visit_load_element(&mut self, instruction: &Instruction) {
+        if self.keyed_symbol_load(instruction) {
+            return;
+        }
         let access = match self.element_access(instruction) {
             Ok(access) => access,
             Err(true) => return self.deopt(DeoptReason::InsufficientFeedback),
@@ -5395,6 +5455,9 @@ impl<'a> Builder<'a> {
     }
 
     fn visit_store_element(&mut self, instruction: &Instruction) {
+        if self.keyed_symbol_store(instruction) {
+            return;
+        }
         let access = match self.element_access(instruction) {
             Ok(access) => access,
             Err(true) => return self.deopt(DeoptReason::InsufficientFeedback),

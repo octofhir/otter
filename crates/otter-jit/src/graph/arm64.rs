@@ -2581,6 +2581,23 @@ impl<'a> Codegen<'a> {
             }
             Kind::NewReceiver(plan) => self.emit_new_receiver(node, *plan)?,
             Kind::CheckReceiverPlan(plan) => self.emit_check_receiver_plan(node, *plan),
+            Kind::CheckSymbolAtom(atom) => {
+                let value = Self::gp(input(0));
+                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                let symbol = self.view.symbol_layout;
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; tst X(value), #0xfffe_0000_0000_0007
+                    ; b.ne =>exit
+                    ; cbz X(value), =>exit
+                    ; ldrb w16, [X(value)]
+                    ; cmp w16, u32::from(symbol.type_tag)
+                    ; b.ne =>exit
+                    ; ldr w16, [X(value), symbol.atom_byte]
+                );
+                self.load_immediate(17, u64::from(*atom));
+                dynasm!(self.ops ; .arch aarch64 ; cmp w16, w17 ; b.ne =>exit);
+            }
             Kind::CheckCellValue(cell) => {
                 let value = Self::gp(input(0));
                 let exit = self.eager_exit(node, DeoptReason::WrongValue);

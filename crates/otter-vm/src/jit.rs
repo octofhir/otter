@@ -769,6 +769,12 @@ pub struct JitCompileSnapshot {
     /// layout never reaches the emitter, so a second element-bearing family
     /// costs a declaration.
     pub element_accesses: rustc_hash::FxHashMap<u32, JitElementAccess>,
+    /// Element sites whose cache serves one symbol key, by byte PC: the
+    /// symbol's atom. Their named programs are in `property_programs`; a
+    /// generated access proves the key's atom first.
+    pub keyed_symbol_atoms: rustc_hash::FxHashMap<u32, u32>,
+    /// Where a symbol body keeps its atom, for that proof.
+    pub symbol_layout: JitSymbolLayout,
     /// The active realm's Array iteration proof, when the function opens or
     /// closes a synchronous iterator record and the proof holds at compile
     /// time (see [`JitArrayIteration`]).
@@ -1832,6 +1838,28 @@ pub struct JitMethodTarget {
     pub inline_fields: Option<JitMethodInlineFields>,
 }
 
+/// A symbol body's type tag and the offset of the atom it keys hidden-class
+/// slots by.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JitSymbolLayout {
+    /// `GcHeader::type_tag` of a symbol body.
+    pub type_tag: u8,
+    /// Header-inclusive offset of the `u32` atom.
+    pub atom_byte: u32,
+}
+
+impl JitSymbolLayout {
+    /// The current symbol body layout.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            type_tag: crate::symbol::SYMBOL_BODY_TYPE_TAG,
+            atom_byte: otter_gc::header::HEADER_SIZE as u32
+                + std::mem::offset_of!(crate::symbol::SymbolBody, atom) as u32,
+        }
+    }
+}
+
 /// Offsets a generated `.length` read on a typed view uses. The read is the
 /// view's own cached element count, which is exact while the view has no
 /// named own property (the only state a `length` read consults besides the
@@ -2458,6 +2486,8 @@ impl JitCompileSnapshot {
             array_layout: JitArrayLayout::default(),
             typed_array_length: JitTypedArrayLengthLayout::default(),
             element_accesses: rustc_hash::FxHashMap::default(),
+            keyed_symbol_atoms: rustc_hash::FxHashMap::default(),
+            symbol_layout: JitSymbolLayout::current(),
             array_iteration: None,
             unseen_element_sites: rustc_hash::FxHashSet::default(),
             out_of_bounds_element_sites: rustc_hash::FxHashSet::default(),

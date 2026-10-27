@@ -197,6 +197,125 @@ impl Interpreter {
         Ok(result)
     }
 
+    /// The element site at `instruction_pc` reading a symbol key from an
+    /// ordinary object, through the site's named cache bound to that symbol:
+    /// a cached or newly resolved data slot, or `undefined` for a key the
+    /// chain lacks. `None` leaves the access to the full keyed path: another
+    /// receiver, another key at a site bound to one, or an accessor.
+    /// Neither allocates nor runs code.
+    pub(crate) fn keyed_symbol_load(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        instruction_pc: u32,
+        receiver: Value,
+        key: Value,
+    ) -> Option<Value> {
+        let symbol = key.as_symbol(&self.gc_heap)?;
+        let obj = receiver.as_object()?;
+        if !object::supports_fast_property_ic(obj, &self.gc_heap) {
+            return None;
+        }
+        let slot =
+            context.property_feedback_slot(function_id, instruction_pc, PropertyIcKind::Load)?;
+        let atom = symbol.property_atom(&mut self.gc_heap);
+        if !slot.native().bind_keyed_atom(atom.raw()) {
+            return None;
+        }
+        if let Some(LoadHit::Value(value)) = slot.probe_load_hit(obj, &self.gc_heap) {
+            slot.record_hit();
+            return Some(value);
+        }
+        slot.record_miss();
+        let key = crate::property_atom::AtomizedPropertyKey::symbol(atom, symbol.handle());
+        let load = self.resolve_property_load(obj, key);
+        self.update_load_ic(slot, obj, &load);
+        match load {
+            crate::property_cache::PropertyLoad::Data(resolved) => Some(resolved.value),
+            crate::property_cache::PropertyLoad::Absent(_) => Some(Value::undefined()),
+            crate::property_cache::PropertyLoad::Other => None,
+        }
+    }
+
+    /// The element site at `instruction_pc` writing a symbol key into an
+    /// ordinary object through its named cache bound to that symbol, as a
+    /// named store does: a cached slot or add, an existing writable own
+    /// slot, or an add the receiver's chain allows. `false` leaves the store
+    /// to the full keyed path, with nothing written. The add may collect; it
+    /// roots the stack and both values.
+    pub(crate) fn keyed_symbol_store(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        function_id: u32,
+        instruction_pc: u32,
+        receiver: Value,
+        key: Value,
+        mut value: Value,
+    ) -> Result<bool, CommittedValueError> {
+        let (Some(symbol), Some(mut obj)) = (key.as_symbol(&self.gc_heap), receiver.as_object())
+        else {
+            return Ok(false);
+        };
+        if self.is_array_prototype_object(obj)
+            || !object::supports_fast_property_ic(obj, &self.gc_heap)
+            || object::state(obj, &self.gc_heap).is_prototype()
+        {
+            return Ok(false);
+        }
+        let Some(slot) =
+            context.property_feedback_slot(function_id, instruction_pc, PropertyIcKind::Store)
+        else {
+            return Ok(false);
+        };
+        let atom = symbol.property_atom(&mut self.gc_heap);
+        if !slot.native().bind_keyed_atom(atom.raw()) {
+            return Ok(false);
+        }
+        let key = crate::property_atom::AtomizedPropertyKey::symbol(atom, symbol.handle());
+        if slot
+            .probe_store(obj, &mut self.gc_heap, key, &value)
+            .map_err(|error| CommittedValueError::JavaScript(error.into()))?
+        {
+            slot.record_hit();
+            return Ok(true);
+        }
+        slot.record_miss();
+        if slot.is_megamorphic()
+            || !matches!(
+                object::resolve_set_atomized(obj, &self.gc_heap, key),
+                object::SetOutcome::AssignData
+            )
+        {
+            return Ok(false);
+        }
+        if let Some((handler, hit)) =
+            crate::property_ic::IcHandler::store_existing_hit(obj, &self.gc_heap, key)
+        {
+            object::store_proven_data_slot(obj, &mut self.gc_heap, hit.slot, value);
+            self.property_cache.record_own_store(hit);
+            slot.install(handler);
+            return Ok(true);
+        }
+        if object::keyed_addition_normalizes(obj, &self.gc_heap) {
+            return Ok(false);
+        }
+        let from_shape = object::keyed_shape(obj, &self.gc_heap);
+        let Some(transition) = self
+            .capture_store_property_transition_with_stack_roots(stack, &mut obj, key, &mut value)
+            .map_err(CommittedValueError::JavaScript)?
+        else {
+            return Ok(false);
+        };
+        if let Some(handler) =
+            crate::property_ic::IcHandler::store_transition(from_shape, &transition)
+        {
+            slot.install(handler);
+        }
+        self.property_cache.record_store(transition);
+        Ok(true)
+    }
+
     /// Call the getter an inline cache named, with the rooted receiver as
     /// `this`.
     fn call_ic_getter(

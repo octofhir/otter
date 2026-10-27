@@ -649,6 +649,7 @@ impl Interpreter {
         self.bake_instanceof_cells(&mut snapshot);
         self.bake_forward_apply(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
+        self.bake_keyed_symbol_sites(&mut snapshot);
         Self::bake_context_allocations(&mut snapshot);
         self.bake_closure_allocations(&mut snapshot, context);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
@@ -1102,6 +1103,7 @@ impl Interpreter {
         self.bake_guarded_method_calls(&mut view);
         self.bake_forward_apply(&mut view);
         self.bake_element_accesses(&mut view);
+        self.bake_keyed_symbol_sites(&mut view);
         Self::bake_context_allocations(&mut view);
         self.bake_closure_allocations(&mut view, context);
         self.bake_field_type_tree(&mut view);
@@ -1764,6 +1766,56 @@ impl Interpreter {
             if !programs.is_empty() {
                 view.property_programs.insert(byte_pc, programs);
             }
+        }
+    }
+
+    /// Export the named programs of each element site whose cache serves one
+    /// symbol key, with that symbol's atom, which the generated access proves.
+    pub(crate) fn bake_keyed_symbol_sites(&mut self, view: &mut jit::JitCompileSnapshot) {
+        let sites: Vec<_> = view
+            .instructions
+            .iter()
+            .filter_map(|instr| {
+                let kind = match instr.op(&view.code_block) {
+                    Op::LoadElement => crate::property_ic::PropertyIcKind::Load,
+                    Op::StoreElement | Op::StoreElementStrict => {
+                        crate::property_ic::PropertyIcKind::Store
+                    }
+                    _ => return None,
+                };
+                Some((instr.byte_pc, instr.instruction_pc(&view.code_block), kind))
+            })
+            .collect();
+        for (byte_pc, instruction_pc, kind) in sites {
+            let Some(slot) = view
+                .code_block
+                .property_feedback_at(instruction_pc as usize, kind)
+            else {
+                continue;
+            };
+            let Some(atom) = slot.native().keyed_atom() else {
+                continue;
+            };
+            let programs = slot
+                .jit_programs(
+                    atom,
+                    |shape| self.bake_shape(shape),
+                    |cell| self.bake_prototype_validity(cell),
+                )
+                .unwrap_or_default();
+            if programs.is_empty() {
+                continue;
+            }
+            view.property_accesses.insert(
+                byte_pc,
+                jit::JitPropertyAccess {
+                    atom,
+                    shared: false,
+                    ic_slot: slot.native().address(),
+                },
+            );
+            view.property_programs.insert(byte_pc, programs);
+            view.keyed_symbol_atoms.insert(byte_pc, atom);
         }
     }
 
@@ -2710,6 +2762,7 @@ impl Interpreter {
             self.bake_instanceof_cells(&mut body);
             self.bake_forward_apply(&mut body);
             self.bake_element_accesses(&mut body);
+            self.bake_keyed_symbol_sites(&mut body);
             Self::bake_context_allocations(&mut body);
             self.bake_closure_allocations(&mut body, context);
             if tier == jit_debug::JitDebugTier::Optimizing {

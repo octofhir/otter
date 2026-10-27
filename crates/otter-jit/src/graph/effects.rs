@@ -425,7 +425,8 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::LoadArgumentCount
         | Kind::LoadActualArgument
         | Kind::SelectArgument { .. }
-        | Kind::CheckArgumentsElided => Effects::reads(&[H::Frame]),
+        | Kind::CheckArgumentsElided
+        | Kind::CheckStackHeadroom => Effects::reads(&[H::Frame]),
         Kind::CheckFieldTypes(_) => Effects::reads(&[H::FieldTypes]),
         Kind::CheckContextSlot { .. } => Effects::reads(&[H::ContextFacts]),
         Kind::CheckStableShapes(_) => Effects::reads(&[H::ChainFacts]),

@@ -1020,6 +1020,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::CheckGuardedMethod(_)
         | K::CheckNative(_)
         | K::CheckArgumentsElided
+        | K::CheckStackHeadroom
         | K::LoadArgumentCount
         | K::LoadActualArgument
         | K::SelectArgument { .. }

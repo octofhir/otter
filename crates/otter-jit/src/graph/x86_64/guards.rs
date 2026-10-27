@@ -134,6 +134,16 @@ impl Codegen<'_> {
                 let exit = self.eager_exit(node, DeoptReason::WrongValue);
                 dynasm!(self.ops ; .arch x64 ; cmp DWORD [r14 + abi::NATIVE_FRAME_ARGUMENTS_OBJECT_OFFSET as i32], 0 ; jne =>exit);
             }
+            Kind::CheckStackHeadroom => {
+                let exit = self.eager_exit(node, DeoptReason::Unsupported);
+                dynasm!(self.ops
+                    ; .arch x64
+                    ; mov r10, rsp
+                    ; sub r10, crate::graph::ir::TAIL_CALL_STACK_RESERVE as i32
+                    ; cmp r10, [r15 + crate::entry::NATIVE_STACK_LIMIT_OFFSET as i32]
+                    ; jb =>exit
+                );
+            }
             Kind::CheckFunction { function_id, cell } => {
                 let exit = self.eager_exit(node, DeoptReason::WrongValue);
                 self.emit_function_identity(

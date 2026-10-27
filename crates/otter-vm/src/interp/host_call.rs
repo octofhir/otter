@@ -148,6 +148,29 @@ pub(crate) struct CallerContext<'a> {
     resolved: std::cell::OnceCell<Option<*const ExecutionContext>>,
 }
 
+impl Interpreter {
+    /// The innermost function, inlined or not, running at `return_pc` of the
+    /// generated code object `code_object_id`; `None` without a record there.
+    /// A native's caller resolves its source owner from it on every call
+    /// that asks, so the last site is kept.
+    fn innermost_function_at_return(&self, code_object_id: u32, return_pc: u64) -> Option<u32> {
+        if let Some((code, pc, function_id)) = self.caller_function_cache.get()
+            && code == code_object_id
+            && pc == return_pc
+        {
+            return function_id;
+        }
+        let function_id = self
+            .jit_code_registry
+            .return_pc_record(u64::from(code_object_id), return_pc)
+            .and_then(|record| record.inline_frames.last())
+            .map(|inline| inline.function_id);
+        self.caller_function_cache
+            .set(Some((code_object_id, return_pc, function_id)));
+        function_id
+    }
+}
+
 impl<'a> CallerContext<'a> {
     fn new(turn: &HostTurn<'a>) -> Self {
         Self {
@@ -187,10 +210,8 @@ impl<'a> CallerContext<'a> {
             let function_id = if frame.code_object_id == 0 || return_pc == 0 {
                 frame.header.function_id
             } else {
-                vm.jit_code_registry
-                    .return_pc_record(u64::from(frame.code_object_id), return_pc)
-                    .and_then(|record| record.inline_frames.last())
-                    .map_or(frame.header.function_id, |inline| inline.function_id)
+                vm.innermost_function_at_return(frame.code_object_id, return_pc)
+                    .unwrap_or(frame.header.function_id)
             };
             if self
                 .admitted

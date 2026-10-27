@@ -14,6 +14,9 @@
 use crate::work_budget::WorkBudgetCheckpoint;
 use crate::*;
 
+/// Turn work units between two clock reads of a work-budget checkpoint.
+const WORK_BUDGET_CLOCK_UNITS: u64 = 1024;
+
 impl Interpreter {
     /// Return the current per-slice work budget policy.
     #[must_use]
@@ -69,6 +72,8 @@ impl Interpreter {
         if self.work_budget_depth == 0 {
             self.work_budget_stats.begin_turn();
             self.work_budget_slice_started_at = Some(std::time::Instant::now());
+            self.work_budget_clock_due = 0;
+            self.work_budget_elapsed_nanos = 0;
             let heap = RuntimeHeapSnapshot::from_heap(&mut self.gc_heap);
             self.work_budget_heap_start = Some(heap);
         }
@@ -105,7 +110,16 @@ impl Interpreter {
             self.work_budget_stats
                 .observe_current_turn_heap_delta(start_heap, end_heap);
         }
-        let elapsed_nanos = u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // The clock is read once per `WORK_BUDGET_CLOCK_UNITS` of work: a
+        // native call records eight units and reading time costs as much as
+        // the call itself. The integer limits below stay exact.
+        let units = self.work_budget_stats.current_turn_work_units();
+        if units >= self.work_budget_clock_due {
+            self.work_budget_clock_due = units.saturating_add(WORK_BUDGET_CLOCK_UNITS);
+            self.work_budget_elapsed_nanos =
+                u64::try_from(started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        }
+        let elapsed_nanos = self.work_budget_elapsed_nanos;
         if work_budget::budget_exceeded(
             self.work_budget_stats.current_turn_work_units(),
             self.work_budget_stats.current_turn_allocated_bytes,
@@ -152,6 +166,8 @@ impl Interpreter {
 
         self.work_budget_stats.begin_turn();
         self.work_budget_slice_started_at = Some(std::time::Instant::now());
+        self.work_budget_clock_due = 0;
+        self.work_budget_elapsed_nanos = 0;
         self.work_budget_heap_start = Some(RuntimeHeapSnapshot::from_heap(&mut self.gc_heap));
     }
 

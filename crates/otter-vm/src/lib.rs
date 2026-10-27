@@ -1175,6 +1175,10 @@ pub struct Interpreter {
     /// published safepoint-resolver view; entries are registered at compile
     /// install and retained while any native frame can name them.
     jit_code_registry: Box<jit_registry::JitCodeRegistry>,
+    /// The last generated return site a native's caller was resolved at:
+    /// `(code object, return pc)` and the innermost function there. Code
+    /// object ids are never reused, so an entry never goes stale.
+    caller_function_cache: std::cell::Cell<Option<(u32, u64, Option<u32>)>>,
     /// Shapes and validity cells held by in-progress compilations (a stack: a
     /// compile can start a nested one). A root until the code object that
     /// embeds them is registered and takes them over.
@@ -1218,6 +1222,11 @@ pub struct Interpreter {
     /// Nested dispatch loops share one ECMAScript-turn accounting window.
     work_budget_depth: u32,
     work_budget_slice_started_at: Option<std::time::Instant>,
+    /// Turn work units at which a checkpoint next reads the clock; a slice
+    /// starts due at zero.
+    work_budget_clock_due: u64,
+    /// Slice time the last clock read observed, nanoseconds.
+    work_budget_elapsed_nanos: u64,
     work_budget_heap_start: Option<RuntimeHeapSnapshot>,
     /// Per-interpreter table of well-known symbol singletons
     /// (ECMA-262 §6.1.5.1). Populated in [`Self::new`]; constant

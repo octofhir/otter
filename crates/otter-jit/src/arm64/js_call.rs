@@ -107,7 +107,8 @@ where
         let first = source(ops, index, 15, bytes)?;
         let offset = u32::try_from(index * 8)
             .map_err(|_| Unsupported::OperandShape("call actual offset"))?;
-        if index + 1 < count {
+        // A pair store reaches 504 bytes; a single store the whole span.
+        if index + 1 < count && offset <= 504 {
             let second = source(ops, index + 1, 16, bytes)?;
             dynasm!(ops ; .arch aarch64 ; stp X(first), X(second), [sp, (offset) as i32]);
             index += 2;

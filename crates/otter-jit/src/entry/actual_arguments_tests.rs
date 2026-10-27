@@ -1,7 +1,8 @@
 //! Executable actual-only JavaScript entry contract.
 //!
 //! # Contents
-//! - Known and generic calls with zero, odd, adequate and extra actuals.
+//! - Known and generic calls with zero, odd, adequate and extra actuals,
+//!   and a span past the pair-store displacement range.
 //! - Template window initialization and Graph lazy underarity entry.
 //!
 //! # Invariants
@@ -207,7 +208,8 @@ fn actual_only_known_and_generic_entries_initialize_missing_formals() {
                 function_entry_count: 2,
                 resolve_return_pc: 0,
             };
-            for argc in 0..=5 {
+            // 70 actuals reach past the 504-byte pair-store displacement.
+            for argc in (0..=5).chain([70]) {
                 let actuals: Vec<_> = (0..argc).map(|i| Value::number_i32(100 + i)).collect();
                 for generic in [false, true] {
                     let buffer = caller(&transitions, &function, &actuals, generic);

@@ -643,6 +643,26 @@ impl Interpreter {
             write_register(&mut stack[top_idx], dst, value).map_err(CommittedValueError::Fatal)?;
             return Ok(());
         }
+        // A typed view's method resolves through its lookup start, cached as
+        // a named load on the view is, so generated code reads it as well.
+        if recv_value.as_typed_array(&self.gc_heap).is_some()
+            && let Some(atomized_key) =
+                context.property_atom_for_function(stack[top_idx].function_id, name_idx)
+            && let Some(slot) = property_slot
+            && let Some(crate::property_ic::LoadHit::Value(method)) =
+                self.projected_load(slot, recv_value, atomized_key)
+            && self.is_callable_runtime(&method)
+        {
+            stack[top_idx]
+                .advance_pc()
+                .map_err(CommittedValueError::Fatal)?;
+            let (recv_value, arg_values) = read_method_call_values(stack, top_idx, operands, argc)
+                .map_err(CommittedValueError::Fatal)?;
+            self.record_method_native_call(operands, method, recv_value);
+            return self
+                .invoke(stack, context, &method, recv_value, arg_values, dst)
+                .map_err(CommittedValueError::JavaScript);
+        }
         // One atomized key for the whole slow path: the builtin arms read its
         // spelling, and every `[[Get]]` fallback below carries the atom so the
         // shape walk compares ids instead of string content.

@@ -159,7 +159,7 @@ pub fn alloc_bound_function(
         receiver,
         &args,
         crate::function_metadata::BoundFunctionCreateMetadata {
-            name: "bound ".to_owned(),
+            target_name: "".into(),
             length: crate::number::NumberValue::from_i32(0),
         },
         None,

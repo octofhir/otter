@@ -408,6 +408,29 @@ impl Interpreter {
             bound_args
                 .push(*read_register(&stack[top_idx], r).map_err(CommittedValueError::Fatal)?);
         }
+        if let Some(metadata) = target.as_closure(&self.gc_heap).and_then(|closure| {
+            function_metadata::intrinsic_closure_bind_metadata(
+                context,
+                &self.gc_heap,
+                closure,
+                bound_args.len(),
+            )
+        }) {
+            let proto = self
+                .get_prototype_for_op(&target)
+                .map_err(CommittedValueError::JavaScript)?;
+            return self
+                .finish_bind_function_with(
+                    stack,
+                    dst,
+                    target,
+                    bound_this,
+                    &bound_args,
+                    metadata,
+                    proto,
+                )
+                .map_err(CommittedValueError::JavaScript);
+        }
         // §20.2.3.2 — `length` is read (HasOwnProperty + Get) BEFORE
         // `name`.
         match self
@@ -638,10 +661,33 @@ impl Interpreter {
             bound_args.len(),
             &self.gc_heap,
         );
-        let bound = self.alloc_bound_function(
+        self.finish_bind_function_with(
+            stack,
+            dst,
             target,
             bound_this,
             &bound_args,
+            metadata,
+            target_proto,
+        )
+    }
+
+    /// Allocate the bound function of an `Op::BindFunction` from its
+    /// computed metadata and write it to `dst`.
+    fn finish_bind_function_with(
+        &mut self,
+        stack: &mut ActivationStack,
+        dst: u16,
+        target: Value,
+        bound_this: Value,
+        bound_args: &[Value],
+        metadata: function_metadata::BoundFunctionCreateMetadata<'_>,
+        target_proto: Value,
+    ) -> Result<(), VmError> {
+        let bound = self.alloc_bound_function(
+            target,
+            bound_this,
+            bound_args,
             metadata,
             Some(target_proto),
         )?;
@@ -692,6 +738,35 @@ impl Interpreter {
                 .map_err(CommittedValueError::JavaScript)?
         };
         let proto_anchor = self.push_iteration_anchor(target_proto) - 1;
+
+        if let Some(metadata) = target.as_closure(&self.gc_heap).and_then(|closure| {
+            function_metadata::intrinsic_closure_bind_metadata(
+                context,
+                &self.gc_heap,
+                closure,
+                arg_regs.len(),
+            )
+        }) {
+            let bound_this =
+                *read_register(&stack[top_idx], this_reg).map_err(CommittedValueError::Fatal)?;
+            let mut bound_args: SmallVec<[Value; 4]> = SmallVec::with_capacity(arg_regs.len());
+            for &reg in arg_regs {
+                bound_args.push(
+                    *read_register(&stack[top_idx], reg).map_err(CommittedValueError::Fatal)?,
+                );
+            }
+            let result = self.finish_bind_function_with(
+                stack,
+                dst,
+                target,
+                bound_this,
+                &bound_args,
+                metadata,
+                target_proto,
+            );
+            self.pop_iteration_anchors_to(proto_anchor);
+            return result.map_err(CommittedValueError::JavaScript);
+        }
 
         // §20.2.3.2 — read `length`, then `name`. Each may be an accessor whose
         // getter runs `this = target`; the frame source registers stay live
@@ -927,40 +1002,56 @@ impl Interpreter {
                     }
                 };
                 roots.set_scratch(0, target_proto);
-                // §20.2.3.2 step 3 — the length transfer keys off
-                // HasOwnProperty(Target, "length") (a trap-observable
-                // [[GetOwnProperty]]); an inherited `length` (mutated
-                // [[Prototype]]) leaves L = 0. The read precedes `name`.
-                let target_length = {
-                    let target = roots.target();
-                    let key = VmPropertyKey::String("length");
-                    let own = self.ordinary_get_own_property_descriptor_value(
-                        stack,
-                        Some(context),
-                        target,
-                        &key,
-                        0,
-                    )?;
-                    if own.is_some() {
-                        self.get_property_value_for_call(stack, context, target, "length")?
-                    } else {
-                        Value::undefined()
+                let intrinsic = roots
+                    .target()
+                    .as_closure(&self.gc_heap)
+                    .and_then(|closure| {
+                        function_metadata::intrinsic_closure_bind_metadata(
+                            context,
+                            &self.gc_heap,
+                            closure,
+                            roots.args_len(),
+                        )
+                    });
+                let metadata = match intrinsic {
+                    Some(metadata) => metadata,
+                    None => {
+                        // §20.2.3.2 step 3 — the length transfer keys off
+                        // HasOwnProperty(Target, "length") (a trap-observable
+                        // [[GetOwnProperty]]); an inherited `length` (mutated
+                        // [[Prototype]]) leaves L = 0. The read precedes `name`.
+                        let target_length = {
+                            let target = roots.target();
+                            let key = VmPropertyKey::String("length");
+                            let own = self.ordinary_get_own_property_descriptor_value(
+                                stack,
+                                Some(context),
+                                target,
+                                &key,
+                                0,
+                            )?;
+                            if own.is_some() {
+                                self.get_property_value_for_call(stack, context, target, "length")?
+                            } else {
+                                Value::undefined()
+                            }
+                        };
+                        roots.set_scratch(1, target_length);
+                        // §20.2.3.2 step 4 — targetName is a plain observable
+                        // Get (no HasOwnProperty probe); a non-string result
+                        // coerces to "" inside the metadata builder.
+                        let target_name = {
+                            let target = roots.target();
+                            self.get_property_value_for_call(stack, context, target, "name")?
+                        };
+                        function_metadata::bound_create_metadata_from_values(
+                            &target_name,
+                            &roots.scratch(1),
+                            roots.args_len(),
+                            &self.gc_heap,
+                        )
                     }
                 };
-                roots.set_scratch(1, target_length);
-                // §20.2.3.2 step 4 — targetName is a plain observable
-                // Get (no HasOwnProperty probe); a non-string result
-                // coerces to "" inside the metadata builder.
-                let target_name = {
-                    let target = roots.target();
-                    self.get_property_value_for_call(stack, context, target, "name")?
-                };
-                let metadata = function_metadata::bound_create_metadata_from_values(
-                    &target_name,
-                    &roots.scratch(1),
-                    roots.args_len(),
-                    &self.gc_heap,
-                );
                 let bound_args = roots.take_args();
                 let target = roots.target();
                 let receiver = roots.receiver_value();

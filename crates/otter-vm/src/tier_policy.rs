@@ -113,6 +113,10 @@ impl TierWorkDecision {
     }
 }
 
+/// Source-opcode work one interpreted entry stands for in the baseline
+/// decision.
+const ENTRY_WORK: u64 = 32;
+
 /// Fixed integer source-work costs, reproduced by the checked-in fit script.
 /// Conservative historical per-op calibration is converted once, rounding
 /// compiler costs upward; the Graph per-instruction term is an invocation
@@ -353,9 +357,16 @@ impl TierPolicy {
             CostedTier::Template => 0,
             CostedTier::Optimizing => state.stable_work_origin,
         };
+        // An interpreted entry costs the interpreter as much as a run of
+        // opcodes: a function called often for a few opcodes each time earns
+        // its baseline body by its calls as well as its work.
+        let entry_work = match tier {
+            CostedTier::Template => function.source_work().entries().saturating_mul(ENTRY_WORK),
+            CostedTier::Optimizing => 0,
+        };
         let mut decision = TierWorkModel::calibrated().decide(TierWorkInput {
             tier,
-            observed_work: total.saturating_sub(origin),
+            observed_work: total.saturating_sub(origin).saturating_add(entry_work),
             bytecode_instructions: function.code.len() as u64,
             register_count: u64::from(function.register_count),
             parameter_count: u64::from(function.param_count),

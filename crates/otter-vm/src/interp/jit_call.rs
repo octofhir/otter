@@ -338,6 +338,22 @@ impl Interpreter {
             .jit_tier_work_decision(context, key.0, selected, available_code_bytes)
             .is_some_and(crate::tier_policy::TierWorkDecision::should_compile)
         {
+            // A loop that already has a baseline body runs it while the
+            // optimizing window fills: the baseline counts its own back-edges
+            // and hands the header back once optimizing OSR is due. Only a
+            // function with no baseline yet keeps interpreting.
+            let baseline_entry = optimizing_enabled
+                && self
+                    .jit_code
+                    .get(&key.0)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|code| {
+                        self.jit_code_registry.is_current_for_entry(code.as_ref())
+                            && code.osr_entry_addr(key.1).is_some()
+                    });
+            if baseline_entry {
+                return self.prepare_osr(stack, context, top_idx, false);
+            }
             return Ok(None);
         }
         // Threshold reached: drop this header's counter (it tiers up now or is

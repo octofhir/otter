@@ -286,6 +286,7 @@ pub(crate) enum Outcome {
 /// Run every candidate start of `window` over `text` until one matches.
 /// `budget` is the number of steps the search may still take and comes back
 /// reduced by the steps taken.
+#[inline(always)]
 pub(crate) fn search<U: Unit>(
     code: &NativeCode,
     program: &Program,

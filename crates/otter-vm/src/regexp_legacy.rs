@@ -71,8 +71,13 @@ impl RegExpLegacyState {
         offsets: &crate::regexp::engine::MatchOffsets,
     ) {
         self.input = Some(input);
+        // A match records a handful of offsets: an element loop, not a
+        // library copy.
         self.offsets.clear();
-        self.offsets.extend_from_slice(&offsets.0);
+        self.offsets.reserve(offsets.0.len());
+        for &offset in &offsets.0 {
+            self.offsets.push(offset);
+        }
     }
 
     /// Group `index` of the recorded match, `None` when it did not

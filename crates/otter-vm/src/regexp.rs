@@ -224,6 +224,19 @@ impl From<otter_gc::OutOfMemory> for RegExpError {
     }
 }
 
+/// The state [`JsRegExp::exec_state`] reads for one exec.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RegExpExecState {
+    /// The `lastIndex` data property's value.
+    pub(crate) last_index: Value,
+    /// Whether `lastIndex` is writable.
+    pub(crate) last_index_writable: bool,
+    /// The parsed flags.
+    pub(crate) flags: RegExpFlags,
+    /// `[[LegacyFeaturesEnabled]]`.
+    pub(crate) legacy_features_enabled: bool,
+}
+
 /// Foundation flag bits.
 ///
 /// We keep this tiny so `JsRegExp` stays cheap to clone. The struct
@@ -780,6 +793,19 @@ impl JsRegExp {
         // nested `to_lossy_string(heap)` reborrows shared.
         let raw = heap.read_payload(self.inner, |body| body.last_index.get());
         last_index_to_u32(&raw, heap)
+    }
+
+    /// What one `RegExpBuiltinExec` reads of this RegExp, in one body read:
+    /// `lastIndex`, its writable bit, the flags and `[[LegacyFeaturesEnabled]]`.
+    #[inline]
+    #[must_use]
+    pub(crate) fn exec_state(&self, heap: &otter_gc::GcHeap) -> RegExpExecState {
+        heap.read_payload(self.inner, |body| RegExpExecState {
+            last_index: body.last_index.get(),
+            last_index_writable: body.last_index_writable,
+            flags: body.flags,
+            legacy_features_enabled: body.legacy_features_enabled,
+        })
     }
 
     /// Read the JS-visible `lastIndex` data-property value.

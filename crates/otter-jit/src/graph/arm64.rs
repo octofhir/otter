@@ -2460,10 +2460,15 @@ impl<'a> Codegen<'a> {
                     allocation,
                 )?;
             }
-            Kind::CallForward { plan, bindings, .. } => {
-                let (plan, bindings) = (*plan, bindings.clone());
+            Kind::CallForward {
+                plan,
+                bindings,
+                skip,
+                ..
+            } => {
+                let (plan, bindings, skip) = (*plan, bindings.clone(), *skip);
                 let temps = [allocation.gp_temps[0], allocation.gp_temps[1]];
-                self.emit_call_forward(node, plan, &bindings, temps)?;
+                self.emit_call_forward(node, plan, &bindings, temps, skip)?;
             }
             Kind::CallApplyArray { .. } => {
                 let temps = [
@@ -5019,6 +5024,7 @@ impl<'a> Codegen<'a> {
         plan: crate::call_linkage::CallPlan,
         bindings: &[u16],
         temps: [u8; 2],
+        skip: u16,
     ) -> Result<(), Unsupported> {
         use crate::arm64::js_call::{
             CallTarget, emit_call, emit_pop_forwarded, emit_push_forwarded,
@@ -5047,7 +5053,7 @@ impl<'a> Codegen<'a> {
                 (index, binding)
             })
             .collect();
-        emit_push_forwarded(&mut self.ops, 21, temps, overflow, &sources);
+        emit_push_forwarded(&mut self.ops, 21, temps, overflow, &sources, skip);
         let generic = self.ops.new_dynamic_label();
         let returned = self.ops.new_dynamic_label();
         if let crate::call_linkage::CallPlan::Bytecode(plan) = plan {
@@ -5102,7 +5108,7 @@ impl<'a> Codegen<'a> {
         );
         self.record_js_return(node, return_pc)?;
         dynasm!(self.ops ; .arch aarch64 ; =>returned);
-        emit_pop_forwarded(&mut self.ops, 21);
+        emit_pop_forwarded(&mut self.ops, 21, skip);
         self.emit_call_completion(node)?;
         Ok(())
     }

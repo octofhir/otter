@@ -1048,6 +1048,11 @@ impl Interpreter {
                     crate::deopt::VirtualObjectKind::Shaped { shape } => {
                         interp.materialize_shaped_object(shape, fields)?
                     }
+                    // The deopt that owns the activation's actuals expands a
+                    // rest list into its elements first.
+                    crate::deopt::VirtualObjectKind::RestArray { .. } => {
+                        return Err(VmError::InvalidOperand);
+                    }
                 };
                 roots.push(interp.scoped_value(scope, value));
             }

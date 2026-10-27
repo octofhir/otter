@@ -271,6 +271,13 @@ pub enum VirtualObjectKind {
         /// retains it.
         shape: u32,
     },
+    /// A rest parameter's list: a dense fixed-length ordinary Array of the
+    /// deopting activation's actual arguments past the first `skip`. It has
+    /// no fields; the deopt reads the actuals.
+    RestArray {
+        /// Leading actuals the formals took.
+        skip: u16,
+    },
 }
 
 /// One virtual allocation embedded in the authoritative frame state.
@@ -510,7 +517,11 @@ impl FrameState {
                     actual: object.id.0,
                 });
             }
-            if object.kind == VirtualObjectKind::PlainObject && !object.fields.is_empty() {
+            if matches!(
+                object.kind,
+                VirtualObjectKind::PlainObject | VirtualObjectKind::RestArray { .. }
+            ) && !object.fields.is_empty()
+            {
                 return Err(DeoptVerifyError::InvalidVirtualObjectFieldCount {
                     object: object.id.0,
                     fields: object.fields.len(),

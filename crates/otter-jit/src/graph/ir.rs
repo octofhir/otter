@@ -374,6 +374,11 @@ pub(crate) enum Kind {
     VirtualObject {
         shape: u32,
     },
+    /// The rest list of the compiled function's actual arguments past its
+    /// first `skip`, never allocated: nothing reads it but `CallForward`s of
+    /// those actuals and frame states, and a deopt materializes it from the
+    /// activation's actuals, which a rest-parameter function never changes.
+    VirtualRestArray(u16),
     /// `ArrayCreate(input0)` for the original `%Array%` constructor called
     /// with at most one argument: an array of that exact nonnegative int32
     /// length, all holes. Any other length resumes the operation.
@@ -778,6 +783,9 @@ pub(crate) enum Kind {
         pc: u32,
         plan: crate::call_linkage::CallPlan,
         bindings: Box<[u16]>,
+        /// Leading actuals left out: a rest parameter's list forwards the
+        /// actuals past its formals. A forward with bindings skips none.
+        skip: u16,
     },
     /// `[[Call]]` of input0 with input1 as receiver and the elements of
     /// input2 as actual arguments, as the realm's `Reflect.apply` passes
@@ -1037,6 +1045,7 @@ impl Kind {
             | Self::ConstInt32(_)
             | Self::ConstFloat64(_)
             | Self::VirtualObject { .. }
+            | Self::VirtualRestArray(_)
             | Self::InitialRegister(_)
             | Self::LoadNewTarget
             | Self::LoadClosure
@@ -1418,7 +1427,8 @@ impl Kind {
             | Self::ConstInt32(_)
             | Self::ConstFloat64(_)
             | Self::Phi
-            | Self::VirtualObject { .. } => Constraints {
+            | Self::VirtualObject { .. }
+            | Self::VirtualRestArray(_) => Constraints {
                 inputs: (0..input_count).map(|_| Any).collect(),
                 result: ResultPolicy::Register,
                 gp_temps: 0,
@@ -2068,7 +2078,7 @@ impl Graph {
     /// `new.target`, recorded actual arguments), then each frame's live
     /// registers. A [`Kind::VirtualObject`] reads its fields in its place, at
     /// its first occurrence in the chain only; later occurrences read
-    /// nothing.
+    /// nothing. A [`Kind::VirtualRestArray`] reads nothing.
     pub(crate) fn state_values(&self, id: FrameStateId) -> SmallVec<[NodeId; 16]> {
         let mut values = SmallVec::new();
         let mut expanded: SmallVec<[NodeId; 4]> = SmallVec::new();
@@ -2097,7 +2107,10 @@ impl Graph {
         values: &mut SmallVec<[NodeId; 16]>,
         expanded: &mut SmallVec<[NodeId; 4]>,
     ) {
-        if !matches!(self.node(value).kind, Kind::VirtualObject { .. }) {
+        if !matches!(
+            self.node(value).kind,
+            Kind::VirtualObject { .. } | Kind::VirtualRestArray(_)
+        ) {
             values.push(value);
             return;
         }

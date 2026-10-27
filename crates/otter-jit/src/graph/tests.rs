@@ -648,6 +648,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::NewReceiver(plan),
         Kind::CheckReceiverPlan(plan),
         Kind::VirtualObject { shape: 0 },
+        Kind::VirtualRestArray(0),
         Kind::NewArrayWithLength,
         Kind::NewRestArray(0),
         Kind::PrimitiveAdd,
@@ -816,6 +817,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
             pc: 0,
             plan: crate::call_linkage::CallPlan::Generic,
             bindings: Box::new([]),
+            skip: 0,
         },
         Kind::CallApplyArray { pc: 0 },
         Kind::CheckFunctionPrototypeCall(0),
@@ -924,6 +926,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::NewReceiver(_)
         | K::CheckReceiverPlan(_)
         | K::VirtualObject { .. }
+        | K::VirtualRestArray(_)
         | K::NewArrayWithLength
         | K::NewRestArray(_)
         | K::PrimitiveAdd

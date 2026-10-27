@@ -3,6 +3,8 @@
 //! # Contents
 //! - Static shaped objects and tagged/numeric dense two-cell arrays.
 //! - Array shells over a literal boilerplate's shared slab.
+//! - `new Array(n)`: a shell over a private slab of `n` holes, sized at run
+//!   time.
 //! - Immutable input recipes and full shell/slab initialization.
 //!
 //! # Invariants
@@ -33,7 +35,8 @@ use crate::x86_64::values::{emit_load_symbol_u64, emit_load_u64};
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::jit::{
     JitAllocationSite, JitArrayLiteralAllocationPlan, JitBoilerplateArrayAllocationPlan,
-    JitDenseArrayAllocationPlan, JitObjectLiteralAllocationPlan, JitSiteMode,
+    JitDenseArrayAllocationPlan, JitHoleyArrayAllocationPlan, JitObjectLiteralAllocationPlan,
+    JitSiteMode,
 };
 
 /// The window offset of the buffer a site's cells are carved from.
@@ -257,6 +260,135 @@ pub(crate) fn emit_boilerplate_array(
         ; mov BYTE [Rq(shell) + plan.shell_own_guard_byte as i32], plan.own_guard as i8
     );
     emit_publish(ops, regs);
+}
+
+/// Carve `new Array(n)` for the int32 `length` in `1..=plan.max_len`: the
+/// shell, then a private holey-double slab of capacity `n` with every hole
+/// bit set, both young in one reservation. Any other length, another realm
+/// or no room misses before a write. The result is in `regs.candidate`.
+pub(crate) fn emit_holey_array(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    context: u8,
+    realm: u32,
+    cage_base: u64,
+    plan: JitHoleyArrayAllocationPlan,
+    length: AllocationValue,
+    regs: LabRegisters,
+    slow: DynamicLabel,
+) {
+    debug_assert_eq!(regs.size, 11);
+    if realm != 0 {
+        dynasm!(ops ; .arch x64 ; jmp =>slow);
+        return;
+    }
+    emit_source_realm_guard(ops, context, realm, regs.scratch, slow);
+    let shell = regs.candidate;
+    let slab = regs.scratch;
+    let cell_mask = plan.cell_mask as i32;
+    // The length is an int32 in range; its slab holds the element words and
+    // one bitmap word per 64 of them.
+    super::emit_value(ops, slab, length);
+    emit_load_u64(ops, 10, tag::NUMBER_TAG);
+    dynasm!(ops ; .arch x64
+        ; mov r11, Rq(slab)
+        ; and r11, r10
+        ; cmp r11, r10
+        ; jne =>slow
+        ; mov Rd(slab), Rd(slab)
+        ; test Rd(slab), Rd(slab)
+        ; jz =>slow
+        ; cmp Rd(slab), plan.max_len as i32
+        ; ja =>slow
+        ; lea r11, [Rq(slab) + 63]
+        ; shr r11, 6
+        ; add r11, Rq(slab)
+        ; shl r11, 3
+        ; add r11, (plan.data_byte as i32) + cell_mask
+        ; and r11, !cell_mask
+        ; add r11, plan.shell.cell_bytes as i32
+    );
+    emit_bump_probe_in(ops, context, ALLOC_WINDOW_LAB_OFFSET, regs, slow);
+    dynasm!(ops ; .arch x64 ; lea Rq(slab), [Rq(shell) + plan.shell.cell_bytes as i32]);
+    emit_load_u64(ops, 10, plan.shell.header_word);
+    dynasm!(ops ; .arch x64 ; mov [Rq(shell)], r10);
+    emit_load_u64(ops, 10, plan.shell.map_word);
+    dynasm!(ops ; .arch x64 ; mov [Rq(shell) + 8], r10);
+    for byte in (16..plan.shell.cell_bytes).step_by(8) {
+        dynasm!(ops ; .arch x64 ; mov QWORD [Rq(shell) + byte as i32], 0);
+    }
+    // The slab header carries its size: the reservation less the shell.
+    dynasm!(ops ; .arch x64
+        ; mov r10, r11
+        ; sub r10, plan.shell.cell_bytes as i32
+        ; shl r10, plan.size_shift as i8
+    );
+    emit_load_u64(ops, 11, plan.slab_header_base);
+    dynasm!(ops ; .arch x64
+        ; or r10, r11
+        ; mov [Rq(slab)], r10
+        // Every slab word after the header starts zero: no element, no
+        // hole bit, no dirty interval end.
+        ; lea r10, [Rq(slab) + 8]
+        ; zero:
+        ; mov QWORD [r10], 0
+        ; add r10, 8
+        ; cmp r10, Rq(regs.end)
+        ; jb <zero
+    );
+    super::emit_value(ops, 11, length);
+    dynasm!(ops ; .arch x64
+        ; mov r11d, r11d
+        ; mov [Rq(slab) + plan.capacity_byte as i32], r11d
+        ; mov [Rq(slab) + plan.len_byte as i32], r11d
+        ; mov [Rq(slab) + plan.hole_count_byte as i32], r11d
+        ; mov [Rq(shell) + plan.shell_length_byte as i32], r11d
+        ; mov [Rq(shell) + plan.shell_len_byte as i32], r11d
+        ; mov [Rq(shell) + plan.shell_capacity_byte as i32], r11d
+        ; mov BYTE [Rq(slab) + plan.kind_byte as i32], plan.kind as i8
+        ; mov BYTE [Rq(shell) + plan.shell_kind_byte as i32], plan.kind as i8
+        ; mov DWORD [Rq(slab) + plan.dirty_start_byte as i32], -1
+        // The hole bitmap follows the element words: whole words of ones,
+        // then the remainder's low bits.
+        ; lea Rq(regs.buffer), [Rq(slab) + r11 * 8 + plan.data_byte as i32]
+        ; mov r10, r11
+        ; whole:
+        ; cmp r10, 64
+        ; jb >partial
+        ; mov QWORD [Rq(regs.buffer)], -1
+        ; add Rq(regs.buffer), 8
+        ; sub r10, 64
+        ; jmp <whole
+        ; partial:
+        ; test r10, r10
+        ; jz >bitmap
+        ; xor r11d, r11d
+        ; bits:
+        ; sub r10, 1
+        ; bts r11, r10
+        ; test r10, r10
+        ; jnz <bits
+        ; mov [Rq(regs.buffer)], r11
+        ; bitmap:
+    );
+    // ArrayBody traces the compressed slab handle and refreshes its full data
+    // address after movement. No raw interior pointer outlives this fit.
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        10,
+        cage_base,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops ; .arch x64
+        ; mov r11, Rq(slab)
+        ; sub r11, r10
+        ; mov [Rq(shell) + plan.shell_slab_byte as i32], r11d
+        ; lea r10, [Rq(slab) + plan.data_byte as i32]
+        ; mov [Rq(shell) + plan.shell_data_byte as i32], r10
+        ; mov Rq(regs.buffer), [Rq(context) + ALLOC_WINDOW_LAB_OFFSET as i32]
+        ; mov [Rq(regs.buffer) + LAB_TOP_OFFSET as i32], Rq(regs.end)
+    );
 }
 
 fn emit_dense_array(

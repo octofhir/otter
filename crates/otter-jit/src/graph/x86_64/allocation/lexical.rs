@@ -152,10 +152,24 @@ impl Codegen<'_> {
                 };
                 (stub, values)
             }
-            Kind::NewArrayWithLength => (
-                abi::STUB_ARRAY_CONSTRUCT_ALLOC,
-                [inputs[0], undefined, undefined],
-            ),
+            Kind::NewArrayWithLength => {
+                crate::x86_64::allocation::emit_holey_array(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    15,
+                    source.literal_allocations.realm_id,
+                    source.cage_base as u64,
+                    source.literal_allocations.holey_array,
+                    inputs[0],
+                    regs,
+                    slow,
+                );
+                dynasm!(self.ops ; .arch x64 ; mov Rq(destination), Rq(regs.candidate) ; jmp =>done);
+                (
+                    abi::STUB_ARRAY_CONSTRUCT_ALLOC,
+                    [inputs[0], undefined, undefined],
+                )
+            }
             Kind::NewRestArray(formals) => (
                 abi::STUB_REST_ARRAY_ALLOC,
                 [

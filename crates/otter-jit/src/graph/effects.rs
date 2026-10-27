@@ -281,6 +281,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::ConstInt32(_)
         | Kind::ConstFloat64(_)
         | Kind::VirtualObject { .. }
+        | Kind::VirtualRestArray(_)
         | Kind::Phi
         | Kind::Select(_)
         | Kind::LoadNewTarget

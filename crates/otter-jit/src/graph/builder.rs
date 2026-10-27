@@ -4440,6 +4440,7 @@ impl<'a> Builder<'a> {
                 pc: self.pc,
                 plan: crate::call_linkage::CallPlan::for_site(self.view, instruction.byte_pc, plan),
                 bindings: bindings.into_boxed_slice(),
+                skip: 0,
             },
             &inputs,
             Repr::Tagged,

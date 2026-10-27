@@ -101,7 +101,7 @@ pub(super) fn emit_forward_call(
             })
             .collect::<Result<Vec<_>, Unsupported>>()?;
         // R8/R9 are scratch until copy completes; shared code reserves R10/R11.
-        emit_push_forwarded(ops, 14, [8, 9], staged, &bindings);
+        emit_push_forwarded(ops, 14, [8, 9], staged, &bindings, 0);
         emit_load_reg(ops, 6, callee);
         emit_load_reg(ops, 2, receiver);
         let generic = ops.new_dynamic_label();
@@ -130,7 +130,7 @@ pub(super) fn emit_forward_call(
             CallTarget::Generic,
         ))?;
         dynasm!(ops ; .arch x64 ; =>returned);
-        emit_pop_forwarded(ops, 14);
+        emit_pop_forwarded(ops, 14, 0);
         calls::emit_completion(
             ops,
             relocations,

@@ -99,6 +99,7 @@ mod range;
 mod redundancy;
 pub(crate) mod regalloc;
 pub(crate) mod registers;
+pub(crate) mod rest_lists;
 mod select;
 mod straighten;
 pub(crate) mod truncation;
@@ -187,6 +188,7 @@ pub(crate) fn compile(
         .iter()
         .map(|header| header.state)
         .collect();
+    rest_lists::elide_rest_lists(&mut built.graph, &built.layout);
     escape::eliminate_allocations(
         &mut built.graph,
         &built.layout,

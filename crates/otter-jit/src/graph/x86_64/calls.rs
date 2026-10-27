@@ -290,6 +290,7 @@ impl Codegen<'_> {
         pc: u32,
         plan: crate::call_linkage::CallPlan,
         bindings: &[u16],
+        skip: u16,
     ) -> Result<(), Unsupported> {
         use crate::call_linkage::ForwardedBinding;
         use crate::x86_64::js_call::{
@@ -317,7 +318,7 @@ impl Codegen<'_> {
                 (index, binding)
             })
             .collect::<Vec<_>>();
-        emit_push_forwarded(&mut self.ops, 14, temps, overflow, &mapped);
+        emit_push_forwarded(&mut self.ops, 14, temps, overflow, &mapped, skip);
         let generic = self.ops.new_dynamic_label();
         let returned = self.ops.new_dynamic_label();
         if let crate::call_linkage::CallPlan::Bytecode(plan) = plan {
@@ -359,7 +360,7 @@ impl Codegen<'_> {
         );
         self.record_js_return(node, return_pc)?;
         dynasm!(self.ops ; .arch x64 ; =>returned);
-        emit_pop_forwarded(&mut self.ops, 14);
+        emit_pop_forwarded(&mut self.ops, 14, skip);
         self.emit_call_completion(node)?;
         Ok(())
     }

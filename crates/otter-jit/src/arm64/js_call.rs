@@ -127,11 +127,24 @@ pub(crate) fn emit_pop_arguments(ops: &mut Assembler, bytes: u32) {
 }
 
 /// `x16` = the bytes of the frame's actual span, rounded up to 16 bytes.
-fn emit_forwarded_bytes(ops: &mut Assembler, frame: u8) {
+/// `w16` = the forwarded count: the activation's argument count past its
+/// first `skip` actuals, at least zero.
+fn emit_forwarded_count(ops: &mut Assembler, frame: u8, skip: u16) {
     dynasm!(ops
         ; .arch aarch64
         ; ldr w16, [X(frame), abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
     );
+    if skip != 0 {
+        dynasm!(ops
+            ; .arch aarch64
+            ; subs w16, w16, u32::from(skip)
+            ; csel w16, w16, wzr, gt
+        );
+    }
+}
+
+fn emit_forwarded_bytes(ops: &mut Assembler, frame: u8, skip: u16) {
+    emit_forwarded_count(ops, frame, skip);
     dynasm!(ops
         ; .arch aarch64
         ; add w16, w16, 1
@@ -141,20 +154,22 @@ fn emit_forwarded_bytes(ops: &mut Assembler, frame: u8) {
 }
 
 /// Reserve and fill the span of a forwarded call below `sp`: the actual
-/// arguments of the activation whose record is in `frame`, each
-/// `(argument index, binding)` actual
-/// below the argument count replaced by the binding's current value; then
-/// `x4` holds the argument count. A span past the stack limit branches to
-/// `overflow` before `sp` moves. `old_sp` keeps the stack pointer the span
-/// moved, `source` is clobbered, and so are `x16`/`x17`.
+/// arguments of the activation whose record is in `frame` past its first
+/// `skip`, each `(argument index, binding)` actual below the argument count
+/// replaced by the binding's current value (a span with bindings skips
+/// none); then `x4` holds the forwarded count. A span past the stack limit
+/// branches to `overflow` before `sp` moves. `old_sp` keeps the stack
+/// pointer the span moved, `source` is clobbered, and so are `x16`/`x17`.
 pub(crate) fn emit_push_forwarded(
     ops: &mut Assembler,
     frame: u8,
     [old_sp, source]: [u8; 2],
     overflow: DynamicLabel,
     bindings: &[(u16, ForwardedBinding)],
+    skip: u16,
 ) {
-    emit_forwarded_bytes(ops, frame);
+    debug_assert!(skip == 0 || bindings.is_empty());
+    emit_forwarded_bytes(ops, frame, skip);
     let probe = ops.new_dynamic_label();
     let probed = ops.new_dynamic_label();
     dynasm!(ops
@@ -182,7 +197,15 @@ pub(crate) fn emit_push_forwarded(
     dynasm!(ops
         ; .arch aarch64
         ; ldr X(source), [X(frame), abi::NATIVE_FRAME_ACTUALS_OFFSET]
-        ; ldr w17, [X(frame), abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
+    );
+    if skip != 0 {
+        emit_load_u64(ops, 17, u64::from(skip) * 8);
+        dynasm!(ops ; .arch aarch64 ; add X(source), X(source), x17);
+    }
+    emit_forwarded_count(ops, frame, skip);
+    dynasm!(ops
+        ; .arch aarch64
+        ; mov w17, w16
         ; =>copy
         ; cbz w17, =>copied
         ; sub w17, w17, 1
@@ -230,16 +253,15 @@ pub(crate) fn emit_push_forwarded(
             ; =>skip
         );
     }
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldr w4, [X(frame), abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET]
-    );
+    emit_forwarded_count(ops, frame, skip);
+    dynasm!(ops ; .arch aarch64 ; mov w4, w16);
 }
 
 /// Release a span [`emit_push_forwarded`] reserved, sized again from the
-/// unchanged argument count of `frame`. Clobbers `x16`/`x17`.
-pub(crate) fn emit_pop_forwarded(ops: &mut Assembler, frame: u8) {
-    emit_forwarded_bytes(ops, frame);
+/// unchanged argument count of `frame` and the same `skip`. Clobbers
+/// `x16`/`x17`.
+pub(crate) fn emit_pop_forwarded(ops: &mut Assembler, frame: u8, skip: u16) {
+    emit_forwarded_bytes(ops, frame, skip);
     dynasm!(ops ; .arch aarch64 ; add sp, sp, x16);
 }
 

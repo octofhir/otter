@@ -127,10 +127,37 @@ extern "C" fn prepare_deopt_writeback(
         };
         native_frame.header.register_count = register_count;
         write_frame(state.outermost(), window as *mut otter_vm::Value);
+        // A rest list's elements are the activation's actuals past its
+        // formals, which the published frame still holds.
+        let actuals: &[otter_vm::Value] = if native_frame.argument_count == 0 {
+            &[]
+        } else {
+            // SAFETY: the published frame keeps `argument_count` initialized
+            // actuals for its whole activation.
+            unsafe {
+                std::slice::from_raw_parts(
+                    native_frame.actuals,
+                    native_frame.argument_count as usize,
+                )
+            }
+        };
         let recipes = match state
             .virtual_objects
             .iter()
             .map(|object| {
+                if let otter_vm::deopt::VirtualObjectKind::RestArray { skip } = object.kind {
+                    return Ok(otter_vm::deopt::VirtualObject {
+                        id: object.id,
+                        kind: otter_vm::deopt::VirtualObjectKind::FixedArray,
+                        fields: actuals
+                            .iter()
+                            .skip(usize::from(skip))
+                            .map(|&value| {
+                                otter_vm::deopt::VirtualMaterializationValue::Value(value)
+                            })
+                            .collect(),
+                    });
+                }
                 Ok(otter_vm::deopt::VirtualObject {
                     id: object.id,
                     kind: object.kind,

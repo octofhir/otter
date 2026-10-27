@@ -571,9 +571,12 @@ impl<'a> Codegen<'a> {
                     *allocation,
                 )?;
             }
-            Kind::CallForward { pc, plan, bindings } => {
-                self.emit_call_forward(node, *pc, *plan, bindings)?
-            }
+            Kind::CallForward {
+                pc,
+                plan,
+                bindings,
+                skip,
+            } => self.emit_call_forward(node, *pc, *plan, bindings, *skip)?,
             Kind::CallApplyArray { .. } => self.emit_call_apply_array(node)?,
             Kind::Generic { pc, registers } => self.emit_generic(node, *pc, registers)?,
             Kind::ConstTagged(_) | Kind::ConstInt32(_) | Kind::ConstFloat64(_) | Kind::Phi => {}

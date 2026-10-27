@@ -377,21 +377,39 @@ pub(crate) fn emit_forwarded_call(
     emit_target_call(ops, relocations, table, target)
 }
 
-/// Copy an activation's exact actual span and replace mapped formals.
-/// Stack-limit refusal precedes writes and page probes precede RSP movement.
-/// Only old_sp/source, R10/R11 and the final r8d count are changed.
+/// `r10d` = the forwarded count: the activation's argument count past its
+/// first `skip` actuals, at least zero. Clobbers `r11`.
+fn emit_forwarded_count(ops: &mut Assembler, frame: u8, skip: u16) {
+    dynasm!(ops ; .arch x64
+        ; mov r10d, [Rq(frame) + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
+    );
+    if skip != 0 {
+        dynasm!(ops ; .arch x64
+            ; xor r11d, r11d
+            ; sub r10d, i32::from(skip)
+            ; cmovl r10d, r11d
+        );
+    }
+}
+
+/// Copy an activation's actual span past its first `skip` actuals and
+/// replace mapped formals (a span with bindings skips none). Stack-limit
+/// refusal precedes writes and page probes precede RSP movement. Only
+/// old_sp/source, R10/R11 and the final r8d count are changed.
 pub(crate) fn emit_push_forwarded(
     ops: &mut Assembler,
     frame: u8,
     [old_sp, source]: [u8; 2],
     overflow: DynamicLabel,
     bindings: &[(u16, crate::call_linkage::ForwardedBinding)],
+    skip: u16,
 ) {
     use crate::call_linkage::ForwardedBinding;
+    debug_assert!(skip == 0 || bindings.is_empty());
     let probe = ops.new_dynamic_label();
     let probed = ops.new_dynamic_label();
+    emit_forwarded_count(ops, frame, skip);
     dynasm!(ops ; .arch x64
-        ; mov r10d, [Rq(frame) + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
         ; add r10d, 1 ; and r10d, -2 ; shl r10, 3
         ; mov Rq(old_sp), rsp ; neg r10 ; add r10, Rq(old_sp)
         ; cmp r10, [r15 + crate::entry::NATIVE_STACK_LIMIT_OFFSET as i32] ; jb =>overflow
@@ -399,8 +417,12 @@ pub(crate) fn emit_push_forwarded(
         ; cmp r11, r10 ; jbe =>probed ; mov QWORD [r11], 0 ; jmp =>probe
         ; =>probed ; mov rsp, r10
         ; mov Rq(source), [Rq(frame) + abi::NATIVE_FRAME_ACTUALS_OFFSET as i32]
-        ; mov r11d, [Rq(frame) + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
     );
+    if skip != 0 {
+        dynasm!(ops ; .arch x64 ; add Rq(source), i32::from(skip) * 8);
+    }
+    emit_forwarded_count(ops, frame, skip);
+    dynasm!(ops ; .arch x64 ; mov r11d, r10d);
     let copy = ops.new_dynamic_label();
     let copied = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>copy ; test r11d, r11d ; jz =>copied
@@ -437,13 +459,15 @@ pub(crate) fn emit_push_forwarded(
         };
         dynasm!(ops ; .arch x64 ; mov [rsp + i32::from(index) * 8], Rq(value) ; =>skip);
     }
-    dynasm!(ops ; .arch x64 ; mov r8d, [Rq(frame) + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]);
+    emit_forwarded_count(ops, frame, skip);
+    dynasm!(ops ; .arch x64 ; mov r8d, r10d);
 }
 
-/// Release the span by the caller's unchanged actual count, preserving result.
-pub(crate) fn emit_pop_forwarded(ops: &mut Assembler, frame: u8) {
+/// Release the span by the caller's unchanged actual count and the same
+/// `skip`, preserving result.
+pub(crate) fn emit_pop_forwarded(ops: &mut Assembler, frame: u8, skip: u16) {
+    emit_forwarded_count(ops, frame, skip);
     dynasm!(ops ; .arch x64
-        ; mov r10d, [Rq(frame) + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
         ; add r10d, 1 ; and r10d, -2 ; shl r10, 3 ; add rsp, r10
     );
 }

@@ -226,6 +226,22 @@ fn recipe_slot(
     locations: &mut impl Iterator<Item = Location>,
     virtual_objects: &mut Vec<(NodeId, VirtualObject<DeoptSlot>)>,
 ) -> DeoptSlot {
+    if let Kind::VirtualRestArray(skip) = graph.node(value).kind {
+        if let Some((_, object)) = virtual_objects.iter().find(|(node, _)| *node == value) {
+            return DeoptSlot::virtual_object(object.id);
+        }
+        // Its elements are the activation's own actuals past `skip`.
+        let id = VirtualObjectId(virtual_objects.len() as u32);
+        virtual_objects.push((
+            value,
+            VirtualObject {
+                id,
+                kind: VirtualObjectKind::RestArray { skip },
+                fields: Box::default(),
+            },
+        ));
+        return DeoptSlot::virtual_object(id);
+    }
     let Kind::VirtualObject { shape } = graph.node(value).kind else {
         let location = locations.next().expect("a location per state value");
         return deopt_slot(graph, slots, value, location);

@@ -4,6 +4,8 @@
 //! - Empty and static nonempty literal plans used by the graph tier.
 //! - [`JitBoilerplateArrayAllocationPlan`]: one array shell over a literal
 //!   boilerplate's shared slab.
+//! - [`JitHoleyArrayAllocationPlan`]: `new Array(n)`, a shell over a private
+//!   slab of `n` holes, sized at run time.
 //! - The ordinary-object header calculation shared with receiver allocation.
 //! - [`JitAllocationSite`]: the placement a literal site had when compiled.
 //!
@@ -43,6 +45,8 @@ pub struct JitLiteralAllocationPlans {
     pub null_object: Option<JitEmptyObjectAllocationPlan>,
     /// Layout of the default-realm bare empty array shell.
     pub array: JitEmptyArrayAllocationPlan,
+    /// Layout of `new Array(n)` in the default realm.
+    pub holey_array: JitHoleyArrayAllocationPlan,
     /// Final static object layouts by own logical instruction PC.
     pub objects: rustc_hash::FxHashMap<u32, JitObjectLiteralAllocationPlan>,
     /// Dense array layouts by own logical instruction PC.
@@ -274,6 +278,79 @@ impl JitDenseArrayAllocationPlan {
                 e::DenseElementKind::Tagged as u8
             },
         })
+    }
+}
+
+/// `new Array(n)`: an empty shell and, after it in one reservation, a private
+/// holey-double slab of capacity `n` whose every element is a hole — the
+/// array the runtime constructor builds. Only the length is dynamic: the
+/// slab's size is `data_byte + 8 * n + 8 * ceil(n / 64)` rounded up to a
+/// cell, ORed into [`Self::slab_header_base`] at [`Self::size_shift`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitHoleyArrayAllocationPlan {
+    /// Array shell geometry.
+    pub shell: JitEmptyArrayAllocationPlan,
+    /// Young slab header with a zero size field.
+    pub slab_header_base: u64,
+    /// Bit position of the header's size field.
+    pub size_shift: u32,
+    /// Slab-relative start of element words.
+    pub data_byte: u32,
+    /// Slab-relative capacity word.
+    pub capacity_byte: u32,
+    /// Slab-relative live length word.
+    pub len_byte: u32,
+    /// Slab-relative hole count word.
+    pub hole_count_byte: u32,
+    /// Slab-relative representation byte.
+    pub kind_byte: u32,
+    /// Slab-relative dirty interval start word.
+    pub dirty_start_byte: u32,
+    /// Header-relative shell slab handle.
+    pub shell_slab_byte: u32,
+    /// Header-relative shell logical length.
+    pub shell_length_byte: u32,
+    /// Header-relative shell cached element address.
+    pub shell_data_byte: u32,
+    /// Header-relative shell cached live length.
+    pub shell_len_byte: u32,
+    /// Header-relative shell cached capacity.
+    pub shell_capacity_byte: u32,
+    /// Header-relative shell cached kind.
+    pub shell_kind_byte: u32,
+    /// The holey-double kind.
+    pub kind: u8,
+    /// Longest length carved here; a longer one takes the runtime path.
+    pub max_len: u32,
+    /// Cell alignment less one: a slab's size is rounded up past it.
+    pub cell_mask: u32,
+}
+
+impl Default for JitHoleyArrayAllocationPlan {
+    fn default() -> Self {
+        use crate::array::elements as e;
+        let header = otter_gc::header::HEADER_SIZE;
+        let offset = |byte: usize| (header + byte) as u32;
+        Self {
+            shell: JitEmptyArrayAllocationPlan::default(),
+            slab_header_base: young_header(e::ELEMENT_SLAB_BODY_TYPE_TAG, 0),
+            size_shift: 8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET as u32,
+            data_byte: (header + std::mem::size_of::<e::ElementSlabBody>()) as u32,
+            capacity_byte: offset(e::SLAB_CAPACITY_BYTE),
+            len_byte: offset(e::SLAB_LEN_BYTE),
+            hole_count_byte: offset(e::SLAB_HOLE_COUNT_BYTE),
+            kind_byte: offset(e::SLAB_KIND_BYTE),
+            dirty_start_byte: offset(e::SLAB_DIRTY_START_BYTE),
+            shell_slab_byte: offset(crate::array::ARRAY_BODY_SLAB_OFFSET),
+            shell_length_byte: offset(crate::array::ARRAY_BODY_LENGTH_OFFSET),
+            shell_data_byte: offset(crate::array::ARRAY_BODY_ELEMENTS_PTR_OFFSET),
+            shell_len_byte: offset(crate::array::ARRAY_BODY_DENSE_LEN_OFFSET),
+            shell_capacity_byte: offset(crate::array::ARRAY_BODY_DENSE_CAP_OFFSET),
+            shell_kind_byte: offset(crate::array::ARRAY_BODY_DENSE_KIND_OFFSET),
+            kind: e::DenseElementKind::HoleyDouble as u8,
+            max_len: 1024,
+            cell_mask: (otter_gc::page::CELL_SIZE - 1) as u32,
+        }
     }
 }
 

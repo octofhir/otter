@@ -2330,6 +2330,25 @@ impl<'a> Codegen<'a> {
                 ];
                 self.emit_store_keyed_cached(node, [receiver, key, value], temps)?;
             }
+            Kind::CallStaticNative => {
+                let callee = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let exit = self.eager_exit(node, DeoptReason::WrongValue);
+                crate::arm64::js_call::emit_native_kind_guard(&mut self.ops, callee, exit);
+                const _: () =
+                    assert!(otter_vm::native_function::NativeEntryKind::Static as u8 == 0);
+                let kind_byte = self.view.native_call_layout.kind_byte;
+                dynasm!(self.ops ; .arch aarch64
+                    ; ldrb w16, [X(callee), kind_byte]
+                    ; cbnz w16, =>exit);
+                let values = allocation.inputs.clone();
+                self.emit_committed_span_call(
+                    node,
+                    abi::STUB_JIT_STATIC_NATIVE_CALL,
+                    &values,
+                    destination,
+                )?;
+            }
             Kind::BuiltinMethod(form) => {
                 let destination = Self::gp(result.expect("a result"));
                 let mut arguments: smallvec::SmallVec<[CommittedArgument; 4]> = (0..=form.arity())

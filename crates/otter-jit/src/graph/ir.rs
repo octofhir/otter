@@ -703,6 +703,11 @@ pub(crate) enum Kind {
     /// (a `lastIndex` or argument coercion, a non-pristine RegExp's
     /// protocol) and throw.
     BuiltinMethod(crate::intrinsic_calls::IntrinsicMethodForm),
+    /// `input0(...input2..)` with input1 as `this`, at a site whose callee
+    /// was only ever a native function: eager deopt unless input0 is one of
+    /// the static entry kind, then its body through the runtime without the
+    /// native call trampoline's frame. May run code and throw.
+    CallStaticNative,
     /// Tagged word at `[input0 + offset]` (input0 a `Word` base or a tagged
     /// cell address).
     LoadTaggedField(i32),
@@ -1231,6 +1236,7 @@ impl Kind {
             | Self::StoreKeyedCached { .. }
             | Self::LoadKeyedCached { .. }
             | Self::BuiltinMethod(_)
+            | Self::CallStaticNative
             | Self::Instanceof => Properties {
                 eager_deopt: true,
                 can_throw: true,
@@ -1377,6 +1383,7 @@ impl Kind {
                     | Form::StringSearch => &[abi::STUB_JIT_STRING_METHOD],
                 }
             }
+            Self::CallStaticNative => &[abi::STUB_JIT_STATIC_NATIVE_CALL],
             Self::Instanceof => &[
                 abi::STUB_INSTANCEOF_LEAF,
                 abi::STUB_JIT_OBJECT_PROTOCOL_VALUE,
@@ -1736,6 +1743,17 @@ impl Kind {
                 }
             }
             Self::BuiltinMethod(form) => simple(1 + form.arity(), ResultPolicy::Register),
+            // The callee is tested in a register; the span call reads every
+            // operand from its home.
+            Self::CallStaticNative => Constraints {
+                inputs: std::iter::once(InputPolicy::Register)
+                    .chain((1..input_count).map(|_| InputPolicy::Home))
+                    .collect(),
+                result: ResultPolicy::Register,
+                gp_temps: 0,
+                fp_temps: 0,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
             Self::Int32Div | Self::Int32Mod => {
                 if let Some(pair) = target.integer_division {
                     Constraints {

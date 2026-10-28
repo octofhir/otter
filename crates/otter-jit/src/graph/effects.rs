@@ -497,6 +497,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::StoreKeyedCached { .. }
         | Kind::LoadKeyedCached { .. }
         | Kind::BuiltinMethod(_)
+        | Kind::CallStaticNative
         | Kind::Instanceof
         | Kind::CallJs { .. }
         | Kind::CallForward { .. }

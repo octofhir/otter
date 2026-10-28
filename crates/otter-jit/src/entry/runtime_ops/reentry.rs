@@ -758,6 +758,26 @@ pub(crate) extern "C" fn jit_regexp_literal_stub(
     committed_value_result(ctx, result)
 }
 
+/// A static-entry native's call over `count` boxed words at `values`:
+/// `[callee, receiver, arguments...]`, which root the body in place.
+pub(crate) extern "C" fn jit_static_native_call_stub(
+    ctx: *mut JitCtx,
+    values: *const Value,
+    count: u32,
+) -> NativeResultPair {
+    let values: &mut [Value] = if values.is_null() || count == 0 {
+        &mut []
+    } else {
+        // SAFETY: generated code owns `count` initialized, aligned Value
+        // words for this synchronous call and pops them only after it.
+        unsafe { std::slice::from_raw_parts_mut(values.cast_mut(), count as usize) }
+    };
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let result = ctx.static_native_call(values);
+    committed_value_result(ctx, result)
+}
+
 /// `receiver.test(argument)` counterpart of [`jit_regexp_exec_stub`].
 pub(crate) extern "C" fn jit_regexp_test_stub(
     ctx: *mut JitCtx,

@@ -349,6 +349,10 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         committed_value2_binding!(abi::STUB_JIT_REGEXP_EXEC, jit_regexp_exec_stub),
         committed_value2_binding!(abi::STUB_JIT_REGEXP_TEST, jit_regexp_test_stub),
         committed_value2_binding!(abi::STUB_JIT_REGEXP_LITERAL, jit_regexp_literal_stub),
+        binding(
+            abi::STUB_JIT_STATIC_NATIVE_CALL,
+            jit_static_native_call_stub as *const () as usize,
+        ),
         committed_value2_binding!(
             abi::STUB_JIT_GLOBAL_DECLARATION_VALUE,
             jit_global_declaration_value_stub

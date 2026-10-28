@@ -142,6 +142,8 @@ impl HostTurn<'_> {
 pub(crate) struct CallerContext<'a> {
     admitted: Option<&'a ExecutionContext>,
     frame: *mut Frame,
+    /// `frame` is the caller's own record, not the native's.
+    caller_frame: bool,
     /// The caller's owner from the isolate's stable owner cache, which keeps
     /// its address while any execution is in progress; `None` for the
     /// admitted context.
@@ -176,6 +178,21 @@ impl<'a> CallerContext<'a> {
         Self {
             admitted: turn.context,
             frame: turn.frame,
+            caller_frame: false,
+            resolved: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// The caller context of a native that compiled code calls without a
+    /// frame of its own: `frame` is the calling function's published record.
+    pub(crate) fn of_caller_frame(
+        admitted: Option<&'a ExecutionContext>,
+        frame: *mut Frame,
+    ) -> Self {
+        Self {
+            admitted,
+            frame,
+            caller_frame: true,
             resolved: std::cell::OnceCell::new(),
         }
     }
@@ -192,6 +209,17 @@ impl<'a> CallerContext<'a> {
     }
 
     fn resolve(&self, vm: &Interpreter) -> Option<*const ExecutionContext> {
+        if self.caller_frame {
+            // SAFETY: the calling record stays published for the whole body.
+            let function_id = unsafe { &*self.frame }.header.function_id;
+            if self
+                .admitted
+                .is_some_and(|context| context.covers_function(function_id))
+            {
+                return None;
+            }
+            return vm.stable_foreign_owner(function_id).ok();
+        }
         let mut child = self.frame;
         loop {
             // SAFETY: the host frame stays published for the whole native

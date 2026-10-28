@@ -252,6 +252,7 @@ impl Interpreter {
             own_slot_cache: crate::object::OwnSlotCache::new(),
             jit_optimized_exit_profiles: std::collections::BTreeMap::new(),
             jit_parameter_widening: rustc_hash::FxHashMap::default(),
+            jit_intrinsic_programs: rustc_hash::FxHashMap::default(),
             jit_optimized_declined_epoch: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),

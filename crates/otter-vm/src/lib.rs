@@ -1161,6 +1161,15 @@ pub struct Interpreter {
     /// Per-function parameter widening learned from failed optimized entry
     /// guards; see [`jit::JitCompileSnapshot::parameter_widening`].
     jit_parameter_widening: rustc_hash::FxHashMap<u32, Box<[jit::JitParameterWidening]>>,
+    /// Intrinsic-prototype programs of each property atom with the layout
+    /// they were built against.
+    jit_intrinsic_programs: rustc_hash::FxHashMap<
+        u32,
+        (
+            interp::jit_intrinsic_properties::IntrinsicLayoutStamp,
+            Vec<jit::JitCacheIrProgram>,
+        ),
+    >,
     /// Feedback epoch at which a hot function last failed optimizing compilation.
     /// A back-edge only re-attempts the whole-body optimizer when the epoch has
     /// advanced, so a structurally-ineligible body is not recompiled on every hot

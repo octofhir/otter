@@ -12,6 +12,8 @@
 //!   `length` and the indices.
 //! - Ordinary closure proofs (no bag, no prototype override, plain kind, the
 //!   compiling realm active) composed with `%Function.prototype%` slot guards.
+//! - [`IntrinsicLayoutStamp`] — the prototype layout a name's programs were
+//!   built against; programs are reused while it is unchanged.
 //! - A closure's own `prototype`, read from its rare record's slot.
 //! - A RegExp's own `lastIndex`, read and written in its body slot.
 //!
@@ -26,6 +28,9 @@
 //!   `length` and canonical numeric names never produce a prototype program.
 //! - The program reads the live slot; it never substitutes a builtin callable.
 //! - Every miss precedes effects and uses the existing committed property call.
+//! - A reused program list was built against the equal stamp: the same
+//!   prototypes with the same shapes (never-reused ids), String layout and
+//!   realm. Its shapes are rooted again for each compilation.
 //!
 //! # See also
 //! - `crate::cache_ir` — ordinary shape/atom/field programs.
@@ -56,8 +61,87 @@ pub(crate) fn body_slot_program(
     })
 }
 
+/// The layout the intrinsic prototypes had when a name's programs were
+/// built: each pinned prototype's identity and current shape (offset and
+/// never-reused id), `%String.prototype%`'s dictionary layout and the active
+/// realm. Programs built against an equal stamp guard exactly these shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IntrinsicLayoutStamp {
+    prototypes: [(u32, u32, u64); 5],
+    string_layout: Option<u32>,
+    active_realm: u32,
+}
+
 impl Interpreter {
+    /// The current [`IntrinsicLayoutStamp`] and the shapes it names.
+    fn intrinsic_layout_stamp(&self) -> (IntrinsicLayoutStamp, [object::ShapeHandle; 5]) {
+        let intrinsics = &self.realm_intrinsics;
+        let prototypes = [
+            intrinsics.map_prototype(),
+            intrinsics.set_prototype(),
+            intrinsics.regexp_prototype(),
+            self.default_array_prototype(),
+            intrinsics.function_prototype(),
+        ];
+        let mut shapes = [object::ShapeHandle::null(); 5];
+        let mut stamp = [(0, 0, 0); 5];
+        for (index, prototype) in prototypes.into_iter().enumerate() {
+            let Some(prototype) = prototype else {
+                continue;
+            };
+            let shape = object::keyed_shape(prototype, &self.gc_heap);
+            shapes[index] = shape;
+            stamp[index] = (
+                prototype.offset(),
+                shape.offset(),
+                if shape.is_null() {
+                    0
+                } else {
+                    object::shape_body::id_of(shape).raw()
+                },
+            );
+        }
+        let string_layout = intrinsics
+            .string_prototype()
+            .and_then(|prototype| object::dictionary_layout(prototype, &self.gc_heap));
+        (
+            IntrinsicLayoutStamp {
+                prototypes: stamp,
+                string_layout,
+                active_realm: self.active_realm_id,
+            },
+            shapes,
+        )
+    }
+
+    /// The intrinsic-prototype programs of `key`: built once per name and
+    /// layout, since every named site of every compilation asks again. A
+    /// reuse roots the guarded shapes for the compilation like a build does.
     pub(crate) fn jit_intrinsic_property_programs(
+        &mut self,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Vec<JitCacheIrProgram> {
+        let atom = key.atom().id().raw();
+        let (stamp, shapes) = self.intrinsic_layout_stamp();
+        if let Some((built, programs)) = self.jit_intrinsic_programs.get(&atom)
+            && *built == stamp
+        {
+            let programs = programs.clone();
+            for shape in shapes {
+                let _ = self.bake_shape(shape);
+            }
+            return programs;
+        }
+        let programs = self.build_intrinsic_property_programs(key);
+        // Building can migrate and root the prototypes, giving them their
+        // final shapes: the stamp is taken after.
+        let (stamp, _) = self.intrinsic_layout_stamp();
+        self.jit_intrinsic_programs
+            .insert(atom, (stamp, programs.clone()));
+        programs
+    }
+
+    fn build_intrinsic_property_programs(
         &mut self,
         key: AtomizedPropertyKey<'_>,
     ) -> Vec<JitCacheIrProgram> {

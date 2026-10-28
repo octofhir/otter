@@ -515,7 +515,10 @@ fn walk(
                     receiver_proved,
                     ..
                 } => {
-                    let receiver = node_data.inputs[0];
+                    // A proved receiver's cell read takes no input.
+                    let Some(&receiver) = node_data.inputs.first() else {
+                        continue;
+                    };
                     let Some(object) = candidate_object(&state, candidates, receiver, &mut escaped)
                     else {
                         continue;

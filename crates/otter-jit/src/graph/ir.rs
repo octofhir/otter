@@ -596,6 +596,12 @@ pub(crate) enum Kind {
     /// named lookup starts there: the bag exists, no `[[Prototype]]` override
     /// is installed and the default realm is active. Eager deopt otherwise.
     LoadFunctionBag,
+    /// [`Self::LoadFunctionBag`] of a function the generation holds as a
+    /// constant: its bag, read from the code-retained identity cell at this
+    /// address, while the default realm is active. Eager deopt otherwise. A
+    /// bag the function released since keeps its emptied shape, which the
+    /// following shape guard refuses.
+    LoadFunctionBagCell(u64),
     /// Store input1 into input0's shape-owned field; a separate node owns its barrier.
     /// `owners` pairs each admitted receiver shape with its selected record;
     /// it is empty when no arm observes.
@@ -895,7 +901,9 @@ pub(crate) enum Kind {
     ArrayPop(u32),
     /// The method the guarded method call at this byte PC reads from
     /// receiver input0: its proved shape, prototype chain and holder slot.
-    /// Eager deopt when the receiver does not match.
+    /// Eager deopt when the receiver does not match. A proved receiver's
+    /// method read from its code-retained cell takes no input; its exit is
+    /// the dependency test a fact-breaking node before it requires.
     LoadGuardedMethod {
         byte_pc: u32,
         /// The site's method target whose guard and slot this load uses.
@@ -1162,11 +1170,13 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
-            Self::LoadArrayExpando(_) | Self::LoadFunctionBag => Properties {
-                eager_deopt: true,
-                effectful: true,
-                ..Properties::default()
-            },
+            Self::LoadArrayExpando(_) | Self::LoadFunctionBag | Self::LoadFunctionBagCell(_) => {
+                Properties {
+                    eager_deopt: true,
+                    effectful: true,
+                    ..Properties::default()
+                }
+            }
             Self::LoadGlobalThis => eager,
             Self::LoadGlobalBinding(_) => Properties {
                 eager_deopt: true,
@@ -1622,13 +1632,14 @@ impl Kind {
                 simple(1 + usize::from(*count), ResultPolicy::Register)
             }
             Self::LoadGuardedMethod { .. } => Constraints {
-                inputs: registers(1),
+                inputs: registers(input_count),
                 result: ResultPolicy::Register,
                 gp_temps: 1,
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
             Self::LoadArrayExpando(_) | Self::LoadFunctionBag => simple(1, ResultPolicy::Register),
+            Self::LoadFunctionBagCell(_) => simple(0, ResultPolicy::Register),
             Self::StringCharCodeAt => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::Register,

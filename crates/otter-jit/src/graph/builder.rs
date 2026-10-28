@@ -666,6 +666,9 @@ struct Builder<'a> {
     /// The slot's dependency keeps that closure the value for the code's
     /// lifetime.
     constant_closures: FxHashMap<NodeId, u32>,
+    /// The identity cell of the own-property bag of each constant closure
+    /// that had one at the bake.
+    constant_bags: FxHashMap<NodeId, u64>,
 }
 
 /// The most actual arguments a spliced body's elided `arguments[i]` selects
@@ -833,6 +836,7 @@ fn build_once(
         field_nullish_candidates: FxHashMap::default(),
         closure_contexts: FxHashMap::default(),
         constant_closures: FxHashMap::default(),
+        constant_bags: FxHashMap::default(),
     };
     let entry = builder.graph.new_block();
     builder.start_entry(entry);
@@ -3834,7 +3838,10 @@ impl<'a> Builder<'a> {
                 bag
             }
             otter_vm::jit::PropertyStorageProjection::LookupStart => {
-                let bag = self.add(Kind::LoadFunctionBag, &[receiver], Repr::Tagged);
+                let bag = match self.constant_bags.get(&receiver) {
+                    Some(&cell) => self.add(Kind::LoadFunctionBagCell(cell), &[], Repr::Tagged),
+                    None => self.add(Kind::LoadFunctionBag, &[receiver], Repr::Tagged),
+                };
                 self.known.entry(bag).heap_object = true;
                 bag
             }
@@ -4309,16 +4316,7 @@ impl<'a> Builder<'a> {
             })
             .into_iter()
             .collect();
-        let callee = self.add(
-            Kind::LoadGuardedMethod {
-                byte_pc,
-                target,
-                receiver_proved: false,
-                cell_read: reads_method_cell(method),
-            },
-            &[receiver],
-            Repr::Tagged,
-        );
+        let callee = self.guarded_method(byte_pc, target, false, method, receiver);
         self.prove_receiver_shape(receiver, method.guard.recv_shape);
         let destination = instruction.writes.first().copied();
         self.emit_receiver_call(
@@ -4357,18 +4355,35 @@ impl<'a> Builder<'a> {
         if self.known_shapes(object).as_deref() != Some(&[method.guard.recv_shape][..]) {
             return false;
         }
-        let value = self.add(
-            Kind::LoadGuardedMethod {
-                byte_pc,
-                target,
-                receiver_proved: true,
-                cell_read: reads_method_cell(method),
-            },
-            &[object],
-            Repr::Tagged,
-        );
+        let value = self.guarded_method(byte_pc, target, true, method, object);
         self.write(instruction.writes[0], value);
         true
+    }
+
+    /// The read of the method target `target` of the guarded site at
+    /// `byte_pc`. Once the receiver is proved, a method a code-retained cell
+    /// holds depends on nothing but the chain facts: that read takes no
+    /// input, so it hoists out of loops and merges with its equals.
+    fn guarded_method(
+        &mut self,
+        byte_pc: u32,
+        target: u8,
+        receiver_proved: bool,
+        method: &otter_vm::jit::JitMethodTarget,
+        receiver: NodeId,
+    ) -> NodeId {
+        let cell_read = reads_method_cell(method);
+        let kind = Kind::LoadGuardedMethod {
+            byte_pc,
+            target,
+            receiver_proved,
+            cell_read,
+        };
+        if receiver_proved && cell_read {
+            self.add(kind, &[], Repr::Tagged)
+        } else {
+            self.add(kind, &[receiver], Repr::Tagged)
+        }
     }
 
     /// The direct method a read of this body's guarded method `node` names.
@@ -4905,16 +4920,7 @@ impl<'a> Builder<'a> {
             let receiver_proved = self
                 .known_shapes(receiver)
                 .is_some_and(|shapes| shapes.as_slice() == [method.guard.recv_shape]);
-            let callee = self.add(
-                Kind::LoadGuardedMethod {
-                    byte_pc,
-                    target,
-                    receiver_proved,
-                    cell_read: reads_method_cell(method),
-                },
-                &[receiver],
-                Repr::Tagged,
-            );
+            let callee = self.guarded_method(byte_pc, target, receiver_proved, method, receiver);
             self.prove_receiver_shape(receiver, method.guard.recv_shape);
             let body = method.body.as_ref();
             // The guard proved an object receiver, which a non-arrow method
@@ -5088,16 +5094,7 @@ impl<'a> Builder<'a> {
             self.current = Some(matched);
             self.known = entry_known.clone();
             self.frame[usize::from(destination)] = before;
-            let callee = self.add(
-                Kind::LoadGuardedMethod {
-                    byte_pc,
-                    target: index as u8,
-                    receiver_proved: true,
-                    cell_read: reads_method_cell(method),
-                },
-                &[receiver],
-                Repr::Tagged,
-            );
+            let callee = self.guarded_method(byte_pc, index as u8, true, method, receiver);
             self.prove_receiver_shape(receiver, method.guard.recv_shape);
             let plan = target.plan;
             let inlined = splice
@@ -5780,10 +5777,14 @@ impl<'a> Builder<'a> {
                 object,
                 shape,
                 function,
+                bag,
             } => {
                 let value = self.add(Kind::LoadCellValue(cell), &[], Repr::Tagged);
                 if let Some(function) = function {
                     self.constant_closures.insert(value, function);
+                }
+                if bag != 0 {
+                    self.constant_bags.insert(value, bag);
                 }
                 let info = self.known.entry(value);
                 info.heap_object = object;

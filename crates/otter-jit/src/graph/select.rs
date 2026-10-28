@@ -74,6 +74,7 @@ fn loads_stored_value(kind: &Kind) -> bool {
             | Kind::LoadKeyedCached { .. }
             | Kind::LoadArrayExpando(_)
             | Kind::LoadFunctionBag
+            | Kind::LoadFunctionBagCell(_)
             | Kind::LoadPresentElement
             | Kind::LoadElementOrUndefined
             | Kind::LoadElement(_)

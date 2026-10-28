@@ -178,6 +178,20 @@ impl Codegen<'_> {
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
                 self.emit_function_bag(input(0), result(), exit);
             }
+            Kind::LoadFunctionBagCell(cell) => {
+                let exit = self.eager_exit(node, DeoptReason::WrongShape);
+                dynasm!(self.ops ; .arch x64
+                    ; mov r11, [r15 + crate::entry::THREAD_OFFSET as i32]
+                    ; mov r11, [r11 + crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET as i32]
+                    ; test r11, r11 ; jz =>exit
+                    ; cmp DWORD [r11], 0 ; jne =>exit);
+                let target = RelocationTarget::CalleeIdentityCell {
+                    function_id: self.view_of(node).code_block.id,
+                    call_pc: self.graph.node(node).pc,
+                };
+                emit_load_symbol_u64(&mut self.ops, &mut self.relocations, 11, cell, target);
+                dynasm!(self.ops ; .arch x64 ; mov Rq(result()), [r11]);
+            }
             Kind::LoadShapedProperty { atom } => {
                 let exit = self.eager_exit(node, DeoptReason::OwnDataMiss);
                 let view = self.view_of(node);
@@ -246,7 +260,12 @@ impl Codegen<'_> {
                     .ok_or(Unsupported::OperandShape("x86 graph guarded method"))?
                     .guard
                     .clone();
-                let receiver = input(0);
+                // A proved receiver's cell read takes no input.
+                let receiver = if assigned.inputs.is_empty() {
+                    result()
+                } else {
+                    input(0)
+                };
                 let holder = assigned.gp_temps[0];
                 if !receiver_proved {
                     let exit = self.eager_exit(node, DeoptReason::WrongShape);

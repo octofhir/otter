@@ -161,6 +161,8 @@ pub struct JitCodeRegistry {
     /// bake these addresses once; tier publication switches only the contained
     /// generation-cell pointer.
     function_entry_cells: rustc_hash::FxHashMap<u32, Box<FunctionEntryCell>>,
+    /// The same cells' addresses, by function, for compiler threads.
+    entry_directory: std::sync::Arc<EntryDirectory>,
     /// Functions retraining after a deopt: their stable cells select the
     /// interpreter while their baseline generation stays installed.
     retraining: rustc_hash::FxHashSet<u32>,
@@ -206,6 +208,7 @@ impl JitCodeRegistry {
             counting_members: rustc_hash::FxHashSet::default(),
             retained_bytes: 0,
             function_entry_cells: rustc_hash::FxHashMap::default(),
+            entry_directory: std::sync::Arc::default(),
             retraining: rustc_hash::FxHashSet::default(),
             function_entries: Vec::new(),
             generated_feedback_seen: rustc_hash::FxHashMap::default(),
@@ -294,6 +297,10 @@ impl JitCodeRegistry {
             self.function_entries.resize(index + 1, 0);
         }
         self.function_entries[index] = std::ptr::from_ref(cell.as_ref()) as u64;
+        let address = std::ptr::from_ref(cell.as_ref()) as usize;
+        self.entry_directory
+            .borrow_mut()
+            .insert(function_id, address);
         self.view.function_entries = self.function_entries.as_ptr() as u64;
         self.view.function_entry_count = self.function_entries.len() as u64;
     }
@@ -632,17 +639,6 @@ impl JitCodeRegistry {
         self.contexts.ensure_watch(heap, context)
     }
 
-    /// The watch slot `slot` of `context` would be watched under; marks
-    /// nothing (see `ContextSubscriptions::watchable_slot`).
-    pub(crate) fn watchable_context_slot(
-        &self,
-        heap: &otter_gc::GcHeap,
-        context: crate::context::ContextHandle,
-        slot: u16,
-    ) -> Option<u32> {
-        self.contexts.watchable_slot(heap, context, slot)
-    }
-
     /// Whether this exact installed generation remains current for entry.
     ///
     /// Entry requires the exact registered generation to remain Installed even
@@ -700,51 +696,13 @@ impl JitCodeRegistry {
         }
     }
 
-    /// Resolve one stable function entry into the complete tier-neutral
-    /// direct-call plan consumed by generated frame construction.
-    ///
-    /// The plan snapshots current generation metadata for layout diagnostics,
-    /// but generated code bakes only the permanent function-cell address. A
-    /// later promotion changes the target generation without changing callers.
-    #[must_use]
-    pub(crate) fn direct_call_plan(
-        &self,
-        function: &crate::executable::CodeBlock,
-    ) -> Option<JitDirectCallPlan> {
-        let (function_entry, generation) = self.published_function_entry(function.id)?;
-        if generation.code_object_id != 0 {
-            let registered = self.codes.get(&generation.code_object_id)?;
-            if registered.state != CodeLifetimeState::Installed
-                || !Self::registered_is_current(&self.epochs, registered)
-            {
-                return None;
-            }
-        }
-        if generation
-            .entry_addr
-            .load(std::sync::atomic::Ordering::Acquire)
-            == 0
-        {
-            return None;
-        }
-        Some(JitDirectCallPlan {
-            function_id: function.id,
-            code_object_id: generation.code_object_id,
-            entry_cell: std::ptr::from_ref(function_entry) as u64,
-            tier: generation.native_frame_header.kind,
-            // An unobservable binding needs no OrdinaryCallBindThis.
-            this_mode: if function.is_strict || function.is_arrow || !function.observes_this {
-                JitDirectCallThisMode::StrictOrLexical
-            } else {
-                JitDirectCallThisMode::SloppyGlobal
-            },
-            is_derived_constructor: function.is_derived_constructor,
-            call_flags: function.call_flags(),
-            callee_cell: 0,
-        })
+    /// The function entry cells' directory, shared with compiler threads.
+    pub(crate) fn entry_directory(&self) -> std::sync::Arc<EntryDirectory> {
+        std::sync::Arc::clone(&self.entry_directory)
     }
 
     /// Read the registry-owned publication without scanning generation history.
+    /// Kept beside [`published_plan`], the plan of one publication.
     /// The publication itself is the sole authority; no reverse-address index or
     /// separately cached generation id participates in target selection.
     fn published_function_entry(
@@ -1483,6 +1441,50 @@ fn retained_call_entry_offset(code: &dyn JitFunctionCode) -> Option<u32> {
         return None;
     }
     u32::try_from(offset).ok()
+}
+
+/// Every function entry cell's address by function, written as the registry
+/// links functions; cells live as long as the registry.
+pub(crate) type EntryDirectory =
+    crate::mutator_owned::MutatorCell<rustc_hash::FxHashMap<u32, usize>>;
+
+/// The direct-call plan of `function`'s published generation in
+/// `function_entry`, when that generation has an entry. Reads atomics only:
+/// a compiler thread may ask, and calls through the permanent cell reach
+/// whatever generation is current when they run.
+pub(crate) fn published_plan(
+    function_entry: &FunctionEntryCell,
+    function: &crate::executable::CodeBlock,
+) -> Option<JitDirectCallPlan> {
+    let address = function_entry.current_generation();
+    if address == 0 {
+        return None;
+    }
+    // SAFETY: published generation cells, tombstones included, live as long
+    // as the registry that published them.
+    let generation = unsafe { &*(address as *const CodeEntryCell) };
+    if generation
+        .entry_addr
+        .load(std::sync::atomic::Ordering::Acquire)
+        == 0
+    {
+        return None;
+    }
+    Some(JitDirectCallPlan {
+        function_id: function.id,
+        code_object_id: generation.code_object_id,
+        entry_cell: std::ptr::from_ref(function_entry) as u64,
+        tier: generation.native_frame_header.kind,
+        // An unobservable binding needs no OrdinaryCallBindThis.
+        this_mode: if function.is_strict || function.is_arrow || !function.observes_this {
+            JitDirectCallThisMode::StrictOrLexical
+        } else {
+            JitDirectCallThisMode::SloppyGlobal
+        },
+        is_derived_constructor: function.is_derived_constructor,
+        call_flags: function.call_flags(),
+        callee_cell: 0,
+    })
 }
 
 #[cfg(test)]

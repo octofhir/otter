@@ -1164,8 +1164,7 @@ impl Baker<'_> {
                 let key = context.property_atom_for_function(view.code_block.id, name_index)?;
                 let holds_intrinsic = self
                     .env
-                    .intrinsics
-                    .function_prototype()
+                    .function_prototype
                     .and_then(|prototype| object::get(prototype, &self.env.heap, "call"))
                     .and_then(|value| value.as_native_function())
                     .is_some_and(|native| native.is_vm_intrinsic(&self.env.heap, intrinsic));
@@ -1860,7 +1859,7 @@ impl Baker<'_> {
                         };
                         let native = if form_site
                             && self.env.foreign_function_realm(fid).is_none()
-                            && let Some(callable) = self.env.intrinsics.callable(kind)
+                            && let Some(callable) = self.env.callable(kind)
                         {
                             let identity_cell =
                                 self.bake_held_identity_cell(Value::native_function(callable));

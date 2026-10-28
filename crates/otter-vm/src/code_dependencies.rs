@@ -216,14 +216,14 @@ pub struct ContextWatch {
     /// must fire.
     watched: std::sync::atomic::AtomicU64,
     /// Bit `s`: slot `s` was written after being watched.
-    volatile: Cell<u64>,
+    volatile: std::sync::atomic::AtomicU64,
     entries: Cell<Vec<(u16, Arc<DependencyFlag>)>>,
     /// This watch's identity in its registry, which dependencies name.
     id: u32,
     /// The volatile slots of every context of this context's scope, owned by
     /// the registry: a slot written after a watch here is never watched in
     /// any context of the scope again.
-    scope: *const Cell<u64>,
+    scope: *const std::sync::atomic::AtomicU64,
 }
 
 const _: [(); 0] = [(); std::mem::offset_of!(ContextWatch, watched)];
@@ -232,7 +232,7 @@ impl Default for ContextWatch {
     fn default() -> Self {
         Self {
             watched: std::sync::atomic::AtomicU64::new(0),
-            volatile: Cell::new(0),
+            volatile: std::sync::atomic::AtomicU64::new(0),
             entries: Cell::new(Vec::new()),
             id: 0,
             scope: std::ptr::null(),
@@ -246,7 +246,7 @@ impl std::fmt::Debug for ContextWatch {
             .debug_struct("ContextWatch")
             .field("id", &self.id)
             .field("watched", &self.watched.load(Ordering::Relaxed))
-            .field("volatile", &self.volatile.get())
+            .field("volatile", &self.volatile.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -274,7 +274,7 @@ pub(crate) struct ContextSubscriptions {
     watches: Vec<Box<ContextWatch>>,
     /// Volatile slots per scope descriptor, `(scope_function_id,
     /// scope_index)`: shared by every context of the scope.
-    scopes: rustc_hash::FxHashMap<(u32, u16), Box<Cell<u64>>>,
+    scopes: rustc_hash::FxHashMap<(u32, u16), Box<std::sync::atomic::AtomicU64>>,
 }
 
 impl ContextSubscriptions {
@@ -287,9 +287,9 @@ impl ContextSubscriptions {
         context: crate::context::ContextHandle,
         slot: u16,
     ) -> Option<u32> {
-        let id = self.watchable_slot(heap, context, slot).or_else(|| {
+        let id = watchable_slot(heap, context, slot).or_else(|| {
             self.ensure_watch(heap, context)?;
-            self.watchable_slot(heap, context, slot)
+            watchable_slot(heap, context, slot)
         })?;
         self.get(id)?.watched.fetch_or(1 << slot, Ordering::Relaxed);
         Some(id)
@@ -307,7 +307,7 @@ impl ContextSubscriptions {
             // SAFETY: a nonzero watch word names a watch this registry owns.
             return Some(unsafe { &*(current as *const ContextWatch) }.id);
         }
-        let scope: &Cell<u64> = self
+        let scope: &std::sync::atomic::AtomicU64 = self
             .scopes
             .entry(crate::context::scope_identity(heap, context))
             .or_default();
@@ -321,35 +321,6 @@ impl ContextSubscriptions {
         crate::context::set_watch(heap, context, std::ptr::from_ref(&*fresh) as u64);
         self.watches.push(fresh);
         Some(id)
-    }
-
-    /// The identity of `context`'s watch when slot `slot` could be watched
-    /// under it: the context has its watch, the slot is in range, and
-    /// neither the watch nor the context's scope saw the slot written after
-    /// a watch. Creates and marks nothing.
-    pub(crate) fn watchable_slot(
-        &self,
-        heap: &otter_gc::GcHeap,
-        context: crate::context::ContextHandle,
-        slot: u16,
-    ) -> Option<u32> {
-        if slot >= WATCHABLE_CONTEXT_SLOTS {
-            return None;
-        }
-        if self
-            .scopes
-            .get(&crate::context::scope_identity(heap, context))
-            .is_some_and(|scope| scope.get() >> slot & 1 != 0)
-        {
-            return None;
-        }
-        let current = crate::context::watch(heap, context);
-        if current == 0 {
-            return None;
-        }
-        // SAFETY: a nonzero watch word names a watch this registry owns.
-        let watch = unsafe { &*(current as *const ContextWatch) };
-        (watch.volatile.get() >> slot & 1 == 0).then_some(watch.id)
     }
 
     fn get(&self, id: u32) -> Option<&ContextWatch> {
@@ -388,6 +359,31 @@ impl ContextSubscriptions {
     }
 }
 
+/// The identity of `context`'s watch when slot `slot` could be watched under
+/// it: the context has its watch, the slot is in range, and neither the
+/// watch nor the context's scope saw the slot written after a watch. Creates
+/// and marks nothing; reads only atomics the mutator writes, so a compiler
+/// thread may ask.
+pub(crate) fn watchable_slot(
+    heap: &otter_gc::GcHeap,
+    context: crate::context::ContextHandle,
+    slot: u16,
+) -> Option<u32> {
+    if slot >= WATCHABLE_CONTEXT_SLOTS {
+        return None;
+    }
+    let current = crate::context::watch(heap, context);
+    if current == 0 {
+        return None;
+    }
+    // SAFETY: a nonzero watch word names a registry-owned watch, which lives
+    // as long as the registry; its scope mask lives as long as the watch.
+    let watch = unsafe { &*(current as *const ContextWatch) };
+    let scope = unsafe { &*watch.scope };
+    let written = watch.volatile.load(Ordering::Relaxed) | scope.load(Ordering::Relaxed);
+    (written >> slot & 1 == 0).then_some(watch.id)
+}
+
 /// Slot `slot` of the context whose watch word is `watch` was just written:
 /// when the slot is watched, set its subscribers' flags, drop them, and mark
 /// the slot volatile.
@@ -400,10 +396,10 @@ pub(crate) fn context_slot_written(watch: u64, slot: u16) {
         return;
     }
     watch.watched.fetch_and(!(1 << slot), Ordering::Relaxed);
-    watch.volatile.set(watch.volatile.get() | 1 << slot);
+    watch.volatile.fetch_or(1 << slot, Ordering::Relaxed);
     // SAFETY: the registry owns the scope's mask for as long as the watch.
     let scope = unsafe { &*watch.scope };
-    scope.set(scope.get() | 1 << slot);
+    scope.fetch_or(1 << slot, Ordering::Relaxed);
     let mut entries = watch.entries.take();
     entries.retain(|(subscribed, flag)| {
         if *subscribed == slot {

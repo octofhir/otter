@@ -154,6 +154,16 @@ impl ClosureContexts {
         }
     }
 
+    /// The address of `function_id`'s fact context word: `Some(0)` for an
+    /// untracked source, `None` before classification.
+    pub(crate) fn fact_cell(&self, function_id: u32) -> Option<usize> {
+        let fact = self.facts.get(&function_id)?;
+        Some(
+            fact.as_ref()
+                .map_or(0, |fact| fact.context.as_ptr() as usize),
+        )
+    }
+
     pub(crate) fn single(&self, function_id: u32) -> Option<(u64, Value)> {
         let fact = self.facts.get(&function_id)?.as_ref()?;
         Some((fact.context.as_ptr() as u64, fact.single()?))
@@ -229,18 +239,57 @@ impl crate::Interpreter {
         {
             return cell;
         }
-        if source.lazy_pending(function_id) {
-            return self
-                .jit_code_registry
+        let cell = if source.lazy_pending(function_id) {
+            self.jit_code_registry
                 .closure_contexts
-                .prepare_pending(function_id);
-        }
-        let Ok(owner) = source.for_function(function_id) else {
-            return 0;
-        };
-        owner.function(function_id).map_or(0, |function| {
+                .prepare_pending(function_id)
+        } else {
+            let Ok(owner) = source.for_function(function_id) else {
+                return 0;
+            };
+            let Some(function) = owner.function(function_id) else {
+                return 0;
+            };
             self.jit_code_registry.closure_contexts.prepare(function)
-        })
+        };
+        // Publish the classification for compilations: the fact's context
+        // cell, which lives as long as the registry, or none.
+        if let Some(fact) = self
+            .jit_code_registry
+            .closure_contexts
+            .fact_cell(function_id)
+        {
+            self.closure_context_cells_mut().insert(function_id, fact);
+        }
+        cell
+    }
+}
+
+/// The context one classified source's closures share, read from its
+/// published fact cell (`0` for an untracked source): what
+/// [`ClosureContexts::single`] answers, for a compiler thread.
+pub(crate) fn single_of_cell(cell: usize) -> Option<Value> {
+    if cell == 0 {
+        return None;
+    }
+    // SAFETY: a published cell is the context word of a fact the registry
+    // keeps for its whole life.
+    let bits = unsafe { &*(cell as *const AtomicU64) }.load(Ordering::Relaxed);
+    (bits != ContextFact::UNSEEN && bits != Value::undefined().to_bits())
+        .then(|| Value::from_bits(bits))
+}
+
+/// What [`ClosureContexts::classified`] answers of a published fact cell.
+pub(crate) fn classified_of_cell(cell: usize) -> u64 {
+    if cell == 0 {
+        return 0;
+    }
+    // SAFETY: as for `single_of_cell`.
+    let bits = unsafe { &*(cell as *const AtomicU64) }.load(Ordering::Relaxed);
+    if bits == Value::undefined().to_bits() {
+        0
+    } else {
+        cell as u64
     }
 }
 

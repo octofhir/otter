@@ -135,11 +135,15 @@ impl Interpreter {
         // Keyed side state uses the admitted directory's atom replay.
         let shape_runtime = object::ShapeRuntime::restored_shell(&mut gc_heap, names);
 
+        let jit_code_registry = crate::jit_registry::JitCodeRegistry::new_boxed();
+        let compile_shared = std::sync::Arc::new(crate::compile_shared::CompileShared::new(
+            jit_code_registry.entry_directory(),
+        ));
         let mut interp = Self {
             local_time_zone: crate::date::LocalTimeZone::default(),
             template_objects: rustc_hash::FxHashMap::default(),
             mutator: crate::mutator_owned::MutatorToken::new(),
-            compile_shared: std::sync::Arc::default(),
+            compile_shared,
             number_strings: crate::string::number_strings::NumberStrings::empty(),
             regexp_match_shape: crate::object::ShapeHandle::null(),
             pending_error_detail: std::cell::RefCell::new(None),
@@ -204,7 +208,7 @@ impl Interpreter {
             jit_code_cache: None,
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),
             jit_runtime_stats: crate::JitRuntimeStats::default(),
-            jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
+            jit_code_registry,
             caller_function_cache: std::cell::Cell::new(None),
             jit_compile_queue: crate::jit_compile_queue::OptimizingCompileQueue::default(),
             jit_instanceof_cells: std::cell::RefCell::default(),

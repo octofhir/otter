@@ -258,6 +258,137 @@ impl MutatingLeafStub2 {
     }
 }
 
+/// Two-argument isolate leaf runtime stub ABI.
+///
+/// [`LeafNoAllocStub2Fn`] handed the published [`crate::native_abi::VmThread`]
+/// instead of the heap: the entry reaches the isolate state beside the heap
+/// through the thread's runtime activation. It may carve cells the nursery
+/// buffer already holds and never collects, throws or reenters JavaScript;
+/// a miss precedes every effect.
+pub type IsolateLeafStub2Fn =
+    extern "C" fn(*const crate::native_abi::VmThread, u64, u64) -> NativeResultPair;
+
+/// Callable isolate-leaf stub entry with its ABI descriptor.
+#[derive(Clone, Copy)]
+pub struct IsolateLeafStub2 {
+    /// Passive descriptor shared with profiler/JIT metadata.
+    pub descriptor: RuntimeStubDescriptor,
+    /// Machine-callable Rust entrypoint with the descriptor's fixed ABI shape.
+    pub entry: IsolateLeafStub2Fn,
+}
+
+impl IsolateLeafStub2 {
+    /// `true` when descriptor metadata matches this callable ABI shape.
+    #[must_use]
+    pub const fn is_valid(self) -> bool {
+        validate_stub_descriptor(self.descriptor, NO_SAFEPOINT)
+            && self.descriptor.argument_count == 2
+            && matches!(
+                self.descriptor.signature,
+                crate::native_abi::RuntimeStubSignature::IsolateLeafValue2
+            )
+    }
+
+    /// Raw native entry address for generated code.
+    #[must_use]
+    pub fn entry_addr(self) -> usize {
+        self.entry as usize
+    }
+}
+
+/// Resolve an isolate leaf entry by descriptor id.
+#[must_use]
+pub const fn isolate_leaf_stub2_by_id(id: RuntimeStubId) -> Option<IsolateLeafStub2> {
+    if id == crate::native_abi::STUB_REGEXP_EXEC_LEAF.id {
+        return Some(REGEXP_EXEC_LEAF);
+    }
+    if id == crate::native_abi::STUB_REGEXP_TEST_LEAF.id {
+        return Some(REGEXP_TEST_LEAF);
+    }
+    None
+}
+
+/// `receiver.exec(subject)` in the isolate, without a frame.
+pub const REGEXP_EXEC_LEAF: IsolateLeafStub2 = IsolateLeafStub2 {
+    descriptor: crate::native_abi::STUB_REGEXP_EXEC_LEAF,
+    entry: regexp_exec_leaf,
+};
+
+/// `receiver.test(subject)` in the isolate, without a frame.
+pub const REGEXP_TEST_LEAF: IsolateLeafStub2 = IsolateLeafStub2 {
+    descriptor: crate::native_abi::STUB_REGEXP_TEST_LEAF,
+    entry: regexp_test_leaf,
+};
+
+/// The interpreter the thread's runtime activation publishes, while one is.
+/// Leaf callers pass the live thread record of the calling compiled
+/// activation, whose runtime context is published for its dynamic extent;
+/// the activation's interpreter is exclusive for the duration of the leaf,
+/// which binds no runtime call.
+fn thread_interpreter(
+    thread: *const crate::native_abi::VmThread,
+) -> Option<&'static mut Interpreter> {
+    if thread.is_null() {
+        return None;
+    }
+    // SAFETY: as [`heap_mut`], for the thread record and the activation it
+    // names.
+    unsafe {
+        let activation = (*thread).runtime_context as *const crate::jit::VmRuntimeActivation;
+        if activation.is_null() {
+            return None;
+        }
+        (*activation).vm.as_mut()
+    }
+}
+
+/// Leaf `%RegExp.prototype.exec%`: the complete method for a RegExp whose
+/// `lastIndex` is a plain non-negative int32 and a contiguous string, its
+/// match array carved from the ready nursery buffer. Any other operand, a
+/// buffer without room, and `hasIndices` or named groups miss before any
+/// effect.
+#[must_use]
+pub extern "C" fn regexp_exec_leaf(
+    thread: *const crate::native_abi::VmThread,
+    receiver_bits: u64,
+    subject_bits: u64,
+) -> NativeResultPair {
+    let Some(vm) = thread_interpreter(thread) else {
+        return NativeResultPair::miss();
+    };
+    match crate::regexp_fast::exec_leaf(
+        vm,
+        Value::from_abi_bits(receiver_bits),
+        Value::from_abi_bits(subject_bits),
+        false,
+    ) {
+        Some(value) => NativeResultPair::success(value),
+        None => NativeResultPair::miss(),
+    }
+}
+
+/// Leaf `%RegExp.prototype.test%`: [`regexp_exec_leaf`] reporting only a
+/// hit, for a receiver whose protocol is the built-in one.
+#[must_use]
+pub extern "C" fn regexp_test_leaf(
+    thread: *const crate::native_abi::VmThread,
+    receiver_bits: u64,
+    subject_bits: u64,
+) -> NativeResultPair {
+    let Some(vm) = thread_interpreter(thread) else {
+        return NativeResultPair::miss();
+    };
+    match crate::regexp_fast::exec_leaf(
+        vm,
+        Value::from_abi_bits(receiver_bits),
+        Value::from_abi_bits(subject_bits),
+        true,
+    ) {
+        Some(value) => NativeResultPair::success(value),
+        None => NativeResultPair::miss(),
+    }
+}
+
 /// Three-argument mutating leaf runtime stub ABI.
 ///
 /// [`MutatingLeafStub2Fn`] with one more operand word, for an in-place write
@@ -1240,6 +1371,7 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
 #[must_use]
 pub(crate) fn is_vm_owned_runtime_stub(id: RuntimeStubId) -> bool {
     leaf_no_alloc_stub2_by_id(id).is_some()
+        || isolate_leaf_stub2_by_id(id).is_some()
         || float64_leaf_stub2_by_id(id).is_some()
         || float64_math_leaf_stub_by_id(id).is_some()
         || float64_to_word_leaf_stub1_by_id(id).is_some()
@@ -4603,6 +4735,12 @@ mod tests {
                         assert!(
                             float64_math_leaf_stub_by_id(descriptor.id)
                                 .is_some_and(Float64MathLeafStub::is_valid)
+                        );
+                    }
+                    crate::native_abi::RuntimeStubSignature::IsolateLeafValue2 => {
+                        assert!(
+                            isolate_leaf_stub2_by_id(descriptor.id)
+                                .is_some_and(IsolateLeafStub2::is_valid)
                         );
                     }
                     crate::native_abi::RuntimeStubSignature::MutatingLeafValue2 => {

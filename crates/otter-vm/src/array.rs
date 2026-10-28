@@ -190,6 +190,33 @@ impl Default for ArrayBody {
 }
 
 impl ArrayBody {
+    /// A fresh dense array over its own private tagged `slab` of `len`
+    /// live elements (null for none), with `expando` preset: every cached
+    /// field as [`Self::adopt_slab`] would leave it, written once.
+    pub(crate) fn fresh_dense_tagged(
+        slab: elements::ElementSlabHandle,
+        len: usize,
+        expando: crate::object::JsObject,
+    ) -> Self {
+        let (kind, data) = if slab.is_null() {
+            (DenseElementKind::Empty, std::ptr::null_mut())
+        } else {
+            (DenseElementKind::Tagged, elements::data_base(slab))
+        };
+        Self {
+            map: otter_gc::cell_map::TypeMap::NEW,
+            slab,
+            logical_length: len as u32,
+            exotic: ArrayExoticHandle::null(),
+            expando,
+            elements_ptr: Cell::new(data),
+            dense_len: Cell::new(len as u32),
+            dense_cap: Cell::new(len as u32),
+            dense_kind: Cell::new(kind as u8),
+            dense_own_guard: Cell::new(0),
+        }
+    }
+
     /// Logical `length` property.
     #[inline]
     #[must_use]
@@ -856,8 +883,8 @@ pub(crate) fn from_values_with_roots(
     alloc_body_with_adopted_elements(heap, body, placement, external_visit)
 }
 
-/// Allocation-buffer bytes [`try_tagged_from_values_no_collect`] takes for
-/// `len` elements.
+/// Allocation-buffer bytes [`place_tagged_array`] takes for `len` elements:
+/// the shell and, for a non-empty array, its slab.
 pub(crate) fn tagged_array_cell_bytes(len: usize) -> usize {
     let slab = if len == 0 {
         0
@@ -870,40 +897,66 @@ pub(crate) fn tagged_array_cell_bytes(len: usize) -> usize {
     GcHeap::cell_bytes::<ArrayBody>(0) + slab
 }
 
-/// A dense array of `values`, none of them a number or a hole, with tagged
-/// storage, built from the allocation buffer without collecting: the bytes
-/// the caller reserved ([`tagged_array_cell_bytes`]). The same cells
-/// [`from_values_with_roots`] makes. `None` when the buffer has no room.
-pub(crate) fn try_tagged_from_values_no_collect(
+/// A private tagged slab of `len` live slots placed in a group's carve, its
+/// slots for the caller to write ([`write_placed_tagged_slot`]) before the
+/// array over it is placed; null for no slots.
+pub(crate) fn place_tagged_slab(
     heap: &mut GcHeap,
-    values: &[Value],
-) -> Option<JsArray> {
-    debug_assert!(values.is_empty() || initial_dense_kind(values) == DenseElementKind::Tagged);
-    let slab = if values.is_empty() {
-        elements::ElementSlabHandle::null()
-    } else {
-        // The slab is exactly as long as `values`: the copy writes every
-        // trailing byte.
-        heap.try_alloc_filled_trailing_no_collect_or_return(
-            elements::ElementSlabBody::new(values.len(), DenseElementKind::Tagged),
-            elements::ElementSlabBody::trailing_bytes(values.len(), DenseElementKind::Tagged),
-            |slab| slab.init_tagged_prefix(values),
-        )
-        .ok()?
-    };
-    let mut body = ArrayBody {
-        ..Default::default()
-    };
-    body.set_length(values.len());
-    body.adopt_slab(slab, values.len());
-    // A young slab needs no generational entry, only the marking half of
-    // the barrier while a cycle runs.
-    // SAFETY: a non-null handle names the live slab allocated above.
-    let young = slab.is_null() || unsafe { (*slab.as_header_ptr()).is_young() };
-    if !young || heap.marking().is_marking() {
-        record_slab_contents(heap, slab, values.len());
+    carve: &mut otter_gc::CellCarve,
+    len: usize,
+) -> elements::ElementSlabHandle {
+    if len == 0 {
+        return elements::ElementSlabHandle::null();
     }
-    heap.try_alloc_no_collect(body)
+    heap.place(
+        carve,
+        elements::ElementSlabBody::new(len, DenseElementKind::Tagged),
+        elements::ElementSlabBody::trailing_bytes(len, DenseElementKind::Tagged),
+        |slab| slab.init_tagged_filled(len),
+    )
+}
+
+/// Write slot `index` of a slab [`place_tagged_slab`] placed, before any
+/// array over it exists: no barrier, the slab being young and unpublished.
+///
+/// # Safety
+/// `index` is below the slab's live length.
+pub(crate) unsafe fn write_placed_tagged_slot(
+    slab: elements::ElementSlabHandle,
+    index: usize,
+    value: Value,
+) {
+    let body = elements::body_of(slab).expect("a placed slab");
+    // SAFETY: the caller keeps `index` within the live slots of a slab no
+    // other borrow reaches.
+    unsafe { (*body).tagged_slot_ptr(index).write(value) };
+}
+
+/// A dense array over the `len` tagged slots of `slab`
+/// ([`place_tagged_slab`], every slot written), none of them a number or a
+/// hole, with its `expando` preset, placed in a group's carve
+/// ([`tagged_array_cell_bytes`] of it): the same cells
+/// [`from_values_with_roots`] makes. Both cells are young, so only a
+/// running marking cycle records their edges.
+pub(crate) fn place_tagged_array(
+    heap: &mut GcHeap,
+    carve: &mut otter_gc::CellCarve,
+    slab: elements::ElementSlabHandle,
+    len: usize,
+    expando: crate::object::JsObject,
+) -> JsArray {
+    let body = ArrayBody::fresh_dense_tagged(slab, len, expando);
+    #[cfg(debug_assertions)]
+    debug_assert!(body.element_cache_is_current());
+    let marking = heap.marking().is_marking();
+    if marking {
+        record_slab_contents(heap, slab, len);
+    }
+    let array = heap.place(carve, body, 0, |_| {});
+    if marking && !expando.is_null() {
+        heap.record_write(array, &expando);
+    }
+    array
 }
 
 /// Allocate a slab sized to `values` and copy them in.

@@ -383,16 +383,24 @@ impl ElementSlabBody {
         }
     }
 
-    /// Fill a fresh tagged slab's first `values.len()` slots with one copy and
-    /// publish them as its live prefix, all of it dirty.
-    pub(crate) fn init_tagged_prefix(&mut self, values: &[Value]) {
+    /// Take a fresh private tagged slab's first `len` slots as live, the
+    /// caller writing each through [`Self::tagged_slot_ptr`] before the slab
+    /// can be observed.
+    pub(crate) fn init_tagged_filled(&mut self, len: usize) {
         self.assert_private();
-        assert!(self.kind == DenseElementKind::Tagged && values.len() <= self.capacity());
-        // SAFETY: `values.len() <= capacity`; tagged data words are `Value`,
-        // and the fresh slab's storage does not overlap the caller's slice.
-        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), self.values_ptr(), values.len()) };
-        self.mark_dirty_range(0, values.len());
-        self.len = values.len() as u32;
+        assert!(self.kind == DenseElementKind::Tagged && len <= self.capacity());
+        self.mark_dirty_range(0, len);
+        self.len = len as u32;
+    }
+
+    /// The tagged word of slot `index`.
+    ///
+    /// # Safety
+    /// `index` is below the slab's capacity.
+    pub(crate) unsafe fn tagged_slot_ptr(&mut self, index: usize) -> *mut Value {
+        debug_assert!(index < self.capacity());
+        // SAFETY: the caller keeps `index` within the trailing storage.
+        unsafe { self.values_ptr().add(index) }
     }
 
     /// Publish a fully initialized live prefix.

@@ -46,7 +46,7 @@ mod parser;
 mod program;
 mod unicode;
 
-pub use api::{MatchScratch, Matches, Regex};
+pub use api::{MatchScratch, MatchSlots, Matches, Regex};
 pub use cursor::Unit;
 pub use error::{ExecError, RegexError};
 pub use exec::ExecConfig;

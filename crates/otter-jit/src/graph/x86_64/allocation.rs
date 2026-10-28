@@ -28,6 +28,46 @@ use otter_vm::jit::{
 };
 
 impl Codegen<'_> {
+    /// A regex literal's young birth from its baked image; the committed
+    /// miss makes the RegExp in the runtime.
+    pub(super) fn emit_regexp_allocation(&mut self, node: NodeId) -> Result<(), Unsupported> {
+        let destination = Self::gp(self.loc(node).result.expect("regexp allocation result"));
+        let Kind::NewRegExp(byte_pc) = self.graph.node(node).kind else {
+            unreachable!("regexp allocation kind");
+        };
+        let source = self.view_of(node);
+        let realm = source.literal_allocations.realm_id;
+        let plan = *source
+            .literal_allocations
+            .regexps
+            .get(&byte_pc)
+            .ok_or(Unsupported::OperandShape("graph regexp literal plan"))?;
+        let allocation = self.loc(node);
+        let regs = LabRegisters {
+            buffer: allocation.gp_temps[0],
+            candidate: allocation.gp_temps[1],
+            end: allocation.gp_temps[2],
+            scratch: allocation.gp_temps[3],
+            size: 11,
+        };
+        debug_assert!(!allocation.gp_temps.contains(&destination));
+        let slow = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        crate::x86_64::allocation::emit_regexp_literal(&mut self.ops, 15, realm, &plan, regs, slow);
+        dynasm!(self.ops ; .arch x64 ; mov Rq(destination), Rq(regs.candidate) ; jmp =>done ; =>slow);
+        self.emit_committed_call(
+            node,
+            abi::STUB_JIT_REGEXP_LITERAL,
+            &[
+                CommittedArgument::Scalar(u64::from(plan.constant)),
+                CommittedArgument::Scalar(0),
+            ],
+            Some(destination),
+        )?;
+        dynasm!(self.ops ; .arch x64 ; =>done);
+        Ok(())
+    }
+
     pub(super) fn emit_empty_allocation(&mut self, node: NodeId) -> Result<(), Unsupported> {
         let destination = Self::gp(self.loc(node).result.expect("empty allocation result"));
         let plans = &self.view_of(node).literal_allocations;

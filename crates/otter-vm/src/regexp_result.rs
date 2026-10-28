@@ -1,9 +1,11 @@
 //! Folded construction of the array a RegExp match returns.
 //!
 //! # Contents
-//! - [`build_match_result_folded`] — the match array, its substrings and its
-//!   `index` / `input` / `groups` record, taken from one allocation-buffer
-//!   reservation.
+//! - [`carve_match_result`] — the match array, its substrings and its
+//!   `index` / `input` / `groups` record, carved from an allocation buffer
+//!   that already holds them: the leaf `exec` entry's builder.
+//! - [`build_match_result_folded`] — the same cells from one reservation
+//!   the subject and receiver are rooted across.
 //!
 //! # Invariants
 //! - One reservation admits every cell of the result. No allocation after it
@@ -24,13 +26,93 @@
 //!   `hasIndices` is the caller's to route there.
 //!
 //! # See also
-//! - [`crate::regexp_fast::exec_direct`] produces the match this builds.
+//! - [`crate::regexp_fast::exec_direct`] and [`crate::regexp_fast::exec_leaf`]
+//!   produce the match this builds.
 //! - [`otter_gc::GcHeap::ensure_machine_allocation_with_roots`] makes the
 //!   reservation generated allocation groups also use.
 
-use crate::regexp::engine::MatchOffsets;
+use crate::regexp::engine::{MatchGroups, MatchOffsets};
 use crate::rooting::RootScopeExt;
 use crate::{Interpreter, Value, VmError};
+
+/// Groups a match array is planned for on the stack; a match with more
+/// plans each group twice instead.
+const PLANNED_GROUPS: usize = 16;
+
+/// The array `exec` returns for `matched` in the string `input`, read
+/// through `source` (its contiguous units), its record of the kept `shape`
+/// ([`Interpreter::regexp_match_shape`]), carved from the allocation buffer
+/// in one group when it already holds every cell: the slab first, each
+/// group's substring written straight into its slot, then the record and
+/// the array over them. Nothing here collects or moves a value. The caller
+/// rules out named groups. `None` when the buffer has no room.
+pub(crate) fn carve_match_result(
+    heap: &mut otter_gc::GcHeap,
+    source: &crate::string::gc_body::SubstringSource,
+    shape: crate::object::ShapeHandle,
+    input: Value,
+    matched: impl MatchGroups,
+) -> Option<Value> {
+    use crate::string::gc_body::SubstringCell;
+    let groups = matched.groups();
+    let mut bytes = crate::array::tagged_array_cell_bytes(groups)
+        + crate::object::object_cell_bytes(crate::object::shape_body::inline_capacity_of(shape));
+    // Each group's cell, planned once; `None` for a group that did not
+    // participate.
+    let mut planned: [Option<SubstringCell>; PLANNED_GROUPS] = [None; PLANNED_GROUPS];
+    let plan = |heap: &otter_gc::GcHeap, index: usize| {
+        matched.group(index).map(|range| source.plan(heap, range))
+    };
+    for index in 0..groups {
+        if let Some((cell, cell_bytes)) = plan(heap, index) {
+            bytes += cell_bytes;
+            if let Some(slot) = planned.get_mut(index) {
+                *slot = Some(cell);
+            }
+        }
+    }
+    let mut carve = heap.carve(bytes)?;
+    let slab = crate::array::place_tagged_slab(heap, &mut carve, groups);
+    for index in 0..groups {
+        let cell = match planned.get(index) {
+            Some(cell) => *cell,
+            None => plan(heap, index).map(|(cell, _)| cell),
+        };
+        let value = match cell {
+            Some(cell) => Value::string_gc(source.place(heap, &mut carve, cell)),
+            None => Value::undefined(),
+        };
+        // SAFETY: `index < groups`, the slab's live length.
+        unsafe { crate::array::write_placed_tagged_slot(slab, index, value) };
+    }
+    let record = [
+        Value::number_f64(matched.range().start as f64),
+        input,
+        Value::undefined(),
+    ];
+    let bag = crate::object::place_generalized_object(heap, &mut carve, shape, &record);
+    let array = crate::array::place_tagged_array(heap, &mut carve, slab, groups, bag);
+    debug_assert_eq!(carve.remaining(), 0, "the group placed what it carved");
+    Some(Value::array(array))
+}
+
+/// Allocation-buffer bytes [`carve_match_result`] takes for `matched`.
+fn match_result_bytes(
+    heap: &otter_gc::GcHeap,
+    source: &crate::string::gc_body::SubstringSource,
+    shape: crate::object::ShapeHandle,
+    matched: impl MatchGroups,
+) -> usize {
+    let groups = matched.groups();
+    let mut bytes = crate::array::tagged_array_cell_bytes(groups)
+        + crate::object::object_cell_bytes(crate::object::shape_body::inline_capacity_of(shape));
+    for index in 0..groups {
+        if let Some(range) = matched.group(index) {
+            bytes += source.plan(heap, range).1;
+        }
+    }
+    bytes
+}
 
 /// The array `exec` of `receiver` returns for `matched` in `input`, or
 /// `None` when the scoped builder must make it. Both values are updated in
@@ -54,57 +136,61 @@ pub(crate) fn build_match_result_folded(
     let Some(shape) = interp.regexp_match_shape()? else {
         return Ok(None);
     };
-    let groups = matched.groups();
-    let substrings = 1 + matched.captures().filter(Option::is_some).count();
-    let bytes = substrings * crate::string::gc_body::SUBSTRING_CELL_BYTES
-        + crate::array::tagged_array_cell_bytes(groups)
-        + crate::object::object_cell_bytes(crate::object::shape_body::inline_capacity_of(shape));
+    let text = input
+        .as_string(&interp.gc_heap)
+        .ok_or(VmError::TypeMismatch)?
+        .handle();
+    let Some(source) = crate::string::gc_body::SubstringSource::of(&interp.gc_heap, text) else {
+        return Ok(None);
+    };
+    let bytes = match_result_bytes(&interp.gc_heap, &source, shape, matched);
     // A buffer that already holds every cell needs no roots; otherwise the
-    // reservation may collect, which moves the subject and the receiver.
-    if !interp.gc_heap.machine_allocation_ready(bytes) {
-        let mut roots = otter_gc::RootScope::new(&mut interp.gc_heap);
-        // SAFETY: both slots belong to the caller and outlive the scope.
-        unsafe {
-            roots.add_value(receiver);
-            roots.add_value(input);
-        }
-        if !interp
-            .gc_heap
-            .ensure_machine_allocation_with_roots(bytes, &mut |_| {})?
-        {
-            return Ok(None);
-        }
+    // reservation may collect, which moves the subject and the receiver,
+    // and the source is resolved again over the moved subject.
+    if interp.gc_heap.machine_allocation_ready(bytes) {
+        return Ok(carve_match_result(
+            &mut interp.gc_heap,
+            &source,
+            shape,
+            *input,
+            matched,
+        ));
     }
-    // Nothing below collects: every cell comes out of the reservation.
-    let heap = &mut interp.gc_heap;
-    let text = input.as_string(heap).ok_or(VmError::TypeMismatch)?.handle();
-    let mut elements = smallvec::SmallVec::<[Value; 16]>::with_capacity(groups);
-    crate::string::gc_body::try_substrings_no_collect(
-        heap,
-        text,
-        (0..groups).map(|index| matched.group(index)),
-        &mut elements,
-    )
-    .ok_or(VmError::TypeMismatch)?;
-    let array = crate::array::try_tagged_from_values_no_collect(heap, &elements)
-        .ok_or(VmError::TypeMismatch)?;
-    let record = [
-        Value::number_f64(matched.range().start as f64),
+    let mut roots = otter_gc::RootScope::new(&mut interp.gc_heap);
+    // SAFETY: both slots belong to the caller and outlive the scope.
+    unsafe {
+        roots.add_value(receiver);
+        roots.add_value(input);
+    }
+    if !interp
+        .gc_heap
+        .ensure_machine_allocation_with_roots(bytes, &mut |_| {})?
+    {
+        return Ok(None);
+    }
+    let text = input
+        .as_string(&interp.gc_heap)
+        .ok_or(VmError::TypeMismatch)?
+        .handle();
+    let Some(source) = crate::string::gc_body::SubstringSource::of(&interp.gc_heap, text) else {
+        return Ok(None);
+    };
+    Ok(carve_match_result(
+        &mut interp.gc_heap,
+        &source,
+        shape,
         *input,
-        Value::undefined(),
-    ];
-    let bag = crate::object::try_alloc_generalized_object_no_collect(heap, shape, &record)
-        .ok_or(VmError::TypeMismatch)?;
-    heap.with_payload(array, |body| body.expando = bag);
-    heap.record_write(array, &bag);
-    Ok(Some(Value::array(array)))
+        matched,
+    ))
 }
 
 impl Interpreter {
     /// The hidden class of match records, resolved once from the fixed
     /// layout, whose field summaries are generalized; `None` when the
     /// layout names no live class.
-    fn regexp_match_shape(&mut self) -> Result<Option<crate::object::ShapeHandle>, VmError> {
+    pub(crate) fn regexp_match_shape(
+        &mut self,
+    ) -> Result<Option<crate::object::ShapeHandle>, VmError> {
         if !self.regexp_match_shape.is_null() {
             return Ok(Some(self.regexp_match_shape));
         }

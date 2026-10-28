@@ -192,6 +192,14 @@ impl<'a> RuntimeState<'a> {
                         .cast::<otter_gc::raw::RawGc>(),
                 );
             }
+            // Compiled regexp programs are old cells with no edges.
+            for cell in interp.regexp_pattern_cells_for_trace() {
+                visitor(
+                    std::ptr::from_ref(cell)
+                        .cast_mut()
+                        .cast::<otter_gc::raw::RawGc>(),
+                );
+            }
         }
         for layout in interp.function_constructor_layouts_for_trace() {
             if !layout.is_null() {

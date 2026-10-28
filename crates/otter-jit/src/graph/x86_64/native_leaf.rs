@@ -66,3 +66,53 @@ impl Codegen<'_> {
         Ok(())
     }
 }
+
+impl Codegen<'_> {
+    /// Try the isolate leaf of a proved builtin method over `inputs`
+    /// (receiver, argument) before its committed entry: a hit writes
+    /// `destination` and jumps to `done`; a miss falls through with every
+    /// live register and both inputs intact, for the committed call that
+    /// follows. The leaf publishes no safepoint and never collects.
+    pub(super) fn emit_isolate_leaf_method(
+        &mut self,
+        node: NodeId,
+        leaf: otter_vm::runtime_stubs::IsolateLeafStub2,
+        inputs: [u8; 2],
+        destination: u8,
+        done: dynasmrt::DynamicLabel,
+    ) {
+        debug_assert!(leaf.is_valid());
+        let live = self.loc(node).live_registers.clone();
+        let [receiver, argument] = inputs;
+        // The inputs outlive the leaf for the committed retry.
+        dynasm!(self.ops ; .arch x64 ; push Rq(receiver) ; push Rq(argument));
+        let saved = self.emit_save_registers(&live);
+        dynasm!(self.ops ; .arch x64
+            ; mov r10, Rq(receiver)
+            ; mov r11, Rq(argument)
+            ; mov rsi, r10
+            ; mov rdx, r11
+            ; mov rdi, [r15 + crate::entry::THREAD_OFFSET as i32]
+        );
+        crate::x86_64::values::emit_load_runtime_stub(
+            &mut self.ops,
+            &mut self.relocations,
+            leaf.entry_addr() as u64,
+            leaf.descriptor,
+        );
+        crate::x86_64::call_abi::emit_runtime_call(&mut self.ops, leaf.descriptor);
+        dynasm!(self.ops ; .arch x64 ; mov r10, rax ; mov r11, rdx);
+        self.emit_restore_registers(&live, saved);
+        dynasm!(self.ops ; .arch x64 ; pop Rq(argument) ; pop Rq(receiver));
+        let fatal = self.fatal;
+        dynasm!(self.ops ; .arch x64
+            ; test r11, r11
+            ; jnz >miss
+            ; mov Rq(destination), r10
+            ; jmp =>done
+            ; miss:
+            ; cmp r11, abi::NativeResultStatus::SideExit as i32
+            ; jne =>fatal
+        );
+    }
+}

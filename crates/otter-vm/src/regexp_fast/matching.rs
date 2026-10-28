@@ -62,31 +62,64 @@ fn match_global(
             .as_string(scope.context().heap())
             .expect("match subject is a string")
             .flatten_in_place(scope.context().heap_mut());
-        let mut last = std::mem::take(&mut scope.context().interp_mut().regexp_offsets);
         let mut ranges: SmallVec<[(u32, u32); 16]> = SmallVec::new();
         let regexp = scope.raw(receiver).as_regexp().expect("pristine RegExp");
         let subject = scope
             .raw(input)
             .as_string(scope.context().heap())
             .expect("match subject is a string");
-        let context = scope.context();
-        let search = context.regex_search();
-        let heap = context.heap();
-        regexp.set_last_index(heap, 0);
-        let execution = subject.with_code_units(heap, |units| {
-            regexp.for_each_match(heap, units, 0, usize::MAX, &search, |matched| {
-                ranges.push((matched.range.start as u32, matched.range.end as u32));
-                record_offsets(&mut last, matched);
-                true
-            })
+        let input_value = scope.raw(input);
+        let interp = scope.context().interp_mut();
+        let step_limit = interp.regex_step_limit();
+        // SAFETY: the pattern record is shared, never moves, and the body
+        // keeps it alive; nothing collects before the stream has ended.
+        let regex = unsafe { &*regexp.regex_ptr(&interp.gc_heap) };
+        let scratch = std::mem::take(interp.regex_scratch.get_mut());
+        regexp.set_last_index(&interp.gc_heap, 0);
+        let (scratch, steps, outcome) = subject.with_code_units(&interp.gc_heap, |units| {
+            let mut stream = crate::regexp::engine::MatchStream::new(
+                regex, units, 0, false, step_limit, scratch,
+            );
+            let mut outcome = Ok(());
+            loop {
+                match stream.next() {
+                    None => break,
+                    Some(Err(error)) => {
+                        outcome = Err(error);
+                        break;
+                    }
+                    Some(Ok(slots)) => {
+                        let range = slots.range();
+                        ranges.push((range.start as u32, range.end as u32));
+                    }
+                }
+            }
+            let (scratch, steps) = stream.finish();
+            (scratch, steps, outcome)
         });
-        let found = crate::regexp::finish_execution(scope.context(), execution);
-        if !matches!(found, Ok(count) if count > 0) {
-            scope.context().interp_mut().regexp_offsets = last;
-            return found.map(|_| Value::null());
+        *interp.regex_scratch.get_mut() = scratch;
+        let found = crate::regexp::finish_execution(
+            scope.context(),
+            crate::regexp::engine::Execution {
+                result: outcome.map(|()| ranges.len()),
+                steps,
+            },
+        )?;
+        if found == 0 {
+            scope
+                .context()
+                .interp_mut()
+                .regex_scratch
+                .get_mut()
+                .release_oversized();
+            return Ok(Value::null());
         }
-        let last = record_legacy(&mut scope, receiver, input, last);
-        scope.context().interp_mut().regexp_offsets = last;
+        let interp = scope.context().interp_mut();
+        if regexp.legacy_features_enabled(&interp.gc_heap) {
+            let slots = interp.regex_scratch.get_mut().last_match(regex);
+            interp.regexp_legacy.record_slots(input_value, slots);
+        }
+        interp.regex_scratch.get_mut().release_oversized();
         let mut pieces = SmallVec::<[crate::Local<'_>; 16]>::with_capacity(ranges.len());
         for &(start, end) in &ranges {
             pieces.push(slice(&mut scope, input, start as usize..end as usize)?);
@@ -133,19 +166,6 @@ pub(crate) fn search(
         scope.context().interp_mut().regexp_offsets = offsets;
         Ok(Value::number_f64(f64::from(index)))
     })
-}
-
-/// Overwrite `out` with `matched`'s group offsets, group zero first.
-pub(super) fn record_offsets(out: &mut Vec<u32>, matched: &crate::regexp::engine::Match<'_>) {
-    use crate::regexp::engine::NO_OFFSET;
-    out.clear();
-    out.extend_from_slice(&[matched.range.start as u32, matched.range.end as u32]);
-    for capture in matched.captures.iter() {
-        let (start, end) = capture.map_or((NO_OFFSET, NO_OFFSET), |range| {
-            (range.start as u32, range.end as u32)
-        });
-        out.extend_from_slice(&[start, end]);
-    }
 }
 
 /// Record the last successful match's `offsets` in the legacy statics when

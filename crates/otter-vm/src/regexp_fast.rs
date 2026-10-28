@@ -279,6 +279,11 @@ pub(crate) fn exec_direct(
     if last_index < 0 || !state.last_index_writable {
         return None;
     }
+    // `test` reads the receiver's `exec`: only the untouched built-in
+    // protocol has a known answer.
+    if test && (state.jit_guard_flags != 0 || !interp.regexp_protocol_proved()) {
+        return None;
+    }
     let tracks_last_index = state.flags.global || state.flags.sticky;
     let start = if tracks_last_index {
         last_index as usize
@@ -336,6 +341,119 @@ pub(crate) fn exec_direct(
     } else {
         DirectExec::Matched(offsets)
     }))
+}
+
+impl Interpreter {
+    /// Whether the realm's `%RegExp.prototype%` protocol is proved built-in
+    /// by a proof already taken, without taking one.
+    fn regexp_protocol_proved(&self) -> bool {
+        self.realm_intrinsics
+            .regexp_protocol
+            .as_ref()
+            .is_some_and(|proof| proof.builtin && proof.validity.is_valid())
+    }
+}
+
+/// `receiver.exec(input)` or `receiver.test(input)` of the realm's original
+/// method, complete, for generated code's leaf entry: no frame, no handle
+/// scope, no collection, no copy of the match: the slots are read in place
+/// from the isolate's matcher scratch. `None`, before any observable
+/// effect, when the operands need the general ladder ([`exec_direct`]'s
+/// terms), when `test` cannot
+/// prove the receiver reads the built-in `exec`, when `exec` builds
+/// indices or named groups, when a match's work overran the budget, or
+/// when the match array cannot be carved from the ready nursery buffer.
+/// The buffer-room check precedes the `lastIndex` write and the legacy
+/// statics, so a declined call left nothing behind and its committed retry
+/// is exact.
+pub(crate) fn exec_leaf(
+    interp: &mut Interpreter,
+    receiver: Value,
+    input: Value,
+    test: bool,
+) -> Option<Value> {
+    let regexp = receiver.as_regexp()?;
+    let text = input.as_string(&interp.gc_heap)?.handle();
+    let state = regexp.exec_state(&interp.gc_heap);
+    let last_index = state.last_index.as_i32()?;
+    if last_index < 0 || !state.last_index_writable {
+        return None;
+    }
+    // `test` reads the receiver's `exec`: only the untouched built-in
+    // protocol has a known answer. An `exec` with match indices builds
+    // its array on the general path.
+    if test {
+        if state.jit_guard_flags != 0 || !interp.regexp_protocol_proved() {
+            return None;
+        }
+    } else if state.flags.has_indices {
+        return None;
+    }
+    let tracks_last_index = state.flags.global || state.flags.sticky;
+    let start = if tracks_last_index {
+        last_index as usize
+    } else {
+        0
+    };
+    let missed = if test {
+        Value::boolean(false)
+    } else {
+        Value::NULL
+    };
+    let step_limit = interp.regex_step_limit();
+    // SAFETY: the pattern record is shared, never moves, and the body keeps
+    // it alive; nothing here collects.
+    let regex = unsafe { &*regexp.regex_ptr(&interp.gc_heap) };
+    if !test && regex.has_named_groups() {
+        return None;
+    }
+    let (source, result, steps) = {
+        let heap = &interp.gc_heap;
+        let (source, units) = crate::string::gc_body::SubstringSource::with_units(heap, text)?;
+        if start > units.len() {
+            regexp.set_last_index(heap, 0);
+            return Some(missed);
+        }
+        let scratch = interp.regex_scratch.get_mut();
+        let (result, steps) = match units {
+            crate::string::CodeUnits::Latin1(bytes) => {
+                regex.search_first(bytes, start, state.flags.sticky, step_limit, scratch)
+            }
+            crate::string::CodeUnits::Utf16(units) => {
+                regex.search_first(units, start, state.flags.sticky, step_limit, scratch)
+            }
+        };
+        (source, result, steps)
+    };
+    // A budget error is the committed path's to raise.
+    if interp.charge_regex_backtrack_steps(steps).is_err() {
+        return None;
+    }
+    if result != Ok(true) {
+        if result.is_err() {
+            return None;
+        }
+        if tracks_last_index {
+            regexp.set_last_index(&interp.gc_heap, 0);
+        }
+        return Some(missed);
+    }
+    let result = if test {
+        Value::boolean(true)
+    } else {
+        let shape = interp.regexp_match_shape().ok()??;
+        let slots = interp.regex_scratch.get_mut().last_match(regex);
+        crate::regexp_result::carve_match_result(&mut interp.gc_heap, &source, shape, input, slots)?
+    };
+    let slots = interp.regex_scratch.get_mut().last_match(regex);
+    if tracks_last_index {
+        regexp.set_last_index(&interp.gc_heap, slots.range().end as u32);
+    }
+    if state.legacy_features_enabled {
+        interp.regexp_legacy.record_slots(input, slots);
+    }
+    interp.regex_scratch.get_mut().release_oversized();
+    Some(result)
 }
 
 /// `ToUint32(limit)` for a limit whose conversion runs no user code.
@@ -525,6 +643,10 @@ mod tests {
             done(exec_direct(&mut vm, plain, subject, false)),
             Some(Value::NULL)
         );
+        // `test` reads `exec`: it completes directly only under the realm's
+        // proof of the built-in protocol, which the general ladder takes.
+        assert!(exec_direct(&mut vm, plain, subject, true).is_none());
+        assert!(vm.is_pristine_regexp(plain));
         assert_eq!(
             done(exec_direct(&mut vm, plain, subject, true)),
             Some(Value::boolean(false))

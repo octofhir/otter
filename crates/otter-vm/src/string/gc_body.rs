@@ -920,12 +920,6 @@ pub(crate) fn splice_string_body(
     Ok(handle)
 }
 
-/// Allocation-buffer bytes [`try_substrings_no_collect`] takes per substring
-/// at most: a copied short substring's cell, which is at least a view's.
-pub(crate) const SUBSTRING_CELL_BYTES: usize =
-    GcHeap::cell_bytes::<JsStringBody>(SHORT_CONCAT_LATIN1);
-const _: () = assert!(SUBSTRING_CELL_BYTES >= GcHeap::cell_bytes::<JsStringBody>(PAIR_BYTES));
-
 /// How a substring of a contiguous parent is built.
 enum SubstringBody<'a> {
     /// Copied into a sequential body: short, so it retains no parent.
@@ -947,93 +941,145 @@ fn substring_body(content: FlatContent<'_>) -> SubstringBody<'_> {
     }
 }
 
-/// The substring of the contiguous `string` at each range, `undefined` for a
-/// `None` range, appended to `out`, each in one cell from the allocation
-/// buffer within the bytes the caller reserved ([`SUBSTRING_CELL_BYTES`] per
-/// substring): an empty or one-unit Latin-1 range the heap's shared string,
-/// short units copied straight from the subject, resolved once, longer ones
-/// viewed in place. `None` when the string does not read contiguously or the
-/// buffer runs out; `out` then holds a prefix.
-pub(crate) fn try_substrings_no_collect(
-    heap: &mut GcHeap,
-    string: JsStringHandle,
-    ranges: impl Iterator<Item = Option<std::ops::Range<usize>>>,
-    out: &mut smallvec::SmallVec<[crate::Value; 16]>,
-) -> Option<()> {
-    let (parent, base, _) = contiguous_view(heap, string)?;
-    let (data, latin1) = heap.read_payload(parent, |body| {
-        (
-            body.trailing_ptr(),
-            body.repr() == JsStringBodyRepr::SeqLatin1,
-        )
-    });
-    for range in ranges {
-        let Some(range) = range else {
-            out.push(crate::Value::undefined());
-            continue;
+/// The contiguous parent a group of substrings of one string is cut from,
+/// resolved once for the group.
+pub(crate) struct SubstringSource {
+    parent: JsStringHandle,
+    base: u32,
+    data: *const u8,
+    latin1: bool,
+}
+
+/// One substring of a [`SubstringSource`], decided before any cell is
+/// placed: the heap's shared string, a short copy, or a view of the parent.
+#[derive(Clone, Copy)]
+pub(crate) enum SubstringCell {
+    Shared(JsStringHandle),
+    Latin1 { start: u32, length: u32 },
+    Wide { start: u32, length: u32 },
+    View { start: u32, length: u32 },
+}
+
+impl SubstringSource {
+    /// The source of `string`'s substrings, when it reads contiguously.
+    pub(crate) fn of(heap: &GcHeap, string: JsStringHandle) -> Option<Self> {
+        Self::with_units(heap, string).map(|(source, _)| source)
+    }
+
+    /// [`Self::of`] together with the string's code units, read in place
+    /// for as long as the heap is borrowed.
+    pub(crate) fn with_units(
+        heap: &GcHeap,
+        string: JsStringHandle,
+    ) -> Option<(Self, CodeUnits<'_>)> {
+        let (parent, base, len) = contiguous_view(heap, string)?;
+        // SAFETY: the body lives in the heap, which the borrow keeps unchanged.
+        let body: &JsStringBody =
+            heap.read_payload(parent, |body| unsafe { &*std::ptr::from_ref(body) });
+        let (start, end) = (base as usize, base as usize + len as usize);
+        let (units, latin1) = match flat_content(body)? {
+            FlatContent::Latin1(bytes) => (CodeUnits::Latin1(&bytes[start..end]), true),
+            FlatContent::Wide(units) => (CodeUnits::Utf16(&units[start..end]), false),
         };
-        let length = u32::try_from(range.len()).ok()?;
-        let start = base.checked_add(u32::try_from(range.start).ok()?)?;
+        Some((
+            Self {
+                parent,
+                base,
+                data: body.trailing_ptr(),
+                latin1,
+            },
+            units,
+        ))
+    }
+
+    /// The cell the substring at `range` takes and its bytes from the
+    /// allocation buffer: zero for a shared string.
+    pub(crate) fn plan(
+        &self,
+        heap: &GcHeap,
+        range: std::ops::Range<usize>,
+    ) -> (SubstringCell, usize) {
+        let length = range.len() as u32;
+        let start = self.base + range.start as u32;
         if range.len() <= 1 {
             // SAFETY: a one-unit range lies inside the parent's payload.
             let unit = (range.len() == 1).then(|| unsafe {
-                if latin1 {
-                    u16::from(*data.add(start as usize))
+                if self.latin1 {
+                    u16::from(*self.data.add(start as usize))
                 } else {
-                    *data.cast::<u16>().add(start as usize)
+                    *self.data.cast::<u16>().add(start as usize)
                 }
             });
             if let Some(shared) =
                 crate::string::JsString::shared_unit_string(range.len(), unit, heap)
             {
-                out.push(crate::Value::string(shared));
-                continue;
+                return (SubstringCell::Shared(shared.handle()), 0);
             }
         }
-        // Nothing below collects or moves a cell, so `data` stays the
-        // parent's units for the whole loop. A copy writes every trailing
-        // byte, so its cell is not zeroed first.
-        let handle = if latin1 && range.len() <= SHORT_CONCAT_LATIN1 {
-            heap.try_alloc_filled_trailing_no_collect_or_return(
+        if self.latin1 && range.len() <= SHORT_CONCAT_LATIN1 {
+            (
+                SubstringCell::Latin1 { start, length },
+                GcHeap::cell_bytes::<JsStringBody>(range.len()),
+            )
+        } else if !self.latin1 && range.len() <= SHORT_CONCAT_FLAT {
+            (
+                SubstringCell::Wide { start, length },
+                GcHeap::cell_bytes::<JsStringBody>(range.len() * 2),
+            )
+        } else {
+            (
+                SubstringCell::View { start, length },
+                GcHeap::cell_bytes::<JsStringBody>(PAIR_BYTES),
+            )
+        }
+    }
+
+    /// Place the planned `cell` in the group's carve. Nothing here moves
+    /// the parent, so `data` stays its units.
+    pub(crate) fn place(
+        &self,
+        heap: &mut GcHeap,
+        carve: &mut otter_gc::CellCarve,
+        cell: SubstringCell,
+    ) -> JsStringHandle {
+        match cell {
+            SubstringCell::Shared(handle) => handle,
+            SubstringCell::Latin1 { start, length } => heap.place(
+                carve,
                 JsStringBody::seq(true, length),
-                range.len(),
+                length as usize,
                 |body| {
                     // SAFETY: `start + length` lies inside the parent's
-                    // Latin-1 payload, which no allocation here moves.
+                    // Latin-1 payload, which nothing here moves.
                     let bytes = unsafe {
-                        std::slice::from_raw_parts(data.add(start as usize), range.len())
+                        std::slice::from_raw_parts(self.data.add(start as usize), length as usize)
                     };
                     body.init_seq_latin1(bytes);
                 },
-            )
-        } else if !latin1 && range.len() <= SHORT_CONCAT_FLAT {
-            heap.try_alloc_filled_trailing_no_collect_or_return(
+            ),
+            SubstringCell::Wide { start, length } => heap.place(
+                carve,
                 JsStringBody::seq(false, length),
-                range.len() * 2,
+                length as usize * 2,
                 |body| {
                     // SAFETY: as above, for the parent's WTF-16 payload.
                     let units = unsafe {
                         std::slice::from_raw_parts(
-                            data.cast::<u16>().add(start as usize),
-                            range.len(),
+                            self.data.cast::<u16>().add(start as usize),
+                            length as usize,
                         )
                     };
                     body.init_seq_flat(units);
                 },
-            )
-        } else {
-            heap.try_alloc_trailing_no_collect_or_return(
+            ),
+            SubstringCell::View { start, length } => heap.place(
+                carve,
                 JsStringBody::pair(STRING_REPR_SLICED, length, 0),
                 PAIR_BYTES,
-                |body| body.init_pair(parent, start),
-            )
+                |body| body.init_pair(self.parent, start),
+            ),
         }
-        .ok()?;
-        out.push(crate::Value::string(crate::string::JsString::from_handle(
-            handle, heap,
-        )));
     }
-    Some(())
 }
 
 /// `length` units at `start` of the contiguous `parent`: copied into a

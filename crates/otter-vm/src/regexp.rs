@@ -70,23 +70,23 @@ impl<'a> RegexSearch<'a> {
 /// `new RegExp(samePattern)`) is the common case; recompiling a large
 /// pattern (e.g. the multi-kilobyte Unicode-property classes test262's
 /// `nativeFunctionMatcher` rebuilds on every call) dominated runtime. A
-/// cache hit shares the compiled pattern instead of re-parsing and
+/// cache hit shares the compiled pattern's cell instead of re-parsing and
 /// re-lowering it.
 ///
 /// # Invariants
-/// - A [`RegExpPattern`] is a pure function of `(pattern, engine-relevant
-///   flags)` and carries no isolate-specific or GC state, so sharing it
-///   between RegExp objects is always sound.
+/// - A [`RegExpPatternBody`] is a pure function of `(pattern, engine-relevant
+///   flags)` and carries no isolate-specific state, so sharing it between
+///   RegExp objects is always sound.
+/// - The cached cells are roots ([`Self::cells_for_trace`]) until the cache
+///   drops them; a RegExp keeps its own cell alive through its body.
 /// - Bounded: once [`Self::CAP`] distinct programs are cached the table
 ///   is cleared wholesale, so a generator of unique patterns cannot grow
 ///   it without bound while the hot-loop fast path stays intact.
 #[derive(Debug, Default)]
 pub(crate) struct RegexCompileCache {
     /// Keyed by the five engine-relevant flag bits, then pattern code units.
-    by_flags: rustc_hash::FxHashMap<
-        CompileKey,
-        rustc_hash::FxHashMap<Box<[u16]>, std::sync::Arc<RegExpPattern>>,
-    >,
+    by_flags:
+        rustc_hash::FxHashMap<CompileKey, rustc_hash::FxHashMap<Box<[u16]>, RegExpPatternHandle>>,
 }
 
 /// Engine-relevant flag bits that select a distinct compiled program.
@@ -98,34 +98,29 @@ impl RegexCompileCache {
     /// Maximum distinct cached programs before the cache is cleared.
     const CAP: usize = 1024;
 
-    /// Return the compiled program for `(source, flags)`, compiling and
-    /// caching it on a miss.
+    /// The cell of the compiled program for `(source, flags)`, compiling
+    /// and caching it on a miss.
     pub(crate) fn get_or_compile(
         &mut self,
+        heap: &mut otter_gc::GcHeap,
         pattern_utf16: &[u16],
-        ignore_case: bool,
-        multiline: bool,
-        dot_all: bool,
-        unicode: bool,
-        unicode_sets: bool,
-    ) -> Result<std::sync::Arc<RegExpPattern>, String> {
-        let key: CompileKey = (ignore_case, multiline, dot_all, unicode, unicode_sets);
+        flags: RegExpFlags,
+    ) -> Result<RegExpPatternHandle, RegExpError> {
+        let key: CompileKey = (
+            flags.ignore_case,
+            flags.multiline,
+            flags.dot_all,
+            flags.unicode,
+            flags.unicode_sets,
+        );
         if let Some(hit) = self
             .by_flags
             .get(&key)
             .and_then(|by_source| by_source.get(pattern_utf16))
         {
-            return Ok(std::sync::Arc::clone(hit));
+            return Ok(*hit);
         }
-        let regex = engine::compile(
-            pattern_utf16,
-            ignore_case,
-            multiline,
-            dot_all,
-            unicode,
-            unicode_sets,
-        )?;
-        let pattern = std::sync::Arc::new(RegExpPattern::new(regex, pattern_utf16));
+        let cell = RegExpPatternBody::compile(heap, pattern_utf16, flags)?;
         let total: usize = self
             .by_flags
             .values()
@@ -137,8 +132,148 @@ impl RegexCompileCache {
         self.by_flags
             .entry(key)
             .or_default()
-            .insert(pattern_utf16.into(), std::sync::Arc::clone(&pattern));
-        Ok(pattern)
+            .insert(pattern_utf16.into(), cell);
+        Ok(cell)
+    }
+
+    /// Root-tracing view of the cached cells.
+    pub(crate) fn cells_for_trace(&self) -> impl Iterator<Item = &RegExpPatternHandle> {
+        self.by_flags
+            .values()
+            .flat_map(|by_source| by_source.values())
+    }
+}
+
+/// The engine-relevant flags of a compiled program as one byte, for the
+/// snapshot's pattern records.
+pub(crate) fn engine_flag_bits(flags: otter_regex::Flags) -> u8 {
+    u8::from(flags.ignore_case)
+        | u8::from(flags.multiline) << 1
+        | u8::from(flags.dot_all) << 2
+        | u8::from(flags.unicode) << 3
+        | u8::from(flags.unicode_sets) << 4
+}
+
+/// The flags [`engine_flag_bits`] encoded.
+pub(crate) fn engine_flags_from_bits(bits: u8) -> otter_regex::Flags {
+    otter_regex::Flags {
+        ignore_case: bits & 1 != 0,
+        multiline: bits & 2 != 0,
+        dot_all: bits & 4 != 0,
+        unicode: bits & 8 != 0,
+        unicode_sets: bits & 16 != 0,
+    }
+}
+
+/// Reserved [`otter_gc::Traceable::TYPE_TAG`] for [`RegExpPatternBody`].
+pub const REGEXP_PATTERN_TYPE_TAG: u8 = 0x32;
+
+/// GC handle to a compiled pattern's cell.
+pub type RegExpPatternHandle = otter_gc::Gc<RegExpPatternBody>;
+
+/// What one regex literal site resolved once: its program cell, its flags
+/// and whether its RegExps keep the legacy statics (an engine-hosted
+/// module's do not). Every later evaluation of the site is one young birth.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RegExpLiteralSite {
+    pub(crate) pattern: RegExpPatternHandle,
+    pub(crate) flags: RegExpFlags,
+    pub(crate) legacy_features_enabled: bool,
+}
+
+/// The cell that owns one compiled program and its pattern text, shared by
+/// every RegExp of that pattern and engine-relevant flags.
+///
+/// It lives in old space, where its drop releases the program, so a RegExp
+/// body owns nothing outside the heap and is born young. The cell never
+/// moves, and a body keeps its cell alive through a traced handle.
+#[derive(Debug)]
+pub struct RegExpPatternBody {
+    /// The program and its text.
+    pub pattern: std::sync::Arc<RegExpPattern>,
+}
+
+impl otter_gc::SafeTraceable for RegExpPatternBody {
+    const TYPE_TAG: u8 = REGEXP_PATTERN_TYPE_TAG;
+
+    fn trace_slots_safe(&mut self, _visitor: &mut SlotVisitor<'_>) {}
+}
+
+impl RegExpPatternBody {
+    /// Compile `pattern_utf16` under the engine-relevant bits of `flags`
+    /// into a fresh old cell.
+    pub(crate) fn compile(
+        heap: &mut otter_gc::GcHeap,
+        pattern_utf16: &[u16],
+        flags: RegExpFlags,
+    ) -> Result<RegExpPatternHandle, RegExpError> {
+        // `g`, `y`, and `d` are spec-level state above the matcher and are
+        // not part of the compiled pattern. `.source` keeps a lossy UTF-8
+        // reading for display; the engine compiles from the raw code units
+        // so lone surrogates survive.
+        let regex = engine::compile(
+            pattern_utf16,
+            flags.ignore_case,
+            flags.multiline,
+            flags.dot_all,
+            flags.unicode,
+            flags.unicode_sets,
+        )
+        .map_err(|message| RegExpError::InvalidPattern { message })?;
+        Ok(heap.alloc_old(Self {
+            pattern: std::sync::Arc::new(RegExpPattern::new(regex, pattern_utf16)),
+        })?)
+    }
+
+    /// Sever foreign ownership after a snapshot restore.
+    ///
+    /// A restored cell's `pattern` aliases the capture isolate's malloc
+    /// storage byte-for-byte. It is overwritten via `ptr::write` with a
+    /// freshly built one — recompiling the pattern from the opaque
+    /// snapshot's side record — so the alias is never dropped and both
+    /// isolates own their storage.
+    pub(crate) fn rebuild_after_restore(
+        &mut self,
+        pattern_utf16: &[u16],
+        source: &str,
+        flags: otter_regex::Flags,
+    ) {
+        let regex = engine::compile(
+            pattern_utf16,
+            flags.ignore_case,
+            flags.multiline,
+            flags.dot_all,
+            flags.unicode,
+            flags.unicode_sets,
+        )
+        .expect("a captured pattern compiled once already");
+        // SAFETY: overwriting without dropping (or reading) is the
+        // point — the old values remain the source isolate's property. The
+        // pattern text comes from the snapshot's owned side record, never
+        // from the copied page field.
+        let pattern = RegExpPattern {
+            regex,
+            pattern_utf16: pattern_utf16.into(),
+            source: source.into(),
+        };
+        unsafe {
+            std::ptr::write(&mut self.pattern, std::sync::Arc::new(pattern));
+        }
+    }
+
+    /// The compiled program of the cell `handle`, for as long as the heap
+    /// is borrowed: the cell never moves and the program is behind its own
+    /// allocation.
+    #[inline]
+    pub(crate) fn pattern_of(
+        handle: RegExpPatternHandle,
+        heap: &otter_gc::GcHeap,
+    ) -> &RegExpPattern {
+        // SAFETY: the record lives behind the cell's `Arc`, whose allocation
+        // outlives the cell; the cell outlives the heap borrow.
+        heap.read_payload(handle, |cell| unsafe {
+            &*std::sync::Arc::as_ptr(&cell.pattern)
+        })
     }
 }
 
@@ -235,6 +370,10 @@ pub(crate) struct RegExpExecState {
     pub(crate) flags: RegExpFlags,
     /// `[[LegacyFeaturesEnabled]]`.
     pub(crate) legacy_features_enabled: bool,
+    /// [`JsRegExpBody::jit_guard_flags`]: zero while no own property beside
+    /// `lastIndex` and no `[[Prototype]]` override can shadow the realm's
+    /// `%RegExp.prototype%`.
+    pub(crate) jit_guard_flags: u32,
 }
 
 /// Foundation flag bits.
@@ -350,12 +489,11 @@ impl RegExpFlags {
 pub struct JsRegExpBody {
     /// Map word: this value cell's type, at body offset 0.
     pub(crate) map: otter_gc::cell_map::TypeMap<REGEXP_BODY_TYPE_TAG>,
-    /// Compiled matcher and pattern text, shared with every other RegExp of
-    /// the same pattern and engine-relevant flags. Always present after
-    /// construction — errors surface during [`compile`] before the body is
-    /// built.
-    #[pelt(skip)]
-    pub pattern: std::sync::Arc<RegExpPattern>,
+    /// The cell of the compiled matcher and pattern text, shared with every
+    /// other RegExp of the same pattern and engine-relevant flags. Always
+    /// present after construction — errors surface during compilation before
+    /// the body is built.
+    pub pattern: RegExpPatternHandle,
     /// Parsed flag bits.
     #[pelt(skip)]
     pub flags: RegExpFlags,
@@ -398,6 +536,10 @@ pub struct JsRegExpBody {
     pub legacy_features_enabled: bool,
 }
 
+/// Payload words of a [`JsRegExpBody`].
+pub const REGEXP_BODY_IMAGE_WORDS: usize = std::mem::size_of::<JsRegExpBody>().div_ceil(8);
+const _: () = assert!(std::mem::align_of::<JsRegExpBody>() <= 8);
+
 /// Byte offset of [`JsRegExpBody::jit_guard_flags`] in the payload.
 pub(crate) const REGEXP_BODY_JIT_GUARD_FLAGS_OFFSET: usize =
     std::mem::offset_of!(JsRegExpBody, jit_guard_flags);
@@ -421,37 +563,6 @@ impl JsRegExpBody {
             crate::code_liveness::visit_value(value, visitor);
         }
     }
-
-    /// Sever foreign ownership after a snapshot restore.
-    ///
-    /// A restored body's shared `pattern` aliases the capture isolate's
-    /// malloc storage byte-for-byte. It is overwritten via `ptr::write` with
-    /// a freshly built one — recompiling the pattern from the opaque
-    /// snapshot's side record — so the alias is never dropped and both
-    /// isolates own their storage.
-    pub(crate) fn rebuild_after_restore(&mut self, pattern_utf16: &[u16], source: &str) {
-        let regex = engine::compile(
-            pattern_utf16,
-            self.flags.ignore_case,
-            self.flags.multiline,
-            self.flags.dot_all,
-            self.flags.unicode,
-            self.flags.unicode_sets,
-        )
-        .expect("a captured pattern compiled once already");
-        // SAFETY: overwriting without dropping (or reading) is the
-        // point — the old values remain the source isolate's property. The
-        // pattern text comes from the snapshot's owned side record, never from
-        // the copied page field.
-        let pattern = RegExpPattern {
-            regex,
-            pattern_utf16: pattern_utf16.into(),
-            source: source.into(),
-        };
-        unsafe {
-            std::ptr::write(&mut self.pattern, std::sync::Arc::new(pattern));
-        }
-    }
 }
 
 /// Cheap-to-clone JS regex handle.
@@ -462,40 +573,16 @@ pub struct JsRegExp {
 }
 
 impl JsRegExp {
-    /// Compile a pattern + flag string into a runtime regex value.
+    /// Compile a pattern + flag string into a runtime regex value: a young
+    /// body over a fresh program cell.
     pub fn compile(
         heap: &mut otter_gc::GcHeap,
         pattern_utf16: &[u16],
         flag_str: &str,
     ) -> Result<Self, RegExpError> {
         let flags = RegExpFlags::parse(flag_str)?;
-        // `g`, `y`, and `d` are spec-level state above the matcher and are not
-        // part of the compiled pattern. `.source` keeps a lossy UTF-8 reading
-        // for display; the engine compiles from the raw code units so lone
-        // surrogates survive.
-        let regex = engine::compile(
-            pattern_utf16,
-            flags.ignore_case,
-            flags.multiline,
-            flags.dot_all,
-            flags.unicode,
-            flags.unicode_sets,
-        )
-        .map_err(|message| RegExpError::InvalidPattern { message })?;
-        Ok(Self {
-            inner: heap.alloc_old(JsRegExpBody {
-                map: otter_gc::cell_map::TypeMap::NEW,
-                pattern: std::sync::Arc::new(RegExpPattern::new(regex, pattern_utf16)),
-                flags,
-                last_index: Cell::new(Value::number_i32(0)),
-                last_index_writable: true,
-                expando: None,
-                extensible: true,
-                prototype_override: None,
-                jit_guard_flags: 0,
-                legacy_features_enabled: true,
-            })?,
-        })
+        let pattern = RegExpPatternBody::compile(heap, pattern_utf16, flags)?;
+        Self::fresh(heap, pattern, flags, true)
     }
 
     /// Like [`Self::compile`] but resolves the program through a
@@ -509,30 +596,68 @@ impl JsRegExp {
         flag_str: &str,
     ) -> Result<Self, RegExpError> {
         let flags = RegExpFlags::parse(flag_str)?;
-        let pattern = cache
-            .get_or_compile(
-                pattern_utf16,
-                flags.ignore_case,
-                flags.multiline,
-                flags.dot_all,
-                flags.unicode,
-                flags.unicode_sets,
-            )
-            .map_err(|message| RegExpError::InvalidPattern { message })?;
+        let pattern = cache.get_or_compile(heap, pattern_utf16, flags)?;
+        Self::fresh(heap, pattern, flags, true)
+    }
+
+    /// The body of a fresh RegExp over the program cell `pattern` with
+    /// `flags`, as `RegExpAlloc` + `RegExpInitialize` leave it: `lastIndex`
+    /// zero and writable, no own properties, the realm's prototype.
+    fn fresh_body(
+        pattern: RegExpPatternHandle,
+        flags: RegExpFlags,
+        legacy_features_enabled: bool,
+    ) -> JsRegExpBody {
+        JsRegExpBody {
+            map: otter_gc::cell_map::TypeMap::NEW,
+            pattern,
+            flags,
+            last_index: Cell::new(Value::number_i32(0)),
+            last_index_writable: true,
+            expando: None,
+            extensible: true,
+            prototype_override: None,
+            jit_guard_flags: 0,
+            legacy_features_enabled,
+        }
+    }
+
+    /// A fresh RegExp ([`Self::fresh_body`]). The body owns nothing outside
+    /// the heap, so it is born young.
+    pub(crate) fn fresh(
+        heap: &mut otter_gc::GcHeap,
+        pattern: RegExpPatternHandle,
+        flags: RegExpFlags,
+        legacy_features_enabled: bool,
+    ) -> Result<Self, RegExpError> {
+        // The one edge is the cell, old and kept by the caller or its
+        // cache: a collection here moves nothing the body names.
         Ok(Self {
-            inner: heap.alloc_old(JsRegExpBody {
-                map: otter_gc::cell_map::TypeMap::NEW,
-                pattern,
-                flags,
-                last_index: Cell::new(Value::number_i32(0)),
-                last_index_writable: true,
-                expando: None,
-                extensible: true,
-                prototype_override: None,
-                jit_guard_flags: 0,
-                legacy_features_enabled: true,
-            })?,
+            inner: heap.alloc_with_roots(
+                Self::fresh_body(pattern, flags, legacy_features_enabled),
+                &mut |_| {},
+            )?,
         })
+    }
+
+    /// The payload words of [`Self::fresh_body`], padding zero: what
+    /// generated code copies into a young cell to birth the literal.
+    #[must_use]
+    pub(crate) fn fresh_image(
+        pattern: RegExpPatternHandle,
+        flags: RegExpFlags,
+        legacy_features_enabled: bool,
+    ) -> [u64; REGEXP_BODY_IMAGE_WORDS] {
+        let mut words = [0u64; REGEXP_BODY_IMAGE_WORDS];
+        let body = Self::fresh_body(pattern, flags, legacy_features_enabled);
+        // SAFETY: the body is `repr(C)` and no larger than the word array,
+        // which was zeroed, so every byte read back is initialized; the
+        // body holds no drop glue or non-trivial field, so the bit copy is
+        // its complete state.
+        unsafe {
+            std::ptr::write(words.as_mut_ptr().cast::<JsRegExpBody>(), body);
+        }
+        words
     }
 
     /// Re-initialize this regex with a new pattern and flags in
@@ -547,16 +672,7 @@ impl JsRegExp {
         flag_str: &str,
     ) -> Result<(), RegExpError> {
         let flags = RegExpFlags::parse(flag_str)?;
-        let regex = engine::compile(
-            pattern_utf16,
-            flags.ignore_case,
-            flags.multiline,
-            flags.dot_all,
-            flags.unicode,
-            flags.unicode_sets,
-        )
-        .map_err(|message| RegExpError::InvalidPattern { message })?;
-        let pattern = std::sync::Arc::new(RegExpPattern::new(regex, pattern_utf16));
+        let pattern = RegExpPatternBody::compile(heap, pattern_utf16, flags)?;
         heap.with_payload(self.inner, |body| {
             body.pattern = pattern;
             body.flags = flags;
@@ -564,6 +680,7 @@ impl JsRegExp {
             body.prototype_override = None;
             body.jit_guard_flags &= !REGEXP_JIT_FLAG_PROTO_OVERRIDE;
         });
+        heap.record_write(self.inner, &pattern);
         Ok(())
     }
 
@@ -597,15 +714,15 @@ impl JsRegExp {
         start: usize,
         search: &RegexSearch<'_>,
     ) -> engine::Execution<Option<engine::MatchRecord>> {
-        heap.read_payload(self.inner, |body| {
-            engine::find_one(
-                &body.pattern.regex,
-                text_units,
-                start,
-                body.flags.sticky,
-                search,
-            )
-        })
+        let (pattern, sticky) =
+            heap.read_payload(self.inner, |body| (body.pattern, body.flags.sticky));
+        engine::find_one(
+            &RegExpPatternBody::pattern_of(pattern, heap).regex,
+            text_units,
+            start,
+            sticky,
+            search,
+        )
     }
 
     /// [`Self::find_one`] writing the match's group offsets into `out`.
@@ -617,46 +734,32 @@ impl JsRegExp {
         search: &RegexSearch<'_>,
         out: &mut Vec<u32>,
     ) -> engine::Execution<bool> {
-        heap.read_payload(self.inner, |body| {
-            engine::find_first_offsets(
-                &body.pattern.regex,
-                text_units,
-                start,
-                body.flags.sticky,
-                search,
-                out,
-            )
-        })
+        let (pattern, sticky) =
+            heap.read_payload(self.inner, |body| (body.pattern, body.flags.sticky));
+        engine::find_first_offsets(
+            &RegExpPatternBody::pattern_of(pattern, heap).regex,
+            text_units,
+            start,
+            sticky,
+            search,
+            out,
+        )
     }
 
-    /// Visit successive matches from a code-unit offset in place (see
-    /// [`engine::for_each_match`]); a sticky RegExp admits only matches that
-    /// begin where the previous one ended.
-    pub(crate) fn for_each_match(
-        &self,
-        heap: &otter_gc::GcHeap,
-        text_units: crate::string::CodeUnits<'_>,
-        start: usize,
-        max_matches: usize,
-        search: &RegexSearch<'_>,
-        visit: impl FnMut(&engine::Match<'_>) -> bool,
-    ) -> engine::Execution<usize> {
-        heap.read_payload(self.inner, |body| {
-            engine::for_each_match(
-                &body.pattern.regex,
-                text_units,
-                start,
-                body.flags.sticky,
-                max_matches,
-                search,
-                visit,
-            )
-        })
+    /// The compiled matcher, addressed for an operation that never collects:
+    /// the pattern record is shared and never moves, and the body keeps it
+    /// alive for as long as the RegExp.
+    pub(crate) fn regex_ptr(&self, heap: &otter_gc::GcHeap) -> *const Regex {
+        let pattern = heap.read_payload(self.inner, |body| body.pattern);
+        std::ptr::from_ref(&RegExpPatternBody::pattern_of(pattern, heap).regex)
     }
 
     /// Whether some capture group of the pattern has a name.
     pub(crate) fn has_named_groups(&self, heap: &otter_gc::GcHeap) -> bool {
-        heap.read_payload(self.inner, |body| body.pattern.regex.has_named_groups())
+        let pattern = heap.read_payload(self.inner, |body| body.pattern);
+        RegExpPatternBody::pattern_of(pattern, heap)
+            .regex
+            .has_named_groups()
     }
 
     /// The owned record of a match [`Self::find_first_offsets`] found.
@@ -665,9 +768,13 @@ impl JsRegExp {
         heap: &otter_gc::GcHeap,
         offsets: &engine::MatchOffsets,
     ) -> engine::MatchRecord {
-        heap.read_payload(self.inner, |body| {
-            engine::MatchRecord::from_offsets(&offsets.0, body.pattern.regex.group_names())
-        })
+        let pattern = heap.read_payload(self.inner, |body| body.pattern);
+        engine::MatchRecord::from_offsets(
+            &offsets.0,
+            RegExpPatternBody::pattern_of(pattern, heap)
+                .regex
+                .group_names(),
+        )
     }
 
     /// Run the compiled engine from a code-unit offset and collect owned
@@ -681,16 +788,16 @@ impl JsRegExp {
         max_matches: usize,
         search: &RegexSearch<'_>,
     ) -> engine::Execution<engine::MatchBatch> {
-        heap.read_payload(self.inner, |body| {
-            engine::find_batch(
-                &body.pattern.regex,
-                text_units,
-                start,
-                body.flags.sticky,
-                max_matches,
-                search,
-            )
-        })
+        let (pattern, sticky) =
+            heap.read_payload(self.inner, |body| (body.pattern, body.flags.sticky));
+        engine::find_batch(
+            &RegExpPatternBody::pattern_of(pattern, heap).regex,
+            text_units,
+            start,
+            sticky,
+            max_matches,
+            search,
+        )
     }
 
     /// Read the lazy expando bag, if any user installations
@@ -776,13 +883,19 @@ impl JsRegExp {
     /// [`Self::pattern_utf16`].
     #[must_use]
     pub fn source(&self, heap: &otter_gc::GcHeap) -> String {
-        heap.read_payload(self.inner, |body| body.pattern.source.to_string())
+        let pattern = heap.read_payload(self.inner, |body| body.pattern);
+        RegExpPatternBody::pattern_of(pattern, heap)
+            .source
+            .to_string()
     }
 
     /// Original WTF-16 pattern body.
     #[must_use]
     pub fn pattern_utf16(&self, heap: &otter_gc::GcHeap) -> Vec<u16> {
-        heap.read_payload(self.inner, |body| body.pattern.pattern_utf16.to_vec())
+        let pattern = heap.read_payload(self.inner, |body| body.pattern);
+        RegExpPatternBody::pattern_of(pattern, heap)
+            .pattern_utf16
+            .to_vec()
     }
 
     /// Read `lastIndex`.
@@ -805,6 +918,7 @@ impl JsRegExp {
             last_index_writable: body.last_index_writable,
             flags: body.flags,
             legacy_features_enabled: body.legacy_features_enabled,
+            jit_guard_flags: body.jit_guard_flags,
         })
     }
 

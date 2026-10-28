@@ -169,6 +169,38 @@ enum TrailingInit {
     Filled,
 }
 
+/// Bytes one group of cells was carved from the nursery buffer
+/// ([`GcHeap::carve`]), placed front to back by [`GcHeap::place`].
+#[must_use = "every carved byte must be placed"]
+pub struct CellCarve {
+    next: usize,
+    end: usize,
+}
+
+impl CellCarve {
+    /// Bytes not yet placed.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.end - self.next
+    }
+}
+
+impl Drop for CellCarve {
+    /// Unplaced bytes become a free-space filler, so the page walk stays
+    /// intact; a group places exactly what it carved.
+    fn drop(&mut self) {
+        if self.next < self.end {
+            debug_assert!(false, "a group left carved bytes unplaced");
+            // SAFETY: the bytes were handed out by the buffer and no cell
+            // was written there.
+            unsafe {
+                (self.next as *mut GcHeader)
+                    .write(GcHeader::new_free((self.end - self.next) as u32));
+            }
+        }
+    }
+}
+
 /// Trivial empty-roots implementation; useful in tests where all
 /// reachable objects sit in handle scopes.
 pub struct EmptyRoots;
@@ -1644,6 +1676,82 @@ impl GcHeap {
         Ok(self.refill_lab(aligned) == LabRefill::Ready)
     }
 
+    /// Reserve `aligned` bytes the nursery buffer already holds for a group
+    /// of cells, each placed by [`Self::place`]: the sum of their
+    /// [`Self::cell_bytes`]. One bump serves the whole group, and nothing
+    /// here collects or moves a cell. `None` when the buffer is not ready
+    /// ([`Self::machine_allocation_ready`]). A carve dropped with bytes
+    /// unplaced leaves them a free-space filler. The group is accounted as
+    /// generated allocation is: by the buffer's progress, not per type.
+    #[inline(always)]
+    pub fn carve(&mut self, aligned: usize) -> Option<CellCarve> {
+        if !self.machine_allocation_ready(aligned) {
+            return None;
+        }
+        let address = self.lab.bump(aligned)?;
+        Some(CellCarve {
+            next: address,
+            end: address + aligned,
+        })
+    }
+
+    /// Place the group's next cell: `value` followed by `extra_bytes` of
+    /// trailing storage that `initialize` writes whole, as
+    /// [`Self::try_alloc_filled_trailing_no_collect_or_return`] would. `T`
+    /// must have been allocated before, so its trace entry exists.
+    ///
+    /// # Panics
+    /// When the cell does not fit the carve.
+    #[inline(always)]
+    pub fn place<T: Traceable>(
+        &mut self,
+        carve: &mut CellCarve,
+        value: T,
+        extra_bytes: usize,
+        initialize: impl FnOnce(&mut T),
+    ) -> Gc<T> {
+        let aligned = Self::cell_bytes::<T>(extra_bytes);
+        let address = carve.next;
+        assert!(
+            address + aligned <= carve.end,
+            "a group's cells exceed the bytes carved for them"
+        );
+        debug_assert!(
+            self.trace_table.get(T::TYPE_TAG).is_some(),
+            "a placed type was never allocated"
+        );
+        carve.next += aligned;
+        let offset = address as u32;
+        // SAFETY: the carve handed out `aligned` bytes inside a live
+        // from-space page; header and payload are fully written before the
+        // handle is published, with no safepoint in between.
+        unsafe {
+            let header_ptr = cage_base().add(offset as usize).cast::<GcHeader>();
+            let payload_ptr = header_ptr
+                .cast::<u8>()
+                .add(std::mem::size_of::<GcHeader>())
+                .cast::<T>();
+            // The cell's last word holds any alignment padding; the
+            // initializer writes every trailing byte before it.
+            if extra_bytes != 0 {
+                header_ptr
+                    .cast::<u8>()
+                    .add(aligned - CELL_SIZE)
+                    .cast::<u64>()
+                    .write_unaligned(0);
+            }
+            std::ptr::write(header_ptr, GcHeader::new_young(T::TYPE_TAG, aligned as u32));
+            std::ptr::write(payload_ptr, value);
+            initialize(&mut *payload_ptr);
+            crate::cell_map::debug_check_map_word(payload_ptr);
+        }
+        if self.trace_table.needs_cleanup(T::TYPE_TAG) {
+            self.new_space.track_cleanup(offset);
+        }
+        // SAFETY: offset is the cage offset of a freshly written `T` payload.
+        unsafe { Gc::from_offset(offset) }
+    }
+
     /// Write a young cell carved from the linear allocation buffer at
     /// `address` and return its handle.
     #[inline(always)]
@@ -1694,7 +1802,6 @@ impl GcHeap {
         if self.trace_table.needs_cleanup(T::TYPE_TAG) {
             self.new_space.track_cleanup(offset);
         }
-        self.runtime_lab_bytes += aligned as u64;
         self.count_runtime_alloc(T::TYPE_TAG, aligned);
         // SAFETY: offset is the cage offset of a freshly written `T` payload.
         unsafe { Gc::from_offset(offset) }
@@ -1800,6 +1907,7 @@ impl GcHeap {
                 address
             }
         };
+        self.runtime_lab_bytes += aligned as u64;
         Ok(self.publish_lab_cell(address, aligned, value, extra_bytes, tail, initialize))
     }
 
@@ -1916,6 +2024,7 @@ impl GcHeap {
         if aligned <= LARGE_OBJECT_THRESHOLD
             && let Some(address) = self.lab.bump(aligned)
         {
+            self.runtime_lab_bytes += aligned as u64;
             return Ok(self.publish_lab_cell(
                 address,
                 aligned,
@@ -2020,6 +2129,7 @@ impl GcHeap {
                 let Some(address) = self.lab.bump(aligned) else {
                     unreachable!("a refilled buffer holds the cell it was sized for");
                 };
+                self.runtime_lab_bytes += aligned as u64;
                 return Ok(self.publish_lab_cell(
                     address,
                     aligned,

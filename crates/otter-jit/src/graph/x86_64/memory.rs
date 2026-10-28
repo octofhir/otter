@@ -57,7 +57,18 @@ impl Codegen<'_> {
                         form.kind().feedback_payload(),
                     )));
                 }
+                let done = self.ops.new_dynamic_label();
+                if let Some(leaf) = form.leaf() {
+                    self.emit_isolate_leaf_method(
+                        node,
+                        leaf,
+                        [Self::gp(input(0)), Self::gp(input(1))],
+                        output(),
+                        done,
+                    );
+                }
                 self.emit_committed_call(node, stub, &arguments, Some(output()))?;
+                dynasm!(self.ops ; .arch x64 ; =>done);
             }
             Kind::LoadOwnField { field, .. } => {
                 crate::x86_64::fields::emit_own_field(

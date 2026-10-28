@@ -166,7 +166,8 @@ pub(crate) enum HighPred {
 /// The finalized machine code of one program for one subject width.
 pub(crate) struct NativeCode {
     buf: dynasmrt::ExecutableBuffer,
-    entry: dynasmrt::AssemblyOffset,
+    /// The search entry, resolved once in the finalized buffer.
+    entry: extern "C" fn(*mut State) -> u64,
     preds: Box<[HighPred]>,
     /// [`thread_tag`] of the thread that finalized the code. That thread
     /// needs no instruction barrier before running it: finalizing already
@@ -175,6 +176,26 @@ pub(crate) struct NativeCode {
 }
 
 impl NativeCode {
+    /// The finalized `buf` whose search entry is at `entry`.
+    pub(super) fn new(
+        buf: dynasmrt::ExecutableBuffer,
+        entry: dynasmrt::AssemblyOffset,
+        preds: Vec<HighPred>,
+    ) -> Self {
+        // SAFETY: the entry is a finalized `extern "C" fn(*mut State) -> u64`
+        // the emitter placed at `entry`; the buffer lives as long as this
+        // code and is never rewritten.
+        let entry = unsafe {
+            core::mem::transmute::<*const u8, extern "C" fn(*mut State) -> u64>(buf.ptr(entry))
+        };
+        Self {
+            buf,
+            entry,
+            preds: preds.into_boxed_slice(),
+            finalized_on: thread_tag(),
+        }
+    }
+
     /// Make the code safe to run on the calling thread: when another thread
     /// finalized it, discard any instructions this core fetched before that.
     pub(crate) fn prepare(&self) {
@@ -326,16 +347,11 @@ pub(crate) fn search<U: Unit>(
         stack: &raw mut scratch.stack,
         log: &raw mut scratch.log,
     };
-    // SAFETY: the entry is a finalized `extern "C" fn(*mut State) -> u64`
-    // emitted for `program` at this width and prepared for this thread when
-    // the search began; `code` outlives the call, and
-    // every pointer in `state` stays valid for it — the buffers it grows
-    // are re-read from `state` after each growth helper returns.
-    let status = unsafe {
-        let entry: extern "C" fn(*mut State) -> u64 =
-            core::mem::transmute(code.buf.ptr(code.entry));
-        entry(&raw mut state)
-    };
+    // The entry was emitted for `program` at this width and prepared for
+    // this thread when the search began; `code` outlives the call, and
+    // every pointer in `state` stays valid for it: the buffers it grows are
+    // re-read from `state` after each growth helper returns.
+    let status = (code.entry)(&raw mut state);
     *budget = state.budget;
     match status {
         0 => Outcome::Exhausted(state.next as usize),

@@ -344,6 +344,9 @@ pub(crate) enum Kind {
     NewNullPrototypeObject,
     /// Fresh empty array shell; extra realms use the committed sidecar allocator.
     NewArrayEmpty,
+    /// A fresh RegExp of the regex literal at this byte PC, born young from
+    /// the site's baked image ([`otter_vm::jit::JitRegExpLiteralPlan`]).
+    NewRegExp(u32),
     /// Static own-property values initialized from canonical tagged homes.
     /// `fields` holds one selected record per input in source order when the
     /// source body's geometry admits the native fit; otherwise only the
@@ -1203,6 +1206,7 @@ impl Kind {
             Self::NewObject
             | Self::NewNullPrototypeObject
             | Self::NewArrayEmpty
+            | Self::NewRegExp(_)
             | Self::NewObjectLiteral { .. }
             | Self::NewArrayLiteral => Properties {
                 eager_deopt: true,
@@ -1355,8 +1359,8 @@ impl Kind {
             Self::BuiltinMethod(form) => {
                 use crate::intrinsic_calls::IntrinsicMethodForm as Form;
                 match form {
-                    Form::RegExpExec => &[abi::STUB_JIT_REGEXP_EXEC],
-                    Form::RegExpTest => &[abi::STUB_JIT_REGEXP_TEST],
+                    Form::RegExpExec => &[abi::STUB_REGEXP_EXEC_LEAF, abi::STUB_JIT_REGEXP_EXEC],
+                    Form::RegExpTest => &[abi::STUB_REGEXP_TEST_LEAF, abi::STUB_JIT_REGEXP_TEST],
                     Form::StringReplace
                     | Form::StringSplit
                     | Form::StringMatch
@@ -1376,6 +1380,7 @@ impl Kind {
             Self::NewObject => &[abi::STUB_JIT_NEW_OBJECT],
             Self::NewNullPrototypeObject => &[abi::STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT],
             Self::NewArrayEmpty | Self::NewArrayLiteral => &[abi::STUB_JIT_NEW_ARRAY],
+            Self::NewRegExp(_) => &[abi::STUB_JIT_REGEXP_LITERAL],
             Self::NewObjectLiteral { .. } => &[
                 abi::STUB_JIT_NEW_OBJECT_LITERAL,
                 abi::STUB_FIELD_TYPE_OBSERVE,
@@ -1474,7 +1479,8 @@ impl Kind {
             Self::AllocationGroup(_)
             | Self::NewObject
             | Self::NewNullPrototypeObject
-            | Self::NewArrayEmpty => Constraints {
+            | Self::NewArrayEmpty
+            | Self::NewRegExp(_) => Constraints {
                 inputs: SmallVec::new(),
                 result: ResultPolicy::Register,
                 gp_temps: 4,

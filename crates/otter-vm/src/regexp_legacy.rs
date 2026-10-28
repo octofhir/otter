@@ -63,6 +63,33 @@ impl RegExpLegacyState {
         }
     }
 
+    /// Record one successful match from its groups wherever the matcher
+    /// left them: one copy, into the kept buffer.
+    pub(crate) fn record_slots(
+        &mut self,
+        input: Value,
+        slots: impl crate::regexp::engine::MatchGroups,
+    ) {
+        self.input = Some(input);
+        let groups = slots.groups();
+        self.offsets.clear();
+        self.offsets.reserve(2 * groups);
+        let words = self.offsets.as_mut_ptr();
+        for index in 0..groups {
+            let (start, end) = match slots.group(index) {
+                Some(range) => (range.start as u32, range.end as u32),
+                None => (NO_OFFSET, NO_OFFSET),
+            };
+            // SAFETY: `2 * groups` words were reserved above.
+            unsafe {
+                words.add(2 * index).write(start);
+                words.add(2 * index + 1).write(end);
+            }
+        }
+        // SAFETY: every word below `2 * groups` was written above.
+        unsafe { self.offsets.set_len(2 * groups) };
+    }
+
     /// Record one successful match from its group offsets (see
     /// [`crate::regexp::engine::MatchOffsets`]): one copy of the buffer.
     pub(crate) fn record_offsets(

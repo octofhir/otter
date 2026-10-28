@@ -53,6 +53,8 @@ pub(crate) use bigint::{emit_bigint64, emit_unbox_bigint64};
 
 mod empty;
 pub(crate) use empty::emit_empty_literal;
+mod regexp;
+pub(crate) use regexp::emit_regexp_literal;
 mod slab;
 pub(crate) use slab::emit_grow_tagged_slab;
 mod literal;

@@ -538,6 +538,7 @@ impl<'a> Codegen<'a> {
             Kind::NumberToString => self.emit_number_to_string(node)?,
             Kind::BigIntBinary(operator) => self.emit_bigint_binary(node, *operator)?,
             Kind::PrimitiveCompare(condition) => self.emit_primitive_compare(node, *condition)?,
+            Kind::NewRegExp(_) => self.emit_regexp_allocation(node)?,
             Kind::NewObject | Kind::NewNullPrototypeObject | Kind::NewArrayEmpty => {
                 self.emit_empty_allocation(node)?
             }

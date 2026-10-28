@@ -730,6 +730,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::StringCharCodeAt,
         Kind::LoadStringLength,
         Kind::LoadFunctionBag,
+        Kind::LoadFunctionBagCell(0),
         Kind::StoreOwnField {
             field,
             atom: 0,
@@ -995,6 +996,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::StringCharCodeAt
         | K::LoadStringLength
         | K::LoadFunctionBag
+        | K::LoadFunctionBagCell(_)
         | K::StoreOwnField { .. }
         | K::StoreDoubleOwnField { .. }
         | K::LoadShapedProperty { .. }

@@ -673,6 +673,10 @@ pub enum JitConstantValue {
         /// The function id of a closure value: the slot's dependency keeps
         /// that closure its value, so generated code may call it directly.
         function: Option<u32>,
+        /// Address of an identity cell holding the closure's own-property
+        /// bag, or zero: a named lookup that starts at that bag reads it
+        /// without decoding the closure.
+        bag: u64,
     },
 }
 

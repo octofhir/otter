@@ -263,6 +263,7 @@ fn proves_inputs(kind: &Kind) -> bool {
         Kind::LoadTypedArrayLength => true,
         Kind::LoadArrayExpando(_)
         | Kind::LoadFunctionBag
+        | Kind::LoadFunctionBagCell(_)
         | Kind::StringCharCodeAt
         | Kind::LoadStringLength => true,
         _ => false,
@@ -401,7 +402,9 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::LoadHoleyFloat64Element(_) => Effects::deref(&[H::Elements]),
         Kind::LoadArrayExpando(_) => Effects::reads(&[H::ArrayExpandos]),
         // The active realm changes only across a call.
-        Kind::LoadFunctionBag => Effects::reads(&[H::FunctionBags]),
+        Kind::LoadFunctionBag | Kind::LoadFunctionBagCell(_) => {
+            Effects::reads(&[H::FunctionBags])
+        }
         Kind::LoadNamedProperty { .. } => Effects::reads(&[H::Heap, H::Dependencies]),
         Kind::LoadGuardedMethod {
             receiver_proved,

@@ -3731,13 +3731,16 @@ impl Interpreter {
                     .filter(|&shape| crate::object::shape_body::is_stable(shape))
                     .and_then(|shape| self.bake_shape(shape))
                     .unwrap_or(0);
+                let closure = value.as_closure(&self.gc_heap);
+                let bag = closure
+                    .and_then(|closure| closure.own_props(&self.gc_heap))
+                    .map_or(0, |bag| self.bake_held_identity_cell(Value::object(bag)));
                 jit::JitConstantValue::Cell {
                     cell: self.bake_held_identity_cell(value),
                     object: value.is_object_type(),
                     shape,
-                    function: value
-                        .as_closure(&self.gc_heap)
-                        .map(|closure| closure.cached_function_id),
+                    function: closure.map(|closure| closure.cached_function_id),
+                    bag,
                 }
             } else {
                 jit::JitConstantValue::Bits(value.to_bits())

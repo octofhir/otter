@@ -2214,6 +2214,28 @@ impl<'a> Codegen<'a> {
                     exit,
                 );
             }
+            Kind::LoadFunctionBagCell(cell) => {
+                let exit = self.eager_exit(node, DeoptReason::WrongShape);
+                let destination = Self::gp(result.expect("function bag result"));
+                dynasm!(self.ops ; .arch aarch64
+                    ; ldr x17, [x20, THREAD_OFFSET]
+                    ; ldr x17, [x17, crate::entry::VM_THREAD_ACTIVE_REALM_CELL_OFFSET]
+                    ; cbz x17, =>exit
+                    ; ldr w17, [x17]
+                    ; cbnz w17, =>exit);
+                let target = RelocationTarget::CalleeIdentityCell {
+                    function_id: self.view_of(node).code_block.id,
+                    call_pc: self.graph.node(node).pc,
+                };
+                emit_load_symbol_u64(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    destination,
+                    *cell,
+                    target,
+                );
+                dynasm!(self.ops ; .arch aarch64 ; ldr X(destination), [X(destination)]);
+            }
             Kind::LoadFunctionBag => {
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
                 self.emit_function_bag(
@@ -2700,8 +2722,13 @@ impl<'a> Codegen<'a> {
                 receiver_proved,
                 ..
             } => {
-                let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
+                // A proved receiver's cell read takes no input.
+                let receiver = if allocation.inputs.is_empty() {
+                    destination
+                } else {
+                    Self::gp(input(0))
+                };
                 let holder = allocation.gp_temps[0];
                 let (byte_pc, target, receiver_proved) = (*byte_pc, *target, *receiver_proved);
                 self.emit_load_guarded_method(

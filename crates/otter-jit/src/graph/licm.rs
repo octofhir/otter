@@ -139,7 +139,8 @@ fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
         | Kind::LoadGuardedMethod { .. }
         | Kind::LoadNamedProperty { .. }
         | Kind::LoadArrayExpando(_)
-        | Kind::LoadFunctionBag => return header.hoist,
+        | Kind::LoadFunctionBag
+        | Kind::LoadFunctionBagCell(_) => return header.hoist,
         Kind::LoadShapedProperty { .. } => &[R::OwnDataMiss],
         Kind::CheckedNumberToInt32
         | Kind::CheckedTaggedToFloat64

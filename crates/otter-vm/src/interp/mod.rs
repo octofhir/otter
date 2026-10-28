@@ -16,7 +16,7 @@ pub(crate) mod host_call;
 mod init;
 mod jit_call;
 mod jit_compile;
-mod jit_intrinsic_properties;
+pub(crate) mod jit_intrinsic_properties;
 mod jit_retraining;
 mod logical_frames;
 mod modules;

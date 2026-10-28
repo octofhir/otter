@@ -665,8 +665,8 @@ impl Interpreter {
         if exit.logical_pc() != 0 || exit.reason() != native_abi::ExitReason::TypeMismatch {
             return false;
         }
-        let widening = self
-            .jit_parameter_widening
+        let mut widenings = self.jit_parameter_widening_mut();
+        let widening = widenings
             .entry(fid)
             .or_insert_with(|| vec![jit::JitParameterWidening::Int32; parameters.len()].into());
         let mut changed = false;
@@ -745,20 +745,22 @@ impl Interpreter {
                     .property_site_population(site_pc as usize)
             })
             .flatten();
-        let profile = self
-            .jit_optimized_exit_profiles
-            .entry((site_fid, site_pc, exit.reason()))
-            .or_insert(jit::JitExitProfile {
-                action: exit.action(),
-                count: 0,
-                feedback_population: None,
-            });
-        profile.action = profile.action.max(exit.action());
-        profile.count = profile.count.saturating_add(1);
-        if population.is_some() {
-            profile.feedback_population = population;
-        }
-        let action = profile.action;
+        let action = {
+            let mut profiles = self.jit_optimized_exit_profiles_mut();
+            let profile = profiles
+                .entry((site_fid, site_pc, exit.reason()))
+                .or_insert(jit::JitExitProfile {
+                    action: exit.action(),
+                    count: 0,
+                    feedback_population: None,
+                });
+            profile.action = profile.action.max(exit.action());
+            profile.count = profile.count.saturating_add(1);
+            if population.is_some() {
+                profile.feedback_population = population;
+            }
+            profile.action
+        };
         let widened = self.widen_arith_exit_site(context, site_fid, site_pc, exit.reason());
         if !current {
             // A genuinely new source representation can stale current narrow
@@ -1607,7 +1609,7 @@ mod tests {
         vm.note_jit_optimized_bail(&context, 0, 91, receiver_miss, false);
         assert_eq!(vm.jit_runtime_stats.receiver_alloc_deopts, 1);
         assert_eq!(vm.jit_runtime_stats.optimized_deopts, 2);
-        assert_eq!(vm.jit_optimized_exit_profiles.len(), 2);
+        assert_eq!(vm.jit_optimized_exit_profiles().len(), 2);
         assert!(vm.jit_code_registry.is_current_generation(91));
         assert!(!vm.jit_retraining_blocks(0));
     }
@@ -2260,9 +2262,9 @@ mod tests {
         }
         vm.note_jit_optimized_bail_at(&context, 99, 99, exit, (0, 0), false);
         vm.note_jit_optimized_bail_at(&context, 100, 100, exit, (0, 0), false);
-        assert_eq!(vm.jit_optimized_exit_profiles.len(), 1);
+        assert_eq!(vm.jit_optimized_exit_profiles().len(), 1);
         assert_eq!(
-            vm.jit_optimized_exit_profiles[&(0, 0, exit.reason())].count,
+            vm.jit_optimized_exit_profiles()[&(0, 0, exit.reason())].count,
             2,
             "two different inlining callers share the source site's lifetime history"
         );
@@ -2291,7 +2293,7 @@ mod tests {
         assert!(vm.jit_code_registry.is_current_generation(12));
         assert!(!vm.jit_retraining_blocks(0));
         assert_eq!(
-            vm.jit_optimized_exit_profiles[&(0, 0, exit.reason())].count,
+            vm.jit_optimized_exit_profiles()[&(0, 0, exit.reason())].count,
             1
         );
         assert_eq!(vm.jit_runtime_stats.optimized_deopts, 1);
@@ -2394,7 +2396,7 @@ mod tests {
                     );
                     if tier == native_abi::NativeFrameKind::Optimizing {
                         assert_eq!(
-                            vm.jit_optimized_exit_profiles[&(0, 1, exit.reason())].count,
+                            vm.jit_optimized_exit_profiles()[&(0, 1, exit.reason())].count,
                             1
                         );
                     }
@@ -2505,7 +2507,7 @@ mod tests {
         assert!(vm.jit_retraining_blocks(0));
         assert!(!vm.jit_retraining_blocks(99));
         assert_eq!(
-            vm.jit_optimized_exit_profiles[&(0, 0, exit.reason())].count,
+            vm.jit_optimized_exit_profiles()[&(0, 0, exit.reason())].count,
             1
         );
     }

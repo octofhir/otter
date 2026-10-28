@@ -167,6 +167,7 @@ pub mod jit_inline_plan;
 pub use feedback as jit_feedback;
 mod array_from_async;
 mod async_from_sync_iterator;
+mod compile_shared;
 mod conversion_protocol;
 mod forward_arguments;
 pub mod host_services;
@@ -193,6 +194,7 @@ mod method_ops;
 pub mod microtask;
 mod module_ops;
 mod module_records;
+mod mutator_owned;
 /// Private VM↔compiler↔generated-code ABI.
 ///
 /// This module is public only so the separately compiled `otter-jit` crate can
@@ -828,25 +830,10 @@ pub struct Interpreter {
     /// template-strings object per tagged-template site, keyed by
     /// `(chunk function_base, site index)`.
     template_objects: rustc_hash::FxHashMap<(u32, u32), Value>,
-    /// Per-context literal cells for `LoadString` and `LoadBigInt`, keyed by
-    /// linked chunk identity and constant-pool index. Both primitives are
-    /// immutable with value semantics, so each literal materializes once; JIT
-    /// preparation canonicalizes every literal of a function before taking a
-    /// compile snapshot, then publishes the shared address-stable box to each
-    /// site. Values are traced from [`RuntimeState::trace_roots`] so moving
-    /// collection rewrites them in place without invalidating relocations.
-    literal_cells: rustc_hash::FxHashMap<(usize, u32), Box<Value>>,
-    /// Shared copy-on-write element slabs of array-literal boilerplate
-    /// constants, keyed like [`Self::literal_cells`]. Each slab and every
-    /// string it holds is old and never written, so arrays of every site that
-    /// names the constant share it until their first write, and compiled code
-    /// may bake its address.
-    array_boilerplates:
-        rustc_hash::FxHashMap<(usize, u32), crate::array::elements::ElementSlabHandle>,
-    /// Regex literal sites resolved once, keyed like [`Self::literal_cells`]:
-    /// the program cell (old, rooted here) and the flags every evaluation of
-    /// the site births a young RegExp from.
-    regexp_literals: rustc_hash::FxHashMap<(usize, u32), regexp::RegExpLiteralSite>,
+    /// The mutator's ownership of [`Self::compile_shared`].
+    mutator: mutator_owned::MutatorToken,
+    /// The tables compilations read, shared with compiler threads.
+    compile_shared: std::sync::Arc<compile_shared::CompileShared>,
     /// Decimal strings for small non-negative integers, served on demand.
     /// Integer → string is one of the most repeated allocations in real code
     /// (`"" + n`, `(n).toString()`, integer keys); caching
@@ -959,11 +946,6 @@ pub struct Interpreter {
     /// Runtime object storage uses the root, interned shape keys, and
     /// transition/cache tables here.
     shape_runtime: object::ShapeRuntime,
-    /// Per-function cache for conservative base-class constructor initializers
-    /// recognized by `constructor_fast_path`. Entries hold owned strings and
-    /// source descriptors only; GC shape handles stay in `shape_runtime`.
-    simple_constructor_init_cache:
-        rustc_hash::FxHashMap<u32, Option<constructor_fast_path::SimpleConstructorInit>>,
     /// Per simple constructor, the prototype-chain proof under which its
     /// field names were last found absent from its receivers' prototypes:
     /// while the cell stays valid and is the prototype's current proof, a
@@ -972,19 +954,9 @@ pub struct Interpreter {
         u32,
         std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>,
     >,
-    /// Final hidden class reached by a cached simple constructor initializer.
-    /// These handles are traced explicitly because a moving GC must rewrite the
-    /// cache slot, not only the owning `shape_runtime` transition table.
-    simple_constructor_shape_cache:
-        rustc_hash::FxHashMap<(u32, object::ShapeId), object::ShapeHandle>,
-    /// Final hidden class of each `Op::NewObjectLiteral` site, keyed by the
-    /// owning function id and the site's first key constant.
-    object_literal_layouts: rustc_hash::FxHashMap<(u32, u32), handles::ObjectLayout>,
     /// Traced family heads belonging to immediate callable values. Function
     /// keys select existing owners and never mark code live by themselves.
     function_constructor_layouts: rustc_hash::FxHashMap<u32, constructor_layout::ConstructorLayout>,
-    /// Weak family-identity index; never a root.
-    constructor_families: constructor_layout::ConstructorFamilies,
     /// Final hidden class of an arguments object, keyed by argument count and
     /// variant; a hit is reused only while it grows from the current realm's
     /// `%Object.prototype%`. Same tracing contract as the constructor cache
@@ -1030,18 +1002,6 @@ pub struct Interpreter {
     /// one module's init run the same closure, so closures instantiated at
     /// link time observe the bindings the body later initialises.
     module_init_closures: std::collections::HashMap<std::sync::Arc<str>, Value>,
-    /// §9.1.1.4 GlobalEnvironmentRecord declarative record — script
-    /// top-level `let` / `const` / `class` bindings, shared across
-    /// every script and eval chunk in the realm and *not* reflected
-    /// as global object properties. Cells start as the TDZ hole.
-    pub(crate) global_lexicals:
-        rustc_hash::FxHashMap<Box<str>, (crate::UpvalueCell, /* is_const */ bool)>,
-    /// Monotonic identity of the global declarative record's name set.
-    ///
-    /// Generated reads of object-record globals guard this live cell because a
-    /// later script/eval lexical declaration may shadow an otherwise
-    /// shape-stable global-object property.
-    pub(crate) global_lexical_epoch: u64,
     /// Per-load-site cache of resolved global declarative-record cells, keyed by
     /// `(function_id, name_constant_index)`. A global lexical binding's cell is
     /// stable for the realm's lifetime (lexical bindings are never deleted), so
@@ -1102,9 +1062,6 @@ pub struct Interpreter {
         std::sync::Arc<str>,
         std::collections::BTreeMap<String, (std::sync::Arc<str>, String)>,
     >,
-    /// Isolate-owned method-only IC and target distributions. Executable
-    /// property programs live in their CodeBlock feedback slots instead.
-    method_feedback: interp::MethodFeedbackDirectory,
     /// Runtime-installed native-tier compiler hook. The hook lives behind a VM
     /// trait object so `otter-vm` never depends on executable-memory code.
     /// `Some` is also the tier-up gate: with no hook installed, all tier-up
@@ -1153,23 +1110,6 @@ pub struct Interpreter {
     /// Own-slot lookups of shaped objects by shape and interned key, for the
     /// generic property paths.
     own_slot_cache: object::OwnSlotCache,
-    /// Lifetime optimizing exit evidence keyed by the owning source function,
-    /// PC and reason, including sites spliced into different native callers.
-    /// The same record owns the requested policy, count and IC population.
-    jit_optimized_exit_profiles:
-        std::collections::BTreeMap<(u32, u32, native_abi::ExitReason), jit::JitExitProfile>,
-    /// Per-function parameter widening learned from failed optimized entry
-    /// guards; see [`jit::JitCompileSnapshot::parameter_widening`].
-    jit_parameter_widening: rustc_hash::FxHashMap<u32, Box<[jit::JitParameterWidening]>>,
-    /// Intrinsic-prototype programs of each property atom with the layout
-    /// they were built against.
-    jit_intrinsic_programs: rustc_hash::FxHashMap<
-        u32,
-        (
-            interp::jit_intrinsic_properties::IntrinsicLayoutStamp,
-            Vec<jit::JitCacheIrProgram>,
-        ),
-    >,
     /// Feedback epoch at which a hot function last failed optimizing compilation.
     /// A back-edge only re-attempts the whole-body optimizer when the epoch has
     /// advanced, so a structurally-ineligible body is not recompiled on every hot
@@ -1548,13 +1488,13 @@ impl Interpreter {
 
     /// Root-tracing view of the literal cells.
     pub(crate) fn literal_cells_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.literal_cells.values().map(Box::as_ref)
+        self.literal_cells().values().map(Box::as_ref)
     }
 
     pub(crate) fn array_boilerplates_for_trace(
         &self,
     ) -> impl Iterator<Item = &crate::array::elements::ElementSlabHandle> {
-        self.array_boilerplates.values()
+        self.array_boilerplates().values()
     }
 
     /// Root-tracing view of every compiled regexp program cell the isolate
@@ -1564,17 +1504,17 @@ impl Interpreter {
     ) -> impl Iterator<Item = &regexp::RegExpPatternHandle> {
         self.regex_compile_cache
             .cells_for_trace()
-            .chain(self.regexp_literals.values().map(|site| &site.pattern))
+            .chain(self.regexp_literals().values().map(|site| &site.pattern))
     }
 
     #[cfg(test)]
     fn literal_cell_count_for_test(&self) -> usize {
-        self.literal_cells.len()
+        self.literal_cells().len()
     }
 
     #[cfg(test)]
     fn literal_cell_addr_for_test(&self, context: &ExecutionContext, idx: u32) -> Option<usize> {
-        self.literal_cells
+        self.literal_cells()
             .get(&context.constant_cache_key(idx))
             .map(|cell| std::ptr::from_ref::<Value>(cell.as_ref()) as usize)
     }
@@ -1591,7 +1531,7 @@ impl Interpreter {
         idx: u32,
     ) -> Result<Value, VmError> {
         let key = context.constant_cache_key(idx);
-        if let Some(value) = self.literal_cells.get(&key) {
+        if let Some(value) = self.literal_cells().get(&key) {
             if !value.is_string() {
                 return Err(VmError::InvalidOperand);
             }
@@ -1610,7 +1550,7 @@ impl Interpreter {
                 .with_payload(string.handle(), |body| body.set_cached_atom(atom));
         }
         let value = Value::string(string);
-        let replaced = self.literal_cells.insert(key, Box::new(value));
+        let replaced = self.literal_cells_mut().insert(key, Box::new(value));
         debug_assert!(replaced.is_none(), "literals canonicalize once");
         Ok(value)
     }
@@ -1694,7 +1634,7 @@ impl otter_gc::ExtraRootSource for Interpreter {
     fn sweep_weak(&self, heap: &otter_gc::GcHeap) {
         self.property_cache.sweep_dead_holders(heap);
         self.code_space.sweep_property_ics(heap);
-        self.constructor_families.sweep_dead(heap);
+        self.compile_shared.constructor_families.sweep_dead(heap);
     }
     fn visit_extra_roots(&self, roots: otter_gc::RootSet, visitor: &mut dyn FnMut(*mut RawGc)) {
         crate::runtime_state::RuntimeState::new(self).trace_roots(roots, visitor);

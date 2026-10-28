@@ -121,7 +121,7 @@ impl Interpreter {
         let atom = key.atom().id().raw();
         let (stamp, _) = self.intrinsic_layout_stamp();
         if self
-            .jit_intrinsic_programs
+            .jit_intrinsic_programs()
             .get(&atom)
             .is_some_and(|(built, _)| *built == stamp)
         {
@@ -131,7 +131,8 @@ impl Interpreter {
         // Building can migrate the prototypes and give them their prototype
         // role, which are their final shapes: the stamp is taken after.
         let (stamp, _) = self.intrinsic_layout_stamp();
-        self.jit_intrinsic_programs.insert(atom, (stamp, programs));
+        self.jit_intrinsic_programs_mut()
+            .insert(atom, (stamp, programs));
     }
 
     /// The prepared intrinsic-prototype programs of `key` and the shapes they
@@ -142,7 +143,7 @@ impl Interpreter {
         key: AtomizedPropertyKey<'_>,
     ) -> Option<(&[JitCacheIrProgram], [object::ShapeHandle; 5])> {
         let (stamp, shapes) = self.intrinsic_layout_stamp();
-        let (built, programs) = self.jit_intrinsic_programs.get(&key.atom().id().raw())?;
+        let (built, programs) = self.jit_intrinsic_programs().get(&key.atom().id().raw())?;
         (*built == stamp).then_some((programs.as_slice(), shapes))
     }
 

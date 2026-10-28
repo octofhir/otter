@@ -436,17 +436,17 @@ fn record_method_distribution(
 
 impl Interpreter {
     pub(crate) fn ensure_method_feedback_context(&mut self, context: &ExecutionContext) {
-        self.method_feedback.install_context(context);
+        self.method_feedback_mut().install_context(context);
     }
 
     #[must_use]
     pub(crate) fn method_target_feedback(&self, site: usize) -> Option<MethodCallFeedback> {
-        self.method_feedback.method_targets(site)
+        self.method_feedback().method_targets(site)
     }
 
     #[must_use]
     pub(crate) fn method_target_feedback_saturated(&self, site: usize) -> bool {
-        self.method_feedback.method_targets_saturated(site)
+        self.method_feedback().method_targets_saturated(site)
     }
 
     /// Record that one `Op::CallMethodValue` site resolved to a declared native
@@ -461,7 +461,7 @@ impl Interpreter {
         stub_id: crate::native_abi::RuntimeStubId,
         method_site: MethodSite,
     ) -> bool {
-        self.method_feedback
+        self.method_feedback_mut()
             .record_method_native_leaf(site, stub_id, method_site)
     }
 
@@ -469,7 +469,7 @@ impl Interpreter {
     /// callee that no generated guard can describe, so later calls skip the
     /// per-call feedback capture.
     pub(crate) fn saturate_method_site_feedback(&mut self, site: usize) {
-        self.method_feedback.saturate_method_targets(site);
+        self.method_feedback_mut().saturate_method_targets(site);
     }
 
     /// Whether a call on `recv_shape` resolving to `target` is already in
@@ -480,7 +480,7 @@ impl Interpreter {
         recv_shape: crate::object::ShapeId,
         target: MethodFeedbackTarget,
     ) -> bool {
-        self.method_feedback
+        self.method_feedback_mut()
             .records_method_target(site, recv_shape, target)
     }
 
@@ -490,7 +490,7 @@ impl Interpreter {
         method_fid: u32,
         method_site: MethodSite,
     ) -> bool {
-        self.method_feedback
+        self.method_feedback_mut()
             .record_method_target(site, method_fid, method_site)
     }
 
@@ -518,11 +518,11 @@ impl Interpreter {
         let shape = crate::object::keyed_shape(receiver, &self.gc_heap);
         // A receiver class the site already recorded under a live proof needs
         // no second resolution.
-        if !shape.is_null()
-            && self
-                .method_feedback
-                .records_receiver(site, crate::object::shape_id(receiver, &self.gc_heap))
-        {
+        if !shape.is_null() && {
+            let receiver_shape = crate::object::shape_id(receiver, &self.gc_heap);
+            self.method_feedback_mut()
+                .records_receiver(site, receiver_shape)
+        } {
             return;
         }
         let resolved = (!shape.is_null())

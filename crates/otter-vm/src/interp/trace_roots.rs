@@ -21,7 +21,7 @@ impl Interpreter {
         for value in self.template_objects.values() {
             crate::code_liveness::visit_value(value, visitor);
         }
-        for value in self.literal_cells.values() {
+        for value in self.literal_cells().values() {
             crate::code_liveness::visit_value(value, visitor);
         }
         for value in self.small_int_strings_for_trace() {
@@ -83,7 +83,7 @@ impl Interpreter {
 
     /// Global declarative-record cells for the GC root walk.
     pub(crate) fn global_lexicals_for_trace(&self) -> impl Iterator<Item = &crate::UpvalueCell> {
-        self.global_lexicals.values().map(|(cell, _)| cell)
+        self.global_lexicals().values().map(|(cell, _)| cell)
     }
 
     /// Cached global-load cells for the GC root walk. These alias cells already
@@ -283,7 +283,7 @@ impl Interpreter {
     pub(crate) fn simple_constructor_shapes_for_trace(
         &self,
     ) -> impl Iterator<Item = &object::ShapeHandle> {
-        self.simple_constructor_shape_cache
+        self.simple_constructor_shape_cache()
             .values()
             .chain(self.arguments_shape_cache.values())
     }
@@ -306,7 +306,7 @@ impl Interpreter {
     /// resolves its id to a shape on every use.
     pub(crate) fn trace_layout_shapes(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         let ids = self
-            .object_literal_layouts
+            .object_literal_layouts()
             .values()
             .map(|layout| layout.shape_id())
             .chain(self.object_layout_cache.shape_ids());

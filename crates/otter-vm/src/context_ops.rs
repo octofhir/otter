@@ -592,7 +592,7 @@ impl Interpreter {
             let removed = eval_env::extension_remove(&mut self.gc_heap, extension, name);
             return Ok(Value::boolean(removed));
         }
-        let removed = if self.global_lexicals.contains_key(name) {
+        let removed = if self.global_lexicals().contains_key(name) {
             // A global declarative binding is an Environment Record binding,
             // not a configurable property: `delete identifier` is `false`.
             false

@@ -555,7 +555,7 @@ impl Interpreter {
         // guard is a single shape compare plus a slab read — no property-atom
         // resolution, no load-IC stub walk, no `is_callable` string dispatch.
         if method_site != usize::MAX
-            && let Some(MethodCallIc::Ordinary(hit)) = self.method_feedback.method_ic(method_site)
+            && let Some(MethodCallIc::Ordinary(hit)) = self.method_feedback().method_ic(method_site)
         {
             if let Some(obj) = recv_value.as_object()
                 && let Some(method) =
@@ -573,7 +573,7 @@ impl Interpreter {
             // The receiver shape moved on or the slot is no longer a callable
             // data property; drop the cache and fall back to full resolution,
             // which reinstalls only while the site stays monomorphic.
-            self.method_feedback.clear_method_ic(method_site);
+            self.method_feedback_mut().clear_method_ic(method_site);
         }
         // Method-resolution inline cache. An ordinary object's method is a data
         // slot on its own object or its prototype, so the receiver shape keys
@@ -602,7 +602,7 @@ impl Interpreter {
             if let Some(hit) =
                 property_slot.and_then(|slot| slot.mono_own_hit(atomized_key.atom().id()))
             {
-                self.method_feedback
+                self.method_feedback_mut()
                     .install_method_ic(method_site, MethodCallIc::Ordinary(hit));
             }
             stack[top_idx]
@@ -1502,7 +1502,7 @@ impl Interpreter {
         // the slot hash. The cached slot offset is only sound while the
         // prototype keeps the recorded shape (guarded on the fast path).
         if let Some(hit) = hit {
-            self.method_feedback.install_method_ic(
+            self.method_feedback_mut().install_method_ic(
                 site,
                 MethodCallIc::Array(ArrayMethodCallIc {
                     proto_shape: hit.shape_id,
@@ -1531,7 +1531,7 @@ impl Interpreter {
         recv: Value,
         args: ValueWindow<'_>,
     ) -> Option<Result<Value, CommittedValueError>> {
-        let ic = match self.method_feedback.method_ic(site)? {
+        let ic = match self.method_feedback().method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) => return None,
             MethodCallIc::Ordinary(_) => return None,
@@ -1540,7 +1540,7 @@ impl Interpreter {
             // The receiver is no longer an array: drop the cache so the direct
             // compiled-call path (skipped while the IC was live) resumes for
             // whatever this site now sees.
-            self.method_feedback.clear_method_ic(site);
+            self.method_feedback_mut().clear_method_ic(site);
             return None;
         };
         if !crate::array::is_ordinary_dense(arr, &self.gc_heap) {
@@ -1581,14 +1581,14 @@ impl Interpreter {
         site: usize,
         recv: Value,
     ) -> Option<CollectionFastTarget> {
-        let ic = match self.method_feedback.method_ic(site)? {
+        let ic = match self.method_feedback().method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) => return None,
             MethodCallIc::Ordinary(_) => return None,
         };
         let proto = if let Some(map) = recv.as_map() {
             if !ic.op.is_map() {
-                self.method_feedback.clear_method_ic(site);
+                self.method_feedback_mut().clear_method_ic(site);
                 return None;
             }
             let proto = self.realm_intrinsics.map_prototype()?;
@@ -1602,7 +1602,7 @@ impl Interpreter {
             proto
         } else if let Some(set) = recv.as_set() {
             if !ic.op.is_set() {
-                self.method_feedback.clear_method_ic(site);
+                self.method_feedback_mut().clear_method_ic(site);
                 return None;
             }
             let proto = self.realm_intrinsics.set_prototype()?;
@@ -1615,7 +1615,7 @@ impl Interpreter {
             }
             proto
         } else {
-            self.method_feedback.clear_method_ic(site);
+            self.method_feedback_mut().clear_method_ic(site);
             return None;
         };
         if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
@@ -1705,7 +1705,7 @@ impl Interpreter {
                 mutating_stub_id: op.mutating_stub_id(),
                 alloc_stub_id: op.alloc_stub_id(),
             };
-            self.method_feedback
+            self.method_feedback_mut()
                 .install_method_ic(site, MethodCallIc::Collection(ic));
         }
         Some(self.dispatch_collection_builtin(CollectionFastTarget::new(op), recv, args))

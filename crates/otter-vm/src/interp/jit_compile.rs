@@ -1464,7 +1464,7 @@ impl Interpreter {
             }
             let constant = function.const_index(instruction, 1)?;
             let key = owner.constant_cache_key(constant);
-            if let Some(cell) = self.literal_cells.get(&key) {
+            if let Some(cell) = self.literal_cells().get(&key) {
                 if !literal_matches(op, cell) {
                     return None;
                 }
@@ -1490,7 +1490,7 @@ impl Interpreter {
         &self,
         fid: u32,
     ) -> impl Iterator<Item = (&(u32, u32, native_abi::ExitReason), &jit::JitExitProfile)> {
-        self.jit_optimized_exit_profiles
+        self.jit_optimized_exit_profiles()
             .range((fid, 0, native_abi::ExitReason::TypeMismatch)..)
             .take_while(move |((profile_fid, _, _), _)| *profile_fid == fid)
     }

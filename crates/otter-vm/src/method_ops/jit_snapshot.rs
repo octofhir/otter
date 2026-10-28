@@ -94,7 +94,7 @@ impl Baker<'_> {
             STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC,
         };
 
-        let ic = match self.vm.method_feedback.method_ic(site)? {
+        let ic = match self.vm.method_feedback().method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) | MethodCallIc::Ordinary(_) => return None,
         };
@@ -220,7 +220,7 @@ impl Baker<'_> {
         site: usize,
         alloc_safepoint_id: crate::native_abi::SafepointId,
     ) -> Option<JitGuardedMethodCall> {
-        let ic = match self.vm.method_feedback.method_ic(site)? {
+        let ic = match self.vm.method_feedback().method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) | MethodCallIc::Ordinary(_) => return None,
         };
@@ -376,7 +376,7 @@ mod tests {
             let proto = vm.escape_scoped(prototype).as_object().unwrap();
             let (hit, _) = object::lookup_own_slot(proto, &vm.gc_heap, "push");
             let hit = hit.unwrap();
-            assert!(vm.method_feedback.install_method_ic(
+            assert!(vm.method_feedback_mut().install_method_ic(
                 site,
                 MethodCallIc::Array(ArrayMethodCallIc {
                     proto_shape: hit.shape_id,

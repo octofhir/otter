@@ -192,7 +192,7 @@ impl Interpreter {
                 )?;
                 let (owner, owner_function_id) = vm.constructor_family_owner(target_now);
                 let body = ConstructorLayoutBody::new(
-                    vm.constructor_families.allocate_id(),
+                    vm.compile_shared.constructor_families.allocate_id(),
                     base,
                     owner,
                     owner_function_id,
@@ -202,7 +202,9 @@ impl Interpreter {
                     ConstructorLayout::null(),
                 );
                 selected = vm.gc_heap.alloc_old_with_roots(body, &mut external)?;
-                vm.constructor_families.register(&vm.gc_heap, selected);
+                vm.compile_shared
+                    .constructor_families
+                    .register(&vm.gc_heap, selected);
                 vm.gc_heap.record_write(selected, &root);
                 // The body's prototype may be young; record its traced edge.
                 let prototype_now = vm.escape_scoped(prototype);

@@ -205,18 +205,19 @@ impl Interpreter {
             .collect();
         self.template_objects
             .retain(|(function_base, _), _| !bases.contains(function_base));
-        self.literal_cells
+        self.literal_cells_mut()
             .retain(|(identity, _), _| !identities.contains(identity));
-        self.array_boilerplates
+        self.array_boilerplates_mut()
             .retain(|(identity, _), _| !identities.contains(identity));
-        self.regexp_literals
+        self.regexp_literals_mut()
             .retain(|(identity, _), _| !identities.contains(identity));
-        self.simple_constructor_init_cache
+        self.simple_constructor_init_cache_mut()
             .retain(|id, _| outside(id));
         self.simple_constructor_absence.retain(|id, _| outside(id));
-        self.simple_constructor_shape_cache
+        self.simple_constructor_shape_cache_mut()
             .retain(|(id, _), _| outside(id));
-        self.object_literal_layouts.retain(|(id, _), _| outside(id));
+        self.object_literal_layouts_mut()
+            .retain(|(id, _), _| outside(id));
         self.prune_constructor_layouts_for_evicted(&ranges);
         self.global_lexical_load_ic.retain(|(id, _), _| outside(id));
         self.global_object_load_ic.retain(|(id, _), _| outside(id));
@@ -236,9 +237,10 @@ impl Interpreter {
         self.function_prototype_slots.retain(|id, _| outside(id));
         self.function_non_extensible.retain(outside);
         self.function_deleted_metadata.retain(|(id, _)| outside(id));
-        self.jit_optimized_exit_profiles
+        self.jit_optimized_exit_profiles_mut()
             .retain(|(id, _, _), _| outside(id));
-        self.jit_parameter_widening.retain(|id, _| outside(id));
+        self.jit_parameter_widening_mut()
+            .retain(|id, _| outside(id));
         self.jit_entry_bail_counts.retain(|id, _| outside(id));
         self.jit_osr_disabled.retain(|(id, _)| outside(id));
         self.jit_optimized_declined_epoch
@@ -246,7 +248,7 @@ impl Interpreter {
         self.optimizing_tier_policy
             .evict_functions(|function_id| ranges.contains(function_id));
         for candidate in evicted {
-            self.method_feedback.evict_site_range(
+            self.method_feedback_mut().evict_site_range(
                 candidate.property_ic_site_base,
                 candidate.property_ic_site_end,
             );
@@ -1362,15 +1364,15 @@ mod tests {
             vm.extra_realms[0]
                 .template_objects
                 .insert((context.function_base(), 0), Value::boolean(false));
-            vm.literal_cells
+            vm.literal_cells_mut()
                 .insert(context.constant_cache_key(0), Box::new(Value::undefined()));
-            vm.literal_cells
+            vm.literal_cells_mut()
                 .insert(context.constant_cache_key(1), Box::new(Value::undefined()));
             vm.ensure_method_feedback_context(context);
             for (site, address) in context.feedback_slot_addresses() {
                 assert!(address.is_method());
                 vm.saturate_method_site_feedback(site);
-                assert!(vm.method_feedback.install_method_ic(
+                assert!(vm.method_feedback_mut().install_method_ic(
                     site,
                     crate::method_ops::MethodCallIc::Collection(
                         crate::method_ops::CollectionMethodCallIc {
@@ -1402,11 +1404,11 @@ mod tests {
             ] {
                 vm.optimizing_tier_policy.record_compile_attempt(fid, tier);
             }
-            vm.simple_constructor_init_cache.insert(fid, None);
+            vm.simple_constructor_init_cache_mut().insert(fid, None);
             vm.simple_constructor_absence.insert(fid, validity.clone());
-            vm.simple_constructor_shape_cache
+            vm.simple_constructor_shape_cache_mut()
                 .insert((fid, shape_id), shape);
-            vm.object_literal_layouts.insert((fid, 0), layout);
+            vm.object_literal_layouts_mut().insert((fid, 0), layout);
             vm.global_lexical_load_ic.insert((fid, 0), lexical);
             vm.global_object_load_ic.insert((fid, 1), object_load);
             vm.extra_realms[0]
@@ -1423,7 +1425,7 @@ mod tests {
             vm.function_non_extensible.insert(fid);
             vm.function_deleted_metadata.insert((fid, "name"));
             for (pc, reason) in [(0, ExitReason::ShapeGuard), (7, ExitReason::IdentityGuard)] {
-                vm.jit_optimized_exit_profiles.insert(
+                vm.jit_optimized_exit_profiles_mut().insert(
                     (fid, pc, reason),
                     JitExitProfile {
                         action: ExitAction::Recompile,
@@ -1432,7 +1434,7 @@ mod tests {
                     },
                 );
             }
-            vm.jit_parameter_widening.insert(
+            vm.jit_parameter_widening_mut().insert(
                 fid,
                 vec![JitParameterWidening::Number, JitParameterWidening::Tagged].into(),
             );
@@ -1454,14 +1456,14 @@ mod tests {
             )
             .expect("actual new.target family");
         }
-        let profiles_before = vm.jit_optimized_exit_profiles.clone();
-        let widening_before = vm.jit_parameter_widening.clone();
+        let profiles_before = vm.jit_optimized_exit_profiles().clone();
+        let widening_before = vm.jit_parameter_widening().clone();
 
         vm.reclaim_dynamic_code().unwrap();
         assert_eq!(vm.code_eviction_stats().evicted_chunks, 0);
-        assert_eq!(vm.jit_optimized_exit_profiles, profiles_before);
-        assert_eq!(vm.jit_parameter_widening, widening_before);
-        assert_eq!(vm.object_literal_layouts.len(), 4);
+        assert_eq!(*vm.jit_optimized_exit_profiles(), profiles_before);
+        assert_eq!(*vm.jit_parameter_widening(), widening_before);
+        assert_eq!(vm.object_literal_layouts().len(), 4);
         assert_eq!(
             vm.function_constructor_layouts.len(),
             4,
@@ -1472,13 +1474,13 @@ mod tests {
         drop(dynamic);
         vm.reclaim_dynamic_code().unwrap();
         assert_eq!(vm.code_eviction_stats().evicted_chunks, 1);
-        assert_eq!(vm.jit_optimized_exit_profiles.len(), 4);
-        assert_eq!(vm.jit_parameter_widening.len(), 2);
+        assert_eq!(vm.jit_optimized_exit_profiles().len(), 4);
+        assert_eq!(vm.jit_parameter_widening().len(), 2);
         assert_eq!(vm.template_objects.len(), 2);
         assert_eq!(vm.extra_realms[0].template_objects.len(), 2);
-        assert_eq!(vm.literal_cells.len(), 4);
-        assert!(!vm.literal_cells.contains_key(&evicted_constants[0]));
-        assert!(!vm.literal_cells.contains_key(&evicted_constants[1]));
+        assert_eq!(vm.literal_cells().len(), 4);
+        assert!(!vm.literal_cells().contains_key(&evicted_constants[0]));
+        assert!(!vm.literal_cells().contains_key(&evicted_constants[1]));
         macro_rules! outside_keys {
             ($map:expr, $expected:expr) => {
                 assert_eq!(
@@ -1494,13 +1496,13 @@ mod tests {
         let surviving = [before_fid, after_fid];
         outside_keys!(vm.jit_entry_bail_counts, surviving);
         outside_keys!(vm.jit_optimized_declined_epoch, surviving);
-        outside_keys!(vm.simple_constructor_init_cache, surviving);
+        outside_keys!(*vm.simple_constructor_init_cache(), surviving);
         outside_keys!(vm.simple_constructor_absence, surviving);
         outside_keys!(
-            vm.simple_constructor_shape_cache,
+            *vm.simple_constructor_shape_cache(),
             surviving.map(|fid| (fid, shape_id))
         );
-        outside_keys!(vm.object_literal_layouts, surviving.map(|fid| (fid, 0)));
+        outside_keys!(*vm.object_literal_layouts(), surviving.map(|fid| (fid, 0)));
         outside_keys!(vm.global_lexical_load_ic, surviving.map(|fid| (fid, 0)));
         outside_keys!(vm.global_object_load_ic, surviving.map(|fid| (fid, 1)));
         outside_keys!(
@@ -1544,16 +1546,16 @@ mod tests {
         for (base, site) in method_sites {
             if base == first_evicted {
                 assert!(vm.method_target_feedback(site).is_none());
-                assert!(vm.method_feedback.method_ic(site).is_none());
+                assert!(vm.method_feedback().method_ic(site).is_none());
             } else {
                 assert!(vm.method_target_feedback_saturated(site));
-                assert!(vm.method_feedback.method_ic(site).is_some());
+                assert!(vm.method_feedback().method_ic(site).is_some());
             }
         }
         for fid in [first_evicted, second_evicted] {
-            assert!(!vm.jit_parameter_widening.contains_key(&fid));
+            assert!(!vm.jit_parameter_widening().contains_key(&fid));
             assert!(
-                !vm.jit_optimized_exit_profiles
+                !vm.jit_optimized_exit_profiles()
                     .keys()
                     .any(|(source_fid, _, _)| *source_fid == fid)
             );
@@ -1570,14 +1572,14 @@ mod tests {
             }
         }
         for fid in [before_fid, after_fid] {
-            assert_eq!(vm.jit_parameter_widening[&fid], widening_before[&fid]);
+            assert_eq!(vm.jit_parameter_widening()[&fid], widening_before[&fid]);
             assert_eq!(vm.jit_entry_bail_counts[&fid], fid + 12);
             assert_eq!(vm.jit_optimized_declined_epoch[&fid], Some(fid + 14));
             assert!(std::sync::Arc::ptr_eq(
                 &vm.simple_constructor_absence[&fid],
                 &validity
             ));
-            assert_eq!(vm.object_literal_layouts[&(fid, 0)], layout);
+            assert_eq!(vm.object_literal_layouts()[&(fid, 0)], layout);
             assert_eq!(
                 crate::read_upvalue(vm.gc_heap(), vm.global_lexical_load_ic[&(fid, 0)]),
                 Value::boolean(true)
@@ -1600,7 +1602,10 @@ mod tests {
             }
             for (pc, reason) in [(0, ExitReason::ShapeGuard), (7, ExitReason::IdentityGuard)] {
                 let key = (fid, pc, reason);
-                assert_eq!(vm.jit_optimized_exit_profiles[&key], profiles_before[&key]);
+                assert_eq!(
+                    vm.jit_optimized_exit_profiles()[&key],
+                    profiles_before[&key]
+                );
             }
         }
         for pair in &pairs[..2] {

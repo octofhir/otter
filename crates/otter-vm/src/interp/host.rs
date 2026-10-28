@@ -361,7 +361,10 @@ impl Interpreter {
     /// their shape guard. The interpreter is exclusively borrowed and cannot
     /// move for the complete compiled activation.
     pub fn jit_global_lexical_epoch_addr(&self) -> *const u64 {
-        std::ptr::addr_of!(self.global_lexical_epoch)
+        self.compile_shared
+            .global_lexical_epoch
+            .as_ptr()
+            .cast_const()
     }
 
     /// Stable address of the array-index accessor protector byte.
@@ -647,7 +650,7 @@ impl Interpreter {
     /// snapshot layer sorts.
     #[must_use]
     pub fn snapshot_global_lexicals(&self) -> Vec<(Box<str>, crate::UpvalueCell, bool)> {
-        self.global_lexicals
+        self.global_lexicals()
             .iter()
             .map(|(name, (cell, is_const))| (name.clone(), *cell, *is_const))
             .collect()

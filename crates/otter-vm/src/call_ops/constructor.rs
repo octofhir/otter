@@ -309,11 +309,11 @@ impl Interpreter {
         function_id: u32,
         function: &CodeBlock,
     ) -> Option<crate::constructor_fast_path::SimpleConstructorInit> {
-        if let Some(cached) = self.simple_constructor_init_cache.get(&function_id) {
+        if let Some(cached) = self.simple_constructor_init_cache().get(&function_id) {
             return cached.clone();
         }
         let init = crate::constructor_fast_path::match_simple_constructor_init(context, function);
-        self.simple_constructor_init_cache
+        self.simple_constructor_init_cache_mut()
             .insert(function_id, init.clone());
         init
     }
@@ -329,7 +329,7 @@ impl Interpreter {
     ) -> Result<crate::object::ShapeHandle, VmError> {
         let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
         if let Some(shape) = self
-            .simple_constructor_shape_cache
+            .simple_constructor_shape_cache()
             .get(&(function_id, root_id))
             .copied()
         {
@@ -361,7 +361,7 @@ impl Interpreter {
                 .map_err(VmError::from)?;
         }
         if !crate::object::shape_body::state_of(root).is_provisional() {
-            self.simple_constructor_shape_cache
+            self.simple_constructor_shape_cache_mut()
                 .insert((function_id, root_id), shape);
         }
         Ok(shape)
@@ -665,10 +665,10 @@ impl Interpreter {
                 slot = slot.checked_add(1).ok_or(VmError::InvalidOperand)?;
             }
             if let Some(init) = simple_init {
-                self.simple_constructor_init_cache
+                self.simple_constructor_init_cache_mut()
                     .insert(function_id, Some(init));
                 let root_id = self.shape_runtime.id_for_handle(&self.gc_heap, root);
-                self.simple_constructor_shape_cache
+                self.simple_constructor_shape_cache_mut()
                     .insert((function_id, root_id), shape);
             }
         }

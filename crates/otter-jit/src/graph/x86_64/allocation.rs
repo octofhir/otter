@@ -60,7 +60,7 @@ impl Codegen<'_> {
             abi::STUB_JIT_REGEXP_LITERAL,
             &[
                 CommittedArgument::Scalar(u64::from(plan.constant)),
-                CommittedArgument::Scalar(0),
+                CommittedArgument::Scalar(u64::from(source.code_block.id)),
             ],
             Some(destination),
         )?;

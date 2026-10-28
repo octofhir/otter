@@ -96,13 +96,21 @@ impl crate::native_abi::JitCtx {
 
 impl crate::native_abi::JitCtx {
     /// The RegExp of the regex literal at constant-pool index `constant` of
-    /// the published function: the committed miss of a generated birth.
-    pub fn regexp_literal(&mut self, constant: u64) -> Result<Value, CommittedValueError> {
-        let constant = u32::try_from(constant)
-            .map_err(|_| CommittedValueError::Fatal(crate::VmError::InvalidOperand))?;
+    /// function `function`'s chunk: the committed miss of a generated birth,
+    /// which names the literal's own function (an inlined body's is not the
+    /// published frame's).
+    pub fn regexp_literal(
+        &mut self,
+        constant: u64,
+        function: u64,
+    ) -> Result<Value, CommittedValueError> {
+        let (Ok(constant), Ok(function)) = (u32::try_from(constant), u32::try_from(function))
+        else {
+            return Err(CommittedValueError::Fatal(crate::VmError::InvalidOperand));
+        };
         let mut runtime = self.runtime_call().map_err(CommittedValueError::Fatal)?;
         runtime
-            .regexp_literal_value(constant)
+            .regexp_literal_value(function, constant)
             .map_err(|error| runtime.regexp_error(error))
     }
 

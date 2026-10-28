@@ -60,9 +60,10 @@ impl Interpreter {
     }
 }
 
-/// [`Interpreter::registered_jit_allocation_site`] over `heap`'s sites.
+/// The site one generation bakes for a literal instruction's cell: the one
+/// its first allocation registered, else none.
 pub(crate) fn registered_site(
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     cell: Option<&AtomicU16>,
 ) -> crate::jit::JitAllocationSite {
     {

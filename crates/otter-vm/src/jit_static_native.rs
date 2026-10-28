@@ -308,7 +308,7 @@ const JIT_LEAF_BUILTINS: &[JitLeafBuiltin] = {
 /// this runs on every unsaturated generic call's feedback path.
 pub(crate) fn jit_static_call_target(
     native: crate::NativeFunction,
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
 ) -> Option<&'static JitLeafBuiltin> {
     let entry = native.static_fn(heap)?;
     let row = JIT_LEAF_BUILTINS
@@ -316,7 +316,7 @@ pub(crate) fn jit_static_call_target(
         .find(|row| std::ptr::fn_addr_eq(row.identity, entry))?;
     debug_assert_eq!(
         native.native_ref(heap),
-        jit_static_call_ref(row.leaf_stub_id, heap),
+        jit_static_call_ref_in(row.leaf_stub_id, heap),
         "static-native classifier and JIT identity field must agree"
     );
     Some(row)
@@ -343,9 +343,16 @@ pub fn jit_static_call_ref(
     stub_id: crate::native_abi::RuntimeStubId,
     heap: &otter_gc::GcHeap,
 ) -> Option<u32> {
+    jit_static_call_ref_in(stub_id, heap)
+}
+
+/// [`jit_static_call_ref`] over any heap reader.
+pub(crate) fn jit_static_call_ref_in(
+    stub_id: crate::native_abi::RuntimeStubId,
+    heap: &impl crate::heap_read::HeapRead,
+) -> Option<u32> {
     let row = jit_leaf_builtin(stub_id)?;
-    heap.external_refs()
-        .lookup(row.identity as *const () as usize)
+    heap.external_ref(row.identity as *const () as usize)
 }
 
 #[cfg(test)]

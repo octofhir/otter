@@ -652,6 +652,12 @@ impl Value {
     #[inline]
     #[must_use]
     pub fn as_closure(self, heap: &otter_gc::GcHeap) -> Option<JsClosure> {
+        self.as_closure_in(heap)
+    }
+
+    /// [`Self::as_closure`] over any heap reader.
+    #[inline]
+    pub(crate) fn as_closure_in(self, heap: &impl crate::heap_read::HeapRead) -> Option<JsClosure> {
         let handle = self.as_raw_gc()?.checked_cast::<JsClosureBody>()?;
         let function_id = heap.read_payload(handle, |body| body.call_header.function_id);
         Some(JsClosure::from_parts(handle, function_id))

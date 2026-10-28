@@ -29,7 +29,6 @@ use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 use otter_gc::{GcHeap, HandleScope};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::cell::RefCell;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TransitionKey {
@@ -47,7 +46,7 @@ struct TransitionKey {
 
 /// The weakly held tables: every shape by id and the transition cache.
 #[derive(Default)]
-struct WeakShapeTables {
+pub(crate) struct WeakShapeTables {
     handles_by_id: FxHashMap<ShapeId, ShapeHandle>,
     transitions: FxHashMap<TransitionKey, ShapeHandle>,
     /// The same transitions by parent: every interned child of each shape.
@@ -78,12 +77,29 @@ impl WeakShapeTables {
 /// One isolate's canonical shape authority, owned by its heap.
 #[derive(Default)]
 pub(crate) struct ShapeInterner {
-    tables: RefCell<WeakShapeTables>,
+    /// Shared with the isolate's compilations, which read it while the
+    /// mutator is not writing it.
+    tables: std::sync::Arc<crate::mutator_owned::MutatorCell<WeakShapeTables>>,
 }
 
 impl ShapeInterner {
     fn of(heap: &GcHeap) -> &Self {
         IsolateNames::of(heap).shapes()
+    }
+
+    /// Run `f` over the tables, as the mutator reads them.
+    pub(crate) fn with_tables<R>(
+        heap: &GcHeap,
+        f: impl FnOnce(&WeakShapeTables) -> R,
+    ) -> Option<R> {
+        Some(f(&Self::of(heap).tables.borrow()))
+    }
+
+    /// The tables, for an isolate's compilations.
+    pub(crate) fn shared_tables(
+        heap: &GcHeap,
+    ) -> std::sync::Arc<crate::mutator_owned::MutatorCell<WeakShapeTables>> {
+        std::sync::Arc::clone(&Self::of(heap).tables)
     }
 
     /// Register a rooted ordinary lineage, pinning each identity once this turn.
@@ -92,7 +108,6 @@ impl ShapeInterner {
     /// keeps its ancestors), so registering it again only pins it for the
     /// current turn.
     pub(crate) fn register_shape(heap: &GcHeap, shape: ShapeHandle) {
-        heap.assert_outside_compilation("shape registration");
         if !shape_body::is_dictionary_of(shape) {
             let id = heap.read_payload(shape, ShapeBody::id);
             let mut tables = Self::of(heap).tables.borrow_mut();
@@ -262,13 +277,12 @@ impl ShapeInterner {
         Ok(result)
     }
 
-    pub(crate) fn handle_for_id(heap: &GcHeap, id: ShapeId) -> Option<ShapeHandle> {
-        Self::of(heap)
-            .tables
-            .borrow()
-            .handles_by_id
-            .get(&id)
-            .copied()
+    pub(crate) fn handle_for_id(
+        heap: &impl crate::heap_read::HeapRead,
+        id: ShapeId,
+    ) -> Option<ShapeHandle> {
+        heap.with_shape_tables(|tables| tables.handles_by_id.get(&id).copied())
+            .flatten()
     }
 
     pub(crate) fn transitions_for_snapshot(heap: &GcHeap) -> Vec<(ShapeId, ShapeHandle)> {
@@ -309,23 +323,19 @@ impl ShapeInterner {
     /// Every interned child of `parent`: the shapes one own-property append
     /// to an object of that shape has produced. Never allocates.
     pub(crate) fn children_of(
-        heap: &GcHeap,
+        heap: &impl crate::heap_read::HeapRead,
         parent: ShapeHandle,
     ) -> smallvec::SmallVec<[ShapeHandle; 2]> {
         let parent = heap.read_payload(parent, ShapeBody::id);
-        Self::of(heap)
-            .tables
-            .borrow()
-            .children
-            .get(&parent)
-            .cloned()
+        heap.with_shape_tables(|tables| tables.children.get(&parent).cloned())
+            .flatten()
             .unwrap_or_default()
     }
 
     /// The interned default-data child of `parent` appending `atom`, if one
     /// exists. Never allocates.
     pub(crate) fn data_child(
-        heap: &GcHeap,
+        heap: &impl crate::heap_read::HeapRead,
         parent: ShapeHandle,
         atom: AtomId,
     ) -> Option<ShapeHandle> {
@@ -344,7 +354,7 @@ impl ShapeInterner {
     }
 
     fn child_exact_if_cached(
-        heap: &GcHeap,
+        heap: &impl crate::heap_read::HeapRead,
         parent: ShapeHandle,
         atom: AtomId,
         flags: PropertyFlags,
@@ -356,12 +366,8 @@ impl ShapeInterner {
             flags,
             is_accessor,
         };
-        Self::of(heap)
-            .tables
-            .borrow()
-            .transitions
-            .get(&key)
-            .copied()
+        heap.with_shape_tables(|tables| tables.transitions.get(&key).copied())
+            .flatten()
     }
 
     /// Intern one immutable descriptor/key append on its exact parent.

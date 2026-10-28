@@ -180,3 +180,45 @@ mod tests {
         assert_eq!(first.addresses(), second.addresses());
     }
 }
+
+/// The heap's external-reference table, shared with compiler threads: the
+/// heap's owner reads it freely and changes it under a short lock, holding
+/// the heap mutably; a compiler thread reads it only while it is not being
+/// changed, through [`Self::try_read`], and never waits.
+#[derive(Debug, Default)]
+pub struct SharedExternalRefs {
+    lock: std::sync::Mutex<()>,
+    table: std::cell::UnsafeCell<ExternalRefTable>,
+}
+
+// SAFETY: the table holds addresses and indices only. Its writes hold the
+// lock (and the owning heap mutably); `try_read` holds the lock too.
+unsafe impl Sync for SharedExternalRefs {}
+
+impl SharedExternalRefs {
+    /// The owner's read, through its heap.
+    pub(crate) fn get(&self) -> &ExternalRefTable {
+        // SAFETY: writes happen only through `get_mut`, which the owning heap
+        // calls with itself borrowed mutably, so no owner read is live.
+        unsafe { &*self.table.get() }
+    }
+
+    /// The owner's write, through its heap held mutably.
+    pub(crate) fn with_mut<R>(&self, f: impl FnOnce(&mut ExternalRefTable) -> R) -> R {
+        let _guard = self
+            .lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: the owner holds its heap mutably and the lock excludes
+        // every compiler-thread read.
+        f(unsafe { &mut *self.table.get() })
+    }
+
+    /// A compiler thread's lookup of `addr`'s index; `None` when the address
+    /// was never interned or the owner is changing the table.
+    pub fn try_lookup(&self, addr: usize) -> Option<u32> {
+        let _guard = self.lock.try_lock().ok()?;
+        // SAFETY: the lock excludes every write.
+        unsafe { &*self.table.get() }.lookup(addr)
+    }
+}

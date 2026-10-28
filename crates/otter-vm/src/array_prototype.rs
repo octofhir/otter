@@ -921,7 +921,11 @@ impl ArrayMethodTag {
     }
 
     /// `true` when `method` is still the original builtin function for this tag.
-    pub(crate) fn matches_builtin(self, method: Value, heap: &otter_gc::GcHeap) -> bool {
+    pub(crate) fn matches_builtin(
+        self,
+        method: Value,
+        heap: &impl crate::heap_read::HeapRead,
+    ) -> bool {
         method
             .as_native_function()
             .is_some_and(|native| native.is_static_fn(heap, self.native_fn()))

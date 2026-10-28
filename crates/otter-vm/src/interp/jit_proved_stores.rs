@@ -32,6 +32,7 @@
 
 use super::Baker;
 use crate::constructor_layout::ConstructorFamilyOwner;
+use crate::heap_read::HeapRead;
 use crate::jit::{JitCacheIrOp, JitCacheIrProgram, JitCompileSnapshot};
 use crate::object::{
     ShapeHandle, ShapeStore, StorePropertyTransitionKind, shape_body,
@@ -90,33 +91,50 @@ impl Baker<'_> {
 
     /// Bake [`JitCompileSnapshot::proved_store_programs`] across the whole
     /// compiled tree rooted at `view`.
-    pub(super) fn bake_proved_stores_tree(&mut self, view: &mut JitCompileSnapshot) {
+    pub(super) fn bake_proved_stores_tree(
+        &mut self,
+        view: &mut JitCompileSnapshot,
+        context: &crate::ExecutionContext,
+    ) {
         let mut roots = Vec::new();
         collect_roots(view, &mut roots);
         let shapes = self.descendant_shapes(&roots);
         if shapes.is_empty() {
             return;
         }
-        self.bake_proved_stores(view, &shapes);
+        self.bake_proved_stores(view, context, &shapes);
     }
 
-    fn bake_proved_stores(&mut self, view: &mut JitCompileSnapshot, shapes: &[ShapeHandle]) {
-        let names = crate::isolate_names::names(&self.env.heap);
+    fn bake_proved_stores(
+        &mut self,
+        view: &mut JitCompileSnapshot,
+        context: &crate::ExecutionContext,
+        shapes: &[ShapeHandle],
+    ) {
+        // Each body names its keys in its own chunk's constant pool.
+        let Ok(owner) = context.for_function(view.code_block.id) else {
+            return;
+        };
         let sites: Vec<(u32, u32)> = view
             .instructions
             .iter()
             .filter(|instruction| instruction.op(&view.code_block) == Op::StoreProperty)
+            .filter(|instruction| {
+                view.property_accesses
+                    .get(&instruction.byte_pc)
+                    .is_some_and(|access| access.shared)
+            })
             .filter_map(|instruction| {
-                let access = view.property_accesses.get(&instruction.byte_pc)?;
-                access.shared.then_some((instruction.byte_pc, access.atom))
+                Some((
+                    instruction.byte_pc,
+                    instruction.const_index(&view.code_block, 1)?,
+                ))
             })
             .collect();
-        for (byte_pc, atom) in sites {
-            let atom = AtomId::from_global(atom);
-            let Some(name) = names.spelling(atom) else {
+        for (byte_pc, name_index) in sites {
+            let Some(key) = owner.property_atom_for_function(view.code_block.id, name_index) else {
                 continue;
             };
-            let key = AtomizedPropertyKey::new(PropertyAtom::new(atom), name);
             for &shape in shapes {
                 if let Some((token, program)) = self.proved_store_program(shape, key) {
                     view.proved_store_programs.insert((byte_pc, token), program);
@@ -124,12 +142,12 @@ impl Baker<'_> {
             }
         }
         for callee in view.inline_callees.values_mut() {
-            self.bake_proved_stores(std::sync::Arc::make_mut(&mut callee.body), shapes);
+            self.bake_proved_stores(std::sync::Arc::make_mut(&mut callee.body), context, shapes);
         }
         for methods in view.method_targets.values_mut() {
             for method in methods {
                 if let Some(body) = &mut method.body {
-                    self.bake_proved_stores(std::sync::Arc::make_mut(body), shapes);
+                    self.bake_proved_stores(std::sync::Arc::make_mut(body), context, shapes);
                 }
             }
         }

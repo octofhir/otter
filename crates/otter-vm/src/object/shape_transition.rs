@@ -40,7 +40,7 @@
 use super::prototype_validity::{PrototypeValidity, chain_validity};
 use super::{
     JsObject, ObjectBody, ObjectPrototype, PropertyLookup, ShapeHandle, ShapeId, SlotMeta,
-    lookup_own_atom, prototype_value,
+    lookup_own_atom, prototype_value_in,
 };
 use crate::Value;
 use crate::property_atom::{AtomId, AtomizedPropertyKey};
@@ -403,7 +403,7 @@ fn transition_kind(
 /// starting at `first` needs: the key is absent from the whole chain, or its
 /// first holder has writable data the append shadows.
 fn chain_append_kind(
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     first: JsObject,
     key: AtomizedPropertyKey<'_>,
 ) -> Option<StorePropertyTransitionKind> {
@@ -421,12 +421,12 @@ fn chain_append_kind(
             }
             PropertyLookup::Data { .. } | PropertyLookup::Accessor { .. } => return None,
         }
-        if prototype_value(proto, heap).is_none() {
+        if prototype_value_in(proto, heap).is_none() {
             return Some(StorePropertyTransitionKind::PrototypeChainMissing {
                 validity: chain_validity(first, heap)?,
             });
         }
-        proto = super::prototype(proto, heap)?;
+        proto = super::prototype_in(proto, heap)?;
     }
     None
 }
@@ -452,7 +452,7 @@ pub(crate) enum ShapeStore {
 /// this shape, an append outside its inline geometry, or a chain whose
 /// holder forbids the append. Reads only; never allocates.
 pub(crate) fn shape_store(
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     shape: ShapeHandle,
     key: AtomizedPropertyKey<'_>,
 ) -> Option<ShapeStore> {

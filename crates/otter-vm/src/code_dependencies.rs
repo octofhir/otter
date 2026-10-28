@@ -365,7 +365,7 @@ impl ContextSubscriptions {
 /// and marks nothing; reads only atomics the mutator writes, so a compiler
 /// thread may ask.
 pub(crate) fn watchable_slot(
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     context: crate::context::ContextHandle,
     slot: u16,
 ) -> Option<u32> {

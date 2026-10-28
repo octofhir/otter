@@ -779,7 +779,11 @@ fn read_indexed_property<'s>(
 /// pointer check) and `delete` removes the slot, so a match means the resolved
 /// value can only be the canonical builtin — the precondition the direct Map
 /// dispatch relies on.
-pub(crate) fn is_map_prototype_builtin(method: Value, heap: &otter_gc::GcHeap, name: &str) -> bool {
+pub(crate) fn is_map_prototype_builtin(
+    method: Value,
+    heap: &impl crate::heap_read::HeapRead,
+    name: &str,
+) -> bool {
     method
         .as_native_function()
         .zip(map_prototype_native(name))
@@ -800,7 +804,11 @@ pub(crate) fn map_prototype_native(name: &str) -> Option<crate::native_function:
 
 /// `true` when `method` is still the original `%Set.prototype%` builtin for
 /// `name` (add/has/delete). See [`is_map_prototype_builtin`].
-pub(crate) fn is_set_prototype_builtin(method: Value, heap: &otter_gc::GcHeap, name: &str) -> bool {
+pub(crate) fn is_set_prototype_builtin(
+    method: Value,
+    heap: &impl crate::heap_read::HeapRead,
+    name: &str,
+) -> bool {
     method
         .as_native_function()
         .zip(set_prototype_native(name))

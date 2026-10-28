@@ -239,7 +239,7 @@ impl LayoutWatchpoint {
 /// The proof the chain starting at `first` already has, creating none.
 pub(crate) fn current_chain_validity(
     first: JsObject,
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
 ) -> Option<Arc<PrototypeValidity>> {
     heap.read_payload(first, |body| body.exotic()?.prototype_watchpoints.current())
 }
@@ -248,7 +248,7 @@ pub(crate) fn current_chain_validity(
 /// An opaque or cyclic chain cannot supply an ordinary-chain proof.
 pub(crate) fn chain_validity(
     first: JsObject,
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
 ) -> Option<Arc<PrototypeValidity>> {
     if let Some(cell) =
         heap.read_payload(first, |body| body.exotic()?.prototype_watchpoints.current())
@@ -256,7 +256,6 @@ pub(crate) fn chain_validity(
         return Some(cell);
     }
 
-    heap.assert_outside_compilation("prototype chain subscription");
     let mut prototypes = Vec::new();
     let mut current = first;
     loop {

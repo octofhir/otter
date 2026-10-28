@@ -59,6 +59,7 @@ pub mod statics;
 
 use otter_gc::{GcHeap, OutOfMemory};
 
+pub(crate) use gc_body::eq_str_in;
 pub use gc_body::{
     CodeUnits, JS_STRING_BODY_TYPE_TAG, JsStringBody, JsStringBodyRepr, JsStringHandle,
     MAX_ROPE_DEPTH as GC_MAX_ROPE_DEPTH, StringConcatError, alloc_flat_string_body_with_roots,

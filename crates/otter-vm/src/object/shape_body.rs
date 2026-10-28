@@ -78,7 +78,7 @@ use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::code_dependencies::{ShapeFact, ShapeWatchers};
 use crate::property_atom::AtomId;
-use crate::string::{JsStringHandle, eq_str};
+use crate::string::{JsStringHandle, eq_str, eq_str_in};
 
 use super::descriptor::PropertyFlags;
 use super::{LookupFact, ShapeId, ShapeState, next_shape_id};
@@ -1027,7 +1027,11 @@ pub(crate) fn shape_offset_of_atom(
     None
 }
 
-pub(crate) fn shape_offset_of_str(heap: &GcHeap, mut shape: ShapeHandle, key: &str) -> Option<u32> {
+pub(crate) fn shape_offset_of_str(
+    heap: &impl crate::heap_read::HeapRead,
+    mut shape: ShapeHandle,
+    key: &str,
+) -> Option<u32> {
     if let Some((keys, count)) = keys_of(shape) {
         let hash = crate::property_atom::spelling_hash(key) as u32;
         return heap.read_payload(keys, |table| table.slot_of_str(heap, key, hash, count));
@@ -1037,7 +1041,7 @@ pub(crate) fn shape_offset_of_str(heap: &GcHeap, mut shape: ShapeHandle, key: &s
             (body.parent(), body.transition_key(), body.own_offset())
         });
         if let Some(transition_key) = transition_key.as_string()
-            && eq_str(heap, transition_key, key)
+            && eq_str_in(heap, transition_key, key)
         {
             return Some(own_offset);
         }
@@ -1048,7 +1052,10 @@ pub(crate) fn shape_offset_of_str(heap: &GcHeap, mut shape: ShapeHandle, key: &s
 
 /// Return the number of string-keyed slots represented by `shape`.
 #[must_use]
-pub(crate) fn shape_property_count(heap: &GcHeap, shape: ShapeHandle) -> u32 {
+pub(crate) fn shape_property_count(
+    heap: &impl crate::heap_read::HeapRead,
+    shape: ShapeHandle,
+) -> u32 {
     heap.read_payload(shape, ShapeBody::property_count)
 }
 
@@ -1192,7 +1199,7 @@ pub(crate) fn shape_key_at_offset(
 /// becomes the authoritative attribute source.
 #[must_use]
 pub(crate) fn shape_slot_attrs(
-    heap: &GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     mut shape: ShapeHandle,
     offset: u32,
 ) -> Option<(PropertyFlags, bool)> {
@@ -1228,7 +1235,7 @@ pub(crate) fn shape_slot_attrs(
 /// the chain.
 #[must_use]
 pub(crate) fn shape_slot_of_atom(
-    heap: &GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     mut shape: ShapeHandle,
     atom: AtomId,
 ) -> Option<ShapeSlot> {

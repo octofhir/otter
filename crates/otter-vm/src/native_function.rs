@@ -193,8 +193,8 @@ impl VmIntrinsicFunction {
     /// External-reference index of this intrinsic in `heap`, or `None` when
     /// the isolate never installed it.
     #[must_use]
-    pub(crate) fn native_ref(self, heap: &otter_gc::GcHeap) -> Option<u32> {
-        heap.external_refs().lookup(self.identity_address())
+    pub(crate) fn native_ref(self, heap: &impl crate::heap_read::HeapRead) -> Option<u32> {
+        heap.external_ref(self.identity_address())
     }
 }
 
@@ -1435,11 +1435,15 @@ impl NativeFunction {
     /// `true` when this callable is the exact static native function.
     #[must_use]
     /// Static entry of a static-backed callable, read once.
-    pub(crate) fn static_fn(&self, heap: &otter_gc::GcHeap) -> Option<NativeFastFn> {
+    pub(crate) fn static_fn(&self, heap: &impl crate::heap_read::HeapRead) -> Option<NativeFastFn> {
         heap.read_payload(self.inner, |body| body.call_header.static_fn())
     }
 
-    pub(crate) fn is_static_fn(&self, heap: &otter_gc::GcHeap, expected: NativeFastFn) -> bool {
+    pub(crate) fn is_static_fn(
+        &self,
+        heap: &impl crate::heap_read::HeapRead,
+        expected: NativeFastFn,
+    ) -> bool {
         self.static_fn(heap)
             .is_some_and(|call| std::ptr::fn_addr_eq(call, expected))
     }
@@ -1447,7 +1451,7 @@ impl NativeFunction {
     /// External-reference index identifying this callable's static entry or
     /// VM intrinsic for JIT builtin guards. `None` for a dynamic closure.
     #[must_use]
-    pub(crate) fn native_ref(&self, heap: &otter_gc::GcHeap) -> Option<u32> {
+    pub(crate) fn native_ref(&self, heap: &impl crate::heap_read::HeapRead) -> Option<u32> {
         heap.read_payload(self.inner, |body| {
             (body.call_header.native_ref != otter_gc::NO_EXTERNAL_REF)
                 .then_some(body.call_header.native_ref)
@@ -1461,6 +1465,15 @@ impl NativeFunction {
     /// an extra frame.
     #[must_use]
     pub fn is_vm_intrinsic(&self, heap: &otter_gc::GcHeap, intrinsic: VmIntrinsicFunction) -> bool {
+        self.is_vm_intrinsic_in(heap, intrinsic)
+    }
+
+    /// [`Self::is_vm_intrinsic`] over any heap reader.
+    pub(crate) fn is_vm_intrinsic_in(
+        &self,
+        heap: &impl crate::heap_read::HeapRead,
+        intrinsic: VmIntrinsicFunction,
+    ) -> bool {
         heap.read_payload(self.inner, |body| {
             body.call_header.intrinsic() == Some(intrinsic)
         })

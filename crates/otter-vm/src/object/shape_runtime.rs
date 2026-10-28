@@ -114,7 +114,11 @@ impl ShapeRuntime {
         ShapeInterner::unpin_turn_shapes(heap);
     }
 
-    pub(crate) fn handle_for_id(&self, heap: &GcHeap, id: ShapeId) -> Option<ShapeHandle> {
+    pub(crate) fn handle_for_id(
+        &self,
+        heap: &impl crate::heap_read::HeapRead,
+        id: ShapeId,
+    ) -> Option<ShapeHandle> {
         ShapeInterner::handle_for_id(heap, id)
     }
 

@@ -163,57 +163,153 @@ impl LocalFound {
     }
 }
 
-/// The isolate's allocation sites.
-#[derive(Debug, Default)]
-pub struct AllocationSites {
-    chunks: Vec<Box<[SiteRecord]>>,
-    len: u16,
+/// Chunks a table of every site id needs.
+const MAX_CHUNKS: usize = (u16::MAX as usize + 1).div_ceil(CHUNK);
+
+/// The records of every registered site, in chunks that never move, by site
+/// id. Registration publishes a chunk before the count that covers it, so a
+/// compiler thread reads registered records without a lock; decisions change
+/// only while a collection runs, when no compiler thread reads.
+#[derive(Debug)]
+pub struct SiteDirectory {
+    chunks: Box<[std::sync::atomic::AtomicPtr<SiteRecord>]>,
+    len: std::sync::atomic::AtomicU16,
 }
 
-impl AllocationSites {
-    /// Register a new site; `0` once every id is taken.
-    pub fn register(&mut self) -> u16 {
-        if self.len == u16::MAX {
-            return 0;
+impl Default for SiteDirectory {
+    fn default() -> Self {
+        Self {
+            chunks: (0..MAX_CHUNKS)
+                .map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()))
+                .collect(),
+            len: std::sync::atomic::AtomicU16::new(0),
         }
-        self.len += 1;
-        let index = usize::from(self.len);
-        if index / CHUNK >= self.chunks.len() {
-            self.chunks
-                .push((0..CHUNK).map(|_| SiteRecord::default()).collect());
-        }
-        let site = self.len;
-        self.record_mut(site).id = site;
-        self.len
     }
+}
 
+impl Drop for SiteDirectory {
+    fn drop(&mut self) {
+        for chunk in &mut self.chunks {
+            let chunk = *chunk.get_mut();
+            if !chunk.is_null() {
+                // SAFETY: `register` allocated every non-null chunk this way.
+                drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(chunk, CHUNK)) });
+            }
+        }
+    }
+}
+
+impl SiteDirectory {
     /// Whether `site` names a registered site.
     #[must_use]
     pub fn contains(&self, site: u16) -> bool {
-        site != 0 && site <= self.len
+        site != 0 && site <= self.len.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn record(&self, site: u16) -> &SiteRecord {
+    /// The record of the registered `site`.
+    fn record_ptr(&self, site: u16) -> *mut SiteRecord {
         let index = usize::from(site);
-        &self.chunks[index / CHUNK][index % CHUNK]
-    }
-
-    fn record_mut(&mut self, site: u16) -> &mut SiteRecord {
-        let index = usize::from(site);
-        &mut self.chunks[index / CHUNK][index % CHUNK]
+        let chunk = self.chunks[index / CHUNK].load(std::sync::atomic::Ordering::Acquire);
+        debug_assert!(!chunk.is_null());
+        // SAFETY: a registered site's chunk holds `CHUNK` records.
+        unsafe { chunk.add(index % CHUNK) }
     }
 
     /// Address of `site`'s record, stable for the table's lifetime.
     #[must_use]
     pub fn record_address(&self, site: u16) -> u64 {
         debug_assert!(self.contains(site));
-        std::ptr::from_ref(self.record(site)) as u64
+        self.record_ptr(site) as u64
     }
 
     /// Current decision of a registered site.
     #[must_use]
     pub fn decision(&self, site: u16) -> PretenureDecision {
-        PretenureDecision::from_byte(self.record(site).decision)
+        // SAFETY: registered; decisions change only during collection.
+        PretenureDecision::from_byte(unsafe { (*self.record_ptr(site)).decision })
+    }
+}
+
+/// The isolate's allocation sites.
+#[derive(Debug, Default)]
+pub struct AllocationSites {
+    directory: std::sync::Arc<SiteDirectory>,
+}
+
+impl AllocationSites {
+    /// Register a new site; `0` once every id is taken.
+    pub fn register(&mut self) -> u16 {
+        let len = self
+            .directory
+            .len
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if len == u16::MAX {
+            return 0;
+        }
+        let site = len + 1;
+        let index = usize::from(site);
+        let slot = &self.directory.chunks[index / CHUNK];
+        if slot.load(std::sync::atomic::Ordering::Relaxed).is_null() {
+            let chunk: Box<[SiteRecord]> = (0..CHUNK).map(|_| SiteRecord::default()).collect();
+            slot.store(
+                Box::into_raw(chunk).cast::<SiteRecord>(),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
+        // SAFETY: the chunk exists; the site is not yet published.
+        unsafe { (*self.directory.record_ptr(site)).id = site };
+        self.directory
+            .len
+            .store(site, std::sync::atomic::Ordering::Release);
+        site
+    }
+
+    /// The table every site lives in.
+    #[must_use]
+    pub fn directory_ref(&self) -> &SiteDirectory {
+        &self.directory
+    }
+
+    /// The table every site lives in, for compiler threads.
+    #[must_use]
+    pub fn directory(&self) -> std::sync::Arc<SiteDirectory> {
+        std::sync::Arc::clone(&self.directory)
+    }
+
+    /// Whether `site` names a registered site.
+    #[must_use]
+    pub fn contains(&self, site: u16) -> bool {
+        self.directory.contains(site)
+    }
+
+    #[cfg(test)]
+    fn record(&self, site: u16) -> &SiteRecord {
+        // SAFETY: registered; the table owns the record for its lifetime.
+        unsafe { &*self.directory.record_ptr(site) }
+    }
+
+    fn record_mut(&mut self, site: u16) -> &mut SiteRecord {
+        // SAFETY: as above; the mutator alone writes counters and the
+        // collector decisions.
+        unsafe { &mut *self.directory.record_ptr(site) }
+    }
+
+    /// Address of `site`'s record, stable for the table's lifetime.
+    #[must_use]
+    pub fn record_address(&self, site: u16) -> u64 {
+        self.directory.record_address(site)
+    }
+
+    /// Current decision of a registered site.
+    #[must_use]
+    pub fn decision(&self, site: u16) -> PretenureDecision {
+        self.directory.decision(site)
+    }
+
+    fn len(&self) -> u16 {
+        self.directory
+            .len
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Count one young cell created at a tracking site.
@@ -234,13 +330,16 @@ impl AllocationSites {
     /// The found counters of every registered site, for scavenger threads
     /// that count evacuated cells concurrently.
     pub(crate) fn found_counters(&mut self) -> FoundCounters {
+        let len = self.len();
         FoundCounters {
             chunks: self
+                .directory
                 .chunks
-                .iter_mut()
-                .map(|chunk| chunk.as_mut_ptr())
+                .iter()
+                .map(|chunk| chunk.load(std::sync::atomic::Ordering::Relaxed))
+                .take_while(|chunk| !chunk.is_null())
                 .collect(),
-            len: self.len,
+            len,
         }
     }
 
@@ -249,7 +348,7 @@ impl AllocationSites {
     /// nursery at its largest size. Returns how many sites became final.
     pub fn digest(&mut self, nursery_at_maximum: bool) -> usize {
         let mut decided = 0;
-        for site in 1..=self.len {
+        for site in 1..=self.len() {
             let record = self.record_mut(site);
             let decision = PretenureDecision::from_byte(record.decision);
             if decision.tracks() && record.created >= MINIMUM_CREATED {
@@ -349,15 +448,10 @@ mod tests {
 
     #[test]
     fn site_ids_saturate_without_reuse() {
-        let mut sites = AllocationSites {
-            chunks: Vec::new(),
-            len: u16::MAX - 1,
-        };
-        sites
-            .chunks
-            .resize_with(usize::from(u16::MAX) / CHUNK + 1, || {
-                (0..CHUNK).map(|_| SiteRecord::default()).collect()
-            });
+        let mut sites = AllocationSites::default();
+        for _ in 1..u16::MAX {
+            sites.register();
+        }
         assert_eq!(sites.register(), u16::MAX);
         assert_eq!(sites.register(), 0);
         sites.record_found(0);

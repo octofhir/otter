@@ -100,7 +100,7 @@ pub(super) fn is_private_slot(heap: &GcHeap, body: &ObjectBody, index: usize) ->
 /// [`super::lookup_own_atom_with`] for a symbol key: the hidden class by
 /// atom, then the side table, which a cache never names by slot.
 pub(super) fn lookup_atom(
-    heap: &GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     body: &ObjectBody,
     key: AtomizedPropertyKey<'_>,
     symbol: crate::symbol::SymbolHandle,

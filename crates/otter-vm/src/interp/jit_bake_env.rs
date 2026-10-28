@@ -25,8 +25,7 @@ use crate::{CodeBlock, Interpreter, MethodCallFeedback, jit, native_abi};
 /// The isolate as one compilation's bake reads it.
 pub(crate) struct BakeEnv<'a> {
     pub(crate) shared: &'a CompileShared,
-    pub(crate) heap: &'a otter_gc::GcHeap,
-    pub(crate) shapes: &'a crate::object::ShapeRuntime,
+    pub(crate) heap: crate::heap_read::HeapView,
     pub(crate) string_prototype: Option<JsObject>,
     pub(crate) map_prototype: Option<JsObject>,
     pub(crate) set_prototype: Option<JsObject>,
@@ -53,8 +52,7 @@ impl<'a> BakeEnv<'a> {
     pub(crate) fn capture(vm: &'a Interpreter) -> Self {
         Self {
             shared: &vm.compile_shared,
-            heap: &vm.gc_heap,
-            shapes: &vm.shape_runtime,
+            heap: crate::heap_read::HeapView::of(&vm.gc_heap),
             string_prototype: vm.realm_intrinsics.string_prototype(),
             map_prototype: vm.realm_intrinsics.map_prototype(),
             set_prototype: vm.realm_intrinsics.set_prototype(),
@@ -267,21 +265,24 @@ impl<'a> BakeEnv<'a> {
         context: crate::context::ContextHandle,
         slot: u16,
     ) -> Option<u32> {
-        crate::code_dependencies::watchable_slot(self.heap, context, slot)
+        crate::code_dependencies::watchable_slot(&self.heap, context, slot)
     }
 
     /// The hidden class with stable id `id`, while interned.
     pub(crate) fn shape_for_id(&self, id: ShapeId) -> Option<ShapeHandle> {
-        self.shapes.handle_for_id(self.heap, id)
+        crate::object::shape_interner::ShapeInterner::handle_for_id(&self.heap, id)
     }
 
-    /// The slot offset `shape` gives the interned spelling `key`.
-    pub(crate) fn shape_offset_of(&self, shape: ShapeHandle, key: &str) -> Option<u32> {
-        let atom = crate::isolate_names::names(self.heap).lookup(key);
+    /// The slot offset `shape` gives `atom`.
+    pub(crate) fn shape_offset_of(
+        &self,
+        shape: ShapeHandle,
+        atom: crate::property_atom::AtomId,
+    ) -> Option<u32> {
         if atom == crate::property_atom::AtomId::NONE {
             return None;
         }
-        crate::object::shape_body::shape_slot_of_atom(self.heap, shape, atom)
+        crate::object::shape_body::shape_slot_of_atom(&self.heap, shape, atom)
             .map(|slot| slot.offset)
     }
 
@@ -291,7 +292,7 @@ impl<'a> BakeEnv<'a> {
         &self,
         holder: JsObject,
     ) -> Option<super::jit_bake::MethodHolderLayout> {
-        super::jit_bake::method_holder_layout(self.heap, self.string_prototype, holder)
+        super::jit_bake::method_holder_layout(&self.heap, self.string_prototype, holder)
     }
 
     /// The prepared intrinsic-prototype programs of `key` and the shapes
@@ -301,7 +302,7 @@ impl<'a> BakeEnv<'a> {
         key: AtomizedPropertyKey<'_>,
     ) -> Option<(Vec<jit::JitCacheIrProgram>, [ShapeHandle; 5])> {
         let (stamp, shapes) = super::jit_intrinsic_properties::layout_stamp(
-            self.heap,
+            &self.heap,
             self.stamp_prototypes,
             self.string_prototype,
             self.active_realm_id,
@@ -319,7 +320,7 @@ impl<'a> BakeEnv<'a> {
         base: u32,
     ) -> Option<(crate::constructor_layout::ConstructorLayout, u32, bool)> {
         crate::constructor_layout::compile::finalized_layout(
-            self.heap,
+            &self.heap,
             self.shared,
             family_id,
             base,
@@ -332,6 +333,6 @@ impl<'a> BakeEnv<'a> {
         &self,
         cell: Option<&std::sync::atomic::AtomicU16>,
     ) -> jit::JitAllocationSite {
-        crate::literal_allocation::registered_site(self.heap, cell)
+        crate::literal_allocation::registered_site(&self.heap, cell)
     }
 }

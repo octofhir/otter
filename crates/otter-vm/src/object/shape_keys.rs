@@ -51,7 +51,7 @@ use otter_gc::heap::RootSlotVisitor;
 use otter_gc::raw::{RawGc, SlotVisitor};
 
 use crate::property_atom::AtomId;
-use crate::string::eq_str;
+use crate::string::eq_str_in;
 
 use super::descriptor::PropertyFlags;
 
@@ -166,7 +166,7 @@ impl ShapeKeysBody {
     #[must_use]
     pub(crate) fn slot_of_str(
         &self,
-        heap: &GcHeap,
+        heap: &impl crate::heap_read::HeapRead,
         key: &str,
         hash: u32,
         count: u32,
@@ -177,7 +177,7 @@ impl ShapeKeysBody {
                 && entry
                     .key
                     .as_string()
-                    .is_some_and(|entry_key| eq_str(heap, entry_key, key))
+                    .is_some_and(|entry_key| eq_str_in(heap, entry_key, key))
         })
     }
 

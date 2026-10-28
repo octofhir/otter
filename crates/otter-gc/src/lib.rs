@@ -123,8 +123,8 @@ pub use frame_roots::{FrameRootProviders, FrameRoots, FrameRootsGuard, RawFrameR
 pub use handle::{EscapableHandleScope, HandleScope, HandleStack, Local};
 pub use header::{GcHeader, MarkColor};
 pub use heap::{
-    AlwaysAllocateScope, CellCarve, CompilationScope, EmptyRoots, GcHeap, HeapStats,
-    MachineAllocationWindow, OLD_LAB_BYTES, PostMarkProcessor, SitePlacement,
+    AlwaysAllocateScope, CellCarve, EmptyRoots, GcHeap, HeapStats, MachineAllocationWindow,
+    OLD_LAB_BYTES, PostMarkProcessor, SitePlacement, read_payload,
 };
 pub use heap_image::{HeapImage, ImageError, Relocation};
 pub use isolate_data::IsolateData;

@@ -170,6 +170,7 @@ mod async_from_sync_iterator;
 mod compile_shared;
 mod conversion_protocol;
 mod forward_arguments;
+mod heap_read;
 pub mod host_services;
 pub(crate) mod iteration_protocol;
 mod jit_call_admission;

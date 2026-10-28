@@ -310,9 +310,6 @@ pub struct GcHeap {
     /// [`Self::lab_consumed_bytes`] (plus the live buffer's progress) is what
     /// generated code allocated.
     runtime_lab_bytes: u64,
-    /// Set while a compilation reads the heap to bake its input; see
-    /// [`Self::enter_compilation_scope`].
-    compilation_scope: std::cell::Cell<bool>,
     /// Sums of the per-type rows' `alloc_count_total`, `alloc_bytes_total`
     /// and `live_bytes`, kept beside every row update so an accounting
     /// checkpoint reads them without walking the table.
@@ -355,7 +352,7 @@ pub struct GcHeap {
     /// Isolate-local interner for the non-GC addresses bodies point at.
     /// Per-heap, not process-global, so index order is a property of
     /// this isolate's install sequence alone.
-    external_refs: ExternalRefTable,
+    external_refs: std::sync::Arc<crate::external_refs::SharedExternalRefs>,
     /// Owned host payloads (dynamic-native closures) bodies name by
     /// index. See [`crate::host_refs`]; slots are recycled from the
     /// sweep through [`crate::trace::ReleaseHostRefs`].
@@ -613,7 +610,6 @@ impl GcHeap {
             lab_page_allocated: 0,
             lab_consumed_bytes: 0,
             runtime_lab_bytes: 0,
-            compilation_scope: std::cell::Cell::new(false),
             rows_alloc_count: 0,
             rows_alloc_bytes: 0,
             rows_live_bytes: 0,
@@ -628,7 +624,7 @@ impl GcHeap {
             young_large_space: LargeObjectSpace::new_young(),
             survived_since_last_expansion: 0,
             trace_table: TraceTable::new(),
-            external_refs: ExternalRefTable::new(),
+            external_refs: std::sync::Arc::default(),
             host_refs: crate::host_refs::HostRefTable::default(),
             marking: MarkingState::new(),
             remembered_parents: Vec::new(),
@@ -1262,20 +1258,27 @@ impl GcHeap {
     /// index instead of storing the raw pointer. See
     /// [`crate::external_refs`].
     pub fn intern_external_ref(&mut self, addr: usize) -> u32 {
-        self.external_refs.intern(addr)
+        self.external_refs.with_mut(|table| table.intern(addr))
     }
 
     /// The heap's external-reference table.
     #[must_use]
     pub fn external_refs(&self) -> &ExternalRefTable {
-        &self.external_refs
+        self.external_refs.get()
+    }
+
+    /// The external-reference table, for compiler threads.
+    #[must_use]
+    pub fn shared_external_refs(&self) -> std::sync::Arc<crate::external_refs::SharedExternalRefs> {
+        std::sync::Arc::clone(&self.external_refs)
     }
 
     /// Rebuild the external-reference table from a same-process captured
     /// address list, preserving indices. See
     /// [`ExternalRefTable::restore_from_addrs`].
     pub fn restore_external_refs(&mut self, addrs: impl IntoIterator<Item = usize>) {
-        self.external_refs.restore_from_addrs(addrs);
+        self.external_refs
+            .with_mut(|table| table.restore_from_addrs(addrs));
     }
 
     /// Store an owned host payload and return its index. See
@@ -2546,17 +2549,7 @@ impl GcHeap {
     /// Immutable access to the payload of a heap-allocated value.
     #[inline]
     pub fn read_payload<T: Traceable, R>(&self, handle: Gc<T>, f: impl FnOnce(&T) -> R) -> R {
-        debug_assert!(!handle.is_null(), "read_payload on null handle");
-        debug_assert_handle_live::<T>(handle, "read_payload");
-        // SAFETY: handle was issued by `alloc` / `alloc_old`;
-        // payload lives immediately after the header at the
-        // same allocation; single-mutator GC (no concurrent
-        // mutator).
-        unsafe {
-            let payload = (handle.as_header_ptr() as *mut u8).add(std::mem::size_of::<GcHeader>())
-                as *const T;
-            f(&*payload)
-        }
+        read_payload(handle, f)
     }
 
     /// Mutable access to the payload of a heap-allocated value.
@@ -4129,38 +4122,19 @@ fn visit_extra_roots_deduped(
     }
 }
 
-/// A compilation reading the heap; see [`GcHeap::enter_compilation_scope`].
-pub struct CompilationScope<'a> {
-    heap: &'a GcHeap,
-}
-
-impl Drop for CompilationScope<'_> {
-    fn drop(&mut self) {
-        self.heap.compilation_scope.set(false);
-    }
-}
-
-impl GcHeap {
-    /// Mark the heap as read by a compilation baking its input until the
-    /// returned scope drops. Baking must leave no effect the mutator can
-    /// observe: entry points that would register, subscribe or publish
-    /// mutator state check [`Self::assert_outside_compilation`].
-    pub fn enter_compilation_scope(&self) -> CompilationScope<'_> {
-        assert!(
-            !self.compilation_scope.replace(true),
-            "nested compilation scope"
-        );
-        CompilationScope { heap: self }
-    }
-
-    /// Fail when a compilation is baking: `what` is mutator state that only
-    /// preparation, a cache miss or installation may change.
-    #[track_caller]
-    pub fn assert_outside_compilation(&self, what: &str) {
-        assert!(
-            !self.compilation_scope.get(),
-            "{what} inside a compilation's bake"
-        );
+/// Read the payload of the live cell `handle`. The cage alone addresses it:
+/// no heap state is read, so a thread reading the heap while no collection
+/// runs reads what the heap would.
+#[inline]
+pub fn read_payload<T: Traceable, R>(handle: Gc<T>, f: impl FnOnce(&T) -> R) -> R {
+    debug_assert!(!handle.is_null(), "read_payload on null handle");
+    debug_assert_handle_live::<T>(handle, "read_payload");
+    // SAFETY: handle was issued by `alloc` / `alloc_old`; the payload lives
+    // immediately after the header at the same allocation.
+    unsafe {
+        let payload =
+            (handle.as_header_ptr() as *mut u8).add(std::mem::size_of::<GcHeader>()) as *const T;
+        f(&*payload)
     }
 }
 

@@ -1366,8 +1366,9 @@ impl Baker<'_> {
                     continue;
                 };
                 // The isolate watches the slot before publishing the code,
-                // once it re-proves the layout is still this one.
+                // once it re-proves the name still owns it under this layout.
                 self.install.global_slot_watches.push(GlobalSlotWatch {
+                    name: name.into(),
                     slot: hit.slot,
                     layout,
                 });
@@ -1477,8 +1478,9 @@ impl Baker<'_> {
                     continue;
                 };
                 // The isolate watches the slot before publishing the code,
-                // once it re-proves the layout is still this one.
+                // once it re-proves the name still owns it under this layout.
                 self.install.global_slot_watches.push(GlobalSlotWatch {
+                    name: name.into(),
                     slot: hit.slot,
                     layout,
                 });
@@ -2743,10 +2745,14 @@ pub(crate) struct InstallTasks {
 }
 
 /// A dictionary slot of the global object generated code reads under the
-/// slot-layout epoch it was baked against. Installing watches the slot, so a
-/// redefinition advances the layout the code guards; it declines when the
-/// layout moved on since baking or the slot no longer holds data.
+/// slot-layout epoch it was baked against. Installing re-proves that the name
+/// owns that data slot (baking read the dictionary while the mutator could
+/// append to it), then watches the slot, so a redefinition advances the
+/// layout the code guards; it declines when the layout moved on since baking
+/// or the name no longer owns the slot as data.
 pub(crate) struct GlobalSlotWatch {
+    /// The global's name, whose own data slot the code reads.
+    pub(crate) name: Box<str>,
     pub(crate) slot: u16,
     pub(crate) layout: u32,
 }

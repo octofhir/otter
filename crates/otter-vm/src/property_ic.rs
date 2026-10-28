@@ -298,16 +298,15 @@ impl IcEntry {
             && self.validity_word() == validity
     }
 
-    fn write(&self, handler: IcHandler) {
+    /// Write `handler`; the proof word the entry held, whose count the
+    /// caller now owns.
+    #[must_use]
+    fn write(&self, handler: IcHandler) -> u64 {
         let key = handler.key();
         let old = self.validity.swap(
             handler.validity.map_or(0, PrototypeValidity::into_raw),
             Ordering::Relaxed,
         );
-        if old != 0 {
-            // SAFETY: the previous word owned its count.
-            unsafe { PrototypeValidity::release_raw(old) };
-        }
         self.field
             .store(handler.field.cache_key(), Ordering::Relaxed);
         self.kind.store(handler.kind as u8, Ordering::Relaxed);
@@ -317,6 +316,21 @@ impl IcEntry {
         self.aux.store(handler.aux.offset(), Ordering::Relaxed);
         self.owner.store(handler.owner.offset(), Ordering::Relaxed);
         self.shape.store(key, Ordering::Relaxed);
+        old
+    }
+
+    /// A copy of every word, owning no proof count.
+    fn copy(&self) -> Self {
+        Self {
+            shape: AtomicU32::new(self.shape.load(Ordering::Relaxed)),
+            field: AtomicU32::new(self.field.load(Ordering::Relaxed)),
+            kind: AtomicU8::new(self.kind.load(Ordering::Relaxed)),
+            transition: AtomicU8::new(self.transition.load(Ordering::Relaxed)),
+            slot: AtomicU16::new(self.slot.load(Ordering::Relaxed)),
+            aux: AtomicU32::new(self.aux.load(Ordering::Relaxed)),
+            owner: AtomicU32::new(self.owner.load(Ordering::Relaxed)),
+            validity: AtomicU64::new(self.validity.load(Ordering::Relaxed)),
+        }
     }
 
     /// The aligned shape named by this validated live entry.
@@ -353,13 +367,13 @@ impl IcEntry {
         other.reset();
     }
 
-    fn clear(&self) {
+    /// Empty the entry; the proof word it held, whose count the caller now
+    /// owns.
+    #[must_use]
+    fn clear(&self) -> u64 {
         let old = self.validity.swap(0, Ordering::Relaxed);
-        if old != 0 {
-            // SAFETY: the word owned its count.
-            unsafe { PrototypeValidity::release_raw(old) };
-        }
         self.reset();
+        old
     }
 
     fn reset(&self) {
@@ -775,6 +789,14 @@ pub struct PropertyIcSlot {
     /// The integer index a keyed-bound site's atom spells; [`u32::MAX`] when
     /// it names a symbol.
     keyed_index: AtomicU32,
+    /// Odd while the mutator rewrites the entries; a compiler thread's copy
+    /// is consistent only between two equal even readings.
+    version: AtomicU32,
+    /// Compiler threads copying the entries now.
+    readers: AtomicU32,
+    /// One proof word dropped while a compiler thread was copying, released
+    /// once none is.
+    retired: AtomicU64,
     kind: PropertyIcKind,
 }
 
@@ -818,8 +840,100 @@ impl PropertyIcSlot {
             installs: AtomicU32::new(0),
             disables: AtomicU32::new(0),
             keyed_index: AtomicU32::new(u32::MAX),
+            version: AtomicU32::new(0),
+            readers: AtomicU32::new(0),
+            retired: AtomicU64::new(0),
             kind,
         }
+    }
+
+    /// Start rewriting the entries: the version turns odd.
+    fn begin_write(&self) {
+        let version = self.version.load(Ordering::Relaxed);
+        self.version
+            .store(version.wrapping_add(1), Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+    }
+
+    /// Finish rewriting the entries: the version turns even again.
+    fn end_write(&self) {
+        let version = self.version.load(Ordering::Relaxed);
+        self.version
+            .store(version.wrapping_add(1), Ordering::Release);
+    }
+
+    /// Release the count of a proof word an entry dropped, unless a compiler
+    /// thread may be taking it from its copy: then it waits in `retired`
+    /// (or, with that taken, the short copy finishes first).
+    fn release_validity(&self, word: u64) {
+        if word == 0 {
+            return;
+        }
+        // Pairs with the fence in `consistent_entries`: either the copier
+        // sees the entry without `word`, or this sees the copier.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if self.readers.load(Ordering::Relaxed) == 0 {
+            // SAFETY: the dropped word owned its count.
+            unsafe { PrototypeValidity::release_raw(word) };
+            self.release_retired();
+            return;
+        }
+        if self
+            .retired
+            .compare_exchange(0, word, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return;
+        }
+        while self.readers.load(Ordering::Acquire) != 0 {
+            std::hint::spin_loop();
+        }
+        // SAFETY: as above; no copier can still take it.
+        unsafe { PrototypeValidity::release_raw(word) };
+        self.release_retired();
+    }
+
+    fn release_retired(&self) {
+        let retired = self.retired.swap(0, Ordering::Relaxed);
+        if retired != 0 {
+            // SAFETY: a retired word owns its count; no copier is running.
+            unsafe { PrototypeValidity::release_raw(retired) };
+        }
+    }
+
+    /// A consistent copy of the live entries with each one's proof count
+    /// taken, for a compiler thread; `None` when the mutator was rewriting
+    /// them, which never waits for it.
+    fn consistent_entries(&self) -> Option<Vec<(IcEntry, Option<Arc<PrototypeValidity>>)>> {
+        self.readers.fetch_add(1, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let result = (|| {
+            let before = self.version.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                return None;
+            }
+            let count = self.entry_count().min(PROFILED_PROPERTY_PIC_CAPACITY);
+            let copies: Vec<IcEntry> = self.entries[..count].iter().map(IcEntry::copy).collect();
+            std::sync::atomic::fence(Ordering::Acquire);
+            if self.version.load(Ordering::Relaxed) != before {
+                return None;
+            }
+            Some(
+                copies
+                    .into_iter()
+                    .map(|entry| {
+                        let word = entry.validity_word();
+                        // SAFETY: the copy is consistent, and a word an
+                        // entry drops while this runs is retired, not freed.
+                        let cell =
+                            (word != 0).then(|| unsafe { PrototypeValidity::clone_raw(word) });
+                        (entry, cell)
+                    })
+                    .collect(),
+            )
+        })();
+        self.readers.fetch_sub(1, Ordering::Release);
+        result
     }
 
     /// Address generated code embeds for this site.
@@ -875,38 +989,39 @@ impl PropertyIcSlot {
             self.atom.store(atom, Ordering::Relaxed);
             self.keyed_index
                 .store(index.unwrap_or(u32::MAX), Ordering::Relaxed);
+            // Publishes the atom and index to a compiler thread's acquire.
             self.state
-                .store(state | STATE_KEYED_BOUND, Ordering::Relaxed);
+                .store(state | STATE_KEYED_BOUND, Ordering::Release);
             return true;
         }
         if self.atom.load(Ordering::Relaxed) == atom {
             return true;
         }
-        for entry in self.live() {
-            entry.clear();
-        }
+        self.begin_write();
+        let dropped: smallvec::SmallVec<[u64; PROFILED_PROPERTY_PIC_CAPACITY]> =
+            self.live().iter().map(IcEntry::clear).collect();
         self.state.store(
             (state & !STATE_COUNT_MASK) | STATE_MEGAMORPHIC,
             Ordering::Relaxed,
         );
         self.refresh_inline();
+        self.end_write();
+        for word in dropped {
+            self.release_validity(word);
+        }
         self.disables.fetch_add(1, Ordering::Relaxed);
         false
-    }
-
-    /// The name key an element site's cache serves, while it serves one.
-    #[must_use]
-    pub(crate) fn keyed_atom(&self) -> Option<u32> {
-        let state = self.state();
-        (state & STATE_KEYED_BOUND != 0 && state & STATE_MEGAMORPHIC == 0)
-            .then(|| self.atom.load(Ordering::Relaxed))
     }
 
     /// The name key an element site's cache serves, while it serves one: its
     /// atom and the integer index it spells, `None` for a symbol.
     #[must_use]
     pub(crate) fn keyed_name(&self) -> Option<(u32, Option<u32>)> {
-        let atom = self.keyed_atom()?;
+        let state = self.state.load(Ordering::Acquire);
+        if state & STATE_KEYED_BOUND == 0 || state & STATE_MEGAMORPHIC != 0 {
+            return None;
+        }
+        let atom = self.atom.load(Ordering::Relaxed);
         let index = self.keyed_index.load(Ordering::Relaxed);
         Some((atom, (index != u32::MAX).then_some(index)))
     }
@@ -1214,37 +1329,53 @@ impl PropertyIcSlot {
             if entry.holds(&handler) {
                 return InstallOutcome::Unchanged;
             }
-            entry.write(handler);
+            self.begin_write();
+            let dropped = entry.write(handler);
             self.refresh_inline();
+            self.end_write();
+            self.release_validity(dropped);
             self.installs.fetch_add(1, Ordering::Relaxed);
             return InstallOutcome::Installed;
         }
-        self.retain(|entry| entry.proof_holds());
+        self.begin_write();
+        let mut dropped = self.retain(|entry| entry.proof_holds());
         let count = self.entry_count();
         if count < PROFILED_PROPERTY_PIC_CAPACITY {
-            self.entries[count].write(handler);
+            dropped.push(self.entries[count].write(handler));
             self.set_count(count + 1);
+            self.end_write();
+            for word in dropped {
+                self.release_validity(word);
+            }
             self.installs.fetch_add(1, Ordering::Relaxed);
             return InstallOutcome::Installed;
         }
-        for entry in self.live() {
-            entry.clear();
-        }
+        dropped.extend(self.live().iter().map(IcEntry::clear));
         let state = (self.state() & !STATE_COUNT_MASK) | STATE_MEGAMORPHIC;
         self.state.store(state, Ordering::Relaxed);
         self.refresh_inline();
+        self.end_write();
+        for word in dropped {
+            self.release_validity(word);
+        }
         self.disables.fetch_add(1, Ordering::Relaxed);
         InstallOutcome::BecameMegamorphic
     }
 
-    /// Keep only entries `keep` accepts, compacting in order.
-    fn retain(&self, mut keep: impl FnMut(&IcEntry) -> bool) {
+    /// Keep only entries `keep` accepts, compacting in order, inside a
+    /// write; the proof words of the dropped ones, whose counts the caller
+    /// now owns.
+    fn retain(
+        &self,
+        mut keep: impl FnMut(&IcEntry) -> bool,
+    ) -> smallvec::SmallVec<[u64; PROFILED_PROPERTY_PIC_CAPACITY]> {
         let count = self.entry_count();
         let mut kept = 0;
+        let mut dropped = smallvec::SmallVec::new();
         for index in 0..count {
             let entry = &self.entries[index];
             if !keep(entry) {
-                entry.clear();
+                dropped.push(entry.clear());
                 continue;
             }
             if kept != index {
@@ -1255,6 +1386,7 @@ impl PropertyIcSlot {
         if kept != count {
             self.set_count(kept);
         }
+        dropped
     }
 
     /// Full-collector weak pass: forget entries naming unmarked shapes.
@@ -1266,7 +1398,8 @@ impl PropertyIcSlot {
             // SAFETY: entry words hold shape handles published by `write`.
             heap.is_marked(unsafe { ShapeHandle::from_offset(handle) }.raw())
         };
-        self.retain(|entry| {
+        self.begin_write();
+        let dropped = self.retain(|entry| {
             PropertyStorageProjection::decode_key(entry.shape())
                 .is_some_and(|(_, shape)| live(shape))
                 && (entry.aux.load(Ordering::Relaxed) == 0
@@ -1274,12 +1407,29 @@ impl PropertyIcSlot {
                 && (entry.owner.load(Ordering::Relaxed) == 0
                     || live(entry.owner.load(Ordering::Relaxed)))
         });
+        self.end_write();
+        for word in dropped {
+            self.release_validity(word);
+        }
     }
 
     /// The first live unprojected own-field load: `(receiver shape, logical slot)`.
     #[must_use]
     pub(crate) fn mono_own_field(&self) -> Option<(ShapeHandle, u16)> {
         let [entry] = self.live() else {
+            return None;
+        };
+        (entry.kind() == IcHandlerKind::OwnField
+            && entry.projection() == PropertyStorageProjection::Receiver)
+            .then(|| (entry.shape_handle(), entry.slot()))
+    }
+
+    /// [`Self::mono_own_field`] from a consistent copy, for a compiler
+    /// thread; `None` also while the mutator rewrites the entries.
+    #[must_use]
+    pub(crate) fn consistent_mono_own_field(&self) -> Option<(ShapeHandle, u16)> {
+        let entries = self.consistent_entries()?;
+        let [(entry, _)] = entries.as_slice() else {
             return None;
         };
         (entry.kind() == IcHandlerKind::OwnField
@@ -1392,8 +1542,9 @@ impl PropertyIcSlot {
         proofs: &mut impl crate::jit_roots::CompileProofs,
     ) -> Option<Vec<crate::jit::JitCacheIrProgram>> {
         use crate::jit::JitCacheIrOp;
-        let mut programs = Vec::with_capacity(self.entry_count());
-        for entry in self.live() {
+        let entries = self.consistent_entries()?;
+        let mut programs = Vec::with_capacity(entries.len());
+        for (entry, cell) in &entries {
             // A lookup-start receiver lowers only as a function's bag owning
             // the data slot; an inherited or absent key, or another receiver
             // kind's start object, reaches the generic node like an unseen
@@ -1422,16 +1573,12 @@ impl PropertyIcSlot {
             let Some(shape) = proofs.shape(receiver) else {
                 continue;
             };
-            let validity = match entry.validity_word() {
-                0 => None,
-                word => {
-                    // SAFETY: a non-zero word owns a strong count.
-                    let cell = unsafe { PrototypeValidity::clone_raw(word) };
-                    match proofs.validity(&cell) {
-                        Some(validity) => Some(validity),
-                        None => continue,
-                    }
-                }
+            let validity = match cell {
+                None => None,
+                Some(cell) => match proofs.validity(cell) {
+                    Some(validity) => Some(validity),
+                    None => continue,
+                },
             };
             let field = entry.field();
             let mut ops: Vec<JitCacheIrOp> = match entry.kind() {
@@ -1578,8 +1725,13 @@ impl PropertyIcSlot {
 impl Drop for PropertyIcSlot {
     fn drop(&mut self) {
         for entry in &self.entries {
-            entry.clear();
+            let word = entry.clear();
+            if word != 0 {
+                // SAFETY: the word owned its count; nothing reads a dying slot.
+                unsafe { PrototypeValidity::release_raw(word) };
+            }
         }
+        self.release_retired();
     }
 }
 

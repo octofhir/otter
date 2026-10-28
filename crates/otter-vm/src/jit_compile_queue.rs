@@ -1,10 +1,13 @@
 //! The isolate's optimizing compiler threads.
 //!
-//! An optimizing compilation has three parts. The isolate thread prepares a
-//! [`crate::jit::JitCompileSnapshot`]: every heap fact the compiler may use,
-//! frozen into plain data and addresses of non-moving cells. A compiler
-//! thread turns that request into code without touching the heap. The
-//! isolate thread installs the result at its next tier decision or loop poll.
+//! An optimizing compilation has three parts. The isolate thread prepares the
+//! facts the function's compilation needs and queues a bake. A compiler
+//! thread bakes the [`crate::jit::JitCompileSnapshot`] under the heap read
+//! right (every heap fact frozen into plain data and addresses of non-moving
+//! cells), leaves the bake's roots, install tasks and source leases in the
+//! compilation's [`BakeProducts`], releases the right and compiles without
+//! touching the heap. The isolate thread installs the result at its next
+//! tier decision or loop poll.
 //!
 //! # Contents
 //! - [`OptimizingCompileQueue`] — the isolate's compiler threads, the requests
@@ -15,11 +18,14 @@
 //! - [`FinishedCompile`] — one request's compiler outcome and its timing.
 //!
 //! # Invariants
-//! - A request holds no GC handle and the compiler reads no heap memory: the
-//!   snapshot names hidden classes, cells and literals by addresses of
-//!   non-moving allocations. The isolate traces the roots of every pending
-//!   compilation, so those allocations live until the result is installed
-//!   (the installed code then takes the roots over) or dropped.
+//! - A compiler thread reads heap memory only while baking, under the heap
+//!   read right, which every collection pause excludes; the request it then
+//!   compiles holds no GC handle: the snapshot names hidden classes, cells
+//!   and literals by addresses of non-moving allocations. The isolate traces
+//!   the products of every pending compilation (the bake's captured handles
+//!   from the start, its roots once published), so those allocations live
+//!   until the result is installed (the installed code then takes the roots
+//!   over) or dropped.
 //! - A function has at most one compilation in flight.
 //! - Results are installed only on the isolate thread. Installed code makes no
 //!   assumption its snapshot could have outlived: every speculation is guarded
@@ -49,7 +55,9 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::JitCompileCancellation;
-use crate::jit::{JitCompileError, JitCompileRequest, JitCompileStatus, JitCompilerHook};
+#[cfg(test)]
+use crate::jit::JitCompileRequest;
+use crate::jit::{JitCompileError, JitCompileStatus, JitCompilerHook};
 use crate::jit_compile_lifetime::CompilationSources;
 use crate::jit_roots::CompilationRoot;
 
@@ -63,14 +71,10 @@ pub(crate) struct PendingCompile {
     pub(crate) function_id: u32,
     /// Loop header that requested the compilation, if any.
     pub(crate) osr_pc: Option<u32>,
-    /// The exact body the snapshot was taken from.
+    /// The exact body the snapshot is taken from.
     pub(crate) function: Arc<crate::executable::CodeBlock>,
-    /// Every allocation the snapshot names.
-    pub(crate) roots: Box<[CompilationRoot]>,
-    /// Mutator-side work run before the result is published.
-    pub(crate) install: crate::interp::jit_bake::InstallTasks,
-    /// Exact source chunks of all prepared bodies, until terminal ACK.
-    pub(crate) sources: CompilationSources,
+    /// The roots, install tasks, events and source leases the bake leaves.
+    pub(crate) products: Arc<BakeProducts>,
     /// The same stop token carried by the queued or active request.
     pub(crate) cancellation: JitCompileCancellation,
     /// A pressure census deferred reclamation while this job held source
@@ -98,10 +102,95 @@ pub(crate) struct FinishedCompile {
     pub(crate) entered_hook: bool,
 }
 
+/// What a compiler thread starts a compilation from.
+pub(crate) enum CompileInput {
+    /// A snapshot already baked.
+    #[cfg(test)]
+    Request(JitCompileRequest),
+    /// A snapshot the compiler thread bakes first.
+    Bake(Box<crate::interp::jit_bake::BakeJob>),
+}
+
 struct CompileJob {
     hook: Arc<dyn JitCompilerHook>,
-    request: JitCompileRequest,
+    input: CompileInput,
+    cancellation: JitCompileCancellation,
+    code_object_id: u64,
     queued: Instant,
+}
+
+/// What one compilation's bake leaves for the isolate: written by the
+/// compiler thread while it holds the heap read right, then read by the
+/// isolate thread, whose collector traces the roots throughout.
+#[derive(Default)]
+pub(crate) struct BakeProducts(Mutex<BakeOutput>);
+
+/// [`BakeProducts`]' contents.
+#[derive(Default)]
+pub(crate) struct BakeOutput {
+    /// Every allocation the snapshot names, and the bake's captured handles.
+    pub(crate) roots: Vec<CompilationRoot>,
+    pub(crate) install: crate::interp::jit_bake::InstallTasks,
+    pub(crate) events: Vec<crate::jit_debug::JitDebugEvent>,
+    /// Exact source chunks of all prepared bodies, until terminal ACK;
+    /// `None` until a bake succeeds.
+    pub(crate) sources: Option<CompilationSources>,
+}
+
+// SAFETY: the roots name GC cells; the compiler thread writes them only under
+// the heap read right, and the collector, on the isolate thread, reads and
+// rewrites them only during pauses, which exclude that right.
+unsafe impl Send for BakeProducts {}
+// SAFETY: as above; every access holds the mutex.
+unsafe impl Sync for BakeProducts {}
+
+impl BakeProducts {
+    fn lock(&self) -> MutexGuard<'_, BakeOutput> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Products holding `roots` from the start.
+    pub(crate) fn holding(roots: impl IntoIterator<Item = CompilationRoot>) -> Self {
+        Self(Mutex::new(BakeOutput {
+            roots: roots.into_iter().collect(),
+            ..BakeOutput::default()
+        }))
+    }
+
+    /// Leave a finished bake's output.
+    pub(crate) fn publish(
+        &self,
+        roots: Box<[CompilationRoot]>,
+        install: crate::interp::jit_bake::InstallTasks,
+        events: Vec<crate::jit_debug::JitDebugEvent>,
+        sources: CompilationSources,
+    ) {
+        let mut output = self.lock();
+        output.roots.extend(roots.into_vec());
+        output.install = install;
+        output.events = events;
+        output.sources = Some(sources);
+    }
+
+    /// Take everything left, for installation.
+    pub(crate) fn take(&self) -> BakeOutput {
+        std::mem::take(&mut *self.lock())
+    }
+
+    fn trace(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
+        for root in &self.lock().roots {
+            root.trace(visitor);
+        }
+    }
+
+    fn process_weak(
+        &self,
+        resolve: &mut dyn FnMut(otter_gc::raw::RawGc) -> Option<otter_gc::raw::RawGc>,
+    ) {
+        for root in &self.lock().roots {
+            root.process_weak(resolve);
+        }
+    }
 }
 
 /// A compiler panic, carried to the isolate thread.
@@ -199,11 +288,20 @@ fn compile_requests(shared: &PoolShared) {
 
 fn compile(job: CompileJob) -> FinishedCompile {
     let started = Instant::now();
-    let code_object_id = job.request.code_object_id;
-    let cancellation = job.request.cancellation.clone();
-    let entered_hook = !cancellation.is_cancelled();
-    let status = if entered_hook {
-        let status = job.hook.compile_optimized_function(job.request);
+    let code_object_id = job.code_object_id;
+    let cancellation = job.cancellation;
+    let request = if cancellation.is_cancelled() {
+        None
+    } else {
+        match job.input {
+            #[cfg(test)]
+            CompileInput::Request(request) => Some(request),
+            CompileInput::Bake(bake) => bake.run(),
+        }
+    };
+    let entered_hook = request.is_some() && !cancellation.is_cancelled();
+    let status = if let Some(request) = request.filter(|_| entered_hook) {
+        let status = job.hook.compile_optimized_function(request);
         // A hook may ignore cancellation or finish its last phase just before
         // cancellation. A completed artifact still must not be published.
         if cancellation.is_cancelled() {
@@ -230,7 +328,7 @@ fn compile(job: CompileJob) -> FinishedCompile {
 /// A queued job's terminal ACK follows destruction of its snapshot.
 fn cancel_queued_job(job: CompileJob) -> FinishedCompile {
     let finished = FinishedCompile {
-        code_object_id: job.request.code_object_id,
+        code_object_id: job.code_object_id,
         status: Ok(JitCompileStatus::Cancelled),
         queue_delay: job.queued.elapsed(),
         duration: Duration::ZERO,
@@ -290,13 +388,15 @@ impl OptimizingCompileQueue {
     pub(crate) fn submit(
         &mut self,
         hook: Arc<dyn JitCompilerHook>,
-        request: JitCompileRequest,
+        input: CompileInput,
+        code_object_id: u64,
         pending: PendingCompile,
     ) -> Option<(PendingCompile, FinishedCompile)> {
-        let code_object_id = request.code_object_id;
         let job = CompileJob {
             hook,
-            request,
+            input,
+            cancellation: pending.cancellation.clone(),
+            code_object_id,
             queued: Instant::now(),
         };
         if self.threads == 0 {
@@ -376,7 +476,7 @@ impl OptimizingCompileQueue {
             let requests = std::mem::take(&mut queue.requests);
             let mut cancelled = Vec::new();
             for job in requests {
-                if job.request.cancellation.is_cancelled() {
+                if job.cancellation.is_cancelled() {
                     cancelled.push(job);
                 } else {
                     queue.requests.push_back(job);
@@ -399,9 +499,7 @@ impl OptimizingCompileQueue {
     /// Visit the roots of every compilation in flight.
     pub(crate) fn trace_roots(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         for pending in self.pending.values() {
-            for root in pending.roots.iter() {
-                root.trace(visitor);
-            }
+            pending.products.trace(visitor);
         }
     }
 
@@ -412,9 +510,7 @@ impl OptimizingCompileQueue {
         resolve: &mut dyn FnMut(otter_gc::raw::RawGc) -> Option<otter_gc::raw::RawGc>,
     ) {
         for pending in self.pending.values() {
-            for root in pending.roots.iter() {
-                root.process_weak(resolve);
-            }
+            pending.products.process_weak(resolve);
         }
     }
 }
@@ -477,9 +573,11 @@ mod tests {
             function_id: snapshot.code_block.id,
             osr_pc: None,
             function: snapshot.code_block.clone(),
-            roots: vec![CompilationRoot::CalleeIdentity(root)].into_boxed_slice(),
-            install: crate::interp::jit_bake::InstallTasks::default(),
-            sources,
+            products: Arc::new(BakeProducts(Mutex::new(BakeOutput {
+                roots: vec![CompilationRoot::CalleeIdentity(root)],
+                sources: Some(sources),
+                ..BakeOutput::default()
+            }))),
             cancellation: cancellation.clone(),
             retry_code_reclamation: false,
             feedback_epoch: None,
@@ -522,9 +620,27 @@ mod tests {
         });
         let mut queue = OptimizingCompileQueue::default();
         queue.set_threads(1);
-        assert!(queue.submit(hook.clone(), active, active_pending).is_none());
+        assert!(
+            queue
+                .submit(
+                    hook.clone(),
+                    CompileInput::Request(active),
+                    1,
+                    active_pending
+                )
+                .is_none()
+        );
         assert_eq!(entries.recv().unwrap(), contexts[0].function_base());
-        assert!(queue.submit(hook.clone(), queued, queued_pending).is_none());
+        assert!(
+            queue
+                .submit(
+                    hook.clone(),
+                    CompileInput::Request(queued),
+                    2,
+                    queued_pending
+                )
+                .is_none()
+        );
         // Both chunks are retained only by the pending owners, not requests'
         // CodeBlock Arcs. The worker cannot complete before cancellation.
         drop(contexts);

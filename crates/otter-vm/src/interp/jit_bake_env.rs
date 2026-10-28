@@ -23,9 +23,14 @@ use crate::property_atom::AtomizedPropertyKey;
 use crate::{CodeBlock, Interpreter, MethodCallFeedback, jit, native_abi};
 
 /// The isolate as one compilation's bake reads it.
-pub(crate) struct BakeEnv<'a> {
-    pub(crate) shared: &'a CompileShared,
+pub(crate) struct BakeEnv {
+    pub(crate) shared: std::sync::Arc<CompileShared>,
     pub(crate) heap: crate::heap_read::HeapView,
+    /// Compiler threads' right to read the heap.
+    pub(crate) read_right: std::sync::Arc<otter_gc::read_right::HeapReadRight>,
+    /// The captured handles below, held where the collector rewrites them;
+    /// [`Self::refresh`] reads them back.
+    held: Box<[std::sync::Arc<crate::jit_roots::CalleeIdentityCell>]>,
     pub(crate) string_prototype: Option<JsObject>,
     pub(crate) map_prototype: Option<JsObject>,
     pub(crate) set_prototype: Option<JsObject>,
@@ -45,14 +50,29 @@ pub(crate) struct BakeEnv<'a> {
     pub(crate) machine_allocation_allowed: bool,
     /// Functions retraining when the compilation was prepared.
     pub(crate) retraining: Vec<u32>,
+    /// Optimized entries of the compiled function that bailed, for its
+    /// prepared-compile report.
+    pub(crate) entry_bail_count: u32,
 }
 
-impl<'a> BakeEnv<'a> {
+// SAFETY: the shared tables, shape tables and site directory are read only
+// through their compiler-side protocols. The heap handles the environment
+// holds are followed only under `read_right`, which excludes collection,
+// after `refresh` read them back from collector-rewritten cells; the
+// compiler thread never writes the heap.
+unsafe impl Send for BakeEnv {}
+
+/// How many handles [`BakeEnv::held`] keeps.
+const HELD_HANDLES: usize = 7 + 5 + crate::IntrinsicCallKind::COUNT;
+
+impl BakeEnv {
     /// Capture `vm` as one compilation's bake reads it.
-    pub(crate) fn capture(vm: &'a Interpreter) -> Self {
-        Self {
-            shared: &vm.compile_shared,
+    pub(crate) fn capture(vm: &Interpreter) -> Self {
+        let mut env = Self {
+            shared: std::sync::Arc::clone(&vm.compile_shared),
             heap: crate::heap_read::HeapView::of(&vm.gc_heap),
+            read_right: vm.gc_heap.read_right(),
+            held: Box::new([]),
             string_prototype: vm.realm_intrinsics.string_prototype(),
             map_prototype: vm.realm_intrinsics.map_prototype(),
             set_prototype: vm.realm_intrinsics.set_prototype(),
@@ -76,6 +96,72 @@ impl<'a> BakeEnv<'a> {
             property_action_cache: vm.property_cache.jit_layout(),
             machine_allocation_allowed: vm.gc_heap.machine_allocation_allowed(),
             retraining: vm.optimizing_tier_policy.retraining_functions(),
+            entry_bail_count: 0,
+        };
+        env.held = env
+            .handles()
+            .into_iter()
+            .map(|value| std::sync::Arc::new(crate::jit_roots::CalleeIdentityCell::holding(value)))
+            .collect();
+        env
+    }
+
+    /// The roots that keep the captured handles alive and current.
+    pub(crate) fn held_roots(
+        &self,
+    ) -> impl Iterator<Item = crate::jit_roots::CompilationRoot> + '_ {
+        self.held.iter().map(|cell| {
+            crate::jit_roots::CompilationRoot::CalleeIdentity(std::sync::Arc::clone(cell))
+        })
+    }
+
+    /// Every captured heap handle as a value, in [`Self::held`] order.
+    fn handles(&self) -> [crate::Value; HELD_HANDLES] {
+        let object = |object: Option<JsObject>| {
+            object.map_or(crate::Value::undefined(), crate::Value::object)
+        };
+        let mut values = [crate::Value::undefined(); HELD_HANDLES];
+        let fixed = [
+            crate::Value::object(self.global_this),
+            object(self.string_prototype),
+            object(self.map_prototype),
+            object(self.set_prototype),
+            object(self.function_prototype),
+            object(self.object_prototype),
+            object(self.default_array_prototype),
+        ];
+        values[..7].copy_from_slice(&fixed);
+        for (value, prototype) in values[7..12].iter_mut().zip(self.stamp_prototypes) {
+            *value = object(prototype);
+        }
+        for (value, callable) in values[12..].iter_mut().zip(self.callables) {
+            if !callable.raw().is_null() {
+                *value = crate::Value::native_function(callable);
+            }
+        }
+        values
+    }
+
+    /// Read the captured handles back from their cells, as the last
+    /// collection left them. Called under the read right, before any heap
+    /// read of the bake.
+    pub(crate) fn refresh(&mut self) {
+        let value = |index: usize| self.held[index].held();
+        let object = |index: usize| value(index).as_object();
+        self.global_this = object(0).unwrap_or(self.global_this);
+        self.string_prototype = object(1);
+        self.map_prototype = object(2);
+        self.set_prototype = object(3);
+        self.function_prototype = object(4);
+        self.object_prototype = object(5);
+        self.default_array_prototype = object(6);
+        for index in 0..5 {
+            self.stamp_prototypes[index] = object(7 + index);
+        }
+        for index in 0..crate::IntrinsicCallKind::COUNT {
+            self.callables[index] = value(12 + index).as_native_function().unwrap_or_else(|| {
+                crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
+            });
         }
     }
 
@@ -321,7 +407,7 @@ impl<'a> BakeEnv<'a> {
     ) -> Option<(crate::constructor_layout::ConstructorLayout, u32, bool)> {
         crate::constructor_layout::compile::finalized_layout(
             &self.heap,
-            self.shared,
+            &self.shared,
             family_id,
             base,
         )

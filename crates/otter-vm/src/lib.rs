@@ -750,7 +750,43 @@ pub(crate) struct PolyMethodTarget {
     pub(crate) method_field: object::FieldLocation,
     /// Observations that resolved to exactly this target. Used only to order
     /// the emitted guard chain; not a correctness input.
-    pub(crate) hits: u32,
+    pub(crate) hits: HitCount,
+}
+
+/// A counter the mutator bumps through shared access, so counting a repeated
+/// observation needs no write of the table holding it.
+#[derive(Debug, Default)]
+pub(crate) struct HitCount(std::sync::atomic::AtomicU32);
+
+impl HitCount {
+    pub(crate) const fn new(hits: u32) -> Self {
+        Self(std::sync::atomic::AtomicU32::new(hits))
+    }
+
+    #[inline]
+    pub(crate) fn get(&self) -> u32 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count one more observation, saturating.
+    #[inline]
+    pub(crate) fn bump(&self) {
+        let hits = self.get();
+        self.0
+            .store(hits.saturating_add(1), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Clone for HitCount {
+    fn clone(&self) -> Self {
+        Self::new(self.get())
+    }
+}
+
+impl PartialEq for HitCount {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
 }
 
 impl PolyMethodTarget {

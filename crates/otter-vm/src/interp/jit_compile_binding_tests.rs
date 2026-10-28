@@ -127,7 +127,7 @@ fn bake_retained(
     let _ = interpreter.prepare_compile_facts(context, fid);
     let mut view = context.jit_compile_snapshot(fid).expect("linked snapshot");
     let env = crate::interp::jit_bake_env::BakeEnv::capture(interpreter);
-    let mut baker = Baker::new(&env);
+    let mut baker = Baker::new(&env, None);
     baker.bake_global_lexical_loads(&mut view, context, fid);
     baker.bake_binding_hit_proofs(&mut view, context, fid);
     let (roots, install, _) = baker.finish();
@@ -503,17 +503,20 @@ fn foreign_linked_source_never_bakes_ambient_global_proofs_or_inline_body() {
     assert!(foreign_view.global_lexical_loads.is_empty());
     assert!(foreign_view.global_object_loads.is_empty());
     assert!(
-        Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&interpreter))
-            .bake_inline_body(
-                &foreign,
-                fid,
-                jit_debug::JitDebugTier::Optimizing,
-                &mut InlineSnapshotBudget::new(),
-                None,
-                None,
-                None,
-            )
-            .is_none(),
+        Baker::new(
+            &crate::interp::jit_bake_env::BakeEnv::capture(&interpreter),
+            None
+        )
+        .bake_inline_body(
+            &foreign,
+            fid,
+            jit_debug::JitDebugTier::Optimizing,
+            &mut InlineSnapshotBudget::new(),
+            None,
+            None,
+            None,
+        )
+        .is_none(),
         "source ownership is not same-realm inline admission"
     );
 
@@ -562,16 +565,19 @@ fn disposed_source_global_never_substitutes_the_active_global() {
             .is_empty()
     );
     assert!(
-        Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&interpreter))
-            .bake_inline_body(
-                &foreign,
-                fid,
-                jit_debug::JitDebugTier::Optimizing,
-                &mut InlineSnapshotBudget::new(),
-                None,
-                None,
-                None,
-            )
-            .is_none()
+        Baker::new(
+            &crate::interp::jit_bake_env::BakeEnv::capture(&interpreter),
+            None
+        )
+        .bake_inline_body(
+            &foreign,
+            fid,
+            jit_debug::JitDebugTier::Optimizing,
+            &mut InlineSnapshotBudget::new(),
+            None,
+            None,
+            None,
+        )
+        .is_none()
     );
 }

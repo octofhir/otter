@@ -1133,11 +1133,17 @@ impl Interpreter {
         function_id: u32,
         idx: u32,
     ) -> Result<Value, VmError> {
-        let key = context.constant_cache_key(idx);
+        // The literal lives in the pool of the chunk that owns the function,
+        // which keys its site: an inlined body, a lazily compiled body or a
+        // builtin-driven frame may run under another chunk's context.
+        let owner = context
+            .for_function(function_id)
+            .map_err(|_| VmError::InvalidOperand)?;
+        let key = owner.constant_cache_key(idx);
         let site = match self.regexp_literals.get(&key) {
             Some(site) => *site,
             None => {
-                let site = self.resolve_regexp_literal_site(context, function_id, idx)?;
+                let site = self.resolve_regexp_literal_site(&owner, function_id, idx)?;
                 self.regexp_literals.insert(key, site);
                 site
             }

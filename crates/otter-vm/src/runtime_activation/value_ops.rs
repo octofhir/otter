@@ -538,11 +538,10 @@ impl RuntimeCall<'_> {
         vm.jit_runtime_load_global(stack, context, &mut frame, function_id, dst, name_index)
     }
 
-    /// The RegExp of the regex literal at constant `index` of the published
-    /// function, as a value.
-    pub fn regexp_literal_value(&mut self, index: u32) -> Result<Value, VmError> {
+    /// The RegExp of the regex literal at constant `index` of function
+    /// `function_id`'s chunk, as a value.
+    pub fn regexp_literal_value(&mut self, function_id: u32, index: u32) -> Result<Value, VmError> {
         let vm = unsafe { &mut *self.vm.as_ptr() };
-        let function_id = self.function_id();
         vm.load_regexp_literal_value(&self.context, function_id, index)
     }
 

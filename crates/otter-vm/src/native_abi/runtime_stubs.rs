@@ -2366,8 +2366,8 @@ pub const STUB_REGEXP_TEST_LEAF: RuntimeStubDescriptor = descriptor(
 );
 
 /// The RegExp of the regex literal at constant-pool index `value0` of the
-/// published function: `(jit_ctx, constant, 0) -> value`, the miss of a
-/// generated literal birth.
+/// chunk owning function `value1`: `(jit_ctx, constant, function) -> value`,
+/// the miss of a generated literal birth.
 pub const STUB_JIT_REGEXP_LITERAL: RuntimeStubDescriptor = descriptor(
     133,
     RuntimeStubClass::Alloc,

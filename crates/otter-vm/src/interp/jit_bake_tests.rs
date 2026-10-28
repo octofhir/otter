@@ -108,7 +108,7 @@ fn retraining_blocks_prewarm_and_inline_body_baking_before_preparation() {
             )
             .is_none()
     );
-    assert!(interpreter.literal_cells.is_empty());
+    assert!(interpreter.literal_cells().is_empty());
 }
 
 #[test]
@@ -191,7 +191,7 @@ fn prewarm_publishes_one_shared_stable_cell_for_all_literal_sites() {
         interpreter.prewarm_literal_cells(&context, 0).is_none(),
         "a cold allocation without published frame roots must decline"
     );
-    assert_eq!(interpreter.literal_cells.len(), 0);
+    assert_eq!(interpreter.literal_cells().len(), 0);
 
     let mut stack = ActivationStack::new();
     interpreter.with_runtime_turn(&mut stack, |turn| {
@@ -229,7 +229,7 @@ fn prewarm_publishes_one_shared_stable_cell_for_all_literal_sites() {
     // corrupt state nevertheless exposes a hole, preparation and baking
     // both decline instead of publishing that state to generated code.
     **interpreter
-        .literal_cells
+        .literal_cells_mut()
         .get_mut(&context.constant_cache_key(0))
         .expect("prepared cell") = Value::hole();
     assert!(interpreter.prewarm_literal_cells(&context, 0).is_none());

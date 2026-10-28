@@ -269,7 +269,7 @@ impl Interpreter {
         obj: crate::object::JsObject,
     ) -> Value {
         if let Some(crate::method_ops::MethodCallIc::Ordinary(hit)) =
-            self.method_feedback.method_ic(site)
+            self.method_feedback().method_ic(site)
         {
             if let Some(cached) =
                 crate::object::load_own_data_slot_by_shape(obj, &self.gc_heap, hit)
@@ -277,7 +277,7 @@ impl Interpreter {
             {
                 return cached;
             }
-            self.method_feedback.clear_method_ic(site);
+            self.method_feedback_mut().clear_method_ic(site);
         }
         if let Some(atomized_key) = context.property_atom_for_function(function_id, name_index)
             && let Some(slot) = property_slot
@@ -285,7 +285,7 @@ impl Interpreter {
             && self.is_callable_runtime(&resolved)
         {
             if let Some(hit) = slot.mono_own_hit(atomized_key.atom().id()) {
-                self.method_feedback
+                self.method_feedback_mut()
                     .install_method_ic(site, crate::method_ops::MethodCallIc::Ordinary(hit));
             }
             return resolved;

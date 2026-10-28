@@ -490,7 +490,7 @@ fn proxy_bound_and_native_actual_targets_trace_distinct_family_heads() {
         assert_eq!(object::shape_body::inline_capacity_of(provisional_root), 64);
         assert!(object::shape_body::state_of(provisional_root).is_provisional());
         let body = ConstructorLayoutBody::new(
-            vm.constructor_families.allocate_id(),
+            vm.compile_shared.constructor_families.allocate_id(),
             12345,
             super::ConstructorFamilyOwner::Other,
             0,

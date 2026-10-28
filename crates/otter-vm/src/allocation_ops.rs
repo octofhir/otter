@@ -904,7 +904,7 @@ impl Interpreter {
         first_key: u32,
         count: usize,
     ) -> Result<crate::handles::ObjectLayout, VmError> {
-        if let Some(layout) = self.object_literal_layouts.get(&(function_id, first_key)) {
+        if let Some(layout) = self.object_literal_layouts().get(&(function_id, first_key)) {
             return Ok(*layout);
         }
         let keys = (0..count as u32)
@@ -917,7 +917,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let keys = keys.iter().map(String::as_str).collect::<Vec<_>>();
         let layout = self.object_layout(&keys)?;
-        self.object_literal_layouts
+        self.object_literal_layouts_mut()
             .insert((function_id, first_key), layout);
         Ok(layout)
     }
@@ -1140,11 +1140,11 @@ impl Interpreter {
             .for_function(function_id)
             .map_err(|_| VmError::InvalidOperand)?;
         let key = owner.constant_cache_key(idx);
-        let site = match self.regexp_literals.get(&key) {
+        let site = match self.regexp_literals().get(&key) {
             Some(site) => *site,
             None => {
                 let site = self.resolve_regexp_literal_site(&owner, function_id, idx)?;
-                self.regexp_literals.insert(key, site);
+                self.regexp_literals_mut().insert(key, site);
                 site
             }
         };

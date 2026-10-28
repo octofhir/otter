@@ -138,9 +138,8 @@ impl Interpreter {
         let mut interp = Self {
             local_time_zone: crate::date::LocalTimeZone::default(),
             template_objects: rustc_hash::FxHashMap::default(),
-            literal_cells: rustc_hash::FxHashMap::default(),
-            array_boilerplates: rustc_hash::FxHashMap::default(),
-            regexp_literals: rustc_hash::FxHashMap::default(),
+            mutator: crate::mutator_owned::MutatorToken::new(),
+            compile_shared: std::sync::Arc::default(),
             number_strings: crate::string::number_strings::NumberStrings::empty(),
             regexp_match_shape: crate::object::ShapeHandle::null(),
             pending_error_detail: std::cell::RefCell::new(None),
@@ -168,12 +167,8 @@ impl Interpreter {
             property_cache: crate::property_cache::PropertyActionCache::default(),
             realm_context: None,
             shape_runtime,
-            simple_constructor_init_cache: rustc_hash::FxHashMap::default(),
             simple_constructor_absence: rustc_hash::FxHashMap::default(),
-            simple_constructor_shape_cache: rustc_hash::FxHashMap::default(),
-            object_literal_layouts: rustc_hash::FxHashMap::default(),
             function_constructor_layouts: rustc_hash::FxHashMap::default(),
-            constructor_families: Default::default(),
             arguments_shape_cache: rustc_hash::FxHashMap::default(),
             max_stack_depth: crate::DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
@@ -182,8 +177,6 @@ impl Interpreter {
             module_environments: std::collections::HashMap::new(),
             host_module_env_cache: std::collections::HashMap::new(),
             module_init_closures: std::collections::HashMap::new(),
-            global_lexicals: rustc_hash::FxHashMap::default(),
-            global_lexical_epoch: 0,
             global_lexical_load_ic: rustc_hash::FxHashMap::default(),
             global_object_load_ic: rustc_hash::FxHashMap::default(),
             module_hoisted: std::collections::HashSet::new(),
@@ -195,7 +188,6 @@ impl Interpreter {
             module_namespaces: std::collections::HashMap::new(),
             module_resolved_exports: std::collections::HashMap::new(),
             rejection_tracker: crate::promise_rejection::RejectionTracker::default(),
-            method_feedback: crate::interp::MethodFeedbackDirectory::default(),
             jit_hook: None,
             jit_debug: crate::jit_debug::JitDebugState::default(),
             jit_artifacts: crate::jit_artifact::JitArtifactState::default(),
@@ -208,9 +200,6 @@ impl Interpreter {
             jit_optimized_code: rustc_hash::FxHashMap::default(),
             jit_optimized_code_cache: None,
             own_slot_cache: crate::object::OwnSlotCache::new(),
-            jit_optimized_exit_profiles: std::collections::BTreeMap::new(),
-            jit_parameter_widening: rustc_hash::FxHashMap::default(),
-            jit_intrinsic_programs: rustc_hash::FxHashMap::default(),
             jit_optimized_declined_epoch: rustc_hash::FxHashMap::default(),
             jit_code_cache: None,
             jit_entry_osr_only: rustc_hash::FxHashSet::default(),
@@ -357,7 +346,7 @@ impl Interpreter {
             // relocated offset names its restored copy.
             let cell = unsafe { crate::UpvalueCell::from_offset(relocated.0) };
             interp
-                .global_lexicals
+                .global_lexicals_mut()
                 .insert(name.clone(), (cell, *is_const));
         }
         for (key, symbol) in &snapshot.registered_symbols {
@@ -420,7 +409,9 @@ impl Interpreter {
         // ids, transitions, provisional descendants and canonical key cells
         // together before any mutator can allocate against this heap.
         object::shape_interner::ShapeInterner::rebuild_restored(&mut interp.gc_heap);
-        interp.constructor_families =
+        std::sync::Arc::get_mut(&mut interp.compile_shared)
+            .expect("no compiler thread shares a restoring isolate")
+            .constructor_families =
             crate::constructor_layout::ConstructorFamilies::restored(&interp.gc_heap);
 
         interp.gc_heap.set_tenure_all(false);

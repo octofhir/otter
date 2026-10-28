@@ -159,7 +159,7 @@ impl Interpreter {
         let (key, elements) = context
             .array_boilerplate_for_function(function_id, idx)
             .ok_or(VmError::InvalidOperand)?;
-        if let Some(slab) = self.array_boilerplates.get(&key) {
+        if let Some(slab) = self.array_boilerplates().get(&key) {
             return Ok(*slab);
         }
         let _roots = self.scope_runtime_roots_guard();
@@ -203,7 +203,7 @@ impl Interpreter {
             kind,
             &mut visit,
         )?;
-        self.array_boilerplates.insert(key, slab);
+        self.array_boilerplates_mut().insert(key, slab);
         Ok(slab)
     }
 
@@ -389,7 +389,7 @@ mod tests {
                 .expect("literal key context");
             let function_id = context.function_base();
             vm.function_realm_ids.insert(function_id, realm.0);
-            assert!(!vm.object_literal_layouts.contains_key(&(function_id, 0)));
+            assert!(!vm.object_literal_layouts().contains_key(&(function_id, 0)));
             vm.with_runtime_roots(|vm| {
                 // The only pending child roots across the first literal call
                 // are the handles installed by allocate_static_object_literal.
@@ -447,7 +447,7 @@ mod tests {
                                 "alias at slot {index}, stride {stride}"
                             );
                         }
-                        let layout = vm.object_literal_layouts[&(function_id, 0)];
+                        let layout = vm.object_literal_layouts()[&(function_id, 0)];
                         assert_eq!(layout.len(), COUNT);
                         let shape = vm
                             .shape_runtime

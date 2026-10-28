@@ -473,7 +473,7 @@ impl Baker<'_> {
                     let owner = context.for_function(fid).ok()?;
                     let key = owner.constant_cache_key(constant);
                     // The literal's first execution resolves its site.
-                    let Some(&site) = self.vm.regexp_literals.get(&key) else {
+                    let Some(&site) = self.vm.regexp_literals().get(&key) else {
                         continue;
                     };
                     view.literal_allocations.regexps.insert(
@@ -534,7 +534,7 @@ impl Baker<'_> {
                     // The literal's first execution built its layout.
                     let plan = self
                         .vm
-                        .object_literal_layouts
+                        .object_literal_layouts()
                         .get(&(fid, first_key))
                         .and_then(|layout| self.shape_for_id(layout.shape_id()))
                         .and_then(|shape| {
@@ -558,7 +558,7 @@ impl Baker<'_> {
                     // The literal's first execution built its shared slab.
                     let slab = context
                         .array_boilerplate_for_function(fid, constant)
-                        .and_then(|(key, _)| self.vm.array_boilerplates.get(&key).copied());
+                        .and_then(|(key, _)| self.vm.array_boilerplates().get(&key).copied());
                     if let Some(plan) = slab.and_then(jit::JitBoilerplateArrayAllocationPlan::new) {
                         view.literal_allocations
                             .boilerplates
@@ -1327,7 +1327,7 @@ impl Baker<'_> {
             let Some(name) = context.string_constant_str_for_function(fid, name_index) else {
                 continue;
             };
-            if let Some(&(cell, _)) = self.vm.global_lexicals.get(name) {
+            if let Some(&(cell, _)) = self.vm.global_lexicals().get(name) {
                 view.global_lexical_loads.insert(
                     instruction.byte_pc,
                     jit::JitGlobalLexicalLoad {
@@ -1379,7 +1379,7 @@ impl Baker<'_> {
                         &self.vm.gc_heap,
                         u32::from(hit.slot),
                     ),
-                    global_lexical_epoch: self.vm.global_lexical_epoch,
+                    global_lexical_epoch: self.vm.global_lexical_epoch(),
                 },
             );
         }
@@ -1437,7 +1437,7 @@ impl Baker<'_> {
             let Some(name) = context.string_constant_str_for_function(fid, name_index) else {
                 continue;
             };
-            if let Some(&(cell, is_const)) = self.vm.global_lexicals.get(name) {
+            if let Some(&(cell, is_const)) = self.vm.global_lexicals().get(name) {
                 view.binding_hit_proofs.insert(
                     instruction.byte_pc,
                     jit::BindingHitProof::GlobalLexical {
@@ -1499,7 +1499,7 @@ impl Baker<'_> {
                         &self.vm.gc_heap,
                         u32::from(hit.slot),
                     ),
-                    global_lexical_epoch: self.vm.global_lexical_epoch,
+                    global_lexical_epoch: self.vm.global_lexical_epoch(),
                     writable: flags.writable(),
                     layout,
                 },
@@ -1524,6 +1524,7 @@ impl Baker<'_> {
         complete: bool,
     ) -> Option<()> {
         let owner = context.for_function(fid).ok()?;
+        let cells = self.vm.compile_shared.literal_cells.try_read()?;
         for instruction in &view.instructions {
             let op = instruction.op(&view.code_block);
             if !matches!(op, Op::LoadString | Op::LoadBigInt) {
@@ -1531,12 +1532,7 @@ impl Baker<'_> {
             }
             let constant = instruction.const_index(&view.code_block, 1)?;
             let key = owner.constant_cache_key(constant);
-            let Some(cell) = self
-                .vm
-                .literal_cells
-                .get(&key)
-                .filter(|cell| literal_matches(op, cell))
-            else {
+            let Some(cell) = cells.get(&key).filter(|cell| literal_matches(op, cell)) else {
                 if complete {
                     return None;
                 }
@@ -1642,7 +1638,7 @@ impl Baker<'_> {
     fn bake_optimized_exit_profile(&mut self, snapshot: &mut jit::JitCompileSnapshot, fid: u32) {
         snapshot.parameter_widening = self
             .vm
-            .jit_parameter_widening
+            .jit_parameter_widening()
             .get(&fid)
             .cloned()
             .unwrap_or_default();
@@ -2610,12 +2606,12 @@ impl Baker<'_> {
         let mut initial_shape = root_handle;
         let (receiver_shape, initial_field_count) = match (
             self.vm
-                .simple_constructor_init_cache
+                .simple_constructor_init_cache()
                 .get(&base_function_id)
                 .and_then(Option::as_ref)
                 .map(|init| init.fields.len()),
             self.vm
-                .simple_constructor_shape_cache
+                .simple_constructor_shape_cache()
                 .get(&(base_function_id, root_id))
                 .copied(),
         ) {
@@ -2714,7 +2710,7 @@ impl Baker<'_> {
         // site to its own feedback.
         let mut shapes = self
             .vm
-            .simple_constructor_shape_cache
+            .simple_constructor_shape_cache()
             .iter()
             .filter(|((id, _), _)| *id == class_fid)
             .map(|(_, shape)| *shape);

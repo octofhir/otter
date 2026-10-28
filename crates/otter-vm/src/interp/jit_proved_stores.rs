@@ -53,7 +53,13 @@ impl Baker<'_> {
         }
         let heap = &self.vm.gc_heap;
         let mut family = None;
-        for layout in self.vm.constructor_families.of_owner(fid) {
+        for layout in self
+            .vm
+            .compile_shared
+            .constructor_families
+            .try_of_owner(fid)
+            .unwrap_or_default()
+        {
             let admitted = heap.read_payload(layout, |body| {
                 (body.owner() == (ConstructorFamilyOwner::Closure, fid)
                     && body.base_function_id() == fid

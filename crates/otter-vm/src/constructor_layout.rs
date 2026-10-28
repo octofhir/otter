@@ -52,11 +52,11 @@ pub use completion::constructor_terminal;
 #[cfg(test)]
 mod tests;
 
+use crate::mutator_owned::MutatorCell;
 use crate::{Value, object::ShapeHandle};
 use otter_gc::raw::SlotVisitor;
 use otter_gc::{Gc, GcHeap};
 use rustc_hash::FxHashMap;
-use std::cell::{Cell, RefCell};
 
 /// Reserved private engine GC payload tag.
 pub(crate) const CONSTRUCTOR_LAYOUT_BODY_TYPE_TAG: u8 = 0x40;
@@ -203,18 +203,18 @@ impl otter_gc::SafeTraceable for ConstructorLayoutBody {
 /// it through their own owners before the next full collection.
 #[derive(Debug)]
 pub(crate) struct ConstructorFamilies {
-    next_id: Cell<u64>,
-    by_id: RefCell<FxHashMap<u64, ConstructorLayout>>,
+    next_id: std::sync::atomic::AtomicU64,
+    by_id: MutatorCell<FxHashMap<u64, ConstructorLayout>>,
     /// The same cells by the function of their new.target owner.
-    by_owner: RefCell<FxHashMap<u32, smallvec::SmallVec<[ConstructorLayout; 1]>>>,
+    by_owner: MutatorCell<FxHashMap<u32, smallvec::SmallVec<[ConstructorLayout; 1]>>>,
 }
 
 impl Default for ConstructorFamilies {
     fn default() -> Self {
         Self {
-            next_id: Cell::new(1),
-            by_id: RefCell::new(FxHashMap::default()),
-            by_owner: RefCell::new(FxHashMap::default()),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+            by_id: MutatorCell::default(),
+            by_owner: MutatorCell::default(),
         }
     }
 }
@@ -222,10 +222,11 @@ impl Default for ConstructorFamilies {
 impl ConstructorFamilies {
     /// Reserve the next never-reused family identity.
     pub(crate) fn allocate_id(&self) -> u64 {
-        let id = self.next_id.get();
-        self.next_id.set(
+        let id = self.next_id.load(std::sync::atomic::Ordering::Relaxed);
+        self.next_id.store(
             id.checked_add(1)
                 .expect("constructor family identity exhausted"),
+            std::sync::atomic::Ordering::Relaxed,
         );
         id
     }
@@ -243,18 +244,24 @@ impl ConstructorFamilies {
     }
 
     /// Every indexed family whose new.target owner is a closure or class of
-    /// the function `owner`.
-    pub(crate) fn of_owner(&self, owner: u32) -> smallvec::SmallVec<[ConstructorLayout; 1]> {
-        self.by_owner
-            .borrow()
-            .get(&owner)
-            .cloned()
-            .unwrap_or_default()
+    /// the function `owner`; `None` while the mutator writes the index.
+    pub(crate) fn try_of_owner(
+        &self,
+        owner: u32,
+    ) -> Option<smallvec::SmallVec<[ConstructorLayout; 1]>> {
+        Some(
+            self.by_owner
+                .try_read()?
+                .get(&owner)
+                .cloned()
+                .unwrap_or_default(),
+        )
     }
 
-    #[must_use]
-    pub(crate) fn get(&self, family_id: u64) -> Option<ConstructorLayout> {
-        self.by_id.borrow().get(&family_id).copied()
+    /// The family `family_id`; `None` when unindexed or while the mutator
+    /// writes the index.
+    pub(crate) fn try_get(&self, family_id: u64) -> Option<ConstructorLayout> {
+        self.by_id.try_read()?.get(&family_id).copied()
     }
 
     /// The full collection's weak pass: forget every family the marking left
@@ -294,7 +301,9 @@ impl ConstructorFamilies {
                 by_owner.entry(owner).or_default().push(layout);
             }
         }
-        families.next_id.set(next);
+        families
+            .next_id
+            .store(next, std::sync::atomic::Ordering::Relaxed);
         families
     }
 }

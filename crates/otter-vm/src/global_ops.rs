@@ -232,7 +232,7 @@ impl Interpreter {
             .map_err(CommittedValueError::JavaScript)?
         {
             if let Some(site) = cache_site
-                && let Some((cell, _)) = self.global_lexicals.get(name).copied()
+                && let Some((cell, _)) = self.global_lexicals().get(name).copied()
             {
                 self.global_lexical_load_ic.insert(site, cell);
             }
@@ -299,7 +299,7 @@ impl Interpreter {
     /// when the name has no global lexical binding;
     /// `Err(ReferenceError)` when the binding is still in its TDZ.
     pub(crate) fn read_global_lexical(&self, name: &str) -> Result<Option<Value>, VmError> {
-        let Some((cell, _)) = self.global_lexicals.get(name) else {
+        let Some((cell, _)) = self.global_lexicals().get(name) else {
             return Ok(None);
         };
         let value = crate::read_upvalue(&self.gc_heap, *cell);
@@ -412,7 +412,7 @@ impl Interpreter {
         // global *lexical* binding is a SyntaxError at declaration
         // time (script collisions are early errors; eval collisions
         // surface here).
-        if self.global_lexicals.contains_key(name) {
+        if self.global_lexicals().contains_key(name) {
             return Err(
                 self.err_syntax((format!("Identifier '{name}' has already been declared")).into())
             );
@@ -547,7 +547,7 @@ impl Interpreter {
         let name = context
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
-        if self.global_lexicals.contains_key(name) {
+        if self.global_lexicals().contains_key(name) {
             return Err(
                 self.err_syntax((format!("Identifier '{name}' has already been declared")).into())
             );
@@ -567,11 +567,12 @@ impl Interpreter {
             );
         }
         let cell = crate::alloc_upvalue(&mut self.gc_heap, Value::hole())?;
-        self.global_lexicals.insert(name.into(), (cell, is_const));
+        self.global_lexicals_mut()
+            .insert(name.into(), (cell, is_const));
         // Generated code reads a global-object property only while it is an
         // own property: a lexical that shadows none invalidates no such read.
         if shadowed.is_some() {
-            self.global_lexical_epoch = self.global_lexical_epoch.wrapping_add(1);
+            self.bump_global_lexical_epoch();
             crate::object::invalidate_dictionary_layout_proof(self.global_this, &self.gc_heap);
         }
         self.global_object_load_ic.clear();
@@ -607,7 +608,7 @@ impl Interpreter {
             // Lexical: same checks as DeclareGlobalLex, minus the
             // cell creation.
             0 => {
-                if self.global_lexicals.contains_key(name) {
+                if self.global_lexicals().contains_key(name) {
                     return Err(self.err_syntax(
                         (format!("Identifier '{name}' has already been declared")).into(),
                     ));
@@ -624,7 +625,7 @@ impl Interpreter {
             // Var: §9.1.1.4.15 CanDeclareGlobalVar + the step-5
             // lexical-collision SyntaxError.
             1 => {
-                if self.global_lexicals.contains_key(name) {
+                if self.global_lexicals().contains_key(name) {
                     return Err(self.err_syntax(
                         (format!("Identifier '{name}' has already been declared")).into(),
                     ));
@@ -633,7 +634,7 @@ impl Interpreter {
             // Function: §9.1.1.4.16 CanDeclareGlobalFunction + the
             // lexical-collision SyntaxError.
             _ => {
-                if self.global_lexicals.contains_key(name) {
+                if self.global_lexicals().contains_key(name) {
                     return Err(self.err_syntax(
                         (format!("Identifier '{name}' has already been declared")).into(),
                     ));
@@ -682,7 +683,7 @@ impl Interpreter {
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)?;
         let cell = self
-            .global_lexicals
+            .global_lexicals()
             .get(name)
             .map(|(cell, _)| *cell)
             .ok_or(VmError::InvalidOperand)?;
@@ -730,7 +731,7 @@ impl Interpreter {
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)
             .map_err(CommittedValueError::Fatal)?;
-        if self.global_lexicals.contains_key(name)
+        if self.global_lexicals().contains_key(name)
             || object::get_own_descriptor(self.global_this, &self.gc_heap, name).is_some()
         {
             return Ok(Value::boolean(true));
@@ -855,7 +856,7 @@ impl Interpreter {
             .string_constant_str_for_function(function_id, name_idx)
             .ok_or(VmError::InvalidOperand)
             .map_err(CommittedValueError::Fatal)?;
-        if let Some(&(cell, is_const)) = self.global_lexicals.get(name) {
+        if let Some(&(cell, is_const)) = self.global_lexicals().get(name) {
             if is_const {
                 return Err(CommittedValueError::JavaScript(self.err_type(
                     (format!("Assignment to constant variable `{name}`")).into(),

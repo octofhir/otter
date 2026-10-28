@@ -29,7 +29,10 @@ impl Interpreter {
         if family_id == 0 {
             return None;
         }
-        let layout = self.constructor_families.get(family_id)?;
+        let layout = self
+            .compile_shared
+            .constructor_families
+            .try_get(family_id)?;
         let (finalized, detached, layout_base, (owner, owner_fid)) =
             self.gc_heap.read_payload(layout, |body| {
                 (

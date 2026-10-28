@@ -175,7 +175,7 @@ fn assert_proofs(
         shape,
         dictionary,
         field,
-        global_lexical_epoch: interpreter.global_lexical_epoch,
+        global_lexical_epoch: interpreter.global_lexical_epoch(),
         writable,
         layout,
     };
@@ -199,7 +199,7 @@ fn assert_proofs(
                     shape,
                     dictionary,
                     field,
-                    global_lexical_epoch: interpreter.global_lexical_epoch,
+                    global_lexical_epoch: interpreter.global_lexical_epoch(),
                 })
             );
         }
@@ -244,7 +244,7 @@ fn ordinary_global_value_updates_keep_proofs_but_native_freeze_retires_the_ident
     let before = bake(&mut interpreter, &context);
     assert_proofs(&interpreter, &before, false, true);
     let shape = object::keyed_shape(interpreter.global_this, &interpreter.gc_heap);
-    let epoch = interpreter.global_lexical_epoch;
+    let epoch = interpreter.global_lexical_epoch();
 
     replace_value(&mut interpreter, 719);
 
@@ -271,7 +271,8 @@ fn ordinary_global_value_updates_keep_proofs_but_native_freeze_retires_the_ident
     assert!(state.is_dictionary() && !state.is_extensible());
     assert!(!state.is_provisional() && !state.is_opaque() && !state.is_prototype());
     assert_eq!(
-        interpreter.global_lexical_epoch, epoch,
+        interpreter.global_lexical_epoch(),
+        epoch,
         "no lexical shadowing masks refusal"
     );
     assert!(object::is_frozen(
@@ -313,7 +314,7 @@ fn descriptor_changes_retire_ordinary_identity_and_bake_current_dictionary_flags
         let shape = object::keyed_shape(interpreter.global_this, &interpreter.gc_heap);
         let before = bake(&mut interpreter, &context);
         assert_proofs(&interpreter, &before, false, true);
-        let epoch = interpreter.global_lexical_epoch;
+        let epoch = interpreter.global_lexical_epoch();
         interpreter.with_handle_scope(|interpreter, scope| {
             let global = interpreter.scoped_value(scope, Value::object(interpreter.global_this));
             let object = interpreter.escape_scoped(global).as_object().unwrap();
@@ -336,7 +337,7 @@ fn descriptor_changes_retire_ordinary_identity_and_bake_current_dictionary_flags
         let state = object::state(interpreter.global_this, &interpreter.gc_heap);
         assert!(state.is_dictionary() && state.is_extensible());
         assert!(!state.is_provisional() && !state.is_opaque() && !state.is_prototype());
-        assert_eq!(interpreter.global_lexical_epoch, epoch);
+        assert_eq!(interpreter.global_lexical_epoch(), epoch);
         let descriptor =
             object::get_own_descriptor(interpreter.global_this, &interpreter.gc_heap, NAME)
                 .unwrap();

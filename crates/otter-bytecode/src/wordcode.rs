@@ -297,6 +297,12 @@ impl FunctionCode {
         self.storage.instructions.iter()
     }
 
+    /// Every instruction, indexed by logical PC.
+    #[must_use]
+    pub fn instructions(&self) -> &[Instruction] {
+        &self.storage.instructions
+    }
+
     /// Instruction at one logical PC.
     #[must_use]
     pub fn get(&self, pc: usize) -> Option<&Instruction> {

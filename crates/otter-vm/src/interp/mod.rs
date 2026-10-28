@@ -5,6 +5,7 @@
 //! re-exports the names that were previously defined at the crate root.
 pub(crate) mod call_dispatch;
 mod dispatch;
+mod dispatch_ops;
 mod errors;
 mod exec;
 mod feedback;

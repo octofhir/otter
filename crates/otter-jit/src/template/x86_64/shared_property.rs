@@ -3,7 +3,8 @@
 //!
 //! # Contents
 //! - [`emit_routine`] emits one routine: load, store, method, concat, keyed
-//!   load or keyed store. [`emit_call`] calls one of them.
+//!   load or keyed store, with probe entries of load and store for optimized
+//!   sites. [`emit_call`] calls one of them.
 //! - Load: the receiver shape selects an entry of the site's slot whose
 //!   handler runs in machine code: own field, prototype field under its chain
 //!   proof, nonexistent key. A megamorphic slot probes the isolate's shared
@@ -35,9 +36,10 @@
 //!   precedes the first effect. Only barriers and the miss call out.
 //! - Feedback is read, never baked: a miss's slot update serves the next
 //!   execution of already-published code.
-//! - The load and store inputs are the committed runtime ABI's, so an
-//!   optimized site calls them like the runtime stub, with every live value in
-//!   its home and the safepoint stamped.
+//! - The probe entries complete no miss and call nothing that collects: the
+//!   load probe preserves every register but `rax`, `r10` and `r11`, the store
+//!   probe every register but `r10` and `r11`. The optimized site enters the
+//!   committed runtime operation on a miss.
 //! - Routines embed only isolate-wide layouts and addresses.
 //!
 //! # See also
@@ -106,9 +108,8 @@ pub(crate) fn emit_call(
     dynasm!(ops ; .arch x64 ; call r11);
 }
 
-/// Emit the routine `object` holds, returning its entry offsets. The load
-/// and store routines already take the committed runtime ABI, so their
-/// committed entries are the routines themselves.
+/// Emit the routine `object` holds, returning its entry offsets: for load
+/// and store, the routine and its probe entry.
 pub(crate) fn emit_routine(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -134,6 +135,8 @@ pub(crate) fn emit_routine(
     let second = ops.offset().0;
     match object {
         RoutineObject::Load => emit_load_probe(ops, relocations, view),
+        RoutineObject::Store => emit_store_probe(ops, relocations, view),
+        RoutineObject::KeyedLoad => emit_keyed_load_probe(ops, relocations, view),
         _ => {
             return RoutineOffsets {
                 entry,
@@ -199,6 +202,161 @@ fn emit_load_probe(
         ; pop r9 ; pop r8 ; pop rdi ; pop rcx ; pop rdx
         ; ret
     );
+}
+
+/// Store probe inputs: the receiver and value words; the slot address
+/// arrives in [`PROBE_SLOT`] and the status leaves in [`PROBE_STATUS`].
+pub(crate) const PROBE_STORE_RECEIVER: u8 = STORE_RECEIVER;
+pub(crate) const PROBE_STORE_VALUE: u8 = STORE_VALUE;
+
+/// The store selection for an optimized site: `r11 == 0` once the value is
+/// stored with both barriers, else `r11 != 0` with nothing written. Every
+/// register but `r10` and `r11` is preserved; nothing collects.
+fn emit_store_probe(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+) {
+    let megamorphic = ops.new_dynamic_label();
+    let slot_stored = ops.new_dynamic_label();
+    let table_stored = ops.new_dynamic_label();
+    let table_appended = ops.new_dynamic_label();
+    let appended = ops.new_dynamic_label();
+    let stored = ops.new_dynamic_label();
+    let miss = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    // Five pushes over the return address leave the stack 16-byte aligned
+    // for the barriers' cold calls.
+    dynasm!(ops ; .arch x64
+        ; push rax ; push rcx ; push rdi ; push r8 ; push r9
+        ; mov Rq(STORE_SLOT), Rq(PROBE_SLOT));
+    property_ic::emit_slot_store(
+        ops,
+        relocations,
+        view,
+        STORE_RECEIVER,
+        STORE_VALUE,
+        STORE_SLOT,
+        [8, 9, 7],
+        megamorphic,
+        miss,
+        slot_stored,
+    );
+    dynasm!(ops ; .arch x64
+        ; =>megamorphic
+        ; mov r9d, [Rq(STORE_SLOT) + IC.atom_byte as i32]);
+    // The probe's identity temporary (`rdi`) carries an appended child,
+    // matching the slot's child register.
+    emit_action_probe(
+        ops,
+        relocations,
+        view,
+        view.property_action_cache,
+        9,
+        PropertySourceAccess::Store,
+        STORE_RECEIVER,
+        Some(STORE_VALUE),
+        [0, 7, 8, 1],
+        None,
+        false,
+        miss,
+        table_stored,
+        table_appended,
+    );
+    // The storage owner is the slot register on every hit; the receiver
+    // word survives.
+    dynasm!(ops ; .arch x64
+        ; =>table_appended
+        ; mov Rq(STORE_SLOT), Rq(STORE_RECEIVER)
+        ; jmp =>appended
+        ; =>table_stored
+        ; mov Rq(STORE_SLOT), Rq(STORE_RECEIVER)
+        ; jmp =>stored
+        ; =>slot_stored
+        ; test edi, edi
+        ; jz =>stored
+        ; =>appended);
+    emit_load_u64(ops, 11, CAGE_MASK);
+    dynasm!(ops ; .arch x64
+        ; and r11, Rq(STORE_SLOT) ; mov r8d, edi ; add r8, r11);
+    emit_write_barrier_preserving(ops, relocations, view, STORE_SLOT, 8);
+    dynasm!(ops ; .arch x64 ; =>stored);
+    emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64
+        ; test Rq(STORE_VALUE), r11 ; jnz >primitive
+        ; test Rq(STORE_VALUE), Rq(STORE_VALUE) ; jz >primitive);
+    emit_write_barrier_preserving(ops, relocations, view, STORE_SLOT, STORE_VALUE);
+    dynasm!(ops ; .arch x64
+        ; primitive:
+        ; xor Rd(PROBE_STATUS), Rd(PROBE_STATUS)
+        ; jmp =>done
+        ; =>miss
+        ; mov Rd(PROBE_STATUS), 1
+        ; =>done
+        ; pop r9 ; pop r8 ; pop rdi ; pop rcx ; pop rax
+        ; ret);
+}
+
+/// The edge barrier for the cell `child` just stored into `parent`, with an
+/// inline fast path over `r10` and `r11` alone and a cold leaf call that
+/// saves every volatile register. Expects a 16-byte aligned stack.
+fn emit_write_barrier_preserving(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    parent: u8,
+    child: u8,
+) {
+    debug_assert!(!matches!(parent, 10 | 11) && !matches!(child, 10 | 11));
+    let slow = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    let layout = view.gc_barrier;
+    let settled = layout.young_flag | layout.remembered_flag;
+    dynasm!(ops ; .arch x64
+        ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
+        ; mov r10, [r10 + crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
+        ; cmp BYTE [r10], 0 ; je >generational
+        // While marking runs, a white old child owes the insertion barrier.
+        ; test BYTE [Rq(child) + layout.header_flags_byte as i32], layout.young_flag as i8 ; jnz >generational
+        ; test BYTE [Rq(child) + layout.header_flags_byte as i32], layout.mark_color_bits as i8 ; jz =>slow
+        ; generational:
+        ; test BYTE [Rq(parent) + layout.header_flags_byte as i32], settled as i8 ; jnz =>done
+        ; test BYTE [Rq(child) + layout.header_flags_byte as i32], layout.young_flag as i8 ; jz =>done
+        ; =>slow);
+    // Nine volatile words and sixteen vector registers, a multiple of 16.
+    const SAVE: i32 = 9 * 8 + 16 * 16 + 8;
+    const VOLATILE: [u8; 9] = [0, 1, 2, 6, 7, 8, 9, 10, 11];
+    dynasm!(ops ; .arch x64 ; sub rsp, SAVE);
+    for (index, register) in VOLATILE.into_iter().enumerate() {
+        dynasm!(ops ; .arch x64 ; mov [rsp + index as i32 * 8], Rq(register));
+    }
+    for register in 0u8..16 {
+        dynasm!(ops ; .arch x64 ; movdqu [rsp + 72 + i32::from(register) * 16], Rx(register));
+    }
+    let saved = |register: u8| VOLATILE.iter().position(|&r| r == register);
+    for (argument, register) in [(6u8, parent), (2, child)] {
+        match saved(register) {
+            Some(index) => dynasm!(ops ; .arch x64 ; mov Rq(argument), [rsp + index as i32 * 8]),
+            None => dynasm!(ops ; .arch x64 ; mov Rq(argument), Rq(register)),
+        }
+    }
+    dynasm!(ops ; .arch x64
+        ; mov rdi, [r15 + crate::entry::THREAD_OFFSET as i32]
+        ; mov rdi, [rdi + crate::entry::VM_THREAD_GC_HEAP_OFFSET as i32]);
+    emit_load_runtime_stub(
+        ops,
+        relocations,
+        otter_vm::runtime_stubs::WRITE_BARRIER_MUTATING.entry_addr() as u64,
+        abi::STUB_WRITE_BARRIER,
+    );
+    emit_runtime_call(ops, abi::STUB_WRITE_BARRIER);
+    for register in 0u8..16 {
+        dynasm!(ops ; .arch x64 ; movdqu Rx(register), [rsp + 72 + i32::from(register) * 16]);
+    }
+    for (index, register) in VOLATILE.into_iter().enumerate() {
+        dynasm!(ops ; .arch x64 ; mov Rq(register), [rsp + index as i32 * 8]);
+    }
+    dynasm!(ops ; .arch x64 ; add rsp, SAVE ; =>done);
 }
 
 /// Leave the atom of the string or symbol `key` in `Rd(atom)`, or branch to
@@ -378,6 +536,94 @@ fn emit_keyed_load(
         ; ret
         ; =>miss
         ; mov edx, 1
+        ; ret);
+}
+
+/// Keyed load probe result on a hit.
+pub(crate) const PROBE_KEYED_RESULT: u8 = 0;
+
+/// The keyed load's shaped table hit for an optimized site, receiver in
+/// [`KEYED_LOAD_RECEIVER`] and key in [`KEYED_LOAD_KEY`]: `r11 == 0` with the
+/// value in [`PROBE_KEYED_RESULT`], else `r11 != 0` and the site takes the
+/// full routine. A key whose atom is unrecorded, a dictionary-mode receiver
+/// and a table miss all decline; nothing is called. Every register but the
+/// result, `r10` and `r11` is preserved.
+fn emit_keyed_load_probe(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+) {
+    let miss = ops.new_dynamic_label();
+    let object = ops.new_dynamic_label();
+    let loaded = ops.new_dynamic_label();
+    let ready = ops.new_dynamic_label();
+    let symbol = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    let key = KEYED_LOAD_KEY;
+    // The probe works on a copy of the receiver, which an Array's bag
+    // replaces.
+    dynasm!(ops ; .arch x64
+        ; push rcx ; push rdi ; push r8 ; push r9 ; push rdx
+        ; mov rdx, Rq(KEYED_LOAD_RECEIVER));
+    emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64
+        ; test Rq(key), r11 ; jnz =>miss
+        ; test Rq(key), Rq(key) ; jz =>miss
+        ; movzx r11d, BYTE [Rq(key)]
+        ; cmp r11d, i32::from(view.string_layout.string_type_tag) ; jne =>symbol
+        // The body records the atom plus one; zero is unrecorded.
+        ; mov r9d, [Rq(key) + view.string_layout.atom_byte as i32]
+        ; sub r9d, 1 ; jb =>miss
+        ; jmp =>ready
+        ; =>symbol
+        ; cmp r11d, i32::from(otter_vm::symbol::SYMBOL_BODY_TYPE_TAG) ; jne =>miss
+        ; mov r9d, [Rq(key) + otter_vm::symbol::SYMBOL_ATOM_BYTE as i32]
+        ; cmp r9d, -1 ; je =>miss
+        ; =>ready);
+    // The table holds no dictionary-mode object's keys, so its probe misses
+    // such a receiver by shape identity; an Array reads its named bag.
+    emit_array_bag(ops, view, 2, object, miss);
+    emit_action_probe(
+        ops,
+        relocations,
+        view,
+        view.property_action_cache,
+        9,
+        PropertySourceAccess::Load,
+        2,
+        None,
+        [1, 7, 8, 0],
+        Some(PROBE_KEYED_RESULT),
+        true,
+        miss,
+        loaded,
+        loaded,
+    );
+    dynasm!(ops ; .arch x64 ; =>object);
+    emit_action_probe(
+        ops,
+        relocations,
+        view,
+        view.property_action_cache,
+        9,
+        PropertySourceAccess::Load,
+        2,
+        None,
+        [1, 7, 8, 0],
+        Some(PROBE_KEYED_RESULT),
+        false,
+        miss,
+        loaded,
+        loaded,
+    );
+    dynasm!(ops ; .arch x64
+        ; =>loaded
+        ; xor Rd(PROBE_STATUS), Rd(PROBE_STATUS)
+        ; jmp =>done
+        ; =>miss
+        ; mov Rd(PROBE_STATUS), 1
+        ; =>done
+        ; pop rdx ; pop r9 ; pop r8 ; pop rdi ; pop rcx
         ; ret);
 }
 

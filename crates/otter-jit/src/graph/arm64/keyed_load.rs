@@ -2,8 +2,9 @@
 //!
 //! # Contents
 //! - [`Codegen::emit_load_keyed_cached`] reads an Array's dense storage of
-//!   any kind inline, a name key through the code object's keyed table
-//!   routine, and every other load in the runtime.
+//!   any kind inline, a name key through the keyed table probe and, when it
+//!   declines, the code object's keyed table routine, and every other load
+//!   in the runtime.
 //!
 //! # Invariants
 //! - Inline paths read only: an element present in dense storage is an own
@@ -164,6 +165,29 @@ impl Codegen<'_> {
             ; b.ne =>missed
             ; =>name
         );
+        {
+            let probe = super::super::registers::AARCH64.keyed_load_probe;
+            use crate::template::arm64::shared_property::{
+                PROBE_KEYED_LOAD_CLOBBERS, PROBE_KEYED_RESULT,
+            };
+            debug_assert_eq!((receiver, key), (probe.receiver, probe.key));
+            debug_assert_eq!((receiver, key), (KEYED_LOAD_RECEIVER, KEYED_LOAD_KEY));
+            debug_assert_eq!(probe.clobbers, PROBE_KEYED_LOAD_CLOBBERS);
+            let declined = self.ops.new_dynamic_label();
+            crate::template::arm64::shared_property::emit_call(
+                &mut self.ops,
+                &mut self.relocations,
+                self.routines,
+                crate::routines::Routine::ProbeKeyedLoad,
+            );
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; cbnz x17, =>declined
+                ; mov X(destination), X(PROBE_KEYED_RESULT)
+                ; b =>loaded
+                ; =>declined
+            );
+        }
         let live = self.allocation.node(node).live_registers.clone();
         // The operands may sit in registers the routine's inputs name: park
         // them below the saved registers and load the inputs from there.

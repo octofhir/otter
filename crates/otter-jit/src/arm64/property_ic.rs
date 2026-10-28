@@ -96,6 +96,12 @@ pub(crate) fn emit_select_entry(
     let found = ops.new_dynamic_label();
     let keyed = ops.new_dynamic_label();
     let projected = ops.new_dynamic_label();
+    // A megamorphic slot leaves before the receiver is decoded: the shared
+    // table's probe decodes it once. `W(entry)` keeps the state word for the
+    // entry count until the scan starts.
+    dynasm!(ops ; .arch aarch64
+        ; ldr W(entry), [X(slot), IC.state_byte]
+        ; tbnz W(entry), IC.megamorphic_bit.trailing_zeros(), =>megamorphic);
     emit_cell_test(ops, receiver, CellTest::IsNotCell, miss);
     dynasm!(ops ; .arch aarch64
         ; cbz X(receiver), =>miss
@@ -117,9 +123,7 @@ pub(crate) fn emit_select_entry(
     }
     dynasm!(ops ; .arch aarch64
         ; =>keyed
-        ; ldr w16, [X(slot), IC.state_byte]
-        ; tbnz w16, IC.megamorphic_bit.trailing_zeros(), =>megamorphic
-        ; and w16, w16, #IC.count_mask
+        ; and w16, W(entry), #IC.count_mask
         ; cbz w16, =>miss
         ; add XSP(entry), XSP(slot), #IC.entries_byte
         ; =>scan

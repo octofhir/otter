@@ -38,7 +38,9 @@
 //!   until after the node's result is assigned: a result never overwrites
 //!   the only location an exit still reads.
 //! - Fixed arithmetic clobbers are evicted into canonical definition homes
-//!   before inputs are assigned. Inputs and temporaries avoid those
+//!   before inputs are assigned; a collecting node's clobbers move a value
+//!   live past it to a free register it neither writes nor reads as a fixed
+//!   input, else into that home. Inputs and temporaries avoid those
 //!   registers; a fixed result writes them late.
 //! - Register decisions never depend on which slot a home gets: the walk
 //!   names each home after its value, and coloring only renames homes and
@@ -1003,7 +1005,7 @@ impl<'g> Allocator<'g> {
 
     /// Reserve implicit writes before any input can be placed in their
     /// registers. Discovery and final assignment use the same eviction order.
-    fn prepare_constraints(&mut self, constraints: &Constraints) -> u32 {
+    fn prepare_constraints(&mut self, constraints: &Constraints, collecting: bool) -> u32 {
         let validate = |register: u8| {
             assert!(
                 register < 32 && self.gp.allocatable & (1 << register) != 0,
@@ -1032,12 +1034,49 @@ impl<'g> Allocator<'g> {
         if let ResultPolicy::FixedGp(register) = constraints.result {
             validate(register);
         }
-        self.gp.blocked = clobbers;
+        // A collecting node's slow path already preserves registers through
+        // homes, so a value its implicit writes displace and that stays live
+        // past it moves to a register the node neither writes nor takes as a
+        // fixed input, when one is free: the fast path then stores no home.
+        let mut fixed_inputs = 0;
+        for &policy in &constraints.inputs {
+            if let InputPolicy::FixedGp(register) | InputPolicy::FixedGpOrConstant(register) =
+                policy
+            {
+                fixed_inputs |= 1 << register;
+            }
+        }
+        self.gp.blocked = clobbers | fixed_inputs;
         self.fp.blocked = 0;
         for &register in &constraints.fixed_gp_clobbers {
-            self.evict(false, register);
+            if collecting {
+                self.evict_aside(register);
+            } else {
+                self.evict(false, register);
+            }
         }
+        self.gp.blocked = clobbers;
         clobbers
+    }
+
+    /// [`Self::evict`] of a general register that keeps a value still live
+    /// after the current node in a free unblocked register when one exists.
+    fn evict_aside(&mut self, register: u8) {
+        let Some(value) = self.gp.holder(register) else {
+            return;
+        };
+        let at = self.pos(self.current);
+        if self.is_live_after(value, at)
+            && !self.graph.node(value).kind.is_constant()
+            && self.registers_of(value) == 1 << register
+            && let Some(free) = self.gp.free_unblocked().next()
+        {
+            self.unbind(false, register);
+            self.emit_move(Location::Gp(register), Location::Gp(free));
+            self.bind(value, free);
+            return;
+        }
+        self.evict(false, register);
     }
 
     /// Fixed words move first so other inputs cannot consume their registers.
@@ -1115,7 +1154,7 @@ impl<'g> Allocator<'g> {
             return;
         }
         let constraints = data.kind.constraints(data.inputs.len(), &self.registers);
-        let fixed_clobbers = self.prepare_constraints(&constraints);
+        let fixed_clobbers = self.prepare_constraints(&constraints, properties.may_collect);
         let inputs = self.allocate_inputs(&data.inputs, &constraints);
         self.out.nodes[node.0 as usize].inputs = inputs.clone();
         if properties.call {
@@ -1255,7 +1294,7 @@ impl<'g> Allocator<'g> {
         let data = graph.node(control);
         let at = self.pos(control);
         let constraints = data.kind.constraints(data.inputs.len(), &self.registers);
-        self.prepare_constraints(&constraints);
+        self.prepare_constraints(&constraints, false);
         let inputs = self.allocate_inputs(&data.inputs, &constraints);
         self.out.nodes[control.0 as usize].inputs = inputs;
         if let Some(state) = data.eager {

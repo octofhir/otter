@@ -145,6 +145,26 @@ impl Codegen<'_> {
             ; cmp BYTE [Rq(key)], otter_vm::symbol::SYMBOL_BODY_TYPE_TAG as i8 ; jne =>missed
             ; =>name
         );
+        {
+            let probe = super::super::registers::X86_64.keyed_load_probe;
+            use crate::template::x86_64::shared_property::{PROBE_KEYED_RESULT, PROBE_STATUS};
+            debug_assert_eq!((receiver, key), (probe.receiver, probe.key));
+            debug_assert_eq!((receiver, key), (KEYED_LOAD_RECEIVER, KEYED_LOAD_KEY));
+            debug_assert_eq!(probe.clobbers, [PROBE_KEYED_RESULT]);
+            let declined = self.ops.new_dynamic_label();
+            crate::template::x86_64::shared_property::emit_call(
+                &mut self.ops,
+                &mut self.relocations,
+                self.routines,
+                crate::routines::Routine::ProbeKeyedLoad,
+            );
+            dynasm!(self.ops ; .arch x64
+                ; test Rq(PROBE_STATUS), Rq(PROBE_STATUS) ; jnz =>declined
+                ; mov Rq(destination), Rq(PROBE_KEYED_RESULT)
+                ; jmp =>loaded
+                ; =>declined
+            );
+        }
         let live = self.allocation.node(node).live_registers.clone();
         // The operands may sit in registers the routine's inputs name: park
         // them below the saved registers and load the inputs from there.

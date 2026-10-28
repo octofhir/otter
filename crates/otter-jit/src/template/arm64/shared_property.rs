@@ -3,8 +3,8 @@
 //!
 //! # Contents
 //! - [`emit_routine`] emits one routine: load, store, method, concat, keyed
-//!   load or keyed store, with committed-ABI entries of load and store for
-//!   optimized megamorphic sites. [`emit_call`] calls one of them.
+//!   load or keyed store, with probe entries of load and store for optimized
+//!   sites. [`emit_call`] calls one of them.
 //! - Load: the receiver shape selects an entry of the site's
 //!   [`otter_vm::jit::PropertyIcLayout`] slot, whose handler is dispatched in
 //!   machine code: own field, prototype field under its chain proof,
@@ -35,9 +35,9 @@
 //!   in `x0`, or a Throw/Fatal status the site routes through its own exits.
 //! - Selection and handlers neither allocate nor collect; only the miss calls
 //!   the runtime. Every handler check precedes the first effect.
-//! - A committed-ABI entry is called like a runtime stub, with every live
-//!   value already in its home and the safepoint stamped, so its miss may
-//!   collect as the runtime stub would.
+//! - A probe entry completes no miss and calls nothing that collects: the
+//!   each writes only its declared clobbers, its result, `x16` and `x17`.
+//!   The optimized site enters the committed runtime operation on a miss.
 //! - Routines embed only isolate-wide layouts and addresses; nothing about
 //!   the calling code object.
 //! - Inputs other than the receiver/value survive no call, matching the
@@ -131,14 +131,8 @@ pub(crate) fn emit_routine(
     let second = ops.offset().0;
     match object {
         RoutineObject::Load => emit_load_probe(ops, relocations, view),
-        // The committed runtime ABI passes the context in `x0`, which `x20`
-        // already holds, and the operands from `x1`.
-        RoutineObject::Store => dynasm!(ops ; .arch aarch64
-            ; mov X(STORE_RECEIVER), x1
-            ; mov X(STORE_VALUE), x2
-            ; mov X(STORE_SLOT), x3
-            ; b =>label
-        ),
+        RoutineObject::Store => emit_store_probe(ops, relocations, view),
+        RoutineObject::KeyedLoad => emit_keyed_load_probe(ops, relocations, view),
         _ => {
             return RoutineOffsets {
                 entry,
@@ -178,12 +172,16 @@ fn emit_store_tail(
 }
 
 /// Probe entry inputs: the receiver and the site's slot address.
-pub(crate) const PROBE_RECEIVER: u8 = 1;
-pub(crate) const PROBE_SLOT: u8 = 17;
+pub(crate) const PROBE_RECEIVER: u8 = LOAD_RECEIVER;
+pub(crate) const PROBE_SLOT: u8 = LOAD_SLOT;
+/// The registers the load probe writes besides `x16`, `x17` and its result
+/// in `x0`: its slot input and its temporaries.
+pub(crate) const PROBE_LOAD_CLOBBERS: [u8; 6] = [3, PROBE_SLOT, 11, 13, 14, 15];
 
-/// The load selection for an optimized site, receiver in `x1` and slot
-/// address in `x17`: `x17 == 0` with the value in `x0`, else `x17 != 0`.
-/// Every register but `x0`, `x16` and `x17` is preserved; nothing is called.
+/// The load selection for an optimized site, receiver in [`PROBE_RECEIVER`]
+/// and slot address in [`PROBE_SLOT`]: `x17 == 0` with the value in `x0`,
+/// else `x17 != 0`. The receiver survives; only [`PROBE_LOAD_CLOBBERS`],
+/// `x0`, `x16` and `x17` are written and nothing is called.
 fn emit_load_probe(
     ops: &mut Assembler,
     relocations: &mut RelocationCapture,
@@ -191,29 +189,174 @@ fn emit_load_probe(
 ) {
     let loaded = ops.new_dynamic_label();
     let miss = ops.new_dynamic_label();
-    let done = ops.new_dynamic_label();
-    dynasm!(ops ; .arch aarch64
-        ; sub sp, sp, #64
-        ; stp x3, x9, [sp]
-        ; stp x10, x11, [sp, #16]
-        ; stp x13, x14, [sp, #32]
-        ; str x15, [sp, #48]
-        ; mov X(LOAD_RECEIVER), X(PROBE_RECEIVER)
-        ; mov X(LOAD_SLOT), X(PROBE_SLOT)
-    );
     emit_load_handlers(ops, relocations, view, loaded, miss);
     dynasm!(ops ; .arch aarch64
         ; =>loaded
-        ; mov X(PROBE_SLOT), xzr
-        ; b =>done
+        ; mov x17, xzr
+        ; ret
         ; =>miss
-        ; movz X(PROBE_SLOT), 1
-        ; =>done
-        ; ldp x3, x9, [sp]
-        ; ldp x10, x11, [sp, #16]
-        ; ldp x13, x14, [sp, #32]
-        ; ldr x15, [sp, #48]
-        ; add sp, sp, #64
+        ; movz x17, 1
+        ; ret
+    );
+}
+
+/// Store probe inputs: the receiver, the value and the site's slot address.
+pub(crate) const PROBE_STORE_RECEIVER: u8 = STORE_RECEIVER;
+pub(crate) const PROBE_STORE_VALUE: u8 = STORE_VALUE;
+pub(crate) const PROBE_STORE_SLOT: u8 = STORE_SLOT;
+/// The registers the store probe writes besides `x16` and `x17`: its slot
+/// input and its temporaries.
+pub(crate) const PROBE_STORE_CLOBBERS: [u8; 6] = [3, PROBE_STORE_SLOT, 11, 13, 14, 15];
+
+/// The store selection for an optimized site: `x17 == 0` once the value is
+/// stored with both barriers, else `x17 != 0` with nothing written. The
+/// receiver and value survive; [`PROBE_STORE_CLOBBERS`], `x16` and `x17` are
+/// written and every other register is preserved. Nothing collects: the
+/// barriers' slow paths save the volatile registers around their leaves.
+fn emit_store_probe(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+) {
+    let megamorphic = ops.new_dynamic_label();
+    let stored = ops.new_dynamic_label();
+    let primitive = ops.new_dynamic_label();
+    let miss = ops.new_dynamic_label();
+    property_ic::emit_slot_store(
+        ops,
+        relocations,
+        view,
+        PROBE_STORE_RECEIVER,
+        PROBE_STORE_VALUE,
+        PROBE_STORE_SLOT,
+        [13, 14, 11],
+        megamorphic,
+        miss,
+        stored,
+    );
+    dynasm!(ops ; .arch aarch64
+        ; =>megamorphic
+        ; ldr w3, [X(PROBE_STORE_SLOT), IC.atom_byte]
+    );
+    property_actions::emit_store(
+        ops,
+        relocations,
+        view,
+        3,
+        [PROBE_STORE_RECEIVER, PROBE_STORE_VALUE],
+        [15, 11, 13, 14],
+        false,
+        miss,
+    );
+    // Both paths leave the compressed child (zero for an overwrite) in
+    // `w11` and the storage owner in the slot register.
+    dynasm!(ops ; .arch aarch64
+        ; mov X(PROBE_STORE_SLOT), X(PROBE_STORE_RECEIVER)
+        ; =>stored
+        ; cbz w11, >value
+    );
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        13,
+        view.cage_base as u64,
+        RelocationTarget::GcCageBase,
+    );
+    dynasm!(ops ; .arch aarch64 ; add x13, x13, x11);
+    super::values::emit_write_barrier_preserving(ops, relocations, view, PROBE_STORE_SLOT, 13);
+    dynasm!(ops ; .arch aarch64 ; value:);
+    emit_cell_test(ops, PROBE_STORE_VALUE, CellTest::IsNotCell, primitive);
+    super::values::emit_write_barrier_preserving(
+        ops,
+        relocations,
+        view,
+        PROBE_STORE_SLOT,
+        PROBE_STORE_VALUE,
+    );
+    dynasm!(ops ; .arch aarch64
+        ; =>primitive
+        ; mov x17, xzr
+        ; ret
+        ; =>miss
+        ; movz x17, 1
+        ; ret
+    );
+}
+
+/// Keyed load probe result on a hit.
+pub(crate) const PROBE_KEYED_RESULT: u8 = 0;
+/// The registers the keyed load probe writes besides `x16` and `x17`: its
+/// result and its temporaries.
+pub(crate) const PROBE_KEYED_LOAD_CLOBBERS: [u8; 7] = [PROBE_KEYED_RESULT, 3, 11, 12, 13, 14, 15];
+
+/// The keyed load's shaped table hit for an optimized site, receiver in
+/// [`KEYED_LOAD_RECEIVER`] and key in [`KEYED_LOAD_KEY`]: `x17 == 0` with the
+/// value in [`PROBE_KEYED_RESULT`], else `x17 != 0` and the site takes the
+/// full routine. A key whose atom is unrecorded, a dictionary-mode receiver
+/// and a table miss all decline; nothing is called. Both inputs survive and
+/// only [`PROBE_KEYED_LOAD_CLOBBERS`], `x16` and `x17` are written.
+fn emit_keyed_load_probe(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+) {
+    let miss = ops.new_dynamic_label();
+    let object = ops.new_dynamic_label();
+    let ready = ops.new_dynamic_label();
+    let symbol = ops.new_dynamic_label();
+    let key = KEYED_LOAD_KEY;
+    // The key's recorded atom, or a decline.
+    emit_cell_test(ops, key, CellTest::IsNotCell, miss);
+    dynasm!(ops ; .arch aarch64
+        ; cbz X(key), =>miss
+        ; ldrb w16, [X(key)]
+        ; cmp w16, u32::from(view.string_layout.string_type_tag)
+        ; b.ne =>symbol
+        // The body records the atom plus one; zero is unrecorded.
+        ; ldr w11, [X(key), view.string_layout.atom_byte]
+        ; cbz w11, =>miss
+        ; sub w11, w11, #1
+        ; b =>ready
+        ; =>symbol
+        ; cmp w16, u32::from(otter_vm::symbol::SYMBOL_BODY_TYPE_TAG)
+        ; b.ne =>miss
+        ; ldr w11, [X(key), otter_vm::symbol::SYMBOL_ATOM_BYTE]
+        ; cmn w11, #1
+        ; b.eq =>miss
+        ; =>ready
+        ; mov x12, X(KEYED_LOAD_RECEIVER)
+    );
+    // The table holds no dictionary-mode object's keys, so its probe misses
+    // such a receiver by shape identity; an Array reads its named bag.
+    emit_array_bag(ops, view, 12, object, miss);
+    property_actions::emit_load(
+        ops,
+        relocations,
+        view,
+        11,
+        12,
+        [13, 14, 15, 3],
+        PROBE_KEYED_RESULT,
+        true,
+        miss,
+    );
+    dynasm!(ops ; .arch aarch64 ; mov x17, xzr ; ret ; =>object);
+    property_actions::emit_load(
+        ops,
+        relocations,
+        view,
+        11,
+        12,
+        [13, 14, 15, 3],
+        PROBE_KEYED_RESULT,
+        false,
+        miss,
+    );
+    dynasm!(ops ; .arch aarch64
+        ; mov x17, xzr
+        ; ret
+        ; =>miss
+        ; movz x17, 1
         ; ret
     );
 }

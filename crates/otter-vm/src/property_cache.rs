@@ -16,6 +16,9 @@
 //! enters the source operation once.
 //! Store owners are retained by their receiver or append child. Weak cleanup
 //! clears a whole row before a dead receiver or defining owner can be reused.
+//! Store facts exist only for shapes whose stores stay in place (not a
+//! dictionary, opaque or prototype shape) and appends only from extensible
+//! ones; shape state is immutable, so probes test no state.
 //! A shaped store uses zero owner only for an absorbing Top summary. An append
 //! with a null child has zero owner for VM dictionary replay; generated probes
 //! reject null children before effects and never use that replay marker.
@@ -44,9 +47,19 @@ pub(crate) mod jit;
 /// the rows its program fills.
 const SETS: usize = 16384;
 const WAYS: usize = 4;
-const HASH_SHAPE_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
-const HASH_ATOM_MULTIPLIER: u64 = 0xC2B2_AE3D_27D4_EB4F;
-const HASH_SHIFT: u8 = 32;
+/// A key hashes as one multiplicative product: the atom shifted above the
+/// shape identity, times the multiplier, whose top bits select the set.
+const HASH_MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+const HASH_ATOM_SHIFT: u8 = 32;
+const HASH_SHIFT: u8 = 64 - SETS.trailing_zeros() as u8;
+
+/// Whether a receiver of a shape in `state` stores through the table: not a
+/// dictionary, not an opaque lookup and not a prototype, whose semantic
+/// mutations retire dependent proofs in the runtime. Shape state is
+/// immutable, so a recorded store fact needs no state test at its probe.
+fn stores_in_place(state: object::ShapeState) -> bool {
+    !state.is_dictionary() && !state.is_opaque() && !state.is_prototype()
+}
 
 /// Selected live shared-table load action. Unknown and Unresolvable are misses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,9 +252,8 @@ impl PropertyActionCache {
     }
 
     fn set_start(shape: ShapeId, atom: AtomId) -> usize {
-        let mixed = shape.raw().wrapping_mul(HASH_SHAPE_MULTIPLIER)
-            ^ u64::from(atom.raw()).wrapping_mul(HASH_ATOM_MULTIPLIER);
-        (((mixed >> HASH_SHIFT) as usize) & (SETS - 1)) * WAYS
+        let key = shape.raw() ^ (u64::from(atom.raw()) << HASH_ATOM_SHIFT);
+        ((key.wrapping_mul(HASH_MULTIPLIER) >> HASH_SHIFT) as usize) * WAYS
     }
 
     fn find(&self, shape: ShapeId, atom: AtomId) -> Option<usize> {
@@ -444,7 +456,7 @@ impl PropertyActionCache {
         };
         let index = self.record_way(hit.shape_id, hit.atom_id);
         self.take_owners(index);
-        let entry = PropertyActionEntry {
+        let mut entry = PropertyActionEntry {
             receiver_shape_id: hit.shape_id,
             atom: hit.atom_id,
             load_action: PropertyLoadAction::OwnData,
@@ -458,6 +470,14 @@ impl PropertyActionCache {
             store_receiver: hit.shape,
             ..PropertyActionEntry::EMPTY
         };
+        // The receiver's shape fixes its state: a shape whose stores the
+        // runtime owns keeps the load fact alone.
+        if !stores_in_place(object::shape_body::state_of(hit.shape)) {
+            entry.store_action = PropertyStoreAction::Unknown;
+            entry.store_slot = 0;
+            entry.store_owner = object::ShapeHandle::null();
+            entry.store_receiver = object::ShapeHandle::null();
+        }
 
         self.entries[index].set(entry);
     }
@@ -471,6 +491,12 @@ impl PropertyActionCache {
         if !target.is_null() {
             let parent = object::shape_body::parent_of(target);
             if parent.is_null() || object::shape_body::id_of(parent) != transition.from_shape_id {
+                return;
+            }
+            // The source shape fixes its state: only an extensible shape
+            // whose stores stay in place appends through the table.
+            let state = object::shape_body::state_of(parent);
+            if !stores_in_place(state) || !state.is_extensible() {
                 return;
             }
         }

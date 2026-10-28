@@ -101,6 +101,12 @@ pub(crate) fn emit_select_entry(
     let found = ops.new_dynamic_label();
     let keyed = ops.new_dynamic_label();
     let projected = ops.new_dynamic_label();
+    // A megamorphic slot leaves before the receiver is decoded: the shared
+    // table's probe decodes it once. `Rd(scratch)` keeps the state word for
+    // the entry count.
+    dynasm!(ops ; .arch x64
+        ; mov Rd(scratch), [Rq(slot) + IC.state_byte as i32]
+        ; test Rd(scratch), IC.megamorphic_bit as i32 ; jnz =>megamorphic);
     emit_load_u64(ops, 10, otter_vm::value::tag::NOT_CELL_MASK);
     dynasm!(ops ; .arch x64
         ; test Rq(receiver), r10 ; jnz =>miss
@@ -119,8 +125,6 @@ pub(crate) fn emit_select_entry(
     }
     dynasm!(ops ; .arch x64
         ; =>keyed
-        ; mov Rd(scratch), [Rq(slot) + IC.state_byte as i32]
-        ; test Rd(scratch), IC.megamorphic_bit as i32 ; jnz =>megamorphic
         ; and Rd(scratch), IC.count_mask as i32 ; jz =>miss
         ; lea Rq(entry), [Rq(slot) + IC.entries_byte as i32]
         ; =>scan

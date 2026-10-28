@@ -1679,17 +1679,29 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            // The probe routine preserves every other allocatable register;
-            // its miss completes through the committed operation.
+            // The probe routine preserves its receiver and every allocatable
+            // register outside its result and declared clobbers; its miss
+            // completes through the committed operation.
             Self::LoadPropertyCached { .. } => Constraints {
                 inputs: smallvec::smallvec![FixedGp(target.property_probe.receiver)],
                 result: ResultPolicy::FixedGp(target.property_probe.result),
                 gp_temps: 0,
                 fp_temps: 0,
-                fixed_gp_clobbers: SmallVec::new(),
+                fixed_gp_clobbers: target.property_probe.clobbers.iter().copied().collect(),
             },
-            // The routine call stages its operands itself.
-            Self::StorePropertyCached { .. } => simple(2, ResultPolicy::None),
+            // The probe routine preserves its inputs and every allocatable
+            // register outside its declared clobbers; its miss completes
+            // through the committed operation.
+            Self::StorePropertyCached { .. } => {
+                let probe = target.property_store_probe;
+                Constraints {
+                    inputs: smallvec::smallvec![FixedGp(probe.receiver), FixedGp(probe.value)],
+                    result: ResultPolicy::None,
+                    gp_temps: 0,
+                    fp_temps: 0,
+                    fixed_gp_clobbers: probe.clobbers.iter().copied().collect(),
+                }
+            }
             Self::StoreKeyedCached { .. } => Constraints {
                 inputs: registers(3),
                 result: ResultPolicy::None,
@@ -1699,13 +1711,19 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::LoadKeyedCached { .. } => Constraints {
-                inputs: registers(2),
-                result: ResultPolicy::Register,
-                gp_temps: 3,
-                fp_temps: 1,
-                fixed_gp_clobbers: SmallVec::new(),
-            },
+            // A name key's shaped table hit goes through the probe routine,
+            // which preserves its inputs and every allocatable register
+            // outside its declared clobbers.
+            Self::LoadKeyedCached { .. } => {
+                let probe = target.keyed_load_probe;
+                Constraints {
+                    inputs: smallvec::smallvec![FixedGp(probe.receiver), FixedGp(probe.key)],
+                    result: ResultPolicy::Register,
+                    gp_temps: 3,
+                    fp_temps: 1,
+                    fixed_gp_clobbers: probe.clobbers.iter().copied().collect(),
+                }
+            }
             Self::BuiltinMethod(form) => simple(1 + form.arity(), ResultPolicy::Register),
             Self::Int32Div | Self::Int32Mod => {
                 if let Some(pair) = target.integer_division {

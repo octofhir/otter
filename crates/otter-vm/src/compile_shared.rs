@@ -101,6 +101,25 @@ pub(crate) struct CompileShared {
     /// Both key and value are scalars; all moving-GC state remains owned and
     /// traced by [`RealmState`].
     pub(crate) function_realm_ids: MutatorOwned<rustc_hash::FxHashMap<u32, u32>>,
+    /// Each classified closure source's context fact cell (`0` when the
+    /// source is untracked), published by compile preparation; the facts
+    /// live as long as the registry.
+    pub(crate) closure_context_cells: MutatorOwned<rustc_hash::FxHashMap<u32, usize>>,
+    /// Every function entry cell by function, written by the registry.
+    pub(crate) function_entries: std::sync::Arc<crate::jit_registry::EntryDirectory>,
+}
+
+impl CompileShared {
+    /// The shared tables of an isolate whose registry publishes its function
+    /// entry cells into `function_entries`.
+    pub(crate) fn new(
+        function_entries: std::sync::Arc<crate::jit_registry::EntryDirectory>,
+    ) -> Self {
+        Self {
+            function_entries,
+            ..Self::default()
+        }
+    }
 }
 
 // SAFETY: the mutator is every table's sole writer (`MutatorOwned`). The GC
@@ -118,7 +137,7 @@ macro_rules! shared_tables {
         impl Interpreter {
             $(
                 #[inline]
-                #[cfg_attr(not(test), allow(dead_code))]
+                #[allow(dead_code)]
                 pub(crate) fn $name(&self) -> &$ty {
                     self.compile_shared.$name.get(&self.mutator)
                 }
@@ -145,6 +164,7 @@ shared_tables! {
     method_feedback, method_feedback_mut: interp::MethodFeedbackDirectory;
     global_lexicals, global_lexicals_mut: rustc_hash::FxHashMap<Box<str>, (crate::UpvalueCell, bool)>;
     function_realm_ids, function_realm_ids_mut: rustc_hash::FxHashMap<u32, u32>;
+    closure_context_cells, closure_context_cells_mut: rustc_hash::FxHashMap<u32, usize>;
 }
 
 impl Interpreter {

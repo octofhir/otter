@@ -26,9 +26,13 @@ use crate::{CodeBlock, Interpreter, MethodCallFeedback, jit, native_abi};
 pub(crate) struct BakeEnv<'a> {
     pub(crate) shared: &'a CompileShared,
     pub(crate) heap: &'a otter_gc::GcHeap,
-    pub(crate) registry: &'a crate::jit_registry::JitCodeRegistry,
     pub(crate) shapes: &'a crate::object::ShapeRuntime,
-    pub(crate) intrinsics: &'a crate::realm_intrinsics::RealmIntrinsics,
+    pub(crate) string_prototype: Option<JsObject>,
+    pub(crate) map_prototype: Option<JsObject>,
+    pub(crate) set_prototype: Option<JsObject>,
+    pub(crate) function_prototype: Option<JsObject>,
+    /// The active realm's intrinsic callables, by call kind.
+    pub(crate) callables: [crate::native_function::NativeFunction; crate::IntrinsicCallKind::COUNT],
     pub(crate) global_this: JsObject,
     pub(crate) active_realm_id: u32,
     pub(crate) object_prototype: Option<JsObject>,
@@ -50,9 +54,18 @@ impl<'a> BakeEnv<'a> {
         Self {
             shared: &vm.compile_shared,
             heap: &vm.gc_heap,
-            registry: &vm.jit_code_registry,
             shapes: &vm.shape_runtime,
-            intrinsics: &vm.realm_intrinsics,
+            string_prototype: vm.realm_intrinsics.string_prototype(),
+            map_prototype: vm.realm_intrinsics.map_prototype(),
+            set_prototype: vm.realm_intrinsics.set_prototype(),
+            function_prototype: vm.realm_intrinsics.function_prototype(),
+            callables: std::array::from_fn(|kind| {
+                vm.realm_intrinsics
+                    .callable(crate::IntrinsicCallKind::ALL[kind])
+                    .unwrap_or_else(|| {
+                        crate::native_function::NativeFunction::from_gc(otter_gc::Gc::null())
+                    })
+            }),
             global_this: vm.global_this,
             active_realm_id: vm.active_realm_id,
             object_prototype: vm.object_prototype_object_opt(),
@@ -66,6 +79,15 @@ impl<'a> BakeEnv<'a> {
             machine_allocation_allowed: vm.gc_heap.machine_allocation_allowed(),
             retraining: vm.optimizing_tier_policy.retraining_functions(),
         }
+    }
+
+    /// The active realm's intrinsic callable of `kind`.
+    pub(crate) fn callable(
+        &self,
+        kind: crate::IntrinsicCallKind,
+    ) -> Option<crate::native_function::NativeFunction> {
+        let callable = self.callables[kind as usize];
+        (!callable.raw().is_null()).then_some(callable)
     }
 
     /// Whether `fid` stays below generated code to collect fresh feedback.
@@ -206,20 +228,37 @@ impl<'a> BakeEnv<'a> {
         &self,
         function: &CodeBlock,
     ) -> Option<jit::JitDirectCallPlan> {
-        self.registry.direct_call_plan(function)
+        let address = self
+            .shared
+            .function_entries
+            .try_read()?
+            .get(&function.id)
+            .copied()?;
+        // SAFETY: directory addresses name registry-lifetime entry cells.
+        crate::jit_registry::published_plan(
+            unsafe { &*(address as *const crate::native_abi::FunctionEntryCell) },
+            function,
+        )
     }
 
     /// The classified context cell of `function_id`'s closures, or `0`.
     pub(crate) fn classified_closure_context(&self, function_id: u32) -> u64 {
-        self.registry
-            .closure_contexts
-            .classified(function_id)
+        crate::closure_contexts::classified_of_cell(self.closure_context_cell(function_id))
+    }
+
+    /// The published context fact cell of `function_id`'s closures, or `0`.
+    fn closure_context_cell(&self, function_id: u32) -> usize {
+        self.shared
+            .closure_context_cells
+            .try_read()
+            .and_then(|cells| cells.get(&function_id).copied())
             .unwrap_or(0)
     }
 
     /// The one context every closure of `function_id` was created with.
     pub(crate) fn single_closure_context(&self, function_id: u32) -> Option<(u64, crate::Value)> {
-        self.registry.closure_contexts.single(function_id)
+        let cell = self.closure_context_cell(function_id);
+        crate::closure_contexts::single_of_cell(cell).map(|context| (cell as u64, context))
     }
 
     /// The watch slot `slot` of `context` would be watched under.
@@ -228,8 +267,7 @@ impl<'a> BakeEnv<'a> {
         context: crate::context::ContextHandle,
         slot: u16,
     ) -> Option<u32> {
-        self.registry
-            .watchable_context_slot(self.heap, context, slot)
+        crate::code_dependencies::watchable_slot(self.heap, context, slot)
     }
 
     /// The hidden class with stable id `id`, while interned.
@@ -253,7 +291,7 @@ impl<'a> BakeEnv<'a> {
         &self,
         holder: JsObject,
     ) -> Option<super::jit_bake::MethodHolderLayout> {
-        super::jit_bake::method_holder_layout(self.heap, self.intrinsics.string_prototype(), holder)
+        super::jit_bake::method_holder_layout(self.heap, self.string_prototype, holder)
     }
 
     /// The prepared intrinsic-prototype programs of `key` and the shapes
@@ -265,7 +303,7 @@ impl<'a> BakeEnv<'a> {
         let (stamp, shapes) = super::jit_intrinsic_properties::layout_stamp(
             self.heap,
             self.stamp_prototypes,
-            self.intrinsics.string_prototype(),
+            self.string_prototype,
             self.active_realm_id,
         );
         let memo = self.shared.jit_intrinsic_programs.try_read()?;

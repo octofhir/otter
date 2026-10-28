@@ -170,7 +170,7 @@ impl Baker<'_> {
     /// guard. `%String.prototype%` is a String wrapper and never adopts a
     /// hidden class, so its slot layout is pinned by its dictionary id.
     pub(crate) fn jit_primitive_method_call(&mut self, name: &str) -> Option<JitGuardedMethodCall> {
-        let proto = self.env.intrinsics.string_prototype()?;
+        let proto = self.env.string_prototype?;
         let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.env.heap, name);
         let hit = hit?;
         let method = match lookup {
@@ -235,12 +235,12 @@ impl Baker<'_> {
         };
         let (proto, receiver_type_tag) = if ic.op.is_map() {
             (
-                self.env.intrinsics.map_prototype()?,
+                self.env.map_prototype?,
                 crate::collections::MAP_BODY_TYPE_TAG,
             )
         } else {
             (
-                self.env.intrinsics.set_prototype()?,
+                self.env.set_prototype?,
                 crate::collections::SET_BODY_TYPE_TAG,
             )
         };

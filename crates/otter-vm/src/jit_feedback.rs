@@ -41,6 +41,9 @@
 //!   alternating actual constructors cannot keep advancing that epoch.
 //! - The isolate's VM thread is the sole property-IC writer and hot-path
 //!   reader; generated code reads the same native slots on that thread.
+//! - That thread is also the sole writer of every instruction cell, which
+//!   background compilation only reads: recording is a relaxed load and, on a
+//!   change, a relaxed store, never an atomic read-modify-write.
 //! - Property attempts precede receiver classification and observable effects.
 //!   A hot accessor, proxy or throwing site without an IC handler is never
 //!   mistaken for an unexecuted branch.
@@ -766,6 +769,7 @@ impl ArithFeedback {
     }
 
     /// Numeric class for one operand, independently of its Value encoding.
+    #[inline(always)]
     fn classify(value: Value) -> u8 {
         if let Some(number) = value.as_number() {
             if number.as_exact_i32().is_some() {
@@ -874,7 +878,19 @@ impl InstructionFeedback {
     /// otherwise unclassifiable call is no longer mistaken for an unexecuted
     /// cold branch. Returns `true` only on the first attempt.
     pub fn record_call_attempted(&self) -> bool {
-        self.states.fetch_or(CALL_ATTEMPTED_SEEN, Ordering::Relaxed) & CALL_ATTEMPTED_SEEN == 0
+        self.set_states(CALL_ATTEMPTED_SEEN)
+    }
+
+    /// Set `bits` in the state byte; `true` when any was clear. The VM thread
+    /// is the sole writer.
+    #[inline(always)]
+    fn set_states(&self, bits: u8) -> bool {
+        let states = self.states.load(Ordering::Relaxed);
+        if states & bits == bits {
+            return false;
+        }
+        self.states.store(states | bits, Ordering::Release);
+        true
     }
 
     /// Whether semantic dispatch has been attempted at this call site.
@@ -886,26 +902,24 @@ impl InstructionFeedback {
     /// Record one conditional-branch outcome in this instruction's dense cell.
     /// Returns `true` only for the first observation of each direction; compact
     /// hit counters continue saturating independently on every observation.
+    #[inline(always)]
     pub fn record_branch(&self, taken: bool) -> bool {
-        let saturating_increment = |value: u8| Some(value.saturating_add(1));
-        let _ = self.branch_total.try_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            saturating_increment,
-        );
+        let total = self.branch_total.load(Ordering::Relaxed);
+        if total != u8::MAX {
+            self.branch_total.store(total + 1, Ordering::Relaxed);
+        }
         if taken {
-            let _ = self.branch_taken.try_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                saturating_increment,
-            );
+            let hits = self.branch_taken.load(Ordering::Relaxed);
+            if hits != u8::MAX {
+                self.branch_taken.store(hits + 1, Ordering::Relaxed);
+            }
         }
         let seen = if taken {
             BRANCH_TAKEN_SEEN
         } else {
             BRANCH_NOT_TAKEN_SEEN
         };
-        self.states.fetch_or(seen, Ordering::Relaxed) & seen == 0
+        self.set_states(seen)
     }
 
     /// `(taken, total)` conditional-branch observations.
@@ -919,16 +933,27 @@ impl InstructionFeedback {
 
     /// Fold one observed arithmetic operand pair into this instruction cell.
     /// Returns `true` when the representation bitset gained at least one bit.
-    #[inline]
+    #[inline(always)]
     pub fn record_arith(&self, lhs: Value, rhs: Value) -> bool {
         let bits = ArithFeedback::classify(lhs) | ArithFeedback::classify(rhs);
-        self.arith.fetch_or(bits, Ordering::Relaxed) & bits != bits
+        let arith = self.arith.load(Ordering::Relaxed);
+        if arith & bits == bits {
+            return false;
+        }
+        self.arith.store(arith | bits, Ordering::Relaxed);
+        true
     }
 
     /// Mark an arithmetic site for float widening after its first overflow bail.
     /// Returns `true` exactly once for the cell.
     pub fn widen_arith_to_float(&self) -> bool {
-        self.arith.fetch_or(ARITH_WIDEN_FLOAT, Ordering::Relaxed) & ARITH_WIDEN_FLOAT == 0
+        let arith = self.arith.load(Ordering::Relaxed);
+        if arith & ARITH_WIDEN_FLOAT != 0 {
+            return false;
+        }
+        self.arith
+            .store(arith | ARITH_WIDEN_FLOAT, Ordering::Relaxed);
+        true
     }
 
     /// Record the receiver family observed at one `LoadElement` instruction.
@@ -988,10 +1013,7 @@ impl InstructionFeedback {
     /// Record that an indexed access here named an index its receiver's dense
     /// elements do not hold. Returns `true` exactly once for the cell.
     pub fn record_element_out_of_bounds(&self) -> bool {
-        self.states
-            .fetch_or(ELEMENT_OUT_OF_BOUNDS_SEEN, Ordering::Relaxed)
-            & ELEMENT_OUT_OF_BOUNDS_SEEN
-            == 0
+        self.set_states(ELEMENT_OUT_OF_BOUNDS_SEEN)
     }
 
     /// Whether an indexed access here ever named an index its receiver's
@@ -1280,7 +1302,7 @@ impl FeedbackVector {
     }
 
     /// Advance the feedback epoch without permitting wraparound.
-    #[inline]
+    #[cold]
     pub(crate) fn bump_epoch(&self) {
         let _ = self
             .epoch
@@ -1336,7 +1358,7 @@ impl<'a> InstructionFeedbackRecorder<'a> {
         Self { vector, cell }
     }
 
-    #[inline]
+    #[inline(always)]
     fn note_transition(self, changed: bool) -> bool {
         if changed {
             self.vector.bump_epoch();
@@ -1345,7 +1367,7 @@ impl<'a> InstructionFeedbackRecorder<'a> {
     }
 
     /// Record arithmetic representations and advance the epoch on new bits.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn record_arith(self, lhs: Value, rhs: Value) -> bool {
         self.note_transition(self.cell.record_arith(lhs, rhs))
     }
@@ -1367,6 +1389,7 @@ impl<'a> InstructionFeedbackRecorder<'a> {
     }
 
     /// Record a branch sample and advance the epoch on a newly seen direction.
+    #[inline(always)]
     pub(crate) fn record_branch(self, taken: bool) -> bool {
         self.note_transition(self.cell.record_branch(taken))
     }

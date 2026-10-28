@@ -116,10 +116,6 @@ impl std::ops::Deref for CodeBlockInstruction<'_> {
 }
 
 impl<'a> CodeBlockInstruction<'a> {
-    #[inline]
-    pub(crate) fn reductions(self) -> u64 {
-        self.source.work_units() as u64
-    }
     pub(crate) fn code_block_id(self) -> u32 {
         self.code.function_id
     }

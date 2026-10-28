@@ -4135,6 +4135,18 @@ impl<'a> Builder<'a> {
                 self.graph.rollback(checkpoint);
             }
         }
+        if !construct && plan.is_none() && self.static_native_site(instruction) {
+            let mut inputs: SmallVec<[NodeId; 6]> = SmallVec::new();
+            inputs.push(callee);
+            inputs.push(self.undefined);
+            for register in arguments {
+                let value = self.read(register);
+                inputs.push(self.tagged(value));
+            }
+            let node = self.add(Kind::CallStaticNative, &inputs, Repr::Tagged);
+            self.write(instruction.writes[0], node);
+            return;
+        }
         let mut inputs: SmallVec<[NodeId; 4]> = SmallVec::new();
         inputs.push(callee);
         for register in arguments {
@@ -4200,6 +4212,16 @@ impl<'a> Builder<'a> {
         );
     }
 
+    /// Whether the call at this site only ever reached native functions
+    /// that are no intrinsic, and no such speculation left here: its callee
+    /// runs as a static native body without a call frame.
+    fn static_native_site(&self, instruction: &Instruction) -> bool {
+        matches!(
+            self.view.native_calls.get(&instruction.byte_pc),
+            Some(otter_vm::JitNativeCall::Native)
+        ) && !self.exited_for(ExitReason::IdentityGuard)
+    }
+
     /// The out-of-line call of `callee` with `receiver` bound as `this`; its
     /// result goes to `destination`, or nowhere for an instruction that
     /// writes no register.
@@ -4246,6 +4268,13 @@ impl<'a> Builder<'a> {
         inputs.push(callee);
         inputs.push(receiver);
         inputs.extend(arguments.iter().copied());
+        if plan.is_none() && self.static_native_site(instruction) {
+            let node = self.add(Kind::CallStaticNative, &inputs, Repr::Tagged);
+            if let Some(destination) = destination {
+                self.write(destination, node);
+            }
+            return;
+        }
         // A sloppy callee converts a receiver that is not an Object; one
         // proved here enters past that test.
         let receiver_object = plan.is_some_and(|plan| {

@@ -41,6 +41,24 @@ impl Codegen<'_> {
         let input = |index| allocation.inputs[index];
         let output = || Self::gp(allocation.result.expect("memory result"));
         match self.graph.node(node).kind.clone() {
+            Kind::CallStaticNative => {
+                let callee = Self::gp(input(0));
+                let exit = self.eager_exit(node, super::DeoptReason::WrongValue);
+                crate::x86_64::js_call::emit_native_kind_guard(&mut self.ops, callee, exit);
+                const _: () =
+                    assert!(otter_vm::native_function::NativeEntryKind::Static as u8 == 0);
+                let kind_byte = self.view.native_call_layout.kind_byte as i32;
+                dynasm!(self.ops ; .arch x64
+                    ; cmp BYTE [Rq(callee) + kind_byte], 0
+                    ; jne =>exit);
+                let values = allocation.inputs.clone();
+                self.emit_committed_span_call(
+                    node,
+                    abi::STUB_JIT_STATIC_NATIVE_CALL,
+                    &values,
+                    output(),
+                )?;
+            }
             Kind::BuiltinMethod(form) => {
                 let mut arguments: smallvec::SmallVec<[CommittedArgument; 4]> = (0..=form.arity())
                     .map(|index| CommittedArgument::Value(Self::gp(input(index))))

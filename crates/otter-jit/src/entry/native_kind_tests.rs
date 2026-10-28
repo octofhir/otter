@@ -272,25 +272,25 @@ fn same_source_whole_compilation_exposes_both_hit_and_miss_code_cost() {
             &Default::default(),
         )
         .unwrap();
-        let plans: Vec<_> = graph
+        let kinds: Vec<_> = graph
             .built
             .graph
             .nodes
             .iter()
-            .filter_map(|node| {
-                if let crate::graph::ir::Kind::CallJs { plan, .. } = &node.kind {
-                    Some(*plan)
-                } else {
-                    None
-                }
+            .filter_map(|node| match &node.kind {
+                crate::graph::ir::Kind::CallJs { plan, .. } => Some(Some(*plan)),
+                crate::graph::ir::Kind::CallStaticNative => Some(None),
+                _ => None,
             })
             .collect();
+        // A site that only reached native functions calls their static body
+        // without the trampoline; any other site keeps the generic call.
         assert_eq!(
-            plans,
+            kinds,
             [if selected {
-                crate::call_linkage::CallPlan::Native
+                None
             } else {
-                crate::call_linkage::CallPlan::Generic
+                Some(crate::call_linkage::CallPlan::Generic)
             }]
         );
         sizes.push((
@@ -299,8 +299,8 @@ fn same_source_whole_compilation_exposes_both_hit_and_miss_code_cost() {
         ));
     }
     assert!(
-        sizes[1].0 > sizes[0].0 && sizes[1].1 > sizes[0].1,
-        "kind specialization retains extra guard, selected hit and complete Generic miss"
+        sizes[1].0 > sizes[0].0,
+        "template kind specialization retains extra guard, selected hit and complete Generic miss"
     );
     println!(
         "native-kind sameSource=(TemplateBytes,GraphBytes) generic={:?} selected={:?}; staticBytesOnly=true",

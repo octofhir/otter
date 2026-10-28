@@ -1934,6 +1934,7 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_REGEXP_EXEC_LEAF.id => "regexp_exec_leaf",
         id if id == STUB_REGEXP_TEST_LEAF.id => "regexp_test_leaf",
         id if id == STUB_JIT_REGEXP_LITERAL.id => "jit_regexp_literal",
+        id if id == STUB_JIT_STATIC_NATIVE_CALL.id => "jit_static_native_call",
 
         _ => "unknown_runtime_stub",
     }
@@ -2379,6 +2380,22 @@ pub const STUB_JIT_REGEXP_LITERAL: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Committed,
 );
 
+/// A call of the static native body of the callee in `values[0]` with the
+/// receiver in `values[1]` and the rest as arguments, run without the native
+/// call trampoline's frame: `(jit_ctx, values, count) -> value`. Generated
+/// code proved the callee a native function of the static entry kind; its
+/// body may run JavaScript.
+pub const STUB_JIT_STATIC_NATIVE_CALL: RuntimeStubDescriptor = descriptor(
+    134,
+    RuntimeStubClass::Reentrant,
+    RuntimeStubSignature::ReentrantValueSpan,
+    VARIADIC_STUB_ARGUMENTS,
+    RuntimeStubEffects::reentrant(true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2514,6 +2531,7 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_REGEXP_EXEC_LEAF,
     STUB_REGEXP_TEST_LEAF,
     STUB_JIT_REGEXP_LITERAL,
+    STUB_JIT_STATIC_NATIVE_CALL,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

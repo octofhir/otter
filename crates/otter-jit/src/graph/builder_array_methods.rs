@@ -1,11 +1,13 @@
 //! Builtin methods at a guarded method call as SSA nodes:
-//! `Array.prototype.push` and `pop`, `String.prototype.charCodeAt`.
+//! `Array.prototype.push` and `pop`, and the methods of primitive strings,
+//! Arrays and keyed collections the builtin registry declares.
 //!
 //! # Contents
 //! - `Builder::emit_array_method` lowers a guarded `push` of one value or
 //!   `pop` of an Array receiver to [`Kind::ArrayPush`] / [`Kind::ArrayPop`].
-//! - `Builder::emit_string_method` lowers a guarded `charCodeAt` of a
-//!   primitive string to [`Kind::StringCharCodeAt`].
+//! - `Builder::emit_registry_method` lowers a guarded registry method of a
+//!   primitive string, an Array or a `Map` / `Set` to its reduction, or to
+//!   the row's read-only [`Kind::NativeLeaf`].
 //!
 //! # Invariants
 //! - Only a site whose guarded receiver is an Array body pinned to a
@@ -16,22 +18,21 @@
 //!   nor the VM's push and pop entries complete leaves through the same
 //!   eager deopt, so the call needs no frame, an inlined body containing it
 //!   stays inlined, and it writes only element storage and lengths.
-//! - A string method is proved by [`Kind::CheckGuardedMethod`]: the receiver
-//!   is a primitive string and `%String.prototype%` still holds the builtin
-//!   in the slot its layout fixes. Any other receiver, index or result leaves
-//!   through an eager deopt, after which the site keeps its baseline
-//!   operation.
+//! - A registry method is proved by [`Kind::CheckGuardedMethod`]: the
+//!   receiver has the body type and guard word its site saw, and the pinned
+//!   prototype still holds the builtin in the slot its layout fixes. Any
+//!   other receiver, index or result, and a leaf's miss, leaves through an
+//!   eager deopt, after which the site keeps its baseline operation.
 //!
 //! # See also
 //! - `otter_vm::Interpreter::jit_array_method_call` for the site's proof.
 //! - `super::Builder::visit_call_method` for the other method call paths.
 
 use otter_vm::jit::{JitArrayStorage, JitGuardedReceiver, JitMethodHolder};
-use otter_vm::native_abi::{
-    ExitReason, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_LEAF, STUB_STRING_CHAR_CODE_AT_LEAF,
-};
+use otter_vm::native_abi::{ExitReason, STUB_ARRAY_POP_LEAF, STUB_ARRAY_PUSH_LEAF};
+use smallvec::SmallVec;
 
-use super::{Builder, Instruction, Kind, Repr};
+use super::{Builder, Instruction, Kind, NodeId, Repr};
 
 impl Builder<'_> {
     /// Lower the guarded `push` / `pop` call `instruction` on `receiver`,
@@ -81,9 +82,10 @@ impl Builder<'_> {
         true
     }
 
-    /// Lower the guarded `charCodeAt` call `instruction` of one argument on
-    /// a primitive string `receiver`, or refuse any other site.
-    pub(super) fn emit_string_method(
+    /// Lower the guarded registry method call `instruction` on a primitive
+    /// string, Array or keyed collection `receiver`, or refuse any other
+    /// site.
+    pub(super) fn emit_registry_method(
         &mut self,
         instruction: &Instruction,
         receiver: u16,
@@ -96,10 +98,21 @@ impl Builder<'_> {
         let JitGuardedReceiver::Exotic(target) = call.receiver else {
             return false;
         };
-        if target.type_tag != otter_vm::string::JS_STRING_BODY_TYPE_TAG
+        let Some(declaration) = otter_vm::jit_static_native::jit_leaf_builtin(call.entry_stub_id)
+        else {
+            return false;
+        };
+        let receiver_kind = target.type_tag == otter_vm::string::JS_STRING_BODY_TYPE_TAG
+            || target.type_tag == otter_vm::collections::MAP_BODY_TYPE_TAG
+            || target.type_tag == otter_vm::collections::SET_BODY_TYPE_TAG
+            || (target.type_tag == JitArrayStorage::current().type_tag
+                && target.is_generated_receiver()
+                && target.active_realm.is_none());
+        if !receiver_kind
             || crate::graph::call::IntrinsicHolder::of(call.holder).is_none()
-            || call.entry_stub_id != STUB_STRING_CHAR_CODE_AT_LEAF.id
-            || arguments.len() != 1
+            || !declaration.this_operand
+            || arguments.len() != usize::from(declaration.argument_count)
+            || super::super::native_leaf::entry(call.entry_stub_id).is_err()
             || self.exited_for(ExitReason::IdentityGuard)
             || self.exited_for(ExitReason::TypeMismatch)
             || self.exited_for(ExitReason::BoundsGuard)
@@ -108,11 +121,25 @@ impl Builder<'_> {
         }
         let receiver = self.read(receiver);
         let receiver = self.tagged(receiver);
-        let index = self.read(arguments[0]);
-        let index = self.int32(index);
+        let arguments: SmallVec<[NodeId; 2]> = arguments
+            .iter()
+            .map(|&register| {
+                let value = self.read(register);
+                self.tagged(value)
+            })
+            .collect();
         self.add(Kind::CheckGuardedMethod(byte_pc), &[receiver], Repr::None);
-        let unit = self.add(Kind::StringCharCodeAt, &[receiver, index], Repr::Int32);
-        self.write(instruction.writes[0], unit);
+        let result = match self.reduce_builtin(declaration, receiver, &arguments) {
+            Some(result) => result,
+            None => {
+                let mut inputs: SmallVec<[NodeId; 2]> = SmallVec::new();
+                inputs.push(receiver);
+                inputs.extend(arguments.iter().copied());
+                inputs.resize(2, self.undefined);
+                self.add(Kind::NativeLeaf(call.entry_stub_id), &inputs, Repr::Tagged)
+            }
+        };
+        self.write(instruction.writes[0], result);
         true
     }
 }

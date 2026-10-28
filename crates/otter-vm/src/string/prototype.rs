@@ -525,20 +525,6 @@ pub(crate) fn is_prototype_builtin(
 pub(crate) type StringNativeBridge =
     fn(&mut NativeCtx<'_>, ValueWindow<'_>) -> Result<Value, NativeError>;
 
-/// The trampoline backing one JIT-recognized `String.prototype` method.
-#[must_use]
-pub(crate) fn prototype_bridge(name: &str) -> Option<StringNativeBridge> {
-    match name {
-        "charCodeAt" => Some(bridge_char_code_at),
-        "codePointAt" => Some(bridge_code_point_at),
-        "indexOf" => Some(bridge_index_of),
-        "includes" => Some(bridge_includes),
-        "startsWith" => Some(bridge_starts_with),
-        "endsWith" => Some(bridge_ends_with),
-        _ => None,
-    }
-}
-
 pub(crate) fn is_char_code_at_builtin(value: Value, heap: &otter_gc::GcHeap) -> bool {
     is_prototype_builtin(value, heap, bridge_char_code_at)
 }

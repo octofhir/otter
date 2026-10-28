@@ -98,6 +98,7 @@ use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
 mod allocation;
 mod array_method;
 mod binding;
+mod builtin_predicates;
 mod committed_call;
 mod equality;
 mod field_types;
@@ -1811,7 +1812,8 @@ impl<'a> Codegen<'a> {
                     ; mov W(destination), w16
                 );
             }
-            Kind::StrictEqual { negate } => {
+            Kind::StrictEqual { negate, same_value } => {
+                let same_value = *same_value;
                 let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
                 let destination = Self::gp(result.expect("a result"));
                 let condition = if *negate {
@@ -1829,8 +1831,28 @@ impl<'a> Codegen<'a> {
                     self.emit_sink_register(destination);
                 } else {
                     let double = allocation.fp_temps[0];
-                    self.emit_strict_equal(node, [a, b], double, destination, condition);
+                    self.emit_strict_equal(
+                        node,
+                        [a, b],
+                        double,
+                        destination,
+                        condition,
+                        same_value,
+                    );
                 }
+            }
+            Kind::NumberTest(test) => {
+                let test = *test;
+                let value = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let double = allocation.fp_temps[0];
+                self.emit_number_test(value, destination, double, test);
+            }
+            Kind::IsArray => {
+                let value = Self::gp(input(0));
+                let destination = Self::gp(result.expect("a result"));
+                let exit = self.eager_exit(node, DeoptReason::WrongType);
+                self.emit_is_array(value, destination, exit);
             }
             Kind::LooseEqual { negate } => {
                 let (a, b) = (Self::gp(input(0)), Self::gp(input(1)));
@@ -2202,17 +2224,26 @@ impl<'a> Codegen<'a> {
                     ; ldr W(destination), [X(receiver), p.string_len_byte]
                 );
             }
-            Kind::StringCharCodeAt => {
+            Kind::StringCharCodeAt { code_point } => {
+                let code_point = *code_point;
                 let exit = self.eager_exit(node, DeoptReason::WrongType);
+                let destination = Self::gp(result.expect("code unit result"));
                 self.emit_string_char_code_at(
                     [
                         Self::gp(input(0)),
                         Self::gp(input(1)),
                         allocation.gp_temps[0],
                     ],
-                    Self::gp(result.expect("code unit result")),
+                    destination,
                     exit,
                 );
+                if code_point {
+                    dynasm!(self.ops ; .arch aarch64
+                        ; and w16, W(destination), #0xfc00
+                        ; mov w17, #0xd800
+                        ; cmp w16, w17
+                        ; b.eq =>exit);
+                }
             }
             Kind::LoadFunctionBagCell(cell) => {
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);
@@ -5859,16 +5890,6 @@ impl<'a> Codegen<'a> {
                         self.load_immediate(16, u64::from(constant));
                         dynasm!(self.ops ; .arch aarch64 ; cmp X(a), x16 ; b.eq =>true_target);
                     }
-                    // Every mismatch leaves for the false successor.
-                    BranchKind::Native(native_ref) => {
-                        let a = Self::gp(allocation.inputs[0]);
-                        let false_target = self.cond_target(false_label);
-                        self.emit_native_identity(a, native_ref, false_target);
-                        if next != Some(if_true) {
-                            dynasm!(self.ops ; .arch aarch64 ; b =>true_label);
-                        }
-                        return Ok(());
-                    }
                     BranchKind::Nullish => {
                         let a = Self::gp(allocation.inputs[0]);
                         dynasm!(self.ops
@@ -5950,7 +5971,7 @@ impl<'a> Codegen<'a> {
                 dynasm!(self.ops ; .arch aarch64 ; cmp XSP(a), VALUE_TRUE as u32);
                 SelectCondition::Eq
             }
-            BranchKind::Float64Truthy | BranchKind::Nullish | BranchKind::Native(_) => {
+            BranchKind::Float64Truthy | BranchKind::Nullish => {
                 return Err(Unsupported::OperandShape("graph select test"));
             }
         })

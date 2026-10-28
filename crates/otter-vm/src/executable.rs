@@ -603,7 +603,6 @@ impl CodeBlock {
                     // can inspect constant strings without exposing them to the
                     // external JIT crate.
                     load_array_length: false,
-                    method_hint: crate::jit::JitMethodHint::None,
                     // Resolved by `ExecutionContext::jit_compile_snapshot`, which
                     // can read the number-constant pool for a `LoadNumber`.
                     load_number: None,

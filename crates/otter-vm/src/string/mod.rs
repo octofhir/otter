@@ -346,9 +346,10 @@ impl JsString {
         value.as_string(heap)
     }
 
-    /// Allocate the heap's shared empty and one-unit Latin-1 strings, once.
-    /// Each string is published into the rooted slab before the next
-    /// allocation, so a collection meanwhile keeps every one.
+    /// Allocate the heap's shared empty and one-unit Latin-1 strings, once,
+    /// each with its content's atom unless it is a digit. Each string is
+    /// published into the rooted slab before the next allocation, so a
+    /// collection meanwhile keeps every one.
     ///
     /// # Errors
     /// Surfaces [`OutOfMemory`] verbatim.
@@ -367,6 +368,14 @@ impl JsString {
                 &unit
             };
             let string = Self::from_latin1(bytes, heap)?;
+            // Each carries its content's atom, so strict equality against a
+            // literal of the same spelling compares atoms. A digit is a
+            // canonical array index, which is never a named key.
+            if !bytes.first().is_some_and(u8::is_ascii_digit) {
+                let text: String = bytes.iter().map(|&unit| char::from(unit)).collect();
+                let atom = crate::isolate_names::names_mut(heap).intern(&text);
+                heap.with_payload(string.handle(), |body| body.set_cached_atom(atom));
+            }
             // SAFETY: the slot holds the slab installed above, rewritten by
             // any collection the allocation ran.
             let slab: crate::value_slab::ValueSlabHandle =

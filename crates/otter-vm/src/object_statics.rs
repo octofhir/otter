@@ -460,7 +460,10 @@ native_object_static!(native_group_by, GroupBy);
 /// read the property as a value (e.g.
 /// `Object.getOwnPropertyDescriptor(Object, "is").value`) and then
 /// invoke it through `.call` / `Reflect.apply` see the spec result.
-fn native_is(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
+pub(crate) fn native_is(
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
     let a = args.first().cloned().unwrap_or(Value::undefined());
     let b = args.get(1).cloned().unwrap_or(Value::undefined());
     Ok(Value::boolean(crate::abstract_ops::same_value(

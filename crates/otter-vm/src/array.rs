@@ -1316,6 +1316,33 @@ pub(crate) fn plain_dense_has(
     })
 }
 
+/// The first index of a hole-free plain dense array whose element `matches`,
+/// or `-1` when none does; `None` for exotic state, accessor elements, a
+/// sparse tail or a hole, where a search would consult the prototype chain
+/// or an inherited value.
+pub(crate) fn plain_dense_position(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    mut matches: impl FnMut(&Value) -> bool,
+) -> Option<i32> {
+    heap.read_payload(arr, |body| {
+        if !body.exotic.is_null() || body.accessors().is_some() || body.length() != body.dense_len()
+        {
+            return None;
+        }
+        for index in 0..body.dense_len() {
+            let element = body.dense_value(index)?;
+            if element.is_hole() {
+                return None;
+            }
+            if matches(&element) {
+                return i32::try_from(index).ok();
+            }
+        }
+        Some(-1)
+    })
+}
+
 /// The element at `idx` of a plain dense array, which [[Get]] answers with
 /// without consulting anything else: no exotic state, no accessor element,
 /// and a present slot. `None` leaves the ordinary [[Get]] authoritative.

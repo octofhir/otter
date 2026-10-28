@@ -3,7 +3,8 @@
 //!
 //! # Contents
 //! - [`Codegen::emit_strict_equal`] — §7.2.16 IsStrictlyEqual inline, with
-//!   the string/BigInt content leaf out of line.
+//!   the string/BigInt content leaf out of line; with `same_value`, §7.2.11
+//!   SameValue, which differs only for Numbers.
 //! - [`Codegen::emit_loose_equal`] — §7.2.15 IsLooselyEqual: every case
 //!   that coerces nothing inline; every coercing case (and `[[IsHTMLDDA]]`)
 //!   leaves through the eager deopt. Against a `null`/`undefined` constant,
@@ -13,6 +14,7 @@
 //! - Both operands are read before the result is written; the result may
 //!   share a register with an operand.
 //! - Numbers compare by value whatever their encoding; NaN is unordered.
+//!   SameValue compares their float64 bits instead, with every NaN equal.
 //! - Two strings with recorded atoms are equal exactly when their atoms are;
 //!   any other pair of strings or BigInts of one type compares by content in
 //!   the no-allocation leaf, which keeps every live register.
@@ -63,6 +65,7 @@ impl Codegen<'_> {
         double: u8,
         destination: u8,
         condition: Condition,
+        same_value: bool,
     ) {
         let lhs_non_number = self.ops.new_dynamic_label();
         let cells = self.ops.new_dynamic_label();
@@ -76,7 +79,11 @@ impl Codegen<'_> {
             ; tst X(b), x16
             ; b.eq =>outcomes.differ
         );
-        self.emit_number_pair_equal([a, b], double, destination, condition);
+        if same_value {
+            self.emit_number_pair_same_value([a, b], double, outcomes);
+        } else {
+            self.emit_number_pair_equal([a, b], double, destination, condition);
+        }
         dynasm!(self.ops
             ; .arch aarch64
             ; b =>done
@@ -352,6 +359,57 @@ impl Codegen<'_> {
             ; fcmp d31, D(double)
         );
         self.emit_cset_bool(destination, condition, true);
+    }
+
+    /// §7.2.11 SameValue of two Numbers in `X(a)` and `X(b)`, branching to
+    /// `outcomes`: equal float64 bits, or two NaNs. `x16` holds `NUMBER_TAG`.
+    fn emit_number_pair_same_value(&mut self, [a, b]: [u8; 2], double: u8, outcomes: Outcomes) {
+        let a_int = self.ops.new_dynamic_label();
+        let a_done = self.ops.new_dynamic_label();
+        let b_int = self.ops.new_dynamic_label();
+        let b_done = self.ops.new_dynamic_label();
+        let unordered = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; cmp X(a), x16
+            ; b.hs =>a_int
+        );
+        self.load_immediate(17, DOUBLE_OFFSET);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; sub x17, X(a), x17
+            ; fmov d31, x17
+            ; b =>a_done
+            ; =>a_int
+            ; scvtf d31, W(a)
+            ; =>a_done
+            ; cmp X(b), x16
+            ; b.hs =>b_int
+        );
+        self.load_immediate(17, DOUBLE_OFFSET);
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; sub x17, X(b), x17
+            ; fmov D(double), x17
+            ; b =>b_done
+            ; =>b_int
+            ; scvtf D(double), W(b)
+            ; =>b_done
+            ; fcmp d31, D(double)
+            ; b.vs =>unordered
+            // Equal values with different bits are `+0` and `-0`.
+            ; fmov x16, d31
+            ; fmov x17, D(double)
+            ; cmp x16, x17
+            ; b.eq =>outcomes.equal
+            ; b =>outcomes.differ
+            ; =>unordered
+            ; fcmp d31, d31
+            ; b.vc =>outcomes.differ
+            ; fcmp D(double), D(double)
+            ; b.vc =>outcomes.differ
+            ; b =>outcomes.equal
+        );
     }
 
     /// Two distinct cells whose type tags, in `w16`, are equal: strings and

@@ -3128,7 +3128,14 @@ impl<'a> Builder<'a> {
                 || !self.analysis.live_at(after).contains(destination)
                     && !self.analysis.live_at(target).contains(destination);
             if dead_after {
-                let value = self.add(Kind::StrictEqual { negate }, &[a, b], Repr::Tagged);
+                let value = self.add(
+                    Kind::StrictEqual {
+                        negate,
+                        same_value: false,
+                    },
+                    &[a, b],
+                    Repr::Tagged,
+                );
                 self.write(destination, value);
                 self.pc = next_pc;
                 let taken = self.analysis.block_of[target as usize];
@@ -3144,7 +3151,14 @@ impl<'a> Builder<'a> {
                 return;
             }
         }
-        let value = self.add(Kind::StrictEqual { negate }, &[a, b], Repr::Tagged);
+        let value = self.add(
+            Kind::StrictEqual {
+                negate,
+                same_value: false,
+            },
+            &[a, b],
+            Repr::Tagged,
+        );
         self.write(destination, value);
     }
 
@@ -3392,7 +3406,47 @@ impl<'a> Builder<'a> {
     /// shape-owned data directory. A typed own-data miss permanently selects
     /// the committed shared lookup for that site; cache residency never deopts
     /// a directory read.
+    /// The read of the one own data slot every program of the site at
+    /// `byte_pc` observed on `object`, through its storage projection and
+    /// shape proof; `None` for any other site.
+    fn own_data_method(&mut self, byte_pc: u32, object: NodeId) -> Option<NodeId> {
+        if self.exited_for(ExitReason::ShapeGuard) {
+            return None;
+        }
+        let receivers = self.known_shapes(object);
+        let access = super::feedback::own_data_load(self.view, byte_pc, receivers.as_deref())?;
+        // Ordinary receivers keep the program path, which also proves them.
+        if access.projection == otter_vm::jit::PropertyStorageProjection::Receiver {
+            return None;
+        }
+        let storage = self.property_storage(object, access.projection);
+        self.check_shapes(storage, &access.shapes, false);
+        let key = FieldKey {
+            object: storage,
+            property: true,
+            offset: access.field.cache_key() as i32,
+        };
+        if let Some(&value) = self.known.fields.get(&key) {
+            return Some(value);
+        }
+        let value = self.add(
+            Kind::LoadOwnField {
+                field: access.field,
+                atom: access.atom,
+            },
+            &[storage],
+            Repr::Tagged,
+        );
+        self.known.fields.insert(key, value);
+        Some(value)
+    }
+
     fn named_lookup(&mut self, byte_pc: u32, object: NodeId) -> NodeId {
+        // A method one own data slot holds, a function's own property among
+        // them (`Object.is`), is that slot's read behind its shape proof.
+        if let Some(value) = self.own_data_method(byte_pc, object) {
+            return value;
+        }
         let receivers = (!self.exited_for(ExitReason::ShapeGuard))
             .then(|| self.known_shapes(object))
             .flatten();
@@ -4729,36 +4783,21 @@ impl<'a> Builder<'a> {
             &[callee],
             Repr::None,
         );
-        // A `Math` method of Numbers is the float64 arithmetic itself: no
-        // box, no leaf frame, one instruction where the target has it. An
-        // operand not proved a Number is checked once; after such a check
-        // failed, the recompile calls the leaf.
-        if let Some(op) = super::ir::MathOp::of_leaf(target.leaf_stub_id)
-            && arguments.len() == op.arity()
-            && (!self.exited_for(ExitReason::TypeMismatch)
-                || arguments.iter().all(|&argument| self.is_number(argument)))
-        {
-            let mut inputs: SmallVec<[NodeId; 2]> = SmallVec::new();
-            for &argument in arguments {
-                inputs.push(self.float64(argument));
-            }
-            let result = self.add(Kind::Float64Math(op), &inputs, Repr::Float64);
+        if let Some(result) = self.reduce_builtin(declaration, this, arguments) {
             self.write(instruction.writes[0], result);
             return;
         }
-        // `String.prototype.charCodeAt` of a flat string at an index within
-        // it reads the code unit inline; anything else leaves, and the
-        // recompile after such an exit calls the leaf.
-        if target.leaf_stub_id == otter_vm::native_abi::STUB_STRING_CHAR_CODE_AT_LEAF.id
-            && declaration.this_operand
-            && arguments.len() == 1
-            && !self.exited_for(ExitReason::TypeMismatch)
-            && !self.exited_for(ExitReason::BoundsGuard)
-        {
-            let index = self.int32(arguments[0]);
-            let unit = self.add(Kind::StringCharCodeAt, &[this, index], Repr::Int32);
-            self.write(instruction.writes[0], unit);
-            return;
+        // A reduction admitting a count its leaf does not take, refused
+        // here, calls the proved native.
+        if arguments.len() != usize::from(declaration.argument_count) {
+            return self.emit_receiver_call(
+                instruction,
+                callee,
+                this,
+                arguments,
+                None,
+                Some(instruction.writes[0]),
+            );
         }
         let mut inputs: SmallVec<[NodeId; 2]> = SmallVec::new();
         if declaration.this_operand {
@@ -4768,6 +4807,160 @@ impl<'a> Builder<'a> {
         inputs.resize(2, self.undefined);
         let node = self.add(Kind::NativeLeaf(target.leaf_stub_id), &inputs, Repr::Tagged);
         self.write(instruction.writes[0], node);
+    }
+
+    /// The value of a call of a registry builtin whose identity is already
+    /// proved, as the graph operation its row reduces to. `None` for a row
+    /// without a reduction, or operands this site may not reduce after an
+    /// exit, which keep the row's leaf.
+    fn reduce_builtin(
+        &mut self,
+        declaration: &otter_vm::jit_static_native::JitLeafBuiltin,
+        this: NodeId,
+        arguments: &[NodeId],
+    ) -> Option<NodeId> {
+        use otter_vm::jit_static_native::{JitBuiltinReduction as R, JitNumberTest};
+        if !declaration
+            .reduction
+            .admits(declaration.argument_count, arguments.len())
+        {
+            return None;
+        }
+        match declaration.reduction {
+            R::Leaf => None,
+            // A `Math` method of Numbers is the float64 arithmetic itself;
+            // `min` / `max` fold pairwise. An operand not proved a Number is
+            // checked once; after such a check failed, the leaf runs.
+            R::Math(method) => {
+                let op = super::ir::MathOp::of_method(method)?;
+                if self.exited_for(ExitReason::TypeMismatch)
+                    && !arguments.iter().all(|&argument| self.is_number(argument))
+                {
+                    return None;
+                }
+                // `min` / `max` of int32s select one of them: no int32 is -0
+                // or NaN, so the integer order decides.
+                if matches!(op, super::ir::MathOp::Min | super::ir::MathOp::Max)
+                    && arguments.iter().all(|&argument| self.holds_int32(argument))
+                {
+                    let condition = if op == super::ir::MathOp::Max {
+                        Condition::Greater
+                    } else {
+                        Condition::Less
+                    };
+                    let mut result = self.int32(arguments[0]);
+                    for &argument in &arguments[1..] {
+                        let operand = self.int32(argument);
+                        result = self.add(
+                            Kind::Select(BranchKind::Int32(condition)),
+                            &[result, operand, result, operand],
+                            Repr::Int32,
+                        );
+                    }
+                    return Some(result);
+                }
+                let mut operands: SmallVec<[NodeId; 4]> = SmallVec::new();
+                for &argument in arguments {
+                    operands.push(self.float64(argument));
+                }
+                if op.arity() == 1 {
+                    return Some(self.add(Kind::Float64Math(op), &operands, Repr::Float64));
+                }
+                let mut result = operands[0];
+                for &operand in &operands[1..] {
+                    result = self.add(Kind::Float64Math(op), &[result, operand], Repr::Float64);
+                }
+                Some(result)
+            }
+            R::SameValue => Some(self.same_value(arguments[0], arguments[1])),
+            // An int32 is a finite integer in the safe range, never NaN.
+            R::NumberTest(test) => {
+                let value = arguments[0];
+                if self.graph.node(value).repr == Repr::Int32
+                    || self
+                        .known
+                        .get(value)
+                        .is_some_and(|info| info.int32.is_some())
+                {
+                    let answer = test != JitNumberTest::NaN;
+                    return Some(self.constant_tagged(otter_vm::Value::boolean(answer).to_bits()));
+                }
+                let value = self.tagged(value);
+                Some(self.add(Kind::NumberTest(test), &[value], Repr::Tagged))
+            }
+            // A Proxy leaves; the recompile after that calls the leaf.
+            R::IsArray => {
+                if self.exited_for(ExitReason::TypeMismatch) {
+                    return None;
+                }
+                let value = self.tagged(arguments[0]);
+                Some(self.add(Kind::IsArray, &[value], Repr::Tagged))
+            }
+            // A flat string at an index inside it reads the code unit inline;
+            // anything else, and for `codePointAt` a lead surrogate, leaves,
+            // and the recompile calls the leaf.
+            R::StringCharCodeAt | R::StringCodePointAt => {
+                if !declaration.this_operand
+                    || self.exited_for(ExitReason::TypeMismatch)
+                    || self.exited_for(ExitReason::BoundsGuard)
+                {
+                    return None;
+                }
+                let index = self.int32(arguments[0]);
+                let code_point = declaration.reduction == R::StringCodePointAt;
+                Some(self.add(
+                    Kind::StringCharCodeAt { code_point },
+                    &[this, index],
+                    Repr::Int32,
+                ))
+            }
+        }
+    }
+
+    /// Whether `node` is an int32 without a check: unboxed, boxed from one,
+    /// or a constant that is one.
+    fn holds_int32(&self, node: NodeId) -> bool {
+        self.graph.node(node).repr == Repr::Int32
+            || self
+                .known
+                .get(node)
+                .is_some_and(|info| info.int32.is_some())
+            || matches!(self.graph.node(node).kind, Kind::ConstTagged(bits)
+                if otter_vm::Value::from_bits(bits)
+                    .as_number()
+                    .is_some_and(|number| number.as_exact_i32().is_some()))
+    }
+
+    /// §7.2.11 SameValue of `a` and `b` as a tagged boolean. Two int32s
+    /// compare as integers, and against a constant that is no Number, or a
+    /// Number other than a zero or NaN, it is strict equality.
+    fn same_value(&mut self, a: NodeId, b: NodeId) -> NodeId {
+        if self.holds_int32(a) && self.holds_int32(b) {
+            let (a, b) = (self.int32(a), self.int32(b));
+            return self.add(Kind::Int32Compare(Condition::Equal), &[a, b], Repr::Tagged);
+        }
+        let a = self.tagged(a);
+        let b = self.tagged(b);
+        let strict = |graph: &Graph, node: NodeId| match graph.node(node).kind {
+            Kind::ConstTagged(bits) => {
+                otter_vm::Value::from_bits(bits)
+                    .as_number()
+                    .is_none_or(|number| {
+                        let value = number.as_f64();
+                        value != 0.0 && !value.is_nan()
+                    })
+            }
+            _ => false,
+        };
+        let same_value = !strict(&self.graph, a) && !strict(&self.graph, b);
+        self.add(
+            Kind::StrictEqual {
+                negate: false,
+                same_value,
+            },
+            &[a, b],
+            Repr::Tagged,
+        )
     }
 
     /// `dst = receiver.name(args...)`: `f.call` on a closure receiver, a
@@ -4784,7 +4977,7 @@ impl<'a> Builder<'a> {
             return self.deopt(DeoptReason::InsufficientFeedback);
         }
         if self.emit_array_method(instruction, receiver, &arguments)
-            || self.emit_string_method(instruction, receiver, &arguments)
+            || self.emit_registry_method(instruction, receiver, &arguments)
         {
             return;
         }
@@ -4867,11 +5060,11 @@ impl<'a> Builder<'a> {
                 .property_accesses
                 .get(&byte_pc)
                 .is_some_and(|site| site.shared);
-        // A `Math` method the site saw, read like a named load: when the
-        // method read is that native, its arithmetic runs on float64
-        // operands, so an inlined body stays inlined. Once an operand was not
-        // a Number here, the baseline operation takes the call, as it does
-        // for every other leaf method, whose misses it commits.
+        // A reducible builtin the site saw, read like a named load: when the
+        // method read is that native, its graph operation runs, so an inlined
+        // body stays inlined. Once a reduced operand was not of the expected
+        // type here, the baseline operation takes the call, as it does for
+        // every other leaf method, whose misses it commits.
         // A guard on the namespace's shape proves the same native the named
         // read checks; an exotic receiver's guard names a builtin of its own.
         let exotic_guard = self
@@ -4890,9 +5083,10 @@ impl<'a> Builder<'a> {
             && polymorphic.is_none()
             && !exotic_guard
             && !self.exited_for(ExitReason::TypeMismatch)
-            && let Some((target, _)) = self.admitted_native_leaf(instruction, arguments.len())
-            && let Some(op) = super::ir::MathOp::of_leaf(target.leaf_stub_id)
-            && arguments.len() == op.arity()
+            && let Some((target, declaration)) =
+                self.admitted_native_leaf(instruction, arguments.len())
+            && declaration.reduction != otter_vm::jit_static_native::JitBuiltinReduction::Leaf
+            && !declaration.this_operand
         {
             let receiver = self.read(receiver);
             let receiver = self.tagged(receiver);
@@ -4904,9 +5098,9 @@ impl<'a> Builder<'a> {
                 })
                 .collect();
             let callee = self.named_lookup(byte_pc, receiver);
-            return self.emit_math_method_call(
+            return self.emit_reduced_method_call(
                 instruction,
-                op,
+                declaration,
                 target.builtin_native_ref,
                 callee,
                 receiver,
@@ -4981,91 +5175,36 @@ impl<'a> Builder<'a> {
         self.emit_call_with_receiver(instruction, callee, receiver, &arguments, None);
     }
 
-    /// A `Math` method call whose method was read like a named load. When
-    /// the method read is the site's native, its arithmetic runs on float64
-    /// operands; any other method read is called like any method, so a
-    /// replaced method neither leaves optimized code nor abandons an inlined
-    /// body. The arms meet with the call's result in its register.
-    fn emit_math_method_call(
+    /// A reducible builtin's method call whose method was read like a named
+    /// load: the method read is checked to be the site's native, leaving
+    /// eagerly otherwise, and its registry reduction runs. After an identity
+    /// exit the recompile keeps the ordinary method call.
+    fn emit_reduced_method_call(
         &mut self,
         instruction: &Instruction,
-        op: super::ir::MathOp,
+        declaration: &otter_vm::jit_static_native::JitLeafBuiltin,
         native_ref: u32,
         callee: NodeId,
         receiver: NodeId,
         arguments: &[NodeId],
     ) {
-        let Some(current) = self.current else {
-            return;
-        };
-        let destination = instruction.writes[0];
-        let before = self.frame[usize::from(destination)];
-        let owner = self.current_slot;
-        let entry_known = self.known.clone();
-        let native = self.graph.new_block();
-        let other = self.graph.new_block();
-        let join = self.graph.new_block();
-        self.terminate(
-            Kind::Branch {
-                kind: BranchKind::Native(native_ref),
-                if_true: native,
-                if_false: other,
-            },
+        self.add(
+            Kind::CheckNative(native_ref, DeoptReason::WrongValue),
             &[callee],
+            Repr::None,
         );
-        self.graph.block_mut(native).predecessors.push(current);
-        self.graph.block_mut(other).predecessors.push(current);
-        let mut arms: SmallVec<[(BlockId, NodeId, Known); 2]> = SmallVec::new();
-        let finish_arm =
-            |builder: &mut Self, arms: &mut SmallVec<[(BlockId, NodeId, Known); 2]>| {
-                if let Some(end) = builder.current {
-                    let value = builder.frame[usize::from(destination)];
-                    arms.push((end, value, builder.known.clone()));
-                    builder.terminate(Kind::Jump(join), &[]);
-                }
-            };
-        self.trailing[owner].push(native);
-        self.current = Some(native);
-        let mut inputs: SmallVec<[NodeId; 2]> = SmallVec::new();
-        for &argument in arguments {
-            inputs.push(self.float64(argument));
+        let destination = instruction.writes[0];
+        match self.reduce_builtin(declaration, receiver, arguments) {
+            Some(result) => self.write(destination, result),
+            None => self.emit_receiver_call(
+                instruction,
+                callee,
+                receiver,
+                arguments,
+                None,
+                Some(destination),
+            ),
         }
-        let result = self.add(Kind::Float64Math(op), &inputs, Repr::Float64);
-        self.write(destination, result);
-        finish_arm(self, &mut arms);
-        self.trailing[owner].push(other);
-        self.current = Some(other);
-        self.known = entry_known;
-        self.frame[usize::from(destination)] = before;
-        self.emit_receiver_call(
-            instruction,
-            callee,
-            receiver,
-            arguments,
-            None,
-            Some(destination),
-        );
-        finish_arm(self, &mut arms);
-        if arms.is_empty() {
-            // Both arms left: nothing reaches the join.
-            return;
-        }
-        self.trailing[owner].push(join);
-        self.graph.block_mut(join).predecessors = arms.iter().map(|&(block, _, _)| block).collect();
-        let mut known = arms[0].2.clone();
-        for (_, _, edge) in &arms[1..] {
-            known.intersect(edge);
-        }
-        self.current = Some(join);
-        let inputs: SmallVec<[NodeId; 4]> = arms
-            .iter_mut()
-            .map(|(block, value, edge)| self.tagged_at_end(*block, *value, edge))
-            .collect();
-        let phi = self.graph.add_node(Kind::Phi, &inputs, Repr::Tagged);
-        self.graph.node_mut(phi).block = Some(join);
-        self.graph.block_mut(join).phis.push(phi);
-        self.known = known;
-        self.write(destination, phi);
     }
 
     /// A method call whose receivers had several observed shapes: the

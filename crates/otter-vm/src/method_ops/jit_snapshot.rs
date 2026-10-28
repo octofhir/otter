@@ -74,8 +74,9 @@ pub(crate) fn array_named_lookup_guard() -> JitBodyGuard {
 }
 
 impl Interpreter {
-    /// Snapshot a monomorphic dense-array mutation site (`push` / `pop` /
-    /// `shift` / `unshift`) into JIT-readable guard metadata.
+    /// Snapshot a monomorphic dense-array method site (`push` / `pop` /
+    /// `shift` / `unshift`, or a read the static-native registry declares)
+    /// into JIT-readable guard metadata.
     ///
     /// `pop` / `shift` / `push` only rewrite the dense buffer in place, so they
     /// run as mutating leaves with no safepoint (`push` misses on a full
@@ -101,13 +102,6 @@ impl Interpreter {
         // A push the leaf refuses for a full buffer grows it through the
         // allocating entry instead of leaving the site.
         let grow = (ic.tag == Tag::Push).then_some((STUB_ARRAY_PUSH_ALLOC.id, alloc_safepoint_id));
-        let (stub_id, safepoint_id, argument_count) = match ic.tag {
-            Tag::Pop => (STUB_ARRAY_POP_LEAF.id, NO_SAFEPOINT, 0),
-            Tag::Shift => (STUB_ARRAY_SHIFT_LEAF.id, NO_SAFEPOINT, 0),
-            Tag::Push => (STUB_ARRAY_PUSH_LEAF.id, NO_SAFEPOINT, 1),
-            Tag::Unshift => (STUB_ARRAY_UNSHIFT_ALLOC.id, alloc_safepoint_id, 1),
-            _ => return None,
-        };
         let proto = self.default_array_prototype()?;
         if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
             return None;
@@ -116,6 +110,26 @@ impl Interpreter {
         if !ic.tag.matches_builtin(method, &self.gc_heap) {
             return None;
         }
+        let (stub_id, safepoint_id, argument_count) = match ic.tag {
+            Tag::Pop => (STUB_ARRAY_POP_LEAF.id, NO_SAFEPOINT, 0),
+            Tag::Shift => (STUB_ARRAY_SHIFT_LEAF.id, NO_SAFEPOINT, 0),
+            Tag::Push => (STUB_ARRAY_PUSH_LEAF.id, NO_SAFEPOINT, 1),
+            Tag::Unshift => (STUB_ARRAY_UNSHIFT_ALLOC.id, alloc_safepoint_id, 1),
+            // Any other method the static-native registry declares with a
+            // `this` operand runs its read-only leaf.
+            _ => {
+                let declaration = crate::jit_static_native::jit_static_call_target(
+                    method.as_native_function()?,
+                    &self.gc_heap,
+                )
+                .filter(|declaration| declaration.this_operand)?;
+                (
+                    declaration.leaf_stub_id,
+                    NO_SAFEPOINT,
+                    declaration.argument_count,
+                )
+            }
+        };
         let builtin_native_ref = method
             .as_native_function()
             .and_then(|native| native.native_ref(&self.gc_heap))?;
@@ -146,32 +160,16 @@ impl Interpreter {
     }
 
     /// One primitive-receiver builtin call (`"…".charCodeAt(i)`) as a guarded
-    /// method call.
+    /// method call: the method `name` names on `%String.prototype%`, when it
+    /// is a builtin the static-native registry declares with a `this`
+    /// operand.
     ///
     /// The receiver's cell type tag stands in for a collection's latch word: a
     /// primitive body carries no expando or override state, so proving the tag
     /// plus the realm prototype's shape and method-slot identity is the whole
     /// guard. `%String.prototype%` is a String wrapper and never adopts a
     /// hidden class, so its slot layout is pinned by its dictionary id.
-    pub(crate) fn jit_primitive_method_call(
-        &self,
-        hint: crate::jit::JitMethodHint,
-    ) -> Option<JitGuardedMethodCall> {
-        use crate::jit::JitMethodHint;
-        use crate::native_abi::{
-            NO_SAFEPOINT, STUB_STRING_CHAR_CODE_AT_LEAF, STUB_STRING_CODE_POINT_AT_LEAF,
-            STUB_STRING_ENDS_WITH_LEAF, STUB_STRING_INCLUDES_LEAF, STUB_STRING_INDEX_OF_LEAF,
-            STUB_STRING_STARTS_WITH_LEAF,
-        };
-        let (name, stub_id) = match hint {
-            JitMethodHint::StringCharCodeAt => ("charCodeAt", STUB_STRING_CHAR_CODE_AT_LEAF.id),
-            JitMethodHint::StringCodePointAt => ("codePointAt", STUB_STRING_CODE_POINT_AT_LEAF.id),
-            JitMethodHint::StringIndexOf => ("indexOf", STUB_STRING_INDEX_OF_LEAF.id),
-            JitMethodHint::StringIncludes => ("includes", STUB_STRING_INCLUDES_LEAF.id),
-            JitMethodHint::StringStartsWith => ("startsWith", STUB_STRING_STARTS_WITH_LEAF.id),
-            JitMethodHint::StringEndsWith => ("endsWith", STUB_STRING_ENDS_WITH_LEAF.id),
-            JitMethodHint::None | JitMethodHint::NumberToString => return None,
-        };
+    pub(crate) fn jit_primitive_method_call(&self, name: &str) -> Option<JitGuardedMethodCall> {
         let proto = self.realm_intrinsics.string_prototype()?;
         let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
         let hit = hit?;
@@ -180,13 +178,10 @@ impl Interpreter {
             crate::object::PropertyLookup::Accessor { .. }
             | crate::object::PropertyLookup::Absent => return None,
         };
-        let bridge = crate::string::prototype::prototype_bridge(name)?;
-        if !crate::string::prototype::is_prototype_builtin(method, &self.gc_heap, bridge) {
-            return None;
-        }
-        let builtin_native_ref = method
-            .as_native_function()
-            .and_then(|native| native.native_ref(&self.gc_heap))?;
+        let native = method.as_native_function()?;
+        let declaration = crate::jit_static_native::jit_static_call_target(native, &self.gc_heap)
+            .filter(|declaration| declaration.this_operand)?;
+        let builtin_native_ref = native.native_ref(&self.gc_heap)?;
         Some(JitGuardedMethodCall {
             receiver: JitGuardedReceiver::Exotic(JitIntrinsicPrototype {
                 type_tag: crate::string::JS_STRING_BODY_TYPE_TAG,
@@ -201,9 +196,9 @@ impl Interpreter {
                 u32::from(hit.slot),
             ),
             builtin_native_ref,
-            entry_stub_id: stub_id,
-            safepoint_id: NO_SAFEPOINT,
-            argument_count: 1,
+            entry_stub_id: declaration.leaf_stub_id,
+            safepoint_id: crate::native_abi::NO_SAFEPOINT,
+            argument_count: declaration.argument_count,
             grow: None,
             holder_validity: None,
         })

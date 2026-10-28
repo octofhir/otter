@@ -645,7 +645,7 @@ impl Interpreter {
             jit_debug::JitDebugTier::Optimizing,
         );
         self.bake_unique_closure_context(&mut snapshot);
-        self.bake_guarded_method_calls(&mut snapshot);
+        self.bake_guarded_method_calls(&mut snapshot, context, fid);
         self.bake_instanceof_cells(&mut snapshot);
         self.bake_forward_apply(&mut snapshot);
         self.bake_element_accesses(&mut snapshot);
@@ -1100,7 +1100,7 @@ impl Interpreter {
         self.bake_binding_hit_proofs(&mut view, context, fid);
         self.bake_property_cache_ir(&mut view, context);
         self.bake_inline_callees(&mut view, context, fid, jit_debug::JitDebugTier::Template);
-        self.bake_guarded_method_calls(&mut view);
+        self.bake_guarded_method_calls(&mut view, context, fid);
         self.bake_forward_apply(&mut view);
         self.bake_element_accesses(&mut view);
         self.bake_keyed_name_sites(&mut view);
@@ -2295,7 +2295,12 @@ impl Interpreter {
         })
     }
 
-    pub(crate) fn bake_guarded_method_calls(&mut self, view: &mut jit::JitCompileSnapshot) {
+    pub(crate) fn bake_guarded_method_calls(
+        &mut self,
+        view: &mut jit::JitCompileSnapshot,
+        context: &ExecutionContext,
+        fid: u32,
+    ) {
         let sites: Vec<_> = view
             .instructions
             .iter()
@@ -2304,11 +2309,11 @@ impl Interpreter {
                 (
                     instr.byte_pc,
                     instr.property_ic_site(&view.code_block),
-                    instr.method_hint,
+                    instr.const_index(&view.code_block, 2),
                 )
             })
             .collect();
-        for (byte_pc, site, method_hint) in sites {
+        for (byte_pc, site, name_index) in sites {
             let alloc_safepoint_id = view.safepoints.len() as native_abi::SafepointId;
             // An exotic receiver — a collection body, a dense array or a
             // primitive — reaches its builtin through a pinned realm prototype
@@ -2318,7 +2323,10 @@ impl Interpreter {
                 .or_else(|| {
                     site.and_then(|site| self.jit_array_method_call(site, alloc_safepoint_id))
                 })
-                .or_else(|| self.jit_primitive_method_call(method_hint))
+                .or_else(|| {
+                    let name = context.string_constant_str_for_function(fid, name_index?)?;
+                    self.jit_primitive_method_call(name)
+                })
             {
                 if reserve_guarded_entry_safepoint(view, &mut call) {
                     view.guarded_method_calls.insert(byte_pc, call);
@@ -2797,7 +2805,7 @@ impl Interpreter {
             if let Some(receiver) = receiver {
                 self.bake_receiver_methods(&mut body, context, receiver, tier, budget);
             }
-            self.bake_guarded_method_calls(&mut body);
+            self.bake_guarded_method_calls(&mut body, context, fid);
             self.bake_instanceof_cells(&mut body);
             self.bake_forward_apply(&mut body);
             self.bake_element_accesses(&mut body);
@@ -4309,12 +4317,9 @@ mod tests {
 
             // Pinned primitive String holders are an explicit dictionary
             // proof domain with nonvirtual names, never an ordinary shape.
-            for hint in [
-                crate::jit::JitMethodHint::StringCharCodeAt,
-                crate::jit::JitMethodHint::StringIndexOf,
-            ] {
+            for name in ["charCodeAt", "indexOf"] {
                 let call = vm
-                    .jit_primitive_method_call(hint)
+                    .jit_primitive_method_call(name)
                     .expect("actual pinned String leaf proof");
                 assert!(matches!(
                     call.holder,

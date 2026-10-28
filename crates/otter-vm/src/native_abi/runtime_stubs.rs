@@ -1935,6 +1935,11 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_REGEXP_TEST_LEAF.id => "regexp_test_leaf",
         id if id == STUB_JIT_REGEXP_LITERAL.id => "jit_regexp_literal",
         id if id == STUB_JIT_STATIC_NATIVE_CALL.id => "jit_static_native_call",
+        id if id == STUB_OBJECT_IS_LEAF.id => "object_is_leaf",
+        id if id == STUB_STRING_CHAR_AT_LEAF.id => "string_char_at_leaf",
+        id if id == STUB_STRING_FROM_CHAR_CODE_LEAF.id => "string_from_char_code_leaf",
+        id if id == STUB_ARRAY_INDEX_OF_LEAF.id => "array_index_of_leaf",
+        id if id == STUB_ARRAY_INCLUDES_LEAF.id => "array_includes_leaf",
 
         _ => "unknown_runtime_stub",
     }
@@ -2396,6 +2401,70 @@ pub const STUB_JIT_STATIC_NATIVE_CALL: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Committed,
 );
 
+/// Leaf `Object.is`: §7.2.11 SameValue, every argument pair answers.
+pub const STUB_OBJECT_IS_LEAF: RuntimeStubDescriptor = descriptor(
+    135,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `String.prototype.charAt` at an int32 index: a one-unit Latin-1 or
+/// empty result is the heap's shared string; any other unit misses.
+pub const STUB_STRING_CHAR_AT_LEAF: RuntimeStubDescriptor = descriptor(
+    136,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `String.fromCharCode` of one int32 code whose unit is Latin-1: the
+/// heap's shared one-unit string; any other code misses.
+pub const STUB_STRING_FROM_CHAR_CODE_LEAF: RuntimeStubDescriptor = descriptor(
+    137,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Array.prototype.indexOf` of one value over a hole-free plain dense
+/// array; anything else misses.
+pub const STUB_ARRAY_INDEX_OF_LEAF: RuntimeStubDescriptor = descriptor(
+    138,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// Leaf `Array.prototype.includes` of one value over a hole-free plain dense
+/// array; anything else misses.
+pub const STUB_ARRAY_INCLUDES_LEAF: RuntimeStubDescriptor = descriptor(
+    139,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::LeafValue2,
+    2,
+    RuntimeStubEffects::none(),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2532,6 +2601,11 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_REGEXP_TEST_LEAF,
     STUB_JIT_REGEXP_LITERAL,
     STUB_JIT_STATIC_NATIVE_CALL,
+    STUB_OBJECT_IS_LEAF,
+    STUB_STRING_CHAR_AT_LEAF,
+    STUB_STRING_FROM_CHAR_CODE_LEAF,
+    STUB_ARRAY_INDEX_OF_LEAF,
+    STUB_ARRAY_INCLUDES_LEAF,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

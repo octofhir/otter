@@ -665,7 +665,13 @@ fn jit_snapshot_lowers_own_load_and_store_handlers() {
     let load = PropertyIcSlot::new(PropertyIcKind::Load);
     load.install(IcHandler::load_resolved(handle, &resolved).unwrap());
     let programs = load
-        .jit_programs(atom.raw(), |s| Some(s.offset()), proof_for_test)
+        .jit_programs(
+            atom.raw(),
+            &mut (
+                |s: crate::object::ShapeHandle| Some(s.offset()),
+                proof_for_test,
+            ),
+        )
         .expect("own-load snapshot");
     assert_eq!(
         programs[0].ops.as_ref(),
@@ -687,7 +693,13 @@ fn jit_snapshot_lowers_own_load_and_store_handlers() {
     let store = PropertyIcSlot::new(PropertyIcKind::Store);
     store.install(IcHandler::store_existing(obj, heap, property).unwrap());
     let programs = store
-        .jit_programs(atom.raw(), |s| Some(s.offset()), proof_for_test)
+        .jit_programs(
+            atom.raw(),
+            &mut (
+                |s: crate::object::ShapeHandle| Some(s.offset()),
+                proof_for_test,
+            ),
+        )
         .expect("own-store snapshot");
     assert_eq!(
         programs[0].ops.as_ref(),
@@ -732,12 +744,21 @@ fn jit_snapshot_lowers_prototype_handler_through_its_holder_root() {
     slot.install(IcHandler::load_resolved(receiver_handle, &resolved).unwrap());
     assert_eq!(holder_root, receiver_handle, "the empty instance root");
     assert!(
-        slot.jit_programs(atom.raw(), |_| None, proof_for_test)
-            .is_none(),
+        slot.jit_programs(
+            atom.raw(),
+            &mut (|_: crate::object::ShapeHandle| None, proof_for_test)
+        )
+        .is_none(),
         "an unnameable receiver drops the entry"
     );
     let program = slot
-        .jit_programs(atom.raw(), |s| Some(s.offset()), proof_for_test)
+        .jit_programs(
+            atom.raw(),
+            &mut (
+                |s: crate::object::ShapeHandle| Some(s.offset()),
+                proof_for_test,
+            ),
+        )
         .expect("prototype-load snapshot");
     assert_eq!(
         program[0].ops.as_ref(),
@@ -794,7 +815,13 @@ fn jit_snapshot_preserves_transition_guards_and_publication() {
     let slot = PropertyIcSlot::new(PropertyIcKind::Store);
     slot.install(IcHandler::store_transition(from_handle, &transition).unwrap());
     let program = slot
-        .jit_programs(atom.raw(), |s| Some(s.offset()), proof_for_test)
+        .jit_programs(
+            atom.raw(),
+            &mut (
+                |s: crate::object::ShapeHandle| Some(s.offset()),
+                proof_for_test,
+            ),
+        )
         .expect("complete add-transition snapshot");
     assert_eq!(
         program[0].ops.as_ref(),
@@ -901,7 +928,13 @@ fn storage_projection_codec_and_own_array_domain_are_disjoint() {
         object::shape_body::id_of(object::shape(bag, &heap)).raw()
     );
     let programs = slot
-        .jit_programs(atom_of("x"), |shape| Some(shape.offset()), |_| None)
+        .jit_programs(
+            atom_of("x"),
+            &mut (
+                |shape: crate::object::ShapeHandle| Some(shape.offset()),
+                |_: &std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>| None,
+            ),
+        )
         .unwrap();
     assert!(matches!(
         programs[0].ops.first(),
@@ -940,7 +973,13 @@ fn projected_array_overwrite_uses_bag_field_authority() {
     assert!(slot.probe_projected_store(bag, Projection::ArrayExpando, &mut heap, Value::TRUE));
     assert_eq!(object::load_proven_data_slot(bag, &heap, 0), Value::TRUE);
     let programs = slot
-        .jit_programs(atom_of("x"), |shape| Some(shape.offset()), |_| None)
+        .jit_programs(
+            atom_of("x"),
+            &mut (
+                |shape: crate::object::ShapeHandle| Some(shape.offset()),
+                |_: &std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>| None,
+            ),
+        )
         .unwrap();
     assert!(matches!(
         programs[0].ops.last(),

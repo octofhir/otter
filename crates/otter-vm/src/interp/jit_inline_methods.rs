@@ -17,9 +17,9 @@
 //! - `crate::object::shape_body` owns immutable ordinary descriptors.
 //! - `otter_jit::template::inline_leaf` validates scratch and receiver use.
 
-use super::{ExecutionContext, Interpreter, Op, PolyMethodTarget, jit};
+use super::{Baker, ExecutionContext, Op, PolyMethodTarget, jit};
 
-impl Interpreter {
+impl Baker<'_> {
     /// Prove the prepared body's property access for this exact guarded
     /// receiver. Mono and poly targets use the same descriptor checks; refusal
     /// removes only Template's field proof, leaving the target's call plan and
@@ -66,12 +66,13 @@ impl Interpreter {
                 return None;
             };
             let key = context.property_atom(name_idx)?;
-            let recv_shape = self
-                .shape_runtime
-                .handle_for_id(&self.gc_heap, target.recv_shape)?;
-            if let Some(slot) = self.shape_offset_of(recv_shape, key.name()) {
-                let (flags, is_accessor) =
-                    crate::object::shape_body::shape_slot_attrs(&self.gc_heap, recv_shape, slot)?;
+            let recv_shape = self.shape_for_id(target.recv_shape)?;
+            if let Some(slot) = self.vm.shape_offset_of(recv_shape, key.name()) {
+                let (flags, is_accessor) = crate::object::shape_body::shape_slot_attrs(
+                    &self.vm.gc_heap,
+                    recv_shape,
+                    slot,
+                )?;
                 if is_accessor
                     || (instr.op(&method_view.code_block) == Op::StoreProperty && !flags.writable())
                 {

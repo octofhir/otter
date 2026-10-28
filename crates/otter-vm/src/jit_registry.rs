@@ -622,6 +622,27 @@ impl JitCodeRegistry {
         self.contexts.watch_slot(heap, context, slot)
     }
 
+    /// Give the live `context` its watch, so a compile can read its slots
+    /// as constants.
+    pub(crate) fn ensure_context_watch(
+        &mut self,
+        heap: &mut otter_gc::GcHeap,
+        context: crate::context::ContextHandle,
+    ) -> Option<u32> {
+        self.contexts.ensure_watch(heap, context)
+    }
+
+    /// The watch slot `slot` of `context` would be watched under; marks
+    /// nothing (see `ContextSubscriptions::watchable_slot`).
+    pub(crate) fn watchable_context_slot(
+        &self,
+        heap: &otter_gc::GcHeap,
+        context: crate::context::ContextHandle,
+        slot: u16,
+    ) -> Option<u32> {
+        self.contexts.watchable_slot(heap, context, slot)
+    }
+
     /// Whether this exact installed generation remains current for entry.
     ///
     /// Entry requires the exact registered generation to remain Installed even

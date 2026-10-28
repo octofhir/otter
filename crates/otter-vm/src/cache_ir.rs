@@ -99,7 +99,27 @@ pub(crate) fn resolve_inherited_atom_data_slot(
     heap: &otter_gc::GcHeap,
     key: AtomizedPropertyKey<'_>,
 ) -> Option<ResolvedDataSlot> {
-    let validity = chain_validity(first, heap)?;
+    resolve_inherited_with(first, heap, key, chain_validity(first, heap)?)
+}
+
+/// [`resolve_inherited_atom_data_slot`] under the chain proof `first`
+/// already has, creating none: what a compilation reads.
+#[must_use]
+pub(crate) fn resolve_proved_inherited_atom_data_slot(
+    first: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+) -> Option<ResolvedDataSlot> {
+    let validity = crate::object::prototype_validity::current_chain_validity(first, heap)?;
+    resolve_inherited_with(first, heap, key, validity)
+}
+
+fn resolve_inherited_with(
+    first: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+    validity: Arc<PrototypeValidity>,
+) -> Option<ResolvedDataSlot> {
     let mut proto = first;
     for _ in 0..object::PROTO_CHAIN_HARD_CAP {
         if !object::supports_fast_property_ic(proto, heap) {

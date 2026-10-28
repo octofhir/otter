@@ -7,6 +7,8 @@
 //!   the prototype OrdinaryHasInstance searches for.
 //! - Weak processing relocates live cache entries and forgets dead ones.
 //! - Installation retains only identity cells used by finalized native code.
+//! - [`CompileProofs`] — where a compilation reading feedback names the
+//!   shapes and validity proofs it embeds.
 //!
 //! # Invariants
 //! - Compile sessions retain every embedded allocation until installation;
@@ -36,6 +38,36 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::object::{ShapeHandle, prototype_validity::PrototypeValidity};
 use otter_gc::raw::RawGc;
+
+/// Where a compilation reading feedback names what its code embeds: each
+/// shape and validity proof it keeps becomes one of its roots.
+pub(crate) trait CompileProofs {
+    /// Name `shape` in the code being compiled; `None` when the shape cannot
+    /// authorize a native proof.
+    fn shape(&mut self, shape: ShapeHandle) -> Option<u32>;
+    /// Retain `cell` while it still holds; `None` once retired.
+    fn validity(
+        &mut self,
+        cell: &Arc<PrototypeValidity>,
+    ) -> Option<crate::jit::JitPrototypeValidity>;
+}
+
+impl<S, V> CompileProofs for (S, V)
+where
+    S: FnMut(ShapeHandle) -> Option<u32>,
+    V: FnMut(&Arc<PrototypeValidity>) -> Option<crate::jit::JitPrototypeValidity>,
+{
+    fn shape(&mut self, shape: ShapeHandle) -> Option<u32> {
+        (self.0)(shape)
+    }
+
+    fn validity(
+        &mut self,
+        cell: &Arc<PrototypeValidity>,
+    ) -> Option<crate::jit::JitPrototypeValidity> {
+        (self.1)(cell)
+    }
+}
 
 /// The last callee value one generated call site proved to be its baked
 /// target. A later call with the identical value skips the full proof; any
@@ -68,6 +100,11 @@ impl CalleeIdentityCell {
     /// Address generated code reads and writes.
     pub(crate) fn address(&self) -> u64 {
         self.value.as_ptr() as u64
+    }
+
+    /// The value a strong cell holds, as the collector last rewrote it.
+    pub(crate) fn held(&self) -> crate::Value {
+        crate::Value::from_bits(self.value.load(Ordering::Relaxed))
     }
 
     /// Empty the cell when it holds a value `release` names. A call through

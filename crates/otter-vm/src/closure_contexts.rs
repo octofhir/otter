@@ -221,6 +221,15 @@ impl crate::Interpreter {
     /// or zero when the source is not tracked: a lazy record whose body is
     /// not compiled is tracked, a compiled body is classified by its code
     /// wherever it lives.
+    /// The classified context cell of `function_id`'s closures, or `0` while
+    /// no closure creation or compile preparation classified it.
+    pub(crate) fn classified_closure_context(&self, function_id: u32) -> u64 {
+        self.jit_code_registry
+            .closure_contexts
+            .classified(function_id)
+            .unwrap_or(0)
+    }
+
     pub(crate) fn prepare_closure_context(
         &mut self,
         source: &crate::ExecutionContext,

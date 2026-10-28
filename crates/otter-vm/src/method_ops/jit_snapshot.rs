@@ -23,7 +23,7 @@
 //! - [`super`] validates and records the method-cache observations.
 
 use super::MethodCallIc;
-use crate::Interpreter;
+use crate::interp::jit_bake::Baker;
 use crate::jit::{
     JitBodyGuard, JitBodySlot, JitGuardWidth, JitGuardedMethodCall, JitGuardedReceiver,
     JitIntrinsicPrototype, JitMethodHolder,
@@ -73,7 +73,7 @@ pub(crate) fn array_named_lookup_guard() -> JitBodyGuard {
     )
 }
 
-impl Interpreter {
+impl Baker<'_> {
     /// Snapshot a monomorphic dense-array method site (`push` / `pop` /
     /// `shift` / `unshift`, or a read the static-native registry declares)
     /// into JIT-readable guard metadata.
@@ -85,7 +85,7 @@ impl Interpreter {
     /// method, family, or when the prototype slot no longer holds the original
     /// native builtin.
     pub(crate) fn jit_array_method_call(
-        &self,
+        &mut self,
         site: usize,
         alloc_safepoint_id: crate::native_abi::SafepointId,
     ) -> Option<JitGuardedMethodCall> {
@@ -94,7 +94,7 @@ impl Interpreter {
             STUB_ARRAY_SHIFT_LEAF, STUB_ARRAY_UNSHIFT_ALLOC,
         };
 
-        let ic = match self.method_feedback.method_ic(site)? {
+        let ic = match self.vm.method_feedback.method_ic(site)? {
             MethodCallIc::Array(ic) => ic,
             MethodCallIc::Collection(_) | MethodCallIc::Ordinary(_) => return None,
         };
@@ -102,12 +102,12 @@ impl Interpreter {
         // A push the leaf refuses for a full buffer grows it through the
         // allocating entry instead of leaving the site.
         let grow = (ic.tag == Tag::Push).then_some((STUB_ARRAY_PUSH_ALLOC.id, alloc_safepoint_id));
-        let proto = self.default_array_prototype()?;
-        if crate::object::shape_id(proto, &self.gc_heap) != ic.proto_shape {
+        let proto = self.vm.default_array_prototype()?;
+        if crate::object::shape_id(proto, &self.vm.gc_heap) != ic.proto_shape {
             return None;
         }
-        let method = crate::object::data_slot_value_at(proto, &self.gc_heap, ic.proto_slot)?;
-        if !ic.tag.matches_builtin(method, &self.gc_heap) {
+        let method = crate::object::data_slot_value_at(proto, &self.vm.gc_heap, ic.proto_slot)?;
+        if !ic.tag.matches_builtin(method, &self.vm.gc_heap) {
             return None;
         }
         let (stub_id, safepoint_id, argument_count) = match ic.tag {
@@ -120,7 +120,7 @@ impl Interpreter {
             _ => {
                 let declaration = crate::jit_static_native::jit_static_call_target(
                     method.as_native_function()?,
-                    &self.gc_heap,
+                    &self.vm.gc_heap,
                 )
                 .filter(|declaration| declaration.this_operand)?;
                 (
@@ -132,7 +132,7 @@ impl Interpreter {
         };
         let builtin_native_ref = method
             .as_native_function()
-            .and_then(|native| native.native_ref(&self.gc_heap))?;
+            .and_then(|native| native.native_ref(&self.vm.gc_heap))?;
         Some(JitGuardedMethodCall {
             receiver: JitGuardedReceiver::Exotic(JitIntrinsicPrototype {
                 type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
@@ -143,7 +143,7 @@ impl Interpreter {
             holder: self.jit_method_holder(proto)?,
             method_field: crate::object::field_location_at(
                 proto,
-                &self.gc_heap,
+                &self.vm.gc_heap,
                 u32::from(ic.proto_slot),
             ),
             builtin_native_ref,
@@ -151,9 +151,9 @@ impl Interpreter {
             safepoint_id,
             argument_count,
             grow,
-            holder_validity: crate::object::prototype_validity::chain_validity(
+            holder_validity: crate::object::prototype_validity::current_chain_validity(
                 proto,
-                &self.gc_heap,
+                &self.vm.gc_heap,
             )
             .and_then(|cell| self.bake_prototype_validity(&cell)),
         })
@@ -169,9 +169,9 @@ impl Interpreter {
     /// plus the realm prototype's shape and method-slot identity is the whole
     /// guard. `%String.prototype%` is a String wrapper and never adopts a
     /// hidden class, so its slot layout is pinned by its dictionary id.
-    pub(crate) fn jit_primitive_method_call(&self, name: &str) -> Option<JitGuardedMethodCall> {
-        let proto = self.realm_intrinsics.string_prototype()?;
-        let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, name);
+    pub(crate) fn jit_primitive_method_call(&mut self, name: &str) -> Option<JitGuardedMethodCall> {
+        let proto = self.vm.realm_intrinsics.string_prototype()?;
+        let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.vm.gc_heap, name);
         let hit = hit?;
         let method = match lookup {
             crate::object::PropertyLookup::Data { value, .. } => value,
@@ -179,9 +179,10 @@ impl Interpreter {
             | crate::object::PropertyLookup::Absent => return None,
         };
         let native = method.as_native_function()?;
-        let declaration = crate::jit_static_native::jit_static_call_target(native, &self.gc_heap)
-            .filter(|declaration| declaration.this_operand)?;
-        let builtin_native_ref = native.native_ref(&self.gc_heap)?;
+        let declaration =
+            crate::jit_static_native::jit_static_call_target(native, &self.vm.gc_heap)
+                .filter(|declaration| declaration.this_operand)?;
+        let builtin_native_ref = native.native_ref(&self.vm.gc_heap)?;
         Some(JitGuardedMethodCall {
             receiver: JitGuardedReceiver::Exotic(JitIntrinsicPrototype {
                 type_tag: crate::string::JS_STRING_BODY_TYPE_TAG,
@@ -192,7 +193,7 @@ impl Interpreter {
             holder: self.jit_method_holder(proto)?,
             method_field: crate::object::field_location_at(
                 proto,
-                &self.gc_heap,
+                &self.vm.gc_heap,
                 u32::from(hit.slot),
             ),
             builtin_native_ref,
@@ -219,7 +220,7 @@ impl Interpreter {
         site: usize,
         alloc_safepoint_id: crate::native_abi::SafepointId,
     ) -> Option<JitGuardedMethodCall> {
-        let ic = match self.method_feedback.method_ic(site)? {
+        let ic = match self.vm.method_feedback.method_ic(site)? {
             MethodCallIc::Collection(ic) => ic,
             MethodCallIc::Array(_) | MethodCallIc::Ordinary(_) => return None,
         };
@@ -233,38 +234,38 @@ impl Interpreter {
             (None, Some(mutating)) => (mutating, crate::native_abi::NO_SAFEPOINT),
             (None, None) => (ic.alloc_stub_id?, alloc_safepoint_id),
         };
-        let (mut proto, receiver_type_tag) = if ic.op.is_map() {
+        let (proto, receiver_type_tag) = if ic.op.is_map() {
             (
-                self.realm_intrinsics.map_prototype()?,
+                self.vm.realm_intrinsics.map_prototype()?,
                 crate::collections::MAP_BODY_TYPE_TAG,
             )
         } else {
             (
-                self.realm_intrinsics.set_prototype()?,
+                self.vm.realm_intrinsics.set_prototype()?,
                 crate::collections::SET_BODY_TYPE_TAG,
             )
         };
-        // Publish only stable hidden-class guards, including for method-only
-        // bodies compiled before any named collection property was observed.
-        self.migrate_slow_to_fast(&mut proto);
-        let holder_shape = crate::object::keyed_shape(proto, &self.gc_heap);
+        // Publish only stable hidden-class guards: the session's preparation
+        // migrated the prototype, including for method-only bodies compiled
+        // before any named collection property was observed.
+        let holder_shape = crate::object::keyed_shape(proto, &self.vm.gc_heap);
         if holder_shape.is_null() {
             return None;
         }
         // Shape preparation can replace dictionary metadata after this runtime
         // IC was observed. Compile the live own-name proof, including its slot,
         // rather than freezing the earlier dictionary identity into code.
-        let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.gc_heap, ic.op.name());
+        let (hit, lookup) = crate::object::lookup_own_slot(proto, &self.vm.gc_heap, ic.op.name());
         let hit = hit?;
         let crate::object::PropertyLookup::Data { value: method, .. } = lookup else {
             return None;
         };
-        if !ic.op.matches_builtin(method, &self.gc_heap) {
+        if !ic.op.matches_builtin(method, &self.vm.gc_heap) {
             return None;
         }
         let builtin_native_ref = method
             .as_native_function()
-            .and_then(|native| native.native_ref(&self.gc_heap))?;
+            .and_then(|native| native.native_ref(&self.vm.gc_heap))?;
         Some(JitGuardedMethodCall {
             receiver: JitGuardedReceiver::Exotic(JitIntrinsicPrototype {
                 type_tag: receiver_type_tag,
@@ -275,7 +276,7 @@ impl Interpreter {
             holder: JitMethodHolder::Shape(self.bake_shape(holder_shape)?),
             method_field: crate::object::field_location_at(
                 proto,
-                &self.gc_heap,
+                &self.vm.gc_heap,
                 u32::from(hit.slot),
             ),
             builtin_native_ref,
@@ -291,6 +292,7 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Interpreter;
     use crate::method_ops::ArrayMethodCallIc;
     use crate::{ExecutionContext, Value, object};
     use otter_bytecode::{
@@ -382,7 +384,7 @@ mod tests {
                     tag: crate::array_prototype::ArrayMethodTag::Push,
                 })
             ));
-            assert!(vm.jit_array_method_call(site, 1).is_some());
+            assert!(Baker::new(&vm).jit_array_method_call(site, 1).is_some());
             let mut proto = vm.escape_scoped(prototype).as_object().unwrap();
             assert!(object::delete(&mut proto, &mut vm.gc_heap, "push").unwrap());
             let proto = vm.escape_scoped(prototype).as_object().unwrap();
@@ -392,7 +394,7 @@ mod tests {
                 Some(vm.escape_scoped(method))
             );
             assert_ne!(object::shape_id(proto, &vm.gc_heap), hit.shape_id);
-            assert!(vm.jit_array_method_call(site, 1).is_none());
+            assert!(Baker::new(&vm).jit_array_method_call(site, 1).is_none());
         });
     }
 }

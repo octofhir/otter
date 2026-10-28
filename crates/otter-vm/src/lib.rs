@@ -1198,10 +1198,6 @@ pub struct Interpreter {
     /// `(code object, return pc)` and the innermost function there. Code
     /// object ids are never reused, so an entry never goes stale.
     caller_function_cache: std::cell::Cell<Option<(u32, u64, Option<u32>)>>,
-    /// Shapes and validity cells held by in-progress compilations (a stack: a
-    /// compile can start a nested one). A root until the code object that
-    /// embeds them is registered and takes them over.
-    jit_compile_roots: std::cell::RefCell<Vec<jit_roots::CompilationRoot>>,
     /// Optimizing compilations handed to the isolate's compiler threads,
     /// with the roots each snapshot embeds until its result is installed.
     jit_compile_queue: jit_compile_queue::OptimizingCompileQueue,
@@ -1689,9 +1685,6 @@ impl Interpreter {
 impl otter_gc::ExtraRootSource for Interpreter {
     fn process_weak(&self, resolve: &mut dyn FnMut(RawGc) -> Option<RawGc>) {
         self.jit_code_registry.process_weak(resolve);
-        for root in self.jit_compile_roots.borrow().iter() {
-            root.process_weak(resolve);
-        }
         self.jit_compile_queue.process_weak(resolve);
     }
     /// Hidden classes are collectable: forget the shapes the marking left

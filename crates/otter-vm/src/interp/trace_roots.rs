@@ -289,8 +289,8 @@ impl Interpreter {
     }
 
     /// Keep alive the hidden classes compiled code embeds: those of every
-    /// registered code object, of the snapshots being prepared and of the
-    /// compilations in flight on compiler threads.
+    /// registered code object and of the compilations in flight on compiler
+    /// threads. A snapshot being baked needs none: baking cannot collect.
     pub(crate) fn trace_compiled_shapes(
         &self,
         visitor: &mut otter_gc::raw::SlotVisitor<'_>,
@@ -298,10 +298,6 @@ impl Interpreter {
     ) {
         self.jit_code_registry
             .trace_retained_roots(visitor, roots == otter_gc::RootSet::Young);
-        let compiling = self.jit_compile_roots.borrow();
-        for root in compiling.iter() {
-            root.trace(visitor);
-        }
         self.jit_compile_queue.trace_roots(visitor);
     }
 

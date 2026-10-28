@@ -27,13 +27,13 @@
 
 use std::collections::BTreeSet;
 
-use crate::Interpreter;
+use super::Baker;
 use crate::jit::{JitCacheIrOp, JitCompileSnapshot, JitFieldType, JitFieldTypeGuard};
 use crate::object::{FieldLocation, ShapeHandle, ShapeId, field_type, shape_body};
 
-impl Interpreter {
+impl Baker<'_> {
     /// Capture each source after receiver plans have seeded their initial words.
-    pub(super) fn bake_field_type_tree(&self, view: &mut JitCompileSnapshot) {
+    pub(super) fn bake_field_type_tree(&mut self, view: &mut JitCompileSnapshot) {
         self.bake_field_types(view);
         for callee in view.inline_callees.values_mut() {
             self.bake_field_type_tree(std::sync::Arc::make_mut(&mut callee.body));
@@ -48,7 +48,7 @@ impl Interpreter {
     }
 
     /// Prepare defining cells for every own property and native birth field.
-    pub(super) fn bake_field_types(&self, view: &mut JitCompileSnapshot) {
+    pub(super) fn bake_field_types(&mut self, view: &mut JitCompileSnapshot) {
         let mut locations = BTreeSet::new();
         let programs = view
             .property_programs
@@ -115,7 +115,7 @@ impl Interpreter {
         }
     }
 
-    fn bake_field_type(&self, receiver: u32, field: FieldLocation) -> Option<JitFieldType> {
+    fn bake_field_type(&mut self, receiver: u32, field: FieldLocation) -> Option<JitFieldType> {
         // SAFETY: these offsets come only from this session's rooted ordinary
         // shape baker, which prepared the source programs and literal plans.
         let shape = unsafe { ShapeHandle::from_offset(receiver) };
@@ -142,9 +142,7 @@ impl Interpreter {
                 if id == 0 {
                     continue;
                 }
-                let target = self
-                    .shape_runtime
-                    .handle_for_id(&self.gc_heap, ShapeId::from_raw(id));
+                let target = self.shape_for_id(ShapeId::from_raw(id));
                 let Some((target, baked)) =
                     target.and_then(|target| self.bake_shape(target).map(|baked| (target, baked)))
                 else {
@@ -177,7 +175,7 @@ impl Interpreter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Value, jit_roots::CompilationRoot, object};
+    use crate::{Interpreter, Value, jit_roots::CompilationRoot, object};
 
     #[test]
     fn historical_store_membership_survives_partial_load_bound_refusal() {
@@ -219,7 +217,7 @@ mod tests {
             let receiver_shape = object::shape(receiver_object, interpreter.gc_heap());
             let location = object::field_location(receiver_shape, 0);
             let owner = field_type::owner(receiver_shape, 0).unwrap();
-            let stable = interpreter
+            let stable = Baker::new(interpreter)
                 .bake_field_type(receiver_shape.offset(), location)
                 .unwrap();
             assert_eq!(stable.shapes.len(), 2);
@@ -229,18 +227,20 @@ mod tests {
                 .create_data_property(&mut second_object, "changed", Value::NULL)
                 .unwrap();
             assert!(!shape_body::is_stable(second_shape));
-            let mixed = interpreter
+            let mut baker = Baker::new(interpreter);
+            let mixed = baker
                 .bake_field_type(receiver_shape.offset(), location)
                 .unwrap();
             assert!(mixed.shapes.is_empty());
             assert_eq!(mixed.stored_shapes, stable.stored_shapes);
             for target in [owner, first_shape, second_shape] {
                 assert!(
-                    interpreter.jit_compile_roots.borrow().iter().any(
+                    baker.roots.iter().any(
                         |root| matches!(root, CompilationRoot::Shape(shape) if *shape == target)
                     )
                 );
             }
+            drop(baker);
 
             let missing = ShapeId::from_raw(field_type::SHAPE_MASK);
             assert!(
@@ -254,7 +254,7 @@ mod tests {
                 field_type::shape_id_sample(missing.raw()),
             );
             field_type::set_snapshot_for_test(owner, expected);
-            let partial = interpreter
+            let partial = Baker::new(interpreter)
                 .bake_field_type(receiver_shape.offset(), location)
                 .unwrap();
             assert_eq!(partial.guard.expected, expected);
@@ -267,13 +267,13 @@ mod tests {
             ] {
                 field_type::set_snapshot_for_test(owner, malformed);
                 assert!(
-                    interpreter
+                    Baker::new(interpreter)
                         .bake_field_type(receiver_shape.offset(), location)
                         .is_none()
                 );
             }
             field_type::observe_owner(owner, Value::TRUE);
-            let top = interpreter
+            let top = Baker::new(interpreter)
                 .bake_field_type(receiver_shape.offset(), location)
                 .unwrap();
             assert!(top.shapes.is_empty() && top.stored_shapes.is_empty());
@@ -320,7 +320,7 @@ mod tests {
             );
             view.literal_allocations.objects.insert(0, plan);
             assert!(view.property_programs.is_empty());
-            interpreter.bake_field_types(&mut view);
+            Baker::new(interpreter).bake_field_types(&mut view);
             assert_eq!(view.field_types.len(), 2);
             let link = &view.field_types[&(receiver_shape.offset(), FieldLocation::inline(0))];
             assert_eq!(
@@ -344,7 +344,7 @@ mod tests {
             interpreter
                 .create_data_property(&mut receiver_object, "link", Value::number_i32(3))
                 .unwrap();
-            interpreter.bake_field_types(&mut view);
+            Baker::new(interpreter).bake_field_types(&mut view);
             let mixed = &view.field_types[&(receiver_shape.offset(), FieldLocation::inline(0))];
             assert_eq!(mixed.guard.expected & field_type::INT32, field_type::INT32);
             assert!(

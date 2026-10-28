@@ -220,6 +220,12 @@ impl LayoutWatchpoint {
         }
     }
 
+    /// The proof of the current layout, if one was created and still holds.
+    pub(super) fn current(&self) -> Option<Arc<PrototypeValidity>> {
+        let current = self.0.lock().expect("layout watchpoint");
+        current.as_ref().filter(|cell| cell.is_valid()).cloned()
+    }
+
     /// The proof of the current layout, created on first use.
     pub(super) fn current_or_new(&self, identity: ShapeId) -> Arc<PrototypeValidity> {
         let mut current = self.0.lock().expect("layout watchpoint");
@@ -228,6 +234,14 @@ impl LayoutWatchpoint {
             None => Arc::clone(current.insert(PrototypeValidity::new(identity))),
         }
     }
+}
+
+/// The proof the chain starting at `first` already has, creating none.
+pub(crate) fn current_chain_validity(
+    first: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Option<Arc<PrototypeValidity>> {
+    heap.read_payload(first, |body| body.exotic()?.prototype_watchpoints.current())
 }
 
 /// Capture the chain starting at `first`, including that prototype itself.
@@ -242,6 +256,7 @@ pub(crate) fn chain_validity(
         return Some(cell);
     }
 
+    heap.assert_outside_compilation("prototype chain subscription");
     let mut prototypes = Vec::new();
     let mut current = first;
     loop {

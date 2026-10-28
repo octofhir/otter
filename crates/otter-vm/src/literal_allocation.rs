@@ -59,13 +59,14 @@ impl Interpreter {
         }
     }
 
-    /// The site one generation bakes for a literal instruction's cell.
-    pub(crate) fn jit_allocation_site(
-        &mut self,
+    /// The site one generation bakes for a literal instruction's cell: the
+    /// one its first allocation registered, else none.
+    pub(crate) fn registered_jit_allocation_site(
+        &self,
         cell: Option<&AtomicU16>,
     ) -> crate::jit::JitAllocationSite {
-        let id = self.literal_site(cell);
-        if id == 0 {
+        let id = cell.map_or(0, |cell| cell.load(Ordering::Relaxed));
+        if id == 0 || !self.gc_heap.allocation_sites().contains(id) {
             return crate::jit::JitAllocationSite::default();
         }
         let sites = self.gc_heap.allocation_sites();
@@ -310,7 +311,7 @@ mod tests {
             assert!((*header(young)).is_young());
             assert_eq!((*header(young)).allocation_site(), site);
         }
-        let tracked = vm.jit_allocation_site(Some(&cell));
+        let tracked = vm.registered_jit_allocation_site(Some(&cell));
         assert_eq!(tracked.id, site);
         assert_eq!(tracked.mode, crate::jit::JitSiteMode::Track);
         assert_eq!(
@@ -323,7 +324,7 @@ mod tests {
             .set_decision_for_test(site, PretenureDecision::Tenure);
         assert_eq!(vm.literal_site_placement(Some(&cell)), SitePlacement::Old);
         assert_eq!(
-            vm.jit_allocation_site(Some(&cell)).mode,
+            vm.registered_jit_allocation_site(Some(&cell)).mode,
             crate::jit::JitSiteMode::Old
         );
         let old = vm
@@ -351,7 +352,7 @@ mod tests {
             SitePlacement::Young(0)
         );
         assert_eq!(
-            vm.jit_allocation_site(Some(&declined)).mode,
+            vm.registered_jit_allocation_site(Some(&declined)).mode,
             crate::jit::JitSiteMode::Young
         );
     }

@@ -92,6 +92,7 @@ impl ShapeInterner {
     /// keeps its ancestors), so registering it again only pins it for the
     /// current turn.
     pub(crate) fn register_shape(heap: &GcHeap, shape: ShapeHandle) {
+        heap.assert_outside_compilation("shape registration");
         if !shape_body::is_dictionary_of(shape) {
             let id = heap.read_payload(shape, ShapeBody::id);
             let mut tables = Self::of(heap).tables.borrow_mut();

@@ -30,7 +30,7 @@
 //! - [`crate::object::shape_store`] resolves one store.
 //! - `crate::property_ic` builds the same programs from installed handlers.
 
-use crate::Interpreter;
+use super::Baker;
 use crate::constructor_layout::ConstructorFamilyOwner;
 use crate::jit::{JitCacheIrOp, JitCacheIrProgram, JitCompileSnapshot};
 use crate::object::{
@@ -43,17 +43,17 @@ use otter_bytecode::Op;
 /// Shapes one compiled tree may prove and bake store programs for.
 const MAX_PROVED_SHAPES: usize = 64;
 
-impl Interpreter {
+impl Baker<'_> {
     /// The receiver `fid`'s own construct entry allocates: the plan of its
     /// one finalized, attached base-constructor family whose new.target is a
     /// closure of `fid` itself, fitted with the family's empty root.
-    pub(super) fn bake_own_receiver_plan(&self, view: &mut JitCompileSnapshot, fid: u32) {
+    pub(super) fn bake_own_receiver_plan(&mut self, view: &mut JitCompileSnapshot, fid: u32) {
         if view.derived_constructor {
             return;
         }
-        let heap = &self.gc_heap;
+        let heap = &self.vm.gc_heap;
         let mut family = None;
-        for layout in self.constructor_families.of_owner(fid) {
+        for layout in self.vm.constructor_families.of_owner(fid) {
             let admitted = heap.read_payload(layout, |body| {
                 (body.owner() == (ConstructorFamilyOwner::Closure, fid)
                     && body.base_function_id() == fid
@@ -84,7 +84,7 @@ impl Interpreter {
 
     /// Bake [`JitCompileSnapshot::proved_store_programs`] across the whole
     /// compiled tree rooted at `view`.
-    pub(super) fn bake_proved_stores_tree(&self, view: &mut JitCompileSnapshot) {
+    pub(super) fn bake_proved_stores_tree(&mut self, view: &mut JitCompileSnapshot) {
         let mut roots = Vec::new();
         collect_roots(view, &mut roots);
         let shapes = self.descendant_shapes(&roots);
@@ -94,8 +94,8 @@ impl Interpreter {
         self.bake_proved_stores(view, &shapes);
     }
 
-    fn bake_proved_stores(&self, view: &mut JitCompileSnapshot, shapes: &[ShapeHandle]) {
-        let names = crate::isolate_names::names(&self.gc_heap);
+    fn bake_proved_stores(&mut self, view: &mut JitCompileSnapshot, shapes: &[ShapeHandle]) {
+        let names = crate::isolate_names::names(&self.vm.gc_heap);
         let sites: Vec<(u32, u32)> = view
             .instructions
             .iter()
@@ -131,11 +131,11 @@ impl Interpreter {
 
     /// The program of a store of `key` into an object of exactly `shape`.
     fn proved_store_program(
-        &self,
+        &mut self,
         shape: ShapeHandle,
         key: AtomizedPropertyKey<'_>,
     ) -> Option<(u32, JitCacheIrProgram)> {
-        let store = shape_store(&self.gc_heap, shape, key)?;
+        let store = shape_store(&self.vm.gc_heap, shape, key)?;
         // As an exported program: never into a prototype, never an append to
         // an object that cannot grow.
         let state = crate::object::shape_body::state_of(shape);
@@ -198,7 +198,7 @@ impl Interpreter {
 
     /// `roots` and their interned descendants, breadth first, at most
     /// [`MAX_PROVED_SHAPES`] of them.
-    fn descendant_shapes(&self, roots: &[u32]) -> Vec<ShapeHandle> {
+    fn descendant_shapes(&mut self, roots: &[u32]) -> Vec<ShapeHandle> {
         let mut shapes: Vec<ShapeHandle> = Vec::new();
         for &token in roots {
             // SAFETY: every root token is a shape this session's baker
@@ -210,7 +210,7 @@ impl Interpreter {
         }
         let mut next = 0;
         while next < shapes.len() && shapes.len() < MAX_PROVED_SHAPES {
-            for child in ShapeInterner::children_of(&self.gc_heap, shapes[next]) {
+            for child in ShapeInterner::children_of(&self.vm.gc_heap, shapes[next]) {
                 if shapes.len() == MAX_PROVED_SHAPES {
                     break;
                 }

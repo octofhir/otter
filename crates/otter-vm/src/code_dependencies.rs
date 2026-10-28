@@ -287,37 +287,69 @@ impl ContextSubscriptions {
         context: crate::context::ContextHandle,
         slot: u16,
     ) -> Option<u32> {
-        if slot >= WATCHABLE_CONTEXT_SLOTS {
-            return None;
+        let id = self.watchable_slot(heap, context, slot).or_else(|| {
+            self.ensure_watch(heap, context)?;
+            self.watchable_slot(heap, context, slot)
+        })?;
+        self.get(id)?.watched.fetch_or(1 << slot, Ordering::Relaxed);
+        Some(id)
+    }
+
+    /// Give the live `context` its watch unless it has one; the identity of
+    /// its watch.
+    pub(crate) fn ensure_watch(
+        &mut self,
+        heap: &mut otter_gc::GcHeap,
+        context: crate::context::ContextHandle,
+    ) -> Option<u32> {
+        let current = crate::context::watch(heap, context);
+        if current != 0 {
+            // SAFETY: a nonzero watch word names a watch this registry owns.
+            return Some(unsafe { &*(current as *const ContextWatch) }.id);
         }
         let scope: &Cell<u64> = self
             .scopes
             .entry(crate::context::scope_identity(heap, context))
             .or_default();
-        if scope.get() >> slot & 1 != 0 {
-            return None;
-        }
         let scope = std::ptr::from_ref(scope);
-        let current = crate::context::watch(heap, context);
-        let watch: &ContextWatch = if current == 0 {
-            let id = u32::try_from(self.watches.len() + 1).ok()?;
-            let fresh = Box::new(ContextWatch {
-                id,
-                scope,
-                ..ContextWatch::default()
-            });
-            crate::context::set_watch(heap, context, std::ptr::from_ref(&*fresh) as u64);
-            self.watches.push(fresh);
-            self.watches.last().expect("just pushed")
-        } else {
-            // SAFETY: a nonzero watch word names a watch this registry owns.
-            unsafe { &*(current as *const ContextWatch) }
-        };
-        if watch.volatile.get() >> slot & 1 != 0 {
+        let id = u32::try_from(self.watches.len() + 1).ok()?;
+        let fresh = Box::new(ContextWatch {
+            id,
+            scope,
+            ..ContextWatch::default()
+        });
+        crate::context::set_watch(heap, context, std::ptr::from_ref(&*fresh) as u64);
+        self.watches.push(fresh);
+        Some(id)
+    }
+
+    /// The identity of `context`'s watch when slot `slot` could be watched
+    /// under it: the context has its watch, the slot is in range, and
+    /// neither the watch nor the context's scope saw the slot written after
+    /// a watch. Creates and marks nothing.
+    pub(crate) fn watchable_slot(
+        &self,
+        heap: &otter_gc::GcHeap,
+        context: crate::context::ContextHandle,
+        slot: u16,
+    ) -> Option<u32> {
+        if slot >= WATCHABLE_CONTEXT_SLOTS {
             return None;
         }
-        watch.watched.fetch_or(1 << slot, Ordering::Relaxed);
-        Some(watch.id)
+        if self
+            .scopes
+            .get(&crate::context::scope_identity(heap, context))
+            .is_some_and(|scope| scope.get() >> slot & 1 != 0)
+        {
+            return None;
+        }
+        let current = crate::context::watch(heap, context);
+        if current == 0 {
+            return None;
+        }
+        // SAFETY: a nonzero watch word names a watch this registry owns.
+        let watch = unsafe { &*(current as *const ContextWatch) };
+        (watch.volatile.get() >> slot & 1 == 0).then_some(watch.id)
     }
 
     fn get(&self, id: u32) -> Option<&ContextWatch> {

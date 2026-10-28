@@ -67,6 +67,8 @@ pub(crate) struct PendingCompile {
     pub(crate) function: Arc<crate::executable::CodeBlock>,
     /// Every allocation the snapshot names.
     pub(crate) roots: Box<[CompilationRoot]>,
+    /// Mutator-side work run before the result is published.
+    pub(crate) install: crate::interp::jit_bake::InstallTasks,
     /// Exact source chunks of all prepared bodies, until terminal ACK.
     pub(crate) sources: CompilationSources,
     /// The same stop token carried by the queued or active request.
@@ -476,6 +478,7 @@ mod tests {
             osr_pc: None,
             function: snapshot.code_block.clone(),
             roots: vec![CompilationRoot::CalleeIdentity(root)].into_boxed_slice(),
+            install: crate::interp::jit_bake::InstallTasks::default(),
             sources,
             cancellation: cancellation.clone(),
             retry_code_reclamation: false,

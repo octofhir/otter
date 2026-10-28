@@ -310,6 +310,9 @@ pub struct GcHeap {
     /// [`Self::lab_consumed_bytes`] (plus the live buffer's progress) is what
     /// generated code allocated.
     runtime_lab_bytes: u64,
+    /// Set while a compilation reads the heap to bake its input; see
+    /// [`Self::enter_compilation_scope`].
+    compilation_scope: std::cell::Cell<bool>,
     /// Sums of the per-type rows' `alloc_count_total`, `alloc_bytes_total`
     /// and `live_bytes`, kept beside every row update so an accounting
     /// checkpoint reads them without walking the table.
@@ -610,6 +613,7 @@ impl GcHeap {
             lab_page_allocated: 0,
             lab_consumed_bytes: 0,
             runtime_lab_bytes: 0,
+            compilation_scope: std::cell::Cell::new(false),
             rows_alloc_count: 0,
             rows_alloc_bytes: 0,
             rows_live_bytes: 0,
@@ -4122,6 +4126,41 @@ fn visit_extra_roots_deduped(
             continue;
         }
         entry.visit(roots, visitor);
+    }
+}
+
+/// A compilation reading the heap; see [`GcHeap::enter_compilation_scope`].
+pub struct CompilationScope<'a> {
+    heap: &'a GcHeap,
+}
+
+impl Drop for CompilationScope<'_> {
+    fn drop(&mut self) {
+        self.heap.compilation_scope.set(false);
+    }
+}
+
+impl GcHeap {
+    /// Mark the heap as read by a compilation baking its input until the
+    /// returned scope drops. Baking must leave no effect the mutator can
+    /// observe: entry points that would register, subscribe or publish
+    /// mutator state check [`Self::assert_outside_compilation`].
+    pub fn enter_compilation_scope(&self) -> CompilationScope<'_> {
+        assert!(
+            !self.compilation_scope.replace(true),
+            "nested compilation scope"
+        );
+        CompilationScope { heap: self }
+    }
+
+    /// Fail when a compilation is baking: `what` is mutator state that only
+    /// preparation, a cache miss or installation may change.
+    #[track_caller]
+    pub fn assert_outside_compilation(&self, what: &str) {
+        assert!(
+            !self.compilation_scope.get(),
+            "{what} inside a compilation's bake"
+        );
     }
 }
 

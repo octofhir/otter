@@ -114,31 +114,36 @@ impl Interpreter {
         )
     }
 
-    /// The intrinsic-prototype programs of `key`: built once per name and
-    /// layout, since every named site of every compilation asks again. A
-    /// reuse roots the guarded shapes for the compilation like a build does.
-    pub(crate) fn jit_intrinsic_property_programs(
-        &mut self,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Vec<JitCacheIrProgram> {
+    /// Build the intrinsic-prototype programs of `key` unless they were built
+    /// against the current layout: once per name and layout, since every
+    /// named site of every compilation reads them.
+    pub(crate) fn prepare_intrinsic_property_programs(&mut self, key: AtomizedPropertyKey<'_>) {
         let atom = key.atom().id().raw();
-        let (stamp, shapes) = self.intrinsic_layout_stamp();
-        if let Some((built, programs)) = self.jit_intrinsic_programs.get(&atom)
-            && *built == stamp
+        let (stamp, _) = self.intrinsic_layout_stamp();
+        if self
+            .jit_intrinsic_programs
+            .get(&atom)
+            .is_some_and(|(built, _)| *built == stamp)
         {
-            let programs = programs.clone();
-            for shape in shapes {
-                let _ = self.bake_shape(shape);
-            }
-            return programs;
+            return;
         }
         let programs = self.build_intrinsic_property_programs(key);
-        // Building can migrate and root the prototypes, giving them their
-        // final shapes: the stamp is taken after.
+        // Building can migrate the prototypes and give them their prototype
+        // role, which are their final shapes: the stamp is taken after.
         let (stamp, _) = self.intrinsic_layout_stamp();
-        self.jit_intrinsic_programs
-            .insert(atom, (stamp, programs.clone()));
-        programs
+        self.jit_intrinsic_programs.insert(atom, (stamp, programs));
+    }
+
+    /// The prepared intrinsic-prototype programs of `key` and the shapes they
+    /// guard, while the layout they were built against still holds; `None`
+    /// when they were never prepared or the layout changed since.
+    pub(crate) fn prepared_intrinsic_property_programs(
+        &self,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<(&[JitCacheIrProgram], [object::ShapeHandle; 5])> {
+        let (stamp, shapes) = self.intrinsic_layout_stamp();
+        let (built, programs) = self.jit_intrinsic_programs.get(&key.atom().id().raw())?;
+        (*built == stamp).then_some((programs.as_slice(), shapes))
     }
 
     fn build_intrinsic_property_programs(
@@ -245,11 +250,55 @@ impl Interpreter {
         })
     }
 
+    /// Give an intrinsic prototype the hidden class programs guard: migrated
+    /// out of dictionary mode, then the prototype role. The role is a new
+    /// hidden class, taken before any program reads the shape, so a later
+    /// root (a builtin fast-path proof, `Object.create`) leaves the guarded
+    /// shape in place. Both steps are no-ops once taken.
+    fn prepare_intrinsic_prototype(
+        &mut self,
+        mut prototype: object::JsObject,
+    ) -> Option<object::JsObject> {
+        self.migrate_slow_to_fast(&mut prototype);
+        self.with_handle_scope(|this, scope| {
+            let rooted = this.scoped_value(scope, Value::object(prototype));
+            this.object_root(
+                Some(prototype),
+                object::DEFAULT_INLINE_CAPACITY,
+                ShapeState::ORDINARY,
+            )
+            .ok()?;
+            this.escape_scoped(rooted).as_object()
+        })
+    }
+
+    /// Prepare every intrinsic prototype whose shape the programs' layout
+    /// stamp names, so building programs never moves the stamp.
+    pub(crate) fn prepare_intrinsic_prototypes(&mut self) {
+        let prototypes = [
+            self.realm_intrinsics.map_prototype(),
+            self.realm_intrinsics.set_prototype(),
+            self.realm_intrinsics.regexp_prototype(),
+            self.default_array_prototype(),
+            self.realm_intrinsics.function_prototype(),
+        ];
+        for prototype in prototypes.into_iter().flatten() {
+            let state = object::state(prototype, &self.gc_heap);
+            if state.is_opaque()
+                || (state.is_prototype()
+                    && !object::keyed_shape(prototype, &self.gc_heap).is_null())
+            {
+                continue;
+            }
+            let _ = self.prepare_intrinsic_prototype(prototype);
+        }
+    }
+
     /// An exotic receiver proof, then the prepared prototype's fast shape and
     /// immutable atom slot.
     fn shaped_prototype_program(
         &mut self,
-        mut prototype: object::JsObject,
+        prototype: object::JsObject,
         key: AtomizedPropertyKey<'_>,
         proof: impl FnOnce(u32) -> JitIntrinsicPrototype,
     ) -> Option<JitCacheIrProgram> {
@@ -265,21 +314,7 @@ impl Interpreter {
         ) {
             return None;
         }
-        self.migrate_slow_to_fast(&mut prototype);
-        // The first instance root over a prototype gives it the prototype
-        // role, which is a new hidden class. Take the role before reading the
-        // shape the program guards, so a later root (a builtin fast-path
-        // proof, `Object.create`) leaves the guarded shape in place.
-        let prototype = self.with_handle_scope(|this, scope| {
-            let rooted = this.scoped_value(scope, Value::object(prototype));
-            this.object_root(
-                Some(prototype),
-                object::DEFAULT_INLINE_CAPACITY,
-                ShapeState::ORDINARY,
-            )
-            .ok()?;
-            this.escape_scoped(rooted).as_object()
-        })?;
+        let prototype = self.prepare_intrinsic_prototype(prototype)?;
         if !object::supports_fast_property_ic(prototype, &self.gc_heap) {
             return None;
         }
@@ -302,7 +337,7 @@ impl Interpreter {
                 },
                 JitCacheIrOp::GuardShape {
                     object: 1,
-                    shape: self.bake_shape(shape)?,
+                    shape: crate::interp::jit_bake::bakeable_shape(shape)?,
                 },
                 JitCacheIrOp::GuardAtomSlot {
                     object: 1,
@@ -330,7 +365,8 @@ impl Interpreter {
             return None;
         }
         let prototype = self.realm_intrinsics.string_prototype()?;
-        let crate::jit::JitMethodHolder::Dictionary(layout) = self.jit_method_holder(prototype)?
+        let crate::interp::jit_bake::MethodHolderLayout::Dictionary(layout) =
+            self.method_holder_layout(prototype)?
         else {
             return None;
         };
@@ -368,6 +404,20 @@ impl Interpreter {
 mod tests {
     use super::*;
     use crate::property_atom::PropertyAtom;
+
+    impl Interpreter {
+        /// The programs a compilation reads for `key` after the session
+        /// prepared them.
+        fn jit_intrinsic_property_programs(
+            &mut self,
+            key: AtomizedPropertyKey<'_>,
+        ) -> Vec<JitCacheIrProgram> {
+            self.prepare_intrinsic_property_programs(key);
+            self.prepared_intrinsic_property_programs(key)
+                .map(|(programs, _)| programs.to_vec())
+                .unwrap_or_default()
+        }
+    }
 
     #[test]
     fn ordinary_eligibility_preserves_intrinsic_collection_and_string_proofs() {

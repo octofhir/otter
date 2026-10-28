@@ -667,12 +667,9 @@ impl<'a> PropertyFeedbackSlot<'a> {
     pub(crate) fn jit_programs(
         self,
         atom: u32,
-        bake_shape: impl FnMut(crate::object::ShapeHandle) -> Option<u32>,
-        bake_validity: impl FnMut(
-            &std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>,
-        ) -> Option<crate::jit::JitPrototypeValidity>,
+        proofs: &mut impl crate::jit_roots::CompileProofs,
     ) -> Option<Vec<crate::jit::JitCacheIrProgram>> {
-        self.slot.jit_programs(atom, bake_shape, bake_validity)
+        self.slot.jit_programs(atom, proofs)
     }
 }
 

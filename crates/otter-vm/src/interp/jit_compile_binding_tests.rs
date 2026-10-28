@@ -112,11 +112,26 @@ fn fixture(dictionary: bool) -> (Interpreter, ExecutionContext) {
 }
 
 fn bake(interpreter: &mut Interpreter, context: &ExecutionContext) -> jit::JitCompileSnapshot {
+    bake_retained(interpreter, context).0
+}
+
+/// [`bake`] with the roots that keep the snapshot's proofs alive.
+fn bake_retained(
+    interpreter: &mut Interpreter,
+    context: &ExecutionContext,
+) -> (
+    jit::JitCompileSnapshot,
+    Box<[crate::jit_roots::CompilationRoot]>,
+) {
     let fid = context.function_base();
+    let _ = interpreter.prepare_compile_facts(context, fid);
     let mut view = context.jit_compile_snapshot(fid).expect("linked snapshot");
-    interpreter.bake_global_lexical_loads(&mut view, context, fid);
-    interpreter.bake_binding_hit_proofs(&mut view, context, fid);
-    view
+    let mut baker = Baker::new(interpreter);
+    baker.bake_global_lexical_loads(&mut view, context, fid);
+    baker.bake_binding_hit_proofs(&mut view, context, fid);
+    let (roots, install, _) = baker.finish();
+    assert!(interpreter.run_install_tasks(install));
+    (view, roots)
 }
 
 fn assert_proofs(
@@ -348,7 +363,7 @@ fn descriptor_changes_retire_ordinary_identity_and_bake_current_dictionary_flags
 #[test]
 fn dictionary_binding_watches_preserve_values_and_unrelated_descriptor_changes() {
     let (mut interpreter, context) = fixture(true);
-    let before = bake(&mut interpreter, &context);
+    let (before, _before_roots) = bake_retained(&mut interpreter, &context);
     assert_proofs(&interpreter, &before, true, true);
     let layout = object::dictionary_layout(interpreter.global_this, &interpreter.gc_heap).unwrap();
 
@@ -394,7 +409,7 @@ fn dictionary_binding_watches_preserve_values_and_unrelated_descriptor_changes()
         object::dictionary_layout(interpreter.global_this, &interpreter.gc_heap),
         Some(layout + 1)
     );
-    let frozen = bake(&mut interpreter, &context);
+    let (frozen, _frozen_roots) = bake_retained(&mut interpreter, &context);
     assert_proofs(&interpreter, &frozen, true, false);
     assert_ne!(frozen.binding_hit_proofs, before.binding_hit_proofs);
     // The slot-layout proof subscribed generations read through retires
@@ -486,7 +501,7 @@ fn foreign_linked_source_never_bakes_ambient_global_proofs_or_inline_body() {
     assert!(foreign_view.global_lexical_loads.is_empty());
     assert!(foreign_view.global_object_loads.is_empty());
     assert!(
-        interpreter
+        Baker::new(&interpreter)
             .bake_inline_body(
                 &foreign,
                 fid,
@@ -545,7 +560,7 @@ fn disposed_source_global_never_substitutes_the_active_global() {
             .is_empty()
     );
     assert!(
-        interpreter
+        Baker::new(&interpreter)
             .bake_inline_body(
                 &foreign,
                 fid,

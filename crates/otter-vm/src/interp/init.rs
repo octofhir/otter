@@ -259,7 +259,6 @@ impl Interpreter {
             jit_runtime_stats: JitRuntimeStats::default(),
             jit_code_registry: crate::jit_registry::JitCodeRegistry::new_boxed(),
             caller_function_cache: std::cell::Cell::new(None),
-            jit_compile_roots: std::cell::RefCell::default(),
             jit_compile_queue: jit_compile_queue::OptimizingCompileQueue::default(),
             jit_instanceof_cells: std::cell::RefCell::default(),
             runtime_turn_depth: 0,

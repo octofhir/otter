@@ -1364,8 +1364,8 @@ impl PropertyIcSlot {
 
     /// Copy every entry the optimizing tier can lower into compile metadata.
     ///
-    /// `bake_shape` names a shape in the compilation (and retains it);
-    /// `bake_validity` retains a still-valid proof. An entry whose shape can
+    /// `proofs` names a shape in the compilation (and retains it) and
+    /// retains a still-valid proof. An entry whose shape can
     /// no longer be named or whose proof died is dropped, as are entries with
     /// no CacheIR lowering (nonexistent keys, dictionary transitions): their
     /// receivers reach the optimized code like unseen shapes. `None` when
@@ -1373,10 +1373,7 @@ impl PropertyIcSlot {
     pub(crate) fn jit_programs(
         &self,
         atom: u32,
-        mut bake_shape: impl FnMut(ShapeHandle) -> Option<u32>,
-        mut bake_validity: impl FnMut(
-            &Arc<PrototypeValidity>,
-        ) -> Option<crate::jit::JitPrototypeValidity>,
+        proofs: &mut impl crate::jit_roots::CompileProofs,
     ) -> Option<Vec<crate::jit::JitCacheIrProgram>> {
         use crate::jit::JitCacheIrOp;
         let mut programs = Vec::with_capacity(self.entry_count());
@@ -1406,7 +1403,7 @@ impl PropertyIcSlot {
                 }
                 _ => {}
             }
-            let Some(shape) = bake_shape(receiver) else {
+            let Some(shape) = proofs.shape(receiver) else {
                 continue;
             };
             let validity = match entry.validity_word() {
@@ -1414,7 +1411,7 @@ impl PropertyIcSlot {
                 word => {
                     // SAFETY: a non-zero word owns a strong count.
                     let cell = unsafe { PrototypeValidity::clone_raw(word) };
-                    match bake_validity(&cell) {
+                    match proofs.validity(&cell) {
                         Some(validity) => Some(validity),
                         None => continue,
                     }
@@ -1433,7 +1430,7 @@ impl PropertyIcSlot {
                     JitCacheIrOp::LoadField { object: 0, field },
                 ],
                 IcHandlerKind::PrototypeField => {
-                    let (Some(root), Some(validity)) = (bake_shape(entry.aux()), validity) else {
+                    let (Some(root), Some(validity)) = (proofs.shape(entry.aux()), validity) else {
                         continue;
                     };
                     vec![
@@ -1458,7 +1455,7 @@ impl PropertyIcSlot {
                     if !object::shape_body::append_geometry_matches(receiver, target, field) {
                         continue;
                     }
-                    let Some(to_shape) = bake_shape(target) else {
+                    let Some(to_shape) = proofs.shape(target) else {
                         continue;
                     };
                     let mut ops = vec![JitCacheIrOp::GuardShape { object: 0, shape }];

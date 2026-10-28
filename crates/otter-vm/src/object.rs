@@ -4006,6 +4006,7 @@ pub(crate) fn dictionary_layout_validity(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
 ) -> Option<std::sync::Arc<prototype_validity::PrototypeValidity>> {
+    heap.assert_outside_compilation("dictionary layout proof");
     heap.read_payload(obj, |body| {
         if !body.is_dictionary() {
             return None;
@@ -4013,6 +4014,20 @@ pub(crate) fn dictionary_layout_validity(
         let identity = body.dictionary_shape_id();
         body.exotic()
             .map(|exotic| exotic.layout_watchpoint.current_or_new(identity))
+    })
+}
+
+/// [`dictionary_layout_validity`] when the proof already exists, creating
+/// none: what a compilation reads.
+pub(crate) fn current_dictionary_layout_validity(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> Option<std::sync::Arc<prototype_validity::PrototypeValidity>> {
+    heap.read_payload(obj, |body| {
+        if !body.is_dictionary() {
+            return None;
+        }
+        body.exotic()?.layout_watchpoint.current()
     })
 }
 

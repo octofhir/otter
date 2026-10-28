@@ -25,9 +25,7 @@
 use super::InlineSnapshotBudget;
 use crate::object::ShapeId;
 use crate::object::shape_body::{self, ShapePrototype};
-use crate::{
-    ExecutionContext, Interpreter, MethodLookupProof, Op, PolyMethodTarget, jit, jit_debug,
-};
+use crate::{ExecutionContext, MethodLookupProof, Op, PolyMethodTarget, jit, jit_debug};
 
 /// The receiver a `new` site allocates in place, by the stable id of its
 /// initial hidden class.
@@ -36,7 +34,7 @@ pub(super) struct ConstructReceiver {
     pub(super) shape: ShapeId,
 }
 
-impl Interpreter {
+impl super::Baker<'_> {
     /// Give `view`, a constructor body spliced where `receiver` is its
     /// `this`, a direct method for every named read and method call whose key
     /// the receiver inherits as a closure and which has no method feedback.
@@ -88,30 +86,32 @@ impl Interpreter {
     /// for constant `name` of `function_id`: an inherited data slot holding
     /// a closure, under the chain proof of the class's prototype.
     fn receiver_method_target(
-        &self,
+        &mut self,
         context: &ExecutionContext,
         function_id: u32,
         name: u32,
         receiver: ConstructReceiver,
     ) -> Option<PolyMethodTarget> {
         let key = context.property_atom_for_function(function_id, name)?;
-        let shape = self
-            .shape_runtime
-            .handle_for_id(&self.gc_heap, receiver.shape)?;
-        if self.shape_slot_of_atom(shape, key.atom().id()).is_some() {
+        let shape = self.shape_for_id(receiver.shape)?;
+        if crate::object::shape_body::shape_slot_of_atom(&self.vm.gc_heap, shape, key.atom().id())
+            .is_some()
+        {
             return None;
         }
         let ShapePrototype::Object(prototype) = shape_body::prototype_of(shape) else {
             return None;
         };
-        let resolved =
-            crate::cache_ir::resolve_inherited_atom_data_slot(prototype, &self.gc_heap, key)?;
+        let resolved = crate::cache_ir::resolve_proved_inherited_atom_data_slot(
+            prototype,
+            &self.vm.gc_heap,
+            key,
+        )?;
         if resolved.hit.shape.is_null() || resolved.holder_root.is_null() {
             return None;
         }
-        let method_fid = resolved.value.as_closure(&self.gc_heap)?.function_id();
-        self.shape_runtime
-            .register_shape(&self.gc_heap, resolved.holder_root);
+        let method_fid = resolved.value.as_closure(&self.vm.gc_heap)?.function_id();
+        self.found_shape(resolved.holder_root);
         Some(PolyMethodTarget {
             method_fid,
             recv_shape: receiver.shape,

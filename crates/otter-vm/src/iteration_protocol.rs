@@ -358,6 +358,26 @@ impl Interpreter {
         })
     }
 
+    /// [`Self::array_iteration_cells`] from the proofs the realm already
+    /// holds, proving nothing new: what a compilation reads.
+    pub(crate) fn proven_array_iteration_cells(&self) -> Option<ArrayIterationCells> {
+        if self.active_realm_id != 0 {
+            return None;
+        }
+        let proofs = &self.realm_intrinsics.iteration;
+        let iterable = &proofs.iterables[Iterable::Array as usize];
+        let iterator = &proofs.iterators[origin_index(BuiltinIteratorOrigin::Array)];
+        if Proof::current(iterable) != Some(true) {
+            return None;
+        }
+        let close = Proof::current(iterator)?.close;
+        Some(ArrayIterationCells {
+            iterable: iterable.as_ref()?.validity.clone(),
+            iterator: iterator.as_ref()?.validity.clone(),
+            close,
+        })
+    }
+
     /// Whether closing an Array iterator runs nothing: its `return` is
     /// proven absent or built-in.
     pub(crate) fn array_iterator_close_proven(&mut self) -> bool {

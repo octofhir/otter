@@ -551,6 +551,8 @@ impl<'a> PropertyFeedbackSlot<'a> {
         self.slot.snapshot_state()
     }
 
+    /// The site's feedback, read from a consistent copy of its entries, as a
+    /// compilation on any thread reads it.
     #[must_use]
     pub(crate) fn state(self) -> PropertyFeedbackState {
         if self.slot.is_megamorphic() {
@@ -561,7 +563,7 @@ impl<'a> PropertyFeedbackSlot<'a> {
             0 => PropertyFeedbackState::Empty,
             _ => self
                 .slot
-                .mono_own_field()
+                .consistent_mono_own_field()
                 .map_or(PropertyFeedbackState::Polymorphic, |(shape, slot)| {
                     PropertyFeedbackState::MonomorphicOwnData { shape, slot }
                 }),

@@ -1357,8 +1357,13 @@ impl Interpreter {
             context_slot_watches,
         } = install;
         for watch in &global_slot_watches {
-            if crate::object::dictionary_layout(self.global_this, &self.gc_heap)
-                != Some(watch.layout)
+            let owns = matches!(
+                crate::object::lookup_own_slot(self.global_this, &self.gc_heap, &watch.name),
+                (Some(hit), crate::object::PropertyLookup::Data { .. }) if hit.slot == watch.slot
+            );
+            if !owns
+                || crate::object::dictionary_layout(self.global_this, &self.gc_heap)
+                    != Some(watch.layout)
                 || !crate::object::watch_dictionary_slot(
                     self.global_this,
                     &mut self.gc_heap,

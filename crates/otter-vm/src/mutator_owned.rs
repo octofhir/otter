@@ -16,12 +16,13 @@
 //!   a compiler thread's read, which holds the lock for its whole duration.
 //! - A compiler thread never waits: [`MutatorOwned::try_read`] fails while
 //!   the mutator writes, and the compilation goes without that fact.
+//!   Compiler threads share the lock, so they never fail for each other.
 //!
 //! # See also
 //! - `interp::jit_bake` — the compiler-side reader.
 
 use std::cell::UnsafeCell;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 /// The isolate thread's ownership of every [`MutatorOwned`] value of its
 /// isolate. Reads borrow it shared, writes mutably, so the borrow checker
@@ -43,7 +44,7 @@ impl MutatorToken {
 
 /// A value the mutator owns and compiler threads may read.
 pub(crate) struct MutatorOwned<T> {
-    lock: Mutex<()>,
+    lock: RwLock<()>,
     value: UnsafeCell<T>,
 }
 
@@ -69,7 +70,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for MutatorOwned<T> {
 impl<T> MutatorOwned<T> {
     pub(crate) fn new(value: T) -> Self {
         Self {
-            lock: Mutex::new(()),
+            lock: RwLock::new(()),
             value: UnsafeCell::new(value),
         }
     }
@@ -87,7 +88,7 @@ impl<T> MutatorOwned<T> {
     pub(crate) fn get_mut<'a>(&'a self, _owner: &'a mut MutatorToken) -> MutatorWrite<'a, T> {
         let guard = self
             .lock
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         MutatorWrite {
             _guard: guard,
@@ -100,7 +101,7 @@ impl<T> MutatorOwned<T> {
     /// A compiler thread's read, while the mutator is not writing; `None`
     /// otherwise.
     pub(crate) fn try_read(&self) -> Option<SharedRead<'_, T>> {
-        let guard = match self.lock.try_lock() {
+        let guard = match self.lock.try_read() {
             Ok(guard) => guard,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => return None,
@@ -115,7 +116,7 @@ impl<T> MutatorOwned<T> {
 
 /// The mutator writing a [`MutatorOwned`] value.
 pub(crate) struct MutatorWrite<'a, T> {
-    _guard: MutexGuard<'a, ()>,
+    _guard: RwLockWriteGuard<'a, ()>,
     value: &'a mut T,
 }
 
@@ -135,7 +136,7 @@ impl<T> std::ops::DerefMut for MutatorWrite<'_, T> {
 
 /// A compiler thread reading a [`MutatorOwned`] value.
 pub(crate) struct SharedRead<'a, T> {
-    _guard: MutexGuard<'a, ()>,
+    _guard: RwLockReadGuard<'a, ()>,
     value: &'a T,
 }
 
@@ -151,7 +152,7 @@ impl<T> std::ops::Deref for SharedRead<'_, T> {
 /// may read. The mutator's borrows are checked like a `RefCell`'s; its writes
 /// also hold the lock a compiler-thread read holds.
 pub(crate) struct MutatorCell<T> {
-    lock: Mutex<()>,
+    lock: RwLock<()>,
     cell: std::cell::RefCell<T>,
 }
 
@@ -172,7 +173,7 @@ impl<T: std::fmt::Debug> std::fmt::Debug for MutatorCell<T> {
 impl<T> MutatorCell<T> {
     pub(crate) fn new(value: T) -> Self {
         Self {
-            lock: Mutex::new(()),
+            lock: RwLock::new(()),
             cell: std::cell::RefCell::new(value),
         }
     }
@@ -188,7 +189,7 @@ impl<T> MutatorCell<T> {
     pub(crate) fn borrow_mut(&self) -> MutatorCellWrite<'_, T> {
         let guard = self
             .lock
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         MutatorCellWrite {
             _guard: guard,
@@ -199,7 +200,7 @@ impl<T> MutatorCell<T> {
     /// A compiler thread's read, while the mutator is not writing; `None`
     /// otherwise.
     pub(crate) fn try_read(&self) -> Option<SharedRead<'_, T>> {
-        let guard = match self.lock.try_lock() {
+        let guard = match self.lock.try_read() {
             Ok(guard) => guard,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(TryLockError::WouldBlock) => return None,
@@ -216,7 +217,7 @@ impl<T> MutatorCell<T> {
 
 /// The mutator writing a [`MutatorCell`] value.
 pub(crate) struct MutatorCellWrite<'a, T> {
-    _guard: MutexGuard<'a, ()>,
+    _guard: RwLockWriteGuard<'a, ()>,
     value: std::cell::RefMut<'a, T>,
 }
 

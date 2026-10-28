@@ -384,7 +384,7 @@ mod tests {
                 })
             ));
             assert!(
-                Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&vm))
+                Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&vm), None)
                     .jit_array_method_call(site, 1)
                     .is_some()
             );
@@ -398,7 +398,7 @@ mod tests {
             );
             assert_ne!(object::shape_id(proto, &vm.gc_heap), hit.shape_id);
             assert!(
-                Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&vm))
+                Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&vm), None)
                     .jit_array_method_call(site, 1)
                     .is_none()
             );

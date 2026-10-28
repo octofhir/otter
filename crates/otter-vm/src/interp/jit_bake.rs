@@ -16,9 +16,13 @@
 //!   and grows no isolate cache. Facts a site needs are prepared where they
 //!   arise (first execution, an IC miss, template compilation); a fact that
 //!   does not exist yet drops that one specialization.
-//! - Because baking cannot collect, every identity it reads stays valid until
-//!   [`Baker::finish`] hands the roots to the pending compilation, which the
-//!   collector traces from then on.
+//! - Baking reads the heap only while no collection can run: a compiler
+//!   thread holds the heap read right and yields when a pause asks it to,
+//!   dropping what it baked; on the isolate thread nothing collects while it
+//!   bakes. Every identity it reads stays valid until the roots reach the
+//!   pending compilation, which the collector traces from then on.
+//! - Captured realm handles are read back from collector-rewritten cells
+//!   when a compiler thread starts baking.
 //! - Requests that must change mutator state (context-slot and dictionary
 //!   watches, `instanceof` cell registration) are recorded as install tasks
 //!   and run on the isolate thread, which re-verifies each one before the
@@ -140,7 +144,13 @@ pub(crate) fn method_holder_layout(
 
 /// One compilation's baking pass over the isolate's feedback and heap.
 pub(crate) struct Baker<'a> {
-    pub(crate) env: &'a super::jit_bake_env::BakeEnv<'a>,
+    pub(crate) env: &'a super::jit_bake_env::BakeEnv,
+    /// The read right a compiler thread bakes under, whose yield requests
+    /// the bake honours; none on the isolate thread, which runs no pause
+    /// while it bakes.
+    right: Option<&'a otter_gc::read_right::HeapReadGuard<'a>>,
+    /// A collection asked this bake to yield: what it baked is dropped.
+    abandoned: bool,
     /// Every allocation the snapshot being baked names.
     roots: Vec<crate::jit_roots::CompilationRoot>,
     /// Mutator-side work the isolate runs before publishing the code.
@@ -154,9 +164,14 @@ pub(crate) struct Baker<'a> {
 }
 
 impl<'a> Baker<'a> {
-    pub(crate) fn new(env: &'a super::jit_bake_env::BakeEnv<'a>) -> Self {
+    pub(crate) fn new(
+        env: &'a super::jit_bake_env::BakeEnv,
+        right: Option<&'a otter_gc::read_right::HeapReadGuard<'a>>,
+    ) -> Self {
         Self {
             env,
+            right,
+            abandoned: false,
             roots: Vec::new(),
             install: InstallTasks::default(),
             events: Vec::new(),
@@ -180,6 +195,16 @@ impl<'a> Baker<'a> {
         let id = crate::object::shape_body::id_of(shape);
         self.found_shapes.insert(id, shape);
         id
+    }
+
+    /// Whether a collection asked this bake to yield. Once it did, the bake
+    /// stops preparing bodies and returns nothing: what it read may have
+    /// moved.
+    fn yielded(&mut self) -> bool {
+        if !self.abandoned && self.right.is_some_and(|right| right.yield_requested()) {
+            self.abandoned = true;
+        }
+        self.abandoned
     }
 
     /// Record a debug event when the isolate captures them.
@@ -244,6 +269,157 @@ impl<'a> Baker<'a> {
         });
     }
 
+    /// Record the prepared-compile report of `view` and its CacheIR sites.
+    pub(crate) fn record_prepared(
+        &mut self,
+        context: &ExecutionContext,
+        fid: u32,
+        tier: jit_debug::JitDebugTier,
+        target: jit_debug::JitDebugTarget,
+        view: &jit::JitCompileSnapshot,
+    ) {
+        if !self.env.debug.events_enabled() {
+            return;
+        }
+        let function_name = context
+            .function(fid)
+            .map(|function| function.name.clone())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let method_feedback_sites = view
+            .instructions
+            .iter()
+            .filter(|instr| {
+                instr
+                    .property_ic_site(&view.code_block)
+                    .is_some_and(|site| self.env.method_target_feedback(site).is_some())
+            })
+            .count();
+        let call_feedback_sites = view
+            .instructions
+            .iter()
+            .filter(|instr| {
+                view.code_block
+                    .call_distribution_at(instr.instruction_pc(&view.code_block) as usize)
+                    .is_some()
+            })
+            .count();
+        let global_load_sites = view
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.op(&view.code_block) == Op::LoadGlobalOrThrow)
+            .count();
+        let source_work = view.code_block.source_work().total();
+        let exit_count = u64::from(self.env.entry_bail_count).saturating_add(
+            self.env
+                .exit_profiles_of(fid)
+                .into_iter()
+                .map(|(_, profile)| u64::from(profile.count))
+                .sum::<u64>(),
+        );
+        let event = jit_debug::JitDebugEvent::CompilePrepared {
+            function_id: fid,
+            function_name,
+            tier,
+            target,
+            register_count: u32::from(view.code_block.register_count),
+            parameter_count: u32::from(view.code_block.param_count),
+            bytecode_instruction_count: u64::try_from(view.instructions.len()).unwrap_or(u64::MAX),
+            source_work,
+            exit_count,
+            call_feedback_sites: u32::try_from(call_feedback_sites).unwrap_or(u32::MAX),
+            method_feedback_sites: u32::try_from(method_feedback_sites).unwrap_or(u32::MAX),
+            global_load_sites: u32::try_from(global_load_sites).unwrap_or(u32::MAX),
+            global_lexical_loads: u32::try_from(view.global_lexical_loads.len())
+                .unwrap_or(u32::MAX),
+            literal_cells: u32::try_from(view.literal_cells.len()).unwrap_or(u32::MAX),
+            global_object_loads: u32::try_from(view.global_object_loads.len()).unwrap_or(u32::MAX),
+            direct_callees: u32::try_from(view.direct_callees.len()).unwrap_or(u32::MAX),
+            direct_constructs: u32::try_from(view.direct_constructs.len()).unwrap_or(u32::MAX),
+            direct_method_sites: u32::try_from(
+                view.method_targets
+                    .values()
+                    .filter(|targets| targets.iter().any(|target| target.callee.is_some()))
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
+            direct_method_targets: u32::try_from(
+                view.method_targets
+                    .values()
+                    .flatten()
+                    .filter(|target| target.callee.is_some())
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
+            native_calls: u32::try_from(view.native_calls.len()).unwrap_or(u32::MAX),
+            inline_callees: u32::try_from(view.inline_callees.len()).unwrap_or(u32::MAX),
+            inline_methods: u32::try_from(
+                view.method_targets
+                    .values()
+                    .filter(|targets| {
+                        targets
+                            .iter()
+                            .filter(|target| target.inline_fields.is_some())
+                            .count()
+                            == 1
+                    })
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
+        };
+        self.events.push(event);
+        self.record_property_cache_ir_sites(fid, tier, view);
+    }
+
+    /// Report every immutable CacheIR program bank in `view`.
+    ///
+    /// Emitted once per baked snapshot, immediately after the prepare event, so
+    /// a report reads as: this function, this tier, these sites lower to
+    /// first-class guards/effects and these are their entry shapes/fields.
+    fn record_property_cache_ir_sites(
+        &mut self,
+        fid: u32,
+        tier: jit_debug::JitDebugTier,
+        view: &jit::JitCompileSnapshot,
+    ) {
+        for (&byte_pc, programs) in &view.property_programs {
+            let access = if programs.iter().any(|program| {
+                program.ops.iter().any(|op| {
+                    matches!(
+                        op,
+                        jit::JitCacheIrOp::StoreField { .. }
+                            | jit::JitCacheIrOp::StoreBodySlot { .. }
+                    )
+                })
+            }) {
+                jit_debug::JitDebugPropertyAccess::Store
+            } else {
+                jit_debug::JitDebugPropertyAccess::Load
+            };
+            self.events
+                .push(jit_debug::JitDebugEvent::PropertyCacheIrSite {
+                    function_id: fid,
+                    tier,
+                    byte_pc,
+                    access,
+                    programs: programs
+                        .iter()
+                        .filter_map(|program| {
+                            let shape = program.ops.iter().find_map(|op| match op {
+                                jit::JitCacheIrOp::GuardShape { shape, .. } => Some(*shape),
+                                _ => None,
+                            })?;
+                            let field = program.ops.iter().find_map(|op| match op {
+                                jit::JitCacheIrOp::LoadField { field, .. }
+                                | jit::JitCacheIrOp::StoreField { field, .. } => Some(*field),
+                                _ => None,
+                            })?;
+                            Some(jit_debug::JitDebugPropertyProgram { shape, field })
+                        })
+                        .collect(),
+                });
+        }
+    }
+
     /// The roots the baked snapshot names, sorted and without duplicates, the
     /// install tasks, and the recorded events.
     pub(crate) fn finish(
@@ -296,6 +472,9 @@ impl Baker<'_> {
         fid: u32,
         dependency_flag: std::sync::Arc<crate::code_dependencies::DependencyFlag>,
     ) -> Option<jit::JitCompileSnapshot> {
+        if self.yielded() {
+            return None;
+        }
         let mut snapshot = context.jit_compile_snapshot(fid)?;
         snapshot.dependency_flag = dependency_flag;
         self.bake_literal_allocations(&mut snapshot, context, fid)?;
@@ -331,6 +510,9 @@ impl Baker<'_> {
         // proven to have one survives calls while the generation's
         // subscription to the shape's stability holds. The rest have been
         // left already, and stay so.
+        if self.yielded() {
+            return None;
+        }
         for root in &self.roots {
             if let crate::jit_roots::CompilationRoot::Shape(shape) = root {
                 if crate::object::shape_body::is_stable(*shape) {
@@ -1580,6 +1762,9 @@ impl Baker<'_> {
         // An inline body shares the physical caller's active-global cells.
         // Source identity alone does not make a foreign realm's globals active.
         // Refuse the optional splice before preparing any ambient proofs.
+        if self.yielded() {
+            return None;
+        }
         let instructions = context
             .exec_function(fid)
             .map_or(u32::MAX, |function| function.instruction_count());
@@ -2176,7 +2361,7 @@ impl Baker<'_> {
                                 recv_shape,
                                 prototype,
                                 method_field,
-                                hits: 1,
+                                hits: crate::HitCount::new(1),
                             });
                             Some(PolySnapshot {
                                 instruction_pc: instr.instruction_pc(&view.code_block),
@@ -2189,7 +2374,7 @@ impl Baker<'_> {
                             let mut targets = (*observed).clone();
                             // Most-frequent target first: the common receiver shape
                             // then hits the shortest guard chain.
-                            targets.sort_by_key(|t| std::cmp::Reverse(t.hits));
+                            targets.sort_by_key(|t| std::cmp::Reverse(t.hits.get()));
                             Some(PolySnapshot {
                                 instruction_pc: instr.instruction_pc(&view.code_block),
                                 call_byte_pc: instr.byte_pc,
@@ -2727,6 +2912,66 @@ impl crate::jit_roots::CompileProofs for Baker<'_> {
         cell: &std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>,
     ) -> Option<jit::JitPrototypeValidity> {
         self.bake_prototype_validity(cell)
+    }
+}
+
+/// One optimizing compilation's bake, run by a compiler thread under the
+/// heap read right: the isolate prepared its facts, captured `env` and
+/// queued this.
+pub(crate) struct BakeJob {
+    pub(crate) env: super::jit_bake_env::BakeEnv,
+    pub(crate) context: ExecutionContext,
+    pub(crate) function_id: u32,
+    pub(crate) osr_pc: Option<u32>,
+    pub(crate) dependency_flag: std::sync::Arc<crate::code_dependencies::DependencyFlag>,
+    pub(crate) debug: jit_debug::JitDebugRequest,
+    pub(crate) artifact_identity: Option<crate::JitArtifactIdentity>,
+    pub(crate) code_object_id: u64,
+    pub(crate) cancellation: crate::JitCompileCancellation,
+    /// Where the bake leaves what the isolate installs with the code.
+    pub(crate) products: std::sync::Arc<crate::jit_compile_queue::BakeProducts>,
+}
+
+impl BakeJob {
+    /// Bake the snapshot and hand back the compile request, leaving the
+    /// roots, install tasks, events and source leases in the products before
+    /// the read right is released. `None` when cancelled, when a collection
+    /// made the bake yield, or when the function cannot be compiled.
+    pub(crate) fn run(mut self) -> Option<jit::JitCompileRequest> {
+        if self.cancellation.is_cancelled() {
+            return None;
+        }
+        let right = std::sync::Arc::clone(&self.env.read_right);
+        let guard = right.read();
+        self.env.refresh();
+        let mut baker = Baker::new(&self.env, Some(&guard));
+        let snapshot = baker.bake_optimized(&self.context, self.function_id, self.dependency_flag);
+        if let Some(snapshot) = &snapshot {
+            let target = self.osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
+                jit_debug::JitDebugTarget::Osr { pc }
+            });
+            baker.record_prepared(
+                &self.context,
+                self.function_id,
+                jit_debug::JitDebugTier::Optimizing,
+                target,
+                snapshot,
+            );
+        }
+        let (roots, install, events) = baker.finish();
+        let snapshot = snapshot?;
+        let sources =
+            crate::jit_compile_lifetime::CompilationSources::retain(&self.context, &snapshot)?;
+        self.products.publish(roots, install, events, sources);
+        drop(guard);
+        Some(jit::JitCompileRequest {
+            cancellation: self.cancellation,
+            snapshot,
+            debug: self.debug,
+            artifact_identity: self.artifact_identity,
+            osr_pc: self.osr_pc,
+            code_object_id: self.code_object_id,
+        })
     }
 }
 

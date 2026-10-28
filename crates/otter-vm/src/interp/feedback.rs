@@ -62,7 +62,7 @@ pub(crate) struct MethodFeedbackDirectory {
     /// entry, so these answer nearly every probe without hashing. Each names
     /// an `installed_chunks` entry, whose `Weak` keeps the address from being
     /// reused until a purge, which clears them.
-    recent_chunks: [usize; 2],
+    recent_chunks: [std::sync::atomic::AtomicUsize; 2],
 }
 
 impl MethodFeedbackDirectory {
@@ -76,21 +76,35 @@ impl MethodFeedbackDirectory {
         }
         self.installed_chunks
             .retain(|_, chunk| chunk.strong_count() != 0);
-        self.recent_chunks = [0; 2];
+        self.recent_chunks = Default::default();
     }
 
     #[inline]
-    fn install_context(&mut self, context: &ExecutionContext) {
+    /// Whether `context`'s chunk is one of the two most recently installed:
+    /// nearly every probe, answered without writing the directory.
+    fn installed_recently(&self, context: &ExecutionContext) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
         let identity = std::sync::Arc::as_ptr(context.executable_module()) as usize;
-        if self.recent_chunks[0] == identity {
+        if self.recent_chunks[0].load(Relaxed) == identity {
+            return true;
+        }
+        if self.recent_chunks[1].load(Relaxed) == identity {
+            let first = self.recent_chunks[0].load(Relaxed);
+            self.recent_chunks[0].store(identity, Relaxed);
+            self.recent_chunks[1].store(first, Relaxed);
+            return true;
+        }
+        false
+    }
+
+    fn install_context(&mut self, context: &ExecutionContext) {
+        if self.installed_recently(context) {
             return;
         }
-        if self.recent_chunks[1] == identity {
-            self.recent_chunks.swap(0, 1);
-            return;
-        }
+        let identity = std::sync::Arc::as_ptr(context.executable_module()) as usize;
         self.install_new_context(context, identity);
-        self.recent_chunks = [identity, self.recent_chunks[0]];
+        let first = *self.recent_chunks[0].get_mut();
+        self.recent_chunks = [identity.into(), first.into()];
     }
 
     #[inline(never)]
@@ -179,24 +193,20 @@ impl MethodFeedbackDirectory {
     /// Whether the site's bounded distribution already names `recv_shape`
     /// under a still-valid lookup proof, whatever function it resolved to,
     /// counting the hit.
-    pub(crate) fn records_receiver(
-        &mut self,
-        site: usize,
-        recv_shape: crate::object::ShapeId,
-    ) -> bool {
+    pub(crate) fn records_receiver(&self, site: usize, recv_shape: crate::object::ShapeId) -> bool {
         let live = |proof: &crate::MethodLookupProof| {
             proof.validity.as_ref().is_none_or(|cell| cell.is_valid())
         };
-        match self.method_targets.get_mut(site) {
+        match self.method_targets.get(site) {
             Some(Some(MethodCallFeedback::Mono {
                 recv_shape: seen,
                 prototype,
                 ..
             })) => *seen == recv_shape && live(prototype),
             Some(Some(MethodCallFeedback::Poly(targets))) => targets
-                .iter_mut()
+                .iter()
                 .find(|seen| seen.recv_shape == recv_shape && live(&seen.prototype))
-                .map(|seen| seen.hits = seen.hits.saturating_add(1))
+                .map(|seen| seen.hits.bump())
                 .is_some(),
             _ => false,
         }
@@ -206,7 +216,7 @@ impl MethodFeedbackDirectory {
     /// resolving to `target` under a still-valid lookup proof, counting the
     /// hit. Recording that call again would change nothing.
     fn records_method_target(
-        &mut self,
+        &self,
         site: usize,
         recv_shape: crate::object::ShapeId,
         target: MethodFeedbackTarget,
@@ -220,7 +230,7 @@ impl MethodFeedbackDirectory {
         let live = |proof: &crate::MethodLookupProof| {
             proof.validity.as_ref().is_none_or(|cell| cell.is_valid())
         };
-        match (self.method_targets.get_mut(site), target) {
+        match (self.method_targets.get(site), target) {
             (
                 Some(Some(MethodCallFeedback::Mono {
                     method_fid,
@@ -243,11 +253,11 @@ impl MethodFeedbackDirectory {
                 Some(Some(MethodCallFeedback::Poly(targets))),
                 MethodFeedbackTarget::Function(fid),
             ) => targets
-                .iter_mut()
+                .iter()
                 .find(|seen| {
                     seen.method_fid == fid && seen.recv_shape == recv_shape && live(&seen.prototype)
                 })
-                .map(|seen| seen.hits = seen.hits.saturating_add(1))
+                .map(|seen| seen.hits.bump())
                 .is_some(),
             _ => false,
         }
@@ -368,7 +378,7 @@ fn record_method_distribution(
         recv_shape: site.recv_shape,
         prototype: site.prototype.clone(),
         method_field: site.method_field,
-        hits: 1,
+        hits: crate::HitCount::new(1),
     };
     match feedback {
         None => {
@@ -396,7 +406,7 @@ fn record_method_distribution(
                     recv_shape: *seen_shape,
                     prototype: seen_prototype.clone(),
                     method_field: *seen_value_byte,
-                    hits: 1,
+                    hits: crate::HitCount::new(1),
                 };
                 let mut targets: SmallVec<[PolyMethodTarget; MAX_POLY_METHOD_TARGETS]> =
                     SmallVec::new();
@@ -413,7 +423,7 @@ fn record_method_distribution(
                 .iter_mut()
                 .find(|target| target.matches(method_fid, &site))
             {
-                existing.hits = existing.hits.saturating_add(1);
+                existing.hits.bump();
                 false
             } else if targets.len() < MAX_POLY_METHOD_TARGETS {
                 targets.push(new_target);
@@ -436,7 +446,9 @@ fn record_method_distribution(
 
 impl Interpreter {
     pub(crate) fn ensure_method_feedback_context(&mut self, context: &ExecutionContext) {
-        self.method_feedback_mut().install_context(context);
+        if !self.method_feedback().installed_recently(context) {
+            self.method_feedback_mut().install_context(context);
+        }
     }
 
     #[must_use]
@@ -480,7 +492,7 @@ impl Interpreter {
         recv_shape: crate::object::ShapeId,
         target: MethodFeedbackTarget,
     ) -> bool {
-        self.method_feedback_mut()
+        self.method_feedback()
             .records_method_target(site, recv_shape, target)
     }
 
@@ -520,7 +532,7 @@ impl Interpreter {
         // no second resolution.
         if !shape.is_null() && {
             let receiver_shape = crate::object::shape_id(receiver, &self.gc_heap);
-            self.method_feedback_mut()
+            self.method_feedback()
                 .records_receiver(site, receiver_shape)
         } {
             return;
@@ -599,7 +611,7 @@ mod tests {
         let Some(MethodCallFeedback::Poly(targets)) = &feedback else {
             panic!("repeated method target must remain polymorphic");
         };
-        assert_eq!(targets.last().map(|target| target.hits), Some(2));
+        assert_eq!(targets.last().map(|target| target.hits.get()), Some(2));
 
         assert!(record_method_distribution(
             &mut feedback,

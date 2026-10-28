@@ -123,7 +123,7 @@ impl super::Baker<'_> {
                 resolved.hit.shape,
                 u32::from(resolved.hit.slot),
             ),
-            hits: 1,
+            hits: crate::HitCount::new(1),
         })
     }
 }

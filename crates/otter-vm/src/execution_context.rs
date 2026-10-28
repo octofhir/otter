@@ -423,7 +423,7 @@ impl ExecutionContext {
         self.payload.executable.function(local)
     }
 
-    fn code_block_arc(&self, function_id: u32) -> Option<std::sync::Arc<CodeBlock>> {
+    pub(crate) fn code_block_arc(&self, function_id: u32) -> Option<std::sync::Arc<CodeBlock>> {
         let local = self.local_function_index(function_id)?;
         self.payload.executable.function_arc(local)
     }

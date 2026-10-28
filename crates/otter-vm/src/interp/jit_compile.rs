@@ -9,9 +9,11 @@
 //!   prototypes and their programs, chain and layout proofs, closure-context
 //!   classification and context watches.
 //! - `compile_jit_function` bakes and compiles a template generation;
-//!   `compile_optimized_jit_function` bakes an optimizing snapshot and hands it
-//!   to the isolate's compiler threads; `install_finished_optimized_compiles`
-//!   installs their results at loop polls and tier decisions.
+//!   `compile_optimized_jit_function` prepares the facts and queues a bake on
+//!   the isolate's compiler threads, which bake and compile it;
+//!   `install_finished_optimized_compiles` installs their results at loop
+//!   polls and tier decisions. A bake a collection made yield re-arms its
+//!   function.
 //! - `run_install_tasks` — the watches and registrations a baked snapshot
 //!   asked for, re-verified before its code is published.
 //! - Call/method target profiling and reoptimization eviction.
@@ -162,157 +164,6 @@ impl Interpreter {
         }
         self.jit_code_cache = None;
         outcome
-    }
-
-    fn record_jit_compile_prepared(
-        &mut self,
-        context: &ExecutionContext,
-        fid: u32,
-        tier: jit_debug::JitDebugTier,
-        target: jit_debug::JitDebugTarget,
-        view: &jit::JitCompileSnapshot,
-    ) {
-        if !self.reserve_jit_debug_event() {
-            return;
-        }
-        let function_name = context
-            .function(fid)
-            .map(|function| function.name.clone())
-            .unwrap_or_else(|| "<unknown>".to_string());
-        let method_feedback_sites = view
-            .instructions
-            .iter()
-            .filter(|instr| {
-                instr
-                    .property_ic_site(&view.code_block)
-                    .is_some_and(|site| self.method_target_feedback(site).is_some())
-            })
-            .count();
-        let call_feedback_sites = view
-            .instructions
-            .iter()
-            .filter(|instr| {
-                view.code_block
-                    .call_distribution_at(instr.instruction_pc(&view.code_block) as usize)
-                    .is_some()
-            })
-            .count();
-        let global_load_sites = view
-            .instructions
-            .iter()
-            .filter(|instruction| instruction.op(&view.code_block) == Op::LoadGlobalOrThrow)
-            .count();
-        let source_work = view.code_block.source_work().total();
-        let exit_count = u64::from(self.jit_entry_bail_counts.get(&fid).copied().unwrap_or(0))
-            .saturating_add(
-                self.exit_profiles_of(fid)
-                    .map(|(_, profile)| u64::from(profile.count))
-                    .sum::<u64>(),
-            );
-        let event = jit_debug::JitDebugEvent::CompilePrepared {
-            function_id: fid,
-            function_name,
-            tier,
-            target,
-            register_count: u32::from(view.code_block.register_count),
-            parameter_count: u32::from(view.code_block.param_count),
-            bytecode_instruction_count: u64::try_from(view.instructions.len()).unwrap_or(u64::MAX),
-            source_work,
-            exit_count,
-            call_feedback_sites: u32::try_from(call_feedback_sites).unwrap_or(u32::MAX),
-            method_feedback_sites: u32::try_from(method_feedback_sites).unwrap_or(u32::MAX),
-            global_load_sites: u32::try_from(global_load_sites).unwrap_or(u32::MAX),
-            global_lexical_loads: u32::try_from(view.global_lexical_loads.len())
-                .unwrap_or(u32::MAX),
-            literal_cells: u32::try_from(view.literal_cells.len()).unwrap_or(u32::MAX),
-            global_object_loads: u32::try_from(view.global_object_loads.len()).unwrap_or(u32::MAX),
-            direct_callees: u32::try_from(view.direct_callees.len()).unwrap_or(u32::MAX),
-            direct_constructs: u32::try_from(view.direct_constructs.len()).unwrap_or(u32::MAX),
-            direct_method_sites: u32::try_from(
-                view.method_targets
-                    .values()
-                    .filter(|targets| targets.iter().any(|target| target.callee.is_some()))
-                    .count(),
-            )
-            .unwrap_or(u32::MAX),
-            direct_method_targets: u32::try_from(
-                view.method_targets
-                    .values()
-                    .flatten()
-                    .filter(|target| target.callee.is_some())
-                    .count(),
-            )
-            .unwrap_or(u32::MAX),
-            native_calls: u32::try_from(view.native_calls.len()).unwrap_or(u32::MAX),
-            inline_callees: u32::try_from(view.inline_callees.len()).unwrap_or(u32::MAX),
-            inline_methods: u32::try_from(
-                view.method_targets
-                    .values()
-                    .filter(|targets| {
-                        targets
-                            .iter()
-                            .filter(|target| target.inline_fields.is_some())
-                            .count()
-                            == 1
-                    })
-                    .count(),
-            )
-            .unwrap_or(u32::MAX),
-        };
-        self.push_reserved_jit_debug_event(event);
-        self.record_property_cache_ir_sites(fid, tier, view);
-    }
-
-    /// Report every immutable CacheIR program bank in `view`.
-    ///
-    /// Emitted once per baked snapshot, immediately after the prepare event, so
-    /// a report reads as: this function, this tier, these sites lower to
-    /// first-class guards/effects and these are their entry shapes/fields.
-    fn record_property_cache_ir_sites(
-        &mut self,
-        fid: u32,
-        tier: jit_debug::JitDebugTier,
-        view: &jit::JitCompileSnapshot,
-    ) {
-        for (&byte_pc, programs) in &view.property_programs {
-            if !self.reserve_jit_debug_event() {
-                return;
-            }
-            let access = if programs.iter().any(|program| {
-                program.ops.iter().any(|op| {
-                    matches!(
-                        op,
-                        jit::JitCacheIrOp::StoreField { .. }
-                            | jit::JitCacheIrOp::StoreBodySlot { .. }
-                    )
-                })
-            }) {
-                jit_debug::JitDebugPropertyAccess::Store
-            } else {
-                jit_debug::JitDebugPropertyAccess::Load
-            };
-            self.push_reserved_jit_debug_event(jit_debug::JitDebugEvent::PropertyCacheIrSite {
-                function_id: fid,
-                tier,
-                byte_pc,
-                access,
-                programs: programs
-                    .iter()
-                    .filter_map(|program| {
-                        let shape = program.ops.iter().find_map(|op| match op {
-                            jit::JitCacheIrOp::GuardShape { shape, .. } => Some(*shape),
-                            _ => None,
-                        })?;
-                        let field = program.ops.iter().find_map(|op| match op {
-                            jit::JitCacheIrOp::LoadField { field, .. }
-                            | jit::JitCacheIrOp::StoreField { field, .. } => Some(*field),
-                            _ => None,
-                        })?;
-                        Some(jit_debug::JitDebugPropertyProgram { shape, field })
-                    })
-                    .collect(),
-            });
-        }
     }
 
     fn record_jit_install_declined(
@@ -522,49 +373,36 @@ impl Interpreter {
             return None;
         }
         let owner = context.for_function(fid).ok()?;
-        let context = &*owner;
-        self.prepare_compile_facts(context, fid)?;
-        let dependency_flag = self.jit_code_registry.dependency_flag();
-        let env = super::jit_bake_env::BakeEnv::capture(self);
-        let mut baker = Baker::new(&env);
-        let snapshot = baker.bake_optimized(context, fid, dependency_flag);
-        let (roots, install, events) = baker.finish();
-        self.publish_bake_events(events);
-        let snapshot = snapshot?;
-        let sources = crate::jit_compile_lifetime::CompilationSources::retain(context, &snapshot)?;
-        let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
-            jit_debug::JitDebugTarget::Osr { pc }
-        });
-        self.record_jit_compile_prepared(
-            context,
-            fid,
-            jit_debug::JitDebugTier::Optimizing,
-            target,
-            &snapshot,
-        );
-        let artifact_identity =
-            self.jit_debug
-                .request()
-                .artifacts_enabled()
-                .then(|| crate::JitArtifactIdentity {
-                    function_name: context
-                        .function(fid)
-                        .map(|function| function.name.clone())
-                        .unwrap_or_else(|| "<unknown>".to_string()),
-                    module: snapshot.code_block.module_url().to_string(),
-                });
-        let function = snapshot.code_block.clone();
+        self.prepare_compile_facts(&owner, fid)?;
+        let function = owner.code_block_arc(fid)?;
+        // Everything the bake reads it reads on a compiler thread; the
+        // isolate captures only what is not shared with it.
+        let mut env = super::jit_bake_env::BakeEnv::capture(self);
+        env.entry_bail_count = self.jit_entry_bail_counts.get(&fid).copied().unwrap_or(0);
+        let products = std::sync::Arc::new(crate::jit_compile_queue::BakeProducts::holding(
+            env.held_roots(),
+        ));
+        let debug = self.jit_debug.request();
+        let artifact_identity = debug
+            .artifacts_enabled()
+            .then(|| crate::JitArtifactIdentity {
+                function_name: owner
+                    .function(fid)
+                    .map(|function| function.name.clone())
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+                module: function.module_url().to_string(),
+            });
         // Compilations may be in flight together, so the identity is reserved
         // before the compiler stamps it into the code.
         let code_object_id = self.jit_next_code_object_id;
         self.jit_next_code_object_id += 1;
-        let queued_ns = if self.jit_debug.request().events_enabled() {
+        let queued_ns = if debug.events_enabled() {
             self.jit_debug.monotonic_ns()
         } else {
             0
         };
-        let perf_name = self.jit_debug.request().perf_map_enabled().then(|| {
-            context
+        let perf_name = debug.perf_map_enabled().then(|| {
+            owner
                 .function(fid)
                 .map_or_else(|| "<unknown>".to_string(), |function| function.name.clone())
         });
@@ -573,24 +411,31 @@ impl Interpreter {
             function_id: fid,
             osr_pc,
             function,
-            roots,
-            install,
-            sources,
+            products: std::sync::Arc::clone(&products),
             cancellation: cancellation.clone(),
             retry_code_reclamation: false,
             feedback_epoch: self.code_space.feedback_epoch(fid),
             queued_ns,
             perf_name,
         };
-        let request = jit::JitCompileRequest {
-            cancellation,
-            snapshot,
-            debug: self.jit_debug.request(),
-            artifact_identity,
+        let job = super::jit_bake::BakeJob {
+            env,
+            context: (*owner).clone(),
+            function_id: fid,
             osr_pc,
+            dependency_flag: self.jit_code_registry.dependency_flag(),
+            debug,
+            artifact_identity,
             code_object_id,
+            cancellation,
+            products,
         };
-        let (pending, finished) = self.jit_compile_queue.submit(hook, request, pending)?;
+        let (pending, finished) = self.jit_compile_queue.submit(
+            hook,
+            crate::jit_compile_queue::CompileInput::Bake(Box::new(job)),
+            code_object_id,
+            pending,
+        )?;
         self.finish_optimized_compile(pending, finished)
     }
 
@@ -647,15 +492,24 @@ impl Interpreter {
             function_id: fid,
             osr_pc,
             function,
-            roots,
-            install,
-            sources,
+            products,
             cancellation,
             retry_code_reclamation,
             feedback_epoch,
             queued_ns,
             perf_name,
         } = pending;
+        let crate::jit_compile_queue::BakeOutput {
+            roots,
+            install,
+            events,
+            sources,
+        } = products.take();
+        self.publish_bake_events(events);
+        let roots = roots.into_boxed_slice();
+        // No source leases and no cancellation: the bake yielded to a
+        // collection (or declined) before it could finish.
+        let yielded = sources.is_none() && !cancellation.is_cancelled();
         if retry_code_reclamation {
             // Release the leases below before the next top-level pressure
             // check. ACK itself never collects or recursively evicts source.
@@ -665,9 +519,15 @@ impl Interpreter {
             Ok(jit::JitCompileStatus::Compiled { code, .. }) => code.spliced_functions(),
             _ => &[],
         };
-        let root_current = sources.is_current(&self.code_space, &function, &[]);
+        // A bake that yielded or declined left no source leases, and no code.
+        let root_current = sources
+            .as_ref()
+            .is_some_and(|sources| sources.is_current(&self.code_space, &function, &[]));
         let sources_current = root_current
-            && (spliced.is_empty() || sources.is_current(&self.code_space, &function, spliced));
+            && (spliced.is_empty()
+                || sources.as_ref().is_some_and(|sources| {
+                    sources.is_current(&self.code_space, &function, spliced)
+                }));
         if !root_current {
             cancellation.cancel();
         }
@@ -705,11 +565,6 @@ impl Interpreter {
             nanos(finished.duration),
             &finished.status,
         );
-        if self.jit_retraining_blocks(fid)
-            || matches!(finished.status, Ok(jit::JitCompileStatus::Cancelled))
-        {
-            return None;
-        }
         let rearm = |vm: &mut Self| {
             let decision = vm.optimizing_tier_policy.decide(
                 &function,
@@ -719,6 +574,17 @@ impl Interpreter {
             vm.jit_code_registry
                 .defer_generated_tiering(fid, decision.work_target);
         };
+        if self.jit_retraining_blocks(fid) {
+            return None;
+        }
+        if matches!(finished.status, Ok(jit::JitCompileStatus::Cancelled)) {
+            // A bake a collection made yield left nothing; nothing cancelled
+            // it, so its function compiles again from the current facts.
+            if yielded {
+                rearm(self);
+            }
+            return None;
+        }
         let declined = match finished.status {
             Ok(jit::JitCompileStatus::Compiled { .. }) if !sources_current => {
                 // Every actual splice must have arrived in the prepared source
@@ -957,24 +823,27 @@ impl Interpreter {
         if self.prepare_template_facts(context, fid).is_none() {
             return TemplateCompileOutcome::Deferred;
         }
-        let env = super::jit_bake_env::BakeEnv::capture(self);
-        let mut baker = Baker::new(&env);
+        let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
+            jit_debug::JitDebugTarget::Osr { pc }
+        });
+        let mut env = super::jit_bake_env::BakeEnv::capture(self);
+        env.entry_bail_count = self.jit_entry_bail_counts.get(&fid).copied().unwrap_or(0);
+        let mut baker = Baker::new(&env, None);
         let view = baker.bake_template(context, fid);
+        if let Some(view) = &view {
+            baker.record_prepared(
+                context,
+                fid,
+                jit_debug::JitDebugTier::Template,
+                target,
+                view,
+            );
+        }
         let (roots, install, events) = baker.finish();
         self.publish_bake_events(events);
         let Some(view) = view else {
             return TemplateCompileOutcome::Deferred;
         };
-        let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
-            jit_debug::JitDebugTarget::Osr { pc }
-        });
-        self.record_jit_compile_prepared(
-            context,
-            fid,
-            jit_debug::JitDebugTier::Template,
-            target,
-            &view,
-        );
         let function = view.code_block.clone();
         let code_object_id = self.jit_next_code_object_id;
         let artifact_identity =
@@ -1476,16 +1345,5 @@ impl Interpreter {
             value.ok()?;
         }
         Some(())
-    }
-
-    /// The optimizing exit evidence recorded for sites of `fid`, by PC and
-    /// reason: one range of the profile map, never a walk of every function's.
-    pub(super) fn exit_profiles_of(
-        &self,
-        fid: u32,
-    ) -> impl Iterator<Item = (&(u32, u32, native_abi::ExitReason), &jit::JitExitProfile)> {
-        self.jit_optimized_exit_profiles()
-            .range((fid, 0, native_abi::ExitReason::TypeMismatch)..)
-            .take_while(move |((profile_fid, _, _), _)| *profile_fid == fid)
     }
 }

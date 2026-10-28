@@ -31,7 +31,7 @@ use crate::ExecutionContext;
 use crate::jit_inline_plan::{InlineCandidate, InlineTree};
 use otter_bytecode::Op;
 
-impl BakeEnv<'_> {
+impl BakeEnv {
     /// Calls `code_block` makes per entry that would stay calls where it is
     /// built in place: its sites with call feedback, less those whose every
     /// target is a small body, a native or an intrinsic.
@@ -180,7 +180,7 @@ impl InlineSnapshotBudget {
 
 /// The call and method sites of bodies, read from their feedback.
 pub(super) struct FeedbackTree<'a> {
-    pub(super) interp: &'a BakeEnv<'a>,
+    pub(super) interp: &'a BakeEnv,
     pub(super) context: &'a ExecutionContext,
     pub(super) root: u32,
 }

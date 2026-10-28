@@ -353,6 +353,8 @@ pub struct GcHeap {
     /// Per-heap, not process-global, so index order is a property of
     /// this isolate's install sequence alone.
     external_refs: std::sync::Arc<crate::external_refs::SharedExternalRefs>,
+    /// Compiler threads' right to read this heap; every pause takes it.
+    read_right: std::sync::Arc<crate::read_right::HeapReadRight>,
     /// Owned host payloads (dynamic-native closures) bodies name by
     /// index. See [`crate::host_refs`]; slots are recycled from the
     /// sweep through [`crate::trace::ReleaseHostRefs`].
@@ -625,6 +627,7 @@ impl GcHeap {
             survived_since_last_expansion: 0,
             trace_table: TraceTable::new(),
             external_refs: std::sync::Arc::default(),
+            read_right: std::sync::Arc::default(),
             host_refs: crate::host_refs::HostRefTable::default(),
             marking: MarkingState::new(),
             remembered_parents: Vec::new(),
@@ -1265,6 +1268,12 @@ impl GcHeap {
     #[must_use]
     pub fn external_refs(&self) -> &ExternalRefTable {
         self.external_refs.get()
+    }
+
+    /// Compiler threads' right to read this heap.
+    #[must_use]
+    pub fn read_right(&self) -> std::sync::Arc<crate::read_right::HeapReadRight> {
+        std::sync::Arc::clone(&self.read_right)
     }
 
     /// The external-reference table, for compiler threads.
@@ -2633,6 +2642,9 @@ impl GcHeap {
         trigger: GcPauseTrigger,
         work: impl FnOnce(&mut Self) -> (R, GcPauseOutcome),
     ) -> R {
+        // No compiler thread reads the heap while it changes under a pause.
+        let right = std::sync::Arc::clone(&self.read_right);
+        let _exclusive = right.exclude();
         crate::compressed::age_retained_pages(Instant::now());
         let token = self.pause_recorder.begin(
             kind,

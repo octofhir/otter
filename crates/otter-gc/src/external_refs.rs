@@ -187,7 +187,7 @@ mod tests {
 /// changed, through [`Self::try_read`], and never waits.
 #[derive(Debug, Default)]
 pub struct SharedExternalRefs {
-    lock: std::sync::Mutex<()>,
+    lock: std::sync::RwLock<()>,
     table: std::cell::UnsafeCell<ExternalRefTable>,
 }
 
@@ -207,7 +207,7 @@ impl SharedExternalRefs {
     pub(crate) fn with_mut<R>(&self, f: impl FnOnce(&mut ExternalRefTable) -> R) -> R {
         let _guard = self
             .lock
-            .lock()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // SAFETY: the owner holds its heap mutably and the lock excludes
         // every compiler-thread read.
@@ -217,7 +217,7 @@ impl SharedExternalRefs {
     /// A compiler thread's lookup of `addr`'s index; `None` when the address
     /// was never interned or the owner is changing the table.
     pub fn try_lookup(&self, addr: usize) -> Option<u32> {
-        let _guard = self.lock.try_lock().ok()?;
+        let _guard = self.lock.try_read().ok()?;
         // SAFETY: the lock excludes every write.
         unsafe { &*self.table.get() }.lookup(addr)
     }

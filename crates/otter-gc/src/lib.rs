@@ -100,6 +100,7 @@ pub mod oom;
 pub mod os_memory;
 pub mod page;
 pub mod pretenuring;
+pub mod read_right;
 pub mod root_scope;
 #[doc(hidden)]
 pub mod scavenger;

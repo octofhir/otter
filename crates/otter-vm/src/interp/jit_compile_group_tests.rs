@@ -50,7 +50,7 @@ fn production_literal_snapshot_freezes_current_heap_group_capability() {
             "unprepared snapshots cannot group"
         );
         assert_eq!(vm.gc_heap.machine_allocation_allowed(), expected);
-        super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&vm))
+        super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&vm), None)
             .bake_literal_allocations(&mut view, &context, fid)
             .expect("real literal plan preparation");
         assert_eq!(view.literal_allocations.group_allowed, expected);

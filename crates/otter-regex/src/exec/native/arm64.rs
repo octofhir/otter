@@ -75,12 +75,7 @@ pub(super) fn compile(program: &Program, wide: bool) -> Option<NativeCode> {
     emitter.function();
     let Emitter { ops, preds, .. } = emitter;
     let buf = ops.finalize().ok()?;
-    Some(NativeCode {
-        buf,
-        entry,
-        preds: preds.into_boxed_slice(),
-        finalized_on: super::thread_tag(),
-    })
+    Some(NativeCode::new(buf, entry, preds))
 }
 
 struct Emitter<'p> {

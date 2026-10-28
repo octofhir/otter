@@ -744,6 +744,20 @@ pub(crate) extern "C" fn jit_regexp_exec_stub(
     committed_value_result(ctx, result)
 }
 
+/// The RegExp of the regex literal at constant-pool index `constant_bits`
+/// of the published function: the committed miss of a generated literal
+/// birth.
+pub(crate) extern "C" fn jit_regexp_literal_stub(
+    ctx: *mut JitCtx,
+    constant_bits: u64,
+    _unused_bits: u64,
+) -> NativeResultPair {
+    // SAFETY: the live `JitCtx` reentry contract.
+    let ctx = unsafe { &mut *ctx };
+    let result = ctx.regexp_literal(constant_bits);
+    committed_value_result(ctx, result)
+}
+
 /// `receiver.test(argument)` counterpart of [`jit_regexp_exec_stub`].
 pub(crate) extern "C" fn jit_regexp_test_stub(
     ctx: *mut JitCtx,

@@ -348,6 +348,7 @@ pub(crate) fn runtime_stub_bindings() -> Vec<otter_vm::JitRuntimeStubBinding> {
         committed_value2_binding!(abi::STUB_JIT_BINDING_VALUE, jit_binding_value_stub),
         committed_value2_binding!(abi::STUB_JIT_REGEXP_EXEC, jit_regexp_exec_stub),
         committed_value2_binding!(abi::STUB_JIT_REGEXP_TEST, jit_regexp_test_stub),
+        committed_value2_binding!(abi::STUB_JIT_REGEXP_LITERAL, jit_regexp_literal_stub),
         committed_value2_binding!(
             abi::STUB_JIT_GLOBAL_DECLARATION_VALUE,
             jit_global_declaration_value_stub
@@ -471,6 +472,7 @@ mod tests {
                 !matches!(
                     descriptor.signature,
                     RuntimeStubSignature::LeafValue2
+                        | RuntimeStubSignature::IsolateLeafValue2
                         | RuntimeStubSignature::Float64Leaf2
                         | RuntimeStubSignature::Float64MathLeaf3
                         | RuntimeStubSignature::Float64ToWordLeaf1

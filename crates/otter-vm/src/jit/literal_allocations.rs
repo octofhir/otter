@@ -56,6 +56,48 @@ pub struct JitLiteralAllocationPlans {
     /// Allocation sites of object and array literals and of concatenating
     /// `+` instructions by own logical PC.
     pub sites: rustc_hash::FxHashMap<u32, JitAllocationSite>,
+    /// Regex literal births by own byte PC, in the default realm.
+    pub regexps: rustc_hash::FxHashMap<u32, JitRegExpLiteralPlan>,
+}
+
+/// Payload words of a fresh RegExp body.
+pub const JIT_REGEXP_IMAGE_WORDS: usize = crate::regexp::REGEXP_BODY_IMAGE_WORDS;
+
+/// One regex literal site's birth: the image of a fresh RegExp over the
+/// site's program cell and flags, which generated code copies into a young
+/// cell. The cell is old and rooted by the site for as long as its chunk
+/// lives, which the code does not outlive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JitRegExpLiteralPlan {
+    /// Constant-pool index of the literal, for the committed miss.
+    pub constant: u32,
+    /// Aligned header-inclusive allocation bytes.
+    pub cell_bytes: u32,
+    /// Complete young/type/size header.
+    pub header_word: u64,
+    /// Every payload word of the fresh body, padding zero.
+    pub image: [u64; JIT_REGEXP_IMAGE_WORDS],
+}
+
+impl JitRegExpLiteralPlan {
+    /// The birth of `site`'s literal at constant `constant`.
+    #[must_use]
+    pub(crate) fn new(constant: u32, site: crate::regexp::RegExpLiteralSite) -> Self {
+        let cell_bytes = otter_gc::GcHeap::cell_bytes::<crate::regexp::JsRegExpBody>(0) as u32;
+        Self {
+            constant,
+            cell_bytes,
+            header_word: u64::from(crate::regexp::REGEXP_BODY_TYPE_TAG)
+                | (u64::from(super::JIT_GC_YOUNG_FLAG)
+                    << (8 * otter_gc::header::HEADER_FLAGS_BYTE_OFFSET))
+                | (u64::from(cell_bytes) << (8 * otter_gc::header::HEADER_SIZE_BYTES_OFFSET)),
+            image: crate::regexp::JsRegExp::fresh_image(
+                site.pattern,
+                site.flags,
+                site.legacy_features_enabled,
+            ),
+        }
+    }
 }
 
 /// Placement generated code bakes for one literal allocation site.

@@ -1122,45 +1122,71 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Compile/materialize a fresh RegExp literal as a representation-neutral
-    /// value operation shared by interpreter and compiled tiers.
-    ///
-    /// The pattern is read from the pool of the chunk that owns
-    /// `function_id`, not from the ambient context: a frame driven by a
-    /// builtin (an `Array.prototype` callback, say) runs under its caller's
-    /// context, and a literal in another chunk indexes a different pool.
+    /// A fresh RegExp of the literal at constant `idx` of the chunk owning
+    /// `function_id`, a representation-neutral value operation shared by
+    /// interpreter and compiled tiers: the site resolves its program once
+    /// ([`Self::resolve_regexp_literal_site`]), then every evaluation is one
+    /// young birth.
     pub(crate) fn load_regexp_literal_value(
         &mut self,
         context: &ExecutionContext,
         function_id: u32,
         idx: u32,
     ) -> Result<Value, VmError> {
-        let (pattern_utf16, flags) = context
-            .regexp_constant_for_function(function_id, idx)
-            .ok_or(VmError::InvalidOperand)?;
-        // A regex literal evaluates to a fresh RegExp each time, but the
-        // *compiled* program is a pure function of pattern + flags, so
-        // resolve it through the per-isolate compile cache (a disjoint
-        // field borrow with `gc_heap`) to skip re-parsing on every eval.
-        let regex = regexp::JsRegExp::compile_cached(
+        let key = context.constant_cache_key(idx);
+        let site = match self.regexp_literals.get(&key) {
+            Some(site) => *site,
+            None => {
+                let site = self.resolve_regexp_literal_site(context, function_id, idx)?;
+                self.regexp_literals.insert(key, site);
+                site
+            }
+        };
+        let regex = regexp::JsRegExp::fresh(
             &mut self.gc_heap,
-            &mut self.regex_compile_cache,
-            pattern_utf16,
-            flags,
+            site.pattern,
+            site.flags,
+            site.legacy_features_enabled,
         )
         .map_err(|e| self.err_invalid_regexp((e.to_string()).into()))?;
         self.register_regexp_realm_proto(regex);
+        Ok(Value::regexp(regex))
+    }
+
+    /// Resolve a regex literal site once: compile its pattern through the
+    /// per-isolate cache and decide its legacy statics.
+    ///
+    /// The pattern is read from the pool of the chunk that owns
+    /// `function_id`, not from the ambient context: a frame driven by a
+    /// builtin (an `Array.prototype` callback, say) runs under its caller's
+    /// context, and a literal in another chunk indexes a different pool.
+    pub(crate) fn resolve_regexp_literal_site(
+        &mut self,
+        context: &ExecutionContext,
+        function_id: u32,
+        idx: u32,
+    ) -> Result<regexp::RegExpLiteralSite, VmError> {
+        let (pattern_utf16, flag_str) = context
+            .regexp_constant_for_function(function_id, idx)
+            .ok_or(VmError::InvalidOperand)?;
+        let flags = regexp::RegExpFlags::parse(flag_str)
+            .map_err(|e| self.err_invalid_regexp((e.to_string()).into()))?;
+        let pattern = self
+            .regex_compile_cache
+            .get_or_compile(&mut self.gc_heap, pattern_utf16, flags)
+            .map_err(|e| self.err_invalid_regexp((e.to_string()).into()))?;
         // §B.2.4 — a match run by engine-hosted builtin code must not
         // publish into the realm's `RegExp.lastMatch` and friends, the
         // same exemption a self-hosted builtin gets elsewhere. Without
         // it every `console.log` overwrites what user code just matched.
-        if context
+        let engine_hosted = context
             .exec_function(function_id)
-            .is_some_and(|block| module_is_engine_hosted(block.module_url()))
-        {
-            regex.disable_legacy_features(&mut self.gc_heap);
-        }
-        Ok(Value::regexp(regex))
+            .is_some_and(|block| module_is_engine_hosted(block.module_url()));
+        Ok(regexp::RegExpLiteralSite {
+            pattern,
+            flags,
+            legacy_features_enabled: !engine_hosted,
+        })
     }
 
     /// Typed JIT allocation operation for `LoadRegExp`: materialize a fresh

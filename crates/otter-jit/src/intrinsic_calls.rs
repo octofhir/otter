@@ -70,6 +70,19 @@ impl IntrinsicMethodForm {
         }
     }
 
+    /// The isolate leaf running the method without a frame, tried before
+    /// [`Self::stub`]: a miss precedes every effect and leaves the call to
+    /// the committed entry.
+    pub(crate) const fn leaf(self) -> Option<otter_vm::runtime_stubs::IsolateLeafStub2> {
+        match self {
+            Self::RegExpExec => Some(otter_vm::runtime_stubs::REGEXP_EXEC_LEAF),
+            Self::RegExpTest => Some(otter_vm::runtime_stubs::REGEXP_TEST_LEAF),
+            Self::StringReplace | Self::StringSplit | Self::StringMatch | Self::StringSearch => {
+                None
+            }
+        }
+    }
+
     /// The committed runtime entry running the method.
     pub(crate) const fn stub(self) -> otter_vm::native_abi::RuntimeStubDescriptor {
         use otter_vm::native_abi as abi;

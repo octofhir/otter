@@ -71,6 +71,7 @@ fn descriptor_arguments(descriptor: RuntimeStubDescriptor) -> Arguments {
         S::Poll1 | S::ExecutionEntry0 => Arguments::Words(1),
         S::ContextWords => Arguments::Words(1 + descriptor.argument_count),
         S::LeafValue2
+        | S::IsolateLeafValue2
         | S::MutatingLeafValue2
         | S::ReentrantValue2
         | S::ReentrantNamedLoad

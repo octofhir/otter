@@ -182,6 +182,7 @@ impl Interpreter {
             template_objects: rustc_hash::FxHashMap::default(),
             literal_cells: rustc_hash::FxHashMap::default(),
             array_boilerplates: rustc_hash::FxHashMap::default(),
+            regexp_literals: rustc_hash::FxHashMap::default(),
             number_strings: crate::string::number_strings::NumberStrings::empty(),
             regexp_match_shape: crate::object::ShapeHandle::null(),
             pending_error_detail: std::cell::RefCell::new(None),

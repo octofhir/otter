@@ -109,9 +109,10 @@ pub struct IsolateSnapshot {
     /// The global symbol registry: key and symbol handle, in registration
     /// order.
     pub(crate) registered_symbols: Vec<(Box<str>, RawGc)>,
-    /// Per-body regexp pattern records, by body handle. These rebuild the
+    /// Per-cell regexp pattern records, by pattern-cell handle: the pattern
+    /// text, its source rendering and its engine flag bits. These rebuild the
     /// compiled matcher and foreign-owned text after page relocation.
-    pub(crate) regexp_payloads: Vec<(RawGc, Vec<u16>, String)>,
+    pub(crate) regexp_payloads: Vec<(RawGc, Vec<u16>, String, u8)>,
     /// Per-body indexed Array descriptor records, by sidecar handle.
     /// Managed named-property bags remain in the relocated page image.
     pub(crate) array_indexed_records: Vec<(RawGc, crate::array::ArrayIndexedSnapshot)>,
@@ -195,7 +196,7 @@ impl crate::Interpreter {
             if unrestorable.is_none()
                 && table.owns_outside_storage(tag)
                 && table.get_sever_restored(tag).is_none()
-                && tag != crate::regexp::REGEXP_BODY_TYPE_TAG
+                && tag != crate::regexp::REGEXP_PATTERN_TYPE_TAG
             {
                 unrestorable = Some(table.name(tag).unwrap_or("?"));
             }
@@ -241,16 +242,17 @@ impl crate::Interpreter {
         }
         let function_kind_prototype_roots = self.function_kind_prototypes.snapshot_roots();
         let external_ref_addrs = self.gc_heap().external_refs().addresses().to_vec();
-        let mut regexp_payloads: Vec<(RawGc, Vec<u16>, String)> = Vec::new();
+        let mut regexp_payloads: Vec<(RawGc, Vec<u16>, String, u8)> = Vec::new();
         let mut array_sidecar_with_content = false;
         let mut array_indexed_records: Vec<(RawGc, crate::array::ArrayIndexedSnapshot)> =
             Vec::new();
         self.gc_heap().for_each_live_body(|_space, body| {
-            if let Some(regexp) = body.downcast::<crate::regexp::JsRegExpBody>() {
+            if let Some(cell) = body.downcast::<crate::regexp::RegExpPatternBody>() {
                 regexp_payloads.push((
                     body.raw(),
-                    regexp.pattern.pattern_utf16.to_vec(),
-                    regexp.pattern.source.to_string(),
+                    cell.pattern.pattern_utf16.to_vec(),
+                    cell.pattern.source.to_string(),
+                    crate::regexp::engine_flag_bits(cell.pattern.regex.flags()),
                 ));
             } else if let Some(sidecar) = body.downcast::<crate::array::ArrayExoticSlots>() {
                 if !sidecar.is_empty_for_snapshot() {
@@ -379,10 +381,11 @@ impl IsolateSnapshot {
             out.u32(symbol.0);
         }
         out.len(self.regexp_payloads.len());
-        for (body, pattern, source) in &self.regexp_payloads {
-            out.u32(body.0);
+        for (cell, pattern, source, flags) in &self.regexp_payloads {
+            out.u32(cell.0);
             out.units(pattern);
             out.str(source);
+            out.u8(*flags);
         }
         out.len(self.array_indexed_records.len());
         for (sidecar, record) in &self.array_indexed_records {
@@ -474,7 +477,12 @@ impl IsolateSnapshot {
         let len = input.len()?;
         let mut regexp_payloads = Vec::with_capacity(len);
         for _ in 0..len {
-            regexp_payloads.push((RawGc(input.u32()?), input.units()?, input.str()?.to_owned()));
+            regexp_payloads.push((
+                RawGc(input.u32()?),
+                input.units()?,
+                input.str()?.to_owned(),
+                input.u8()?,
+            ));
         }
         let len = input.len()?;
         let mut array_indexed_records = Vec::with_capacity(len);

@@ -3119,6 +3119,7 @@ pub fn register_gc_traceables(heap: &mut otter_gc::GcHeap) {
     register! {
         crate::array::ArrayBody,
         crate::array::elements::ElementSlabBody,
+        crate::regexp::RegExpPatternBody,
         crate::value_slab::ValueSlabBody,
         crate::bigint::gc_body::BigIntBody,
         crate::binary::array_buffer::LocalArrayBufferBodyGc,
@@ -3426,36 +3427,28 @@ pub(crate) fn alloc_object_with_shape_and_values_roots(
     )
 }
 
-/// Publish initialized Value words from an already reserved allocation buffer,
-/// for a layout whose field summaries were generalized
-/// ([`field_type::generalize`]): they track nothing, so the values are not
-/// observed. No allocation, JavaScript or representation preparation occurs
-/// here.
-pub(crate) fn try_alloc_generalized_object_no_collect(
+/// An object of `shape`, a layout whose field summaries were generalized
+/// ([`field_type::generalize`]) so its `values` are not observed, placed in
+/// a group's carve ([`object_cell_bytes`] of the shape's inline capacity).
+pub(crate) fn place_generalized_object(
     heap: &mut GcHeap,
+    carve: &mut otter_gc::CellCarve,
     shape: ShapeHandle,
     values: &[Value],
-) -> Option<JsObject> {
+) -> JsObject {
     debug_assert_eq!(shape_body::property_count_of(shape) as usize, values.len());
     let capacity = shape_body::inline_capacity_of(shape);
-    if values.len() > capacity {
-        return None;
-    }
+    debug_assert!(values.len() <= capacity);
     let PendingObject { body } = empty_object_body(shape);
-    heap.try_alloc_filled_trailing_no_collect_or_return(
-        body,
-        FieldLocation::words_bytes(capacity),
-        |body| {
-            body.init_cell();
-            for index in 0..capacity {
-                let value = values.get(index).copied().unwrap_or_else(Value::undefined);
-                unsafe {
-                    *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) = value
-                };
-            }
-        },
-    )
-    .ok()
+    heap.place(carve, body, FieldLocation::words_bytes(capacity), |body| {
+        body.init_cell();
+        for index in 0..capacity {
+            let value = values.get(index).copied().unwrap_or_else(Value::undefined);
+            unsafe {
+                *FieldLocation::inline(index as u32).word_ptr(body.inline_values_ptr()) = value
+            };
+        }
+    })
 }
 
 /// Install `shape` on a fresh, slotless object together with a value for

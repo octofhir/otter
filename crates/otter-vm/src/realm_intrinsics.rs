@@ -680,7 +680,11 @@ mod tests {
         empty.visit_slots(&mut |_| visited += 1);
         assert_eq!(
             visited,
-            Intrinsic::COUNT + 3 + crate::IntrinsicCallKind::ALL.len(),
+            Intrinsic::COUNT
+                + 3
+                + crate::IntrinsicCallKind::ALL.len()
+                + empty.typed_array_constructors.len()
+                + 2,
             "a fixed-shape walk must not depend on which slots are filled"
         );
         let mut traced = 0usize;

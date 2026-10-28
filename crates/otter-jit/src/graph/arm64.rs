@@ -2325,7 +2325,18 @@ impl<'a> Codegen<'a> {
                         form.kind().feedback_payload(),
                     )));
                 }
+                let done = self.ops.new_dynamic_label();
+                if let Some(leaf) = form.leaf() {
+                    self.emit_isolate_leaf_method(
+                        node,
+                        leaf,
+                        [Self::gp(input(0)), Self::gp(input(1))],
+                        destination,
+                        done,
+                    );
+                }
                 self.emit_committed_call(node, stub, &arguments, Some(destination))?;
+                dynasm!(self.ops ; .arch aarch64 ; =>done);
             }
             Kind::LoadKeyedCached { .. } => {
                 let (receiver, key) = (Self::gp(input(0)), Self::gp(input(1)));
@@ -2575,6 +2586,10 @@ impl<'a> Codegen<'a> {
             Kind::NewObject | Kind::NewNullPrototypeObject | Kind::NewArrayEmpty => {
                 let destination = Self::gp(result.expect("an allocation result"));
                 self.emit_empty_allocation(node, destination)?;
+            }
+            Kind::NewRegExp(_) => {
+                let destination = Self::gp(result.expect("an allocation result"));
+                self.emit_regexp_allocation(node, destination)?;
             }
             Kind::NewObjectLiteral { .. } | Kind::NewArrayLiteral => {
                 let destination = Self::gp(result.expect("an allocation result"));

@@ -65,3 +65,52 @@ impl Codegen<'_> {
         Ok(())
     }
 }
+
+impl Codegen<'_> {
+    /// Try the isolate leaf of a proved builtin method over `inputs`
+    /// (receiver, argument) before its committed entry: a hit writes
+    /// `destination` and branches to `done`; a miss falls through with every
+    /// live register and both inputs intact, for the committed call that
+    /// follows. The leaf publishes no safepoint and never collects.
+    pub(super) fn emit_isolate_leaf_method(
+        &mut self,
+        node: NodeId,
+        leaf: otter_vm::runtime_stubs::IsolateLeafStub2,
+        inputs: [u8; 2],
+        destination: u8,
+        done: dynasmrt::DynamicLabel,
+    ) {
+        debug_assert!(leaf.is_valid());
+        let live = self.allocation.node(node).live_registers.clone();
+        let [receiver, argument] = inputs;
+        // The inputs outlive the leaf for the committed retry.
+        dynasm!(self.ops ; .arch aarch64 ; stp X(receiver), X(argument), [sp, #-16]!);
+        let saved = self.emit_save_registers(&live);
+        dynasm!(self.ops ; .arch aarch64
+            ; mov x16, X(receiver)
+            ; mov x17, X(argument)
+            ; ldr x0, [x20, THREAD_OFFSET]
+            ; mov x1, x16
+            ; mov x2, x17
+        );
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            16,
+            leaf.entry_addr() as u64,
+            RelocationTarget::runtime_stub(leaf.descriptor),
+        );
+        dynasm!(self.ops ; .arch aarch64 ; blr x16 ; mov x16, x0 ; mov x17, x1);
+        self.emit_restore_registers(&live, saved);
+        dynasm!(self.ops ; .arch aarch64 ; ldp X(receiver), X(argument), [sp], #16);
+        let fatal = self.cond_target(self.fatal);
+        dynasm!(self.ops ; .arch aarch64
+            ; cbnz x17, >miss
+            ; mov X(destination), x16
+            ; b =>done
+            ; miss:
+            ; cmp x17, #abi::NativeResultStatus::SideExit as u32
+            ; b.ne =>fatal
+        );
+    }
+}

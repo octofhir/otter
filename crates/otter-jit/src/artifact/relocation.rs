@@ -216,6 +216,7 @@ impl RelocationTarget {
 fn runtime_stub_signature_name(signature: RuntimeStubSignature) -> &'static str {
     match signature {
         RuntimeStubSignature::LeafValue2 => "leafValue2",
+        RuntimeStubSignature::IsolateLeafValue2 => "isolateLeafValue2",
         RuntimeStubSignature::Float64Leaf2 => "float64Leaf2",
         RuntimeStubSignature::Float64MathLeaf3 => "float64MathLeaf3",
         RuntimeStubSignature::Float64ToWordLeaf1 => "float64ToWordLeaf1",

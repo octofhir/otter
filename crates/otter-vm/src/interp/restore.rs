@@ -140,6 +140,7 @@ impl Interpreter {
             template_objects: rustc_hash::FxHashMap::default(),
             literal_cells: rustc_hash::FxHashMap::default(),
             array_boilerplates: rustc_hash::FxHashMap::default(),
+            regexp_literals: rustc_hash::FxHashMap::default(),
             number_strings: crate::string::number_strings::NumberStrings::empty(),
             regexp_match_shape: crate::object::ShapeHandle::null(),
             pending_error_detail: std::cell::RefCell::new(None),
@@ -387,16 +388,17 @@ impl Interpreter {
         // its body by the handle it was captured at.
         {
             let heap = &mut interp.gc_heap;
-            for (body, pattern_utf16, source) in &snapshot.regexp_payloads {
-                let body = relocation
-                    .relocate_raw(*body)
-                    .expect("a captured regexp body is in the image");
-                // SAFETY: the record was taken from a live `JsRegExpBody`
+            for (cell, pattern_utf16, source, flags) in &snapshot.regexp_payloads {
+                let cell = relocation
+                    .relocate_raw(*cell)
+                    .expect("a captured regexp pattern cell is in the image");
+                // SAFETY: the record was taken from a live `RegExpPatternBody`
                 // at this captured offset; relocation names its copy.
-                let body: otter_gc::Gc<crate::regexp::JsRegExpBody> =
-                    unsafe { otter_gc::Gc::from_offset(body.0) };
-                heap.with_payload(body, |body| {
-                    body.rebuild_after_restore(pattern_utf16, source)
+                let cell: otter_gc::Gc<crate::regexp::RegExpPatternBody> =
+                    unsafe { otter_gc::Gc::from_offset(cell.0) };
+                let flags = crate::regexp::engine_flags_from_bits(*flags);
+                heap.with_payload(cell, |cell| {
+                    cell.rebuild_after_restore(pattern_utf16, source, flags)
                 });
             }
             for (sidecar, record) in &snapshot.array_indexed_records {

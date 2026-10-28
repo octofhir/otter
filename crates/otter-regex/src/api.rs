@@ -86,12 +86,107 @@ pub struct Regex {
 #[derive(Debug, Default)]
 pub struct MatchScratch(Option<Box<Buffers>>);
 
+impl MatchScratch {
+    /// The group slots of the match [`Regex::search_first`] of `regex` last
+    /// found in these buffers, read in place: `[start, end)` per group,
+    /// group zero first. Empty when no search of `regex` matched here, or
+    /// another search ran since.
+    #[inline]
+    #[must_use]
+    pub fn last_match(&self, regex: &Regex) -> MatchSlots<'_> {
+        let count = regex.program.capture_slot_count();
+        let Some(buffers) = self.0.as_ref() else {
+            return MatchSlots(Slots::Encoded(&[]));
+        };
+        MatchSlots(match buffers.last {
+            LastSlots::None => Slots::Encoded(&[]),
+            LastSlots::Literal => Slots::Encoded(&buffers.literal),
+            LastSlots::Native => {
+                Slots::Encoded(buffers.native.captures().get(..count).unwrap_or(&[]))
+            }
+            LastSlots::Interpreted => {
+                Slots::Interpreted(buffers.interpreter.captures().get(..count).unwrap_or(&[]))
+            }
+        })
+    }
+
+    /// Hand back buffers a search grew past the retained bound, so a
+    /// pathological subject does not pin them for the host.
+    #[inline]
+    pub fn release_oversized(&mut self) {
+        if self.0.as_ref().is_some_and(|buffers| {
+            buffers.native.is_oversized() || buffers.interpreter.is_oversized()
+        }) {
+            *self = Self::default();
+        }
+    }
+}
+
+/// Group slots of a match, read in place from the search's scratch: each
+/// group's `[start, end)` as the matcher left them.
+#[derive(Debug, Clone, Copy)]
+pub struct MatchSlots<'a>(Slots<'a>);
+
+impl MatchSlots<'_> {
+    /// Groups, group zero included.
+    #[inline]
+    #[must_use]
+    pub fn groups(self) -> usize {
+        self.0.len() / 2
+    }
+
+    /// Group `index`, `None` when it did not participate.
+    #[inline]
+    #[must_use]
+    pub fn group(self, index: usize) -> Option<core::ops::Range<usize>> {
+        match self.0 {
+            Slots::Encoded(slots) => {
+                // A group the matcher closed without opening reads as absent
+                // from its end.
+                let end = *slots.get(2 * index + 1)?;
+                (end != crate::exec::native::NONE).then(|| slots[2 * index] as usize..end as usize)
+            }
+            Slots::Interpreted(slots) => {
+                let start = (*slots.get(2 * index)?)?;
+                let end = (*slots.get(2 * index + 1)?)?;
+                Some(start..end)
+            }
+        }
+    }
+
+    /// The whole match.
+    #[inline]
+    #[must_use]
+    pub fn range(self) -> core::ops::Range<usize> {
+        self.group(0).unwrap_or(0..0)
+    }
+
+    /// Every group's offsets as `u32` pairs, [`crate::NO_OFFSET`] for both
+    /// ends of a group that did not participate.
+    #[inline]
+    pub fn write_offsets(self, out: &mut Vec<u32>) {
+        self.0.write_offsets(out);
+    }
+}
+
 /// The buffers of both tiers.
 #[derive(Debug, Default)]
 struct Buffers {
     interpreter: backtrack::Scratch,
     native: native::Scratch,
     literal: [u64; 2],
+    /// Which buffer holds the slots of the last match a kept search found.
+    last: LastSlots,
+}
+
+/// The execution whose buffer holds the last kept match's slots.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum LastSlots {
+    #[default]
+    None,
+    Literal,
+    Native,
+    Interpreted,
 }
 
 impl Regex {
@@ -220,11 +315,8 @@ impl Regex {
     }
 
     /// [`Self::first_offsets_into`] of a search the program's machine code
-    /// decides with one window: a sticky search, or a start-anchored program.
-    /// `None` when another execution owns the search (a complete literal,
-    /// no machine code, or several candidate starts). It selects the window
-    /// [`Matches::advance_native_once`] would and runs it over the scratch
-    /// buffers in place.
+    /// decides with one window ([`Self::search_native_once`]), the slots
+    /// copied out as offsets.
     #[inline]
     fn native_once_into<U: Unit>(
         &self,
@@ -234,6 +326,60 @@ impl Regex {
         config: ExecConfig,
         scratch: &mut MatchScratch,
         out: &mut Vec<u32>,
+    ) -> Option<(Result<bool, ExecError>, u64)> {
+        let found = self.native_once(text, start, anchored, config.step_limit, scratch)?;
+        if let (Ok(true), _) = found {
+            scratch.last_match(self).write_offsets(out);
+        }
+        scratch.release_oversized();
+        Some(found)
+    }
+
+    /// One leftmost search for the first match at or after `start`, by
+    /// whichever execution owns it, with the match's slots left in
+    /// `scratch` for [`MatchScratch::last_match`] until the next search:
+    /// whether a match exists and the backtrack steps explored. `anchored`
+    /// admits only a match beginning at `start`. Nothing is allocated once
+    /// the buffers exist, and nothing is copied; the host hands oversized
+    /// buffers back with [`MatchScratch::release_oversized`] once it has
+    /// read the slots.
+    #[inline]
+    pub fn search_first<U: Unit>(
+        &self,
+        text: &[U],
+        start: usize,
+        anchored: bool,
+        step_limit: u64,
+        scratch: &mut MatchScratch,
+    ) -> (Result<bool, ExecError>, u64) {
+        if let Some(found) = self.native_once(text, start, anchored, step_limit, scratch) {
+            return found;
+        }
+        let config = ExecConfig { step_limit };
+        let mut matches = self.find_units(text, start, config, std::mem::take(scratch));
+        matches.anchored = anchored;
+        let found = match matches.advance() {
+            None => Ok(false),
+            Some(found) => found.map(|()| true),
+        };
+        let steps = matches.steps_executed;
+        *scratch = matches.into_scratch_kept();
+        (found, steps)
+    }
+
+    /// [`Self::search_first`] of a search the program's machine code
+    /// decides with one window: a sticky (`anchored`) search, or a
+    /// start-anchored program. `None` when another execution owns the
+    /// search: a complete literal, no machine code yet, or several
+    /// candidate starts.
+    #[inline]
+    fn native_once<U: Unit>(
+        &self,
+        text: &[U],
+        start: usize,
+        anchored: bool,
+        step_limit: u64,
+        scratch: &mut MatchScratch,
     ) -> Option<(Result<bool, ExecError>, u64)> {
         let program = &self.program;
         if !(anchored || program.start_anchored)
@@ -264,7 +410,7 @@ impl Regex {
             return Some((Ok(false), 0));
         }
         let buffers = scratch.0.get_or_insert_with(Box::default);
-        let mut budget = config.step_limit;
+        let mut budget = step_limit;
         let outcome = native::search(
             code,
             program,
@@ -277,20 +423,16 @@ impl Regex {
             &mut budget,
             &mut buffers.native,
         );
-        let steps = config.step_limit - budget;
+        let steps = step_limit - budget;
         let found = match outcome {
             Outcome::Match => {
-                let count = program.capture_slot_count();
-                Slots::Encoded(&buffers.native.captures()[..count]).write_offsets(out);
+                buffers.last = LastSlots::Native;
                 (Ok(true), steps)
             }
             Outcome::Exhausted(_) => (Ok(false), steps),
             // The interpreter counts the step that overran the budget.
             Outcome::StepLimit => (Err(ExecError::StepLimitExceeded), steps.saturating_add(1)),
         };
-        if buffers.native.is_oversized() {
-            *scratch = MatchScratch::default();
-        }
         Some(found)
     }
 
@@ -487,6 +629,30 @@ impl<U: Unit> Matches<'_, '_, U> {
                 Ok(true)
             }
         }
+    }
+
+    /// The next match's slots, read in place until the search moves on:
+    /// `None` once no match remains.
+    #[inline]
+    pub fn next_slots(&mut self) -> Option<Result<MatchSlots<'_>, ExecError>> {
+        match self.advance()? {
+            Ok(()) => Some(Ok(MatchSlots(self.current_slots()))),
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    /// End the search and hand its matcher buffers back with the last
+    /// match's slots kept in them, oversized or not, for
+    /// [`MatchScratch::last_match`]; the host hands oversized buffers back
+    /// with [`MatchScratch::release_oversized`] once it has read them.
+    #[must_use]
+    pub fn into_scratch_kept(mut self) -> MatchScratch {
+        self.scratch.last = match self.execution {
+            Execution::Literal(_) => LastSlots::Literal,
+            Execution::Native(_) => LastSlots::Native,
+            Execution::Interpreted => LastSlots::Interpreted,
+        };
+        MatchScratch(Some(self.scratch))
     }
 
     /// End the search and hand its matcher buffers back for the next one.

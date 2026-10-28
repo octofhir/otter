@@ -31,30 +31,25 @@ fn render(
         },
     )
     .unwrap();
-    let config = otter_regex::ExecConfig::default();
-    let named = regex.has_named_groups();
+    let names = regex.group_names();
     let mut runs: SmallVec<[SpliceRun; 16]> = SmallVec::new();
     let mut next = 0;
-    let mut visit = |matched: &crate::regexp::engine::Match<'_>| {
-        if matched.range.start > next {
-            runs.push(run(SUBJECT, next..matched.range.start));
+    let mut stream = MatchStream::new(
+        &regex,
+        subject,
+        0,
+        false,
+        u64::MAX,
+        otter_regex::MatchScratch::default(),
+    );
+    while let Some(found) = stream.next() {
+        let matched = found.unwrap();
+        let range = matched.range();
+        if range.start > next {
+            runs.push(run(SUBJECT, next..range.start));
         }
-        expand_template(&mut runs, template, subject.len(), matched, named);
-        next = matched.range.end;
-    };
-    match subject {
-        CodeUnits::Latin1(bytes) => {
-            let mut matches = regex.find_latin1(bytes, 0, config);
-            while let Some(found) = matches.next() {
-                visit(&found.unwrap());
-            }
-        }
-        CodeUnits::Utf16(units) => {
-            let mut matches = regex.find_utf16(units, 0, config);
-            while let Some(found) = matches.next() {
-                visit(&found.unwrap());
-            }
-        }
+        expand_template(&mut runs, template, subject.len(), matched, names);
+        next = range.end;
     }
     if next < subject.len() {
         runs.push(run(SUBJECT, next..subject.len()));

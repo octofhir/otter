@@ -116,7 +116,7 @@ pub use literal_allocations::{
     JIT_SITE_ID_OFFSET, JIT_SITE_TENURE, JitAllocationSite, JitArrayLiteralAllocationPlan,
     JitBoilerplateArrayAllocationPlan, JitDenseArrayAllocationPlan, JitEmptyArrayAllocationPlan,
     JitEmptyObjectAllocationPlan, JitHoleyArrayAllocationPlan, JitLiteralAllocationPlans,
-    JitObjectLiteralAllocationPlan, JitSiteMode, ordinary_object_header_word,
+    JitObjectLiteralAllocationPlan, JitRegExpLiteralPlan, JitSiteMode, ordinary_object_header_word,
 };
 
 mod string_layout;
@@ -3224,6 +3224,7 @@ mod layout_tests {
                 crate::object::SLOT_META_BODY_TYPE_TAG,
                 crate::constructor_layout::CONSTRUCTOR_LAYOUT_BODY_TYPE_TAG,
                 crate::array::elements::ELEMENT_SLAB_BODY_TYPE_TAG,
+                crate::regexp::REGEXP_PATTERN_TYPE_TAG,
                 <crate::object::ShapeBody as otter_gc::SafeTraceable>::TYPE_TAG,
                 <crate::object::slot_slab::SlotSlabBody as otter_gc::SafeTraceable>::TYPE_TAG,
                 <crate::value_slab::ValueSlabBody as otter_gc::SafeTraceable>::TYPE_TAG,

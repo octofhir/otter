@@ -2489,6 +2489,16 @@ impl<'a> Builder<'a> {
                     };
                 self.write(instruction.writes[0], result);
             }
+            Op::LoadRegExp
+                if self
+                    .view
+                    .literal_allocations
+                    .regexps
+                    .contains_key(&instruction.byte_pc) =>
+            {
+                let value = self.add(Kind::NewRegExp(instruction.byte_pc), &[], Repr::Tagged);
+                self.write(instruction.writes[0], value);
+            }
             Op::LoadString | Op::LoadBigInt
                 if self.view.literal_cells.contains_key(&instruction.byte_pc) =>
             {

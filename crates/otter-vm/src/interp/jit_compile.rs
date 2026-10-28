@@ -1440,6 +1440,29 @@ impl Interpreter {
         view.literal_allocations.group_allowed = self.gc_heap.machine_allocation_allowed();
         for (pc, instruction) in view.instructions.iter().enumerate() {
             match instruction.op(&view.code_block) {
+                // A literal in the default realm needs no prototype override.
+                Op::LoadRegExp if realm_id == 0 => {
+                    let Some(constant) = instruction.const_index(&view.code_block, 1) else {
+                        continue;
+                    };
+                    let owner = context.for_function(fid).ok()?;
+                    let key = owner.constant_cache_key(constant);
+                    let site = match self.regexp_literals.get(&key) {
+                        Some(site) => *site,
+                        None => {
+                            let Ok(site) = self.resolve_regexp_literal_site(&owner, fid, constant)
+                            else {
+                                continue;
+                            };
+                            self.regexp_literals.insert(key, site);
+                            site
+                        }
+                    };
+                    view.literal_allocations.regexps.insert(
+                        instruction.byte_pc,
+                        jit::JitRegExpLiteralPlan::new(constant, site),
+                    );
+                }
                 op if op == Op::NewObject
                     || (matches!(op, Op::Call | Op::New)
                         && instruction.const_index(&view.code_block, 2) == Some(0)

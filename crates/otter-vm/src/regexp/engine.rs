@@ -3,10 +3,12 @@
 //! # Contents
 //! - Pattern compilation and width-preserving first/all searches.
 //! - [`MatchOffsets`] — one match's group offsets in the interpreter's
-//!   reused buffer, for the direct `exec`/`test` path.
+//!   reused buffer, for the general `exec`/`test` ladder.
+//! - [`MatchGroups`] — one match's groups wherever the matcher left them:
+//!   that buffer, or a search's scratch read in place.
+//! - [`MatchStream`] — successive matches read in place, for a loop that
+//!   owns no capture storage and copies nothing per match.
 //! - Sticky searches anchored at their start, one candidate per match.
-//! - [`for_each_match`] — successive matches visited in place, without
-//!   owning any capture storage.
 //! - Scratch handoff and backtrack work transferred to the VM ledger.
 //!
 //! # Invariants
@@ -43,10 +45,103 @@ impl MatchOffsets {
         let start = self.0[2 * index];
         (start != NO_OFFSET).then(|| start as usize..self.0[2 * index + 1] as usize)
     }
+}
 
-    /// Capture groups, group zero excluded.
-    pub(crate) fn captures(&self) -> impl Iterator<Item = Option<std::ops::Range<usize>>> + '_ {
-        (1..self.groups()).map(|index| self.group(index))
+/// One match's groups, read from wherever the matcher left them: the
+/// interpreter's offsets buffer or a native search's scratch in place.
+pub(crate) trait MatchGroups: Copy {
+    /// Groups, group zero included.
+    fn groups(self) -> usize;
+    /// Group `index`, `None` when it did not participate.
+    fn group(self, index: usize) -> Option<std::ops::Range<usize>>;
+    /// The whole match.
+    fn range(self) -> std::ops::Range<usize> {
+        self.group(0).unwrap_or(0..0)
+    }
+}
+
+impl MatchGroups for &MatchOffsets {
+    #[inline]
+    fn groups(self) -> usize {
+        MatchOffsets::groups(self)
+    }
+    #[inline]
+    fn group(self, index: usize) -> Option<std::ops::Range<usize>> {
+        MatchOffsets::group(self, index)
+    }
+}
+
+impl MatchGroups for otter_regex::MatchSlots<'_> {
+    #[inline]
+    fn groups(self) -> usize {
+        otter_regex::MatchSlots::groups(self)
+    }
+    #[inline]
+    fn group(self, index: usize) -> Option<std::ops::Range<usize>> {
+        otter_regex::MatchSlots::group(self, index)
+    }
+}
+
+/// Successive matches of one search, each read in place: a loop over them
+/// owns no capture storage and copies nothing per match. The last match's
+/// slots stay in the scratch [`Self::finish`] hands back, for the legacy
+/// statics.
+pub(crate) enum MatchStream<'r, 't> {
+    Latin1(otter_regex::Matches<'r, 't, u8>),
+    Utf16(otter_regex::Matches<'r, 't, u16>),
+}
+
+impl<'r, 't> MatchStream<'r, 't> {
+    /// The matches of `re` in `text` from `start`, over the isolate's
+    /// `scratch`; a sticky search admits only matches that begin where the
+    /// previous one ended.
+    pub(crate) fn new(
+        re: &'r Regex,
+        text: crate::string::CodeUnits<'t>,
+        start: usize,
+        sticky: bool,
+        step_limit: u64,
+        scratch: otter_regex::MatchScratch,
+    ) -> Self {
+        let config = otter_regex::ExecConfig { step_limit };
+        match text {
+            crate::string::CodeUnits::Latin1(bytes) => Self::Latin1(
+                re.find_latin1_with(bytes, start, config, scratch)
+                    .anchored(sticky),
+            ),
+            crate::string::CodeUnits::Utf16(units) => Self::Utf16(
+                re.find_utf16_with(units, start, config, scratch)
+                    .anchored(sticky),
+            ),
+        }
+    }
+
+    /// The next match's slots, `None` once no match remains.
+    #[inline]
+    pub(crate) fn next(&mut self) -> Option<Result<otter_regex::MatchSlots<'_>, ExecError>> {
+        match self {
+            Self::Latin1(matches) => matches.next_slots(),
+            Self::Utf16(matches) => matches.next_slots(),
+        }
+    }
+
+    /// End the search: the scratch with the last match's slots kept, and
+    /// the backtrack steps to charge.
+    pub(crate) fn finish(self) -> (otter_regex::MatchScratch, u64) {
+        match self {
+            Self::Latin1(matches) => (matches.steps_executed(), matches).into_kept(),
+            Self::Utf16(matches) => (matches.steps_executed(), matches).into_kept(),
+        }
+    }
+}
+
+trait IntoKept {
+    fn into_kept(self) -> (otter_regex::MatchScratch, u64);
+}
+
+impl<U: otter_regex::Unit> IntoKept for (u64, otter_regex::Matches<'_, '_, U>) {
+    fn into_kept(self) -> (otter_regex::MatchScratch, u64) {
+        (self.1.into_scratch_kept(), self.0)
     }
 }
 
@@ -120,73 +215,6 @@ fn collect_batch<U: otter_regex::Unit>(
     let steps = matches.steps_executed();
     search.scratch.set(matches.into_scratch());
     Execution { result, steps }
-}
-
-/// Visit at most `max_matches` successive matches from `start`, in order,
-/// with exact work accounting; `visit` returns whether to continue. Each
-/// match borrows the matcher's scratch until `visit` returns, so nothing is
-/// collected: a caller keeps only the ranges it needs. The result counts the
-/// visited matches.
-pub(crate) fn for_each_match(
-    re: &Regex,
-    text: crate::string::CodeUnits<'_>,
-    start: usize,
-    sticky: bool,
-    max_matches: usize,
-    search: &super::RegexSearch<'_>,
-    visit: impl FnMut(&Match<'_>) -> bool,
-) -> Execution<usize> {
-    let config = otter_regex::ExecConfig {
-        step_limit: search.step_limit,
-    };
-    let scratch = search.scratch.take();
-    match text {
-        crate::string::CodeUnits::Latin1(bytes) => visit_matches(
-            re.find_latin1_with(bytes, start, config, scratch)
-                .anchored(sticky),
-            max_matches,
-            search,
-            visit,
-        ),
-        crate::string::CodeUnits::Utf16(units) => visit_matches(
-            re.find_utf16_with(units, start, config, scratch)
-                .anchored(sticky),
-            max_matches,
-            search,
-            visit,
-        ),
-    }
-}
-
-fn visit_matches<U: otter_regex::Unit>(
-    mut matches: otter_regex::Matches<'_, '_, U>,
-    max_matches: usize,
-    search: &super::RegexSearch<'_>,
-    mut visit: impl FnMut(&Match<'_>) -> bool,
-) -> Execution<usize> {
-    let mut visited = 0;
-    let mut result = Ok(());
-    while visited < max_matches {
-        match matches.next() {
-            None => break,
-            Some(Err(error)) => {
-                result = Err(error);
-                break;
-            }
-            Some(Ok(found)) => {
-                visited += 1;
-                if !visit(&found) {
-                    break;
-                }
-            }
-        }
-    }
-    let steps = matches.steps_executed();
-    search.scratch.set(matches.into_scratch());
-    Execution {
-        result: result.map(|()| visited),
-        steps,
-    }
 }
 
 /// Find only the first match from `start` — the single-match path for

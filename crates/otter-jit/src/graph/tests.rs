@@ -921,6 +921,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::NewObject
         | K::NewNullPrototypeObject
         | K::NewArrayEmpty
+        | K::NewRegExp(_)
         | K::NewObjectLiteral { .. }
         | K::NewArrayLiteral
         | K::NativeNewContext(_)

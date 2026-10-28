@@ -484,6 +484,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::NewObject
         | Kind::NewNullPrototypeObject
         | Kind::NewArrayEmpty
+        | Kind::NewRegExp(_)
         | Kind::NewArrayLiteral => Effects::writes(&[], &[H::Movement]),
         // A literal's initial values seed the field types of its shape.
         Kind::NewObjectLiteral { .. } => Effects::writes(&[], &[H::FieldTypes, H::Movement]),

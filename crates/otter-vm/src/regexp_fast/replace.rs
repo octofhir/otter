@@ -27,6 +27,7 @@
 
 use smallvec::SmallVec;
 
+use crate::regexp::engine::MatchStream;
 use crate::runtime_cx::{NativeCtx, NativeScope};
 use crate::string::CodeUnits;
 use crate::string::gc_body::SpliceRun;
@@ -108,65 +109,68 @@ pub(crate) fn replace_direct(
     if flags.sticky || !subject.is_contiguous(heap) || !replacement.is_contiguous(heap) {
         return None;
     }
-    let mut last = std::mem::take(&mut interp.regexp_offsets);
+    let step_limit = interp.regex_step_limit();
+    // SAFETY: the pattern record is shared, never moves, and the body keeps
+    // it alive; nothing collects before the stream has ended.
+    let regex = unsafe { &*regexp.regex_ptr(heap) };
+    let names = regex.group_names();
+    let scratch = std::mem::take(interp.regex_scratch.get_mut());
     let mut runs: SmallVec<[SpliceRun; 16]> = SmallVec::new();
-    let search = interp.regex_search();
-    let heap = &interp.gc_heap;
     if flags.global {
         regexp.set_last_index(heap, 0);
     }
-    let named = regexp.has_named_groups(heap);
     let size = subject.len() as usize;
+    let max_matches = if flags.global { usize::MAX } else { 1 };
     let mut next = 0usize;
-    let execution = subject.with_code_units(heap, |units| {
+    let mut found = 0usize;
+    let (scratch, steps, outcome) = subject.with_code_units(heap, |units| {
         replacement.with_code_units(heap, |template| {
             let plain = !template.contains(u16::from(b'$'));
-            regexp.for_each_match(
-                heap,
-                units,
-                0,
-                if flags.global { usize::MAX } else { 1 },
-                &search,
-                |matched| {
-                    let position = matched.range.start;
-                    if position > next {
-                        runs.push(run(SUBJECT, next..position));
+            let mut stream = MatchStream::new(regex, units, 0, false, step_limit, scratch);
+            let mut outcome = Ok(());
+            while found < max_matches {
+                let slots = match stream.next() {
+                    None => break,
+                    Some(Err(error)) => {
+                        outcome = Err(error);
+                        break;
                     }
-                    let mark = runs.len();
-                    if plain {
-                        if !template.is_empty() {
-                            runs.push(run(TEMPLATE, 0..template.len()));
-                        }
-                    } else {
-                        expand_template(&mut runs, template, size, matched, named);
+                    Some(Ok(slots)) => slots,
+                };
+                found += 1;
+                let range = slots.range();
+                let position = range.start;
+                if position > next {
+                    runs.push(run(SUBJECT, next..position));
+                }
+                let mark = runs.len();
+                if plain {
+                    if !template.is_empty() {
+                        runs.push(run(TEMPLATE, 0..template.len()));
                     }
-                    if position >= next {
-                        next = matched.range.end;
-                    } else {
-                        runs.truncate(mark);
-                    }
-                    super::matching::record_offsets(&mut last, matched);
-                    true
-                },
-            )
+                } else {
+                    expand_template(&mut runs, template, size, slots, names);
+                }
+                if position >= next {
+                    next = range.end;
+                } else {
+                    runs.truncate(mark);
+                }
+            }
+            let (scratch, steps) = stream.finish();
+            (scratch, steps, outcome)
         })
     });
-    let finish = |interp: &mut crate::Interpreter, last: Vec<u32>| interp.regexp_offsets = last;
-    if let Err(error) = interp.charge_regex_backtrack_steps(execution.steps) {
-        finish(interp, last);
+    *interp.regex_scratch.get_mut() = scratch;
+    if let Err(error) = interp.charge_regex_backtrack_steps(steps) {
         return Some(Err(error));
     }
-    let found = match execution.result {
-        Ok(found) => found,
-        Err(_) => {
-            finish(interp, last);
-            return Some(Err(interp.err_budget(
-                "work budget exceeded in a regular expression search".into(),
-            )));
-        }
-    };
+    if outcome.is_err() {
+        return Some(Err(interp.err_budget(
+            "work budget exceeded in a regular expression search".into(),
+        )));
+    }
     if found == 0 {
-        finish(interp, last);
         return Some(Ok(input));
     }
     if next < size {
@@ -174,15 +178,13 @@ pub(crate) fn replace_direct(
     }
     let total: usize = runs.iter().map(|run| run.len as usize).sum();
     if total > MAX_STRING_UNITS {
-        finish(interp, last);
         return None;
     }
     if regexp.legacy_features_enabled(&interp.gc_heap) {
-        let offsets = crate::regexp::engine::MatchOffsets(last);
-        interp.regexp_legacy.record_offsets(input, &offsets);
-        last = offsets.0;
+        let slots = interp.regex_scratch.get_mut().last_match(regex);
+        interp.regexp_legacy.record_slots(input, slots);
     }
-    finish(interp, last);
+    interp.regex_scratch.get_mut().release_oversized();
     let mut sources = [subject.handle(), replacement.handle()];
     let heap = &mut interp.gc_heap;
     Some(
@@ -206,8 +208,8 @@ fn expand_template(
     runs: &mut SmallVec<[SpliceRun; 16]>,
     template: CodeUnits<'_>,
     subject_len: usize,
-    matched: &crate::regexp::engine::Match<'_>,
-    named: bool,
+    matched: otter_regex::MatchSlots<'_>,
+    names: &[String],
 ) {
     const DOLLAR: u16 = b'$' as u16;
     let digit = |unit: u16| {
@@ -215,8 +217,10 @@ fn expand_template(
             .contains(&unit)
             .then(|| usize::from(unit - u16::from(b'0')))
     };
-    let groups = matched.captures.len();
-    let tail = matched.range.end.min(subject_len);
+    let groups = matched.groups() - 1;
+    let range = matched.range();
+    let tail = range.end.min(subject_len);
+    let named = names.iter().any(|name| !name.is_empty());
     // The literal template span not yet emitted starts here.
     let mut literal = 0;
     let mut i = 0;
@@ -245,11 +249,11 @@ fn expand_template(
                 i += 2;
             }
             0x26 => {
-                substitute(runs, &mut literal, i, i + 2, Some(matched.range.clone()));
+                substitute(runs, &mut literal, i, i + 2, Some(range.clone()));
                 i += 2;
             }
             0x60 => {
-                substitute(runs, &mut literal, i, i + 2, Some(0..matched.range.start));
+                substitute(runs, &mut literal, i, i + 2, Some(0..range.start));
                 i += 2;
             }
             0x27 => {
@@ -265,8 +269,7 @@ fn expand_template(
                     _ => (group(first), 2),
                 };
                 if let Some(index) = index {
-                    let piece = matched.captures.get(index - 1);
-                    substitute(runs, &mut literal, i, i + consumed, piece);
+                    substitute(runs, &mut literal, i, i + consumed, matched.group(index));
                 }
                 i += consumed;
             }
@@ -281,10 +284,7 @@ fn expand_template(
                     char::decode_utf16((i + 2..close).filter_map(|j| template.get(j)))
                         .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
                         .collect();
-                let piece = matched
-                    .named_groups()
-                    .find(|(group, _)| *group == name)
-                    .and_then(|(_, range)| range);
+                let piece = named_group(matched, names, &name);
                 substitute(runs, &mut literal, i, close + 1, piece);
                 i = close + 1;
             }
@@ -294,6 +294,26 @@ fn expand_template(
     if template.len() > literal {
         runs.push(run(TEMPLATE, literal..template.len()));
     }
+}
+
+/// The range of the group named `name` in `matched`, preferring an
+/// alternative that participated; `None` for no such name or one that did
+/// not participate.
+fn named_group(
+    matched: otter_regex::MatchSlots<'_>,
+    names: &[String],
+    name: &str,
+) -> Option<std::ops::Range<usize>> {
+    let mut first = None;
+    for (index, candidate) in names.iter().enumerate() {
+        if candidate == name {
+            if let Some(range) = matched.group(index + 1) {
+                return Some(range);
+            }
+            first.get_or_insert(index + 1);
+        }
+    }
+    first.and_then(|index| matched.group(index))
 }
 
 fn invalid_length() -> NativeError {

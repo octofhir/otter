@@ -238,6 +238,15 @@ pub enum RuntimeStubSignature {
     /// method's arithmetic on unboxed doubles, the right operand ignored by
     /// unary methods.
     Float64MathLeaf3 = 18,
+    /// `(vm_thread, value0, value1) -> NativeResultPair` isolate leaf.
+    ///
+    /// [`Self::LeafValue2`] handed the published [`super::VmThread`] instead
+    /// of the heap, for an entry that reads isolate state beside the heap:
+    /// a matcher's buffers, the work ledger, the legacy RegExp statics. It
+    /// may carve cells the nursery buffer already holds and never collects,
+    /// throws or reenters JavaScript, so the call site publishes no safepoint
+    /// and keeps its values in registers. A miss precedes every effect.
+    IsolateLeafValue2 = 19,
 }
 
 /// Safepoint requirement encoded in the descriptor.
@@ -1922,6 +1931,9 @@ pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
         id if id == STUB_JIT_RECORD_CALL_TARGET.id => "jit_record_call_target",
         id if id == STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT.id => "jit_new_null_prototype_object",
         id if id == STUB_NUMBER_TO_STRING_ALLOC.id => "number_to_string_alloc",
+        id if id == STUB_REGEXP_EXEC_LEAF.id => "regexp_exec_leaf",
+        id if id == STUB_REGEXP_TEST_LEAF.id => "regexp_test_leaf",
+        id if id == STUB_JIT_REGEXP_LITERAL.id => "jit_regexp_literal",
 
         _ => "unknown_runtime_stub",
     }
@@ -2324,6 +2336,49 @@ pub const STUB_NUMBER_TO_STRING_ALLOC: RuntimeStubDescriptor = descriptor(
     NativeResultDomain::Probe,
 );
 
+/// `receiver.exec(subject)` of the realm's original RegExp method, its
+/// identity proved by generated code, run in the isolate without a frame:
+/// `(vm_thread, receiver, subject)`. Success carries the method's result
+/// (the match array carved from the ready nursery buffer, or `null`); a miss
+/// precedes every effect and leaves the call to [`STUB_JIT_REGEXP_EXEC`].
+pub const STUB_REGEXP_EXEC_LEAF: RuntimeStubDescriptor = descriptor(
+    131,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::IsolateLeafValue2,
+    2,
+    RuntimeStubEffects::leaf(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// `%RegExp.prototype.test%` counterpart of [`STUB_REGEXP_EXEC_LEAF`]: the
+/// receiver's protocol must be the built-in one, since `test` reads `exec`.
+pub const STUB_REGEXP_TEST_LEAF: RuntimeStubDescriptor = descriptor(
+    132,
+    RuntimeStubClass::LeafNoAlloc,
+    RuntimeStubSignature::IsolateLeafValue2,
+    2,
+    RuntimeStubEffects::leaf(false, true),
+    RuntimeStubException::Never,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Probe,
+);
+
+/// The RegExp of the regex literal at constant-pool index `value0` of the
+/// published function: `(jit_ctx, constant, 0) -> value`, the miss of a
+/// generated literal birth.
+pub const STUB_JIT_REGEXP_LITERAL: RuntimeStubDescriptor = descriptor(
+    133,
+    RuntimeStubClass::Alloc,
+    RuntimeStubSignature::CommittedValue2,
+    2,
+    RuntimeStubEffects::allocating(true, true),
+    RuntimeStubException::Status,
+    RuntimeStubResultAbi::NativePair,
+    NativeResultDomain::Committed,
+);
+
 /// Dense inventory of every current machine-callable runtime-stub contract.
 pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_BACKEDGE_POLL,
@@ -2456,6 +2511,9 @@ pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
     STUB_JIT_RECORD_CALL_TARGET,
     STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT,
     STUB_NUMBER_TO_STRING_ALLOC,
+    STUB_REGEXP_EXEC_LEAF,
+    STUB_REGEXP_TEST_LEAF,
+    STUB_JIT_REGEXP_LITERAL,
 ];
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.
@@ -2490,6 +2548,7 @@ pub const fn validate_stub_descriptor(
     };
     let result_matches = match desc.signature {
         RuntimeStubSignature::LeafValue2
+        | RuntimeStubSignature::IsolateLeafValue2
         | RuntimeStubSignature::MutatingLeafValue2
         | RuntimeStubSignature::MutatingLeafValue3
         | RuntimeStubSignature::AllocValue3 => matches!(

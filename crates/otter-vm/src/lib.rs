@@ -843,6 +843,10 @@ pub struct Interpreter {
     /// may bake its address.
     array_boilerplates:
         rustc_hash::FxHashMap<(usize, u32), crate::array::elements::ElementSlabHandle>,
+    /// Regex literal sites resolved once, keyed like [`Self::literal_cells`]:
+    /// the program cell (old, rooted here) and the flags every evaluation of
+    /// the site births a young RegExp from.
+    regexp_literals: rustc_hash::FxHashMap<(usize, u32), regexp::RegExpLiteralSite>,
     /// Decimal strings for small non-negative integers, served on demand.
     /// Integer → string is one of the most repeated allocations in real code
     /// (`"" + n`, `(n).toString()`, integer keys); caching
@@ -1546,6 +1550,16 @@ impl Interpreter {
         &self,
     ) -> impl Iterator<Item = &crate::array::elements::ElementSlabHandle> {
         self.array_boilerplates.values()
+    }
+
+    /// Root-tracing view of every compiled regexp program cell the isolate
+    /// keeps: the compile cache's and the literal sites'.
+    pub(crate) fn regexp_pattern_cells_for_trace(
+        &self,
+    ) -> impl Iterator<Item = &regexp::RegExpPatternHandle> {
+        self.regex_compile_cache
+            .cells_for_trace()
+            .chain(self.regexp_literals.values().map(|site| &site.pattern))
     }
 
     #[cfg(test)]

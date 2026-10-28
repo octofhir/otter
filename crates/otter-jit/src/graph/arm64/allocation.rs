@@ -229,6 +229,49 @@ impl Codegen<'_> {
     }
 }
 
+impl Codegen<'_> {
+    /// A regex literal's young birth from its baked image; the committed
+    /// miss makes the RegExp in the runtime.
+    pub(super) fn emit_regexp_allocation(
+        &mut self,
+        node: NodeId,
+        destination: u8,
+    ) -> Result<(), crate::Unsupported> {
+        let Kind::NewRegExp(byte_pc) = self.graph.node(node).kind else {
+            unreachable!("regexp allocation kind");
+        };
+        let source = self.view_of(node);
+        let realm = source.literal_allocations.realm_id;
+        let plan = *source.literal_allocations.regexps.get(&byte_pc).ok_or(
+            crate::Unsupported::OperandShape("graph regexp literal plan"),
+        )?;
+        let allocation = self.allocation.node(node);
+        let regs = LabRegisters {
+            buffer: allocation.gp_temps[0],
+            candidate: allocation.gp_temps[1],
+            end: allocation.gp_temps[2],
+            scratch: allocation.gp_temps[3],
+            size: 17,
+        };
+        debug_assert!(!allocation.gp_temps.contains(&destination));
+        let slow = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        crate::arm64::allocation::emit_regexp_literal(&mut self.ops, 20, realm, &plan, regs, slow);
+        dynasm!(self.ops ; .arch aarch64 ; mov X(destination), X(regs.candidate) ; b =>done ; =>slow);
+        self.emit_committed_call(
+            node,
+            abi::STUB_JIT_REGEXP_LITERAL,
+            &[
+                CommittedArgument::Scalar(u64::from(plan.constant)),
+                CommittedArgument::Scalar(0),
+            ],
+            Some(destination),
+        )?;
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        Ok(())
+    }
+}
+
 mod lexical;
 
 mod primitive;

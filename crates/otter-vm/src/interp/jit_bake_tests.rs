@@ -96,7 +96,7 @@ fn retraining_blocks_prewarm_and_inline_body_baking_before_preparation() {
     assert!(interpreter.prewarm_literal_cells(&context, 0).is_none());
     let mut budget = super::InlineSnapshotBudget::new();
     assert!(
-        super::Baker::new(&interpreter)
+        super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&interpreter))
             .bake_inline_body(
                 &context,
                 0,
@@ -128,10 +128,12 @@ fn repeated_inline_site_history_suppresses_the_source_snapshot_guard() {
     interpreter.note_jit_optimized_bail_at(&context, 99, 99, exit, (0, 0), false);
     interpreter.note_jit_optimized_bail_at(&context, 100, 100, exit, (0, 0), false);
     let mut source = context.jit_compile_snapshot(0).unwrap();
-    super::Baker::new(&interpreter).bake_optimized_exit_profile(&mut source, 0);
+    super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&interpreter))
+        .bake_optimized_exit_profile(&mut source, 0);
     assert!(source.optimized_exit_reasons[&0].contains(&exit.reason()));
     let mut outer = context.jit_compile_snapshot(0).unwrap();
-    super::Baker::new(&interpreter).bake_optimized_exit_profile(&mut outer, 99);
+    super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&interpreter))
+        .bake_optimized_exit_profile(&mut outer, 99);
     assert!(
         outer.optimized_exit_reasons.is_empty(),
         "the diagnostic outer resume PC is not the guarded source operation"
@@ -206,7 +208,7 @@ fn prewarm_publishes_one_shared_stable_cell_for_all_literal_sites() {
     );
 
     let mut snapshot = context.jit_compile_snapshot(0).expect("snapshot");
-    super::Baker::new(&interpreter)
+    super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&interpreter))
         .bake_literal_cells(&mut snapshot, &context, 0, true)
         .expect("prepared bake");
     assert_eq!(snapshot.literal_cells.len(), 2);
@@ -237,7 +239,7 @@ fn prewarm_publishes_one_shared_stable_cell_for_all_literal_sites() {
         .jit_compile_snapshot(0)
         .expect("invalid snapshot input");
     assert!(
-        super::Baker::new(&interpreter)
+        super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&interpreter))
             .bake_literal_cells(&mut invalid, &context, 0, true)
             .is_none()
     );
@@ -297,7 +299,7 @@ fn caller_snapshot_survives_forced_gc_then_nested_target_prewarm() {
             .prewarm_literal_cells(&context, 0)
             .expect("caller prewarm");
         let mut caller = context.jit_compile_snapshot(0).expect("caller snapshot");
-        super::Baker::new(&interpreter)
+        super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&interpreter))
             .bake_literal_cells(&mut caller, &context, 0, true)
             .expect("caller bake");
         let caller_cell = caller.literal_cells[&0].cell_addr;
@@ -313,7 +315,7 @@ fn caller_snapshot_survives_forced_gc_then_nested_target_prewarm() {
             .prewarm_literal_cells(&context, 1)
             .expect("nested target prewarm after moving GC");
         let mut nested = context.jit_compile_snapshot(1).expect("nested snapshot");
-        super::Baker::new(&interpreter)
+        super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&interpreter))
             .bake_literal_cells(&mut nested, &context, 1, true)
             .expect("nested target bake");
         assert_eq!(caller.literal_cells[&0].cell_addr, caller_cell);
@@ -348,11 +350,13 @@ fn finalized_shape_baker_refuses_unsupported_state_without_retaining_a_proof() {
             .expect("ordinary root");
         let ordinary_id = shape_body::id_of(ordinary);
         assert_eq!(
-            super::Baker::new(vm).bake_shape(ordinary),
+            super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm))
+                .bake_shape(ordinary),
             Some(ordinary.offset())
         );
         assert_eq!(
-            super::Baker::new(vm).bake_shape_id(ordinary_id),
+            super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm))
+                .bake_shape_id(ordinary_id),
             Some(ordinary.offset())
         );
         // Reads can prove finalized non-extensible/prototype ordinary
@@ -365,11 +369,13 @@ fn finalized_shape_baker_refuses_unsupported_state_without_retaining_a_proof() {
                 .object_root(None, 4, state)
                 .expect("eligible ordinary state root");
             assert_eq!(
-                super::Baker::new(vm).bake_shape(shape),
+                super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm))
+                    .bake_shape(shape),
                 Some(shape.offset())
             );
             assert_eq!(
-                super::Baker::new(vm).bake_shape_id(shape_body::id_of(shape)),
+                super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm))
+                    .bake_shape_id(shape_body::id_of(shape)),
                 Some(shape.offset())
             );
         }
@@ -379,11 +385,13 @@ fn finalized_shape_baker_refuses_unsupported_state_without_retaining_a_proof() {
             .object_root(None, 4, ShapeState::ORDINARY.with_provisional(true))
             .expect("provisional state root");
         assert_eq!(
-            super::Baker::new(vm).bake_shape(provisional),
+            super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm))
+                .bake_shape(provisional),
             Some(provisional.offset())
         );
         assert!(crate::jit::JitObjectLiteralAllocationPlan::new(provisional, 0).is_none());
-        let mut baker = super::Baker::new(vm);
+        let env = crate::interp::jit_bake_env::BakeEnv::capture(vm);
+        let mut baker = super::Baker::new(&env);
         assert_eq!(baker.bake_shape(crate::object::ShapeHandle::null()), None);
         assert!(baker.roots.is_empty());
         drop(baker);
@@ -408,7 +416,8 @@ fn finalized_shape_baker_refuses_unsupported_state_without_retaining_a_proof() {
                 ));
             }
             assert_eq!(shape_body::state_of(shape), state);
-            let mut baker = super::Baker::new(vm);
+            let env = crate::interp::jit_bake_env::BakeEnv::capture(vm);
+            let mut baker = super::Baker::new(&env);
             assert_eq!(baker.bake_shape(shape), None);
             assert_eq!(baker.bake_shape_id(shape_body::id_of(shape)), None);
             assert!(baker.roots.is_empty());
@@ -417,7 +426,8 @@ fn finalized_shape_baker_refuses_unsupported_state_without_retaining_a_proof() {
         }
         let dictionary = shape_body::dictionary_of(ordinary);
         assert!(shape_body::state_of(dictionary).is_dictionary());
-        let mut baker = super::Baker::new(vm);
+        let env = crate::interp::jit_bake_env::BakeEnv::capture(vm);
+        let mut baker = super::Baker::new(&env);
         assert_eq!(baker.bake_shape(dictionary), None);
         assert!(baker.roots.is_empty());
         drop(baker);
@@ -426,7 +436,7 @@ fn finalized_shape_baker_refuses_unsupported_state_without_retaining_a_proof() {
         // Pinned primitive String holders are an explicit dictionary
         // proof domain with nonvirtual names, never an ordinary shape.
         for name in ["charCodeAt", "indexOf"] {
-            let call = super::Baker::new(vm)
+            let call = super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm))
                 .jit_primitive_method_call(name)
                 .expect("actual pinned String leaf proof");
             assert!(matches!(

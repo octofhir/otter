@@ -67,12 +67,9 @@ impl Baker<'_> {
             };
             let key = context.property_atom(name_idx)?;
             let recv_shape = self.shape_for_id(target.recv_shape)?;
-            if let Some(slot) = self.vm.shape_offset_of(recv_shape, key.name()) {
-                let (flags, is_accessor) = crate::object::shape_body::shape_slot_attrs(
-                    &self.vm.gc_heap,
-                    recv_shape,
-                    slot,
-                )?;
+            if let Some(slot) = self.env.shape_offset_of(recv_shape, key.name()) {
+                let (flags, is_accessor) =
+                    crate::object::shape_body::shape_slot_attrs(&self.env.heap, recv_shape, slot)?;
                 if is_accessor
                     || (instr.op(&method_view.code_block) == Op::StoreProperty && !flags.writable())
                 {

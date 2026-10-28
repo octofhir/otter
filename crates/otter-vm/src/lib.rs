@@ -1213,10 +1213,6 @@ pub struct Interpreter {
     active_realm_id: u32,
     /// Monotonic allocator for additional realm identities.
     next_realm_id: u32,
-    /// ECMAScript function `[[Realm]]` metadata for linked bytecode chunks.
-    /// Both key and value are scalars; all moving-GC state remains owned and
-    /// traced by [`RealmState`].
-    function_realm_ids: rustc_hash::FxHashMap<u32, u32>,
     /// `true` while an extra realm (not the first/default realm) is the
     /// active one. Array allocation stamps a per-instance prototype
     /// override only in that window: a default-realm array resolves its

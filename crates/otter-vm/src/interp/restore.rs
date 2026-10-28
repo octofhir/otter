@@ -229,7 +229,6 @@ impl Interpreter {
             extra_realms: Vec::new(),
             active_realm_id: 0,
             next_realm_id: 1,
-            function_realm_ids: rustc_hash::FxHashMap::default(),
             active_realm_is_extra: false,
             eval_hook: None,
             lazy_compile_hook: None,

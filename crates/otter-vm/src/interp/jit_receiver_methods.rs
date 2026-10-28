@@ -94,7 +94,7 @@ impl super::Baker<'_> {
     ) -> Option<PolyMethodTarget> {
         let key = context.property_atom_for_function(function_id, name)?;
         let shape = self.shape_for_id(receiver.shape)?;
-        if crate::object::shape_body::shape_slot_of_atom(&self.vm.gc_heap, shape, key.atom().id())
+        if crate::object::shape_body::shape_slot_of_atom(&self.env.heap, shape, key.atom().id())
             .is_some()
         {
             return None;
@@ -104,13 +104,13 @@ impl super::Baker<'_> {
         };
         let resolved = crate::cache_ir::resolve_proved_inherited_atom_data_slot(
             prototype,
-            &self.vm.gc_heap,
+            &self.env.heap,
             key,
         )?;
         if resolved.hit.shape.is_null() || resolved.holder_root.is_null() {
             return None;
         }
-        let method_fid = resolved.value.as_closure(&self.vm.gc_heap)?.function_id();
+        let method_fid = resolved.value.as_closure(&self.env.heap)?.function_id();
         self.found_shape(resolved.holder_root);
         Some(PolyMethodTarget {
             method_fid,

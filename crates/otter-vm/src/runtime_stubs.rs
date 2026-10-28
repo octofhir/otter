@@ -4445,7 +4445,7 @@ mod tests {
         for stride in 1..=16 {
             let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
             let realm = interp.create_host_realm().expect("source realm");
-            interp.function_realm_ids.insert(0, realm.0);
+            interp.function_realm_ids_mut().insert(0, realm.0);
             let source = crate::ExecutionContext::from_module(
                 crate::test_support::minimal_bytecode_module("source-array-length-probe.js"),
                 crate::source_registry::SourceRegistry::default(),

@@ -72,45 +72,65 @@ pub(crate) struct IntrinsicLayoutStamp {
     active_realm: u32,
 }
 
+/// The [`IntrinsicLayoutStamp`] of `prototypes` (in
+/// [`Interpreter::intrinsic_stamp_prototypes`] order), `%String.prototype%`
+/// and the active realm, and the shapes it names.
+pub(crate) fn layout_stamp(
+    heap: &otter_gc::GcHeap,
+    prototypes: [Option<object::JsObject>; 5],
+    string_prototype: Option<object::JsObject>,
+    active_realm: u32,
+) -> (IntrinsicLayoutStamp, [object::ShapeHandle; 5]) {
+    let mut shapes = [object::ShapeHandle::null(); 5];
+    let mut stamp = [(0, 0, 0); 5];
+    for (index, prototype) in prototypes.into_iter().enumerate() {
+        let Some(prototype) = prototype else {
+            continue;
+        };
+        let shape = object::keyed_shape(prototype, heap);
+        shapes[index] = shape;
+        stamp[index] = (
+            prototype.offset(),
+            shape.offset(),
+            if shape.is_null() {
+                0
+            } else {
+                object::shape_body::id_of(shape).raw()
+            },
+        );
+    }
+    let string_layout =
+        string_prototype.and_then(|prototype| object::dictionary_layout(prototype, heap));
+    (
+        IntrinsicLayoutStamp {
+            prototypes: stamp,
+            string_layout,
+            active_realm,
+        },
+        shapes,
+    )
+}
+
 impl Interpreter {
-    /// The current [`IntrinsicLayoutStamp`] and the shapes it names.
-    fn intrinsic_layout_stamp(&self) -> (IntrinsicLayoutStamp, [object::ShapeHandle; 5]) {
+    /// The prototypes whose shapes an [`IntrinsicLayoutStamp`] names.
+    pub(crate) fn intrinsic_stamp_prototypes(&self) -> [Option<object::JsObject>; 5] {
         let intrinsics = &self.realm_intrinsics;
-        let prototypes = [
+        [
             intrinsics.map_prototype(),
             intrinsics.set_prototype(),
             intrinsics.regexp_prototype(),
             self.default_array_prototype(),
             intrinsics.function_prototype(),
-        ];
-        let mut shapes = [object::ShapeHandle::null(); 5];
-        let mut stamp = [(0, 0, 0); 5];
-        for (index, prototype) in prototypes.into_iter().enumerate() {
-            let Some(prototype) = prototype else {
-                continue;
-            };
-            let shape = object::keyed_shape(prototype, &self.gc_heap);
-            shapes[index] = shape;
-            stamp[index] = (
-                prototype.offset(),
-                shape.offset(),
-                if shape.is_null() {
-                    0
-                } else {
-                    object::shape_body::id_of(shape).raw()
-                },
-            );
-        }
-        let string_layout = intrinsics
-            .string_prototype()
-            .and_then(|prototype| object::dictionary_layout(prototype, &self.gc_heap));
-        (
-            IntrinsicLayoutStamp {
-                prototypes: stamp,
-                string_layout,
-                active_realm: self.active_realm_id,
-            },
-            shapes,
+        ]
+    }
+
+    /// The current [`IntrinsicLayoutStamp`] and the shapes it names.
+    fn intrinsic_layout_stamp(&self) -> (IntrinsicLayoutStamp, [object::ShapeHandle; 5]) {
+        layout_stamp(
+            &self.gc_heap,
+            self.intrinsic_stamp_prototypes(),
+            self.realm_intrinsics.string_prototype(),
+            self.active_realm_id,
         )
     }
 
@@ -133,18 +153,6 @@ impl Interpreter {
         let (stamp, _) = self.intrinsic_layout_stamp();
         self.jit_intrinsic_programs_mut()
             .insert(atom, (stamp, programs));
-    }
-
-    /// The prepared intrinsic-prototype programs of `key` and the shapes they
-    /// guard, while the layout they were built against still holds; `None`
-    /// when they were never prepared or the layout changed since.
-    pub(crate) fn prepared_intrinsic_property_programs(
-        &self,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Option<(&[JitCacheIrProgram], [object::ShapeHandle; 5])> {
-        let (stamp, shapes) = self.intrinsic_layout_stamp();
-        let (built, programs) = self.jit_intrinsic_programs().get(&key.atom().id().raw())?;
-        (*built == stamp).then_some((programs.as_slice(), shapes))
     }
 
     fn build_intrinsic_property_programs(
@@ -414,8 +422,9 @@ mod tests {
             key: AtomizedPropertyKey<'_>,
         ) -> Vec<JitCacheIrProgram> {
             self.prepare_intrinsic_property_programs(key);
-            self.prepared_intrinsic_property_programs(key)
-                .map(|(programs, _)| programs.to_vec())
+            self.jit_intrinsic_programs()
+                .get(&key.atom().id().raw())
+                .map(|(_, programs)| programs.clone())
                 .unwrap_or_default()
         }
     }

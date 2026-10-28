@@ -6452,7 +6452,8 @@ fn snapshot_restore_republishes_owned_interpreter_destinations() {
         )
         .unwrap();
     let donor = vm
-        .current_direct_callee_plan(context.exec_function(0).unwrap())
+        .jit_code_registry
+        .direct_call_plan(context.exec_function(0).unwrap())
         .unwrap();
     let snapshot = vm.capture_isolate_snapshot().unwrap();
     let restored =
@@ -6460,7 +6461,10 @@ fn snapshot_restore_republishes_owned_interpreter_destinations() {
             .unwrap();
     let restored_context = restored.function_context(None, 0).unwrap();
     let function = restored_context.exec_function(0).unwrap();
-    let plan = restored.current_direct_callee_plan(function).unwrap();
+    let plan = restored
+        .jit_code_registry
+        .direct_call_plan(function)
+        .unwrap();
     assert_eq!(plan.function_id, function.id);
     assert_eq!(plan.tier, native_abi::NativeFrameKind::Interpreter);
     assert_eq!(plan.code_object_id, 0);

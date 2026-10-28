@@ -176,7 +176,7 @@ impl Interpreter {
         for function in linked.iter().skip(1) {
             self.jit_code_registry.link_function(function, realm_id);
             if realm_id != 0 {
-                self.function_realm_ids.insert(function.id, realm_id);
+                self.function_realm_ids_mut().insert(function.id, realm_id);
             }
         }
         self.jit_code_registry

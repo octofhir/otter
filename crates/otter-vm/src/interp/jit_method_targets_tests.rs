@@ -209,13 +209,14 @@ fn method_targets_keep_one_body_through_real_nested_baking() {
 
                 let mut view = context.jit_compile_snapshot(base).unwrap();
                 let mut budget = InlineSnapshotBudget::new();
-                super::Baker::new(vm).bake_call_site_plans(
-                    &mut view,
-                    &context,
-                    base,
-                    jit_debug::JitDebugTier::Optimizing,
-                    &mut budget,
-                );
+                super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm))
+                    .bake_call_site_plans(
+                        &mut view,
+                        &context,
+                        base,
+                        jit_debug::JitDebugTier::Optimizing,
+                        &mut budget,
+                    );
                 let targets = &view.method_targets[&root_call_pc.unwrap().0];
                 let population = if two_receiver_shapes { 2 } else { 1 };
                 assert_eq!(targets.len(), population);
@@ -239,7 +240,8 @@ fn method_targets_keep_one_body_through_real_nested_baking() {
                     64 - before.len(),
                     "call linkage and Template proof do not charge another body bake"
                 );
-                super::Baker::new(vm).bake_field_type_tree(&mut view);
+                super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm))
+                    .bake_field_type_tree(&mut view);
                 assert_eq!(
                     body_allocations(&view),
                     before,

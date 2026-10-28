@@ -230,7 +230,7 @@ impl Interpreter {
                 .retain(|(id, _), _| outside(id));
             realm.global_object_load_ic.retain(|(id, _), _| outside(id));
         }
-        self.function_realm_ids.retain(|id, _| outside(id));
+        self.function_realm_ids_mut().retain(|id, _| outside(id));
         self.function_user_props.retain(|id, _| outside(id));
         self.function_prototype_overrides
             .retain(|id, _| outside(id));
@@ -459,9 +459,10 @@ impl Interpreter {
                     function_count: function_count as usize,
                 },
             )?;
+            let realm = self.active_realm_id;
+            let mut realms = self.function_realm_ids_mut();
             for function_id in base..end {
-                self.function_realm_ids
-                    .insert(function_id, self.active_realm_id);
+                realms.insert(function_id, realm);
             }
         }
         Ok(context)
@@ -1393,7 +1394,8 @@ mod tests {
         for fid in [before_fid, first_evicted, second_evicted, after_fid] {
             // Default-realm linking omits the redundant zero entry. Seed its
             // equivalent explicit mapping so this range cleanup is exercised.
-            vm.function_realm_ids.insert(fid, vm.active_realm_id);
+            let realm = vm.active_realm_id;
+            vm.function_realm_ids_mut().insert(fid, realm);
             vm.jit_entry_bail_counts.insert(fid, fid + 12);
             vm.jit_osr_disabled.insert((fid, 8));
             vm.jit_optimized_declined_epoch.insert(fid, Some(fid + 14));
@@ -1513,7 +1515,7 @@ mod tests {
             vm.extra_realms[0].global_object_load_ic,
             surviving.map(|fid| (fid, 1))
         );
-        outside_keys!(vm.function_realm_ids, surviving);
+        outside_keys!(*vm.function_realm_ids(), surviving);
         outside_keys!(vm.function_user_props, surviving);
         outside_keys!(vm.function_prototype_overrides, surviving);
         outside_keys!(vm.function_prototype_slots, surviving);

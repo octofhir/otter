@@ -97,6 +97,10 @@ pub(crate) struct CompileShared {
     /// cell because a later script/eval lexical declaration may shadow an
     /// otherwise shape-stable global-object property.
     pub(crate) global_lexical_epoch: std::sync::atomic::AtomicU64,
+    /// ECMAScript function `[[Realm]]` metadata for linked bytecode chunks.
+    /// Both key and value are scalars; all moving-GC state remains owned and
+    /// traced by [`RealmState`].
+    pub(crate) function_realm_ids: MutatorOwned<rustc_hash::FxHashMap<u32, u32>>,
 }
 
 // SAFETY: the mutator is every table's sole writer (`MutatorOwned`). The GC
@@ -114,6 +118,7 @@ macro_rules! shared_tables {
         impl Interpreter {
             $(
                 #[inline]
+                #[cfg_attr(not(test), allow(dead_code))]
                 pub(crate) fn $name(&self) -> &$ty {
                     self.compile_shared.$name.get(&self.mutator)
                 }
@@ -139,11 +144,12 @@ shared_tables! {
     jit_intrinsic_programs, jit_intrinsic_programs_mut: rustc_hash::FxHashMap<u32, (interp::jit_intrinsic_properties::IntrinsicLayoutStamp, Vec<jit::JitCacheIrProgram>)>;
     method_feedback, method_feedback_mut: interp::MethodFeedbackDirectory;
     global_lexicals, global_lexicals_mut: rustc_hash::FxHashMap<Box<str>, (crate::UpvalueCell, bool)>;
+    function_realm_ids, function_realm_ids_mut: rustc_hash::FxHashMap<u32, u32>;
 }
 
 impl Interpreter {
     /// The global declarative record's name-set identity.
-    #[inline]
+    #[cfg(test)]
     pub(crate) fn global_lexical_epoch(&self) -> u64 {
         self.compile_shared
             .global_lexical_epoch

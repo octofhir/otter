@@ -350,8 +350,14 @@ fn tagged_predicates_keep_all_live_words_and_numeric_nan_zero_semantics() {
         tag::box_double(tag::CANONICAL_NAN),
     ];
     for kind in [
-        Kind::StrictEqual { negate: false },
-        Kind::StrictEqual { negate: true },
+        Kind::StrictEqual {
+            negate: false,
+            same_value: false,
+        },
+        Kind::StrictEqual {
+            negate: true,
+            same_value: false,
+        },
         Kind::ToBoolean,
         Kind::LogicalNot,
     ] {
@@ -384,7 +390,7 @@ fn tagged_predicates_keep_all_live_words_and_numeric_nan_zero_semantics() {
                     a == b
                 };
                 let expected = match kind {
-                    Kind::StrictEqual { negate } => equal ^ negate,
+                    Kind::StrictEqual { negate, .. } => equal ^ negate,
                     Kind::ToBoolean => truthy,
                     _ => !truthy,
                 };
@@ -405,8 +411,14 @@ fn tagged_predicates_keep_all_live_words_and_numeric_nan_zero_semantics() {
 #[test]
 fn content_and_heap_truthiness_cold_leaves_preserve_the_complete_register_bank() {
     let codes: Vec<_> = [
-        Kind::StrictEqual { negate: false },
-        Kind::StrictEqual { negate: true },
+        Kind::StrictEqual {
+            negate: false,
+            same_value: false,
+        },
+        Kind::StrictEqual {
+            negate: true,
+            same_value: false,
+        },
         Kind::ToBoolean,
         Kind::LogicalNot,
     ]
@@ -470,7 +482,7 @@ fn content_and_heap_truthiness_cold_leaves_preserve_the_complete_register_bank()
                     assert_live(&observed, kind, a, b);
                     let truthy = left != 3 && left != 6;
                     let expected = match kind {
-                        Kind::StrictEqual { negate } => equal ^ negate,
+                        Kind::StrictEqual { negate, .. } => equal ^ negate,
                         Kind::ToBoolean => truthy,
                         _ => !truthy,
                     };

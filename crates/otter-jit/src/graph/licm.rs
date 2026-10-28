@@ -27,9 +27,11 @@
 //!   was itself moved: in the pre-header the same proofs precede it.
 //! - The pre-header merges every entering edge, the OSR entry included,
 //!   with a phi wherever the edges bring different values; the header's
-//!   back edges stay its last predecessors. Nothing moves out of the blocks
-//!   of a loop that an entry, such as the OSR entry into an inner loop,
-//!   reaches without passing its header.
+//!   back edges stay its last predecessors. Nothing moves out of a loop that
+//!   an entry, such as the OSR entry into an inner loop, reaches without
+//!   passing its header: that entry reaches the header again along a back
+//!   edge, past no pre-header, so no value the pre-header defines would
+//!   reach the blocks after the header on its path.
 //! - A moved check leaves to the loop header with the values entering the
 //!   loop, so the interpreter runs the iteration the check guarded. A
 //!   header that already left optimized code for a reason a check raises
@@ -96,35 +98,12 @@ pub(crate) fn loop_body(graph: &Graph, header: BlockId) -> FxHashSet<BlockId> {
     body
 }
 
-/// The blocks of `body` an entry reaches without passing `header`: every
-/// block forward of a body block with no predecessor, such as the OSR entry.
-fn bypassed_blocks(
-    graph: &Graph,
-    header: BlockId,
-    body: &FxHashSet<BlockId>,
-) -> FxHashSet<BlockId> {
-    let mut reached = FxHashSet::default();
-    let mut work: Vec<BlockId> = body
-        .iter()
-        .copied()
-        .filter(|&block| block != header && graph.block(block).predecessors.is_empty())
-        .collect();
-    while let Some(block) = work.pop() {
-        if block == header || !body.contains(&block) || !reached.insert(block) {
-            continue;
-        }
-        let Some(control) = graph.block(block).control else {
-            continue;
-        };
-        match graph.node(control).kind {
-            Kind::Jump(target) | Kind::JumpLoop(target) => work.push(target),
-            Kind::Branch {
-                if_true, if_false, ..
-            } => work.extend([if_true, if_false]),
-            _ => {}
-        }
-    }
-    reached
+/// Whether an entry reaches a block of `body` without passing `header`:
+/// a body block other than the header with no predecessor, such as the OSR
+/// entry into an inner loop. Such a loop moves nothing.
+fn entry_bypasses_header(graph: &Graph, header: BlockId, body: &FxHashSet<BlockId>) -> bool {
+    body.iter()
+        .any(|&block| block != header && graph.block(block).predecessors.is_empty())
 }
 
 /// Whether a check moved to the pre-header may leave at the loop header: no
@@ -153,7 +132,7 @@ fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
             &[R::InvalidElementIndex]
         }
         Kind::CheckBounds => &[R::BoundsGuard],
-        Kind::StringCharCodeAt => &[R::TypeMismatch, R::BoundsGuard],
+        Kind::StringCharCodeAt { .. } => &[R::TypeMismatch, R::BoundsGuard],
         Kind::LoadStringLength => &[R::TypeMismatch],
         Kind::Int32Add | Kind::Int32Sub | Kind::Int32Negate => &[R::Int32Overflow, R::NegativeZero],
         Kind::Int32Mul
@@ -241,9 +220,11 @@ fn hoist_loop(
     body: &FxHashSet<BlockId>,
 ) {
     // An entry into the body that bypasses the header, the OSR entry into an
-    // inner loop among them, reaches the blocks after it without the
-    // pre-header: nothing there moves.
-    let bypassed = bypassed_blocks(graph, header.block, body);
+    // inner loop among them, reaches every block of the loop without the
+    // pre-header: nothing moves.
+    if entry_bypasses_header(graph, header.block, body) {
+        return;
+    }
     let writes = loop_writes(graph, body);
     if writes.is_world() {
         return;
@@ -286,9 +267,6 @@ fn hoist_loop(
     // Values a guard moved to the pre-header proves there.
     let mut proved: FxHashSet<NodeId> = FxHashSet::default();
     for &block in &ordered {
-        if bypassed.contains(&block) {
-            continue;
-        }
         let equivalent =
             control_equivalent(graph, &dominators, header.block, body, &latches, block);
         let nodes = graph.block(block).body.clone();

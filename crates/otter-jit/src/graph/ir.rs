@@ -194,9 +194,6 @@ pub(crate) enum BranchKind {
     Nullish,
     /// The word `input0` equals this constant.
     WordEqual(u32),
-    /// `input0` is the native function whose external reference index is
-    /// this constant.
-    Native(u32),
 }
 
 impl BranchKind {
@@ -204,11 +201,7 @@ impl BranchKind {
     pub(crate) fn operands(self) -> usize {
         match self {
             Self::Int32(_) | Self::Float64(_) | Self::TaggedEqual => 2,
-            Self::Truthy
-            | Self::Float64Truthy
-            | Self::Nullish
-            | Self::WordEqual(_)
-            | Self::Native(_) => 1,
+            Self::Truthy | Self::Float64Truthy | Self::Nullish | Self::WordEqual(_) => 1,
         }
     }
 }
@@ -235,26 +228,26 @@ pub(crate) enum MathOp {
 }
 
 impl MathOp {
-    /// The method a static native `Math` leaf computes on Number operands.
-    pub(crate) fn of_leaf(stub: otter_vm::native_abi::RuntimeStubId) -> Option<Self> {
-        use otter_vm::native_abi as abi;
-        Some(match stub {
-            id if id == abi::STUB_MATH_ABS_LEAF.id => Self::Abs,
-            id if id == abi::STUB_MATH_SQRT_LEAF.id => Self::Sqrt,
-            id if id == abi::STUB_MATH_FLOOR_LEAF.id => Self::Floor,
-            id if id == abi::STUB_MATH_CEIL_LEAF.id => Self::Ceil,
-            id if id == abi::STUB_MATH_TRUNC_LEAF.id => Self::Trunc,
-            id if id == abi::STUB_MATH_ROUND_LEAF.id => Self::Round,
-            id if id == abi::STUB_MATH_MIN_LEAF.id => Self::Min,
-            id if id == abi::STUB_MATH_MAX_LEAF.id => Self::Max,
-            id if id == abi::STUB_MATH_SIN_LEAF.id => Self::Sin,
-            id if id == abi::STUB_MATH_COS_LEAF.id => Self::Cos,
-            id if id == abi::STUB_MATH_TAN_LEAF.id => Self::Tan,
-            id if id == abi::STUB_MATH_ATAN_LEAF.id => Self::Atan,
-            id if id == abi::STUB_MATH_EXP_LEAF.id => Self::Exp,
-            id if id == abi::STUB_MATH_LOG_LEAF.id => Self::Log,
-            id if id == abi::STUB_MATH_ATAN2_LEAF.id => Self::Atan2,
-            id if id == abi::STUB_MATH_POW_LEAF.id => Self::Pow,
+    /// The float64 operation of a `Math` method a builtin row reduces to.
+    pub(crate) fn of_method(method: otter_bytecode::method_id::MathMethod) -> Option<Self> {
+        use otter_bytecode::method_id::MathMethod as M;
+        Some(match method {
+            M::Abs => Self::Abs,
+            M::Sqrt => Self::Sqrt,
+            M::Floor => Self::Floor,
+            M::Ceil => Self::Ceil,
+            M::Trunc => Self::Trunc,
+            M::Round => Self::Round,
+            M::Min => Self::Min,
+            M::Max => Self::Max,
+            M::Sin => Self::Sin,
+            M::Cos => Self::Cos,
+            M::Tan => Self::Tan,
+            M::Atan => Self::Atan,
+            M::Exp => Self::Exp,
+            M::Log => Self::Log,
+            M::Atan2 => Self::Atan2,
+            M::Pow => Self::Pow,
             _ => return None,
         })
     }
@@ -477,10 +470,19 @@ pub(crate) enum Kind {
     CheckedFloat64ToIndex,
     /// `input0 === input1` (or `!==` when `negate`) on any two tagged values,
     /// producing a tagged boolean: numbers by value, strings and BigInts by
-    /// content through a leaf probe, everything else by identity.
+    /// content through a leaf probe, everything else by identity. With
+    /// `same_value`, §7.2.11 SameValue instead: two NaNs are equal and `+0`
+    /// differs from `-0`.
     StrictEqual {
         negate: bool,
+        same_value: bool,
     },
+    /// A `Number.is*` predicate of a tagged value, producing a tagged
+    /// boolean; a value that is no Number answers `false`.
+    NumberTest(otter_vm::jit_static_native::JitNumberTest),
+    /// `Array.isArray` of a tagged value, producing a tagged boolean. Eager
+    /// deopt for a Proxy, whose answer is its target's.
+    IsArray,
     /// `input0 == input1` (or `!=` when `negate`) on any two tagged values,
     /// producing a tagged boolean: identity, two Numbers, `null`/`undefined`
     /// and two cells that convert nothing. Eager deopt for a pair that would
@@ -587,8 +589,11 @@ pub(crate) enum Kind {
     /// The UTF-16 code unit of string input0 at int32 index input1, as an
     /// int32: the string is flat (inline or sequential, Latin-1 or UTF-16)
     /// or a slice of a flat string, and the index lies within it. Eager
-    /// deopt otherwise.
-    StringCharCodeAt,
+    /// deopt otherwise. With `code_point`, `codePointAt`: a lead surrogate,
+    /// whose pair would combine, leaves too.
+    StringCharCodeAt {
+        code_point: bool,
+    },
     /// The `length` of the primitive string input0 as an int32. Eager deopt
     /// unless input0 is a string.
     LoadStringLength,
@@ -1043,6 +1048,8 @@ impl Kind {
                 | Self::PrimitiveCompare(_)
                 | Self::Float64Compare(_)
                 | Self::StrictEqual { .. }
+                | Self::NumberTest(_)
+                | Self::IsArray
                 | Self::LooseEqual { .. }
                 | Self::NullishEqual { .. }
                 | Self::ToBoolean
@@ -1104,6 +1111,7 @@ impl Kind {
             | Self::Int32ToFloat64
             | Self::TruncateFloat64ToInt32
             | Self::StrictEqual { .. }
+            | Self::NumberTest(_)
             | Self::NullishEqual { .. }
             | Self::ToBoolean
             | Self::LogicalNot
@@ -1140,6 +1148,7 @@ impl Kind {
             | Self::CheckedTaggedToIndex
             | Self::CheckedFloat64ToIndex
             | Self::CheckNumber
+            | Self::IsArray
             | Self::CheckNotNullish { .. }
             | Self::CheckShapes { .. }
             | Self::CheckBounds
@@ -1168,7 +1177,7 @@ impl Kind {
             | Self::LoadArrayLength { .. }
             | Self::LoadTypedArrayLength
             | Self::LoadStringLength
-            | Self::StringCharCodeAt => eager,
+            | Self::StringCharCodeAt { .. } => eager,
             // A derived constructor changes its physical this binding at
             // super(); lexical capture must read the current binding here.
             Self::LoadThis => Properties {
@@ -1647,7 +1656,7 @@ impl Kind {
             },
             Self::LoadArrayExpando(_) | Self::LoadFunctionBag => simple(1, ResultPolicy::Register),
             Self::LoadFunctionBagCell(_) => simple(0, ResultPolicy::Register),
-            Self::StringCharCodeAt => Constraints {
+            Self::StringCharCodeAt { .. } => Constraints {
                 inputs: registers(2),
                 result: ResultPolicy::Register,
                 gp_temps: 1,
@@ -1786,7 +1795,14 @@ impl Kind {
                 fp_temps: 1,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::NullishEqual { .. } => simple(1, ResultPolicy::Register),
+            Self::NullishEqual { .. } | Self::IsArray => simple(1, ResultPolicy::Register),
+            Self::NumberTest(_) => Constraints {
+                inputs: registers(1),
+                result: ResultPolicy::Register,
+                gp_temps: 0,
+                fp_temps: 1,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
             Self::TestTypeOf { .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,

@@ -264,7 +264,7 @@ fn proves_inputs(kind: &Kind) -> bool {
         Kind::LoadArrayExpando(_)
         | Kind::LoadFunctionBag
         | Kind::LoadFunctionBagCell(_)
-        | Kind::StringCharCodeAt
+        | Kind::StringCharCodeAt { .. }
         | Kind::LoadStringLength => true,
         _ => false,
     }
@@ -330,6 +330,9 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::CheckedTaggedToIndex
         | Kind::CheckedFloat64ToIndex
         | Kind::StrictEqual { .. }
+        | Kind::NumberTest(_)
+        // A Proxy leaves; any other cell's type never changes.
+        | Kind::IsArray
         | Kind::NullishEqual { .. }
         | Kind::ToBoolean
         | Kind::LogicalNot
@@ -351,7 +354,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         // changes; a pair that would convert leaves before reading more.
         | Kind::LooseEqual { .. }
         // String content never changes; the node tests its own receiver.
-        | Kind::StringCharCodeAt
+        | Kind::StringCharCodeAt { .. }
         | Kind::LoadStringLength => Effects::default(),
         // A cell's map word decides the result. An unproved input is tested
         // for a cell first; a proved one is read directly.

@@ -178,7 +178,7 @@ impl Codegen<'_> {
                         dynasm!(self.ops ; .arch x64
                             ; cmp Rq(a), tag::VALUE_TRUE as i32 ; je =>picked);
                     }
-                    BranchKind::Float64Truthy | BranchKind::Nullish | BranchKind::Native(_) => {
+                    BranchKind::Float64Truthy | BranchKind::Nullish => {
                         return Err(Unsupported::OperandShape("graph x86 select test"));
                     }
                 }

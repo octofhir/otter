@@ -745,7 +745,10 @@ fn native_array_method(
 }
 macro_rules! native_array {
     ($fn_name:ident, $js_name:literal) => {
-        fn $fn_name(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
+        pub(crate) fn $fn_name(
+            ctx: &mut NativeCtx<'_>,
+            args: ValueWindow<'_>,
+        ) -> Result<Value, NativeError> {
             native_array_method($js_name, ctx, args)
         }
     };

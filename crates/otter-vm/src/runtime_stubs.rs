@@ -866,6 +866,36 @@ pub const OBJECT_GET_PROTOTYPE_OF_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: object_get_prototype_of_leaf,
 };
 
+/// Callable ABI entry: leaf `Object.is`; every argument pair answers.
+pub const OBJECT_IS_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_OBJECT_IS_LEAF,
+    entry: object_is_leaf,
+};
+
+/// Callable ABI entry: leaf `String.prototype.charAt` of a shared unit.
+pub const STRING_CHAR_AT_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_STRING_CHAR_AT_LEAF,
+    entry: string_char_at_leaf,
+};
+
+/// Callable ABI entry: leaf `String.fromCharCode` of a shared unit.
+pub const STRING_FROM_CHAR_CODE_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_STRING_FROM_CHAR_CODE_LEAF,
+    entry: string_from_char_code_leaf,
+};
+
+/// Callable ABI entry: leaf `Array.prototype.indexOf` of a dense array.
+pub const ARRAY_INDEX_OF_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_ARRAY_INDEX_OF_LEAF,
+    entry: array_index_of_leaf,
+};
+
+/// Callable ABI entry: leaf `Array.prototype.includes` of a dense array.
+pub const ARRAY_INCLUDES_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_ARRAY_INCLUDES_LEAF,
+    entry: array_includes_leaf,
+};
+
 /// Callable ABI entry: leaf `Number(value)` call of a non-string primitive; anything else misses.
 pub const NUMBER_CALL_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: crate::native_abi::STUB_NUMBER_CALL_LEAF,
@@ -1278,6 +1308,13 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
             Some(NUMBER_IS_SAFE_INTEGER_LEAF)
         }
         id if id == crate::native_abi::STUB_ARRAY_IS_ARRAY_LEAF.id => Some(ARRAY_IS_ARRAY_LEAF),
+        id if id == crate::native_abi::STUB_OBJECT_IS_LEAF.id => Some(OBJECT_IS_LEAF),
+        id if id == crate::native_abi::STUB_STRING_CHAR_AT_LEAF.id => Some(STRING_CHAR_AT_LEAF),
+        id if id == crate::native_abi::STUB_STRING_FROM_CHAR_CODE_LEAF.id => {
+            Some(STRING_FROM_CHAR_CODE_LEAF)
+        }
+        id if id == crate::native_abi::STUB_ARRAY_INDEX_OF_LEAF.id => Some(ARRAY_INDEX_OF_LEAF),
+        id if id == crate::native_abi::STUB_ARRAY_INCLUDES_LEAF.id => Some(ARRAY_INCLUDES_LEAF),
         id if id == crate::native_abi::STUB_OBJECT_GET_PROTOTYPE_OF_LEAF.id => {
             Some(OBJECT_GET_PROTOTYPE_OF_LEAF)
         }
@@ -2077,6 +2114,62 @@ pub extern "C" fn string_char_code_at_leaf(
     NativeResultPair::success(Value::number(crate::NumberValue::from_i32(i32::from(unit))))
 }
 
+/// `String.prototype.charAt` over a contiguous string receiver and an int32
+/// index: past either end the empty string, inside it the unit's string,
+/// both the heap's shared bodies. A unit above Latin-1, which would
+/// allocate, a non-int32 index or another receiver misses.
+#[must_use]
+pub extern "C" fn string_char_at_leaf(
+    heap: *const otter_gc::GcHeap,
+    receiver_bits: u64,
+    index_bits: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return NativeResultPair::miss();
+    };
+    let receiver = Value::from_abi_bits(receiver_bits);
+    let index = Value::from_abi_bits(index_bits);
+    let (Some(string), Some(index)) = (receiver.as_string(heap), index.as_i32()) else {
+        return NativeResultPair::miss();
+    };
+    if !string.is_contiguous(heap) {
+        return NativeResultPair::miss();
+    }
+    let unit = u32::try_from(index)
+        .ok()
+        .and_then(|index| string.char_code_at(index, heap));
+    let shared = match unit {
+        Some(unit) => crate::JsString::shared_unit_string(1, Some(unit), heap),
+        None => crate::JsString::shared_unit_string(0, None, heap),
+    };
+    shared.map_or_else(NativeResultPair::miss, |shared| {
+        NativeResultPair::success(Value::string(shared))
+    })
+}
+
+/// `String.fromCharCode` of one int32 code: ToUint16 of it, whose one-unit
+/// string is the heap's shared body when the unit is Latin-1. Any other
+/// code misses.
+#[must_use]
+pub extern "C" fn string_from_char_code_leaf(
+    heap: *const otter_gc::GcHeap,
+    code_bits: u64,
+    _unused: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return NativeResultPair::miss();
+    };
+    let Some(code) = Value::from_abi_bits(code_bits).as_i32() else {
+        return NativeResultPair::miss();
+    };
+    crate::JsString::shared_unit_string(1, Some(code as u16), heap)
+        .map_or_else(NativeResultPair::miss, |shared| {
+            NativeResultPair::success(Value::string(shared))
+        })
+}
+
 /// Resolve two operand words to a string receiver and a string argument, the
 /// shape every two-string leaf probe below shares.
 fn string_pair(
@@ -2701,6 +2794,24 @@ pub extern "C" fn array_is_array_leaf(
         return NativeResultPair::miss();
     }
     NativeResultPair::success(Value::boolean(value.as_array().is_some()))
+}
+
+/// Leaf `Object.is`: §7.2.11 SameValue, string and BigInt content compared
+/// in place.
+pub extern "C" fn object_is_leaf(
+    heap: *const otter_gc::GcHeap,
+    lhs_bits: u64,
+    rhs_bits: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let Some(heap) = heap_ref(heap) else {
+        return NativeResultPair::miss();
+    };
+    let lhs = Value::from_abi_bits(lhs_bits);
+    let rhs = Value::from_abi_bits(rhs_bits);
+    NativeResultPair::success(Value::boolean(crate::abstract_ops::same_value(
+        &lhs, &rhs, heap,
+    )))
 }
 
 /// Leaf `Object.getPrototypeOf` of an ordinary object whose
@@ -3417,6 +3528,60 @@ fn dense_range_is_fast(
         && !crate::array::has_shared_elements(arr, heap)
         && crate::array::length_writable(arr, heap)
         && crate::array::can_fast_fill_dense_range(arr, heap, start, end)
+}
+
+/// [`crate::array::plain_dense_position`] of the argument in a receiver
+/// Array; anything else misses.
+fn array_search_leaf(
+    heap: *const otter_gc::GcHeap,
+    recv_bits: u64,
+    value_bits: u64,
+    matches: fn(&Value, &Value, &otter_gc::GcHeap) -> bool,
+) -> Option<i32> {
+    let heap = heap_ref(heap)?;
+    let arr = Value::from_abi_bits(recv_bits).as_array()?;
+    let target = Value::from_abi_bits(value_bits);
+    crate::array::plain_dense_position(arr, heap, |element| matches(element, &target, heap))
+}
+
+/// Leaf `Array.prototype.indexOf` of one value: IsStrictlyEqual from index
+/// zero over a hole-free plain dense array.
+#[must_use]
+pub extern "C" fn array_index_of_leaf(
+    heap: *const otter_gc::GcHeap,
+    recv_bits: u64,
+    value_bits: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    array_search_leaf(
+        heap,
+        recv_bits,
+        value_bits,
+        crate::abstract_ops::is_strictly_equal,
+    )
+    .map_or_else(NativeResultPair::miss, |index| {
+        NativeResultPair::success(Value::number(crate::NumberValue::from_i32(index)))
+    })
+}
+
+/// Leaf `Array.prototype.includes` of one value: SameValueZero from index
+/// zero over a hole-free plain dense array.
+#[must_use]
+pub extern "C" fn array_includes_leaf(
+    heap: *const otter_gc::GcHeap,
+    recv_bits: u64,
+    value_bits: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    array_search_leaf(
+        heap,
+        recv_bits,
+        value_bits,
+        crate::abstract_ops::same_value_zero,
+    )
+    .map_or_else(NativeResultPair::miss, |index| {
+        NativeResultPair::success(Value::boolean(index >= 0))
+    })
 }
 
 /// Leaf `Array.prototype.pop` over a dense array.

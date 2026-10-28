@@ -1,7 +1,9 @@
 //! x86 tagged predicates with cold, typed NoAlloc content probes.
 //!
 //! # Contents
-//! - Numeric and identity strict equality, with content comparison in the VM.
+//! - Numeric and identity strict equality, with content comparison in the VM;
+//!   SameValue, which differs from it only for Numbers.
+//! - `Number.is*` and `Array.isArray` reductions of builtin calls.
 //! - Loose equality: the pairs that convert nothing inline; every coercing
 //!   pair leaves through the eager deopt.
 //! - Unary nullish equality preserves heap facts through a total native leaf.
@@ -13,7 +15,8 @@
 //! # Invariants
 //! - Inputs remain intact until the final tagged boolean is committed.
 //! - Slow leaves see a live heap and preserve every control-flow-live register.
-//! - Numeric equality distinguishes NaN from identical words and equates ±0.
+//! - Numeric equality distinguishes NaN from identical words and equates ±0;
+//!   SameValue compares float64 bits, with every NaN equal.
 //! - Loose equality never runs JavaScript or enters the runtime: a pair
 //!   that may convert leaves before any effect, and a site that left so
 //!   lowers to its baseline operation.
@@ -44,12 +47,24 @@ impl<'a> Codegen<'a> {
                     self.emit_to_boolean(value, dst, negate);
                 }
             }
-            Kind::StrictEqual { negate } => {
+            Kind::StrictEqual { negate, same_value } => {
                 let a = Self::gp(self.loc(node).inputs[0]);
                 let b = Self::gp(self.loc(node).inputs[1]);
                 let dst = Self::gp(self.loc(node).result.unwrap());
                 let double = self.loc(node).fp_temps[0];
-                self.emit_strict_equal(node, a, b, double, dst, negate);
+                self.emit_strict_equal(node, [a, b], double, dst, negate, same_value);
+            }
+            Kind::NumberTest(test) => {
+                let value = Self::gp(self.loc(node).inputs[0]);
+                let dst = Self::gp(self.loc(node).result.unwrap());
+                let double = self.loc(node).fp_temps[0];
+                self.emit_number_test(value, dst, double, test);
+            }
+            Kind::IsArray => {
+                let value = Self::gp(self.loc(node).inputs[0]);
+                let dst = Self::gp(self.loc(node).result.unwrap());
+                let exit = self.eager_exit(node, DeoptReason::WrongType);
+                self.emit_is_array(value, dst, exit);
             }
             Kind::LooseEqual { negate } => {
                 let a = Self::gp(self.loc(node).inputs[0]);
@@ -72,7 +87,15 @@ impl<'a> Codegen<'a> {
         Ok(true)
     }
 
-    fn emit_strict_equal(&mut self, node: NodeId, a: u8, b: u8, double: u8, dst: u8, negate: bool) {
+    fn emit_strict_equal(
+        &mut self,
+        node: NodeId,
+        [a, b]: [u8; 2],
+        double: u8,
+        dst: u8,
+        negate: bool,
+        same_value: bool,
+    ) {
         let non_number = self.ops.new_dynamic_label();
         let outcomes = self.equality_outcomes();
         self.load_immediate(10, tag::NUMBER_TAG);
@@ -80,7 +103,11 @@ impl<'a> Codegen<'a> {
             ; test Rq(a), r10 ; jz =>non_number
             ; test Rq(b), r10 ; jz =>outcomes.differ
         );
-        self.emit_number_pair(a, b, double, outcomes);
+        if same_value {
+            self.emit_number_pair_same_value(a, b, double, outcomes);
+        } else {
+            self.emit_number_pair(a, b, double, outcomes);
+        }
         dynasm!(self.ops ; .arch x64 ; =>non_number);
         self.load_immediate(10, tag::NUMBER_TAG);
         dynasm!(self.ops ; .arch x64
@@ -271,6 +298,126 @@ impl<'a> Codegen<'a> {
             ; ucomisd xmm15, Rx(double) ; jp =>outcomes.differ ; je =>outcomes.equal
             ; jmp =>outcomes.differ
         );
+    }
+
+    /// §7.2.11 SameValue of two Numbers, branching to `outcomes`: equal
+    /// float64 bits, or two NaNs.
+    fn emit_number_pair_same_value(
+        &mut self,
+        a: u8,
+        b: u8,
+        double: u8,
+        outcomes: EqualityOutcomes,
+    ) {
+        let a_int = self.ops.new_dynamic_label();
+        let a_ready = self.ops.new_dynamic_label();
+        let b_int = self.ops.new_dynamic_label();
+        let b_ready = self.ops.new_dynamic_label();
+        let unordered = self.ops.new_dynamic_label();
+        dynasm!(self.ops ; .arch x64
+            ; mov r11, Rq(a) ; sar r11, 49 ; cmp r11, -1 ; je =>a_int
+        );
+        self.load_immediate(11, tag::DOUBLE_ENCODE_OFFSET);
+        dynasm!(self.ops ; .arch x64
+            ; mov r10, Rq(a) ; sub r10, r11 ; movq xmm15, r10 ; jmp =>a_ready
+            ; =>a_int ; cvtsi2sd xmm15, Rd(a) ; =>a_ready
+            ; mov r11, Rq(b) ; sar r11, 49 ; cmp r11, -1 ; je =>b_int
+        );
+        self.load_immediate(11, tag::DOUBLE_ENCODE_OFFSET);
+        dynasm!(self.ops ; .arch x64
+            ; mov r10, Rq(b) ; sub r10, r11 ; movq Rx(double), r10 ; jmp =>b_ready
+            ; =>b_int ; cvtsi2sd Rx(double), Rd(b) ; =>b_ready
+            ; ucomisd xmm15, Rx(double) ; jp =>unordered ; jne =>outcomes.differ
+            // Equal values with different bits are `+0` and `-0`.
+            ; movq r10, xmm15 ; movq r11, Rx(double) ; cmp r10, r11
+            ; je =>outcomes.equal ; jmp =>outcomes.differ
+            ; =>unordered
+            ; ucomisd xmm15, xmm15 ; jnp =>outcomes.differ
+            ; ucomisd Rx(double), Rx(double) ; jnp =>outcomes.differ
+            ; jmp =>outcomes.equal
+        );
+    }
+
+    /// `Rq(dst)` = the tagged boolean of `test` on `Rq(value)`, with
+    /// `Rx(double)` as scratch. A double's magnitude bits order like its
+    /// magnitude, so finiteness and the safe range compare as integers.
+    fn emit_number_test(
+        &mut self,
+        value: u8,
+        dst: u8,
+        double: u8,
+        test: otter_vm::jit_static_native::JitNumberTest,
+    ) {
+        use otter_vm::jit_static_native::JitNumberTest;
+        const INFINITY_BITS: u64 = 0x7ff0_0000_0000_0000;
+        let int = self.ops.new_dynamic_label();
+        let yes = self.ops.new_dynamic_label();
+        let no = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        self.load_immediate(10, tag::NUMBER_TAG);
+        dynasm!(self.ops ; .arch x64
+            ; test Rq(value), r10 ; jz =>no
+            ; mov r11, Rq(value) ; sar r11, 49 ; cmp r11, -1 ; je =>int
+        );
+        self.load_immediate(11, tag::DOUBLE_ENCODE_OFFSET);
+        dynasm!(self.ops ; .arch x64
+            ; mov r10, Rq(value) ; sub r10, r11 ; movq Rx(double), r10
+            ; shl r10, 1 ; shr r10, 1
+        );
+        self.load_immediate(11, INFINITY_BITS);
+        match test {
+            JitNumberTest::NaN => dynasm!(self.ops ; .arch x64
+                ; cmp r10, r11 ; ja =>yes ; jmp =>no
+            ),
+            JitNumberTest::Finite => dynasm!(self.ops ; .arch x64
+                ; cmp r10, r11 ; jb =>yes ; jmp =>no
+            ),
+            JitNumberTest::Integer | JitNumberTest::SafeInteger => {
+                dynasm!(self.ops ; .arch x64 ; cmp r10, r11 ; jae =>no);
+                if test == JitNumberTest::SafeInteger {
+                    self.load_immediate(11, 9_007_199_254_740_991_f64.to_bits());
+                    dynasm!(self.ops ; .arch x64 ; cmp r10, r11 ; ja =>no);
+                }
+                // From 2^52 on every double is an integer; below it the
+                // truncation round-trips through an integer register.
+                self.load_immediate(11, 4_503_599_627_370_496_f64.to_bits());
+                dynasm!(self.ops ; .arch x64
+                    ; cmp r10, r11 ; jae =>yes
+                    ; cvttsd2si r11, Rx(double) ; cvtsi2sd xmm15, r11
+                    ; ucomisd xmm15, Rx(double) ; je =>yes ; jmp =>no
+                );
+            }
+        }
+        dynasm!(self.ops ; .arch x64 ; =>int);
+        if test == JitNumberTest::NaN {
+            dynasm!(self.ops ; .arch x64 ; jmp =>no);
+        }
+        dynasm!(self.ops ; .arch x64 ; =>yes);
+        self.load_immediate(dst, tag::VALUE_TRUE);
+        dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>no);
+        self.load_immediate(dst, tag::VALUE_FALSE);
+        dynasm!(self.ops ; .arch x64 ; =>done);
+    }
+
+    /// `Rq(dst)` = whether `Rq(value)` is an Array body, as a tagged
+    /// boolean. A Proxy, whose answer is its target's, takes `exit`.
+    fn emit_is_array(&mut self, value: u8, dst: u8, exit: DynamicLabel) {
+        let yes = self.ops.new_dynamic_label();
+        let no = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        self.load_immediate(10, tag::NOT_CELL_MASK);
+        dynasm!(self.ops ; .arch x64
+            ; test Rq(value), r10 ; jnz =>no
+            ; test Rq(value), Rq(value) ; jz =>no
+            ; movzx r10d, BYTE [Rq(value)]
+            ; cmp r10d, DWORD i32::from(otter_vm::array::ARRAY_BODY_TYPE_TAG) ; je =>yes
+            ; cmp r10d, DWORD i32::from(otter_vm::proxy::PROXY_BODY_TYPE_TAG) ; je =>exit
+            ; =>no
+        );
+        self.load_immediate(dst, tag::VALUE_FALSE);
+        dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>yes);
+        self.load_immediate(dst, tag::VALUE_TRUE);
+        dynasm!(self.ops ; .arch x64 ; =>done);
     }
 
     /// Two distinct cells whose type tags, in `r10d`, are equal: strings and

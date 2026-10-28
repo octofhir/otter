@@ -2364,8 +2364,6 @@ pub struct JitInstructionMetadata {
     /// `"length"`. The emitter uses it to try the Array exotic length fast
     /// path before falling back to ordinary property semantics.
     pub load_array_length: bool,
-    /// Compact VM-baked identity for common primitive method names.
-    pub method_hint: JitMethodHint,
     /// Resolved `f64` value of a `LoadNumber` instruction, whose operand is a
     /// number-constant-pool index rather than an inline immediate. Baked at
     /// view build so the optimizing tier can materialize the constant as a
@@ -2404,7 +2402,6 @@ impl JitInstructionMetadata {
             instruction_index,
             byte_pc,
             load_array_length: false,
-            method_hint: JitMethodHint::None,
             load_number: None,
             call_attempted: false,
             property_attempted: false,
@@ -2735,29 +2732,6 @@ pub enum JitElementFamily {
     Typed(crate::binary::TypedArrayKind),
     /// More than one family, or one no instance describes.
     Generic,
-}
-
-/// Common method names the external JIT can specialize without reading VM
-/// constant pools.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum JitMethodHint {
-    /// No recognized method name.
-    #[default]
-    None,
-    /// `String.prototype.charCodeAt`.
-    StringCharCodeAt,
-    /// `String.prototype.codePointAt`.
-    StringCodePointAt,
-    /// `String.prototype.indexOf`.
-    StringIndexOf,
-    /// `String.prototype.includes`.
-    StringIncludes,
-    /// `String.prototype.startsWith`.
-    StringStartsWith,
-    /// `String.prototype.endsWith`.
-    StringEndsWith,
-    /// `Number.prototype.toString`.
-    NumberToString,
 }
 
 /// VM-owned runtime state retained behind [`crate::native_abi::VmThread`]

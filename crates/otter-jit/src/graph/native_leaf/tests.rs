@@ -107,12 +107,11 @@ fn build(view: &JitCompileSnapshot) -> builder::Built {
 }
 #[test]
 fn declaration_arity_effects_and_identity_layout_have_one_admission() {
-    let view = call(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 1);
-    let declared =
-        super::admit(&view, target(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 1), 1).unwrap();
+    let view = call(abi::STUB_STRING_INDEX_OF_LEAF.id, 1);
+    let declared = super::admit(&view, target(abi::STUB_STRING_INDEX_OF_LEAF.id, 1), 1).unwrap();
     assert!(declared.this_operand);
-    assert!(super::admit(&view, target(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 1), 0).is_none());
-    assert!(super::admit(&view, target(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 2), 1).is_none());
+    assert!(super::admit(&view, target(abi::STUB_STRING_INDEX_OF_LEAF.id, 1), 0).is_none());
+    assert!(super::admit(&view, target(abi::STUB_STRING_INDEX_OF_LEAF.id, 2), 1).is_none());
     assert!(
         super::admit(
             &view,
@@ -124,14 +123,7 @@ fn declaration_arity_effects_and_identity_layout_have_one_admission() {
     assert!(super::admit(&view, target(u32::MAX, 1), 1).is_none());
     let mut absent = view.clone();
     absent.native_call_layout = JitNativeCallLayout::default();
-    assert!(
-        super::admit(
-            &absent,
-            target(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 1),
-            1
-        )
-        .is_none()
-    );
+    assert!(super::admit(&absent, target(abi::STUB_STRING_INDEX_OF_LEAF.id, 1), 1).is_none());
 }
 #[test]
 fn char_code_at_reads_its_unit_inline_from_the_evaluated_operands() {
@@ -147,7 +139,7 @@ fn char_code_at_reads_its_unit_inline_from_the_evaluated_operands() {
     let unit = graph
         .nodes
         .iter()
-        .find(|node| node.kind == Kind::StringCharCodeAt)
+        .find(|node| matches!(node.kind, Kind::StringCharCodeAt { .. }))
         .expect("an inline code-unit read");
     assert_eq!(graph.node(unit.inputs[0]).kind, Kind::InitialRegister(1));
     let index = graph.node(unit.inputs[1]);
@@ -194,11 +186,38 @@ fn math_leaves_are_float64_arithmetic_on_the_evaluated_operands() {
                 .any(|node| matches!(node.kind, Kind::CheckNative(73, _)))
         );
     }
+    // Every other registry reduction is its graph operation behind the
+    // same identity check: `Object.is` the SameValue comparison,
+    // `Number.isInteger` the tag and value test.
+    for (id, argc) in [
+        (abi::STUB_OBJECT_IS_LEAF.id, 2),
+        (abi::STUB_NUMBER_IS_INTEGER_LEAF.id, 1),
+    ] {
+        let built = build(&call(id, argc));
+        let kinds: Vec<_> = built.graph.nodes.iter().map(|node| &node.kind).collect();
+        assert!(
+            !kinds
+                .iter()
+                .any(|kind| matches!(kind, Kind::NativeLeaf(_) | Kind::Generic { .. }))
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|kind| matches!(kind, Kind::CheckNative(73, _)))
+        );
+        assert!(kinds.iter().any(|kind| matches!(
+            kind,
+            Kind::StrictEqual {
+                same_value: true,
+                ..
+            } | Kind::NumberTest(otter_vm::jit_static_native::JitNumberTest::Integer)
+        )));
+    }
 }
 
 #[test]
 fn builder_preserves_evaluated_receiver_operands_and_exact_eager_call_pc() {
-    let view = call(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 1);
+    let view = call(abi::STUB_STRING_INDEX_OF_LEAF.id, 1);
     let built = build(&view);
     let graph = &built.graph;
     let leaf = graph
@@ -236,7 +255,7 @@ fn builder_preserves_evaluated_receiver_operands_and_exact_eager_call_pc() {
             .any(|node| matches!(node.kind, Kind::Generic { .. } | Kind::CallJs { .. }))
     );
     for view in [
-        call(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 0),
+        call(abi::STUB_STRING_INDEX_OF_LEAF.id, 0),
         call(abi::STUB_COLLECTION_MAP_SET_MUTATING.id, 2),
     ] {
         let built = build(&view);
@@ -319,7 +338,7 @@ fn native_leaf_calls_home_eager_only_gp_fp_and_cfg_live_values_on_both_targets()
         let leaf = append(
             &mut graph,
             block,
-            Kind::NativeLeaf(abi::STUB_STRING_CODE_POINT_AT_LEAF.id),
+            Kind::NativeLeaf(abi::STUB_STRING_INDEX_OF_LEAF.id),
             &[receiver, argument],
             Repr::Tagged,
         );
@@ -390,11 +409,7 @@ fn nested_native_leaf_has_its_own_descriptor_source_and_complete_miss_recipe() {
             (Op::ReturnValue, vec![Register(3)]),
         ],
     );
-    prepare(
-        &mut body,
-        2,
-        target(abi::STUB_STRING_CODE_POINT_AT_LEAF.id, 1),
-    );
+    prepare(&mut body, 2, target(abi::STUB_STRING_INDEX_OF_LEAF.id, 1));
     let call_byte_pc = body.instructions[2].byte_pc;
     let mut root = snapshot(
         704,
@@ -534,12 +549,10 @@ fn nested_native_leaf_has_its_own_descriptor_source_and_complete_miss_recipe() {
             .as_array()
             .unwrap()
             .iter()
-            .any(
-                |r| r["target"]["id"] == abi::STUB_STRING_CODE_POINT_AT_LEAF.id
-                    && r["target"]["signature"] == "leafValue2"
-                    && r["startOffset"].as_u64() >= region["startOffset"].as_u64()
-                    && r["startOffset"].as_u64() < region["endOffset"].as_u64()
-            )
+            .any(|r| r["target"]["id"] == abi::STUB_STRING_INDEX_OF_LEAF.id
+                && r["target"]["signature"] == "leafValue2"
+                && r["startOffset"].as_u64() >= region["startOffset"].as_u64()
+                && r["startOffset"].as_u64() < region["endOffset"].as_u64())
     );
     let points = json(otter_vm::JitArtifactFileName::Safepoints);
     assert!(

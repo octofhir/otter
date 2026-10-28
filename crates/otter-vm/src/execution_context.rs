@@ -461,22 +461,6 @@ impl ExecutionContext {
                 instr.length_reads_strings_only = slot
                     .is_some_and(crate::feedback::PropertyFeedbackSlot::length_reads_strings_only);
             }
-            if instr.op(&code_block) == otter_bytecode::Op::CallMethodValue
-                && let Some(otter_bytecode::Operand::ConstIndex(idx)) =
-                    instr.operand(&code_block, 2)
-                && let Some(name) = self.string_constant_str_for_function(function_id, idx)
-            {
-                instr.method_hint = match name {
-                    "charCodeAt" => crate::jit::JitMethodHint::StringCharCodeAt,
-                    "codePointAt" => crate::jit::JitMethodHint::StringCodePointAt,
-                    "indexOf" => crate::jit::JitMethodHint::StringIndexOf,
-                    "includes" => crate::jit::JitMethodHint::StringIncludes,
-                    "startsWith" => crate::jit::JitMethodHint::StringStartsWith,
-                    "endsWith" => crate::jit::JitMethodHint::StringEndsWith,
-                    "toString" => crate::jit::JitMethodHint::NumberToString,
-                    _ => crate::jit::JitMethodHint::None,
-                };
-            }
             if instr.op(&code_block) == otter_bytecode::Op::LoadNumber
                 && let Some(otter_bytecode::Operand::ConstIndex(idx)) =
                     instr.operand(&code_block, 1)
@@ -976,57 +960,6 @@ mod tests {
 
         assert!(view.instructions[0].load_array_length);
         assert!(!view.instructions[1].load_array_length);
-    }
-
-    #[test]
-    fn jit_snapshot_marks_primitive_method_hints() {
-        let context = ExecutionContext::from_module(
-            module_with(
-                vec![
-                    instr(
-                        0,
-                        Op::CallMethodValue,
-                        [
-                            Operand::Register(0),
-                            Operand::Register(1),
-                            Operand::ConstIndex(0),
-                            Operand::ConstIndex(1),
-                            Operand::Register(2),
-                        ],
-                    ),
-                    instr(
-                        1,
-                        Op::CallMethodValue,
-                        [
-                            Operand::Register(3),
-                            Operand::Register(1),
-                            Operand::ConstIndex(2),
-                            Operand::ConstIndex(0),
-                        ],
-                    ),
-                    instr(2, Op::ReturnUndefined, []),
-                ],
-                vec![
-                    string_constant("charCodeAt"),
-                    string_constant("unused"),
-                    string_constant("value"),
-                ],
-                4,
-            ),
-            crate::source_registry::SourceRegistry::default(),
-        )
-        .expect("valid bytecode fixture");
-
-        let view = context.jit_compile_snapshot(0).expect("function exists");
-
-        assert_eq!(
-            view.instructions[0].method_hint,
-            crate::jit::JitMethodHint::StringCharCodeAt
-        );
-        assert_eq!(
-            view.instructions[1].method_hint,
-            crate::jit::JitMethodHint::None
-        );
     }
 
     #[test]

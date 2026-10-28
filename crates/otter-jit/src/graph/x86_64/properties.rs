@@ -166,13 +166,20 @@ impl Codegen<'_> {
                     ; jne =>exit
                     ; mov Rd(destination), [Rq(receiver) + p.string_len_byte as i32]);
             }
-            Kind::StringCharCodeAt => {
+            Kind::StringCharCodeAt { code_point } => {
                 let exit = self.eager_exit(node, DeoptReason::WrongType);
                 self.emit_string_char_code_at(
                     [input(0), input(1), assigned.gp_temps[0]],
                     result(),
                     exit,
                 );
+                if code_point {
+                    dynasm!(self.ops ; .arch x64
+                        ; mov r10d, Rd(result())
+                        ; and r10d, 0xfc00
+                        ; cmp r10d, 0xd800
+                        ; je =>exit);
+                }
             }
             Kind::LoadFunctionBag => {
                 let exit = self.eager_exit(node, DeoptReason::WrongShape);

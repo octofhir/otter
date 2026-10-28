@@ -692,7 +692,12 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::CheckedFloat64ToInt32,
         Kind::CheckedTaggedToIndex,
         Kind::CheckedFloat64ToIndex,
-        Kind::StrictEqual { negate: false },
+        Kind::StrictEqual {
+            negate: false,
+            same_value: false,
+        },
+        Kind::NumberTest(otter_vm::jit_static_native::JitNumberTest::Integer),
+        Kind::IsArray,
         Kind::LooseEqual { negate: false },
         Kind::NullishEqual {
             negate: false,
@@ -727,7 +732,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
             atom: 0,
         },
         Kind::LoadArrayExpando(JitArrayLayout::default()),
-        Kind::StringCharCodeAt,
+        Kind::StringCharCodeAt { code_point: false },
         Kind::LoadStringLength,
         Kind::LoadFunctionBag,
         Kind::LoadFunctionBagCell(0),
@@ -880,7 +885,6 @@ fn every_kind() -> Vec<super::ir::Kind> {
         BranchKind::TaggedEqual,
         BranchKind::Nullish,
         BranchKind::WordEqual(0),
-        BranchKind::Native(0),
     ] {
         kinds.push(Kind::Branch {
             kind,
@@ -976,6 +980,8 @@ fn listed(kind: &super::ir::Kind) {
         | K::CheckedTaggedToIndex
         | K::CheckedFloat64ToIndex
         | K::StrictEqual { .. }
+        | K::NumberTest(_)
+        | K::IsArray
         | K::LooseEqual { .. }
         | K::NullishEqual { .. }
         | K::ToBoolean
@@ -994,7 +1000,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::LoadOwnField { .. }
         | K::LoadNumberOwnField { .. }
         | K::LoadArrayExpando(_)
-        | K::StringCharCodeAt
+        | K::StringCharCodeAt { .. }
         | K::LoadStringLength
         | K::LoadFunctionBag
         | K::LoadFunctionBagCell(_)

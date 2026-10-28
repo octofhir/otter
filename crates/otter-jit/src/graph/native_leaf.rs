@@ -5,8 +5,8 @@
 //! - [`entry`] resolves the VM-owned two-value entry for target encoders.
 //!
 //! # Invariants
-//! Exact JavaScript arity and the existing native identity guard precede the
-//! call. The admitted entry has no effects, allocation, collection or reentry.
+//! Exact JavaScript arity, or one the row's reduction admits, and the
+//! existing native identity guard precede the call. The admitted entry has no effects, allocation, collection or reentry.
 //! Its two boxed operands follow the sole heap/value/value C ABI and result
 //! Probe domain. A miss precedes effects and resumes the current CallWithThis;
 //! this module never owns a second builtin table or runtime semantic kernel.
@@ -38,7 +38,9 @@ pub(super) fn entry(
         ))
 }
 
-/// Admit one actual explicit-receiver call, without adapting arity or effects.
+/// Admit one actual explicit-receiver call, without adapting arity or
+/// effects: the leaf's exact count, or any count the row's reduction
+/// admits, which the reduction (or the ordinary call it refuses to) runs.
 pub(super) fn admit(
     view: &JitCompileSnapshot,
     target: JitStaticNativeCall,
@@ -47,7 +49,10 @@ pub(super) fn admit(
     let declaration = otter_vm::jit_static_native::jit_leaf_builtin(target.leaf_stub_id)?;
     entry(target.leaf_stub_id).ok()?;
     (view.native_call_layout.identity_byte != 0
-        && argument_count == usize::from(declaration.argument_count)
+        && (argument_count == usize::from(declaration.argument_count)
+            || declaration
+                .reduction
+                .admits(declaration.argument_count, argument_count))
         && target.argument_count == declaration.argument_count
         && declaration.operand_words() <= 2)
         .then_some(declaration)

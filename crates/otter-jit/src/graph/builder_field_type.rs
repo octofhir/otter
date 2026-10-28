@@ -567,7 +567,7 @@ impl Builder<'_> {
                     Kind::NullishEqual { negate, .. } => {
                         test = Some((self.graph.node(value).inputs[0], NULLISH, truth != negate))
                     }
-                    Kind::StrictEqual { negate } => {
+                    Kind::StrictEqual { negate, .. } => {
                         test = self.nullish_equality(
                             &self.graph.node(value).inputs,
                             truth != negate,

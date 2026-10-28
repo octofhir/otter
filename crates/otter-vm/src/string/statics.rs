@@ -206,7 +206,7 @@ fn string_raw(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, N
 /// `BigInt` (which throws — see [`crate::number::parse::to_number_value`]
 /// for the exact contract), or a wrapper object via
 /// `@@toPrimitive` → `valueOf` → `toString`.
-fn string_from_char_code(
+pub(crate) fn string_from_char_code(
     ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {

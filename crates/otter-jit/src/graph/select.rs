@@ -52,10 +52,7 @@ fn condition_operands(graph: &Graph, kind: BranchKind, inputs: &[NodeId]) -> Opt
         | BranchKind::TaggedEqual
         | BranchKind::WordEqual(_) => Some(kind.operands()),
         BranchKind::Truthy if graph.node(inputs[0]).kind.produces_boolean() => Some(1),
-        BranchKind::Truthy
-        | BranchKind::Float64Truthy
-        | BranchKind::Nullish
-        | BranchKind::Native(_) => None,
+        BranchKind::Truthy | BranchKind::Float64Truthy | BranchKind::Nullish => None,
     }
 }
 

@@ -107,7 +107,7 @@ pub(crate) fn resolve_inherited_atom_data_slot(
 #[must_use]
 pub(crate) fn resolve_proved_inherited_atom_data_slot(
     first: JsObject,
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     key: AtomizedPropertyKey<'_>,
 ) -> Option<ResolvedDataSlot> {
     let validity = crate::object::prototype_validity::current_chain_validity(first, heap)?;
@@ -116,7 +116,7 @@ pub(crate) fn resolve_proved_inherited_atom_data_slot(
 
 fn resolve_inherited_with(
     first: JsObject,
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     key: AtomizedPropertyKey<'_>,
     validity: Arc<PrototypeValidity>,
 ) -> Option<ResolvedDataSlot> {
@@ -140,7 +140,7 @@ fn resolve_inherited_with(
                         .read_payload(holder_root, object::shape_body::ShapeBody::id),
                 });
             }
-            (_, object::PropertyLookup::Absent) => proto = object::prototype(proto, heap)?,
+            (_, object::PropertyLookup::Absent) => proto = object::prototype_in(proto, heap)?,
             _ => return None,
         }
     }

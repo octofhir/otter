@@ -772,6 +772,9 @@ pub struct PropertyIcSlot {
     misses: AtomicU32,
     installs: AtomicU32,
     disables: AtomicU32,
+    /// The integer index a keyed-bound site's atom spells; [`u32::MAX`] when
+    /// it names a symbol.
+    keyed_index: AtomicU32,
     kind: PropertyIcKind,
 }
 
@@ -814,6 +817,7 @@ impl PropertyIcSlot {
             misses: AtomicU32::new(0),
             installs: AtomicU32::new(0),
             disables: AtomicU32::new(0),
+            keyed_index: AtomicU32::new(u32::MAX),
             kind,
         }
     }
@@ -860,14 +864,17 @@ impl PropertyIcSlot {
     /// Bind an element site's cache to the one name key it serves, by atom:
     /// the first key binds it, the same key keeps it, and any other leaves
     /// the site megamorphic with no entries, which are keyed by shape alone.
-    /// Whether the site still serves `atom` from its own entries.
-    pub(crate) fn bind_keyed_atom(&self, atom: u32) -> bool {
+    /// Whether the site still serves `atom` from its own entries. `index`
+    /// is the integer index the atom spells, `None` for a symbol.
+    pub(crate) fn bind_keyed_atom(&self, atom: u32, index: Option<u32>) -> bool {
         let state = self.state();
         if state & STATE_MEGAMORPHIC != 0 {
             return false;
         }
         if state & STATE_KEYED_BOUND == 0 {
             self.atom.store(atom, Ordering::Relaxed);
+            self.keyed_index
+                .store(index.unwrap_or(u32::MAX), Ordering::Relaxed);
             self.state
                 .store(state | STATE_KEYED_BOUND, Ordering::Relaxed);
             return true;
@@ -893,6 +900,15 @@ impl PropertyIcSlot {
         let state = self.state();
         (state & STATE_KEYED_BOUND != 0 && state & STATE_MEGAMORPHIC == 0)
             .then(|| self.atom.load(Ordering::Relaxed))
+    }
+
+    /// The name key an element site's cache serves, while it serves one: its
+    /// atom and the integer index it spells, `None` for a symbol.
+    #[must_use]
+    pub(crate) fn keyed_name(&self) -> Option<(u32, Option<u32>)> {
+        let atom = self.keyed_atom()?;
+        let index = self.keyed_index.load(Ordering::Relaxed);
+        Some((atom, (index != u32::MAX).then_some(index)))
     }
 
     /// Whether the site overflowed into the shared table.

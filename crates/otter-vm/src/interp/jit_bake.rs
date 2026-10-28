@@ -28,6 +28,7 @@
 //! - `jit_compile` — compile sessions, queueing and installation.
 //! - [`crate::jit_roots`] — what a compilation's roots keep alive.
 #![allow(unused_imports)]
+use crate::heap_read::HeapRead;
 use crate::*;
 
 #[path = "inline_snapshot_budget.rs"]
@@ -108,7 +109,7 @@ impl Interpreter {
 /// [`Interpreter::method_holder_layout`] given the active realm's
 /// `%String.prototype%`, the one opaque dictionary holder admitted.
 pub(crate) fn method_holder_layout(
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     string_prototype: Option<crate::object::JsObject>,
     holder: crate::object::JsObject,
 ) -> Option<MethodHolderLayout> {
@@ -117,7 +118,7 @@ pub(crate) fn method_holder_layout(
         if !shape.is_null() {
             return Some(MethodHolderLayout::Shape(shape));
         }
-        let state = crate::object::state(holder, heap);
+        let state = crate::object::state_in(holder, heap);
         if !state.is_dictionary() {
             return None;
         }
@@ -150,8 +151,6 @@ pub(crate) struct Baker<'a> {
     /// method holder's root) by id, for the steps that name them by id. A
     /// handle stays valid for the whole pass: baking cannot collect.
     found_shapes: rustc_hash::FxHashMap<crate::object::ShapeId, crate::object::ShapeHandle>,
-    /// Marks the heap as read by this pass while it lives.
-    _scope: otter_gc::CompilationScope<'a>,
 }
 
 impl<'a> Baker<'a> {
@@ -162,7 +161,6 @@ impl<'a> Baker<'a> {
             install: InstallTasks::default(),
             events: Vec::new(),
             found_shapes: rustc_hash::FxHashMap::default(),
-            _scope: env.heap.enter_compilation_scope(),
         }
     }
 
@@ -327,7 +325,7 @@ impl Baker<'_> {
         self.bake_closure_allocations(&mut snapshot, context);
         self.bake_optimized_exit_profile(&mut snapshot, fid);
         self.bake_own_receiver_plan(&mut snapshot, fid);
-        self.bake_proved_stores_tree(&mut snapshot);
+        self.bake_proved_stores_tree(&mut snapshot, context);
         self.bake_field_type_tree(&mut snapshot);
         // Every shape baked so far that no object has left yet: a value
         // proven to have one survives calls while the generation's
@@ -855,16 +853,15 @@ impl Baker<'_> {
             else {
                 continue;
             };
-            let Some(atom) = slot.native().keyed_atom() else {
+            // The cache recorded at binding whether its key is a symbol or
+            // which integer index it spells.
+            let Some((atom, index)) = slot.native().keyed_name() else {
                 continue;
             };
-            let names = crate::isolate_names::names(&self.env.heap);
-            let name = match names.spelling(crate::property_atom::AtomId::from_global(atom)) {
+            let name = match index {
                 None => jit::JitKeyedName::Symbol { atom },
-                Some(spelling) => {
-                    let Some(index) = crate::object::array_index_property_name(spelling)
-                        .and_then(|index| i32::try_from(index).ok())
-                    else {
+                Some(index) => {
+                    let Ok(index) = i32::try_from(index) else {
                         continue;
                     };
                     jit::JitKeyedName::Index { index }
@@ -1165,9 +1162,9 @@ impl Baker<'_> {
                 let holds_intrinsic = self
                     .env
                     .function_prototype
-                    .and_then(|prototype| object::get(prototype, &self.env.heap, "call"))
+                    .and_then(|prototype| object::get_in(prototype, &self.env.heap, "call"))
                     .and_then(|value| value.as_native_function())
-                    .is_some_and(|native| native.is_vm_intrinsic(&self.env.heap, intrinsic));
+                    .is_some_and(|native| native.is_vm_intrinsic_in(&self.env.heap, intrinsic));
                 if key.name() != "call" || !holds_intrinsic {
                     return None;
                 }
@@ -1281,7 +1278,7 @@ impl Baker<'_> {
             // A builtin this isolate never installed has no external-ref
             // index, so no live receiver could carry its identity.
             let Some(builtin_native_ref) =
-                crate::jit_static_native::jit_static_call_ref(stub_id, &self.env.heap)
+                crate::jit_static_native::jit_static_call_ref_in(stub_id, &self.env.heap)
             else {
                 continue;
             };
@@ -1353,7 +1350,7 @@ impl Baker<'_> {
             else {
                 continue;
             };
-            let state = crate::object::state(self.env.global_this, &self.env.heap);
+            let state = crate::object::state_in(self.env.global_this, &self.env.heap);
             if state.is_opaque() {
                 continue;
             }
@@ -1464,7 +1461,7 @@ impl Baker<'_> {
             else {
                 continue;
             };
-            let state = crate::object::state(self.env.global_this, &self.env.heap);
+            let state = crate::object::state_in(self.env.global_this, &self.env.heap);
             if state.is_opaque() || (writing && state.is_prototype()) {
                 continue;
             }
@@ -1882,11 +1879,11 @@ impl Baker<'_> {
                             .expect("native leaf call feedback names a declared entry");
                         // Feedback recorded a call to this builtin, so the isolate
                         // installed it and its external-ref index exists.
-                        let builtin_native_ref =
-                            crate::jit_static_native::jit_static_call_ref(stub_id, &self.env.heap)
-                                .expect(
-                                    "a builtin the site already called is interned in this isolate",
-                                );
+                        let builtin_native_ref = crate::jit_static_native::jit_static_call_ref_in(
+                            stub_id,
+                            &self.env.heap,
+                        )
+                        .expect("a builtin the site already called is interned in this isolate");
                         view.native_calls.insert(
                             call_byte_pc,
                             jit::JitNativeCall::Leaf(jit::JitStaticNativeCall {
@@ -2317,7 +2314,7 @@ impl Baker<'_> {
         crate::object::load_slot_at_field(holder, &self.env.heap, target.method_field).filter(
             |value| {
                 value
-                    .as_closure(&self.env.heap)
+                    .as_closure_in(&self.env.heap)
                     .is_some_and(|closure| closure.function_id() == target.method_fid)
             },
         )
@@ -2399,8 +2396,8 @@ impl Baker<'_> {
         if graph_body
             && let Some(closure) = self.proven_method(target)
             && let Some(context) = closure
-                .as_closure(&self.env.heap)
-                .map(|closure| closure.context(&self.env.heap))
+                .as_closure_in(&self.env.heap)
+                .map(|closure| closure.context_in(&self.env.heap))
             && let Some(body) = body.as_mut().and_then(std::sync::Arc::get_mut)
         {
             body.closure_constants = self.bake_closure_constants(context, &body.code_block);
@@ -2523,9 +2520,9 @@ impl Baker<'_> {
                     .filter(|&shape| crate::object::shape_body::is_stable(shape))
                     .and_then(|shape| self.bake_shape(shape))
                     .unwrap_or(0);
-                let closure = value.as_closure(&self.env.heap);
+                let closure = value.as_closure_in(&self.env.heap);
                 let bag = closure
-                    .and_then(|closure| closure.own_props(&self.env.heap))
+                    .and_then(|closure| closure.own_props_in(&self.env.heap))
                     .map_or(0, |bag| self.bake_held_identity_cell(Value::object(bag)));
                 let held = self.held_cell(value);
                 let cell = held.address();

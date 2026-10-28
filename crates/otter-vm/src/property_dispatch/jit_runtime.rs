@@ -242,7 +242,11 @@ impl Interpreter {
             context.property_feedback_slot(function_id, instruction_pc, PropertyIcKind::Load)?;
         let mut digits = itoa::Buffer::new();
         let (atom, symbol) = self.keyed_site_name(key, &mut digits)?;
-        if !slot.native().bind_keyed_atom(atom.raw()) {
+        let index = symbol.is_none().then(|| key.as_i32()).flatten();
+        if !slot
+            .native()
+            .bind_keyed_atom(atom.raw(), index.map(|index| index as u32))
+        {
             return None;
         }
         if let Some(LoadHit::Value(value)) = slot.probe_load_hit(obj, &self.gc_heap) {
@@ -301,7 +305,11 @@ impl Interpreter {
         let Some((atom, symbol)) = self.keyed_site_name(key, &mut digits) else {
             return Ok(false);
         };
-        if !slot.native().bind_keyed_atom(atom.raw()) {
+        let index = symbol.is_none().then(|| key.as_i32()).flatten();
+        if !slot
+            .native()
+            .bind_keyed_atom(atom.raw(), index.map(|index| index as u32))
+        {
             return Ok(false);
         }
         let mut spelling = itoa::Buffer::new();

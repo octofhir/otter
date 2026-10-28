@@ -369,14 +369,21 @@ pub(crate) fn scope_identity(heap: &GcHeap, context: ContextHandle) -> (u32, u16
 
 /// Parent of `context`, `None` for the outermost.
 #[must_use]
-pub(crate) fn parent(heap: &GcHeap, context: ContextHandle) -> Option<ContextHandle> {
+pub(crate) fn parent(
+    heap: &impl crate::heap_read::HeapRead,
+    context: ContextHandle,
+) -> Option<ContextHandle> {
     heap.read_payload(context, ContextBody::parent_handle)
 }
 
 /// Follow `depth` parent links from `context`. `None` when the chain is
 /// shorter, which verified bytecode never produces.
 #[must_use]
-pub(crate) fn walk(heap: &GcHeap, context: ContextHandle, depth: u16) -> Option<ContextHandle> {
+pub(crate) fn walk(
+    heap: &impl crate::heap_read::HeapRead,
+    context: ContextHandle,
+    depth: u16,
+) -> Option<ContextHandle> {
     let mut current = context;
     for _ in 0..depth {
         current = parent(heap, current)?;
@@ -386,7 +393,11 @@ pub(crate) fn walk(heap: &GcHeap, context: ContextHandle, depth: u16) -> Option<
 
 /// Slot `slot` of `context`.
 #[must_use]
-pub(crate) fn read_slot(heap: &GcHeap, context: ContextHandle, slot: u16) -> Option<Value> {
+pub(crate) fn read_slot(
+    heap: &impl crate::heap_read::HeapRead,
+    context: ContextHandle,
+    slot: u16,
+) -> Option<Value> {
     heap.read_payload(context, |body| body.slots().get(slot as usize).copied())
 }
 
@@ -420,7 +431,7 @@ pub(crate) fn write_slot(
 
 /// The watch word of `context`.
 #[must_use]
-pub(crate) fn watch(heap: &GcHeap, context: ContextHandle) -> u64 {
+pub(crate) fn watch(heap: &impl crate::heap_read::HeapRead, context: ContextHandle) -> u64 {
     heap.read_payload(context, |body| body.watch)
 }
 

@@ -177,6 +177,12 @@ impl<T> MutatorCell<T> {
         }
     }
 
+    /// The mutator's read.
+    #[inline]
+    pub(crate) fn borrow(&self) -> std::cell::Ref<'_, T> {
+        self.cell.borrow()
+    }
+
     /// The mutator's write, excluding compiler-thread reads while it lasts.
     #[inline]
     pub(crate) fn borrow_mut(&self) -> MutatorCellWrite<'_, T> {

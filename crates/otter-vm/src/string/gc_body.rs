@@ -1205,7 +1205,17 @@ pub fn flatten_in_place(
 /// Only the rare `Cons` / `Sliced` rope shapes fall back to the
 /// allocating [`to_utf16_vec`] materialiser.
 #[must_use]
-pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
+pub fn eq_str(heap: &otter_gc::GcHeap, string: JsStringHandle, key: &str) -> bool {
+    eq_str_in(heap, string, key)
+}
+
+/// [`eq_str`] over any heap reader.
+#[inline]
+pub(crate) fn eq_str_in(
+    heap: &impl crate::heap_read::HeapRead,
+    string: JsStringHandle,
+    key: &str,
+) -> bool {
     enum Fast {
         Mismatch,
         Match,
@@ -1276,7 +1286,7 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
                     None => unreachable!("resolved view stores its units contiguously"),
                 })
             }
-            None => to_utf16_vec(heap, string)
+            None => to_utf16_vec_in(heap, string)
                 .into_iter()
                 .eq(crate::wtf16_escape::units(key)),
         },
@@ -1292,7 +1302,16 @@ pub fn eq_str(heap: &GcHeap, string: JsStringHandle, key: &str) -> bool {
 /// serves a `memcpy` from the cache instead of re-walking the rope /
 /// re-widening Latin-1 on every call.
 #[must_use]
-pub fn to_utf16_vec(heap: &GcHeap, string: JsStringHandle) -> Vec<u16> {
+pub fn to_utf16_vec(heap: &otter_gc::GcHeap, string: JsStringHandle) -> Vec<u16> {
+    to_utf16_vec_in(heap, string)
+}
+
+/// [`to_utf16_vec`] over any heap reader.
+#[inline]
+pub(crate) fn to_utf16_vec_in(
+    heap: &impl crate::heap_read::HeapRead,
+    string: JsStringHandle,
+) -> Vec<u16> {
     materialize_utf16_vec(heap, string)
 }
 
@@ -1497,7 +1516,11 @@ pub fn is_contiguous(heap: &GcHeap, string: JsStringHandle) -> bool {
 /// rewrites a rope into a view, *every* read of an already-flattened rope
 /// would re-materialise the whole string, turning a `/g` regex loop over a
 /// long subject quadratic.
-fn contiguous_view(heap: &GcHeap, string: JsStringHandle) -> Option<(JsStringHandle, u32, u32)> {
+#[inline]
+fn contiguous_view(
+    heap: &impl crate::heap_read::HeapRead,
+    string: JsStringHandle,
+) -> Option<(JsStringHandle, u32, u32)> {
     let (repr, len) = heap.read_payload(string, |b| (b.repr(), b.len));
     match repr {
         JsStringBodyRepr::SeqFlat | JsStringBodyRepr::SeqLatin1 => Some((string, 0, len)),
@@ -1528,7 +1551,10 @@ fn flat_content_range(body: &JsStringBody, start: u32, len: u32) -> Option<FlatC
 }
 
 /// Uncached body walk backing [`to_utf16_vec`]. Always re-materialises.
-fn materialize_utf16_vec(heap: &GcHeap, string: JsStringHandle) -> Vec<u16> {
+fn materialize_utf16_vec(
+    heap: &impl crate::heap_read::HeapRead,
+    string: JsStringHandle,
+) -> Vec<u16> {
     let len = heap.read_payload(string, |b| b.len);
     let mut out: Vec<u16> = Vec::with_capacity(len as usize);
     let mut stack: Vec<(JsStringHandle, u32, u32)> = Vec::new();

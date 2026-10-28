@@ -433,7 +433,7 @@ struct MappedArgumentsData {
 /// A mapped argument's aliased binding: the parameter-scope context and slot.
 type MappedCell = (crate::context::ContextHandle, u16);
 
-fn mapped_read(heap: &otter_gc::GcHeap, (context, slot): MappedCell) -> Value {
+fn mapped_read(heap: &impl crate::heap_read::HeapRead, (context, slot): MappedCell) -> Value {
     crate::context::read_slot(heap, context, slot).unwrap_or_else(Value::undefined)
 }
 
@@ -557,7 +557,10 @@ pub(crate) fn alloc_accessor_cell(
 
 /// Read the `(getter, setter)` pair from an accessor slot's flat value,
 /// mapping the `undefined` sentinel back to `None`.
-fn read_accessor_cell(heap: &GcHeap, cell_value: Value) -> (Option<Value>, Option<Value>) {
+fn read_accessor_cell(
+    heap: &impl crate::heap_read::HeapRead,
+    cell_value: Value,
+) -> (Option<Value>, Option<Value>) {
     let Some(cell) = cell_value
         .as_raw_gc()
         .and_then(|raw| raw.checked_cast::<AccessorCellBody>())
@@ -2288,7 +2291,7 @@ impl ObjectBody {
 
     /// Read the data value for string-keyed slot `i`.
     #[inline]
-    fn data_value(&self, _heap: &otter_gc::GcHeap, i: usize) -> Value {
+    fn data_value(&self, _heap: &impl crate::heap_read::HeapRead, i: usize) -> Value {
         self.slot_word(i)
     }
 
@@ -2450,7 +2453,11 @@ impl ObjectBody {
 
     /// Read descriptor facts from their sole shape or dictionary owner.
     #[inline]
-    fn slot_attrs(&self, heap: &otter_gc::GcHeap, i: usize) -> (PropertyFlags, bool) {
+    fn slot_attrs(
+        &self,
+        heap: &impl crate::heap_read::HeapRead,
+        i: usize,
+    ) -> (PropertyFlags, bool) {
         if !self.is_dictionary()
             && let Some(attrs) = shape_body::shape_slot_attrs(heap, self.shape, i as u32)
         {
@@ -2481,7 +2488,7 @@ impl ObjectBody {
     }
 
     /// [`PropertyLookup`] for the string-keyed slot at `i`.
-    fn slot_lookup_at(&self, heap: &otter_gc::GcHeap, i: usize) -> PropertyLookup {
+    fn slot_lookup_at(&self, heap: &impl crate::heap_read::HeapRead, i: usize) -> PropertyLookup {
         let (flags, is_accessor) = self.slot_attrs(heap, i);
         self.slot_lookup_with(heap, i, flags, is_accessor)
     }
@@ -2490,7 +2497,7 @@ impl ObjectBody {
     /// the caller already holds.
     fn slot_lookup_with(
         &self,
-        heap: &otter_gc::GcHeap,
+        heap: &impl crate::heap_read::HeapRead,
         i: usize,
         flags: PropertyFlags,
         is_accessor: bool,
@@ -3938,7 +3945,13 @@ fn apply_mapped_arguments_partial_define(
 
 /// Immutable semantic state of an object's exact hidden class.
 #[must_use]
-pub fn state(obj: JsObject, heap: &GcHeap) -> ShapeState {
+pub fn state(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeState {
+    state_in(obj, heap)
+}
+
+/// [`state`] over any heap reader.
+#[inline]
+pub(crate) fn state_in(obj: JsObject, heap: &impl crate::heap_read::HeapRead) -> ShapeState {
     heap.read_payload(obj, ObjectBody::state)
 }
 
@@ -3967,7 +3980,10 @@ pub fn is_empty(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
 /// Slot-layout epoch of a dictionary-mode `obj`, or `None` when it is shaped,
 /// was never in dictionary mode, or has saturated past any provable value.
 /// See [`ObjectBody::dictionary_layout`].
-pub(crate) fn dictionary_layout(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<u32> {
+pub(crate) fn dictionary_layout(
+    obj: JsObject,
+    heap: &impl crate::heap_read::HeapRead,
+) -> Option<u32> {
     heap.read_payload(obj, |body| {
         let layout = body.dictionary_layout();
         (body.is_dictionary() && layout != 0 && layout != u32::MAX).then_some(layout)
@@ -4006,7 +4022,6 @@ pub(crate) fn dictionary_layout_validity(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
 ) -> Option<std::sync::Arc<prototype_validity::PrototypeValidity>> {
-    heap.assert_outside_compilation("dictionary layout proof");
     heap.read_payload(obj, |body| {
         if !body.is_dictionary() {
             return None;
@@ -4021,7 +4036,7 @@ pub(crate) fn dictionary_layout_validity(
 /// none: what a compilation reads.
 pub(crate) fn current_dictionary_layout_validity(
     obj: JsObject,
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
 ) -> Option<std::sync::Arc<prototype_validity::PrototypeValidity>> {
     heap.read_payload(obj, |body| {
         if !body.is_dictionary() {
@@ -4042,7 +4057,7 @@ pub(crate) fn invalidate_dictionary_layout_proof(obj: JsObject, heap: &otter_gc:
     });
 }
 
-pub(crate) fn shape_id(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeId {
+pub(crate) fn shape_id(obj: JsObject, heap: &impl crate::heap_read::HeapRead) -> ShapeId {
     heap.read_payload(obj, |body| body_shape_id(heap, body))
 }
 
@@ -4063,21 +4078,25 @@ pub(crate) fn data_value_at(obj: JsObject, heap: &otter_gc::GcHeap, slot: u16) -
     })
 }
 
-fn body_shape_id(heap: &otter_gc::GcHeap, body: &ObjectBody) -> ShapeId {
+fn body_shape_id(heap: &impl crate::heap_read::HeapRead, body: &ObjectBody) -> ShapeId {
     if !body.is_dictionary() {
         return heap.read_payload(body.shape, shape_body::ShapeBody::id);
     }
     body.dictionary_shape_id()
 }
 
-fn body_property_count(heap: &otter_gc::GcHeap, body: &ObjectBody) -> usize {
+fn body_property_count(heap: &impl crate::heap_read::HeapRead, body: &ObjectBody) -> usize {
     if !body.is_dictionary() {
         return shape_body::shape_property_count(heap, body.shape) as usize;
     }
     body.dict_key_count()
 }
 
-pub(super) fn body_offset_of(heap: &otter_gc::GcHeap, body: &ObjectBody, key: &str) -> Option<u32> {
+pub(super) fn body_offset_of(
+    heap: &impl crate::heap_read::HeapRead,
+    body: &ObjectBody,
+    key: &str,
+) -> Option<u32> {
     if !body.is_dictionary() {
         debug_assert_object_shape_handle(body.shape, "property offset lookup");
         return shape_body::shape_offset_of_str(heap, body.shape, key);
@@ -4113,7 +4132,10 @@ pub(super) fn body_offset_of_atom(
 /// Number of own string-keyed properties recorded in a fast-mode
 /// shape (`0` for a dictionary shape). Used to decide when an object should
 /// normalize to dictionary storage.
-pub(crate) fn shape_property_count(shape: ShapeHandle, heap: &otter_gc::GcHeap) -> u32 {
+pub(crate) fn shape_property_count(
+    shape: ShapeHandle,
+    heap: &impl crate::heap_read::HeapRead,
+) -> u32 {
     shape_body::shape_property_count(heap, shape)
 }
 
@@ -4185,7 +4207,10 @@ fn body_key_matches(
 /// This excludes string exotic wrappers and objects that have taken delete-like
 /// mutations reserved for future dictionary storage.
 #[must_use]
-pub(crate) fn supports_fast_property_ic(obj: JsObject, heap: &otter_gc::GcHeap) -> bool {
+pub(crate) fn supports_fast_property_ic(
+    obj: JsObject,
+    heap: &impl crate::heap_read::HeapRead,
+) -> bool {
     heap.read_payload(obj, shape_cache::supports_fast_property_ic)
 }
 
@@ -4228,7 +4253,17 @@ pub fn get_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Valu
 /// - <https://tc39.es/ecma262/#sec-ordinaryget>
 #[must_use]
 pub fn get(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
-    match lookup(obj, heap, key) {
+    get_in(obj, heap, key)
+}
+
+/// [`get`] over any heap reader.
+#[inline]
+pub(crate) fn get_in(
+    obj: JsObject,
+    heap: &impl crate::heap_read::HeapRead,
+    key: &str,
+) -> Option<Value> {
+    match lookup_in(obj, heap, key) {
         PropertyLookup::Absent => None,
         PropertyLookup::Data { value, .. } => Some(value),
         PropertyLookup::Accessor { .. } => Some(Value::undefined()),
@@ -4243,6 +4278,16 @@ pub fn get(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Option<Value> {
 /// - <https://tc39.es/ecma262/#sec-ordinarygetownproperty>
 #[must_use]
 pub fn lookup_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> PropertyLookup {
+    lookup_own_in(obj, heap, key)
+}
+
+/// [`lookup_own`] over any heap reader.
+#[inline]
+pub(crate) fn lookup_own_in(
+    obj: JsObject,
+    heap: &impl crate::heap_read::HeapRead,
+    key: &str,
+) -> PropertyLookup {
     heap.read_payload(obj, |body| match body_offset_of(heap, body, key) {
         Some(offset) => {
             let mut lookup = body.slot_lookup_at(heap, offset as usize);
@@ -4261,7 +4306,7 @@ pub fn lookup_own(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> Property
 #[must_use]
 pub(crate) fn lookup_own_slot(
     obj: JsObject,
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     key: &str,
 ) -> (Option<OwnPropertySlotHit>, PropertyLookup) {
     heap.read_payload(obj, |body| match body_offset_of(heap, body, key) {
@@ -4291,7 +4336,7 @@ pub(crate) fn lookup_own_slot(
 #[must_use]
 pub(crate) fn data_slot_value_at(
     obj: JsObject,
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     slot: u16,
 ) -> Option<Value> {
     heap.read_payload(obj, |body| {
@@ -4316,7 +4361,7 @@ pub(crate) fn has_symbol_side_table(obj: JsObject, heap: &otter_gc::GcHeap) -> b
 #[must_use]
 pub(crate) fn lookup_own_atom(
     obj: JsObject,
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     key: AtomizedPropertyKey<'_>,
 ) -> AtomPropertyLookup {
     lookup_own_atom_with(obj, heap, key, |shape, atom| {
@@ -4358,7 +4403,7 @@ pub(crate) fn get_data_atom(
 /// of earlier walks: a shape's slots never change.
 pub(crate) fn lookup_own_atom_with(
     obj: JsObject,
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     key: AtomizedPropertyKey<'_>,
     slot_of: impl FnOnce(ShapeHandle, crate::property_atom::AtomId) -> Option<shape_body::ShapeSlot>,
 ) -> AtomPropertyLookup {
@@ -4383,7 +4428,7 @@ pub(crate) fn lookup_own_atom_with(
 }
 
 fn lookup_resolved_slot(
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     body: &ObjectBody,
     key: AtomizedPropertyKey<'_>,
     resolved: Option<(u32, PropertyFlags, bool)>,
@@ -4534,7 +4579,7 @@ pub(crate) fn load_proven_getter(obj: JsObject, heap: &GcHeap, slot: u16) -> Opt
 /// or `None` when no slot of that layout sits there.
 pub(crate) fn load_slot_at_field(
     obj: JsObject,
-    heap: &GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     field: FieldLocation,
 ) -> Option<Value> {
     heap.read_payload(obj, |body| {
@@ -4562,22 +4607,32 @@ pub(crate) fn store_proven_data_slot(obj: JsObject, heap: &mut GcHeap, slot: u16
 /// - <https://tc39.es/ecma262/#sec-ordinaryget>
 #[must_use]
 pub fn lookup(obj: JsObject, heap: &otter_gc::GcHeap, key: &str) -> PropertyLookup {
-    match lookup_own(obj, heap, key) {
+    lookup_in(obj, heap, key)
+}
+
+/// [`lookup`] over any heap reader.
+#[inline]
+pub(crate) fn lookup_in(
+    obj: JsObject,
+    heap: &impl crate::heap_read::HeapRead,
+    key: &str,
+) -> PropertyLookup {
+    match lookup_own_in(obj, heap, key) {
         PropertyLookup::Absent => {}
         hit => return hit,
     }
-    let mut current = prototype(obj, heap);
+    let mut current = prototype_in(obj, heap);
     let mut hops = 0;
     while let Some(proto) = current {
         if hops >= PROTO_CHAIN_HARD_CAP {
             return PropertyLookup::Absent;
         }
         hops += 1;
-        match lookup_own(proto, heap, key) {
+        match lookup_own_in(proto, heap, key) {
             PropertyLookup::Absent => {}
             hit => return hit,
         }
-        current = prototype(proto, heap);
+        current = prototype_in(proto, heap);
     }
     PropertyLookup::Absent
 }
@@ -4612,6 +4667,15 @@ pub fn get_own_descriptor(
 /// (the in-payload encoding for JS `null`).
 #[must_use]
 pub fn prototype(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsObject> {
+    prototype_in(obj, heap)
+}
+
+/// [`prototype`] over any heap reader.
+#[inline]
+pub(crate) fn prototype_in(
+    obj: JsObject,
+    heap: &impl crate::heap_read::HeapRead,
+) -> Option<JsObject> {
     heap.read_payload(obj, |body| match &body.prototype() {
         ObjectPrototype::Object(proto) => Some(*proto),
         ObjectPrototype::Null | ObjectPrototype::Value(_) | ObjectPrototype::Proxy(_) => None,
@@ -4621,6 +4685,15 @@ pub fn prototype(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<JsObject> {
 /// Borrow the current prototype as a JS value, if any.
 #[must_use]
 pub fn prototype_value(obj: JsObject, heap: &otter_gc::GcHeap) -> Option<Value> {
+    prototype_value_in(obj, heap)
+}
+
+/// [`prototype_value`] over any heap reader.
+#[inline]
+pub(crate) fn prototype_value_in(
+    obj: JsObject,
+    heap: &impl crate::heap_read::HeapRead,
+) -> Option<Value> {
     heap.read_payload(obj, |body| body.prototype().as_value())
 }
 
@@ -5555,7 +5628,7 @@ pub(crate) fn set_deferred_namespace_populated(obj: JsObject, heap: &otter_gc::G
 /// The object's hidden class: a keyed shape, or its lineage's dictionary
 /// shape in dictionary mode.
 #[must_use]
-pub(crate) fn shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {
+pub(crate) fn shape(obj: JsObject, heap: &impl crate::heap_read::HeapRead) -> ShapeHandle {
     heap.read_payload(obj, |body| body.shape)
 }
 
@@ -5563,7 +5636,7 @@ pub(crate) fn shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {
 /// mode. Caches and generated guards that prove a layout by shape identity
 /// must name this, never the lineage's shared dictionary shape.
 #[must_use]
-pub(crate) fn keyed_shape(obj: JsObject, heap: &otter_gc::GcHeap) -> ShapeHandle {
+pub(crate) fn keyed_shape(obj: JsObject, heap: &impl crate::heap_read::HeapRead) -> ShapeHandle {
     heap.read_payload(obj, ObjectBody::keyed_shape)
 }
 
@@ -5720,7 +5793,7 @@ pub(crate) fn ordinary_set_data_property_with_shape(
 #[must_use]
 pub(crate) fn cached_instance_root(
     proto: JsObject,
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
 ) -> Option<ShapeHandle> {
     heap.read_payload(proto, |body| {
         body.exotic()
@@ -9067,7 +9140,11 @@ pub(crate) fn field_location(shape: ShapeHandle, slot: u32) -> FieldLocation {
 }
 
 /// Resolve a dictionary or shaped object's immutable prefix layout.
-pub(crate) fn field_location_at(object: JsObject, heap: &GcHeap, slot: u32) -> FieldLocation {
+pub(crate) fn field_location_at(
+    object: JsObject,
+    heap: &impl crate::heap_read::HeapRead,
+    slot: u32,
+) -> FieldLocation {
     field_location(self::shape(object, heap), slot)
 }
 

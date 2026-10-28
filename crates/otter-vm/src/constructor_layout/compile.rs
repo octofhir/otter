@@ -23,7 +23,7 @@ use crate::{ExecutionContext, Interpreter, VmError};
 /// The finalized, attached family `family_id` of base constructor `base`,
 /// with its new.target owner function and whether that owner is a class.
 pub(crate) fn finalized_layout(
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     shared: &crate::compile_shared::CompileShared,
     family_id: u64,
     base: u32,

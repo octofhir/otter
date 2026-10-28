@@ -76,7 +76,7 @@ pub(crate) struct IntrinsicLayoutStamp {
 /// [`Interpreter::intrinsic_stamp_prototypes`] order), `%String.prototype%`
 /// and the active realm, and the shapes it names.
 pub(crate) fn layout_stamp(
-    heap: &otter_gc::GcHeap,
+    heap: &impl crate::heap_read::HeapRead,
     prototypes: [Option<object::JsObject>; 5],
     string_prototype: Option<object::JsObject>,
     active_realm: u32,

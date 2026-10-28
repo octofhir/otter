@@ -67,7 +67,11 @@ impl CollectionFastOp {
         }
     }
 
-    pub(crate) fn matches_builtin(self, method: Value, heap: &otter_gc::GcHeap) -> bool {
+    pub(crate) fn matches_builtin(
+        self,
+        method: Value,
+        heap: &impl crate::heap_read::HeapRead,
+    ) -> bool {
         if self.is_map() {
             crate::bootstrap_collections::is_map_prototype_builtin(method, heap, self.name())
         } else {

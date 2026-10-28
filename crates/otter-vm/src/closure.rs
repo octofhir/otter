@@ -465,7 +465,13 @@ impl JsClosure {
 
     /// The context this closure was created over, or `undefined`.
     #[must_use]
-    pub fn context(self, heap: &GcHeap) -> Value {
+    pub fn context(self, heap: &otter_gc::GcHeap) -> Value {
+        self.context_in(heap)
+    }
+
+    /// [`Self::context`] over any heap reader.
+    #[inline]
+    pub(crate) fn context_in(self, heap: &impl crate::heap_read::HeapRead) -> Value {
         heap.read_payload(self.handle, |body| body.call_header.context)
     }
 
@@ -485,7 +491,7 @@ impl JsClosure {
 
     /// This closure's rare record, if allocated.
     #[must_use]
-    pub(crate) fn rare(self, heap: &GcHeap) -> Option<ClosureRareHandle> {
+    pub(crate) fn rare(self, heap: &impl crate::heap_read::HeapRead) -> Option<ClosureRareHandle> {
         heap.read_payload(self.handle, JsClosureBody::rare)
     }
 
@@ -500,7 +506,11 @@ impl JsClosure {
     }
 
     /// Read the rare record with `read`, or `None` without one.
-    fn with_rare<R>(self, heap: &GcHeap, read: impl FnOnce(&ClosureRareBody) -> R) -> Option<R> {
+    fn with_rare<R>(
+        self,
+        heap: &impl crate::heap_read::HeapRead,
+        read: impl FnOnce(&ClosureRareBody) -> R,
+    ) -> Option<R> {
         let rare = self.rare(heap)?;
         Some(heap.read_payload(rare, read))
     }
@@ -508,7 +518,13 @@ impl JsClosure {
     /// This closure instance's own-property bag, if it has been
     /// materialized. The zero compressed handle denotes an absent bag.
     #[must_use]
-    pub fn own_props(self, heap: &GcHeap) -> Option<JsObject> {
+    pub fn own_props(self, heap: &otter_gc::GcHeap) -> Option<JsObject> {
+        self.own_props_in(heap)
+    }
+
+    /// [`Self::own_props`] over any heap reader.
+    #[inline]
+    pub(crate) fn own_props_in(self, heap: &impl crate::heap_read::HeapRead) -> Option<JsObject> {
         self.with_rare(heap, |rare| rare.own_props)
             .filter(|bag| !bag.is_null())
     }

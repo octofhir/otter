@@ -51,18 +51,45 @@ pub(crate) struct RegisterContract {
     /// `None` means division has ordinary inputs, output and temporaries.
     pub(crate) integer_division: Option<IntDivisionRegisters>,
     pub(crate) receiver_allocation: ReceiverAllocationRegisters,
-    /// The receiver and result words of the compiler's named-load probe,
-    /// which preserves every other allocatable register.
+    /// The receiver and result words of the compiler's named-load probe and
+    /// the allocatable registers it writes besides its result.
     pub(crate) property_probe: PropertyProbeRegisters,
+    /// The receiver and value words of the compiler's named-store probe and
+    /// the allocatable registers it writes.
+    pub(crate) property_store_probe: PropertyStoreProbeRegisters,
+    /// The receiver and key words of the compiler's keyed-load probe and the
+    /// allocatable registers it writes.
+    pub(crate) keyed_load_probe: KeyedLoadProbeRegisters,
 }
 
 /// The fixed words of the compiler's named-load probe routine: it reads the
-/// receiver from `receiver`, leaves a hit's value in `result` and writes no
-/// other allocatable register.
+/// receiver from `receiver`, which it preserves, leaves a hit's value in
+/// `result` and writes no other allocatable register outside `clobbers`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PropertyProbeRegisters {
     pub(crate) receiver: u8,
     pub(crate) result: u8,
+    pub(crate) clobbers: &'static [u8],
+}
+
+/// The fixed words of the compiler's named-store probe routine: it reads the
+/// receiver and value from their words, which it preserves, and writes no
+/// allocatable register outside `clobbers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PropertyStoreProbeRegisters {
+    pub(crate) receiver: u8,
+    pub(crate) value: u8,
+    pub(crate) clobbers: &'static [u8],
+}
+
+/// The fixed words of the compiler's keyed-load probe routine: it reads the
+/// receiver and key from their words, which it preserves, and writes no
+/// allocatable register outside `clobbers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyedLoadProbeRegisters {
+    pub(crate) receiver: u8,
+    pub(crate) key: u8,
+    pub(crate) clobbers: &'static [u8],
 }
 
 impl RegisterContract {
@@ -132,12 +159,51 @@ impl RegisterContract {
             "receiver allocation preserves its new.target input"
         );
         let probe = self.property_probe;
-        for register in [probe.receiver, probe.result] {
+        assert!(
+            !probe.clobbers.contains(&probe.receiver) && !probe.clobbers.contains(&probe.result),
+            "the load probe preserves its receiver"
+        );
+        for register in [probe.receiver, probe.result]
+            .into_iter()
+            .chain(probe.clobbers.iter().copied())
+        {
             assert!(
                 register < 32 && general & (1 << register) != 0,
                 "fixed probe word must have an allocatable physical register"
             );
         }
+        let store = self.property_store_probe;
+        for register in [store.receiver, store.value]
+            .into_iter()
+            .chain(store.clobbers.iter().copied())
+        {
+            assert!(
+                register < 32 && general & (1 << register) != 0,
+                "fixed probe word must have an allocatable physical register"
+            );
+        }
+        assert!(
+            store.receiver != store.value
+                && !store.clobbers.contains(&store.receiver)
+                && !store.clobbers.contains(&store.value),
+            "the store probe preserves its inputs"
+        );
+        let keyed = self.keyed_load_probe;
+        for register in [keyed.receiver, keyed.key]
+            .into_iter()
+            .chain(keyed.clobbers.iter().copied())
+        {
+            assert!(
+                register < 32 && general & (1 << register) != 0,
+                "fixed probe word must have an allocatable physical register"
+            );
+        }
+        assert!(
+            keyed.receiver != keyed.key
+                && !keyed.clobbers.contains(&keyed.receiver)
+                && !keyed.clobbers.contains(&keyed.key),
+            "the keyed load probe preserves its inputs"
+        );
         if let Some(pair) = self.integer_division {
             assert_ne!(
                 pair.quotient, pair.remainder,
@@ -171,8 +237,19 @@ pub(crate) const AARCH64: RegisterContract = RegisterContract {
         clobbers: &[1, 4, 11, 12, 13, 14, 15],
     },
     property_probe: PropertyProbeRegisters {
-        receiver: 1,
+        receiver: 9,
         result: 0,
+        clobbers: &[3, 10, 11, 13, 14, 15],
+    },
+    property_store_probe: PropertyStoreProbeRegisters {
+        receiver: 12,
+        value: 9,
+        clobbers: &[3, 10, 11, 13, 14, 15],
+    },
+    keyed_load_probe: KeyedLoadProbeRegisters {
+        receiver: 9,
+        key: 10,
+        clobbers: &[0, 3, 11, 12, 13, 14, 15],
     },
 };
 
@@ -199,6 +276,17 @@ pub(crate) const X86_64: RegisterContract = RegisterContract {
     property_probe: PropertyProbeRegisters {
         receiver: 6,
         result: 0,
+        clobbers: &[],
+    },
+    property_store_probe: PropertyStoreProbeRegisters {
+        receiver: 6,
+        value: 2,
+        clobbers: &[],
+    },
+    keyed_load_probe: KeyedLoadProbeRegisters {
+        receiver: 6,
+        key: 1,
+        clobbers: &[0],
     },
 };
 

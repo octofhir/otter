@@ -615,6 +615,108 @@ pub(crate) fn emit_write_barrier_with_context(
     dynasm!(ops ; .arch aarch64 ; blr x16 ; =>done);
 }
 
+/// [`emit_write_barrier`] that preserves every register but `x16` and `x17`:
+/// the fast path uses only those, and the slow path saves the volatile
+/// general and floating registers and the link around its leaf call.
+/// `parent` and `child` must not be `x16` or `x17`.
+pub(crate) fn emit_write_barrier_preserving(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    parent: u8,
+    child: u8,
+) {
+    debug_assert!(!matches!(parent, 16 | 17) && !matches!(child, 16 | 17));
+    let flags_byte = view.gc_barrier.header_flags_byte;
+    let young = view.gc_barrier.young_flag;
+    let settled = young | view.gc_barrier.remembered_flag;
+    let slow = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    let generational = ops.new_dynamic_label();
+    dynasm!(ops
+        ; .arch aarch64
+        ; cbz W(child), =>done
+        ; ldr x16, [x20, THREAD_OFFSET]
+        ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
+        ; ldrb w16, [x16]
+        ; cbz w16, =>generational
+        // While marking runs, a white old child owes the insertion barrier.
+        ; ldrb w16, [X(child), flags_byte]
+        ; movz w17, young
+        ; tst w16, w17
+        ; b.ne =>generational
+        ; movz w17, view.gc_barrier.mark_color_bits
+        ; tst w16, w17
+        ; b.eq =>slow
+        ; =>generational
+        ; ldrb w16, [X(parent), flags_byte]
+        ; movz w17, settled
+        ; tst w16, w17
+        ; b.ne =>done
+        // An old, unrecorded parent: only a nursery child owes the
+        // remembered set an entry.
+        ; ldrb w16, [X(child), flags_byte]
+        ; movz w17, young
+        ; tst w16, w17
+        ; b.eq =>done
+        ; =>slow
+    );
+    emit_preserving_leaf_call(
+        ops,
+        relocations,
+        [parent, child],
+        otter_vm::runtime_stubs::WRITE_BARRIER_MUTATING.entry_addr() as u64,
+        otter_vm::native_abi::STUB_WRITE_BARRIER,
+    );
+    dynasm!(ops ; .arch aarch64 ; =>done);
+}
+
+/// Bytes of the save area [`emit_preserving_leaf_call`] reserves: `x0`–`x18`,
+/// the link, `d0`–`d7` and `d16`–`d31`.
+const PRESERVING_SAVE_BYTES: u32 = 352;
+
+/// Call the leaf runtime stub `stub` with the heap in `x0` and the words of
+/// `[first, second]` in `x1` and `x2`, every volatile register (`x16` and
+/// `x17` included) and the link preserved through a save area.
+pub(crate) fn emit_preserving_leaf_call(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    [first, second]: [u8; 2],
+    entry: u64,
+    stub: otter_vm::native_abi::RuntimeStubDescriptor,
+) {
+    dynasm!(ops ; .arch aarch64 ; sub sp, sp, PRESERVING_SAVE_BYTES);
+    for register in 0u8..19 {
+        dynasm!(ops ; .arch aarch64 ; str X(register), [sp, u32::from(register) * 8]);
+    }
+    dynasm!(ops ; .arch aarch64 ; str x30, [sp, #152]);
+    for (index, register) in (0u8..8).chain(16..32).enumerate() {
+        dynasm!(ops ; .arch aarch64 ; str D(register), [sp, 160 + index as u32 * 8]);
+    }
+    // The operands are read back from their saved words: either may sit in
+    // an argument register.
+    for (argument, register) in [(1u8, first), (2, second)] {
+        if register < 19 {
+            dynasm!(ops ; .arch aarch64 ; ldr X(argument), [sp, u32::from(register) * 8]);
+        } else {
+            dynasm!(ops ; .arch aarch64 ; mov X(argument), X(register));
+        }
+    }
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x0, [x20, THREAD_OFFSET]
+        ; ldr x0, [x0, VM_THREAD_GC_HEAP_OFFSET]);
+    emit_load_runtime_stub(ops, relocations, 16, entry, stub);
+    dynasm!(ops ; .arch aarch64 ; blr x16);
+    for (index, register) in (0u8..8).chain(16..32).enumerate() {
+        dynasm!(ops ; .arch aarch64 ; ldr D(register), [sp, 160 + index as u32 * 8]);
+    }
+    for register in 0u8..19 {
+        dynasm!(ops ; .arch aarch64 ; ldr X(register), [sp, u32::from(register) * 8]);
+    }
+    dynasm!(ops ; .arch aarch64 ; ldr x30, [sp, #152] ; add sp, sp, PRESERVING_SAVE_BYTES);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

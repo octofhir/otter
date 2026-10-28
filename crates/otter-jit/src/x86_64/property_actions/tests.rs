@@ -109,13 +109,12 @@ impl Fixture {
             load_validity_byte: 56,
             store_validity_byte: 64,
             shape_id_byte: SHAPE_ID_BYTE,
-            hash_shape_multiplier: 0x9e37_79b9_7f4a_7c15,
-            hash_atom_multiplier: 0xc2b2_ae3d_27d4_eb4f,
-            hash_shift: 32,
+            hash_multiplier: 0x9e37_79b9_7f4a_7c15,
+            hash_atom_shift: 32,
+            hash_shift: 64 - 9,
         };
-        let hash = RECEIVER_ID.wrapping_mul(cache.hash_shape_multiplier)
-            ^ u64::from(atom).wrapping_mul(cache.hash_atom_multiplier);
-        let set = ((hash >> cache.hash_shift) & u64::from(cache.set_mask)) as usize;
+        let key = RECEIVER_ID ^ (u64::from(atom) << cache.hash_atom_shift);
+        let set = (key.wrapping_mul(cache.hash_multiplier) >> cache.hash_shift) as usize;
         let mut fixture = Self {
             cells,
             table,
@@ -490,7 +489,10 @@ fn own_data_reads_readonly_and_current_suffix_while_store_requires_its_action() 
 
 #[test]
 fn every_miss_finishes_before_any_slot_or_shape_effect() {
-    for refusal in 0..14 {
+    // Shape state is immutable and the table records no store fact for a
+    // dictionary, opaque, prototype or non-extensible source shape, so the
+    // probe tests none.
+    for refusal in [0, 1, 2, 7, 8, 9, 10, 11, 12, 13] {
         let mut f = Fixture::new(4);
         f.append(5, false);
         match refusal {
@@ -499,24 +501,6 @@ fn every_miss_finishes_before_any_slot_or_shape_effect() {
             2 => f.table_u8(
                 f.entry + 13,
                 otter_vm::jit::PropertyStoreAction::Unknown as u8,
-            ),
-            3 => f.cell_u8(
-                SHAPE + f.view.shape_state_byte as usize,
-                ShapeState::ORDINARY.with_dictionary(true).bits(),
-            ),
-            4 => f.cell_u8(
-                SHAPE + f.view.shape_state_byte as usize,
-                ShapeState::ORDINARY
-                    .with_lookup(otter_vm::object::LookupFact::HostLookup, true)
-                    .bits(),
-            ),
-            5 => f.cell_u8(
-                SHAPE + f.view.shape_state_byte as usize,
-                ShapeState::ORDINARY.with_prototype_role(true).bits(),
-            ),
-            6 => f.cell_u8(
-                SHAPE + f.view.shape_state_byte as usize,
-                ShapeState::ORDINARY.with_extensible(false).bits(),
             ),
             7 => {
                 f.table_u64(

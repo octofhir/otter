@@ -30,12 +30,63 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::{
     JitCompileSnapshot,
     jit::{JitPropertyActionCache, PropertyLoadAction, PropertyStoreAction},
-    object::ShapeState,
     value::tag,
 };
 
 use super::values::{emit_load_symbol_u64, emit_load_u64};
 use crate::artifact::relocation::{PropertySourceAccess, RelocationCapture, RelocationTarget};
+
+/// The bytes of one set as `odd << shift` with `odd` one of 1, 3, 5 or 9, so
+/// a set index scales into the table with one `lea` and a shift.
+fn set_stride(cache: JitPropertyActionCache) -> Option<(u32, u32)> {
+    let stride = u64::from(cache.entry_bytes) * u64::from(cache.ways);
+    let shift = stride.trailing_zeros();
+    matches!(stride >> shift, 1 | 3 | 5 | 9).then_some(((stride >> shift) as u32, shift))
+}
+
+/// `Rq(entry)` = the first entry of the set the key `(Rq(identity),
+/// Rd(atom))` hashes to: one multiply of the shape identity XOR the shifted
+/// atom, whose top bits are the set index, scaled by `lea` and a shift.
+/// Clobbers `r11`.
+fn emit_set_address(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    cache: JitPropertyActionCache,
+    [identity, atom]: [u8; 2],
+    entry: u8,
+) {
+    let (odd, shift) = set_stride(cache).expect("validated set stride");
+    if cache.set_mask == 0 {
+        dynasm!(ops ; .arch x64 ; xor Rd(entry), Rd(entry));
+    } else {
+        // The atom register's upper half is not read: the shift drops it.
+        dynasm!(ops ; .arch x64
+            ; mov Rq(entry), Rq(atom)
+            ; shl Rq(entry), cache.hash_atom_shift as i8
+            ; xor Rq(entry), Rq(identity));
+        emit_load_u64(ops, 11, cache.hash_multiplier);
+        dynasm!(ops ; .arch x64
+            ; imul Rq(entry), r11
+            ; shr Rq(entry), cache.hash_shift as i8);
+        match odd {
+            3 => dynasm!(ops ; .arch x64 ; lea Rq(entry), [Rq(entry) + Rq(entry) * 2]),
+            5 => dynasm!(ops ; .arch x64 ; lea Rq(entry), [Rq(entry) + Rq(entry) * 4]),
+            9 => dynasm!(ops ; .arch x64 ; lea Rq(entry), [Rq(entry) + Rq(entry) * 8]),
+            _ => {}
+        }
+        if shift != 0 {
+            dynasm!(ops ; .arch x64 ; shl Rq(entry), shift as i8);
+        }
+    }
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        11,
+        cache.table_addr as u64,
+        RelocationTarget::PropertyActionCacheTable,
+    );
+    dynasm!(ops ; .arch x64 ; add Rq(entry), r11);
+}
 
 /// Probe a key once, then consume only the requested independent action.
 ///
@@ -83,12 +134,14 @@ pub(crate) fn emit_action_probe(
             && cache.entry_bytes < 4096
             && cache.ways != 0
             && cache.ways <= u32::from(u16::MAX)
-            && cache.hash_shift < 64
+            && (cache.set_mask + 1).is_power_of_two()
+            && u32::from(cache.hash_shift) + (cache.set_mask + 1).trailing_zeros() == 64
+            && cache.hash_atom_shift < 64
+            && set_stride(*cache).is_some()
     }) else {
         dynasm!(ops ; .arch x64 ; jmp =>miss);
         return;
     };
-    let store = matches!(access, PropertySourceAccess::Store);
     emit_load_u64(ops, 10, tag::NOT_CELL_MASK);
     dynasm!(ops ; .arch x64
         ; test Rq(receiver), r10 ; jnz =>miss
@@ -102,41 +155,13 @@ pub(crate) fn emit_action_probe(
         ; add Rq(shape), r10
     );
     // The table records loads only for shaped receivers with ordinary
-    // lookup: a dictionary or opaque receiver's shape id keys no load entry,
-    // so a load probe needs no state test. A store also refuses a prototype
-    // receiver, whose stores reach the prototype-validity owner.
-    if store {
-        let excluded = ShapeState::DICTIONARY_MASK
-            | ShapeState::OPAQUE_LOOKUP_MASK
-            | ShapeState::PROTOTYPE_MASK;
-        dynasm!(ops ; .arch x64
-            ; test BYTE [Rq(shape) + view.shape_state_byte as i32], excluded as i8 ; jnz =>miss);
-    }
+    // lookup and stores only for shapes whose stores stay in place: a
+    // dictionary, opaque or prototype receiver's shape id keys no such fact,
+    // and shape state is immutable, so neither probe tests state.
     dynasm!(ops ; .arch x64
         ; mov Rq(identity), [Rq(shape) + cache.shape_id_byte as i32]);
 
-    emit_load_u64(ops, 11, cache.hash_shape_multiplier);
-    dynasm!(ops ; .arch x64 ; mov Rq(entry), Rq(identity) ; imul Rq(entry), r11);
-    // The register holds the zero-extended 32-bit atom.
-    emit_load_u64(ops, 11, cache.hash_atom_multiplier);
-    dynasm!(ops ; .arch x64 ; mov Rd(atom), Rd(atom) ; imul r11, Rq(atom));
-    dynasm!(ops ; .arch x64 ; xor Rq(entry), r11 ; shr Rq(entry), cache.hash_shift as i8);
-    emit_load_u64(ops, 11, u64::from(cache.set_mask));
-    dynasm!(ops ; .arch x64 ; and Rq(entry), r11);
-    emit_load_u64(
-        ops,
-        11,
-        u64::from(cache.entry_bytes) * u64::from(cache.ways),
-    );
-    dynasm!(ops ; .arch x64 ; imul Rq(entry), r11);
-    emit_load_symbol_u64(
-        ops,
-        relocations,
-        11,
-        cache.table_addr as u64,
-        RelocationTarget::PropertyActionCacheTable,
-    );
-    dynasm!(ops ; .arch x64 ; add Rq(entry), r11);
+    emit_set_address(ops, relocations, cache, [identity, atom], entry);
     let way = ops.new_dynamic_label();
     let next = ops.new_dynamic_label();
     let found = ops.new_dynamic_label();
@@ -230,7 +255,8 @@ pub(crate) fn emit_action_probe(
             dynasm!(ops ; .arch x64
                 ; cmp BYTE [Rq(entry) + cache.store_action_byte as i32], PropertyStoreAction::OwnWritable as i8 ; je =>own
                 ; cmp BYTE [Rq(entry) + cache.store_action_byte as i32], PropertyStoreAction::AddOwn as i8 ; jne =>miss
-                ; test BYTE [Rq(shape) + view.shape_state_byte as i32], ShapeState::EXTENSIBLE_MASK as i8 ; jz =>miss
+                // The recorded source shape was extensible, which its
+                // immutable state keeps.
                 // Code subscribed to the shape the receiver leaves: the
                 // runtime store fires it, before anything is written.
                 ; test BYTE [Rq(shape) + view.shape_watched_byte as i32], otter_vm::code_dependencies::ShapeFact::Stable as i8 ; jnz =>miss

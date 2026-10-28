@@ -18,8 +18,8 @@
 use std::mem::{offset_of, size_of};
 
 use super::{
-    HASH_ATOM_MULTIPLIER, HASH_SHAPE_MULTIPLIER, HASH_SHIFT, PropertyActionCache,
-    PropertyActionEntry, SETS, WAYS,
+    HASH_ATOM_SHIFT, HASH_MULTIPLIER, HASH_SHIFT, PropertyActionCache, PropertyActionEntry, SETS,
+    WAYS,
 };
 
 /// Borrow-free layout of the current isolate's shared key/action table.
@@ -66,11 +66,13 @@ pub struct JitPropertyActionCache {
     pub store_validity_byte: u32,
     /// Header-inclusive immutable identity offset within a shape cell.
     pub shape_id_byte: u32,
-    /// Receiver shape hash multiplier.
-    pub hash_shape_multiplier: u64,
-    /// Property atom hash multiplier.
-    pub hash_atom_multiplier: u64,
-    /// Shift after XORing both wrapping products.
+    /// Multiplier of the key word: the receiver shape identity XOR the atom
+    /// shifted left by [`Self::hash_atom_shift`].
+    pub hash_multiplier: u64,
+    /// Left shift of the atom within the key word.
+    pub hash_atom_shift: u8,
+    /// Right shift of the wrapping product that leaves exactly the set index:
+    /// `64 - log2(set_mask + 1)`.
     pub hash_shift: u8,
 }
 
@@ -99,8 +101,8 @@ impl PropertyActionCache {
             store_validity_byte: offset_of!(PropertyActionEntry, store_validity) as u32,
             shape_id_byte: (otter_gc::header::HEADER_SIZE + crate::object::SHAPE_BODY_ID_OFFSET)
                 as u32,
-            hash_shape_multiplier: HASH_SHAPE_MULTIPLIER,
-            hash_atom_multiplier: HASH_ATOM_MULTIPLIER,
+            hash_multiplier: HASH_MULTIPLIER,
+            hash_atom_shift: HASH_ATOM_SHIFT,
             hash_shift: HASH_SHIFT,
         }
     }

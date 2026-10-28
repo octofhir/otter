@@ -19,7 +19,7 @@
 use super::*;
 use crate::CompiledCode;
 use otter_bytecode::{BytecodeModule, Function, FunctionCodeBuilder, Op, SourceKind};
-use otter_vm::{ExecutionContext, Value};
+use otter_vm::{ExecutionContext, Value, object::ShapeState};
 use std::sync::atomic::AtomicU32;
 
 const POISON: u64 = 0xbadc_0ffe_2468_1357;
@@ -220,9 +220,9 @@ fn prepare(arena: &mut [u64], view: &mut JitCompileSnapshot, proof: &AtomicU32) 
         load_validity_byte: 56,
         store_validity_byte: 64,
         shape_id_byte: SHAPE_ID_BYTE,
-        hash_shape_multiplier: 0x9e37_79b9_7f4a_7c15,
-        hash_atom_multiplier: 0xc2b2_ae3d_27d4_eb4f,
-        hash_shift: 32,
+        hash_multiplier: 0x9e37_79b9_7f4a_7c15,
+        hash_atom_shift: 32,
+        hash_shift: 64,
     });
 }
 
@@ -360,23 +360,16 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
     );
     assert_stability(&arena, &view, 0);
 
-    for failure in 0..10 {
+    // Shape state is immutable and the table records no store fact for a
+    // prototype, opaque, dictionary or non-extensible source shape, so the
+    // probe tests none.
+    for failure in [0, 1, 2, 3, 6, 7, 9] {
         prepare(&mut arena, &mut view, &proof);
         match failure {
             0 => put(&mut arena, 152, 10u32), // full key mismatch
             1 => put(&mut arena, 157, PropertyStoreAction::Unknown as u8),
             2 => put(&mut arena, 172, 0u32), // runtime-only transition
             3 => proof.store(0, std::sync::atomic::Ordering::Relaxed),
-            4 => put(
-                &mut arena,
-                RECEIVER_SHAPE + view.shape_state_byte as usize,
-                ShapeState::PROTOTYPE_MASK | ShapeState::EXTENSIBLE_MASK,
-            ),
-            5 => put(
-                &mut arena,
-                RECEIVER_SHAPE + view.shape_state_byte as usize,
-                0u8,
-            ),
             6 => put(&mut arena, CHILD + SHAPE_ID_BYTE as usize, 123u64),
             7 => {
                 put(&mut arena, 160, 2u16);
@@ -386,11 +379,6 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
                     0u32,
                 );
             }
-            8 => put(
-                &mut arena,
-                RECEIVER_SHAPE + view.shape_state_byte as usize,
-                ShapeState::OPAQUE_LOOKUP_MASK | ShapeState::EXTENSIBLE_MASK,
-            ),
             // Code relies on the shape staying stable: the runtime store
             // fires it.
             9 => put(

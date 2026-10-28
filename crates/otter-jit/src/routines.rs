@@ -7,9 +7,9 @@
 //! isolate's shared action table and, on a miss, enter the committed runtime
 //! operation. Each is emitted once per isolate, when a site first calls it,
 //! into the compiler's [`CodeMemory`]; baseline sites call them with their
-//! fixed register inputs. Optimized megamorphic loads call a probe entry that
-//! preserves every allocatable register but its result and completes no miss;
-//! optimized megamorphic stores call through the committed runtime ABI.
+//! fixed register inputs. Optimized named loads and stores call probe entries
+//! that write only their declared registers and complete no miss: the
+//! optimized site enters the committed runtime operation itself.
 //!
 //! # Contents
 //! - [`NativeCodeSpace`] — one compiler's executable memory and routines.
@@ -58,8 +58,12 @@ pub(crate) enum Routine {
     /// [`Self::Load`]'s selection alone, preserving every allocatable
     /// register but its result and reporting a miss instead of completing it.
     ProbeLoad,
-    /// [`Self::Store`] entered through the committed runtime ABI.
-    CommittedStore,
+    /// [`Self::Store`]'s selection alone, writing only its declared clobbers
+    /// and reporting a miss instead of completing it.
+    ProbeStore,
+    /// [`Self::KeyedLoad`]'s shaped table hit alone, writing only its
+    /// declared clobbers and declining everything else without a call.
+    ProbeKeyedLoad,
     /// `ToBoolean` of a value that is not an immediate optimized code tests
     /// inline, preserving every allocatable register.
     Truthy,
@@ -82,7 +86,8 @@ impl Routine {
             Self::KeyedLoad => "keyedLoad",
             Self::KeyedStore => "keyedStore",
             Self::ProbeLoad => "probeLoad",
-            Self::CommittedStore => "committedStore",
+            Self::ProbeStore => "probeStore",
+            Self::ProbeKeyedLoad => "probeKeyedLoad",
             Self::Truthy => "truthy",
             Self::StoreTail => "storeTail",
             Self::FieldObserve => "fieldObserve",
@@ -93,10 +98,10 @@ impl Routine {
     const fn object(self) -> RoutineObject {
         match self {
             Self::Load | Self::ProbeLoad => RoutineObject::Load,
-            Self::Store | Self::CommittedStore => RoutineObject::Store,
+            Self::Store | Self::ProbeStore => RoutineObject::Store,
             Self::Method => RoutineObject::Method,
             Self::Concat => RoutineObject::Concat,
-            Self::KeyedLoad => RoutineObject::KeyedLoad,
+            Self::KeyedLoad | Self::ProbeKeyedLoad => RoutineObject::KeyedLoad,
             Self::KeyedStore => RoutineObject::KeyedStore,
             Self::Truthy => RoutineObject::Truthy,
             Self::StoreTail => RoutineObject::StoreTail,
@@ -106,12 +111,15 @@ impl Routine {
 
     /// Whether this is the second entry of its object.
     const fn second(self) -> bool {
-        matches!(self, Self::ProbeLoad | Self::CommittedStore)
+        matches!(
+            self,
+            Self::ProbeLoad | Self::ProbeStore | Self::ProbeKeyedLoad
+        )
     }
 }
 
-/// One emitted code object: a routine, and for load its probe entry and for
-/// store its committed-ABI entry as well.
+/// One emitted code object: a routine, and for load, store and keyed load
+/// its probe entry as well.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RoutineObject {
     Load,
@@ -156,8 +164,7 @@ impl RoutineObject {
 }
 
 /// Entry offsets of one routine object: the routine and its second entry,
-/// which is the routine itself for an object that has none or whose
-/// committed-ABI inputs already match.
+/// which is the routine itself for an object that has none.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RoutineOffsets {
     pub(crate) entry: usize,

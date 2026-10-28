@@ -33,24 +33,6 @@ impl Codegen<'_> {
         self.emit_committed_call_inner(node, target, arguments, destination, 0)
     }
 
-    /// [`Self::emit_committed_call`] of a routine of the compiler's set that
-    /// takes the committed runtime ABI.
-    pub(super) fn emit_committed_routine_call(
-        &mut self,
-        node: NodeId,
-        routine: crate::routines::Routine,
-        arguments: &[CommittedArgument],
-        destination: Option<u8>,
-    ) -> Result<(), crate::Unsupported> {
-        let target = (
-            self.routines.entry(routine),
-            RelocationTarget::Routine {
-                routine: routine.name(),
-            },
-        );
-        self.emit_committed_call_inner(node, target, arguments, destination, 0)
-    }
-
     pub(super) fn emit_committed_span_call(
         &mut self,
         node: NodeId,

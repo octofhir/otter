@@ -30,7 +30,6 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_vm::{
     JitCompileSnapshot,
     jit::{JitPropertyActionCache, PropertyLoadAction, PropertyStoreAction},
-    object::ShapeState,
 };
 
 /// `X(register)` = `value`: one move when that encodes it, else one load of
@@ -55,8 +54,55 @@ fn layout(view: &JitCompileSnapshot) -> Option<JitPropertyActionCache> {
             && cache.entry_bytes < 4096
             && cache.ways != 0
             && cache.ways <= u32::from(u16::MAX)
-            && cache.hash_shift < 64
+            && (cache.set_mask + 1).is_power_of_two()
+            && u32::from(cache.hash_shift) + (cache.set_mask + 1).trailing_zeros() == 64
+            && cache.hash_atom_shift < 64
+            && set_stride(*cache).is_some()
     })
+}
+
+/// The bytes of one set as `odd << shift` with `odd` one of 1, 3, 5 or 9, so
+/// a set index scales into the table with shifted adds alone.
+fn set_stride(cache: JitPropertyActionCache) -> Option<(u32, u32)> {
+    let stride = u64::from(cache.entry_bytes) * u64::from(cache.ways);
+    let shift = stride.trailing_zeros();
+    matches!(stride >> shift, 1 | 3 | 5 | 9).then_some(((stride >> shift) as u32, shift))
+}
+
+/// `X(entry)` = the first entry of the set the key `(X(shape_id), W(atom))`
+/// hashes to: one multiply of the shape identity XOR the shifted atom, whose
+/// top bits are the set index, scaled by shifted adds. Clobbers `x17`.
+fn emit_set_address(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    cache: JitPropertyActionCache,
+    [shape_id, atom]: [u8; 2],
+    entry: u8,
+) {
+    let (odd, shift) = set_stride(cache).expect("validated set stride");
+    if cache.set_mask == 0 {
+        dynasm!(ops ; .arch aarch64 ; mov X(entry), xzr);
+    } else {
+        load_constant(ops, relocations, 17, cache.hash_multiplier);
+        dynasm!(ops ; .arch aarch64
+            ; eor X(entry), X(shape_id), X(atom), lsl u32::from(cache.hash_atom_shift)
+            ; mul X(entry), X(entry), x17
+            ; lsr X(entry), X(entry), u32::from(cache.hash_shift));
+        match odd {
+            3 => dynasm!(ops ; .arch aarch64 ; add X(entry), X(entry), X(entry), lsl 1),
+            5 => dynasm!(ops ; .arch aarch64 ; add X(entry), X(entry), X(entry), lsl 2),
+            9 => dynasm!(ops ; .arch aarch64 ; add X(entry), X(entry), X(entry), lsl 3),
+            _ => {}
+        }
+    }
+    emit_load_symbol_u64(
+        ops,
+        relocations,
+        17,
+        cache.table_addr as u64,
+        RelocationTarget::PropertyActionCacheTable,
+    );
+    dynasm!(ops ; .arch aarch64 ; add X(entry), x17, X(entry), lsl shift);
 }
 fn registers(inputs: &[u8], temps: [u8; 4]) {
     debug_assert!(inputs.iter().all(|r| *r < 31 && !matches!(*r, 16 | 17)));
@@ -81,7 +127,6 @@ fn key(
     atom: u8,
     receiver: u8,
     [holder, slot, entry, base]: [u8; 4],
-    store: bool,
     miss: DynamicLabel,
 ) {
     dynasm!(ops ; .arch aarch64
@@ -91,63 +136,45 @@ fn key(
         ; ldr W(holder), [X(receiver), view.object_shape_byte] ; cbz W(holder), =>miss
         ; add X(holder), x16, X(holder));
     // The table records loads only for shaped receivers with ordinary
-    // lookup: a dictionary or opaque receiver's shape id keys no load entry,
-    // so a load probe needs no state test. A store also refuses a prototype
-    // receiver, whose stores reach the prototype-validity owner.
-    if store {
-        let mask = ShapeState::DICTIONARY_MASK
-            | ShapeState::OPAQUE_LOOKUP_MASK
-            | ShapeState::PROTOTYPE_MASK;
-        dynasm!(ops ; .arch aarch64 ; ldrb w17, [X(holder), view.shape_state_byte]);
-        emit_load_u64(ops, 16, u64::from(mask));
-        dynasm!(ops ; .arch aarch64 ; tst w17, w16 ; b.ne =>miss);
-    }
+    // lookup and stores only for shapes whose stores stay in place: a
+    // dictionary, opaque or prototype receiver's shape id keys no such fact,
+    // and shape state is immutable, so neither probe tests state.
     dynasm!(ops ; .arch aarch64 ; ldr X(slot), [X(holder), cache.shape_id_byte]);
-    load_constant(ops, relocations, 17, cache.hash_shape_multiplier);
-    dynasm!(ops ; .arch aarch64 ; mul X(entry), X(slot), x17);
-    load_constant(ops, relocations, 17, cache.hash_atom_multiplier);
-    dynasm!(ops ; .arch aarch64 ; mov W(base), W(atom) ; mul x17, X(base), x17);
-    dynasm!(ops ; .arch aarch64 ; eor X(entry), X(entry), x17);
-    let set_bits = (cache.set_mask + 1).trailing_zeros();
-    let stride = u64::from(cache.entry_bytes) * u64::from(cache.ways);
-    let fused = (cache.set_mask + 1).is_power_of_two()
-        && set_bits != 0
-        && u32::from(cache.hash_shift) + set_bits <= 64
-        && stride.is_power_of_two()
-        && stride.trailing_zeros() < 64;
-    if fused {
-        // Set index = hash bits [shift, shift + set_bits), scaled by the
-        // power-of-two set stride into the table.
-        dynasm!(ops ; .arch aarch64
-            ; ubfx X(entry), X(entry), u32::from(cache.hash_shift), set_bits);
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            17,
-            cache.table_addr as u64,
-            RelocationTarget::PropertyActionCacheTable,
-        );
-        dynasm!(ops ; .arch aarch64
-            ; add X(entry), x17, X(entry), lsl stride.trailing_zeros());
-    } else {
-        dynasm!(ops ; .arch aarch64 ; lsr X(entry), X(entry), #u32::from(cache.hash_shift));
-        emit_load_u64(ops, 17, u64::from(cache.set_mask));
-        dynasm!(ops ; .arch aarch64 ; and X(entry), X(entry), x17);
-        emit_load_u64(ops, 17, stride);
-        dynasm!(ops ; .arch aarch64 ; mul X(entry), X(entry), x17);
-        emit_load_symbol_u64(
-            ops,
-            relocations,
-            17,
-            cache.table_addr as u64,
-            RelocationTarget::PropertyActionCacheTable,
-        );
-        dynasm!(ops ; .arch aarch64 ; add X(entry), X(entry), x17);
+    emit_set_address(ops, relocations, cache, [slot, atom], entry);
+    let found = ops.new_dynamic_label();
+    let paired = cache.atom_byte == cache.receiver_shape_id_byte + 8
+        && cache.receiver_shape_id_byte.is_multiple_of(8)
+        && cache.ways <= 8
+        && (cache.ways - 1) * cache.entry_bytes + cache.receiver_shape_id_byte <= 504;
+    if paired {
+        // Every way of the set is one pair load of its key and a compare
+        // chain; a hit beyond the first way rebases the entry address.
+        let mut rebase = Vec::new();
+        for way in 0..cache.ways {
+            let offset = way * cache.entry_bytes + cache.receiver_shape_id_byte;
+            let hit = if way == 0 {
+                found
+            } else {
+                let label = ops.new_dynamic_label();
+                rebase.push((label, way * cache.entry_bytes));
+                label
+            };
+            dynasm!(ops ; .arch aarch64
+                ; ldp x16, x17, [X(entry), offset as i32]
+                ; cmp x16, X(slot)
+                ; ccmp w17, W(atom), #0, eq
+                ; b.eq =>hit);
+        }
+        dynasm!(ops ; .arch aarch64 ; b =>miss);
+        for (label, bytes) in rebase {
+            dynasm!(ops ; .arch aarch64 ; =>label ; add XSP(entry), XSP(entry), bytes ; b =>found);
+        }
+        dynasm!(ops ; .arch aarch64 ; =>found);
+        return;
     }
     emit_load_u64(ops, base, u64::from(cache.ways));
     let way = ops.new_dynamic_label();
     let next = ops.new_dynamic_label();
-    let found = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>way
         ; ldr x16, [X(entry), cache.receiver_shape_id_byte] ; cmp x16, X(slot) ; b.ne =>next
         ; ldr w16, [X(entry), cache.atom_byte]);
@@ -217,17 +244,7 @@ pub(crate) fn emit_load(
         dynasm!(ops ; .arch aarch64 ; b =>miss);
         return;
     };
-    key(
-        ops,
-        relocations,
-        view,
-        cache,
-        atom,
-        receiver,
-        temps,
-        false,
-        miss,
-    );
+    key(ops, relocations, view, cache, atom, receiver, temps, miss);
     let own = ops.new_dynamic_label();
     let absent = ops.new_dynamic_label();
     let undefined = ops.new_dynamic_label();
@@ -317,17 +334,7 @@ pub(crate) fn emit_store(
         dynasm!(ops ; .arch aarch64 ; b =>miss);
         return;
     };
-    key(
-        ops,
-        relocations,
-        view,
-        cache,
-        atom,
-        receiver,
-        temps,
-        true,
-        miss,
-    );
+    key(ops, relocations, view, cache, atom, receiver, temps, miss);
     let own = ops.new_dynamic_label();
     let chain = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
@@ -343,8 +350,9 @@ pub(crate) fn emit_store(
         ; ldr w16, [X(entry), cache.target_shape_byte] ; cbz w16, =>miss
         ; ldr x16, [X(entry), cache.store_validity_byte] ; cbz x16, =>chain
         ; ldr w16, [x16] ; cbz w16, =>miss
-        ; =>chain ; ldrb w16, [X(holder), view.shape_state_byte]
-        ; tst w16, #u32::from(ShapeState::EXTENSIBLE_MASK) ; b.eq =>miss
+        // The recorded source shape was extensible, which its immutable
+        // state keeps.
+        ; =>chain
         // Code subscribed to the shape the receiver leaves: the runtime
         // store fires it, before anything is written.
         ; ldrb w16, [X(holder), view.shape_watched_byte] ; tbnz w16, otter_vm::code_dependencies::ShapeFact::Stable.bit(), =>miss

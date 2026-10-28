@@ -3759,7 +3759,7 @@ impl<'a> Codegen<'a> {
 
     /// `X(destination)` = the named property at `pc` of `X(receiver)`, both
     /// in the probe routine's fixed words: the routine's selection, which
-    /// preserves every other register, and on its miss the committed runtime
+    /// writes only its declared clobbers, and on its miss the committed runtime
     /// operation with every live register kept in its canonical home.
     fn emit_property_probe_load(
         &mut self,
@@ -3768,9 +3768,15 @@ impl<'a> Codegen<'a> {
         receiver: u8,
         destination: u8,
     ) -> Result<(), Unsupported> {
-        use crate::template::arm64::shared_property::{PROBE_RECEIVER, PROBE_SLOT};
+        use crate::template::arm64::shared_property::{
+            PROBE_LOAD_CLOBBERS, PROBE_RECEIVER, PROBE_SLOT,
+        };
         debug_assert_eq!(receiver, PROBE_RECEIVER);
         debug_assert_eq!(destination, super::registers::AARCH64.property_probe.result);
+        debug_assert_eq!(
+            super::registers::AARCH64.property_probe.clobbers,
+            PROBE_LOAD_CLOBBERS
+        );
         let (slot, target) = self.property_site_slot(node, pc)?;
         let done = self.ops.new_dynamic_label();
         emit_load_symbol_u64(
@@ -3786,7 +3792,7 @@ impl<'a> Codegen<'a> {
             self.routines,
             crate::routines::Routine::ProbeLoad,
         );
-        dynasm!(self.ops ; .arch aarch64 ; cbz X(PROBE_SLOT), =>done);
+        dynasm!(self.ops ; .arch aarch64 ; cbz x17, =>done);
         self.emit_committed_call(
             node,
             abi::STUB_JIT_LOAD_PROPERTY,
@@ -3800,27 +3806,52 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
-    /// The named store at `pc` of `X(value)` into `X(receiver)` through the
-    /// compiler's store routine, called like the committed runtime operation
-    /// it completes with on a miss, every live register preserved through its
-    /// canonical home. A throw leaves through the node's throw routing.
+    /// The named store at `pc` of `X(value)` into `X(receiver)`, both in the
+    /// store probe's fixed words: the probe's selection, which writes only
+    /// its declared clobbers, and on its miss the committed runtime operation
+    /// with every live register kept in its canonical home. A throw leaves
+    /// through the node's throw routing.
     fn emit_property_routine_store(
         &mut self,
         node: NodeId,
         pc: u32,
         [receiver, value]: [u8; 2],
     ) -> Result<(), Unsupported> {
+        use crate::template::arm64::shared_property::{
+            PROBE_STORE_CLOBBERS, PROBE_STORE_RECEIVER, PROBE_STORE_SLOT, PROBE_STORE_VALUE,
+        };
+        let probe = super::registers::AARCH64.property_store_probe;
+        debug_assert_eq!((receiver, value), (PROBE_STORE_RECEIVER, PROBE_STORE_VALUE));
+        debug_assert_eq!((probe.receiver, probe.value), (receiver, value));
+        debug_assert_eq!(probe.clobbers, PROBE_STORE_CLOBBERS);
         let (slot, target) = self.property_site_slot(node, pc)?;
-        self.emit_committed_routine_call(
+        let done = self.ops.new_dynamic_label();
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            PROBE_STORE_SLOT,
+            slot,
+            target.clone(),
+        );
+        crate::template::arm64::shared_property::emit_call(
+            &mut self.ops,
+            &mut self.relocations,
+            self.routines,
+            crate::routines::Routine::ProbeStore,
+        );
+        dynasm!(self.ops ; .arch aarch64 ; cbz x17, =>done);
+        self.emit_committed_call(
             node,
-            crate::routines::Routine::CommittedStore,
+            abi::STUB_JIT_STORE_PROPERTY,
             &[
                 CommittedArgument::Value(receiver),
                 CommittedArgument::Value(value),
                 CommittedArgument::Address(slot, target),
             ],
             None,
-        )
+        )?;
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        Ok(())
     }
 
     /// `X(destination)` = `X(value) instanceof X(target)`. A target that is

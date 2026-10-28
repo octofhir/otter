@@ -918,26 +918,48 @@ impl Codegen<'_> {
         Ok(())
     }
 
-    /// The named store at `pc` of `Rq(value)` into `Rq(receiver)` through
-    /// the compiler's store routine, whose inputs are the committed runtime
-    /// ABI's, every live register preserved through its canonical home.
+    /// The named store at `pc` of `Rq(value)` into `Rq(receiver)`, both in
+    /// the store probe's fixed words: the probe's selection, which preserves
+    /// every allocatable register, and on its miss the committed runtime
+    /// operation with every live register kept in its canonical home.
     fn emit_property_routine_store(
         &mut self,
         node: NodeId,
         pc: u32,
         [receiver, value]: [u8; 2],
     ) -> Result<(), Unsupported> {
+        use crate::template::x86_64::shared_property::{
+            PROBE_SLOT, PROBE_STATUS, PROBE_STORE_RECEIVER, PROBE_STORE_VALUE,
+        };
+        debug_assert_eq!((receiver, value), (PROBE_STORE_RECEIVER, PROBE_STORE_VALUE));
         let (slot, target) = self.property_site_slot(node, pc)?;
-        self.emit_committed_routine_call(
+        let done = self.ops.new_dynamic_label();
+        emit_load_symbol_u64(
+            &mut self.ops,
+            &mut self.relocations,
+            PROBE_SLOT,
+            slot,
+            target.clone(),
+        );
+        crate::template::x86_64::shared_property::emit_call(
+            &mut self.ops,
+            &mut self.relocations,
+            self.routines,
+            crate::routines::Routine::ProbeStore,
+        );
+        dynasm!(self.ops ; .arch x64 ; test Rq(PROBE_STATUS), Rq(PROBE_STATUS) ; jz =>done);
+        self.emit_committed_call(
             node,
-            crate::routines::Routine::CommittedStore,
+            abi::STUB_JIT_STORE_PROPERTY,
             &[
                 CommittedArgument::Value(receiver),
                 CommittedArgument::Value(value),
                 CommittedArgument::Address(slot, target),
             ],
             None,
-        )
+        )?;
+        dynasm!(self.ops ; .arch x64 ; =>done);
+        Ok(())
     }
 
     fn emit_instanceof(

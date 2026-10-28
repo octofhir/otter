@@ -51,11 +51,11 @@ impl Baker<'_> {
         if view.derived_constructor {
             return;
         }
-        let heap = &self.vm.gc_heap;
+        let heap = &self.env.heap;
         let mut family = None;
         for layout in self
-            .vm
-            .compile_shared
+            .env
+            .shared
             .constructor_families
             .try_of_owner(fid)
             .unwrap_or_default()
@@ -101,7 +101,7 @@ impl Baker<'_> {
     }
 
     fn bake_proved_stores(&mut self, view: &mut JitCompileSnapshot, shapes: &[ShapeHandle]) {
-        let names = crate::isolate_names::names(&self.vm.gc_heap);
+        let names = crate::isolate_names::names(&self.env.heap);
         let sites: Vec<(u32, u32)> = view
             .instructions
             .iter()
@@ -141,7 +141,7 @@ impl Baker<'_> {
         shape: ShapeHandle,
         key: AtomizedPropertyKey<'_>,
     ) -> Option<(u32, JitCacheIrProgram)> {
-        let store = shape_store(&self.vm.gc_heap, shape, key)?;
+        let store = shape_store(&self.env.heap, shape, key)?;
         // As an exported program: never into a prototype, never an append to
         // an object that cannot grow.
         let state = crate::object::shape_body::state_of(shape);
@@ -216,7 +216,7 @@ impl Baker<'_> {
         }
         let mut next = 0;
         while next < shapes.len() && shapes.len() < MAX_PROVED_SHAPES {
-            for child in ShapeInterner::children_of(&self.vm.gc_heap, shapes[next]) {
+            for child in ShapeInterner::children_of(&self.env.heap, shapes[next]) {
                 if shapes.len() == MAX_PROVED_SHAPES {
                     break;
                 }

@@ -217,7 +217,7 @@ mod tests {
             let receiver_shape = object::shape(receiver_object, interpreter.gc_heap());
             let location = object::field_location(receiver_shape, 0);
             let owner = field_type::owner(receiver_shape, 0).unwrap();
-            let stable = Baker::new(interpreter)
+            let stable = Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(interpreter))
                 .bake_field_type(receiver_shape.offset(), location)
                 .unwrap();
             assert_eq!(stable.shapes.len(), 2);
@@ -227,7 +227,8 @@ mod tests {
                 .create_data_property(&mut second_object, "changed", Value::NULL)
                 .unwrap();
             assert!(!shape_body::is_stable(second_shape));
-            let mut baker = Baker::new(interpreter);
+            let env = crate::interp::jit_bake_env::BakeEnv::capture(interpreter);
+            let mut baker = Baker::new(&env);
             let mixed = baker
                 .bake_field_type(receiver_shape.offset(), location)
                 .unwrap();
@@ -254,7 +255,7 @@ mod tests {
                 field_type::shape_id_sample(missing.raw()),
             );
             field_type::set_snapshot_for_test(owner, expected);
-            let partial = Baker::new(interpreter)
+            let partial = Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(interpreter))
                 .bake_field_type(receiver_shape.offset(), location)
                 .unwrap();
             assert_eq!(partial.guard.expected, expected);
@@ -267,13 +268,13 @@ mod tests {
             ] {
                 field_type::set_snapshot_for_test(owner, malformed);
                 assert!(
-                    Baker::new(interpreter)
+                    Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(interpreter))
                         .bake_field_type(receiver_shape.offset(), location)
                         .is_none()
                 );
             }
             field_type::observe_owner(owner, Value::TRUE);
-            let top = Baker::new(interpreter)
+            let top = Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(interpreter))
                 .bake_field_type(receiver_shape.offset(), location)
                 .unwrap();
             assert!(top.shapes.is_empty() && top.stored_shapes.is_empty());
@@ -320,7 +321,8 @@ mod tests {
             );
             view.literal_allocations.objects.insert(0, plan);
             assert!(view.property_programs.is_empty());
-            Baker::new(interpreter).bake_field_types(&mut view);
+            Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(interpreter))
+                .bake_field_types(&mut view);
             assert_eq!(view.field_types.len(), 2);
             let link = &view.field_types[&(receiver_shape.offset(), FieldLocation::inline(0))];
             assert_eq!(
@@ -344,7 +346,8 @@ mod tests {
             interpreter
                 .create_data_property(&mut receiver_object, "link", Value::number_i32(3))
                 .unwrap();
-            Baker::new(interpreter).bake_field_types(&mut view);
+            Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(interpreter))
+                .bake_field_types(&mut view);
             let mixed = &view.field_types[&(receiver_shape.offset(), FieldLocation::inline(0))];
             assert_eq!(mixed.guard.expected & field_type::INT32, field_type::INT32);
             assert!(

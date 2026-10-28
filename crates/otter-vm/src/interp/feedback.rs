@@ -171,7 +171,7 @@ impl MethodFeedbackDirectory {
         stats
     }
 
-    fn method_targets(&self, site: usize) -> Option<MethodCallFeedback> {
+    pub(crate) fn method_targets(&self, site: usize) -> Option<MethodCallFeedback> {
         self.address(site)?.is_method().then_some(())?;
         self.method_targets.get(site)?.clone()
     }

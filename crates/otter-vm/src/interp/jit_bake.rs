@@ -97,16 +97,32 @@ impl Interpreter {
         &self,
         holder: crate::object::JsObject,
     ) -> Option<MethodHolderLayout> {
-        let shape = crate::object::keyed_shape(holder, &self.gc_heap);
+        method_holder_layout(
+            &self.gc_heap,
+            self.realm_intrinsics.string_prototype(),
+            holder,
+        )
+    }
+}
+
+/// [`Interpreter::method_holder_layout`] given the active realm's
+/// `%String.prototype%`, the one opaque dictionary holder admitted.
+pub(crate) fn method_holder_layout(
+    heap: &otter_gc::GcHeap,
+    string_prototype: Option<crate::object::JsObject>,
+    holder: crate::object::JsObject,
+) -> Option<MethodHolderLayout> {
+    {
+        let shape = crate::object::keyed_shape(holder, heap);
         if !shape.is_null() {
             return Some(MethodHolderLayout::Shape(shape));
         }
-        let state = crate::object::state(holder, &self.gc_heap);
+        let state = crate::object::state(holder, heap);
         if !state.is_dictionary() {
             return None;
         }
         if state.is_opaque()
-            && (Some(holder) != self.realm_intrinsics.string_prototype()
+            && (Some(holder) != string_prototype
                 || state.bits() & crate::object::ShapeState::OPAQUE_LOOKUP_MASK
                     != crate::object::ShapeState::STRING_WRAPPER_MASK)
         {
@@ -116,14 +132,14 @@ impl Interpreter {
         // source-realm String prototype. Its callers prove primitive receiver
         // type plus nonvirtual names (fixed builtin names or explicit index/
         // length exclusion), then own Data and watched layout/live callable.
-        crate::object::dictionary_layout(holder, &self.gc_heap)
+        crate::object::dictionary_layout(holder, heap)
             .map(|layout| MethodHolderLayout::Dictionary(u64::from(layout)))
     }
 }
 
 /// One compilation's baking pass over the isolate's feedback and heap.
 pub(crate) struct Baker<'a> {
-    pub(crate) vm: &'a Interpreter,
+    pub(crate) env: &'a super::jit_bake_env::BakeEnv<'a>,
     /// Every allocation the snapshot being baked names.
     roots: Vec<crate::jit_roots::CompilationRoot>,
     /// Mutator-side work the isolate runs before publishing the code.
@@ -139,14 +155,14 @@ pub(crate) struct Baker<'a> {
 }
 
 impl<'a> Baker<'a> {
-    pub(crate) fn new(vm: &'a Interpreter) -> Self {
+    pub(crate) fn new(env: &'a super::jit_bake_env::BakeEnv<'a>) -> Self {
         Self {
-            vm,
+            env,
             roots: Vec::new(),
             install: InstallTasks::default(),
             events: Vec::new(),
             found_shapes: rustc_hash::FxHashMap::default(),
-            _scope: vm.gc_heap.enter_compilation_scope(),
+            _scope: env.heap.enter_compilation_scope(),
         }
     }
 
@@ -156,9 +172,8 @@ impl<'a> Baker<'a> {
         &mut self,
         id: crate::object::ShapeId,
     ) -> Option<crate::object::ShapeHandle> {
-        self.vm
-            .shape_runtime
-            .handle_for_id(&self.vm.gc_heap, id)
+        self.env
+            .shape_for_id(id)
             .or_else(|| self.found_shapes.get(&id).copied())
     }
 
@@ -171,7 +186,7 @@ impl<'a> Baker<'a> {
 
     /// Record a debug event when the isolate captures them.
     fn record_event(&mut self, event: impl FnOnce() -> jit_debug::JitDebugEvent) {
-        if self.vm.jit_debug.request().events_enabled() {
+        if self.env.debug.events_enabled() {
             self.events.push(event());
         }
     }
@@ -257,7 +272,7 @@ impl Baker<'_> {
     ) -> Option<jit::JitCompileSnapshot> {
         let mut view = context.jit_compile_snapshot(fid)?;
         // Realm guards compare the active realm with the function's own.
-        view.literal_allocations.realm_id = self.vm.function_realm_id(fid);
+        view.literal_allocations.realm_id = self.env.function_realm_id(fid);
         Self::bake_typed_array_layout(&mut view);
         Self::bake_string_layout(&mut view);
         self.bake_literal_cells(&mut view, context, fid, true)?;
@@ -426,7 +441,7 @@ impl Baker<'_> {
         &mut self,
         holder: crate::object::JsObject,
     ) -> Option<jit::JitMethodHolder> {
-        match self.vm.method_holder_layout(holder)? {
+        match self.env.method_holder_layout(holder)? {
             MethodHolderLayout::Shape(shape) => {
                 self.bake_shape(shape).map(jit::JitMethodHolder::Shape)
             }
@@ -443,14 +458,13 @@ impl Baker<'_> {
         &mut self,
         key: crate::property_atom::AtomizedPropertyKey<'_>,
     ) -> Vec<jit::JitCacheIrProgram> {
-        let vm = self.vm;
-        let Some((programs, shapes)) = vm.prepared_intrinsic_property_programs(key) else {
+        let Some((programs, shapes)) = self.env.prepared_intrinsic_property_programs(key) else {
             return Vec::new();
         };
         for shape in shapes {
             let _ = self.bake_shape(shape);
         }
-        programs.to_vec()
+        programs
     }
 
     /// Prepare exact source-realm literal shapes and scalar dense geometry.
@@ -460,9 +474,9 @@ impl Baker<'_> {
         context: &ExecutionContext,
         fid: u32,
     ) -> Option<()> {
-        let realm_id = self.vm.function_realm_id(fid);
+        let realm_id = self.env.function_realm_id(fid);
         view.literal_allocations.realm_id = realm_id;
-        view.literal_allocations.group_allowed = self.vm.gc_heap.machine_allocation_allowed();
+        view.literal_allocations.group_allowed = self.env.machine_allocation_allowed;
         for (pc, instruction) in view.instructions.iter().enumerate() {
             match instruction.op(&view.code_block) {
                 // A literal in the default realm needs no prototype override.
@@ -473,7 +487,7 @@ impl Baker<'_> {
                     let owner = context.for_function(fid).ok()?;
                     let key = owner.constant_cache_key(constant);
                     // The literal's first execution resolves its site.
-                    let Some(&site) = self.vm.regexp_literals().get(&key) else {
+                    let Some(site) = self.env.regexp_literal(key) else {
                         continue;
                     };
                     view.literal_allocations.regexps.insert(
@@ -499,11 +513,11 @@ impl Baker<'_> {
                     // The first `{}` of the realm gave `%Object.prototype%` its
                     // instance root; a foreign realm's literal keeps its
                     // allocating entry.
-                    if realm_id != self.vm.active_realm_id {
+                    if realm_id != self.env.active_realm_id {
                         continue;
                     }
-                    let root = self.vm.object_prototype_object_opt().and_then(|prototype| {
-                        crate::object::cached_instance_root(prototype, &self.vm.gc_heap)
+                    let root = self.env.object_prototype.and_then(|prototype| {
+                        crate::object::cached_instance_root(prototype, &self.env.heap)
                     });
                     view.literal_allocations.object = root
                         .and_then(|root| {
@@ -517,14 +531,14 @@ impl Baker<'_> {
                         .map(jit::JitEmptyObjectAllocationPlan::new);
                 }
                 Op::SetPrototype if view.literal_allocations.null_object.is_none() => {
-                    let root = self.vm.null_prototype_root();
+                    let root = self.env.null_prototype_root;
                     view.literal_allocations.null_object = self
                         .bake_shape(root)
                         .map(jit::JitEmptyObjectAllocationPlan::new);
                 }
                 Op::NewObjectLiteral => {
                     let site = self
-                        .vm
+                        .env
                         .registered_jit_allocation_site(view.code_block.allocation_site_at(pc));
                     view.literal_allocations
                         .sites
@@ -533,9 +547,8 @@ impl Baker<'_> {
                     let first_key = instruction.const_index(&view.code_block, 2)?;
                     // The literal's first execution built its layout.
                     let plan = self
-                        .vm
-                        .object_literal_layouts()
-                        .get(&(fid, first_key))
+                        .env
+                        .object_literal_layout(fid, first_key)
                         .and_then(|layout| self.shape_for_id(layout.shape_id()))
                         .and_then(|shape| {
                             self.bake_shape(shape)?;
@@ -549,7 +562,7 @@ impl Baker<'_> {
                 }
                 Op::NewArrayBoilerplate => {
                     let site = self
-                        .vm
+                        .env
                         .registered_jit_allocation_site(view.code_block.allocation_site_at(pc));
                     view.literal_allocations
                         .sites
@@ -558,7 +571,7 @@ impl Baker<'_> {
                     // The literal's first execution built its shared slab.
                     let slab = context
                         .array_boilerplate_for_function(fid, constant)
-                        .and_then(|(key, _)| self.vm.array_boilerplates().get(&key).copied());
+                        .and_then(|(key, _)| self.env.array_boilerplate(key));
                     if let Some(plan) = slab.and_then(jit::JitBoilerplateArrayAllocationPlan::new) {
                         view.literal_allocations
                             .boilerplates
@@ -571,7 +584,7 @@ impl Baker<'_> {
                         != 0 =>
                 {
                     let site = self
-                        .vm
+                        .env
                         .registered_jit_allocation_site(view.code_block.allocation_site_at(pc));
                     view.literal_allocations
                         .sites
@@ -581,7 +594,7 @@ impl Baker<'_> {
                     let count = instruction.const_index(&view.code_block, 1)? as usize;
                     if count != 0 {
                         let site = self
-                            .vm
+                            .env
                             .registered_jit_allocation_site(view.code_block.allocation_site_at(pc));
                         view.literal_allocations
                             .sites
@@ -681,7 +694,7 @@ impl Baker<'_> {
                 jit::JitClosureAllocationPlan {
                     call_word: u64::from(function_id) | (u64::from(flags) << 32),
                     arrow,
-                    context_cell: self.vm.classified_closure_context(function_id),
+                    context_cell: self.env.classified_closure_context(function_id),
                 },
             );
         }
@@ -712,8 +725,8 @@ impl Baker<'_> {
         view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
     ) {
-        view.property_action_cache = Some(self.vm.property_cache.jit_layout());
-        view.backedge_fuel_cell = self.vm.interrupt.fuel_ptr() as usize;
+        view.property_action_cache = Some(self.env.property_action_cache);
+        view.backedge_fuel_cell = self.env.fuel_cell;
         let sites: Vec<_> = view
             .instructions
             .iter()
@@ -845,7 +858,7 @@ impl Baker<'_> {
             let Some(atom) = slot.native().keyed_atom() else {
                 continue;
             };
-            let names = crate::isolate_names::names(&self.vm.gc_heap);
+            let names = crate::isolate_names::names(&self.env.heap);
             let name = match names.spelling(crate::property_atom::AtomId::from_global(atom)) {
                 None => jit::JitKeyedName::Symbol { atom },
                 Some(spelling) => {
@@ -954,7 +967,7 @@ impl Baker<'_> {
         if !iterates {
             return;
         }
-        let Some(cells) = self.vm.proven_array_iteration_cells() else {
+        let Some(cells) = self.env.array_iteration.as_ref() else {
             return;
         };
         let (Some(iterable), Some(iterator)) = (
@@ -967,7 +980,7 @@ impl Baker<'_> {
             iterable,
             iterator,
             close: cells.close,
-            realm: self.vm.active_realm_id,
+            realm: self.env.active_realm_id,
             array_type_tag: crate::array::ARRAY_BODY_TYPE_TAG,
             receiver_guard: crate::method_ops::array_named_lookup_guard(),
         });
@@ -1140,7 +1153,7 @@ impl Baker<'_> {
         instruction_pc: u32,
     ) -> Option<jit::JitFunctionPrototypeCall> {
         let intrinsic = crate::native_function::VmIntrinsicFunction::FunctionPrototypeCall;
-        let call_native_ref = intrinsic.native_ref(&self.vm.gc_heap)?;
+        let call_native_ref = intrinsic.native_ref(&self.env.heap)?;
         let lookup = match op {
             Op::CallWithThis => None,
             Op::CallMethodValue => {
@@ -1150,12 +1163,12 @@ impl Baker<'_> {
                     .const_index(&view.code_block, 2)?;
                 let key = context.property_atom_for_function(view.code_block.id, name_index)?;
                 let holds_intrinsic = self
-                    .vm
-                    .realm_intrinsics
+                    .env
+                    .intrinsics
                     .function_prototype()
-                    .and_then(|prototype| object::get(prototype, &self.vm.gc_heap, "call"))
+                    .and_then(|prototype| object::get(prototype, &self.env.heap, "call"))
                     .and_then(|value| value.as_native_function())
-                    .is_some_and(|native| native.is_vm_intrinsic(&self.vm.gc_heap, intrinsic));
+                    .is_some_and(|native| native.is_vm_intrinsic(&self.env.heap, intrinsic));
                 if key.name() != "call" || !holds_intrinsic {
                     return None;
                 }
@@ -1240,7 +1253,7 @@ impl Baker<'_> {
                 method_field,
                 recv_shape,
                 prototype,
-            }) = self.vm.method_target_feedback(site)
+            }) = self.env.method_target_feedback(site)
             else {
                 continue;
             };
@@ -1269,7 +1282,7 @@ impl Baker<'_> {
             // A builtin this isolate never installed has no external-ref
             // index, so no live receiver could carry its identity.
             let Some(builtin_native_ref) =
-                crate::jit_static_native::jit_static_call_ref(stub_id, &self.vm.gc_heap)
+                crate::jit_static_native::jit_static_call_ref(stub_id, &self.env.heap)
             else {
                 continue;
             };
@@ -1314,7 +1327,7 @@ impl Baker<'_> {
         // The linked FID owns its realm. A foreign call may reach compilation
         // while the caller's realm is active; those cells cannot prove this
         // source's bindings. Keep the source-aware committed operation instead.
-        if self.vm.foreign_function_realm(fid).is_some() {
+        if self.env.foreign_function_realm(fid).is_some() {
             return;
         }
         for instruction in &view.instructions {
@@ -1327,7 +1340,7 @@ impl Baker<'_> {
             let Some(name) = context.string_constant_str_for_function(fid, name_index) else {
                 continue;
             };
-            if let Some(&(cell, _)) = self.vm.global_lexicals().get(name) {
+            if let Some((cell, _)) = self.env.global_lexical(name) {
                 view.global_lexical_loads.insert(
                     instruction.byte_pc,
                     jit::JitGlobalLexicalLoad {
@@ -1337,22 +1350,22 @@ impl Baker<'_> {
                 continue;
             }
             let (Some(hit), crate::object::PropertyLookup::Data { .. }) =
-                crate::object::lookup_own_slot(self.vm.global_this, &self.vm.gc_heap, name)
+                crate::object::lookup_own_slot(self.env.global_this, &self.env.heap, name)
             else {
                 continue;
             };
-            let state = crate::object::state(self.vm.global_this, &self.vm.gc_heap);
+            let state = crate::object::state(self.env.global_this, &self.env.heap);
             if state.is_opaque() {
                 continue;
             }
-            let shape = crate::object::keyed_shape(self.vm.global_this, &self.vm.gc_heap);
+            let shape = crate::object::keyed_shape(self.env.global_this, &self.env.heap);
             let (shape, dictionary) = if shape.is_null() {
                 // A dictionary global object is proven by its slot layout, so
                 // globals the program adds later do not retire the proof. The
                 // generated read trusts this slot's kind; watching it makes a
                 // redefinition advance the layout the proof guards.
                 let Some(layout) =
-                    crate::object::dictionary_layout(self.vm.global_this, &self.vm.gc_heap)
+                    crate::object::dictionary_layout(self.env.global_this, &self.env.heap)
                 else {
                     continue;
                 };
@@ -1375,11 +1388,11 @@ impl Baker<'_> {
                     shape,
                     dictionary,
                     field: crate::object::field_location_at(
-                        self.vm.global_this,
-                        &self.vm.gc_heap,
+                        self.env.global_this,
+                        &self.env.heap,
                         u32::from(hit.slot),
                     ),
-                    global_lexical_epoch: self.vm.global_lexical_epoch(),
+                    global_lexical_epoch: self.env.global_lexical_epoch(),
                 },
             );
         }
@@ -1410,7 +1423,7 @@ impl Baker<'_> {
         // The linked FID owns its realm. A foreign call may reach compilation
         // while the caller's realm is active; those cells cannot prove this
         // source's bindings. Keep the source-aware committed operation instead.
-        if self.vm.foreign_function_realm(fid).is_some() {
+        if self.env.foreign_function_realm(fid).is_some() {
             return;
         }
         for instruction in &view.instructions {
@@ -1437,7 +1450,7 @@ impl Baker<'_> {
             let Some(name) = context.string_constant_str_for_function(fid, name_index) else {
                 continue;
             };
-            if let Some(&(cell, is_const)) = self.vm.global_lexicals().get(name) {
+            if let Some((cell, is_const)) = self.env.global_lexical(name) {
                 view.binding_hit_proofs.insert(
                     instruction.byte_pc,
                     jit::BindingHitProof::GlobalLexical {
@@ -1448,22 +1461,22 @@ impl Baker<'_> {
                 continue;
             }
             let (Some(hit), crate::object::PropertyLookup::Data { flags, .. }) =
-                crate::object::lookup_own_slot(self.vm.global_this, &self.vm.gc_heap, name)
+                crate::object::lookup_own_slot(self.env.global_this, &self.env.heap, name)
             else {
                 continue;
             };
-            let state = crate::object::state(self.vm.global_this, &self.vm.gc_heap);
+            let state = crate::object::state(self.env.global_this, &self.env.heap);
             if state.is_opaque() || (writing && state.is_prototype()) {
                 continue;
             }
-            let shape = crate::object::keyed_shape(self.vm.global_this, &self.vm.gc_heap);
+            let shape = crate::object::keyed_shape(self.env.global_this, &self.env.heap);
             let (shape, dictionary) = if shape.is_null() {
                 // A dictionary global object is proven by its slot layout, so
                 // globals the program adds later do not retire the proof. The
                 // generated read trusts this slot's kind; watching it makes a
                 // redefinition advance the layout the proof guards.
                 let Some(layout) =
-                    crate::object::dictionary_layout(self.vm.global_this, &self.vm.gc_heap)
+                    crate::object::dictionary_layout(self.env.global_this, &self.env.heap)
                 else {
                     continue;
                 };
@@ -1483,8 +1496,8 @@ impl Baker<'_> {
             let layout = dictionary
                 .then(|| {
                     crate::object::current_dictionary_layout_validity(
-                        self.vm.global_this,
-                        &self.vm.gc_heap,
+                        self.env.global_this,
+                        &self.env.heap,
                     )
                 })
                 .flatten()
@@ -1495,11 +1508,11 @@ impl Baker<'_> {
                     shape,
                     dictionary,
                     field: crate::object::field_location_at(
-                        self.vm.global_this,
-                        &self.vm.gc_heap,
+                        self.env.global_this,
+                        &self.env.heap,
                         u32::from(hit.slot),
                     ),
-                    global_lexical_epoch: self.vm.global_lexical_epoch(),
+                    global_lexical_epoch: self.env.global_lexical_epoch(),
                     writable: flags.writable(),
                     layout,
                 },
@@ -1524,7 +1537,7 @@ impl Baker<'_> {
         complete: bool,
     ) -> Option<()> {
         let owner = context.for_function(fid).ok()?;
-        let cells = self.vm.compile_shared.literal_cells.try_read()?;
+        let cells = self.env.shared.literal_cells.try_read()?;
         for instruction in &view.instructions {
             let op = instruction.op(&view.code_block);
             if !matches!(op, Op::LoadString | Op::LoadBigInt) {
@@ -1572,8 +1585,8 @@ impl Baker<'_> {
         let instructions = context
             .exec_function(fid)
             .map_or(u32::MAX, |function| function.instruction_count());
-        if self.vm.jit_retraining_blocks(fid)
-            || self.vm.foreign_function_realm(fid).is_some()
+        if self.env.jit_retraining_blocks(fid)
+            || self.env.foreign_function_realm(fid).is_some()
             || !budget.enter(call_byte_pc, fid, instructions, site_frequency)
         {
             return None;
@@ -1623,7 +1636,7 @@ impl Baker<'_> {
         if forwards {
             view.forward_apply_native_ref =
                 crate::native_function::VmIntrinsicFunction::FunctionPrototypeApply
-                    .native_ref(&self.vm.gc_heap);
+                    .native_ref(&self.env.heap);
         }
     }
 
@@ -1636,15 +1649,10 @@ impl Baker<'_> {
     /// caller splicing this body inline — does not emit the speculation that
     /// already exited.
     fn bake_optimized_exit_profile(&mut self, snapshot: &mut jit::JitCompileSnapshot, fid: u32) {
-        snapshot.parameter_widening = self
-            .vm
-            .jit_parameter_widening()
-            .get(&fid)
-            .cloned()
-            .unwrap_or_default();
+        snapshot.parameter_widening = self.env.parameter_widening(fid).unwrap_or_default();
         let code_block = &snapshot.code_block;
         snapshot.optimized_exit_reasons = self
-            .vm
+            .env
             .exit_profiles_of(fid)
             // An insufficient-feedback exit only collected feedback, and a
             // runtime transition resumed a call no speculation guarded; the
@@ -1652,7 +1660,8 @@ impl Baker<'_> {
             // a property site whose inline cache learned another receiver
             // program after its shape guard failed: the receiver that left
             // is now part of the feedback.
-            .filter_map(|(&(_, pc, reason), profile)| {
+            .into_iter()
+            .filter_map(|((_, pc, reason), profile)| {
                 let relearned = reason == native_abi::ExitReason::ShapeGuard
                     && profile.feedback_population.is_some_and(|population| {
                         code_block
@@ -1684,7 +1693,7 @@ impl Baker<'_> {
         // A site that an earlier generation left to collect feedback has
         // executed since. An element site that still records no family meets
         // receivers no generated access describes, and is no longer unseen.
-        for (&(_, pc, reason), _) in self.vm.exit_profiles_of(fid) {
+        for ((_, pc, reason), _) in self.env.exit_profiles_of(fid) {
             if reason == native_abi::ExitReason::InsufficientFeedback {
                 snapshot.feedback_exits.insert(pc);
                 if let Some(instruction) = snapshot.instructions.get(pc as usize) {
@@ -1717,7 +1726,7 @@ impl Baker<'_> {
         let mut budget = if tier == jit_debug::JitDebugTier::Optimizing {
             InlineSnapshotBudget::chosen(crate::jit_inline_plan::choose_inlined(
                 &mut inline_snapshot_budget::FeedbackTree {
-                    interp: self.vm,
+                    interp: self.env,
                     context,
                     root: fid,
                 },
@@ -1740,7 +1749,7 @@ impl Baker<'_> {
         tier: jit_debug::JitDebugTier,
         budget: &mut InlineSnapshotBudget,
     ) {
-        view.invokes = self.vm.inline_body_invokes(context, &view.code_block);
+        view.invokes = self.env.inline_body_invokes(context, &view.code_block);
         view.call_frequencies = view
             .instructions
             .iter()
@@ -1850,15 +1859,15 @@ impl Baker<'_> {
                             matches!(op, Op::Call | Op::New)
                         };
                         let native = if form_site
-                            && self.vm.foreign_function_realm(fid).is_none()
-                            && let Some(callable) = self.vm.realm_intrinsics.callable(kind)
+                            && self.env.foreign_function_realm(fid).is_none()
+                            && let Some(callable) = self.env.intrinsics.callable(kind)
                         {
                             let identity_cell =
                                 self.bake_held_identity_cell(Value::native_function(callable));
                             jit::JitNativeCall::Intrinsic(jit::JitIntrinsicCallProof {
                                 kind,
                                 identity_cell,
-                                realm_id: self.vm.function_realm_id(fid),
+                                realm_id: self.env.function_realm_id(fid),
                             })
                         } else {
                             jit::JitNativeCall::Native
@@ -1874,11 +1883,11 @@ impl Baker<'_> {
                             .expect("native leaf call feedback names a declared entry");
                         // Feedback recorded a call to this builtin, so the isolate
                         // installed it and its external-ref index exists.
-                        let builtin_native_ref = crate::jit_static_native::jit_static_call_ref(
-                            stub_id,
-                            &self.vm.gc_heap,
-                        )
-                        .expect("a builtin the site already called is interned in this isolate");
+                        let builtin_native_ref =
+                            crate::jit_static_native::jit_static_call_ref(stub_id, &self.env.heap)
+                                .expect(
+                                    "a builtin the site already called is interned in this isolate",
+                                );
                         view.native_calls.insert(
                             call_byte_pc,
                             jit::JitNativeCall::Leaf(jit::JitStaticNativeCall {
@@ -1986,7 +1995,7 @@ impl Baker<'_> {
                 }
                 let mut construct_receiver = None;
                 let direct_call_outcome = if let Some(mut plan) =
-                    self.vm.current_direct_callee_plan(callee)
+                    self.env.current_direct_callee_plan(callee)
                 {
                     debug_assert_eq!(plan.function_id, callee_fid);
                     plan.callee_cell = self.bake_callee_identity_cell();
@@ -2154,7 +2163,7 @@ impl Baker<'_> {
                         _ => return None,
                     };
                     let site = instr.property_ic_site(&view.code_block)?;
-                    let state = self.vm.method_target_feedback(site)?;
+                    let state = self.env.method_target_feedback(site)?;
                     match state {
                         MethodCallFeedback::Mono {
                             method_fid,
@@ -2306,10 +2315,10 @@ impl Baker<'_> {
         else {
             return None;
         };
-        crate::object::load_slot_at_field(holder, &self.vm.gc_heap, target.method_field).filter(
+        crate::object::load_slot_at_field(holder, &self.env.heap, target.method_field).filter(
             |value| {
                 value
-                    .as_closure(&self.vm.gc_heap)
+                    .as_closure(&self.env.heap)
                     .is_some_and(|closure| closure.function_id() == target.method_fid)
             },
         )
@@ -2353,7 +2362,7 @@ impl Baker<'_> {
             guard.slot_proven = false;
             guard.method_cell = 0;
         }
-        let callee = self.vm.current_direct_callee_plan(method).map(|mut plan| {
+        let callee = self.env.current_direct_callee_plan(method).map(|mut plan| {
             debug_assert_eq!(plan.function_id, target.method_fid);
             plan.callee_cell = self.bake_callee_identity_cell();
             jit::JitDirectCallee {
@@ -2391,8 +2400,8 @@ impl Baker<'_> {
         if graph_body
             && let Some(closure) = self.proven_method(target)
             && let Some(context) = closure
-                .as_closure(&self.vm.gc_heap)
-                .map(|closure| closure.context(&self.vm.gc_heap))
+                .as_closure(&self.env.heap)
+                .map(|closure| closure.context(&self.env.heap))
             && let Some(body) = body.as_mut().and_then(std::sync::Arc::get_mut)
         {
             body.closure_constants = self.bake_closure_constants(context, &body.code_block);
@@ -2421,12 +2430,7 @@ impl Baker<'_> {
     }
 
     fn bake_unique_closure_context(&mut self, view: &mut jit::JitCompileSnapshot) {
-        let Some((_, context)) = self
-            .vm
-            .jit_code_registry
-            .closure_contexts
-            .single(view.code_block.id)
-        else {
+        let Some((_, context)) = self.env.single_closure_context(view.code_block.id) else {
             return;
         };
         // The source fact observes a context weakly. Once a compilation
@@ -2496,11 +2500,10 @@ impl Baker<'_> {
             if !seen.insert((coord.depth, coord.slot)) {
                 continue;
             }
-            let Some(context) = crate::context::walk(&self.vm.gc_heap, base, coord.depth) else {
+            let Some(context) = crate::context::walk(&self.env.heap, base, coord.depth) else {
                 continue;
             };
-            let Some(value) = crate::context::read_slot(&self.vm.gc_heap, context, coord.slot)
-            else {
+            let Some(value) = crate::context::read_slot(&self.env.heap, context, coord.slot) else {
                 continue;
             };
             if value.is_hole() || value.is_undefined() {
@@ -2508,11 +2511,7 @@ impl Baker<'_> {
             }
             // The isolate starts the slot's watch at installation, after
             // finding the slot still holds this value.
-            let Some(watch) = self.vm.jit_code_registry.watchable_context_slot(
-                &self.vm.gc_heap,
-                context,
-                coord.slot,
-            ) else {
+            let Some(watch) = self.env.watchable_context_slot(context, coord.slot) else {
                 continue;
             };
             let mut value_cell = None;
@@ -2521,13 +2520,13 @@ impl Baker<'_> {
             } else if value.is_cell() {
                 let shape = value
                     .as_object()
-                    .map(|object| crate::object::shape(object, &self.vm.gc_heap))
+                    .map(|object| crate::object::shape(object, &self.env.heap))
                     .filter(|&shape| crate::object::shape_body::is_stable(shape))
                     .and_then(|shape| self.bake_shape(shape))
                     .unwrap_or(0);
-                let closure = value.as_closure(&self.vm.gc_heap);
+                let closure = value.as_closure(&self.env.heap);
                 let bag = closure
-                    .and_then(|closure| closure.own_props(&self.vm.gc_heap))
+                    .and_then(|closure| closure.own_props(&self.env.heap))
                     .map_or(0, |bag| self.bake_held_identity_cell(Value::object(bag)));
                 let held = self.held_cell(value);
                 let cell = held.address();
@@ -2568,11 +2567,11 @@ impl Baker<'_> {
         family_id: u64,
     ) -> Option<(jit::JitReceiverAllocationPlan, ConstructReceiver)> {
         let (layout, new_target_function_id, new_target_is_class) = self
-            .vm
+            .env
             .finalized_constructor_layout_for_id(family_id, base_function_id)?;
         let (root_handle, prototype) = self
-            .vm
-            .gc_heap
+            .env
+            .heap
             .read_payload(layout, |body| (body.root(), body.prototype()));
         // Generated code proves only the family identity; the family fixes an
         // ordinary prototype object, never an exotic one.
@@ -2588,8 +2587,8 @@ impl Baker<'_> {
         }
         let prototype_root = self.bake_shape(root_handle)?;
         let cell = self
-            .vm
-            .gc_heap
+            .env
+            .heap
             .read_payload(layout, |body| body.preparation_validity())?;
         let prototype_validity = self.bake_prototype_validity(&cell)?;
         // Receivers are born in the initializer's final shape only while the
@@ -2597,23 +2596,16 @@ impl Baker<'_> {
         // name the chain gained since (an accessor, a read-only property)
         // ends the prepared prefix, and its store must run as written.
         let prepared = self
-            .vm
-            .gc_heap
+            .env
+            .heap
             .read_payload(layout, |body| {
                 body.prepared_capacity(root_handle, prototype)
             })
             .unwrap_or(0);
         let mut initial_shape = root_handle;
         let (receiver_shape, initial_field_count) = match (
-            self.vm
-                .simple_constructor_init_cache()
-                .get(&base_function_id)
-                .and_then(Option::as_ref)
-                .map(|init| init.fields.len()),
-            self.vm
-                .simple_constructor_shape_cache()
-                .get(&(base_function_id, root_id))
-                .copied(),
+            self.env.simple_constructor_field_count(base_function_id),
+            self.env.simple_constructor_shape(base_function_id, root_id),
         ) {
             (Some(field_count), Some(shape))
                 if field_count <= inline_capacity
@@ -2622,7 +2614,7 @@ impl Baker<'_> {
                     && crate::object::shape_body::inline_capacity_of(shape) == inline_capacity =>
             {
                 debug_assert_eq!(
-                    crate::object::shape_property_count(shape, &self.vm.gc_heap) as usize,
+                    crate::object::shape_property_count(shape, &self.env.heap) as usize,
                     field_count,
                     "source initial fields and final shape diverged"
                 );
@@ -2708,12 +2700,7 @@ impl Baker<'_> {
         let class_fid = code_block.class_hint(instruction.instruction_pc(code_block) as usize)?;
         // One prototype lineage per class in practice; several leave the
         // site to its own feedback.
-        let mut shapes = self
-            .vm
-            .simple_constructor_shape_cache()
-            .iter()
-            .filter(|((id, _), _)| *id == class_fid)
-            .map(|(_, shape)| *shape);
+        let mut shapes = self.env.simple_constructor_shapes(class_fid).into_iter();
         let shape = shapes.next()?;
         if shapes.next().is_some() {
             return None;
@@ -2724,7 +2711,7 @@ impl Baker<'_> {
             return None;
         };
         let key = context.property_atom(name_idx)?;
-        let slot = crate::object::shape_offset_of_str(&self.vm.gc_heap, shape, key.name())?;
+        let slot = crate::object::shape_offset_of_str(&self.env.heap, shape, key.name())?;
         Some((
             self.bake_shape(shape)?,
             crate::object::field_location(shape, slot),

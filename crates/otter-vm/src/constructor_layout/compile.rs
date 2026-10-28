@@ -20,38 +20,38 @@
 use super::ConstructorLayout;
 use crate::{ExecutionContext, Interpreter, VmError};
 
-impl Interpreter {
-    pub(crate) fn finalized_constructor_layout_for_id(
-        &self,
-        family_id: u64,
-        base: u32,
-    ) -> Option<(ConstructorLayout, u32, bool)> {
-        if family_id == 0 {
-            return None;
-        }
-        let layout = self
-            .compile_shared
-            .constructor_families
-            .try_get(family_id)?;
-        let (finalized, detached, layout_base, (owner, owner_fid)) =
-            self.gc_heap.read_payload(layout, |body| {
-                (
-                    body.finalized(),
-                    body.detached(),
-                    body.base_function_id(),
-                    body.owner(),
-                )
-            });
-        if !finalized || detached || layout_base != base {
-            return None;
-        }
-        match owner {
-            super::ConstructorFamilyOwner::Class => Some((layout, owner_fid, true)),
-            super::ConstructorFamilyOwner::Closure => Some((layout, owner_fid, false)),
-            super::ConstructorFamilyOwner::Other => None,
-        }
+/// The finalized, attached family `family_id` of base constructor `base`,
+/// with its new.target owner function and whether that owner is a class.
+pub(crate) fn finalized_layout(
+    heap: &otter_gc::GcHeap,
+    shared: &crate::compile_shared::CompileShared,
+    family_id: u64,
+    base: u32,
+) -> Option<(ConstructorLayout, u32, bool)> {
+    if family_id == 0 {
+        return None;
     }
+    let layout = shared.constructor_families.try_get(family_id)?;
+    let (finalized, detached, layout_base, (owner, owner_fid)) =
+        heap.read_payload(layout, |body| {
+            (
+                body.finalized(),
+                body.detached(),
+                body.base_function_id(),
+                body.owner(),
+            )
+        });
+    if !finalized || detached || layout_base != base {
+        return None;
+    }
+    match owner {
+        super::ConstructorFamilyOwner::Class => Some((layout, owner_fid, true)),
+        super::ConstructorFamilyOwner::Closure => Some((layout, owner_fid, false)),
+        super::ConstructorFamilyOwner::Other => None,
+    }
+}
 
+impl Interpreter {
     /// Called after rooted receiver preparation selected/finalized its exact
     /// family; `caller` is the suspended source frame, not the entered callee.
     /// The caller's safepoint recipe resolves inline and root source alike.

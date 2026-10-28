@@ -58,18 +58,19 @@ impl Interpreter {
             }
         }
     }
+}
 
-    /// The site one generation bakes for a literal instruction's cell: the
-    /// one its first allocation registered, else none.
-    pub(crate) fn registered_jit_allocation_site(
-        &self,
-        cell: Option<&AtomicU16>,
-    ) -> crate::jit::JitAllocationSite {
+/// [`Interpreter::registered_jit_allocation_site`] over `heap`'s sites.
+pub(crate) fn registered_site(
+    heap: &otter_gc::GcHeap,
+    cell: Option<&AtomicU16>,
+) -> crate::jit::JitAllocationSite {
+    {
         let id = cell.map_or(0, |cell| cell.load(Ordering::Relaxed));
-        if id == 0 || !self.gc_heap.allocation_sites().contains(id) {
+        if id == 0 || !heap.allocation_sites().contains(id) {
             return crate::jit::JitAllocationSite::default();
         }
-        let sites = self.gc_heap.allocation_sites();
+        let sites = heap.allocation_sites();
         crate::jit::JitAllocationSite {
             id,
             record: sites.record_address(id),
@@ -82,7 +83,9 @@ impl Interpreter {
             },
         }
     }
+}
 
+impl Interpreter {
     pub(crate) fn allocate_static_object_literal(
         &mut self,
         context: &crate::ExecutionContext,
@@ -311,7 +314,7 @@ mod tests {
             assert!((*header(young)).is_young());
             assert_eq!((*header(young)).allocation_site(), site);
         }
-        let tracked = vm.registered_jit_allocation_site(Some(&cell));
+        let tracked = registered_site(&vm.gc_heap, Some(&cell));
         assert_eq!(tracked.id, site);
         assert_eq!(tracked.mode, crate::jit::JitSiteMode::Track);
         assert_eq!(
@@ -324,7 +327,7 @@ mod tests {
             .set_decision_for_test(site, PretenureDecision::Tenure);
         assert_eq!(vm.literal_site_placement(Some(&cell)), SitePlacement::Old);
         assert_eq!(
-            vm.registered_jit_allocation_site(Some(&cell)).mode,
+            registered_site(&vm.gc_heap, Some(&cell)).mode,
             crate::jit::JitSiteMode::Old
         );
         let old = vm
@@ -352,7 +355,7 @@ mod tests {
             SitePlacement::Young(0)
         );
         assert_eq!(
-            vm.registered_jit_allocation_site(Some(&declined)).mode,
+            registered_site(&vm.gc_heap, Some(&declined)).mode,
             crate::jit::JitSiteMode::Young
         );
     }
@@ -388,7 +391,7 @@ mod tests {
                 .link_module(module, crate::source_registry::SourceRegistry::default())
                 .expect("literal key context");
             let function_id = context.function_base();
-            vm.function_realm_ids.insert(function_id, realm.0);
+            vm.function_realm_ids_mut().insert(function_id, realm.0);
             assert!(!vm.object_literal_layouts().contains_key(&(function_id, 0)));
             vm.with_runtime_roots(|vm| {
                 // The only pending child roots across the first literal call
@@ -522,7 +525,7 @@ mod tests {
     fn empty_literals_select_source_realm_and_restore_active_realm() {
         let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         let realm = vm.create_host_realm().expect("extra realm");
-        vm.function_realm_ids.insert(42, realm.0);
+        vm.function_realm_ids_mut().insert(42, realm.0);
         vm.with_runtime_roots(|vm| {
             vm.with_handle_scope(|vm, scope| {
                 let object = vm

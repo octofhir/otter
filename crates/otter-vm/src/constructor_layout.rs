@@ -41,7 +41,7 @@
 
 mod code_eviction;
 pub(crate) use code_eviction::EvictedRanges;
-mod compile;
+pub(crate) mod compile;
 mod completion;
 mod lexical;
 mod native_receiver;

@@ -525,7 +525,8 @@ impl Interpreter {
         let context = &*owner;
         self.prepare_compile_facts(context, fid)?;
         let dependency_flag = self.jit_code_registry.dependency_flag();
-        let mut baker = Baker::new(self);
+        let env = super::jit_bake_env::BakeEnv::capture(self);
+        let mut baker = Baker::new(&env);
         let snapshot = baker.bake_optimized(context, fid, dependency_flag);
         let (roots, install, events) = baker.finish();
         self.publish_bake_events(events);
@@ -956,7 +957,8 @@ impl Interpreter {
         if self.prepare_template_facts(context, fid).is_none() {
             return TemplateCompileOutcome::Deferred;
         }
-        let mut baker = Baker::new(self);
+        let env = super::jit_bake_env::BakeEnv::capture(self);
+        let mut baker = Baker::new(&env);
         let view = baker.bake_template(context, fid);
         let (roots, install, events) = baker.finish();
         self.publish_bake_events(events);
@@ -1245,19 +1247,6 @@ impl Interpreter {
                 u32::from(resolved.hit.slot),
             ),
         })
-    }
-
-    /// Resolve the stable entry cell for one compiler-native call.
-    ///
-    /// The registry publishes an optimizing generation only when it advertises
-    /// safe stack-owned cold deoptimization; otherwise the current baseline
-    /// remains selected. The returned function-cell address survives every
-    /// later generation replacement.
-    pub(crate) fn current_direct_callee_plan(
-        &self,
-        function: &CodeBlock,
-    ) -> Option<jit::JitDirectCallPlan> {
-        self.jit_code_registry.direct_call_plan(function)
     }
 
     /// Make the facts a compilation of `fid` reads exist: canonical

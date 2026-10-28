@@ -126,7 +126,8 @@ fn bake_retained(
     let fid = context.function_base();
     let _ = interpreter.prepare_compile_facts(context, fid);
     let mut view = context.jit_compile_snapshot(fid).expect("linked snapshot");
-    let mut baker = Baker::new(interpreter);
+    let env = crate::interp::jit_bake_env::BakeEnv::capture(interpreter);
+    let mut baker = Baker::new(&env);
     baker.bake_global_lexical_loads(&mut view, context, fid);
     baker.bake_binding_hit_proofs(&mut view, context, fid);
     let (roots, install, _) = baker.finish();
@@ -483,7 +484,7 @@ fn foreign_linked_source_never_bakes_ambient_global_proofs_or_inline_body() {
         })
         .expect("foreign linked source");
     let fid = foreign.function_base();
-    assert_eq!(interpreter.function_realm_ids[&fid], realm.0);
+    assert_eq!(interpreter.function_realm_ids()[&fid], realm.0);
     assert_eq!(interpreter.foreign_function_realm(fid), Some(realm.0));
     let source_global = interpreter.global_this_for_function(fid).unwrap();
     assert_ne!(source_global, interpreter.global_this);
@@ -502,7 +503,7 @@ fn foreign_linked_source_never_bakes_ambient_global_proofs_or_inline_body() {
     assert!(foreign_view.global_lexical_loads.is_empty());
     assert!(foreign_view.global_object_loads.is_empty());
     assert!(
-        Baker::new(&interpreter)
+        Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&interpreter))
             .bake_inline_body(
                 &foreign,
                 fid,
@@ -561,7 +562,7 @@ fn disposed_source_global_never_substitutes_the_active_global() {
             .is_empty()
     );
     assert!(
-        Baker::new(&interpreter)
+        Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(&interpreter))
             .bake_inline_body(
                 &foreign,
                 fid,

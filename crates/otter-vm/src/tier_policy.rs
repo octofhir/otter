@@ -271,6 +271,17 @@ impl TierPolicy {
     pub(crate) fn has_retraining(&self) -> bool {
         self.retraining_functions != 0
     }
+    /// Every function retraining now; empty, without a walk, when none is.
+    pub(crate) fn retraining_functions(&self) -> Vec<u32> {
+        if !self.has_retraining() {
+            return Vec::new();
+        }
+        self.functions
+            .iter()
+            .filter(|(_, state)| state.retraining)
+            .map(|(fid, _)| *fid)
+            .collect()
+    }
     #[inline]
     pub(crate) fn retraining_generation(&self, fid: u32) -> Option<u64> {
         if !self.has_retraining() {

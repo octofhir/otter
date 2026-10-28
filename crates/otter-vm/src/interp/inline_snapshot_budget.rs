@@ -26,11 +26,12 @@
 //! # See also
 //! - `jit_compile::bake_inline_body` owns each descendant's source and feedback.
 
+use super::super::jit_bake_env::BakeEnv;
+use crate::ExecutionContext;
 use crate::jit_inline_plan::{InlineCandidate, InlineTree};
-use crate::{ExecutionContext, Interpreter};
 use otter_bytecode::Op;
 
-impl Interpreter {
+impl BakeEnv<'_> {
     /// Calls `code_block` makes per entry that would stay calls where it is
     /// built in place: its sites with call feedback, less those whose every
     /// target is a small body, a native or an intrinsic.
@@ -179,7 +180,7 @@ impl InlineSnapshotBudget {
 
 /// The call and method sites of bodies, read from their feedback.
 pub(super) struct FeedbackTree<'a> {
-    pub(super) interp: &'a Interpreter,
+    pub(super) interp: &'a BakeEnv<'a>,
     pub(super) context: &'a ExecutionContext,
     pub(super) root: u32,
 }

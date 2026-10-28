@@ -271,7 +271,6 @@ impl Interpreter {
             extra_realms: Vec::new(),
             active_realm_id: 0,
             next_realm_id: 1,
-            function_realm_ids: rustc_hash::FxHashMap::default(),
             active_realm_is_extra: false,
             eval_hook: None,
             lazy_compile_hook: None,
@@ -1221,7 +1220,7 @@ impl Interpreter {
     /// belongs to the default realm.
     #[inline]
     pub(crate) fn function_realm_id(&self, function_id: u32) -> u32 {
-        self.function_realm_ids
+        self.function_realm_ids()
             .get(&function_id)
             .copied()
             .unwrap_or(0)
@@ -1233,7 +1232,7 @@ impl Interpreter {
     #[inline]
     pub(crate) fn calling_realm(&self, frame: Option<&crate::Frame>) -> u32 {
         frame
-            .and_then(|frame| self.function_realm_ids.get(&frame.function_id))
+            .and_then(|frame| self.function_realm_ids().get(&frame.function_id))
             .copied()
             .unwrap_or(self.active_realm_id)
     }
@@ -1243,7 +1242,7 @@ impl Interpreter {
     /// an unregistered function belongs to the default realm.
     #[inline]
     pub(crate) fn foreign_function_realm(&self, function_id: u32) -> Option<u32> {
-        if self.function_realm_ids.is_empty() && self.active_realm_id == 0 {
+        if self.function_realm_ids().is_empty() && self.active_realm_id == 0 {
             return None;
         }
         let realm_id = self.function_realm_id(function_id);

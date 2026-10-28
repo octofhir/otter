@@ -184,12 +184,14 @@ pub struct ExtraRootsGuard {
 }
 
 impl ExtraRootsGuard {
+    #[inline]
     pub(crate) fn new(heap: &mut GcHeap, depth: usize) -> Self {
         Self { heap, depth }
     }
 }
 
 impl Drop for ExtraRootsGuard {
+    #[inline]
     fn drop(&mut self) {
         // SAFETY: `GcHeap::register_extra_roots` creates the guard from a live
         // heap and the guard cannot outlive the owning VM turn. The source

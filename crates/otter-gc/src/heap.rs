@@ -1390,6 +1390,7 @@ impl GcHeap {
     /// registration never hides an outer scope's roots.
     #[doc(hidden)]
     #[must_use]
+    #[inline]
     pub fn push_extra_roots(&mut self, roots: ExtraRoots) -> usize {
         self.extra_roots.push(roots);
         self.extra_roots.len()
@@ -1399,6 +1400,7 @@ impl GcHeap {
     ///
     /// This is the standard API for VM/runtime root owners. It keeps cleanup
     /// panic-safe while allowing normal mutable heap access inside the scope.
+    #[inline]
     pub fn register_extra_roots(&mut self, roots: ExtraRoots) -> ExtraRootsGuard {
         let depth = self.push_extra_roots(roots) - 1;
         ExtraRootsGuard::new(self, depth)
@@ -1429,6 +1431,7 @@ impl GcHeap {
 
     /// Truncate the extra-roots stack back down to `depth`.
     #[doc(hidden)]
+    #[inline]
     pub fn pop_extra_roots_to(&mut self, depth: usize) {
         debug_assert!(depth <= self.extra_roots.len());
         self.extra_roots.truncate(depth);

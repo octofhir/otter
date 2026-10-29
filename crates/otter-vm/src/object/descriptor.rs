@@ -41,6 +41,7 @@ use crate::Value;
 /// # See also
 /// - <https://tc39.es/ecma262/#table-default-attributes>
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[repr(transparent)]
 pub struct PropertyFlags(u8);
 
 impl PropertyFlags {

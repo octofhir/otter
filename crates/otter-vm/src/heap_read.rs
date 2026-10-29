@@ -72,15 +72,24 @@ impl HeapRead for otter_gc::GcHeap {
 /// A compiler thread's read-only view of one isolate's heap.
 #[derive(Clone)]
 pub(crate) struct HeapView {
+    /// A read met the mutator changing a shared table: what the bake
+    /// read is incomplete, and it is retried.
+    contended: std::cell::Cell<bool>,
     shape_tables: std::sync::Arc<MutatorCell<WeakShapeTables>>,
     external_refs: std::sync::Arc<otter_gc::external_refs::SharedExternalRefs>,
     allocation_sites: std::sync::Arc<otter_gc::pretenuring::SiteDirectory>,
 }
 
 impl HeapView {
+    /// Whether a read since the view was made met the mutator writing.
+    pub(crate) fn contended(&self) -> bool {
+        self.contended.get()
+    }
+
     /// The view of `heap`, for one of its compilations.
     pub(crate) fn of(heap: &otter_gc::GcHeap) -> Self {
         Self {
+            contended: std::cell::Cell::new(false),
             shape_tables: crate::object::shape_interner::ShapeInterner::shared_tables(heap),
             external_refs: heap.shared_external_refs(),
             allocation_sites: heap.allocation_sites().directory(),
@@ -99,12 +108,19 @@ impl HeapRead for HeapView {
     }
 
     fn with_shape_tables<R>(&self, f: impl FnOnce(&WeakShapeTables) -> R) -> Option<R> {
-        let tables = self.shape_tables.try_read()?;
+        let Some(tables) = self.shape_tables.read_briefly() else {
+            self.contended.set(true);
+            return None;
+        };
         Some(f(&tables))
     }
 
     fn external_ref(&self, addr: usize) -> Option<u32> {
-        self.external_refs.try_lookup(addr)
+        crate::mutator_owned::retry_briefly(|| self.external_refs.try_lookup(addr).ok())
+            .unwrap_or_else(|| {
+                self.contended.set(true);
+                None
+            })
     }
 
     fn allocation_sites(&self) -> &otter_gc::pretenuring::SiteDirectory {

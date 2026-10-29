@@ -1965,6 +1965,7 @@ mod tests {
     fn source_work_exact_resource_refusal_waits_for_real_headroom_without_new_work() {
         let (context, headers) = multi_loop_context(1);
         let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
+        vm.code_space = Arc::clone(context.space());
         vm.set_jit_debug_request(jit_debug::JitDebugRequest::events());
         let requests = Arc::new(Mutex::new(Vec::new()));
         vm.jit_hook = Some(Arc::new(CountingTemplateHook {
@@ -2572,6 +2573,7 @@ mod tests {
 
         let entry_first_requests = Arc::new(Mutex::new(Vec::new()));
         let mut entry_first = Interpreter::new().expect("fixture interpreter bootstrap");
+        entry_first.code_space = Arc::clone(context.space());
         entry_first.jit_hook = Some(Arc::new(CountingTemplateHook {
             requests: Arc::clone(&entry_first_requests),
         }));
@@ -2596,6 +2598,7 @@ mod tests {
 
         let osr_first_requests = Arc::new(Mutex::new(Vec::new()));
         let mut osr_first = Interpreter::new().expect("fixture interpreter bootstrap");
+        osr_first.code_space = Arc::clone(context.space());
         osr_first.jit_hook = Some(Arc::new(CountingTemplateHook {
             requests: Arc::clone(&osr_first_requests),
         }));
@@ -2678,6 +2681,7 @@ mod tests {
             requests: AtomicUsize::new(0),
         });
         let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
+        vm.code_space = Arc::clone(context.space());
         vm.jit_hook = Some(hook.clone());
         context
             .exec_function(0)

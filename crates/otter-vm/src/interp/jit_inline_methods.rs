@@ -32,7 +32,10 @@ impl Baker<'_> {
     ) -> Option<jit::JitMethodInlineFields> {
         let method_context = context.for_function(target.method_fid).ok()?;
         let context = &*method_context;
-        let method = context.exec_function(target.method_fid)?;
+        if self.unlinked_body(context, target.method_fid) {
+            return None;
+        }
+        let method = context.compiled_function(target.method_fid)?;
         if method.is_generator
             || method.is_async
             || method.is_async_generator

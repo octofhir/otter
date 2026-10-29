@@ -61,6 +61,82 @@ fn stores_in_place(state: object::ShapeState) -> bool {
     !state.is_dictionary() && !state.is_opaque() && !state.is_prototype()
 }
 
+/// One slot resolved in the layout of the shape a key proves, as generated
+/// probes read it: the byte offset into its bank, the bank, and for an
+/// own-overwrite the value classes the field's summary already holds, which
+/// a store of such a value needs no observation for.
+pub mod slot_word {
+    /// Byte offset from the object (inline bank) or the slab's first word.
+    pub const OFFSET_MASK: u32 = 0xffff;
+    /// The slot lives in the object's slab.
+    pub const SLAB: u32 = 1 << 16;
+    /// The summary is Top: every value is covered.
+    pub const ANY: u32 = 1 << 24;
+    /// Every Int32 value is covered.
+    pub const INT32: u32 = 1 << 25;
+    /// Every double value is covered.
+    pub const DOUBLE: u32 = 1 << 26;
+    /// `null` is covered.
+    pub const NULL: u32 = 1 << 27;
+    /// `undefined` is covered.
+    pub const UNDEFINED: u32 = 1 << 28;
+    /// The summary tracks value shapes: an uncovered value is observed
+    /// through the defining owner instead of missing.
+    pub const OBSERVE: u32 = 1 << 29;
+}
+
+/// [`slot_word`] of logical `slot` in `shape`'s layout; zero (a miss for
+/// every probe, since no slot sits at the object's first byte) when the
+/// offset does not fit.
+fn slot_word(shape: object::ShapeHandle, slot: u16) -> u32 {
+    if shape.is_null() {
+        return 0;
+    }
+    let layout = object::FieldLayout::current();
+    let inline = object::shape_body::inline_capacity_of(shape);
+    let slot = usize::from(slot);
+    let (offset, bank) = if slot < inline {
+        (layout.inline_values_byte as usize + slot * 8, 0)
+    } else {
+        ((slot - inline) * 8, slot_word::SLAB)
+    };
+    u32::try_from(offset)
+        .ok()
+        .filter(|offset| *offset <= slot_word::OFFSET_MASK)
+        .map_or(0, |offset| offset | bank)
+}
+
+/// The value classes `owner`'s summary covers (a null owner is Top).
+fn covered_classes(owner: object::ShapeHandle) -> u32 {
+    use object::field_type as summary;
+    if owner.is_null() {
+        return slot_word::ANY;
+    }
+    let word = summary::snapshot(owner);
+    if word == summary::TOP {
+        return slot_word::ANY;
+    }
+    let mut classes = 0;
+    if word & summary::SHAPE_COUNT_MASK != 0 {
+        classes |= slot_word::OBSERVE;
+    }
+    // An exact Int32 constant covers only its own value, and its presence
+    // makes every other category a widening.
+    if word & summary::CONST_INT32 == 0 {
+        for (bit, class) in [
+            (summary::INT32, slot_word::INT32),
+            (summary::DOUBLE, slot_word::DOUBLE),
+            (summary::NULL, slot_word::NULL),
+            (summary::UNDEFINED, slot_word::UNDEFINED),
+        ] {
+            if word & bit != 0 {
+                classes |= class;
+            }
+        }
+    }
+    classes
+}
+
 /// Selected live shared-table load action. Unknown and Unresolvable are misses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -102,6 +178,11 @@ struct PropertyActionEntry {
     load_slot: u16,
     store_slot: u16,
     load_writable: bool,
+    /// The load slot resolved in its holder's layout ([`slot_word`]).
+    load_word: u32,
+    /// The own-overwrite slot resolved in the receiver's layout, with the
+    /// value classes its field summary already holds ([`slot_word`]).
+    store_word: u32,
     holder_shape: object::ShapeHandle,
     holder_root: object::ShapeHandle,
     target_shape: object::ShapeHandle,
@@ -122,6 +203,8 @@ impl PropertyActionEntry {
         load_slot: 0,
         store_slot: 0,
         load_writable: false,
+        load_word: 0,
+        store_word: 0,
         holder_shape: object::ShapeHandle::null(),
         holder_root: object::ShapeHandle::null(),
         target_shape: object::ShapeHandle::null(),
@@ -146,6 +229,7 @@ impl PropertyActionEntry {
     fn clear_load(&mut self) {
         self.load_action = PropertyLoadAction::Unknown;
         self.load_slot = 0;
+        self.load_word = 0;
         self.load_writable = false;
         self.holder_shape = object::ShapeHandle::null();
         self.holder_root = object::ShapeHandle::null();
@@ -266,6 +350,28 @@ impl PropertyActionCache {
 
     /// Reuse an exact key, or move one complete row plus its proof owners.
     /// Publication cannot interleave with generated probes or collection.
+    /// Publish `entry` at `index` with its slot words resolved.
+    fn publish(&self, index: usize, mut entry: PropertyActionEntry) {
+        entry.load_word = match entry.load_action {
+            PropertyLoadAction::OwnData | PropertyLoadAction::InheritedData => {
+                slot_word(entry.holder_shape, entry.load_slot)
+            }
+            _ => 0,
+        };
+        entry.store_word = match entry.store_action {
+            PropertyStoreAction::OwnWritable => {
+                let word = slot_word(entry.store_receiver, entry.store_slot);
+                if word == 0 {
+                    0
+                } else {
+                    word | covered_classes(entry.store_owner)
+                }
+            }
+            _ => 0,
+        };
+        self.entries[index].set(entry);
+    }
+
     fn record_way(&self, shape: ShapeId, atom: AtomId) -> usize {
         if let Some(index) = self.find(shape, atom) {
             return index;
@@ -422,7 +528,7 @@ impl PropertyActionCache {
                         owners.store = None;
                         owners.load = validity;
                     });
-                    self.entries[index].set(entry);
+                    self.publish(index, entry);
                     return;
                 };
                 entry.store_action = PropertyStoreAction::OwnWritable;
@@ -441,7 +547,7 @@ impl PropertyActionCache {
             entry.load_action = PropertyLoadAction::Unresolvable;
         }
         self.update_owners(index, |owners| owners.load = validity);
-        self.entries[index].set(entry);
+        self.publish(index, entry);
     }
 
     /// Publish the existing own-data hit of a committed writable store program.
@@ -479,7 +585,7 @@ impl PropertyActionCache {
             entry.store_receiver = object::ShapeHandle::null();
         }
 
-        self.entries[index].set(entry);
+        self.publish(index, entry);
     }
 
     /// Merge a committed add sample into its original key, retaining any load.
@@ -528,7 +634,7 @@ impl PropertyActionCache {
             }
         };
         self.update_owners(index, |owners| owners.store = Some(transition.kind));
-        self.entries[index].set(entry);
+        self.publish(index, entry);
     }
 
     /// Replay only the selected store action, preserving a matched refusal.

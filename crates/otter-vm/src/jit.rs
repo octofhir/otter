@@ -74,7 +74,7 @@ use otter_bytecode::{Op, Operand};
 use serde::Serialize;
 
 pub use crate::property_cache::jit::JitPropertyActionCache;
-pub use crate::property_cache::{PropertyLoadAction, PropertyStoreAction};
+pub use crate::property_cache::{PropertyLoadAction, PropertyStoreAction, slot_word};
 
 pub use crate::property_ic::{
     EMPTY_SHAPE as PROPERTY_IC_EMPTY_SHAPE, IcHandlerKind as PropertyIcHandlerKind,

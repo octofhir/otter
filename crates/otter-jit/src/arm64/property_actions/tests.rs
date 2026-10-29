@@ -25,6 +25,8 @@ use std::sync::atomic::AtomicU32;
 const POISON: u64 = 0xbadc_0ffe_2468_1357;
 const CANARY: u64 = 0x51a7_6d9b_2468_1357;
 const SHAPE_ID_BYTE: u32 = 160;
+/// The matching (third) way of the table's one set.
+const ROW: usize = 160;
 const RECEIVER: usize = 512;
 const HOLDER: usize = 1024;
 const RECEIVER_SHAPE: usize = 1536;
@@ -179,9 +181,9 @@ fn prepare(arena: &mut [u64], view: &mut JitCompileSnapshot, proof: &AtomicU32) 
     // in one component; only the third full key matches.
     put(arena, 0, 7u64);
     put(arena, 8, 123u32);
-    put(arena, 72, 123u64);
-    put(arena, 80, 0u32);
-    let row = 144;
+    put(arena, 80, 123u64);
+    put(arena, 88, 0u32);
+    let row = ROW;
     put(arena, row, 7u64);
     put(arena, row + 8, 0u32);
     put(arena, row + 12, PropertyLoadAction::InheritedData as u8);
@@ -189,19 +191,21 @@ fn prepare(arena: &mut [u64], view: &mut JitCompileSnapshot, proof: &AtomicU32) 
     put(arena, row + 14, 0u16);
     put(arena, row + 16, 1u16);
     put(arena, row + 18, true);
-
-    put_offset(arena, row + 20, HOLDER_SHAPE);
-    put_offset(arena, row + 24, ROOT);
-    put_offset(arena, row + 28, CHILD);
-    put(arena, row + 32, 0u32);
-    put(arena, row + 36, 0u32);
-    put(arena, row + 40, 8u64);
-    put(arena, row + 48, 9u64);
-    put(arena, row + 56, proof as *const AtomicU32 as usize);
+    // Slot 0 lies in the holder's inline bank.
+    put(arena, row + 20, view.field_layout.inline_values_byte);
+    put(arena, row + 24, 0u32);
+    put_offset(arena, row + 28, HOLDER_SHAPE);
+    put_offset(arena, row + 32, ROOT);
+    put_offset(arena, row + 36, CHILD);
+    put(arena, row + 40, 0u32);
+    put(arena, row + 44, 0u32);
+    put(arena, row + 48, 8u64);
+    put(arena, row + 56, 9u64);
     put(arena, row + 64, proof as *const AtomicU32 as usize);
+    put(arena, row + 72, proof as *const AtomicU32 as usize);
     view.property_action_cache = Some(JitPropertyActionCache {
         table_addr: arena.as_ptr() as usize,
-        entry_bytes: 72,
+        entry_bytes: 80,
         set_mask: 0,
         ways: 4,
         receiver_shape_id_byte: 0,
@@ -211,14 +215,16 @@ fn prepare(arena: &mut [u64], view: &mut JitCompileSnapshot, proof: &AtomicU32) 
         load_slot_byte: 14,
         store_slot_byte: 16,
         load_writable_byte: 18,
-        holder_shape_byte: 20,
-        holder_root_byte: 24,
-        target_shape_byte: 28,
-        store_owner_byte: 32,
-        holder_shape_id_byte: 40,
-        target_shape_id_byte: 48,
-        load_validity_byte: 56,
-        store_validity_byte: 64,
+        load_word_byte: 20,
+        store_word_byte: 24,
+        holder_shape_byte: 28,
+        holder_root_byte: 32,
+        target_shape_byte: 36,
+        store_owner_byte: 40,
+        holder_shape_id_byte: 48,
+        target_shape_id_byte: 56,
+        load_validity_byte: 64,
+        store_validity_byte: 72,
         shape_id_byte: SHAPE_ID_BYTE,
         hash_multiplier: 0x9e37_79b9_7f4a_7c15,
         hash_atom_shift: 32,
@@ -311,11 +317,11 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
         );
         assert_eq!(arena, before);
     }
-    put(&mut arena, 156, PropertyLoadAction::OwnData as u8);
-    put(&mut arena, 157, PropertyStoreAction::Unknown as u8);
-    put(&mut arena, 162, false);
-    put_offset(&mut arena, 164, RECEIVER_SHAPE);
-    put(&mut arena, 184, 7u64);
+    put(&mut arena, ROW + 12, PropertyLoadAction::OwnData as u8);
+    put(&mut arena, ROW + 13, PropertyStoreAction::Unknown as u8);
+    put(&mut arena, ROW + 18, false);
+    put_offset(&mut arena, ROW + 28, RECEIVER_SHAPE);
+    put(&mut arena, ROW + 48, 7u64);
     let own = executable(&view, false, true);
     let before_own = arena.clone();
     assert_eq!(
@@ -366,13 +372,13 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
     for failure in [0, 1, 2, 3, 6, 7, 9] {
         prepare(&mut arena, &mut view, &proof);
         match failure {
-            0 => put(&mut arena, 152, 10u32), // full key mismatch
-            1 => put(&mut arena, 157, PropertyStoreAction::Unknown as u8),
-            2 => put(&mut arena, 172, 0u32), // runtime-only transition
+            0 => put(&mut arena, ROW + 8, 10u32), // full key mismatch
+            1 => put(&mut arena, ROW + 13, PropertyStoreAction::Unknown as u8),
+            2 => put(&mut arena, ROW + 36, 0u32), // runtime-only transition
             3 => proof.store(0, std::sync::atomic::Ordering::Relaxed),
             6 => put(&mut arena, CHILD + SHAPE_ID_BYTE as usize, 123u64),
             7 => {
-                put(&mut arena, 160, 2u16);
+                put(&mut arena, ROW + 16, 2u16);
                 put(
                     &mut arena,
                     RECEIVER + view.field_layout.slab_handle_byte as usize,
@@ -400,9 +406,15 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
         proof.store(1, std::sync::atomic::Ordering::Relaxed);
     }
     prepare(&mut arena, &mut view, &proof);
-    put(&mut arena, 156, PropertyLoadAction::Unknown as u8);
-    put(&mut arena, 157, PropertyStoreAction::OwnWritable as u8);
-    put(&mut arena, 160, 2u16);
+    put(&mut arena, ROW + 12, PropertyLoadAction::Unknown as u8);
+    put(&mut arena, ROW + 13, PropertyStoreAction::OwnWritable as u8);
+    put(&mut arena, ROW + 16, 2u16);
+    // Slot 2 is the first slab word; Top covers every value.
+    put(
+        &mut arena,
+        ROW + 24,
+        otter_vm::jit::slot_word::SLAB | otter_vm::jit::slot_word::ANY,
+    );
     put(
         &mut arena,
         RECEIVER_SHAPE + view.shape_state_byte as usize,
@@ -440,6 +452,26 @@ fn emitted_actions_keep_inherited_reads_append_slots_and_pre_effect_misses_indep
     assert_eq!(run(&code, &mut arena, Value::number_i32(999)), POISON);
     assert_eq!(arena, before);
     assert_stability(&arena, &view, 1);
+    // A summary holding Int32 alone covers an Int32 overwrite; any other
+    // class misses before anything is written.
+    put(
+        &mut arena,
+        SLAB + view.field_layout.slab_capacity_byte as usize,
+        1u32,
+    );
+    put(
+        &mut arena,
+        ROW + 24,
+        otter_vm::jit::slot_word::SLAB | otter_vm::jit::slot_word::INT32,
+    );
+    assert_eq!(run(&code, &mut arena, Value::number_i32(321)), 1);
+    assert_eq!(
+        get::<u64>(&arena, SLAB + view.field_layout.slab_words_byte as usize),
+        Value::number_i32(321).to_bits()
+    );
+    let before = arena.clone();
+    assert_eq!(run(&code, &mut arena, Value::UNDEFINED), POISON);
+    assert_eq!(arena, before);
 }
 
 #[test]

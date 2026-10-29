@@ -30,7 +30,11 @@ use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dyna
 use otter_vm::{
     JitCompileSnapshot,
     jit::{JitPropertyActionCache, PropertyLoadAction, PropertyStoreAction},
+    jit::slot_word,
+    value::tag,
 };
+
+const SLOT_WORD_SLAB_BIT: u32 = slot_word::SLAB.trailing_zeros();
 
 /// `X(register)` = `value`: one move when that encodes it, else one load of
 /// its literal-pool word where the code object has a pool.
@@ -222,6 +226,115 @@ pub(super) fn bank_of_shape(
         ; =>inline ; add XSP(base), XSP(holder), #view.field_layout.inline_values_byte ; =>ready);
 }
 
+/// `X(destination)` = the slot of `holder` that `W(word)` resolves
+/// ([`otter_vm::property_cache::slot_word`]); a slab slot beyond the
+/// object's current slab goes to `miss`, before the destination is written.
+fn emit_word_load(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    holder: u8,
+    word: u8,
+    base: u8,
+    destination: u8,
+    miss: DynamicLabel,
+) {
+    let slab = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64
+        ; cbz W(word), =>miss
+        ; tbnz W(word), SLOT_WORD_SLAB_BIT, =>slab
+        ; and x16, X(word), #u64::from(slot_word::OFFSET_MASK)
+        ; ldr X(destination), [X(holder), x16]
+        ; b =>done
+        ; =>slab);
+    emit_word_slab(ops, view, holder, word, base, miss);
+    dynasm!(ops ; .arch aarch64 ; ldr X(destination), [X(base), X(word)] ; =>done);
+}
+
+/// `X(base)` = `holder`'s slab words and `X(word)` the byte offset of the
+/// slab slot `W(word)` resolves, inside the slab's capacity, else `miss`.
+fn emit_word_slab(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    holder: u8,
+    word: u8,
+    base: u8,
+    miss: DynamicLabel,
+) {
+    dynasm!(ops ; .arch aarch64
+        ; and WSP(word), W(word), #slot_word::OFFSET_MASK
+        ; and x16, X(holder), #0xffff_ffff_0000_0000
+        ; ldr W(base), [X(holder), view.field_layout.slab_handle_byte] ; cbz W(base), =>miss
+        ; add X(base), x16, X(base) ; ldr w16, [X(base), view.field_layout.slab_capacity_byte]
+        ; cmp W(word), w16, lsl #3 ; b.hs =>miss
+        ; add XSP(base), XSP(base), #view.field_layout.slab_words_byte);
+}
+
+/// Fall through when `W(word)` covers `X(value)`'s class, so the store
+/// needs no observation; else go to `observe` when the summary tracks value
+/// shapes, or to `miss`.
+fn emit_covered(
+    ops: &mut Assembler,
+    value: u8,
+    word: u8,
+    observe: DynamicLabel,
+    miss: DynamicLabel,
+) {
+    let covered = ops.new_dynamic_label();
+    let uncovered = ops.new_dynamic_label();
+    let number = ops.new_dynamic_label();
+    let other = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64
+        ; tbnz W(word), slot_word::ANY.trailing_zeros(), =>covered
+        ; asr x16, X(value), tag::NUMBER_TAG.trailing_zeros()
+        ; cmn x16, 1 ; b.ne =>number
+        ; tbnz W(word), slot_word::INT32.trailing_zeros(), =>covered
+        ; b =>uncovered
+        ; =>number
+        ; tst X(value), tag::NUMBER_TAG ; b.eq =>other
+        ; tbnz W(word), slot_word::DOUBLE.trailing_zeros(), =>covered
+        ; b =>uncovered
+        ; =>other);
+    emit_load_u64(ops, 16, crate::entry::VALUE_NULL);
+    dynasm!(ops ; .arch aarch64
+        ; cmp X(value), x16 ; b.ne >undefined
+        ; tbnz W(word), slot_word::NULL.trailing_zeros(), =>covered
+        ; b =>uncovered
+        ; undefined:);
+    emit_load_u64(ops, 16, crate::entry::VALUE_UNDEFINED);
+    dynasm!(ops ; .arch aarch64
+        ; cmp X(value), x16 ; b.ne =>uncovered
+        ; tbnz W(word), slot_word::UNDEFINED.trailing_zeros(), =>covered
+        ; =>uncovered
+        ; tbnz W(word), slot_word::OBSERVE.trailing_zeros(), =>observe
+        ; b =>miss
+        ; =>covered);
+}
+
+/// Store `X(value)` into the slot of `receiver` that `W(word)` resolves; a
+/// slab slot beyond the current slab goes to `miss` before anything is
+/// written.
+fn emit_word_store(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    value: u8,
+    word: u8,
+    base: u8,
+    miss: DynamicLabel,
+) {
+    let slab = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64
+        ; tbnz W(word), SLOT_WORD_SLAB_BIT, =>slab
+        ; and x16, X(word), #u64::from(slot_word::OFFSET_MASK)
+        ; str X(value), [X(receiver), x16]
+        ; b =>done
+        ; =>slab);
+    emit_word_slab(ops, view, receiver, word, base, miss);
+    dynasm!(ops ; .arch aarch64 ; str X(value), [X(base), X(word)] ; =>done);
+}
+
 /// Complete one own/inherited data load or branch before effects. The result
 /// may alias the receiver and is written only after every guard succeeds.
 /// `own_only` accepts an own data slot alone: a projected storage object's
@@ -256,10 +369,8 @@ pub(crate) fn emit_load(
         dynasm!(ops ; .arch aarch64
             ; ldrb w16, [X(entry), cache.load_action_byte]
             ; cmp w16, #PropertyLoadAction::OwnData as u32 ; b.ne =>miss
-            ; ldrh W(slot), [X(entry), cache.load_slot_byte]);
-        bank_of_shape(ops, view, receiver, holder, slot, base, miss);
-        dynasm!(ops ; .arch aarch64
-            ; ldr X(destination), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]);
+            ; ldr W(slot), [X(entry), cache.load_word_byte]);
+        emit_word_load(ops, view, receiver, slot, base, destination, miss);
         return;
     }
     dynasm!(ops ; .arch aarch64
@@ -284,17 +395,14 @@ pub(crate) fn emit_load(
         // reused shape id proves the holder's state as well as its layout.
         ; ldr x16, [X(base), cache.shape_id_byte]
         ; ldr x17, [X(entry), cache.holder_shape_id_byte] ; cmp x16, x17 ; b.ne =>miss
-        ; ldrh W(slot), [X(entry), cache.load_slot_byte]);
-    bank_of_shape(ops, view, holder, base, slot, base, miss);
+        ; ldr W(slot), [X(entry), cache.load_word_byte]);
+    emit_word_load(ops, view, holder, slot, base, destination, miss);
     dynasm!(ops ; .arch aarch64
-        ; ldr X(destination), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
         ; b =>canonical
-        // The matched key already proved the receiver's exact shape, whose
-        // address `key` left in the holder temporary.
-        ; =>own ; ldrh W(slot), [X(entry), cache.load_slot_byte]);
-    bank_of_shape(ops, view, receiver, holder, slot, base, miss);
+        // The matched key already proved the receiver's exact shape.
+        ; =>own ; ldr W(slot), [X(entry), cache.load_word_byte]);
+    emit_word_load(ops, view, receiver, slot, base, destination, miss);
     dynasm!(ops ; .arch aarch64
-        ; ldr X(destination), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
         ; b =>canonical
         // Absent from the whole chain: the proof (none for a `null`
         // prototype the receiver shape fixes) authorizes `undefined`.
@@ -371,15 +479,21 @@ pub(crate) fn emit_store(
         ; ldr W(entry), [X(entry), cache.store_owner_byte]
     );
     super::field_type::emit_observe(ops, relocations, view, entry, value);
+    // An overwrite of a value its field already covers needs no
+    // observation; an uncovered one is observed only where the summary
+    // tracks value shapes, and otherwise completes in the runtime.
+    let observe = ops.new_dynamic_label();
+    let overwritten = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; b =>done
-        ; =>own ; ldrh W(slot), [X(entry), cache.store_slot_byte]);
-    bank_of_shape(ops, view, receiver, holder, slot, base, miss);
-    dynasm!(ops ; .arch aarch64
-        ; str X(value), [X(base), X(slot), lsl #otter_vm::object::FieldLocation::INDEX_SHIFT]
-        ; ldr W(entry), [X(entry), cache.store_owner_byte]
-    );
+        ; =>own ; ldr W(slot), [X(entry), cache.store_word_byte] ; cbz W(slot), =>miss);
+    emit_covered(ops, value, slot, observe, miss);
+    emit_word_store(ops, view, receiver, value, slot, base, miss);
+    dynasm!(ops ; .arch aarch64 ; b =>overwritten ; =>observe);
+    emit_word_store(ops, view, receiver, value, slot, base, miss);
+    dynasm!(ops ; .arch aarch64 ; ldr W(entry), [X(entry), cache.store_owner_byte]);
     super::field_type::emit_observe(ops, relocations, view, entry, value);
     dynasm!(ops ; .arch aarch64
+        ; =>overwritten
         ; mov W(slot), wzr ; =>done);
 }
 

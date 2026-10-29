@@ -2858,6 +2858,9 @@ impl GcHeap {
                 }
             }
         };
+        if crate::scavenger::gc_verify_enabled() {
+            self.verify_remembered_complete();
+        }
         // SAFETY: STW pause for the duration of the call;
         // every type tag in from-space is registered.
         let scavenge_start = Instant::now();
@@ -3443,6 +3446,109 @@ impl GcHeap {
             self.verify_marking_closed();
         }
         Ok(())
+    }
+
+    /// `OTTER_GC_VERIFY`: before a scavenge, every young child an old cell
+    /// holds is reached by a trace the scavenge runs: of a remembered parent
+    /// or of a young cell, either of which may walk storage it keeps out of
+    /// line (an object's old slot slab). A miss names a store no generational barrier saw: the
+    /// scavenge would move the child and leave that slot pointing at its
+    /// forwarded copy. Reports the holder's tag and the slot's byte offset,
+    /// and the cell referencing it; an unreferenced holder is garbage no
+    /// trace reads. A remembered parent counts as traced in full: a type
+    /// whose re-trace reads only its dirty interval (an element slab) is
+    /// checked no closer than that, since reading the interval consumes it.
+    fn verify_remembered_complete(&self) {
+        let trace_table = &self.trace_table;
+        let old_pages = || self.old_space.pages().iter().chain(self.large_space.pages().iter());
+        let live = |h: *mut GcHeader| {
+            // SAFETY: STW pause; `h` is a walkable header.
+            unsafe {
+                (*h).type_tag() != crate::header::FREE_TAG
+                    && (*h).size_bytes() != 0
+                    && !(*h).is_swept_settled()
+            }
+        };
+        let mut covered = std::collections::HashSet::new();
+        // Holder of each referenced cell, to name a reported cell's owner.
+        let mut holder = std::collections::HashMap::new();
+        let young_pages = self
+            .new_space
+            .from_pages()
+            .iter()
+            .chain(self.young_large_space.pages().iter());
+        for (page, young) in old_pages()
+            .map(|page| (page, false))
+            .chain(young_pages.map(|page| (page, true)))
+        {
+            // SAFETY: STW pause; every non-filler cell is a registered body.
+            unsafe {
+                page.for_each_object(|h, _| {
+                    if !live(h) {
+                        return;
+                    }
+                    let traced = young || (*h).is_remembered();
+                    trace_table.trace(h, &mut |slot| {
+                        if traced {
+                            covered.insert(slot as usize);
+                        }
+                        if (*slot).0 != 0 {
+                            holder.insert((*slot).0, h as usize);
+                        }
+                    });
+                });
+            }
+        }
+        let mut reported = 0usize;
+        for page in old_pages() {
+            // SAFETY: as above.
+            unsafe {
+                page.for_each_object(|h, _| {
+                    if !live(h) {
+                        return;
+                    }
+                    trace_table.trace(h, &mut |slot| {
+                        let raw = (*slot).0;
+                        if raw == 0 || covered.contains(&(slot as usize)) {
+                            return;
+                        }
+                        let child = cage_base().add(raw as usize) as *const GcHeader;
+                        let offset = (h as usize - cage_base() as usize) as u32;
+                        // An unreferenced cell is garbage the next full
+                        // collection reclaims; no trace reads it.
+                        let Some(&owner) = holder.get(&offset) else {
+                            return;
+                        };
+                        if (*child).is_young() && reported < 16 {
+                            reported += 1;
+                            let owner = owner as *const GcHeader;
+                            eprintln!(
+                                "OTTER_GC_VERIFY: old cell {offset:#x} (tag {:#x}, {} bytes) holds \
+                                 young cell {raw:#x} (tag {:#x}) at byte {} that no traced cell \
+                                 reaches; referenced by {:#x} (tag {:#x}, young {}, remembered {}); \
+                                 spaces {:?}/{:?}/{:?} flags {:#x}/{:#x}",
+                                (*h).type_tag(),
+                                (*h).size_bytes(),
+                                (*child).type_tag(),
+                                slot as usize - h as usize,
+                                owner as usize - cage_base() as usize,
+                                (*owner).type_tag(),
+                                (*owner).is_young(),
+                                (*owner).is_remembered(),
+                                crate::page::Page::space_of(h as *const u8),
+                                crate::page::Page::space_of(owner as *const u8),
+                                crate::page::Page::space_of(child as *const u8),
+                                *(h as *const u8).add(1),
+                                *(owner as *const u8).add(1),
+                            );
+                            if std::env::var_os("OTTER_GC_VERIFY_BT").is_some() {
+                                eprintln!("{}", std::backtrace::Backtrace::force_capture());
+                            }
+                        }
+                    });
+                });
+            }
+        }
     }
 
     /// `OTTER_GC_VERIFY`: after the final drain, every marked old cell's old

@@ -443,6 +443,7 @@ fn emit_keyed_load(
     let generic = ops.new_dynamic_label();
     let object = ops.new_dynamic_label();
     let shaped = ops.new_dynamic_label();
+    let dictionary = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>label);
     // The key's atom first: interning records it on the string, so the
     // own-data walk below reads it back instead of hashing the units again.
@@ -474,7 +475,7 @@ fn emit_keyed_load(
         ; add r10, r11
         ; test BYTE [r10 + view.shape_state_byte as i32],
             otter_vm::object::ShapeState::DICTIONARY_MASK as i8
-        ; jnz =>generic
+        ; jnz =>dictionary
         ; =>shaped
     );
     // An Array's own named data lives in its bag.
@@ -519,6 +520,15 @@ fn emit_keyed_load(
         ; =>loaded
         ; xor edx, edx
         ; ret
+        // A dictionary-mode receiver's own data property, by its key table.
+        ; =>dictionary
+    );
+    emit_dictionary_own_load(ops, view, KEYED_LOAD_RECEIVER, 9, 0, [2, 7, 8], generic);
+    dynasm!(ops ; .arch x64
+        ; xor edx, edx
+        ; ret
+        // A name the table does not hold, an absent own key or an accessor:
+        // the generic own-data walk.
         ; =>generic
         ; mov rdx, Rq(KEYED_LOAD_KEY)
         ; mov rdi, [r15 + crate::entry::THREAD_OFFSET as i32]
@@ -540,14 +550,98 @@ fn emit_keyed_load(
         ; ret);
 }
 
+/// `destination` = the own data property `atom` names on the
+/// dictionary-mode object in `receiver`; `absent` for an opaque lookup, an
+/// absent key or an accessor. Writes only `destination`, the three
+/// temporaries, `r10` and `r11`.
+fn emit_dictionary_own_load(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    atom: u8,
+    destination: u8,
+    [metas, table, index]: [u8; 3],
+    absent: DynamicLabel,
+) {
+    let layout = otter_vm::object::DictionaryLayout::current();
+    let field = otter_vm::object::FieldLayout::current();
+    let chain = ops.new_dynamic_label();
+    let found = ops.new_dynamic_label();
+    let slab = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    emit_load_u64(ops, 10, CAGE_MASK);
+    dynasm!(ops ; .arch x64
+        ; and r10, Rq(receiver)
+        ; mov r11d, [Rq(receiver) + view.object_shape_byte as i32]
+        ; add r11, r10
+        ; test BYTE [r11 + view.shape_state_byte as i32],
+            otter_vm::object::ShapeState::OPAQUE_LOOKUP_MASK as i8
+        ; jnz =>absent
+        ; mov Rd(metas), [Rq(receiver) + layout.exotic_byte as i32]
+        ; test Rd(metas), Rd(metas) ; jz =>absent
+        ; add Rq(metas), r10
+        ; mov Rd(table), [Rq(metas) + layout.keys_byte as i32]
+        ; test Rd(table), Rd(table) ; jz =>absent
+        ; add Rq(table), r10
+        ; mov Rd(metas), [Rq(metas) + layout.metas_byte as i32]
+        ; test Rd(metas), Rd(metas) ; jz =>absent
+        ; add Rq(metas), r10
+        ; mov Rd(index), Rd(atom)
+    );
+    emit_load_u64(ops, 11, layout.hash_multiplier);
+    dynasm!(ops ; .arch x64
+        ; imul Rq(index), r11
+        ; shr Rq(index), 32
+        ; mov r11d, [Rq(table) + layout.mask_byte as i32]
+        ; and Rd(index), r11d
+        ; lea Rq(table), [Rq(table) + layout.buckets_byte as i32]
+        ; mov Rd(index), [Rq(table) + Rq(index) * 4]
+        // The entry records follow the `mask + 1` buckets.
+        ; add r11d, 1
+        ; lea Rq(table), [Rq(table) + r11 * 4]
+        ; =>chain
+        ; cmp Rd(index), -1
+        ; je =>absent
+        ; mov r11d, Rd(index)
+        ; shl r11, layout.entry_shift as i8
+        ; add r11, Rq(table)
+        ; cmp [r11 + layout.entry_atom_byte as i32], Rd(atom)
+        ; je =>found
+        ; mov Rd(index), [r11 + layout.entry_next_byte as i32]
+        ; jmp =>chain
+        ; =>found
+        // The entry index is the slot index; its metadata says data or
+        // accessor.
+        ; imul r11d, Rd(index), layout.meta_bytes as i32
+        ; add r11, Rq(metas)
+        ; cmp BYTE [r11 + (layout.metas_records_byte + layout.meta_accessor_byte) as i32], 0
+        ; jne =>absent
+        ; mov r11d, [Rq(receiver) + view.object_shape_byte as i32]
+        ; add r11, r10
+        ; movzx r11d, BYTE [r11 + view.shape_inline_capacity_byte as i32]
+        ; cmp Rd(index), r11d
+        ; jae =>slab
+        ; mov Rq(destination), [Rq(receiver) + Rq(index) * 8 + field.inline_values_byte as i32]
+        ; jmp =>done
+        ; =>slab
+        ; sub Rd(index), r11d
+        ; mov r11d, [Rq(receiver) + field.slab_handle_byte as i32]
+        ; test r11d, r11d ; jz =>absent
+        ; add r11, r10
+        ; mov Rq(destination), [r11 + Rq(index) * 8 + field.slab_words_byte as i32]
+        ; =>done
+    );
+}
+
 /// Keyed load probe result on a hit.
 pub(crate) const PROBE_KEYED_RESULT: u8 = 0;
 
 /// The keyed load's shaped table hit for an optimized site, receiver in
 /// [`KEYED_LOAD_RECEIVER`] and key in [`KEYED_LOAD_KEY`]: `r11 == 0` with the
 /// value in [`PROBE_KEYED_RESULT`], else `r11 != 0` and the site takes the
-/// full routine. A key whose atom is unrecorded, a dictionary-mode receiver
-/// and a table miss all decline; nothing is called. Every register but the
+/// full routine. A dictionary-mode receiver reads its own key table. A key
+/// whose atom is unrecorded, an absent or accessor dictionary key and a
+/// table miss all decline; nothing is called. Every register but the
 /// result, `r10` and `r11` is preserved.
 fn emit_keyed_load_probe(
     ops: &mut Assembler,
@@ -581,8 +675,37 @@ fn emit_keyed_load_probe(
         ; mov r9d, [Rq(key) + otter_vm::symbol::SYMBOL_ATOM_BYTE as i32]
         ; cmp r9d, -1 ; je =>miss
         ; =>ready);
-    // The table holds no dictionary-mode object's keys, so its probe misses
-    // such a receiver by shape identity; an Array reads its named bag.
+    // The table holds no dictionary-mode object's keys: such a receiver
+    // reads its own key table.
+    let shaped = ops.new_dynamic_label();
+    emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64
+        ; test Rq(KEYED_LOAD_RECEIVER), r11 ; jnz =>shaped
+        ; test Rq(KEYED_LOAD_RECEIVER), Rq(KEYED_LOAD_RECEIVER) ; jz =>shaped
+        ; cmp BYTE [Rq(KEYED_LOAD_RECEIVER)], crate::entry::OBJECT_BODY_TYPE_TAG as i8
+        ; jne =>shaped
+        ; mov r11d, [Rq(KEYED_LOAD_RECEIVER) + view.object_shape_byte as i32]
+        ; test r11d, r11d ; jz =>shaped
+    );
+    emit_load_u64(ops, 10, CAGE_MASK);
+    dynasm!(ops ; .arch x64
+        ; and r10, Rq(KEYED_LOAD_RECEIVER)
+        ; add r10, r11
+        ; test BYTE [r10 + view.shape_state_byte as i32],
+            otter_vm::object::ShapeState::DICTIONARY_MASK as i8
+        ; jz =>shaped
+    );
+    emit_dictionary_own_load(
+        ops,
+        view,
+        KEYED_LOAD_RECEIVER,
+        9,
+        PROBE_KEYED_RESULT,
+        [2, 7, 8],
+        miss,
+    );
+    dynasm!(ops ; .arch x64 ; jmp =>loaded ; =>shaped);
+    // An Array reads its named bag.
     emit_array_bag(ops, view, 2, object, miss);
     emit_action_probe(
         ops,

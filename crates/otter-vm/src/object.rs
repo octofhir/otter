@@ -1337,11 +1337,69 @@ pub struct DictKeysBody {
 /// End of a dictionary hash chain.
 const DICT_CHAIN_END: u32 = u32::MAX;
 
+/// Multiplier of the dictionary key hash.
+const DICT_KEY_HASH_MULTIPLIER: u64 = 0x9e37_79b9_7f4a_7c15;
+
 /// Bucket hash of a dictionary key's atom: the high word of a Fibonacci
 /// product, which spreads consecutive ids.
 #[inline]
 fn dict_key_hash(atom: crate::property_atom::AtomId) -> u32 {
-    ((u64::from(atom.raw()).wrapping_mul(0x9e37_79b9_7f4a_7c15)) >> 32) as u32
+    ((u64::from(atom.raw()).wrapping_mul(DICT_KEY_HASH_MULTIPLIER)) >> 32) as u32
+}
+
+/// The words generated code reads a dictionary-mode object's own data
+/// properties through: its sidecar's key table and slot metadata, and the
+/// key table's hash. Offsets count from each cell's header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DictionaryLayout {
+    /// The object body's compressed sidecar handle.
+    pub exotic_byte: u32,
+    /// The sidecar's compressed key table handle.
+    pub keys_byte: u32,
+    /// The sidecar's compressed slot metadata handle.
+    pub metas_byte: u32,
+    /// The key table's `u32` bucket mask.
+    pub mask_byte: u32,
+    /// The key table's first `u32` bucket head; the entry records follow
+    /// the `mask + 1` buckets.
+    pub buckets_byte: u32,
+    /// `log2` of an entry record's size.
+    pub entry_shift: u32,
+    /// An entry's `u32` next index in its chain, `u32::MAX` at the end.
+    pub entry_next_byte: u32,
+    /// An entry's `u32` key atom.
+    pub entry_atom_byte: u32,
+    /// The metadata table's first record.
+    pub metas_records_byte: u32,
+    /// A metadata record's size.
+    pub meta_bytes: u32,
+    /// A metadata record's accessor flag byte.
+    pub meta_accessor_byte: u32,
+    /// The bucket hash: the high word of the atom times this.
+    pub hash_multiplier: u64,
+}
+
+impl DictionaryLayout {
+    /// The VM's dictionary layout.
+    #[must_use]
+    pub const fn current() -> Self {
+        let header = otter_gc::header::HEADER_SIZE as u32;
+        assert!(std::mem::size_of::<DictKeyEntry>().is_power_of_two());
+        Self {
+            exotic_byte: header + std::mem::offset_of!(ObjectBody, exotic) as u32,
+            keys_byte: header + std::mem::offset_of!(ExoticSlots, dictionary_keys) as u32,
+            metas_byte: header + std::mem::offset_of!(ExoticSlots, slots) as u32,
+            mask_byte: header + std::mem::offset_of!(DictKeysBody, bucket_mask) as u32,
+            buckets_byte: header + std::mem::size_of::<DictKeysBody>() as u32,
+            entry_shift: std::mem::size_of::<DictKeyEntry>().trailing_zeros(),
+            entry_next_byte: std::mem::offset_of!(DictKeyEntry, next) as u32,
+            entry_atom_byte: std::mem::offset_of!(DictKeyEntry, atom) as u32,
+            metas_records_byte: header + std::mem::size_of::<SlotMetaBody>() as u32,
+            meta_bytes: std::mem::size_of::<SlotMeta>() as u32,
+            meta_accessor_byte: std::mem::offset_of!(SlotMeta, is_accessor) as u32,
+            hash_multiplier: DICT_KEY_HASH_MULTIPLIER,
+        }
+    }
 }
 
 impl DictKeysBody {

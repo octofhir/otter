@@ -146,6 +146,7 @@ pub(super) fn define_string(
         .map(|table| handles.local(table));
         let table = table.map(|table| table.get());
         let keys = keys.map(|table| table.get());
+        let key_atom = crate::isolate_names::names_mut(heap).intern(key);
         heap.with_payload(*object, |body| {
             body.enter_dictionary_mode(true);
             if let Some(table) = table {
@@ -154,7 +155,7 @@ pub(super) fn define_string(
             if let Some(keys) = keys {
                 body.exotic_mut().dictionary_keys = keys;
             }
-            dict_push_key(body, key.to_owned());
+            dict_push_key(body, key, key_atom);
             body.push_slot(index, meta, stored);
         });
         let sidecar = heap.read_payload(*object, |body| body.exotic.get());

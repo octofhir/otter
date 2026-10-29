@@ -1294,8 +1294,8 @@ pub const DICT_KEYS_BODY_TYPE_TAG: u8 = 0x3d;
 /// Handle to a dictionary-mode object's key table.
 pub(crate) type DictKeysHandle = otter_gc::Gc<DictKeysBody>;
 
-/// One dictionary key record: where its UTF-8 bytes sit in the table's
-/// byte arena, and the next entry in its hash chain.
+/// One dictionary key record: the key's atom, where its UTF-8 bytes sit in
+/// the table's byte arena, and the next entry in its hash chain.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DictKeyEntry {
@@ -1303,18 +1303,18 @@ struct DictKeyEntry {
     byte_len: u32,
     /// Next entry index in the same bucket, or `u32::MAX`.
     next: u32,
-    /// The key hash's high word: a chain walk compares it before the bytes.
-    tag: u32,
+    /// The key's isolate-global atom; a chain walk compares only it.
+    atom: u32,
 }
 
 /// Header for a dictionary-mode object's insertion-ordered key table.
 ///
 /// The trailing storage holds, in order: the bucket array (one `u32`
 /// head per bucket), the entry records, and a byte arena the keys'
-/// UTF-8 lives in. Everything the old `Vec<String>` +
-/// `FxHashMap<String, u16>` pair provided, in one cell the page image
-/// carries whole. Keys hash by content, which no collection changes,
-/// so the chains never go stale — unlike identity-keyed tables.
+/// UTF-8 lives in, in one cell the page image carries whole. Keys hash by
+/// atom: an atom is permanent for its isolate and no collection changes
+/// it, so the chains never go stale, and a lookup compares `u32`s, never
+/// bytes. Every key is interned when it enters the table.
 ///
 /// Slot offsets are entry indices: the table is append-only between
 /// wholesale rebuilds (delete compaction replaces the table), exactly
@@ -1337,12 +1337,11 @@ pub struct DictKeysBody {
 /// End of a dictionary hash chain.
 const DICT_CHAIN_END: u32 = u32::MAX;
 
-/// Content hash for dictionary keys — stable across collections.
-fn dict_key_hash(key: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = rustc_hash::FxHasher::default();
-    key.as_bytes().hash(&mut hasher);
-    hasher.finish()
+/// Bucket hash of a dictionary key's atom: the high word of a Fibonacci
+/// product, which spreads consecutive ids.
+#[inline]
+fn dict_key_hash(atom: crate::property_atom::AtomId) -> u32 {
+    ((u64::from(atom.raw()).wrapping_mul(0x9e37_79b9_7f4a_7c15)) >> 32) as u32
 }
 
 impl DictKeysBody {
@@ -1432,29 +1431,45 @@ impl DictKeysBody {
         }
     }
 
-    /// Entry index of `key`, or `None`.
-    fn find(&self, key: &str) -> Option<u32> {
-        let hash = dict_key_hash(key);
-        let bucket = (hash as u32 & self.bucket_mask) as usize;
-        let tag = (hash >> 32) as u32;
+    /// The atom of the key at entry `index`.
+    fn atom_at(&self, index: usize) -> crate::property_atom::AtomId {
+        debug_assert!(index < self.len());
+        // SAFETY: the entry was written before the table became reachable.
+        crate::property_atom::AtomId::from_global(unsafe { (*self.entries_ptr().add(index)).atom })
+    }
+
+    /// Entry index of the key `atom`, or `None`.
+    #[inline]
+    fn find(&self, atom: crate::property_atom::AtomId) -> Option<u32> {
+        if atom == crate::property_atom::AtomId::NONE {
+            return None;
+        }
+        let bucket = (dict_key_hash(atom) & self.bucket_mask) as usize;
         // SAFETY: `bucket < bucket_count`; buckets were initialised.
         let mut current = unsafe { *self.buckets_ptr().add(bucket) };
         while current != DICT_CHAIN_END {
-            let index = current as usize;
             // SAFETY: chain indices always name written entries.
-            let entry = unsafe { *self.entries_ptr().add(index) };
-            if entry.tag == tag && entry.byte_len as usize == key.len() && self.key_at(index) == key
-            {
-                return Some(u32::try_from(index).expect("dictionary index exceeds u32"));
+            let entry = unsafe { *self.entries_ptr().add(current as usize) };
+            if entry.atom == atom.raw() {
+                return Some(current);
             }
             current = entry.next;
         }
         None
     }
 
-    /// Append `key`. The caller must have reserved entry and byte room:
-    /// growth allocates, and a payload borrow has no heap.
-    fn push(&mut self, key: &str) {
+    /// Entry index of the key spelled `key`, read without the interner: a
+    /// walk of the entries.
+    fn find_spelling(&self, key: &str) -> Option<u32> {
+        (0..self.len())
+            .find(|&index| self.key_at(index) == key)
+            .map(|index| u32::try_from(index).expect("dictionary index exceeds u32"))
+    }
+
+    /// Append `key`, whose atom is `atom`. The caller must have reserved
+    /// entry and byte room: growth allocates, and a payload borrow has no
+    /// heap.
+    fn push(&mut self, key: &str, atom: crate::property_atom::AtomId) {
         let index = self.len();
         debug_assert!(
             index < self.capacity(),
@@ -1474,8 +1489,8 @@ impl DictKeysBody {
             );
         }
         self.byte_len += key.len() as u32;
-        let hash = dict_key_hash(key);
-        let bucket = (hash as u32 & self.bucket_mask) as usize;
+        debug_assert_ne!(atom, crate::property_atom::AtomId::NONE);
+        let bucket = (dict_key_hash(atom) & self.bucket_mask) as usize;
         // SAFETY: `bucket < bucket_count`; `index < capacity`.
         unsafe {
             let head = *self.buckets_ptr().add(bucket);
@@ -1483,7 +1498,7 @@ impl DictKeysBody {
                 byte_offset,
                 byte_len: key.len() as u32,
                 next: head,
-                tag: (hash >> 32) as u32,
+                atom: atom.raw(),
             });
             *self.buckets_ptr().add(bucket) = index as u32;
         }
@@ -1525,17 +1540,18 @@ fn dict_keys_body_of(handle: DictKeysHandle) -> Option<*mut DictKeysBody> {
     })
 }
 
-/// Allocate a key table holding `keys` (in order) with headroom for
-/// `extra_entries` more entries and `extra_bytes` more key bytes.
+/// Allocate a key table holding `keys` (in order, each with its atom) with
+/// headroom for `extra_entries` more entries and `extra_bytes` more key
+/// bytes.
 fn dict_keys_table_from(
     heap: &mut otter_gc::GcHeap,
-    keys: &[String],
+    keys: &[(String, crate::property_atom::AtomId)],
     extra_entries: usize,
     extra_bytes: usize,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<DictKeysHandle, otter_gc::OutOfMemory> {
     let capacity = (keys.len() + extra_entries).max(4);
-    let byte_capacity = (keys.iter().map(String::len).sum::<usize>() + extra_bytes)
+    let byte_capacity = (keys.iter().map(|(key, _)| key.len()).sum::<usize>() + extra_bytes)
         .next_multiple_of(8)
         .max(32);
     let table: DictKeysHandle = heap.alloc_variable_with_roots(
@@ -1547,8 +1563,8 @@ fn dict_keys_table_from(
     let body = dict_keys_body_of(table).expect("fresh table");
     unsafe {
         (*body).init_buckets();
-        for key in keys {
-            (*body).push(key);
+        for (key, atom) in keys {
+            (*body).push(key, *atom);
         }
     }
     Ok(table)
@@ -1581,7 +1597,14 @@ fn dict_keys_table_for_install(
         }
     };
     if let Some(keys) = keys {
-        let table = dict_keys_table_from(heap, keys, 1, pending_key.len(), &mut visit)?;
+        let keys: Vec<(String, crate::property_atom::AtomId)> = keys
+            .iter()
+            .map(|key| {
+                let atom = crate::isolate_names::names_mut(heap).intern(key);
+                (key.clone(), atom)
+            })
+            .collect();
+        let table = dict_keys_table_from(heap, &keys, 1, pending_key.len(), &mut visit)?;
         return Ok(Some(table));
     }
     // Already dictionary-mode: grow the existing table when the pending
@@ -1598,8 +1621,8 @@ fn dict_keys_table_for_install(
             if fits {
                 (true, Vec::new())
             } else {
-                let keys: Vec<String> = (0..(*table).len())
-                    .map(|i| (*table).key_at(i).to_owned())
+                let keys: Vec<(String, crate::property_atom::AtomId)> = (0..(*table).len())
+                    .map(|i| ((*table).key_at(i).to_owned(), (*table).atom_at(i)))
                     .collect();
                 (false, keys)
             }
@@ -1610,7 +1633,8 @@ fn dict_keys_table_for_install(
         return Ok(None);
     }
     let extra_entries = existing.len().max(4);
-    let extra_bytes = (existing.iter().map(String::len).sum::<usize>() + pending_key.len()).max(32);
+    let extra_bytes =
+        (existing.iter().map(|(key, _)| key.len()).sum::<usize>() + pending_key.len()).max(32);
     let table = dict_keys_table_from(heap, &existing, extra_entries, extra_bytes, &mut visit)?;
     Ok(Some(table))
 }
@@ -2708,15 +2732,23 @@ impl ObjectBody {
     fn dict_key_count(&self) -> usize {
         self.dict_keys().map_or(0, DictKeysBody::len)
     }
-    /// Dictionary-mode `key → slot offset`, or `None`.
-    ///
-    /// A small dictionary keeps no hash index (see [`DICT_LINEAR_SCAN_MAX`]):
-    /// a linear scan over its few short key strings is faster than hashing and
-    /// avoids allocating/maintaining a `FxHashMap` per object. This matters for
-    /// `JSON.parse`, which builds large numbers of small dictionary objects.
+    /// Dictionary-mode slot offset of the key `atom`, or `None`.
     #[inline]
-    fn dictionary_index_get(&self, key: &str) -> Option<u32> {
-        self.dict_keys().and_then(|table| table.find(key))
+    fn dictionary_index_get(&self, atom: crate::property_atom::AtomId) -> Option<u32> {
+        self.dict_keys().and_then(|table| table.find(atom))
+    }
+
+    /// Dictionary-mode slot offset of the key spelled `key`, from `heap`'s
+    /// interner, or by spelling where `heap` cannot read it.
+    fn dictionary_index_of(
+        &self,
+        heap: &impl crate::heap_read::HeapRead,
+        key: &str,
+    ) -> Option<u32> {
+        match heap.spelling_atom(key) {
+            Some(atom) => self.dictionary_index_get(atom),
+            None => self.dict_keys().and_then(|table| table.find_spelling(key)),
+        }
     }
 
     /// `true` when per-slot metadata is materialized in [`ExoticSlots::slots`]
@@ -4103,12 +4135,12 @@ pub(super) fn body_offset_of(
     }
     // O(1) dictionary lookup via the maintained index — a linear scan
     // here makes bulk property addition O(n²).
-    body.dictionary_index_get(key)
+    body.dictionary_index_of(heap, key)
 }
 
 /// [`body_offset_of`] for an atomized key: a shaped object answers with one
-/// `u32` compare per shape-chain link and never touches a heap string.
-/// Dictionary storage keys by spelling, so it still hashes the name. A key
+/// `u32` compare per shape-chain link and never touches a heap string, and
+/// dictionary storage, keyed by atom, with one per chain entry. A key
 /// whose spelling was never interned ([`crate::property_atom::AtomId::NONE`],
 /// the root shape's own marker) names no shaped property.
 pub(super) fn body_offset_of_atom(
@@ -4126,7 +4158,7 @@ pub(super) fn body_offset_of_atom(
     if key.symbol_handle().is_some() {
         return None;
     }
-    body.dictionary_index_get(key.name())
+    body.dictionary_index_get(key.atom().id())
 }
 
 /// Number of own string-keyed properties recorded in a fast-mode
@@ -4152,17 +4184,17 @@ pub(crate) const MAX_FAST_PROPERTIES: u32 = 128;
 /// (and shape ICs) up to this limit.
 pub(crate) const MAX_NAMED_FAST_PROPERTIES: u32 = 1020;
 
-/// Append a dictionary key. The caller pushes the matching slot
+/// Append a dictionary key, interned as `atom`. The caller pushes the matching slot
 /// separately; the new offset is the pre-push length (slots and keys
 /// stay aligned), and the caller must have reserved room in the key
 /// table — growth allocates, and a payload borrow has no heap.
-pub(super) fn dict_push_key(body: &mut ObjectBody, key: String) {
+pub(super) fn dict_push_key(body: &mut ObjectBody, key: &str, atom: crate::property_atom::AtomId) {
     let exotic = body.exotic_mut();
     let table = dict_keys_body_of(exotic.dictionary_keys)
         .expect("dictionary key pushed without a reserved table");
     // SAFETY: a non-null handle names a live table; the sidecar borrow
     // rules out an aliasing read.
-    unsafe { (*table).push(&key) };
+    unsafe { (*table).push(key, atom) };
 }
 
 /// Clear all dictionary keys and the index together.
@@ -4412,7 +4444,7 @@ pub(crate) fn lookup_own_atom_with(
             return symbol_slots::lookup_atom(heap, body, key, symbol, slot_of);
         }
         let resolved = if body.is_dictionary() {
-            body.dictionary_index_get(key.name()).map(|offset| {
+            body.dictionary_index_get(key.atom().id()).map(|offset| {
                 let (flags, is_accessor) = body.slot_attrs(heap, offset as usize);
                 (offset, flags, is_accessor)
             })
@@ -7944,7 +7976,9 @@ mod tests {
         );
         let shape = shape_id(o, &heap);
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
+            crate::property_atom::PropertyAtom::new(
+                crate::isolate_names::names_mut(&mut heap).intern("x"),
+            ),
             "x",
         );
 
@@ -7982,7 +8016,9 @@ mod tests {
             .expect("fixture property allocation")
         );
         let key = AtomizedPropertyKey::new(
-            crate::property_atom::PropertyAtom::new(AtomId::from_global(7)),
+            crate::property_atom::PropertyAtom::new(
+                crate::isolate_names::names_mut(&mut heap).intern("x"),
+            ),
             "x",
         );
         let hit = lookup_own_atom(o, &heap, key).hit.expect("atom hit");

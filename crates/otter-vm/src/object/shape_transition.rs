@@ -139,6 +139,7 @@ pub(crate) fn capture_store_property_transition(
         std::slice::from_mut(&mut stored),
     )
     .ok()?;
+    let key_atom = crate::isolate_names::names_mut(heap).intern(key.name());
     let transition = heap.with_payload(obj, |body| {
         if !is_fast_shape_body(body)
             || !body.extensible()
@@ -158,7 +159,7 @@ pub(crate) fn capture_store_property_transition(
         if let Some(table) = slot_meta_table {
             body.exotic_mut().slots = table;
         }
-        super::dict_push_key(body, key.name().to_owned());
+        super::dict_push_key(body, key.name(), key_atom);
         body.push_slot(index, SlotMeta::data_default(), stored);
         Some(StorePropertyTransition {
             from_shape_id,
@@ -359,6 +360,7 @@ pub(crate) fn replay_store_property_transition(
     )?;
     // Read the actual retained child word after every collecting reservation.
     let to_shape = read_target();
+    let key_atom = crate::isolate_names::names_mut(heap).intern(key.name());
     heap.with_payload(obj, |body| {
         let offset = usize::from(slot);
         if to_shape.is_null() {
@@ -370,7 +372,7 @@ pub(crate) fn replay_store_property_transition(
             if let Some(table) = slot_meta_table {
                 body.exotic_mut().slots = table;
             }
-            super::dict_push_key(body, key.name().to_owned());
+            super::dict_push_key(body, key.name(), key_atom);
         } else {
             debug_assert_eq!(to_shape_id, Some(target_shape_id));
             body.invalidate_prototype_proofs();

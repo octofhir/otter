@@ -1939,17 +1939,16 @@ pub const UNINTERNED_KEY: u64 = u32::MAX as u64;
 /// The generic property load's dictionary case for a keyed load whose name
 /// key missed the shared property table: the data property of the
 /// dictionary-mode object `receiver_bits` or its prototype chain for the
-/// string `key_bits`, by the atom the key recorded and its ASCII spelling.
-/// The table never holds a dictionary-mode receiver, so the runtime's miss
-/// could record nothing either; a shaped receiver misses here and completes
-/// through that runtime, which fills the table.
+/// string `key_bits`, by the key's atom. The table never holds a
+/// dictionary-mode receiver, so the runtime's miss could record nothing
+/// either; a shaped receiver misses here and completes through that
+/// runtime, which fills the table.
 ///
-/// A key without a recorded atom reaches this leaf only after
-/// [`string_key_atom_leaf`] answered [`UNINTERNED_KEY`]: no shaped object
-/// has the property, so any receiver's chain is walked, dictionary objects by
-/// spelling, and its end yields `undefined`. An index-like spelling, a
-/// non-ASCII key, an accessor, an opaque object or a non-object prototype
-/// misses; nothing allocates.
+/// A key without a recorded atom is looked up in the interner from its
+/// units in place. One the interner never saw names no own string key, so
+/// any receiver's chain is walked and its end yields `undefined`. An
+/// index-like spelling, a non-ASCII key, an accessor, an opaque object or a
+/// non-object prototype misses; nothing allocates.
 #[must_use]
 pub extern "C" fn keyed_named_load_leaf(
     heap: *const otter_gc::GcHeap,
@@ -1969,7 +1968,15 @@ pub extern "C" fn keyed_named_load_leaf(
     let atom = match heap.read_payload(key.handle(), crate::string::JsStringBody::cached_atom) {
         Some(atom) if crate::object::is_dictionary(object, heap) => atom,
         Some(_) => return NativeResultPair::miss(),
-        None => crate::property_atom::AtomId::NONE,
+        // A spelling the interner never saw names no own string key.
+        None => {
+            let Some(atom) = crate::isolate_names::IsolateNames::get(heap).and_then(|isolate| {
+                crate::string::gc_body::lookup_atom_in_place(heap, key.handle(), isolate.names())
+            }) else {
+                return NativeResultPair::miss();
+            };
+            atom
+        }
     };
     crate::string::gc_body::with_latin1(heap, key.handle(), |bytes| {
         if !bytes.is_ascii() {

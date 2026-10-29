@@ -2285,6 +2285,62 @@ impl Interpreter {
         })
     }
 
+    /// `concat` of a plain array without holes whose `ArraySpeciesCreate` is
+    /// `%Array%`, over arguments that are such arrays or primitives, while no
+    /// prototype on the arrays' chain defines `@@isConcatSpreadable` or an
+    /// index: every `IsConcatSpreadable`, `HasProperty` and `Get` of the
+    /// specification loop answers from the dense storage, so the result is
+    /// the values' copy. `None` leaves every other case to the specification
+    /// steps.
+    fn dense_concat(
+        &mut self,
+        stack: &ActivationStack,
+        receiver: Value,
+        args: ValueWindow<'_>,
+    ) -> Option<Result<Value, VmError>> {
+        let heap = &self.gc_heap;
+        let spreadable = crate::symbol::WellKnown::IsConcatSpreadable;
+        let plain = |value: &Value| {
+            value.as_array().is_some_and(|array| {
+                crate::array::is_ordinary_dense(array, heap)
+                    && crate::array::is_fully_dense(array, heap)
+            })
+        };
+        if self.active_realm_id != 0
+            || self.array_index_accessor_protector
+            || !plain(&receiver)
+            || !args
+                .iter()
+                .all(|argument| plain(argument) || !argument.is_object_type())
+            || [
+                self.realm_intrinsics.array_prototype(),
+                self.realm_intrinsics.object_prototype(),
+            ]
+            .iter()
+            .any(|prototype| {
+                prototype.is_none_or(|prototype| {
+                    object::has_own_well_known_symbol(prototype, heap, spreadable)
+                })
+            })
+            || !self.array_species_is_default()
+        {
+            return None;
+        }
+        let mut values: SmallVec<[Value; 8]> = SmallVec::new();
+        for part in std::iter::once(receiver).chain(args.iter().copied()) {
+            match part.as_array() {
+                Some(array) => crate::array::with_plain_dense_values(array, heap, |items| {
+                    values.extend(items);
+                })?,
+                None => values.push(part),
+            }
+        }
+        Some(
+            self.alloc_stack_rooted_array_from_values(stack, values, &mut [], &mut [])
+                .map(Value::array),
+        )
+    }
+
     /// §22.1.3.10.1 IsConcatSpreadable(O): a non-object is never spread;
     /// otherwise `Get(O, @@isConcatSpreadable)` decides when not
     /// undefined (ToBoolean), else `IsArray(O)`.
@@ -2404,6 +2460,9 @@ impl Interpreter {
         args: ValueWindow<'_>,
         roots: &mut [&mut [Value]],
     ) -> Result<Value, CommittedValueError> {
+        if let Some(result) = self.dense_concat(stack, receiver, args) {
+            return result.map_err(CommittedValueError::JavaScript);
+        }
         self.with_handle_scope(|interp, scope| {
             let receiver = interp.scoped_value(scope, receiver);
             let arguments: Vec<_> = args
@@ -3522,6 +3581,52 @@ impl Interpreter {
         )
     }
 
+    /// `splice` of a plain array without holes whose `ArraySpeciesCreate` is
+    /// `%Array%`, after its arguments were coerced: no element read or write
+    /// of the specification loop is observable, so the dense storage slides
+    /// once. `len` is the length the coercions saw; any change since, an
+    /// unwritable `length`, an indexed accessor on a prototype or a range a
+    /// direct write cannot fill leaves the specification steps (`None`).
+    fn dense_splice(
+        &mut self,
+        stack: &ActivationStack,
+        receiver: Value,
+        len: usize,
+        start: usize,
+        delete: usize,
+        items: &[Value],
+    ) -> Option<Result<Value, VmError>> {
+        let array = receiver.as_array()?;
+        let heap = &self.gc_heap;
+        let new_len = len - delete + items.len();
+        if self.active_realm_id != 0
+            || self.array_index_accessor_protector
+            || !crate::array::is_ordinary_dense(array, heap)
+            || !crate::array::is_fully_dense(array, heap)
+            || crate::array::len(array, heap) != len
+            || !crate::array::length_writable(array, heap)
+            || !crate::array::can_fast_fill_dense_range(array, heap, start, new_len.max(len))
+            || !self.array_species_is_default()
+        {
+            return None;
+        }
+        let mut items: SmallVec<[Value; 8]> = items.iter().copied().collect();
+        let spliced = crate::array::dense_splice_with_roots(
+            array,
+            &mut self.gc_heap,
+            start,
+            delete,
+            &mut items,
+            &mut |_| {},
+        );
+        Some(match spliced {
+            Ok((_, removed)) => self
+                .alloc_stack_rooted_array_from_values(stack, removed, &mut [], &mut [])
+                .map(Value::array),
+            Err(error) => Err(error.into()),
+        })
+    }
+
     /// Whether `ArraySpeciesCreate` of a plain array of the active realm is
     /// `%Array%`: `%Array.prototype%.constructor` is `%Array%` and its
     /// `@@species` is the original getter, which answers `this`.
@@ -3886,6 +3991,17 @@ impl Interpreter {
                 return Err(CommittedValueError::JavaScript(
                     interp.err_type(("Invalid array length".to_string()).into()),
                 ));
+            }
+            let current_receiver = interp.escape_scoped(receiver);
+            if let Some(removed) = interp.dense_splice(
+                stack,
+                current_receiver,
+                len,
+                actual_start,
+                actual_delete_count,
+                &arguments.iter().skip(2).map(|argument| interp.escape_scoped(*argument)).collect::<SmallVec<[Value; 8]>>(),
+            ) {
+                return removed.map_err(CommittedValueError::JavaScript);
             }
             let current_receiver = interp.escape_scoped(receiver);
             let removed = interp.array_species_create(

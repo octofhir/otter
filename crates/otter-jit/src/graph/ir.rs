@@ -95,9 +95,14 @@ impl Repr {
 /// Selection into the source site's existing immutable store programs.
 /// Static transitions use that program's immutable append geometry; every
 /// miss-capable source/prototype/admission guard still precedes the write.
+/// `GrowingPrograms` runs the site's programs like `Programs`, and one of
+/// them appends a suffix slot: a receiver its guards prove that lacks the
+/// suffix storage completes the same append through the committed store,
+/// which allocates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum NamedStorePlan {
     Programs,
+    GrowingPrograms,
     TransitionTagged(u8),
     TransitionDouble(u8),
 }
@@ -105,9 +110,14 @@ pub(crate) enum NamedStorePlan {
 impl NamedStorePlan {
     pub(crate) const fn program(self) -> Option<u8> {
         match self {
-            Self::Programs => None,
+            Self::Programs | Self::GrowingPrograms => None,
             Self::TransitionTagged(index) | Self::TransitionDouble(index) => Some(index),
         }
+    }
+
+    /// Whether a proved append may complete through the collecting store.
+    pub(crate) const fn grows(self) -> bool {
+        matches!(self, Self::GrowingPrograms)
     }
 
     pub(crate) const fn is_double(self) -> bool {
@@ -1219,6 +1229,20 @@ impl Kind {
                 effectful: true,
                 ..Properties::default()
             },
+            // The committed store completing a proved append is the cached
+            // store's own operation.
+            Self::StoreNamedProperty {
+                plan: NamedStorePlan::GrowingPrograms,
+                ..
+            } => Properties {
+                eager_deopt: true,
+                can_throw: true,
+                writes: true,
+                effectful: true,
+                may_collect: true,
+                runs_js: true,
+                ..Properties::default()
+            },
             Self::StoreNamedProperty { .. } | Self::StoreBodySlot(_) => Properties {
                 eager_deopt: true,
                 writes: true,
@@ -1354,6 +1378,15 @@ impl Kind {
             Self::StoreOwnField { .. } | Self::StoreDoubleOwnField { .. } => {
                 &[abi::STUB_FIELD_TYPE_OBSERVE]
             }
+            Self::StoreNamedProperty {
+                plan: NamedStorePlan::GrowingPrograms,
+                ..
+            } => &[
+                abi::STUB_FIELD_TYPE_OBSERVE,
+                abi::STUB_SHAPE_LEFT,
+                abi::STUB_WRITE_BARRIER,
+                abi::STUB_JIT_STORE_PROPERTY,
+            ],
             Self::StoreNamedProperty { .. } => &[
                 abi::STUB_FIELD_TYPE_OBSERVE,
                 abi::STUB_SHAPE_LEFT,

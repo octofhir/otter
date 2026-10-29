@@ -495,6 +495,8 @@ impl Codegen<'_> {
         }
         let exit = self.eager_exit(node, DeoptReason::WrongShape);
         let done = self.ops.new_dynamic_label();
+        // A proved receiver that lacks the suffix storage an append needs.
+        let grow = (value.is_some() && plan.grows()).then(|| self.ops.new_dynamic_label());
         let view = self.view;
         let stored_value = value.map(|value| {
             if plan.is_double() {
@@ -680,12 +682,15 @@ impl Codegen<'_> {
                     }
                     Op::GuardAtomSlot { .. } => {}
                     Op::GuardExtensible { field, .. } if value.is_some() => {
+                        // Storage the receiver lacks the committed store
+                        // allocates.
                         if !field.is_inline() {
+                            let short = grow.unwrap_or(next);
                             self.load_immediate(11, 0xffff_ffff_0000_0000);
                             dynasm!(self.ops ; .arch x64 ; and r11, Rq(receiver)
                                 ; mov r10d, [Rq(receiver) + view.field_layout.slab_handle_byte as i32]
-                                ; test r10d, r10d ; jz =>next ; add r10, r11
-                                ; cmp DWORD [r10 + view.field_layout.slab_capacity_byte as i32], field.index() as i32 ; jbe =>next);
+                                ; test r10d, r10d ; jz =>short ; add r10, r11
+                                ; cmp DWORD [r10 + view.field_layout.slab_capacity_byte as i32], field.index() as i32 ; jbe =>short);
                         }
                         // A fresh receiver ran no code since its allocation,
                         // so it is still extensible; an exact guarded shape
@@ -799,6 +804,27 @@ impl Codegen<'_> {
         if last.is_none() {
             dynasm!(self.ops ; .arch x64 ; jmp =>exit);
         }
+        if let (Some(grow), Some(value)) = (grow, value) {
+            // Every guard before the append held, so the committed store
+            // makes the same append, allocating the storage, and runs no
+            // JavaScript.
+            let (slot, target) = self.property_ic_slot(node, pc)?;
+            self.defer(move |codegen| {
+                dynasm!(codegen.ops ; .arch x64 ; =>grow);
+                codegen.emit_committed_call(
+                    node,
+                    abi::STUB_JIT_STORE_PROPERTY,
+                    &[
+                        CommittedArgument::Value(receiver),
+                        CommittedArgument::Value(value),
+                        CommittedArgument::Address(slot, target),
+                    ],
+                    None,
+                )?;
+                dynasm!(codegen.ops ; .arch x64 ; jmp =>done);
+                Ok(())
+            });
+        }
         dynasm!(self.ops ; .arch x64 ; =>done);
         Ok(())
     }
@@ -875,12 +901,22 @@ impl Codegen<'_> {
         node: NodeId,
         pc: u32,
     ) -> Result<(u64, RelocationTarget), Unsupported> {
-        let view = self.view_of(node);
-        let byte_pc = view
+        let byte_pc = self
+            .view_of(node)
             .instructions
             .get(pc as usize)
             .map(|instruction| instruction.byte_pc)
             .ok_or(Unsupported::OperandShape("x86 graph property site pc"))?;
+        self.property_ic_slot(node, byte_pc)
+    }
+
+    /// The IC slot of the property site at `byte_pc` in `node`'s function.
+    fn property_ic_slot(
+        &self,
+        node: NodeId,
+        byte_pc: u32,
+    ) -> Result<(u64, RelocationTarget), Unsupported> {
+        let view = self.view_of(node);
         let slot = view
             .property_accesses
             .get(&byte_pc)

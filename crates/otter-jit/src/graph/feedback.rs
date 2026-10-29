@@ -511,10 +511,10 @@ pub(crate) fn store_node_programs(
 /// shapes or a null link.
 ///
 /// An overflow append may need to allocate or grow the suffix slab: a
-/// receiver shape alone does not prove resident storage. The committed cached
-/// store owns that collecting miss; the noncollecting named specialization
-/// accepts only inline appends. Existing suffix-slot overwrites still
-/// specialize directly.
+/// receiver shape alone does not prove resident storage. A receiver the
+/// program proves that lacks it completes the same append through the
+/// committed cached store, which collects; [`store_programs_grow`] tells the
+/// builder so.
 pub(crate) fn named_store_programs(
     view: &JitCompileSnapshot,
     byte_pc: u32,
@@ -564,8 +564,7 @@ pub(crate) fn named_store_programs(
                     writable: true,
                     ..
                 } if !stored && object == operand => {}
-                JitCacheIrOp::GuardExtensible { object: 0, field }
-                    if !stored && operand == 0 && field.is_inline() => {}
+                JitCacheIrOp::GuardExtensible { object: 0, .. } if !stored && operand == 0 => {}
                 JitCacheIrOp::StoreField { object, field, .. } if !stored && object == operand => {
                     stored = true;
                     stored_field = Some(field);
@@ -583,6 +582,18 @@ pub(crate) fn named_store_programs(
         view.field_types.get(&(receiver_shape?, stored_field?))?;
     }
     Some((projection?, programs))
+}
+
+/// Whether one of `programs` appends a suffix slot, whose storage a proved
+/// receiver may lack.
+pub(crate) fn store_programs_grow<'p>(
+    mut programs: impl Iterator<Item = &'p otter_vm::JitCacheIrProgram>,
+) -> bool {
+    programs.any(|program| {
+        program.ops.iter().any(|op| {
+            matches!(*op, JitCacheIrOp::GuardExtensible { object: 0, field } if !field.is_inline())
+        })
+    })
 }
 
 /// Select a complete ordinary inline append. The VM's StoreTransition

@@ -3681,7 +3681,18 @@ impl<'a> Builder<'a> {
                     })
                 })
                 .flatten();
-            let mut plan = NamedStorePlan::Programs;
+            let mut plan = if super::feedback::store_programs_grow(
+                programs.iter().filter(|program| compatible(program)),
+            ) {
+                // The committed store completes the sloppy-or-function-strict
+                // form only.
+                if instruction.op != otter_bytecode::Op::StoreProperty {
+                    return self.generic(instruction);
+                }
+                NamedStorePlan::GrowingPrograms
+            } else {
+                NamedStorePlan::Programs
+            };
             if projection == otter_vm::jit::PropertyStorageProjection::Receiver
                 && let Some((index, program)) = candidate
                 && super::feedback::inline_store_transition(program)

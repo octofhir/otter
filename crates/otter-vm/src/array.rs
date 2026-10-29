@@ -385,12 +385,11 @@ fn body_elements_insert(body: &mut ArrayBody, index: usize, value: Value) {
             .convert_to_tagged();
         body.refresh_element_cache();
     }
-    for source in (index..len).rev() {
-        let moved = body.dense_value(source).expect("live dense slot");
-        body.write_dense_value(source + 1, moved);
-    }
-    body.write_dense_value(index, value);
+    let slab = body.slab_body_mut().expect("dense insert without a slab");
+    slab.move_within(index, index + 1, len - index);
+    slab.set(index, value);
     body.set_dense_len(len + 1);
+    body.refresh_element_cache();
 }
 
 /// Remove the dense element at `index`, shifting the tail down.
@@ -399,10 +398,9 @@ fn body_elements_remove(body: &mut ArrayBody, index: usize) -> Value {
     let len = body.dense_len();
     assert!(index < len, "dense remove out of range");
     let removed = body.dense_value(index).expect("live dense slot");
-    for source in index + 1..len {
-        let moved = body.dense_value(source).expect("live dense slot");
-        body.write_dense_value(source - 1, moved);
-    }
+    body.slab_body_mut()
+        .expect("dense remove without a slab")
+        .move_within(index + 1, index, len - index - 1);
     body.truncate_dense(len - 1);
     removed
 }
@@ -2049,6 +2047,102 @@ pub(crate) fn dense_unshift_with_roots(
     Ok(new_len)
 }
 
+/// Replace the `delete` elements at `start` of a fully dense array with
+/// `items`, sliding the tail once, and return the removed values in order.
+///
+/// Callers must have established what makes this the specification's
+/// `splice` loop with nothing observable: the array is fully dense
+/// ([`is_fully_dense`]), its `length` writable, the written range fast-fillable
+/// ([`can_fast_fill_dense_range`]) and no prototype indexed accessor exists.
+/// Growing the storage may collect: `items` and the array are traced through
+/// the reservation, and the removed values are read only after it.
+///
+/// # Errors
+///
+/// Returns [`otter_gc::OutOfMemory`] if growing dense storage would exceed the
+/// configured heap cap.
+pub(crate) fn dense_splice_with_roots(
+    mut arr: JsArray,
+    heap: &mut otter_gc::GcHeap,
+    start: usize,
+    delete: usize,
+    items: &mut [Value],
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Result<(JsArray, SmallVec<[Value; 8]>), otter_gc::OutOfMemory> {
+    let len = len(arr, heap);
+    debug_assert!(start + delete <= len);
+    if len == 0 && items.is_empty() {
+        // Nothing to remove or insert: no storage to touch.
+        return Ok((arr, SmallVec::new()));
+    }
+    let new_len = len - delete + items.len();
+    let kind = items
+        .iter()
+        .map(|item| dense_kind_for_value(*item))
+        .find(|kind| *kind == DenseElementKind::Tagged)
+        .or_else(|| items.first().map(|item| dense_kind_for_value(*item)))
+        .unwrap_or(DenseElementKind::Empty);
+    // Room for the result, and a private slab: a shared literal slab reports
+    // no capacity, so even a shrinking splice copies it first.
+    {
+        let items_ptr = std::ptr::from_mut(items);
+        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
+            // SAFETY: the caller's slice outlives this reservation and
+            // nothing else borrows it meanwhile.
+            for item in unsafe { (*items_ptr).iter_mut() } {
+                item.trace_value_slot_mut(visitor);
+            }
+        };
+        reserve_dense_capacity(&mut arr, heap, new_len.max(len), kind, &mut reserve_roots)?;
+    }
+    let removed = heap.with_payload(arr, |body| {
+        debug_assert!(body.exotic.is_null(), "dense splice over an exotic array");
+        let removed: SmallVec<[Value; 8]> = (start..start + delete)
+            .map(|index| body.dense_value(index).expect("live dense slot"))
+            .collect();
+        let slab = body.slab_body_mut().expect("dense splice without a slab");
+        // A non-number makes tagged storage terminal; widen before moving so
+        // every moved and written word shares one representation.
+        if slab.kind().is_numeric() && kind == DenseElementKind::Tagged {
+            slab.convert_to_tagged();
+        }
+        let tail = start + delete;
+        slab.move_within(tail, start + items.len(), len - tail);
+        for (offset, item) in items.iter().enumerate() {
+            slab.set(start + offset, *item);
+        }
+        // The body's cached dense length is what generated code reads and
+        // appends past: publish the new one through it.
+        if new_len < len {
+            body.truncate_dense(new_len);
+        } else {
+            body.set_dense_len(new_len);
+        }
+        body.set_length(new_len);
+        body.refresh_element_cache();
+        removed
+    });
+    // Every word from `start` on moved or was written: remember the young
+    // ones and shade the white ones, as a store of each would.
+    let slab = heap.read_payload(arr, |body| body.slab);
+    if !slab.is_null() && elements::kind_of(slab) == DenseElementKind::Tagged {
+        let body = elements::body_of(slab).expect("live element slab");
+        heap.record_bulk_writes(
+            slab,
+            (start..new_len).map(|index| {
+                // SAFETY: `index < new_len`, the tagged prefix just written;
+                // the barrier neither allocates nor moves the slab.
+                unsafe { (*body).get(index).expect("live tagged slot") }
+            }),
+        );
+    }
+    for item in items.iter() {
+        heap.record_write(arr, item);
+    }
+    Ok((arr, removed))
+}
+
 /// `true` when the array is dense over its whole logical length with no hole
 /// sentinel — the precondition that makes [`dense_shift`] /
 /// [`dense_unshift_with_roots`] observationally identical to the spec loop.
@@ -2064,8 +2158,12 @@ pub(crate) fn is_fully_dense(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
             && match body.dense_kind() {
                 DenseElementKind::Empty | DenseElementKind::PackedDouble => true,
                 DenseElementKind::HoleyDouble => false,
-                DenseElementKind::Tagged => !(0..body.dense_len())
-                    .any(|index| body.dense_value(index).is_some_and(Value::is_hole)),
+                DenseElementKind::Tagged => elements::body_of(body.slab).is_none_or(|slab| {
+                    // SAFETY: the array body keeps the slab reachable for
+                    // this read-only borrow.
+                    unsafe { (*slab).tagged_slice() }
+                        .is_none_or(|values| !values.iter().any(|value| value.is_hole()))
+                }),
             }
     })
 }

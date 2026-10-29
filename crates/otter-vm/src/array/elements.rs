@@ -344,6 +344,59 @@ impl ElementSlabBody {
         self.mark_dirty_range(index, index + 1);
     }
 
+    /// Move the `count` slots at `from` to `to`, overlapping or not, leaving
+    /// what a `set` of each moved value in order would. Tagged and packed
+    /// numeric words move as one block, the tagged destination range marked
+    /// dirty; holey numeric storage also moves its hole bits. The caller
+    /// owns the live length and any slot the move vacates.
+    pub(crate) fn move_within(&mut self, from: usize, to: usize, count: usize) {
+        self.assert_private();
+        assert!(
+            from + count <= self.capacity() && to + count <= self.capacity(),
+            "dense move exceeds slab capacity"
+        );
+        if count == 0 || from == to {
+            return;
+        }
+        match self.kind {
+            DenseElementKind::Empty => unreachable!("materialized slab cannot be empty"),
+            DenseElementKind::Tagged => {
+                // SAFETY: both ranges lie inside the reserved tagged words.
+                unsafe { std::ptr::copy(self.values_ptr().add(from), self.values_ptr().add(to), count) };
+                self.mark_dirty_range(to, to + count);
+            }
+            DenseElementKind::PackedDouble => {
+                // SAFETY: both ranges lie inside the reserved numeric words;
+                // packed storage has no hole bit to carry.
+                unsafe {
+                    std::ptr::copy(self.doubles_ptr().add(from), self.doubles_ptr().add(to), count);
+                }
+            }
+            DenseElementKind::HoleyDouble => {
+                let order: &mut dyn Iterator<Item = usize> = if to < from {
+                    &mut (0..count)
+                } else {
+                    &mut (0..count).rev()
+                };
+                for offset in order {
+                    let source = from + offset;
+                    let target = to + offset;
+                    if self.hole_bit(source) {
+                        if !self.hole_bit(target) {
+                            self.set_hole_bit(target);
+                        }
+                    } else {
+                        // SAFETY: both indices lie inside the numeric words.
+                        unsafe { *self.doubles_ptr().add(target) = *self.doubles_ptr().add(source) };
+                        if self.hole_bit(target) {
+                            self.clear_hole_bit(target);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Copy `source`'s whole live prefix into this fresh private slab of the
     /// same kind, leaving what a `set` of each slot in order would: the
     /// element words, and for numeric storage the hole bits and count; tagged

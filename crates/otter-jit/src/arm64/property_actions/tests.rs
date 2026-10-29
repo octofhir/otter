@@ -542,11 +542,13 @@ fn shape_directory_reads_live_banks_and_rejects_accessor_and_shared_suffix() {
         dynasm!(ops ; .arch aarch64 ; fmov d0, x7);
         crate::arm64::shape_lookup::emit_load(
             &mut ops,
+            &mut RelocationCapture::default(),
             &view,
             atom,
             12,
             [9, 10, 11, 15],
             if alias { 12 } else { 0 },
+            None,
             miss,
         );
         if alias {

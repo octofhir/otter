@@ -986,3 +986,75 @@ fn projected_array_overwrite_uses_bag_field_authority() {
         Some(JitCacheIrOp::StoreField { object: 1, .. })
     ));
 }
+
+/// An ordinary object a keyed store loop built past the fast-property soft
+/// limit, which leaves it in dictionary mode.
+fn keyed_dictionary(vm: &mut crate::Interpreter, keys: usize, base: i32) -> object::JsObject {
+    let mut built = vm
+        .alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
+        .expect("object");
+    for index in 0..keys {
+        object::normalize_before_keyed_addition(&mut built, vm.gc_heap_mut()).expect("keyed add");
+        vm.create_data_property(
+            &mut built,
+            &format!("k{index}"),
+            Value::number_i32(base + index as i32),
+        )
+        .expect("keyed property");
+    }
+    assert!(object::is_dictionary(built, vm.gc_heap()));
+    built
+}
+
+#[test]
+fn dictionary_receivers_of_one_shape_share_a_key_table_handler() {
+    let mut vm = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+    let mut first = keyed_dictionary(&mut vm, 20, 0);
+    let second = keyed_dictionary(&mut vm, 24, 100);
+    let shape = object::shape(first, vm.gc_heap());
+    assert_eq!(object::shape(second, vm.gc_heap()), shape);
+    let atom = crate::isolate_names::names_mut(vm.gc_heap_mut()).intern("k3");
+    let property = AtomizedPropertyKey::new(PropertyAtom::new(atom), "k3");
+    match vm.resolve_property_load(first, property) {
+        crate::property_cache::PropertyLoad::Data(resolved) => {
+            assert_eq!((resolved.hops, resolved.value), (0, Value::number_i32(3)));
+            assert!(!resolved.is_writable, "a dictionary slot is written by its table");
+        }
+        _ => panic!("own dictionary data resolves"),
+    }
+
+    let slot = PropertyIcSlot::new(PropertyIcKind::Load);
+    let handler = IcHandler::load_dictionary(shape, atom).expect("dictionary handler");
+    assert_eq!(slot.install(handler), InstallOutcome::Installed);
+    let heap = vm.gc_heap();
+    assert_eq!(slot.probe_load(first, heap), Some(Value::number_i32(3)));
+    assert_eq!(slot.probe_load(second, heap), Some(Value::number_i32(103)));
+    let programs = slot
+        .jit_programs(
+            atom.raw(),
+            &mut (
+                |s: crate::object::ShapeHandle| Some(s.offset()),
+                proof_for_test,
+            ),
+        )
+        .expect("dictionary snapshot");
+    assert_eq!(
+        programs[0].ops.as_ref(),
+        &[
+            JitCacheIrOp::GuardShape {
+                object: 0,
+                shape: shape.offset(),
+            },
+            JitCacheIrOp::LoadDictionaryField {
+                object: 0,
+                atom: atom.raw(),
+            },
+        ]
+    );
+
+    assert!(object::delete(&mut first, vm.gc_heap_mut(), "k3").unwrap());
+    let heap = vm.gc_heap();
+    assert_eq!(object::shape(first, heap), shape);
+    assert_eq!(slot.probe_load(first, heap), None, "a deleted key misses");
+    assert_eq!(slot.probe_load(second, heap), Some(Value::number_i32(103)));
+}

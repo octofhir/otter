@@ -749,6 +749,9 @@ impl crate::Interpreter {
             return cache_ir::resolve_atom_data_slot(obj, &self.gc_heap, key)
                 .map_or(PropertyLoad::Other, PropertyLoad::Data);
         }
+        if object::state(obj, &self.gc_heap).is_dictionary() {
+            return self.resolve_dictionary_load(obj, key);
+        }
         match self.property_cache.probe_load(obj, &self.gc_heap, key) {
             PropertyProbe::Resolved(resolved) => return PropertyLoad::Data(resolved),
             PropertyProbe::Absent(proof) => return PropertyLoad::Absent(proof),
@@ -777,6 +780,40 @@ impl crate::Interpreter {
             (Some(resolved), _) => PropertyLoad::Data(resolved),
             (None, Some(proof)) => PropertyLoad::Absent(proof),
             (None, None) => PropertyLoad::Other,
+        }
+    }
+
+    /// [`Self::resolve_property_load`] for a dictionary-mode receiver: its own
+    /// key table answers by atom, then ordinary data along its chain. No
+    /// hidden class names the receiver, so the shared table records nothing;
+    /// the site's handler for the receiver's dictionary shape reads the table
+    /// again (`IcHandlerKind::DictionaryField`).
+    ///
+    /// An own hit reports a non-writable slot: a dictionary slot changes
+    /// through the key table's write path, which honours the compiled proofs
+    /// that watch it.
+    fn resolve_dictionary_load(&self, obj: JsObject, key: AtomizedPropertyKey<'_>) -> PropertyLoad {
+        let heap = &self.gc_heap;
+        if key.symbol_handle().is_some() || object::state(obj, heap).is_opaque() {
+            return PropertyLoad::Other;
+        }
+        let own = object::lookup_own_atom(obj, heap, key);
+        match (own.hit, own.lookup) {
+            (Some(hit), object::PropertyLookup::Data { value, .. }) => {
+                PropertyLoad::Data(cache_ir::ResolvedDataSlot {
+                    validity: None,
+                    holder_root: object::ShapeHandle::null(),
+                    holder_root_id: ShapeId::UNASSIGNED,
+                    hops: 0,
+                    hit,
+                    value,
+                    is_writable: false,
+                })
+            }
+            (_, object::PropertyLookup::Absent) => object::prototype(obj, heap)
+                .and_then(|first| cache_ir::resolve_inherited_atom_data_slot(first, heap, key))
+                .map_or(PropertyLoad::Other, PropertyLoad::Data),
+            _ => PropertyLoad::Other,
         }
     }
 
@@ -1235,6 +1272,12 @@ impl crate::Interpreter {
         }
         let shape = object::keyed_shape(obj, &self.gc_heap);
         let handler = match load {
+            PropertyLoad::Data(resolved) if resolved.hops == 0 && shape.is_null() => {
+                crate::property_ic::IcHandler::load_dictionary(
+                    object::shape(obj, &self.gc_heap),
+                    resolved.hit.atom_id,
+                )
+            }
             PropertyLoad::Data(resolved) => {
                 crate::property_ic::IcHandler::load_resolved(shape, resolved)
             }

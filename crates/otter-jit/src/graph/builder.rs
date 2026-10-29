@@ -3475,6 +3475,7 @@ impl<'a> Builder<'a> {
                     byte_pc,
                     programs: programs.programs,
                     receiver_shape,
+                    dictionary: programs.dictionary,
                 },
                 &[object],
                 Repr::Tagged,

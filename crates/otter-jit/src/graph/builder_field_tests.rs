@@ -542,6 +542,7 @@ fn selected_named_programs_remove_only_exact_receiver_guards() {
                 byte_pc: pc,
                 programs: smallvec::smallvec![1],
                 receiver_shape: covered.then_some(128),
+                dictionary: false,
             }
         );
         let frame = built.graph.frame_state(access.eager.unwrap());
@@ -672,6 +673,7 @@ fn inlined_named_selection_uses_its_source_bank_and_full_eager_chain() {
             byte_pc: body_pc,
             programs: smallvec::smallvec![1],
             receiver_shape: Some(128),
+            dictionary: false,
         }
     );
     let frame = built.graph.frame_state(access.eager.unwrap());

@@ -4467,6 +4467,27 @@ pub(crate) fn lookup_own_atom(
     })
 }
 
+/// The own data property `atom` names on the dictionary-mode `obj`, read
+/// from its key table: `None` for a shaped object, an absent key or an
+/// accessor.
+#[must_use]
+pub(crate) fn load_dictionary_data(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+    atom: crate::property_atom::AtomId,
+) -> Option<Value> {
+    heap.read_payload(obj, |body| {
+        if !body.is_dictionary() {
+            return None;
+        }
+        let offset = body.dictionary_index_get(atom)?;
+        match body.slot_lookup_at(heap, offset as usize) {
+            PropertyLookup::Data { value, .. } => Some(value),
+            _ => None,
+        }
+    })
+}
+
 /// Ordinary `[[Get]]` of an interned key that own data answers along the
 /// prototype chain: the first data property's
 /// value, or `undefined` past a `null` prototype. `None` for an accessor, an

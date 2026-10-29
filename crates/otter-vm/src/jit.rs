@@ -1605,6 +1605,16 @@ pub enum JitCacheIrOp {
         /// The slot and the receiver it belongs to.
         slot: JitBodySlot,
     },
+    /// Read the own data property `atom` names from the key table of a
+    /// dictionary-mode object whose shape an earlier guard proved. An absent
+    /// key or an accessor misses. Terminal: the slot value is the load's
+    /// result.
+    LoadDictionaryField {
+        /// Shape-proved dictionary-mode object operand.
+        object: u8,
+        /// Raw atom id the key table is probed for.
+        atom: u32,
+    },
     /// Write an exotic body's own data property into its tagged slot once
     /// the slot's guard proves it writable. A receiver of another cell type
     /// or a failed guard misses before any effect. Terminal; the value's

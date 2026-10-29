@@ -578,7 +578,7 @@ impl Interpreter {
         context: &ExecutionContext,
         value: &Value,
     ) -> Result<String, CommittedValueError> {
-        let primitive = if value.is_object() || value.is_proxy() {
+        let primitive = if !value.is_primitive() {
             self.to_primitive_string_hint_sync(stack, context, *value)?
         } else {
             *value

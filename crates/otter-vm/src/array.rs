@@ -2105,6 +2105,7 @@ pub fn prevent_extensions(
     ensure_exotic(&mut arr, heap, &mut |_| {})?;
     heap.with_payload(arr, |body| {
         body.exotic_mut().extensible = ExtensibleFlag(false);
+        body.refresh_dense_own_guard();
     });
     Ok(())
 }

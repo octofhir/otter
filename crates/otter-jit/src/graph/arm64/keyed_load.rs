@@ -173,7 +173,36 @@ impl Codegen<'_> {
             debug_assert_eq!((receiver, key), (probe.receiver, probe.key));
             debug_assert_eq!((receiver, key), (KEYED_LOAD_RECEIVER, KEYED_LOAD_KEY));
             debug_assert_eq!(probe.clobbers, PROBE_KEYED_LOAD_CLOBBERS);
+            use crate::template::arm64::shared_property::PROBE_KEYED_SITE;
             let declined = self.ops.new_dynamic_label();
+            let shared = self.ops.new_dynamic_label();
+            // The site's slot address rides in the probe's result word: its
+            // own cache first, which the shared table's hits fill.
+            match self.element_site_slot(node) {
+                Some((slot, target)) => crate::template::arm64::values::emit_load_symbol_u64(
+                    &mut self.ops,
+                    &mut self.relocations,
+                    PROBE_KEYED_SITE,
+                    slot,
+                    target,
+                ),
+                None => dynasm!(self.ops ; .arch aarch64 ; mov X(PROBE_KEYED_SITE), xzr),
+            }
+            crate::arm64::property_actions::emit_keyed_site_cache_load(
+                &mut self.ops,
+                self.view,
+                [receiver, key],
+                PROBE_KEYED_SITE,
+                [11, 13, 14, 15],
+                PROBE_KEYED_RESULT,
+                shared,
+            );
+            dynasm!(self.ops
+                ; .arch aarch64
+                ; mov X(destination), X(PROBE_KEYED_RESULT)
+                ; b =>loaded
+                ; =>shared
+            );
             crate::template::arm64::shared_property::emit_call(
                 &mut self.ops,
                 &mut self.relocations,

@@ -278,6 +278,56 @@ pub(crate) fn emit_site_cache_load(
         ; ldr X(destination), [X(receiver), x16]);
 }
 
+/// `X(destination)` = `X(receiver)[X(key)]` from the cache of the keyed
+/// site whose slot address is in `X(site)` (zero for none), for a string
+/// or symbol key with a recorded atom and an inline-bank own data slot;
+/// anything else goes to `fallback` with nothing written but the
+/// temporaries, `x16` and `x17`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_keyed_site_cache_load(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    [receiver, key]: [u8; 2],
+    site: u8,
+    [atom, identity, table, word]: [u8; 4],
+    destination: u8,
+    fallback: DynamicLabel,
+) {
+    use otter_vm::jit::PROPERTY_IC_LAYOUT as IC;
+    let Some(cache) = layout(view) else {
+        dynasm!(ops ; .arch aarch64 ; b =>fallback);
+        return;
+    };
+    let symbol = ops.new_dynamic_label();
+    let ready = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64
+        ; cbz X(site), =>fallback
+        ; ldr X(table), [X(site), IC.site_cache_byte] ; cbz X(table), =>fallback
+        // The key is a string or a symbol: its recorded atom, or a decline.
+        ; ldrb w16, [X(key)]
+        ; cmp w16, u32::from(view.string_layout.string_type_tag) ; b.ne =>symbol
+        ; ldr W(atom), [X(key), view.string_layout.atom_byte] ; cbz W(atom), =>fallback
+        ; sub WSP(atom), WSP(atom), #1 ; b =>ready
+        ; =>symbol
+        ; ldr W(atom), [X(key), otter_vm::symbol::SYMBOL_ATOM_BYTE]
+        ; cmn WSP(atom), #1 ; b.eq =>fallback
+        ; =>ready
+        ; tst X(receiver), #0xfffe_0000_0000_0007 ; b.ne =>fallback ; cbz X(receiver), =>fallback
+        ; ldrb w16, [X(receiver)] ; cmp w16, #OBJECT_BODY_TYPE_TAG ; b.ne =>fallback
+        ; ldr w16, [X(receiver), view.object_shape_byte] ; cbz w16, =>fallback
+        ; and x17, X(receiver), #0xffff_ffff_0000_0000 ; add x16, x17, x16
+        ; ldr X(identity), [x16, cache.shape_id_byte]
+        ; eor X(word), X(identity), X(atom)
+        ; and XSP(word), X(word), #u64::from(IC.site_cache_entries - 1)
+        ; add X(table), X(table), X(word), lsl #4
+        ; ldp x17, X(word), [X(table)]
+        ; cmp x17, X(identity) ; b.ne =>fallback
+        ; cmp X(atom), X(word), lsr #32 ; b.ne =>fallback
+        ; tbnz W(word), SLOT_WORD_SLAB_BIT, =>fallback
+        ; and x16, X(word), #u64::from(slot_word::OFFSET_MASK)
+        ; ldr X(destination), [X(receiver), x16]);
+}
+
 /// Store `X(value)` into the named property of `X(receiver)` through the
 /// cache of the site whose slot address is in `X(site)`: an inline-bank own
 /// overwrite of a value its field already covers. Anything else goes to
@@ -303,26 +353,54 @@ pub(crate) fn emit_site_cache_store(
         ; str X(value), [X(receiver), x16]);
 }
 
+/// The site whose cache a shared-table hit fills.
+#[derive(Clone, Copy)]
+pub(crate) enum SiteFill {
+    /// A named site whose slot address the register holds.
+    Named(u8),
+    /// A keyed site whose slot address (zero for none) and key atom the
+    /// registers hold.
+    Keyed {
+        /// The slot address, or zero.
+        site: u8,
+        /// The key's atom.
+        atom: u8,
+    },
+}
+
 /// Copy the matched row's receiver shape identity and `W(word)` into the
-/// cache of the site whose slot address `X(site)` holds, when it has one.
-/// Writes `X(scratch)`, `x16` and `x17`.
+/// cache of the site `fill` names, when it has one. Writes `X(scratch)`,
+/// `x16` and `x17`.
 fn emit_site_fill(
     ops: &mut Assembler,
     cache: JitPropertyActionCache,
-    site: u8,
+    fill: SiteFill,
     entry: u8,
     word: u8,
     scratch: u8,
 ) {
     use otter_vm::jit::PROPERTY_IC_LAYOUT as IC;
     debug_assert_eq!(IC.site_cache_entry_bytes, 16);
-    dynasm!(ops ; .arch aarch64
-        ; ldr x16, [X(site), IC.site_cache_byte] ; cbz x16, >skip
-        ; ldr x17, [X(entry), cache.receiver_shape_id_byte]
-        ; and XSP(scratch), x17, #u64::from(IC.site_cache_entries - 1)
-        ; add x16, x16, X(scratch), lsl #4
-        ; stp x17, X(word), [x16]
-        ; skip:);
+    let mask = u64::from(IC.site_cache_entries - 1);
+    match fill {
+        SiteFill::Named(site) => dynasm!(ops ; .arch aarch64
+            ; ldr x16, [X(site), IC.site_cache_byte] ; cbz x16, >skip
+            ; ldr x17, [X(entry), cache.receiver_shape_id_byte]
+            ; and XSP(scratch), x17, #mask
+            ; add x16, x16, X(scratch), lsl #4
+            ; stp x17, X(word), [x16]
+            ; skip:),
+        SiteFill::Keyed { site, atom } => dynasm!(ops ; .arch aarch64
+            ; cbz X(site), >skip
+            ; ldr x16, [X(site), IC.site_cache_byte] ; cbz x16, >skip
+            ; ldr x17, [X(entry), cache.receiver_shape_id_byte]
+            ; eor X(scratch), x17, X(atom)
+            ; and XSP(scratch), X(scratch), #mask
+            ; add x16, x16, X(scratch), lsl #4
+            ; orr X(scratch), X(word), X(atom), lsl #32
+            ; stp x17, X(scratch), [x16]
+            ; skip:),
+    }
 }
 
 /// `X(destination)` = the slot of `holder` that `W(word)` resolves
@@ -476,7 +554,7 @@ pub(crate) fn emit_site_load(
     temps @ [holder, slot, entry, base]: [u8; 4],
     destination: u8,
     own_only: bool,
-    site: Option<u8>,
+    site: Option<SiteFill>,
     miss: DynamicLabel,
 ) {
     registers(&[receiver], temps);
@@ -590,7 +668,7 @@ pub(crate) fn emit_site_store(
     [receiver, value]: [u8; 2],
     temps @ [holder, slot, entry, base]: [u8; 4],
     own_only: bool,
-    site: Option<u8>,
+    site: Option<SiteFill>,
     miss: DynamicLabel,
 ) {
     registers(&[receiver, value], temps);

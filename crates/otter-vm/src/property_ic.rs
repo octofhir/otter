@@ -781,7 +781,9 @@ pub const SITE_CACHE_ENTRIES: usize = 32;
 
 /// One entry of a site cache: a receiver shape identity and the shared
 /// table's slot word for the site's atom on it
-/// ([`crate::property_cache::slot_word`]). Shape identities are never
+/// ([`crate::property_cache::slot_word`]); a keyed site's word carries the
+/// key's atom in its high half and its entries are indexed by the identity
+/// XOR the atom. Shape identities are never
 /// reused, so an entry never needs invalidation: the words it copies are
 /// immutable per shape except for a store's covered value classes, which
 /// only widen, so a copy is at worst narrower than the table's row.
@@ -791,8 +793,8 @@ pub struct SiteCacheEntry {
     word: AtomicU64,
 }
 
-/// A named megamorphic site's cache, indexed by the low bits of the
-/// receiver's shape identity. Generated code alone fills and reads it, on
+/// A megamorphic site's cache, indexed by the low bits of the receiver's
+/// shape identity (XOR the key's atom at a keyed site). Generated code alone fills and reads it, on
 /// the isolate thread.
 type SiteCache = [SiteCacheEntry; SITE_CACHE_ENTRIES];
 
@@ -824,7 +826,7 @@ pub struct PropertyIcSlot {
     /// One proof word dropped while a compiler thread was copying, released
     /// once none is.
     retired: AtomicU64,
-    /// The site cache of a named megamorphic site; null otherwise.
+    /// The site cache of a megamorphic site; null otherwise.
     site_cache: std::sync::atomic::AtomicPtr<SiteCache>,
     kind: PropertyIcKind,
 }
@@ -880,11 +882,11 @@ impl PropertyIcSlot {
         }
     }
 
-    /// Give a named site that turned megamorphic its own cache. A keyed
-    /// site's atom is not fixed, so it keeps none.
-    fn allocate_site_cache(&self) {
-        if self.state() & STATE_KEYED_BOUND != 0 || !self.site_cache.load(Ordering::Relaxed).is_null()
-        {
+    /// Give the site its own shape cache: a site that turned megamorphic, or
+    /// an element site that reads ordinary objects by string key, which the
+    /// shared table serves without binding the site to one key.
+    pub(crate) fn allocate_site_cache(&self) {
+        if !self.site_cache.load(Ordering::Relaxed).is_null() {
             return;
         }
         let cache: Box<SiteCache> = Box::new(std::array::from_fn(|_| SiteCacheEntry {
@@ -1053,6 +1055,7 @@ impl PropertyIcSlot {
         );
         self.refresh_inline();
         self.end_write();
+        self.allocate_site_cache();
         for word in dropped {
             self.release_validity(word);
         }

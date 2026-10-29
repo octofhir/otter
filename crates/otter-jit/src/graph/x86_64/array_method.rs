@@ -2,8 +2,9 @@
 //!
 //! # Contents
 //! - [`Codegen::emit_array_method`] appends to tagged storage, growing it
-//!   when full, or removes a present tagged last element; any other dense
-//!   state goes through the VM's allocating push or its pop leaf.
+//!   when full, or a Number to packed numeric storage with spare capacity,
+//!   or removes a present tagged or packed numeric last element; any other
+//!   dense state goes through the VM's allocating push or its pop leaf.
 //!
 //! # Invariants
 //! - Growing storage and the VM's push are deferred code: the body holds
@@ -14,11 +15,12 @@
 //!   eager deopt.
 //! - The inline paths cover an Array whose dense prefix is its whole length:
 //!   an append to tagged storage, which grows full or absent storage into a
-//!   nursery slab while no marking runs, and the removal of a present tagged
-//!   last element. Any other dense state completes in the VM's allocating
-//!   push or its pop leaf, neither of which runs JavaScript; a state those
-//!   refuse leaves through the eager deopt before any effect. Neither node
-//!   therefore writes more than element storage and lengths.
+//!   nursery slab while no marking runs, an append of a Number to packed
+//!   numeric storage with spare capacity, and the removal of a present tagged
+//!   or packed numeric last element. Any other dense state completes in the
+//!   VM's allocating push or its pop leaf, neither of which runs JavaScript;
+//!   a state those refuse leaves through the eager deopt before any effect.
+//!   Neither node therefore writes more than element storage and lengths.
 //! - Grown storage is young, so its copied words owe no barrier; the Array
 //!   takes the barrier for the slab it now holds.
 //! - The appended value takes the element write barrier before the lengths
@@ -39,6 +41,7 @@ use otter_vm::jit::{JitArrayStorage, JitGuardedReceiver, JitMethodHolder};
 use otter_vm::value::tag;
 
 use super::Codegen;
+use super::scalar::conversions::emit_tagged_number_to_float;
 use crate::allocation::LabRegisters;
 use crate::x86_64::allocation::emit_grow_tagged_slab;
 use crate::{
@@ -77,9 +80,10 @@ impl Codegen<'_> {
                 ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
                 ; mov r10, [r10 + crate::entry::VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET as i32]
                 ; cmp BYTE [r10], 0 ; jne =>exit);
+            let numeric = self.ops.new_dynamic_label();
             // Absent storage reads the empty kind, zero capacity and an empty
             // prefix, so its first append grows it.
-            self.emit_whole_prefix(storage, receiver, length, true, runtime);
+            self.emit_whole_prefix(storage, receiver, length, true, numeric);
             dynasm!(self.ops ; .arch x64
                 ; mov r11d, [Rq(receiver) + storage.capacity_byte as i32]
                 ; cmp Rd(length), r11d ; jae =>grow
@@ -104,6 +108,26 @@ impl Codegen<'_> {
             // Growing storage and the VM's push are the cold side of an
             // append.
             self.defer(move |codegen| {
+                // Packed numeric storage takes a Number as its double into
+                // spare capacity; its new slot reads as present, as the VM's
+                // own append leaves it, and its raw word owes no barrier.
+                dynasm!(codegen.ops ; .arch x64 ; =>numeric);
+                codegen.emit_numeric_prefix(storage, receiver, length, runtime);
+                dynasm!(codegen.ops ; .arch x64
+                    ; cmp BYTE [Rq(receiver) + storage.own_guard_byte as i32], 0 ; jne =>runtime
+                    ; cmp Rd(length), DWORD [Rq(receiver) + storage.capacity_byte as i32]
+                    ; jae =>runtime
+                    ; mov Rq(base), [Rq(receiver) + storage.base_byte as i32]);
+                emit_tagged_number_to_float(&mut codegen.ops, value, 15, runtime);
+                codegen.emit_hole_bit(storage.numeric, base, length);
+                dynasm!(codegen.ops ; .arch x64
+                    ; jc =>runtime
+                    ; movsd [Rq(base) + Rq(length) * 8], xmm15
+                    ; lea r10d, [Rq(length) + 1]
+                    ; mov [Rq(receiver) + storage.length_byte as i32], r10d
+                    ; mov [Rq(base) + storage.slab_length_from_base], r10d
+                    ; mov [Rq(receiver) + storage.logical_length_byte as i32], r10d
+                    ; jmp =>appended);
                 dynasm!(codegen.ops ; .arch x64
                     ; =>grow
                     // The copied words would owe marking barriers.
@@ -148,7 +172,8 @@ impl Codegen<'_> {
             });
         } else {
             let empty = self.ops.new_dynamic_label();
-            self.emit_whole_prefix(storage, receiver, length, false, runtime);
+            let numeric = self.ops.new_dynamic_label();
+            self.emit_whole_prefix(storage, receiver, length, false, numeric);
             dynasm!(self.ops ; .arch x64
                 ; cmp BYTE [Rq(receiver) + storage.own_guard_byte as i32], 0 ; jne =>runtime
                 ; test Rd(length), Rd(length) ; jz =>empty
@@ -168,6 +193,20 @@ impl Codegen<'_> {
                 ; jmp =>done
                 ; =>empty);
             self.load_immediate(destination, tag::VALUE_UNDEFINED);
+            dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>numeric);
+            // Packed numeric storage has no hole below its length, and its
+            // truncated suffix keeps no state.
+            self.emit_numeric_prefix(storage, receiver, length, runtime);
+            dynasm!(self.ops ; .arch x64
+                ; cmp BYTE [Rq(receiver) + storage.own_guard_byte as i32], 0 ; jne =>runtime
+                ; test Rd(length), Rd(length) ; jz =>empty
+                ; sub Rd(length), 1
+                ; mov Rq(base), [Rq(receiver) + storage.base_byte as i32]
+                ; movsd xmm15, [Rq(base) + Rq(length) * 8]
+                ; mov [Rq(receiver) + storage.length_byte as i32], Rd(length)
+                ; mov [Rq(base) + storage.slab_length_from_base], Rd(length)
+                ; mov [Rq(receiver) + storage.logical_length_byte as i32], Rd(length));
+            crate::x86_64::values::emit_box_double(&mut self.ops, 15, destination, 11);
             dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>runtime);
             self.emit_array_pop_leaf(node, receiver, exit);
             dynasm!(self.ops ; .arch x64 ; mov Rq(destination), r10);
@@ -244,6 +283,24 @@ impl Codegen<'_> {
             self.emit_intrinsic_method_identity(method, site, receiver, temp, exit);
         }
         Ok(())
+    }
+
+    /// Load the Array `receiver`'s dense length into `length` and branch to
+    /// `other` unless its storage is packed numeric and that dense prefix is
+    /// its whole `length`.
+    fn emit_numeric_prefix(
+        &mut self,
+        storage: JitArrayStorage,
+        receiver: u8,
+        length: u8,
+        other: DynamicLabel,
+    ) {
+        dynasm!(self.ops ; .arch x64
+            ; cmp BYTE [Rq(receiver) + storage.numeric.kind_byte as i32], storage.numeric.packed_kind as i8
+            ; jne =>other
+            ; mov Rd(length), [Rq(receiver) + storage.length_byte as i32]
+            ; cmp [Rq(receiver) + storage.logical_length_byte as i32], Rd(length)
+            ; jne =>other);
     }
 
     /// Load the Array `receiver`'s dense length into `length` and branch to

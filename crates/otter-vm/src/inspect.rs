@@ -249,6 +249,9 @@ pub enum IcEntryVariant {
     OwnAccessor,
     /// The key is absent from the receiver and its whole chain.
     NonExistent,
+    /// A dictionary-mode receiver owns the data property its key table maps
+    /// the key to.
+    DictionaryData,
     /// Append transition that adds a slot on store.
     OwnAddTransition,
     /// Store transition guarded by a missing-key prototype chain.

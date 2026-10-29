@@ -751,6 +751,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
             byte_pc: 0,
             programs: Default::default(),
             receiver_shape: None,
+            dictionary: false,
         },
         Kind::StoreNamedProperty {
             plan: super::ir::NamedStorePlan::Programs,

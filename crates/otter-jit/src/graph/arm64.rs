@@ -2293,11 +2293,19 @@ impl<'a> Codegen<'a> {
                     exit,
                 );
             }
-            Kind::LoadNamedProperty { .. } => {
+            Kind::LoadNamedProperty { dictionary, .. } => {
                 let receiver = Self::gp(input(0));
                 let destination = Self::gp(result.expect("a result"));
-                let [holder, scratch] = [allocation.gp_temps[0], allocation.gp_temps[1]];
-                self.emit_load_named_property(node, receiver, [holder, scratch], destination)?;
+                let temps = &allocation.gp_temps;
+                let [holder, scratch] = [temps[0], temps[1]];
+                let table = dictionary.then(|| [temps[2], temps[3]]);
+                self.emit_load_named_property(
+                    node,
+                    receiver,
+                    [holder, scratch],
+                    table,
+                    destination,
+                )?;
             }
             Kind::StoreNamedProperty {
                 byte_pc,
@@ -4338,6 +4346,7 @@ impl<'a> Codegen<'a> {
         node: NodeId,
         receiver: u8,
         [holder, scratch]: [u8; 2],
+        table: Option<[u8; 2]>,
         destination: u8,
     ) -> Result<(), Unsupported> {
         use otter_vm::JitCacheIrOp as Op;
@@ -4345,6 +4354,7 @@ impl<'a> Codegen<'a> {
             byte_pc,
             programs: selected,
             receiver_shape,
+            ..
         } = self.graph.node(node).kind.clone()
         else {
             return Err(Unsupported::OperandShape("graph named load plan"));
@@ -4550,6 +4560,21 @@ impl<'a> Codegen<'a> {
                             dynasm!(self.ops ; .arch aarch64 ; b =>done);
                         }
                     }
+                    Op::LoadDictionaryField { object: 0, atom } => {
+                        let [entries, metas] = table.ok_or(Unsupported::OperandShape(
+                            "graph dictionary load temporaries",
+                        ))?;
+                        self.emit_dictionary_field(
+                            receiver,
+                            atom,
+                            [holder, scratch, entries, metas],
+                            destination,
+                            next,
+                        );
+                        if !final_program {
+                            dynasm!(self.ops ; .arch aarch64 ; b =>done);
+                        }
+                    }
                     Op::LoadBodySlot { object: 0, slot } if slot.is_generated(false) => {
                         self.emit_body_slot_receiver(receiver, slot, next);
                         dynasm!(self.ops
@@ -4573,6 +4598,92 @@ impl<'a> Codegen<'a> {
         }
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         Ok(())
+    }
+
+    /// `X(destination)` = the own data property `atom` names on the
+    /// dictionary-mode object in `X(receiver)`, whose shape a guard proved;
+    /// `miss` for an absent key or an accessor. The bucket of a constant atom
+    /// is fixed but for the table's mask; the chain compares atoms in `w17`.
+    /// Writes only the four temporaries, `x16`, `x17` and, on a hit,
+    /// `destination`.
+    fn emit_dictionary_field(
+        &mut self,
+        receiver: u8,
+        atom: u32,
+        [entry, index, base, metas]: [u8; 4],
+        destination: u8,
+        miss: DynamicLabel,
+    ) {
+        let layout = otter_vm::object::DictionaryLayout::current();
+        let field = otter_vm::object::FieldLayout::current();
+        let hash = (u64::from(atom).wrapping_mul(layout.hash_multiplier) >> 32) as u32;
+        let chain = self.ops.new_dynamic_label();
+        let found = self.ops.new_dynamic_label();
+        let suffix = self.ops.new_dynamic_label();
+        let loaded = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+            ; ldr W(metas), [X(receiver), layout.exotic_byte]
+            ; cbz W(metas), =>miss
+            ; add X(metas), x17, X(metas)
+            ; ldr W(entry), [X(metas), layout.keys_byte]
+            ; cbz W(entry), =>miss
+            ; add X(entry), x17, X(entry)
+            ; ldr W(metas), [X(metas), layout.metas_byte]
+            ; cbz W(metas), =>miss
+            ; add X(metas), x17, X(metas)
+        );
+        self.load_immediate(index, u64::from(hash));
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr w16, [X(entry), layout.mask_byte]
+            ; and W(index), W(index), w16
+            ; add XSP(base), XSP(entry), layout.buckets_byte
+            ; ldr W(index), [X(base), X(index), lsl #2]
+            // The entry records follow the `mask + 1` buckets.
+            ; add w16, w16, #1
+            ; add X(base), X(base), x16, lsl #2
+        );
+        self.load_immediate(17, u64::from(atom));
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; =>chain
+            ; cmn WSP(index), #1
+            ; b.eq =>miss
+            ; add X(entry), X(base), X(index), lsl layout.entry_shift
+            ; ldr w16, [X(entry), layout.entry_atom_byte]
+            ; cmp w16, w17
+            ; b.eq =>found
+            ; ldr W(index), [X(entry), layout.entry_next_byte]
+            ; b =>chain
+            ; =>found
+            // The entry index is the slot index; its metadata says data or
+            // accessor.
+            ; mov w16, layout.meta_bytes
+            ; madd x16, X(index), x16, X(metas)
+            ; ldrb w16, [x16, layout.metas_records_byte + layout.meta_accessor_byte]
+            ; cbnz w16, =>miss
+            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+            ; ldr w16, [X(receiver), self.view.object_shape_byte]
+            ; add x16, x17, x16
+            ; ldrb w16, [x16, self.view.shape_inline_capacity_byte]
+            ; cmp W(index), w16
+            ; b.hs =>suffix
+            ; add X(entry), X(receiver), X(index), lsl #3
+            ; add XSP(entry), XSP(entry), field.inline_values_byte
+            ; ldr X(destination), [X(entry)]
+            ; b =>loaded
+            ; =>suffix
+            ; sub W(index), W(index), w16
+            ; ldr w16, [X(receiver), field.slab_handle_byte]
+            ; cbz w16, =>miss
+            ; add x16, x17, x16
+            ; add X(entry), x16, X(index), lsl #3
+            ; add XSP(entry), XSP(entry), field.slab_words_byte
+            ; ldr X(destination), [X(entry)]
+            ; =>loaded
+        );
     }
 
     /// Branch to `miss` unless `receiver` is a cell of the slot's type whose

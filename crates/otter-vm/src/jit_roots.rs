@@ -45,6 +45,10 @@ pub(crate) trait CompileProofs {
     /// Name `shape` in the code being compiled; `None` when the shape cannot
     /// authorize a native proof.
     fn shape(&mut self, shape: ShapeHandle) -> Option<u32>;
+    /// Name the dictionary shape `shape` in the code being compiled. Such a
+    /// shape proves only an object's dictionary mode and prototype, so it
+    /// guards only a key-table read; `None` for any other shape.
+    fn dictionary_shape(&mut self, shape: ShapeHandle) -> Option<u32>;
     /// Retain `cell` while it still holds; `None` once retired.
     fn validity(
         &mut self,
@@ -58,6 +62,10 @@ where
     V: FnMut(&Arc<PrototypeValidity>) -> Option<crate::jit::JitPrototypeValidity>,
 {
     fn shape(&mut self, shape: ShapeHandle) -> Option<u32> {
+        (self.0)(shape)
+    }
+
+    fn dictionary_shape(&mut self, shape: ShapeHandle) -> Option<u32> {
         (self.0)(shape)
     }
 

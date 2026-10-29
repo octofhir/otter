@@ -2939,6 +2939,19 @@ impl crate::jit_roots::CompileProofs for Baker<'_> {
         self.bake_shape(shape)
     }
 
+    fn dictionary_shape(&mut self, shape: crate::object::ShapeHandle) -> Option<u32> {
+        if shape.is_null() {
+            return None;
+        }
+        let state = crate::object::shape_body::state_of(shape);
+        if !state.is_dictionary() || state.is_opaque() {
+            return None;
+        }
+        self.roots
+            .push(crate::jit_roots::CompilationRoot::Shape(shape));
+        Some(shape.offset())
+    }
+
     fn validity(
         &mut self,
         cell: &std::sync::Arc<crate::object::prototype_validity::PrototypeValidity>,

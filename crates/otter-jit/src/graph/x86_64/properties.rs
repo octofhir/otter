@@ -212,14 +212,23 @@ impl Codegen<'_> {
                     exit,
                 );
             }
-            Kind::LoadNamedProperty { byte_pc, .. } => self.emit_named_program(
-                node,
+            Kind::LoadNamedProperty {
                 byte_pc,
-                input(0),
-                None,
-                assigned.gp_temps[0],
-                Some(result()),
-            )?,
+                dictionary,
+                ..
+            } => {
+                let table =
+                    dictionary.then(|| [assigned.gp_temps[1], assigned.gp_temps[2]]);
+                self.emit_named_program(
+                    node,
+                    byte_pc,
+                    input(0),
+                    None,
+                    assigned.gp_temps[0],
+                    table,
+                    Some(result()),
+                )?
+            }
             Kind::StoreNamedProperty {
                 byte_pc: pc, plan, ..
             } => self.emit_named_program(
@@ -232,6 +241,7 @@ impl Codegen<'_> {
                     input(1)
                 }),
                 assigned.gp_temps[0],
+                None,
                 None,
             )?,
             Kind::StoreBodySlot(slot) => {
@@ -410,6 +420,80 @@ impl Codegen<'_> {
         dynasm!(self.ops ; .arch x64 ; cmp DWORD [r10], 0 ; je =>miss);
     }
 
+    /// `Rq(destination)` = the own data property `atom` names on the
+    /// dictionary-mode object in `Rq(receiver)`, whose shape a guard proved;
+    /// `miss` for an absent key or an accessor. The bucket of a constant atom
+    /// is fixed but for the table's mask. Writes only the three temporaries,
+    /// `r10`, `r11` and, on a hit, `destination`.
+    fn emit_dictionary_field(
+        &mut self,
+        receiver: u8,
+        atom: u32,
+        [base, metas, index]: [u8; 3],
+        destination: u8,
+        miss: DynamicLabel,
+    ) {
+        let layout = otter_vm::object::DictionaryLayout::current();
+        let field = otter_vm::object::FieldLayout::current();
+        let hash = (u64::from(atom).wrapping_mul(layout.hash_multiplier) >> 32) as u32;
+        let chain = self.ops.new_dynamic_label();
+        let found = self.ops.new_dynamic_label();
+        let suffix = self.ops.new_dynamic_label();
+        let loaded = self.ops.new_dynamic_label();
+        self.load_immediate(10, 0xffff_ffff_0000_0000);
+        dynasm!(self.ops ; .arch x64
+            ; and r10, Rq(receiver)
+            ; mov Rd(metas), [Rq(receiver) + layout.exotic_byte as i32]
+            ; test Rd(metas), Rd(metas) ; jz =>miss
+            ; add Rq(metas), r10
+            ; mov Rd(base), [Rq(metas) + layout.keys_byte as i32]
+            ; test Rd(base), Rd(base) ; jz =>miss
+            ; add Rq(base), r10
+            ; mov Rd(metas), [Rq(metas) + layout.metas_byte as i32]
+            ; test Rd(metas), Rd(metas) ; jz =>miss
+            ; add Rq(metas), r10
+            ; mov Rd(index), hash as i32
+            ; mov r11d, [Rq(base) + layout.mask_byte as i32]
+            ; and Rd(index), r11d
+            ; lea Rq(base), [Rq(base) + layout.buckets_byte as i32]
+            ; mov Rd(index), [Rq(base) + Rq(index) * 4]
+            // The entry records follow the `mask + 1` buckets.
+            ; add r11d, 1
+            ; lea Rq(base), [Rq(base) + r11 * 4]
+            ; =>chain
+            ; cmp Rd(index), -1
+            ; je =>miss
+            ; mov r11d, Rd(index)
+            ; shl r11, layout.entry_shift as i8
+            ; add r11, Rq(base)
+            ; cmp DWORD [r11 + layout.entry_atom_byte as i32], atom as i32
+            ; je =>found
+            ; mov Rd(index), [r11 + layout.entry_next_byte as i32]
+            ; jmp =>chain
+            ; =>found
+            // The entry index is the slot index; its metadata says data or
+            // accessor.
+            ; imul r11d, Rd(index), layout.meta_bytes as i32
+            ; add r11, Rq(metas)
+            ; cmp BYTE [r11 + (layout.metas_records_byte + layout.meta_accessor_byte) as i32], 0
+            ; jne =>miss
+            ; mov r11d, [Rq(receiver) + self.view.object_shape_byte as i32]
+            ; add r11, r10
+            ; movzx r11d, BYTE [r11 + self.view.shape_inline_capacity_byte as i32]
+            ; cmp Rd(index), r11d
+            ; jae =>suffix
+            ; mov Rq(destination), [Rq(receiver) + Rq(index) * 8 + field.inline_values_byte as i32]
+            ; jmp =>loaded
+            ; =>suffix
+            ; sub Rd(index), r11d
+            ; mov r11d, [Rq(receiver) + field.slab_handle_byte as i32]
+            ; test r11d, r11d ; jz =>miss
+            ; add r11, r10
+            ; mov Rq(destination), [r11 + Rq(index) * 8 + field.slab_words_byte as i32]
+            ; =>loaded
+        );
+    }
+
     fn emit_prototype_holder(&mut self, receiver: u8, holder: u8, root: u32, miss: DynamicLabel) {
         self.load_immediate(10, 0xffff_ffff_0000_0000);
         self.load_immediate(11, u64::from(root));
@@ -425,6 +509,7 @@ impl Codegen<'_> {
         receiver: u8,
         value: Option<u8>,
         holder: u8,
+        table: Option<[u8; 2]>,
         destination: Option<u8>,
     ) -> Result<(), Unsupported> {
         let (receiver_shape, proved) = match self.graph.node(node).kind {
@@ -585,6 +670,20 @@ impl Codegen<'_> {
                             &mut self.ops,
                             view,
                             receiver,
+                            destination.expect("named load result"),
+                            next,
+                        );
+                        dynasm!(self.ops ; .arch x64 ; jmp =>done);
+                        committed = true;
+                    }
+                    Op::LoadDictionaryField { object: 0, atom } if value.is_none() => {
+                        let [metas, index] = table.ok_or(Unsupported::OperandShape(
+                            "x86 graph dictionary load temporaries",
+                        ))?;
+                        self.emit_dictionary_field(
+                            receiver,
+                            atom,
+                            [holder, metas, index],
                             destination.expect("named load result"),
                             next,
                         );

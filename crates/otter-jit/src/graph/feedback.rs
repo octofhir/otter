@@ -9,8 +9,9 @@
 //! - [`NamedLoadPrograms`] / [`named_load_programs`] — source-owned indices
 //!   of load programs compatible with the receiver's known ordinary shapes.
 //!   Each reads the receiver, a guarded holder, a pinned intrinsic prototype,
-//!   a live Array expando, a closure's own `prototype` slot, or an exotic
-//!   body's own data slot.
+//!   a live Array expando, a closure's own `prototype` slot, an exotic
+//!   body's own data slot, or a shape-proved dictionary-mode receiver's key
+//!   table.
 //! - [`body_slot_store`] — a store site whose only program writes an exotic
 //!   body's own data slot.
 //! - [`named_store_programs`] — any store whose every program writes an
@@ -59,6 +60,9 @@ pub(crate) struct NamedLoadPrograms {
     /// Ordinary shapes proved by the selected programs, when all start with
     /// an ordinary receiver shape guard.
     pub(crate) receiver_shapes: Option<SmallVec<[u32; 4]>>,
+    /// Whether a selected program probes a dictionary-mode receiver's key
+    /// table.
+    pub(crate) dictionary: bool,
 }
 
 /// Select programs whose first receiver proof can match an ordinary object
@@ -376,6 +380,15 @@ pub(crate) fn named_load_programs(
         if let [JitCacheIrOp::LoadClosurePrototype { object: 0 }] = *program.ops {
             continue;
         }
+        // So does a dictionary-mode receiver's key-table read behind its
+        // shape proof.
+        if let [
+            JitCacheIrOp::GuardShape { object: 0, .. },
+            JitCacheIrOp::LoadDictionaryField { object: 0, .. },
+        ] = *program.ops
+        {
+            continue;
+        }
         // So does an exotic body's own data slot read.
         if let [JitCacheIrOp::LoadBodySlot { object: 0, slot }] = *program.ops {
             if !slot.is_generated(false) {
@@ -445,9 +458,16 @@ pub(crate) fn named_load_programs(
             _ => None,
         })
         .collect();
+    let dictionary = selected.iter().any(|&index| {
+        programs[index as usize]
+            .ops
+            .iter()
+            .any(|op| matches!(op, JitCacheIrOp::LoadDictionaryField { .. }))
+    });
     Some(NamedLoadPrograms {
         programs: selected,
         receiver_shapes,
+        dictionary,
     })
 }
 
@@ -817,6 +837,7 @@ mod tests {
             NamedLoadPrograms {
                 programs: smallvec::smallvec![1],
                 receiver_shapes: Some(smallvec::smallvec![16]),
+                dictionary: false,
             }
         );
         assert!(own_data_load(&view, 0, Some(&[48])).is_none());
@@ -842,6 +863,7 @@ mod tests {
             NamedLoadPrograms {
                 programs: smallvec::smallvec![0, 1, 2, 3],
                 receiver_shapes: None,
+                dictionary: false,
             }
         );
         assert!(own_data_load(&view, 0, None).is_none());
@@ -850,6 +872,7 @@ mod tests {
             NamedLoadPrograms {
                 programs: smallvec::smallvec![3],
                 receiver_shapes: Some(smallvec::smallvec![16]),
+                dictionary: false,
             }
         );
         assert_eq!(

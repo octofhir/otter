@@ -641,11 +641,14 @@ pub(crate) enum Kind {
     /// at `byte_pc`. Indices refer to the original source programs in their
     /// order. A live exact `receiver_shape` proves only a matching receiver
     /// shape guard; holder and chain guards remain. Eager deopt when no
-    /// selected program matches.
+    /// selected program matches. `dictionary` marks a selection with a
+    /// dictionary-mode receiver's key-table probe, which needs two more
+    /// temporaries.
     LoadNamedProperty {
         byte_pc: u32,
         programs: SmallVec<[u32; 4]>,
         receiver_shape: Option<u32>,
+        dictionary: bool,
     },
     /// Store input1 into the named property of receiver input0 through the
     /// feedback programs of the store site at `byte_pc`: an existing
@@ -1696,10 +1699,10 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::LoadNamedProperty { .. } => Constraints {
+            Self::LoadNamedProperty { dictionary, .. } => Constraints {
                 inputs: registers(1),
                 result: ResultPolicy::Register,
-                gp_temps: 2,
+                gp_temps: if *dictionary { 4 } else { 2 },
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },

@@ -167,7 +167,14 @@ const _: () = assert!(std::mem::offset_of!(PrototypeValidity, valid) == 0);
 struct WatchpointState {
     current: Option<Arc<PrototypeValidity>>,
     subscribers: Vec<Weak<PrototypeValidity>>,
+    /// Subscriber count at which the next subscription drops dead and
+    /// invalidated entries: twice the live count the last sweep kept, so
+    /// sweeps cost amortized O(1) per subscription.
+    sweep_at: usize,
 }
+
+/// Fewest subscribers a prototype keeps before it sweeps dead entries.
+const MIN_SWEEP_SUBSCRIBERS: usize = 16;
 
 /// Cold mutation and capture state, owned by a prototype's sidecar.
 #[derive(Debug, Default)]
@@ -198,9 +205,12 @@ impl PrototypeWatchpoints {
 
     fn subscribe(&self, cell: &Arc<PrototypeValidity>) {
         let mut state = self.0.lock().expect("prototype watchpoints");
-        state
-            .subscribers
-            .retain(|weak| weak.upgrade().is_some_and(|cell| cell.is_valid()));
+        if state.subscribers.len() >= state.sweep_at {
+            state
+                .subscribers
+                .retain(|weak| weak.upgrade().is_some_and(|cell| cell.is_valid()));
+            state.sweep_at = (state.subscribers.len() * 2).max(MIN_SWEEP_SUBSCRIBERS);
+        }
         state.subscribers.push(Arc::downgrade(cell));
     }
 }

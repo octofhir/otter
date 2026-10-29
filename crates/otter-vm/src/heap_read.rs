@@ -2,8 +2,9 @@
 //!
 //! # Contents
 //! - [`HeapRead`] — what reading object, shape and context bodies needs: a
-//!   payload read and the shape tables. The mutator's [`otter_gc::GcHeap`]
-//!   and a compiler thread's [`HeapView`] both answer it.
+//!   payload read, the shape tables and, on the mutator, the name interner.
+//!   The mutator's [`otter_gc::GcHeap`] and a compiler thread's
+//!   [`HeapView`] both answer it.
 //! - [`HeapView`] — a compiler thread's read-only view of one isolate's heap.
 //!
 //! # Invariants
@@ -16,12 +17,15 @@
 //! - Shape tables are shared ([`crate::mutator_owned::MutatorCell`]); a view
 //!   reads them only while the mutator is not writing them, and reads
 //!   nothing when it is.
+//! - The name interner has no lock and only the mutator interns: a view
+//!   never reads it, and answers a spelling's atom as unknown.
 //!
 //! # See also
 //! - `interp::jit_bake_env` — the view's holder.
 
 use crate::mutator_owned::MutatorCell;
 use crate::object::shape_interner::WeakShapeTables;
+use crate::property_atom::AtomId;
 
 /// What reading heap bodies needs.
 pub(crate) trait HeapRead {
@@ -42,6 +46,10 @@ pub(crate) trait HeapRead {
 
     /// The allocation-site records, whose registered entries never move.
     fn allocation_sites(&self) -> &otter_gc::pretenuring::SiteDirectory;
+
+    /// The atom spelled `name` ([`AtomId::NONE`] when none is), or `None`
+    /// when the interner cannot be read here.
+    fn spelling_atom(&self, name: &str) -> Option<AtomId>;
 }
 
 impl HeapRead for otter_gc::GcHeap {
@@ -66,6 +74,11 @@ impl HeapRead for otter_gc::GcHeap {
 
     fn allocation_sites(&self) -> &otter_gc::pretenuring::SiteDirectory {
         otter_gc::GcHeap::allocation_sites(self).directory_ref()
+    }
+
+    #[inline]
+    fn spelling_atom(&self, name: &str) -> Option<AtomId> {
+        Some(crate::isolate_names::names(self).lookup(name))
     }
 }
 
@@ -125,5 +138,9 @@ impl HeapRead for HeapView {
 
     fn allocation_sites(&self) -> &otter_gc::pretenuring::SiteDirectory {
         &self.allocation_sites
+    }
+
+    fn spelling_atom(&self, _name: &str) -> Option<AtomId> {
+        None
     }
 }

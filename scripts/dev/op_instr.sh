@@ -18,6 +18,17 @@ const oarr = []; for (let i = 0; i < 1024; i++) oarr.push(new P(i));
 const keep = new Array(1024).fill(null);
 const darr = new Float64Array(1024);
 const str = 'abcdefghijklmnopqrstuvwxyz'.repeat(40);
+const map = new Map(); for (let i = 0; i < 1024; i++) map.set(i, i);
+const keys = []; for (let i = 0; i < 1024; i++) keys.push('k' + i);
+const sset = new Set(keys.filter((_, i) => i % 2));
+const dict = {}; for (const k of keys) dict[k] = 1;
+const re = /k1[0-9]+/, re2 = /k(\d)(\d)/;
+const smallarr = [1, 2, 3, 4];
+const pair = [1, 2];
+function argsf() { return arguments.length + arguments[0]; }
+function restf(...xs) { return xs.length + xs[0]; }
+const bound = big.bind(null);
+const gobj = { get v() { return 3; } };
 let out = 0;
 JS
 case_body() {
@@ -45,6 +56,45 @@ case_body() {
     charcode) echo 's = (s + str.charCodeAt(i & 1023)) | 0;' ;;
     concat) echo 's = (s + 1) | 0; keep[i & 1023] = "k" + (i & 1023);' ;;
     closurecall) echo 's = (s + fns[i & 3](s)) | 0;' ;;
+    mapget) echo 's = (s + map.get(i & 1023)) | 0;' ;;
+    mapset) echo 's = (s + 1) | 0; map.set(i & 1023, s);' ;;
+    setgetstr) echo 's = (s + (sset.has(keys[i & 1023]) ? 1 : 0)) | 0;' ;;
+    objkey) echo 's = (s + dict[keys[i & 1023]]) | 0;' ;;
+    objkeyset) echo 's = (s + 1) | 0; dict[keys[i & 1023]] = s;' ;;
+    retest) echo 's = (s + (re.test(keys[i & 1023]) ? 1 : 0)) | 0;' ;;
+    reexec) echo 's = (s + (re2.exec(keys[i & 1023]) !== null ? 1 : 0)) | 0;' ;;
+    indexof) echo 's = (s + str.indexOf("xyz", i & 511)) | 0;' ;;
+    slice) echo 's = (s + 1) | 0; keep[i & 1023] = str.slice(i & 511, (i & 511) + 8);' ;;
+    streq) echo 's = (s + (keys[i & 1023] === keys[(i + 1) & 1023] ? 1 : 0)) | 0;' ;;
+    substrcmp) echo 's = (s + (keys[i & 1023] < keys[(i + 7) & 1023] ? 1 : 0)) | 0;' ;;
+    split) echo 's = (s + "a,b,c".split(",").length) | 0;' ;;
+    join) echo 's = (s + smallarr.join(",").length) | 0;' ;;
+    tostr) echo 's = (s + String(i & 1023).length) | 0;' ;;
+    spread) echo 's = (s + 1) | 0; keep[i & 1023] = [...smallarr];' ;;
+    destruct) echo 'const { x, y } = pobj; s = (s + x + y) | 0;' ;;
+    forof) echo 'for (const v of smallarr) s = (s + v) | 0;' ;;
+    forin) echo 'for (const k in pobj) s = (s + k.length) | 0;' ;;
+    instanceof) echo 's = (s + (oarr[i & 1023] instanceof P ? 1 : 0)) | 0;' ;;
+    typeofs) echo 's = (s + (typeof keep[i & 1023] === "object" ? 1 : 0)) | 0;' ;;
+    trycatch) echo 'try { s = (s + 1) | 0; if (s === -5) throw 1; } catch (e) { s = 0; }' ;;
+    args) echo 's = (s + argsf(s, 1, 2)) | 0;' ;;
+    rest) echo 's = (s + restf(s, 1, 2)) | 0;' ;;
+    applyc) echo 's = (s + big2.apply(null, pair)) | 0;' ;;
+    callc) echo 's = (s + big2.call(null, s, 1)) | 0;' ;;
+    bindc) echo 's = (s + bound(s)) | 0;' ;;
+    getter) echo 's = (s + gobj.v) | 0;' ;;
+    proto) echo 's = (s + oarr[i & 1023].get()) | 0;' ;;
+    mathf) echo 's = (s + Math.floor(Math.sqrt(i & 1023))) | 0;' ;;
+    dmath) echo 's = (s + ((darr[i & 1023] * 1.5 + 0.25) | 0)) | 0;' ;;
+    strcat2) echo 's = (s + 1) | 0; keep[i & 1023] = keys[i & 1023] + keys[(i + 1) & 1023];' ;;
+    template) echo 's = (s + 1) | 0; keep[i & 1023] = `a${i & 1023}b`;' ;;
+    jsonp) echo 's = (s + JSON.parse("[1,2,3]").length) | 0;' ;;
+    sortsmall) echo 's = (s + [3, 1, 2].sort((a, b) => a - b)[0]) | 0;' ;;
+    arrmap) echo 's = (s + smallarr.map((v) => v + 1)[0]) | 0;' ;;
+    arrfilter) echo 's = (s + smallarr.filter((v) => v > 1).length) | 0;' ;;
+    arrindexof) echo 's = (s + smallarr.indexOf(3)) | 0;' ;;
+    objkeys) echo 's = (s + Object.keys(pobj).length) | 0;' ;;
+    switchs) echo 'switch (keys[i & 7]) { case "k0": s = (s + 1) | 0; break; case "k1": s = (s + 2) | 0; break; default: s = (s + 3) | 0; }' ;;
     *) echo "unknown case $1" >&2; exit 1 ;;
   esac
 }

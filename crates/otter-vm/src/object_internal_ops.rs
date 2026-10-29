@@ -347,10 +347,10 @@ impl Interpreter {
         Some((bag, atom, name, symbol))
     }
 
-    /// A runtime spelling as an atomized key: shape walks compare its interned
-    /// id instead of string contents at every link. A spelling nothing has
-    /// interned carries [`crate::property_atom::AtomId::NONE`], which no shape
-    /// key has, while dictionary storage still matches it by spelling.
+    /// A runtime spelling as an atomized key: shape and dictionary walks
+    /// compare its interned id instead of string contents. A spelling
+    /// nothing has interned carries [`crate::property_atom::AtomId::NONE`],
+    /// which no own string key has.
     pub(crate) fn atomized_key<'a>(
         &self,
         name: &'a str,

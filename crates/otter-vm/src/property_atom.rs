@@ -218,9 +218,8 @@ impl NameInterner {
 
     /// `name`'s atom id when some shape, chunk or cache has interned it, or
     /// [`AtomId::NONE`] for a spelling never interned. Nothing is minted:
-    /// every shape key is interned when its transition is built, so a
-    /// never-interned spelling names no shaped property, and a lookup keyed
-    /// by [`AtomId::NONE`] still finds dictionary-mode properties by spelling.
+    /// every shape and dictionary key is interned when it is added, so a
+    /// never-interned spelling names no own string-keyed property.
     #[must_use]
     pub(crate) fn lookup(&self, name: &str) -> AtomId {
         let names = &self.names;

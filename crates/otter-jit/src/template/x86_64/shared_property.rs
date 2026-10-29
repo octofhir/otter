@@ -444,9 +444,21 @@ fn emit_keyed_load(
     let object = ops.new_dynamic_label();
     let shaped = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>label);
+    // The key's atom first: interning records it on the string, so the
+    // own-data walk below reads it back instead of hashing the units again.
+    // Entered by `call`: `rsp` is eight bytes past alignment.
+    emit_key_atom(
+        ops,
+        relocations,
+        view,
+        KEYED_LOAD_KEY,
+        9,
+        false,
+        generic,
+        miss,
+    );
     // The table never holds a dictionary-mode object's keys: such a
-    // receiver goes straight to the own-data walk, which reads the key's
-    // spelling without an atom.
+    // receiver goes straight to the own-data walk.
     crate::x86_64::values::emit_load_u64(ops, 10, otter_vm::value::tag::NOT_CELL_MASK);
     dynasm!(ops ; .arch x64
         ; test Rq(KEYED_LOAD_RECEIVER), r10 ; jnz =>shaped
@@ -464,17 +476,6 @@ fn emit_keyed_load(
             otter_vm::object::ShapeState::DICTIONARY_MASK as i8
         ; jnz =>generic
         ; =>shaped
-    );
-    // Entered by `call`: `rsp` is eight bytes past alignment.
-    emit_key_atom(
-        ops,
-        relocations,
-        view,
-        KEYED_LOAD_KEY,
-        9,
-        false,
-        generic,
-        miss,
     );
     // An Array's own named data lives in its bag.
     emit_array_bag(ops, view, KEYED_LOAD_RECEIVER, object, miss);

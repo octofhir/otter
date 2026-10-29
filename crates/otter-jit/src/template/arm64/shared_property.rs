@@ -478,9 +478,11 @@ fn emit_keyed_load(
     let object = ops.new_dynamic_label();
     let shaped = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label);
+    // The key's atom first: interning records it on the string, so the
+    // own-data walk below reads it back instead of hashing the units again.
+    emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 11, generic, miss);
     // The table never holds a dictionary-mode object's keys: such a
-    // receiver goes straight to the own-data walk, which reads the key's
-    // spelling without an atom.
+    // receiver goes straight to the own-data walk.
     emit_cell_test(ops, KEYED_LOAD_RECEIVER, CellTest::IsNotCell, shaped);
     dynasm!(ops ; .arch aarch64
         ; cbz X(KEYED_LOAD_RECEIVER), =>shaped
@@ -495,7 +497,6 @@ fn emit_keyed_load(
         ; tbnz w16, otter_vm::object::ShapeState::DICTIONARY_MASK.trailing_zeros(), =>generic
         ; =>shaped
     );
-    emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 11, generic, miss);
     emit_array_bag(ops, view, KEYED_LOAD_RECEIVER, object, miss);
     property_actions::emit_load(
         ops,

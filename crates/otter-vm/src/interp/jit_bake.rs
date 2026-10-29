@@ -201,10 +201,24 @@ impl<'a> Baker<'a> {
     /// stops preparing bodies and returns nothing: what it read may have
     /// moved.
     fn yielded(&mut self) -> bool {
-        if !self.abandoned && self.right.is_some_and(|right| right.yield_requested()) {
+        if !self.abandoned
+            && (self.env.contended() || self.right.is_some_and(|right| right.yield_requested()))
+        {
             self.abandoned = true;
         }
         self.abandoned
+    }
+
+    /// Whether `fid` resolves in `context` to a lazy record whose body the
+    /// mutator has not linked yet. Code baked without that body would keep
+    /// the gap for its whole life, so the bake is abandoned and retried as
+    /// after a collection's yield.
+    pub(super) fn unlinked_body(&mut self, context: &ExecutionContext, fid: u32) -> bool {
+        if context.is_lazy_record(fid) {
+            self.abandoned = true;
+            return true;
+        }
+        false
     }
 
     /// Record a debug event when the isolate captures them.
@@ -1717,7 +1731,7 @@ impl Baker<'_> {
         complete: bool,
     ) -> Option<()> {
         let owner = context.for_function(fid).ok()?;
-        let cells = self.env.shared.literal_cells.try_read()?;
+        let cells = self.env.shared.literal_cells.read_briefly().or_else(|| self.env.contend())?;
         for instruction in &view.instructions {
             let op = instruction.op(&view.code_block);
             if !matches!(op, Op::LoadString | Op::LoadBigInt) {
@@ -1772,6 +1786,9 @@ impl Baker<'_> {
             || self.env.foreign_function_realm(fid).is_some()
             || !budget.enter(call_byte_pc, fid, instructions, site_frequency)
         {
+            return None;
+        }
+        if self.unlinked_body(context, fid) {
             return None;
         }
         let result = (|| {
@@ -2065,12 +2082,19 @@ impl Baker<'_> {
                         let declaration = crate::jit_static_native::jit_leaf_builtin(stub_id)
                             .expect("native leaf call feedback names a declared entry");
                         // Feedback recorded a call to this builtin, so the isolate
-                        // installed it and its external-ref index exists.
-                        let builtin_native_ref = crate::jit_static_native::jit_static_call_ref_in(
-                            stub_id,
-                            &self.env.heap,
-                        )
-                        .expect("a builtin the site already called is interned in this isolate");
+                        // installed it and its external-ref index exists; a
+                        // compiler thread still misses it while the mutator
+                        // interns another reference, and the site then calls
+                        // through the generic native path.
+                        let Some(builtin_native_ref) =
+                            crate::jit_static_native::jit_static_call_ref_in(
+                                stub_id,
+                                &self.env.heap,
+                            )
+                        else {
+                            view.native_calls.insert(call_byte_pc, jit::JitNativeCall::Native);
+                            continue;
+                        };
                         view.native_calls.insert(
                             call_byte_pc,
                             jit::JitNativeCall::Leaf(jit::JitStaticNativeCall {
@@ -2114,7 +2138,10 @@ impl Baker<'_> {
                     );
                     continue;
                 };
-                let Some(callee) = callee_context.exec_function(callee_fid) else {
+                if self.unlinked_body(&callee_context, callee_fid) {
+                    continue;
+                }
+                let Some(callee) = callee_context.compiled_function(callee_fid) else {
                     self.record_jit_inline_candidate(
                         fid,
                         instruction_pc,
@@ -2531,8 +2558,11 @@ impl Baker<'_> {
         let method_context = context
             .for_function(target.method_fid)
             .map_err(|_| jit_debug::JitDirectCallRejectionReason::MissingCallee)?;
+        if self.unlinked_body(&method_context, target.method_fid) {
+            return Err(jit_debug::JitDirectCallRejectionReason::MissingCallee);
+        }
         let method = method_context
-            .exec_function(target.method_fid)
+            .compiled_function(target.method_fid)
             .ok_or(jit_debug::JitDirectCallRejectionReason::MissingCallee)?;
         if !method.admits_generated_call(jit::JitDirectCallKind::Method) {
             return Err(jit_debug::JitDirectCallRejectionReason::IneligibleFunction);
@@ -2915,7 +2945,7 @@ impl crate::jit_roots::CompileProofs for Baker<'_> {
     }
 }
 
-/// One optimizing compilation's bake, run by a compiler thread under the
+/// One compilation's bake, run by a compiler thread under the
 /// heap read right: the isolate prepared its facts, captured `env` and
 /// queued this.
 pub(crate) struct BakeJob {
@@ -2923,6 +2953,7 @@ pub(crate) struct BakeJob {
     pub(crate) context: ExecutionContext,
     pub(crate) function_id: u32,
     pub(crate) osr_pc: Option<u32>,
+    pub(crate) tier: jit_debug::JitDebugTier,
     pub(crate) dependency_flag: std::sync::Arc<crate::code_dependencies::DependencyFlag>,
     pub(crate) debug: jit_debug::JitDebugRequest,
     pub(crate) artifact_identity: Option<crate::JitArtifactIdentity>,
@@ -2945,21 +2976,21 @@ impl BakeJob {
         let guard = right.read();
         self.env.refresh();
         let mut baker = Baker::new(&self.env, Some(&guard));
-        let snapshot = baker.bake_optimized(&self.context, self.function_id, self.dependency_flag);
+        let snapshot = match self.tier {
+            jit_debug::JitDebugTier::Template => {
+                baker.bake_template(&self.context, self.function_id)
+            }
+            _ => baker.bake_optimized(&self.context, self.function_id, self.dependency_flag),
+        };
         if let Some(snapshot) = &snapshot {
             let target = self.osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
                 jit_debug::JitDebugTarget::Osr { pc }
             });
-            baker.record_prepared(
-                &self.context,
-                self.function_id,
-                jit_debug::JitDebugTier::Optimizing,
-                target,
-                snapshot,
-            );
+            baker.record_prepared(&self.context, self.function_id, self.tier, target, snapshot);
         }
+        let abandoned = baker.yielded();
         let (roots, install, events) = baker.finish();
-        let snapshot = snapshot?;
+        let snapshot = snapshot.filter(|_| !abandoned)?;
         let sources =
             crate::jit_compile_lifetime::CompilationSources::retain(&self.context, &snapshot)?;
         self.products.publish(roots, install, events, sources);

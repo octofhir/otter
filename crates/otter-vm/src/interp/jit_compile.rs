@@ -410,6 +410,7 @@ impl Interpreter {
         let pending = crate::jit_compile_queue::PendingCompile {
             function_id: fid,
             osr_pc,
+            tier: jit_debug::JitDebugTier::Optimizing,
             function,
             products: std::sync::Arc::clone(&products),
             cancellation: cancellation.clone(),
@@ -423,6 +424,7 @@ impl Interpreter {
             context: (*owner).clone(),
             function_id: fid,
             osr_pc,
+            tier: jit_debug::JitDebugTier::Optimizing,
             dependency_flag: self.jit_code_registry.dependency_flag(),
             debug,
             artifact_identity,
@@ -471,7 +473,14 @@ impl Interpreter {
         self.retire_fired_jit_code();
         if self.jit_compile_queue.has_finished() {
             for (pending, finished) in self.jit_compile_queue.take_finished() {
-                let _ = self.finish_optimized_compile(pending, finished);
+                match pending.tier {
+                    jit_debug::JitDebugTier::Template => {
+                        let _ = self.finish_template_compile(pending, finished);
+                    }
+                    _ => {
+                        let _ = self.finish_optimized_compile(pending, finished);
+                    }
+                }
             }
         }
     }
@@ -498,6 +507,7 @@ impl Interpreter {
             feedback_epoch,
             queued_ns,
             perf_name,
+            ..
         } = pending;
         let crate::jit_compile_queue::BakeOutput {
             roots,
@@ -787,26 +797,22 @@ impl Interpreter {
                     available_code_bytes,
                 )
                 .is_some_and(crate::tier_policy::TierWorkDecision::should_compile)
+            || self.jit_compile_queue.is_pending(fid)
             || !self.jit_template_compiling.insert(fid)
         {
             return TemplateCompileOutcome::Deferred;
         }
-        let outcome = self.compile_jit_function_unchecked(context, fid, osr_pc);
-        self.jit_template_compiling.remove(&fid);
+        let outcome = self.compile_jit_function_session(context, fid, osr_pc);
+        if !self.jit_compile_queue.is_pending(fid) {
+            self.jit_template_compiling.remove(&fid);
+        }
         outcome
     }
 
-    /// Compile after the per-function in-flight guard has been acquired.
-    fn compile_jit_function_unchecked(
-        &mut self,
-        context: &ExecutionContext,
-        fid: u32,
-        osr_pc: Option<u32>,
-    ) -> TemplateCompileOutcome {
-        self.compile_jit_function_session(context, fid, osr_pc)
-    }
-
-    /// [`Self::compile_jit_function_unchecked`] once the guard is held.
+    /// [`Self::compile_jit_function`] once the in-flight guard is held:
+    /// prepare the facts and queue the bake and compile, or run them here
+    /// without compiler threads. A queued compilation answers `Deferred` and
+    /// installs at a later poll.
     fn compile_jit_function_session(
         &mut self,
         context: &ExecutionContext,
@@ -823,82 +829,140 @@ impl Interpreter {
         if self.prepare_template_facts(context, fid).is_none() {
             return TemplateCompileOutcome::Deferred;
         }
+        let Some(function) = owner.code_block_arc(fid) else {
+            return TemplateCompileOutcome::Deferred;
+        };
+        let mut env = super::jit_bake_env::BakeEnv::capture(self);
+        env.entry_bail_count = self.jit_entry_bail_counts.get(&fid).copied().unwrap_or(0);
+        let products = std::sync::Arc::new(crate::jit_compile_queue::BakeProducts::holding(
+            env.held_roots(),
+        ));
+        let debug = self.jit_debug.request();
+        let artifact_identity = debug
+            .artifacts_enabled()
+            .then(|| crate::JitArtifactIdentity {
+                function_name: owner
+                    .function(fid)
+                    .map(|function| function.name.clone())
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+                module: function.module_url().to_string(),
+            });
+        let code_object_id = self.jit_next_code_object_id;
+        self.jit_next_code_object_id += 1;
+        let queued_ns = if debug.events_enabled() {
+            self.jit_debug.monotonic_ns()
+        } else {
+            0
+        };
+        let perf_name = debug.perf_map_enabled().then(|| {
+            owner
+                .function(fid)
+                .map_or_else(|| "<unknown>".to_string(), |function| function.name.clone())
+        });
+        let cancellation = crate::JitCompileCancellation::default();
+        let pending = crate::jit_compile_queue::PendingCompile {
+            function_id: fid,
+            osr_pc,
+            tier: jit_debug::JitDebugTier::Template,
+            function,
+            products: std::sync::Arc::clone(&products),
+            cancellation: cancellation.clone(),
+            retry_code_reclamation: false,
+            feedback_epoch: self.code_space.feedback_epoch(fid),
+            queued_ns,
+            perf_name,
+        };
+        let job = super::jit_bake::BakeJob {
+            env,
+            context: (*owner).clone(),
+            function_id: fid,
+            osr_pc,
+            tier: jit_debug::JitDebugTier::Template,
+            dependency_flag: self.jit_code_registry.dependency_flag(),
+            debug,
+            artifact_identity,
+            code_object_id,
+            cancellation,
+            products,
+        };
+        match self.jit_compile_queue.submit(
+            hook,
+            crate::jit_compile_queue::CompileInput::Bake(Box::new(job)),
+            code_object_id,
+            pending,
+        ) {
+            Some((pending, finished)) => self.finish_template_compile(pending, finished),
+            None => TemplateCompileOutcome::Deferred,
+        }
+    }
+
+    /// Install one finished template compilation: register its code and keep
+    /// the outcome in the function's template cache, which later entries and
+    /// loop polls read.
+    fn finish_template_compile(
+        &mut self,
+        pending: crate::jit_compile_queue::PendingCompile,
+        finished: crate::jit_compile_queue::FinishedCompile,
+    ) -> TemplateCompileOutcome {
+        let crate::jit_compile_queue::PendingCompile {
+            function_id: fid,
+            osr_pc,
+            function,
+            products,
+            cancellation,
+            queued_ns,
+            perf_name,
+            ..
+        } = pending;
+        self.jit_template_compiling.remove(&fid);
+        let crate::jit_compile_queue::BakeOutput {
+            roots,
+            install,
+            events,
+            sources,
+        } = products.take();
+        self.publish_bake_events(events);
         let target = osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
             jit_debug::JitDebugTarget::Osr { pc }
         });
-        let mut env = super::jit_bake_env::BakeEnv::capture(self);
-        env.entry_bail_count = self.jit_entry_bail_counts.get(&fid).copied().unwrap_or(0);
-        let mut baker = Baker::new(&env, None);
-        let view = baker.bake_template(context, fid);
-        if let Some(view) = &view {
-            baker.record_prepared(
-                context,
-                fid,
-                jit_debug::JitDebugTier::Template,
-                target,
-                view,
-            );
-        }
-        let (roots, install, events) = baker.finish();
-        self.publish_bake_events(events);
-        let Some(view) = view else {
-            return TemplateCompileOutcome::Deferred;
-        };
-        let function = view.code_block.clone();
-        let code_object_id = self.jit_next_code_object_id;
-        let artifact_identity =
-            self.jit_debug
-                .request()
-                .artifacts_enabled()
-                .then(|| crate::JitArtifactIdentity {
-                    function_name: context
-                        .function(fid)
-                        .map(|function| function.name.clone())
-                        .unwrap_or_else(|| "<unknown>".to_string()),
-                    module: view.code_block.module_url().to_string(),
-                });
-        let capture_timing = self.jit_debug.request().events_enabled();
-        let queued_ns = if capture_timing {
-            self.jit_debug.monotonic_ns()
+        let nanos =
+            |duration: std::time::Duration| duration.as_nanos().min(u128::from(u64::MAX)) as u64;
+        let queue_delay_ns = nanos(finished.queue_delay);
+        let code_object_id = finished.code_object_id;
+        let current = sources
+            .as_ref()
+            .is_some_and(|sources| sources.is_current(&self.code_space, &function, &[]));
+        let cancelled = cancellation.is_cancelled() || !current;
+        let status = if cancelled {
+            Ok(jit::JitCompileStatus::Cancelled)
         } else {
-            0
+            finished.status
         };
-        let compile_started_ns = if capture_timing {
-            self.jit_debug.monotonic_ns()
-        } else {
-            0
-        };
-        let compile_started = capture_timing.then(std::time::Instant::now);
-        self.jit_runtime_stats.compile_attempts =
-            self.jit_runtime_stats.compile_attempts.saturating_add(1);
-        self.optimizing_tier_policy
-            .record_compile_attempt(fid, crate::tier_policy::CostedTier::Template);
-        let cancellation = crate::JitCompileCancellation::default();
-        let mut status = hook.compile_function(jit::JitCompileRequest {
-            cancellation: cancellation.clone(),
-            snapshot: view,
-            debug: self.jit_debug.request(),
-            artifact_identity,
-            osr_pc,
-            code_object_id,
-        });
-        if cancellation.is_cancelled() {
-            status = Ok(jit::JitCompileStatus::Cancelled);
+        // Only compiler work on a still-current body is an attempt: a
+        // cancelled or abandoned compilation leaves the function's work
+        // budget ready to request it again at once.
+        if finished.entered_hook && !cancelled {
+            self.jit_runtime_stats.compile_attempts =
+                self.jit_runtime_stats.compile_attempts.saturating_add(1);
+            self.optimizing_tier_policy
+                .record_compile_attempt(fid, crate::tier_policy::CostedTier::Template);
         }
-        let compile_duration_ns = compile_started.map_or(0, |started| {
-            started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
-        });
         self.record_jit_compile_finished(
             fid,
             jit_debug::JitDebugTier::Template,
             target,
             code_object_id,
-            Some(compile_started_ns),
-            compile_started_ns.saturating_sub(queued_ns),
-            compile_duration_ns,
+            finished
+                .entered_hook
+                .then(|| queued_ns.saturating_add(queue_delay_ns)),
+            queue_delay_ns,
+            nanos(finished.duration),
             &status,
         );
-        match status {
+        if self.jit_retraining_blocks(fid) {
+            return TemplateCompileOutcome::Deferred;
+        }
+        let outcome = match status {
             Ok(jit::JitCompileStatus::Compiled {
                 code,
                 artifact,
@@ -908,7 +972,6 @@ impl Interpreter {
                 if let Some(artifact) = artifact {
                     self.record_jit_artifact(*artifact);
                 }
-                self.jit_next_code_object_id += 1;
                 // Sweep before registering: cached/installed users hold an
                 // `Arc`; executing generations are named by published frames.
                 self.retire_unreferenced_jit_code();
@@ -916,18 +979,22 @@ impl Interpreter {
                     return TemplateCompileOutcome::Deferred;
                 }
                 let roots = crate::jit_roots::CompilationRoot::retain_required_cells(
-                    roots,
+                    roots.into_boxed_slice(),
                     &required_cells,
                 );
                 let required_bytes = crate::jit_registry::JitCodeRegistry::retained_admission_bytes(
                     code.as_ref(),
                     &roots,
                 );
+                let optimizing = self
+                    .jit_hook
+                    .as_ref()
+                    .is_some_and(|hook| hook.optimizing_tier_enabled());
                 let admission = self.jit_code_registry.install_compiled(
                     code_object_id,
                     code.clone(),
                     &function,
-                    if hook.optimizing_tier_enabled() {
+                    if optimizing {
                         self.optimizing_tier_policy
                             .decide(
                                 &function,
@@ -960,21 +1027,14 @@ impl Interpreter {
                         error,
                     );
                 }
-                let installed = admission.is_ok();
-                if installed {
+                if admission.is_ok() {
                     self.jit_runtime_stats.code_generations =
                         self.jit_runtime_stats.code_generations.saturating_add(1);
                     self.optimizing_tier_policy
                         .observe_template_generation(&function);
-                    if self.jit_debug.request().perf_map_enabled() {
-                        let name = context.function(fid).map_or_else(
-                            || "<unknown>".to_string(),
-                            |function| function.name.clone(),
-                        );
-                        self.record_jit_perf_map(&name, code.as_ref(), "template");
+                    if let Some(name) = &perf_name {
+                        self.record_jit_perf_map(name, code.as_ref(), "template");
                     }
-                }
-                if installed {
                     TemplateCompileOutcome::Installed(code)
                 } else {
                     TemplateCompileOutcome::Deferred
@@ -984,7 +1044,8 @@ impl Interpreter {
             Ok(jit::JitCompileStatus::Cancelled | jit::JitCompileStatus::Unavailable) | Err(_) => {
                 TemplateCompileOutcome::Deferred
             }
-        }
+        };
+        self.retain_template_compile_outcome(fid, outcome)
     }
 
     /// Name one installed code object of function `name` in the perf map.

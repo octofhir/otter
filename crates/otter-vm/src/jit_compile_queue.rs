@@ -71,6 +71,8 @@ pub(crate) struct PendingCompile {
     pub(crate) function_id: u32,
     /// Loop header that requested the compilation, if any.
     pub(crate) osr_pc: Option<u32>,
+    /// The tier being compiled, whose installation runs at collection.
+    pub(crate) tier: crate::jit_debug::JitDebugTier,
     /// The exact body the snapshot is taken from.
     pub(crate) function: Arc<crate::executable::CodeBlock>,
     /// The roots, install tasks, events and source leases the bake leaves.
@@ -113,6 +115,7 @@ pub(crate) enum CompileInput {
 
 struct CompileJob {
     hook: Arc<dyn JitCompilerHook>,
+    tier: crate::jit_debug::JitDebugTier,
     input: CompileInput,
     cancellation: JitCompileCancellation,
     code_object_id: u64,
@@ -301,7 +304,10 @@ fn compile(job: CompileJob) -> FinishedCompile {
     };
     let entered_hook = request.is_some() && !cancellation.is_cancelled();
     let status = if let Some(request) = request.filter(|_| entered_hook) {
-        let status = job.hook.compile_optimized_function(request);
+        let status = match job.tier {
+            crate::jit_debug::JitDebugTier::Template => job.hook.compile_function(request),
+            _ => job.hook.compile_optimized_function(request),
+        };
         // A hook may ignore cancellation or finish its last phase just before
         // cancellation. A completed artifact still must not be published.
         if cancellation.is_cancelled() {
@@ -394,6 +400,7 @@ impl OptimizingCompileQueue {
     ) -> Option<(PendingCompile, FinishedCompile)> {
         let job = CompileJob {
             hook,
+            tier: pending.tier,
             input,
             cancellation: pending.cancellation.clone(),
             code_object_id,
@@ -572,6 +579,7 @@ mod tests {
         let pending = PendingCompile {
             function_id: snapshot.code_block.id,
             osr_pc: None,
+            tier: crate::jit_debug::JitDebugTier::Optimizing,
             function: snapshot.code_block.clone(),
             products: Arc::new(BakeProducts(Mutex::new(BakeOutput {
                 roots: vec![CompilationRoot::CalleeIdentity(root)],

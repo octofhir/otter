@@ -14,14 +14,31 @@
 //!   mutably, so no mutator read is live across its own write.
 //! - A mutator read takes no lock: the only other access a write excludes is
 //!   a compiler thread's read, which holds the lock for its whole duration.
-//! - A compiler thread never waits: [`MutatorOwned::try_read`] fails while
-//!   the mutator writes, and the compilation goes without that fact.
-//!   Compiler threads share the lock, so they never fail for each other.
+//! - A compiler thread never blocks: [`MutatorOwned::try_read`] fails while
+//!   the mutator writes. [`MutatorOwned::read_briefly`] retries over a
+//!   bounded number of scheduler yields, as long as a mutator write lasts,
+//!   and a compilation that still fails is retried whole, never published
+//!   without the fact. Compiler threads share the lock, so they never fail
+//!   for each other.
 //!
 //! # See also
 //! - `interp::jit_bake` — the compiler-side reader.
 
 use std::cell::UnsafeCell;
+
+/// Scheduler yields a compiler-thread read waits through a mutator write.
+const READ_YIELDS: u32 = 64;
+
+/// `read` retried through [`READ_YIELDS`] yields while it fails.
+pub(crate) fn retry_briefly<R>(mut read: impl FnMut() -> Option<R>) -> Option<R> {
+    for _ in 0..READ_YIELDS {
+        if let Some(value) = read() {
+            return Some(value);
+        }
+        std::thread::yield_now();
+    }
+    read()
+}
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 /// The isolate thread's ownership of every [`MutatorOwned`] value of its
@@ -96,6 +113,12 @@ impl<T> MutatorOwned<T> {
             // and the lock excludes every compiler-thread read.
             value: unsafe { &mut *self.value.get() },
         }
+    }
+
+    /// A compiler thread's read once a mutator write ends, waiting through
+    /// a bounded number of yields; `None` when the write outlasts them.
+    pub(crate) fn read_briefly(&self) -> Option<SharedRead<'_, T>> {
+        retry_briefly(|| self.try_read())
     }
 
     /// A compiler thread's read, while the mutator is not writing; `None`
@@ -195,6 +218,12 @@ impl<T> MutatorCell<T> {
             _guard: guard,
             value: self.cell.borrow_mut(),
         }
+    }
+
+    /// A compiler thread's read once a mutator write ends, waiting through
+    /// a bounded number of yields; `None` when the write outlasts them.
+    pub(crate) fn read_briefly(&self) -> Option<SharedRead<'_, T>> {
+        retry_briefly(|| self.try_read())
     }
 
     /// A compiler thread's read, while the mutator is not writing; `None`

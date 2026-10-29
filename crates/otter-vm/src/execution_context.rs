@@ -423,6 +423,22 @@ impl ExecutionContext {
         self.payload.executable.function(local)
     }
 
+    /// Whether `function_id` resolves here to a lazy record, whose slot
+    /// holds the placeholder body: a compiler thread meets one when call
+    /// feedback named the target before the mutator linked its body.
+    pub(crate) fn is_lazy_record(&self, function_id: u32) -> bool {
+        self.local_function_index(function_id)
+            .is_some_and(|local| self.payload.executable.is_lazy_record(local))
+    }
+
+    /// [`Self::exec_function`] for a compiler: `None` for a lazy record.
+    pub(crate) fn compiled_function(&self, function_id: u32) -> Option<&CodeBlock> {
+        if self.is_lazy_record(function_id) {
+            return None;
+        }
+        self.exec_function(function_id)
+    }
+
     pub(crate) fn code_block_arc(&self, function_id: u32) -> Option<std::sync::Arc<CodeBlock>> {
         let local = self.local_function_index(function_id)?;
         self.payload.executable.function_arc(local)
@@ -438,6 +454,7 @@ impl ExecutionContext {
     /// an untraced moving `Value` or GC handle.
     #[must_use]
     pub fn jit_compile_snapshot(&self, function_id: u32) -> Option<crate::jit::JitCompileSnapshot> {
+        self.compiled_function(function_id)?;
         let mut view = self.code_block_arc(function_id)?.jit_compile_snapshot();
         let code_block = Arc::clone(&view.code_block);
         for instr in &mut view.instructions {

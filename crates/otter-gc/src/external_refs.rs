@@ -181,6 +181,10 @@ mod tests {
     }
 }
 
+/// A compiler thread's read met the owner changing the table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Contended;
+
 /// The heap's external-reference table, shared with compiler threads: the
 /// heap's owner reads it freely and changes it under a short lock, holding
 /// the heap mutably; a compiler thread reads it only while it is not being
@@ -216,9 +220,10 @@ impl SharedExternalRefs {
 
     /// A compiler thread's lookup of `addr`'s index; `None` when the address
     /// was never interned or the owner is changing the table.
-    pub fn try_lookup(&self, addr: usize) -> Option<u32> {
-        let _guard = self.lock.try_read().ok()?;
+    /// `Err` while the owner writes, else the index `addr` has if any.
+    pub fn try_lookup(&self, addr: usize) -> Result<Option<u32>, Contended> {
+        let _guard = self.lock.try_read().map_err(|_| Contended)?;
         // SAFETY: the lock excludes every write.
-        unsafe { &*self.table.get() }.lookup(addr)
+        Ok(unsafe { &*self.table.get() }.lookup(addr))
     }
 }

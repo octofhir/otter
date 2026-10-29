@@ -211,6 +211,17 @@ impl ExecutableModule {
                 .is_some_and(|function| function.lazy.is_some())
     }
 
+    /// Whether function `local_index` is a lazy record: its slot holds the
+    /// placeholder body whatever its forward says, and the compiled body
+    /// lives in the forwarded chunk.
+    #[must_use]
+    pub(crate) fn is_lazy_record(&self, local_index: u32) -> bool {
+        self.bytecode
+            .functions
+            .get(local_index as usize)
+            .is_some_and(|function| function.lazy.is_some())
+    }
+
     /// Base id of the chunk holding the compiled body of lazy record
     /// `local_index`, once its first call compiled it.
     #[inline]

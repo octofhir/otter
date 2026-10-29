@@ -24,6 +24,9 @@ use crate::{CodeBlock, Interpreter, MethodCallFeedback, jit, native_abi};
 
 /// The isolate as one compilation's bake reads it.
 pub(crate) struct BakeEnv {
+    /// A shared-table read met the mutator writing it: the bake is
+    /// incomplete and is retried, never published without that fact.
+    contended: std::cell::Cell<bool>,
     pub(crate) shared: std::sync::Arc<CompileShared>,
     pub(crate) heap: crate::heap_read::HeapView,
     /// Compiler threads' right to read the heap.
@@ -69,6 +72,7 @@ impl BakeEnv {
     /// Capture `vm` as one compilation's bake reads it.
     pub(crate) fn capture(vm: &Interpreter) -> Self {
         let mut env = Self {
+            contended: std::cell::Cell::new(false),
             shared: std::sync::Arc::clone(&vm.compile_shared),
             heap: crate::heap_read::HeapView::of(&vm.gc_heap),
             read_right: vm.gc_heap.read_right(),
@@ -145,6 +149,17 @@ impl BakeEnv {
     /// Read the captured handles back from their cells, as the last
     /// collection left them. Called under the read right, before any heap
     /// read of the bake.
+    /// Note a shared-table read that met the mutator writing it.
+    pub(crate) fn contend<T>(&self) -> Option<T> {
+        self.contended.set(true);
+        None
+    }
+
+    /// Whether any read of this bake met the mutator writing.
+    pub(crate) fn contended(&self) -> bool {
+        self.contended.get() || self.heap.contended()
+    }
+
     pub(crate) fn refresh(&mut self) {
         let value = |index: usize| self.held[index].held();
         let object = |index: usize| value(index).as_object();
@@ -183,7 +198,7 @@ impl BakeEnv {
     pub(crate) fn function_realm_id(&self, function_id: u32) -> u32 {
         self.shared
             .function_realm_ids
-            .try_read()
+            .read_briefly().or_else(|| self.contend())
             .and_then(|realms| realms.get(&function_id).copied())
             .unwrap_or(0)
     }
@@ -196,12 +211,12 @@ impl BakeEnv {
 
     /// The method target distribution of one method site.
     pub(crate) fn method_target_feedback(&self, site: usize) -> Option<MethodCallFeedback> {
-        self.shared.method_feedback.try_read()?.method_targets(site)
+        self.shared.method_feedback.read_briefly().or_else(|| self.contend())?.method_targets(site)
     }
 
     /// The method-resolution IC of one method site.
     pub(crate) fn method_ic(&self, site: usize) -> Option<crate::method_ops::MethodCallIc> {
-        self.shared.method_feedback.try_read()?.method_ic(site)
+        self.shared.method_feedback.read_briefly().or_else(|| self.contend())?.method_ic(site)
     }
 
     /// The optimizing exit evidence recorded for sites of `fid`.
@@ -209,7 +224,7 @@ impl BakeEnv {
         &self,
         fid: u32,
     ) -> Vec<((u32, u32, native_abi::ExitReason), jit::JitExitProfile)> {
-        let Some(profiles) = self.shared.jit_optimized_exit_profiles.try_read() else {
+        let Some(profiles) = self.shared.jit_optimized_exit_profiles.read_briefly().or_else(|| self.contend()) else {
             return Vec::new();
         };
         profiles
@@ -223,7 +238,7 @@ impl BakeEnv {
     pub(crate) fn parameter_widening(&self, fid: u32) -> Option<Box<[jit::JitParameterWidening]>> {
         self.shared
             .jit_parameter_widening
-            .try_read()?
+            .read_briefly().or_else(|| self.contend())?
             .get(&fid)
             .cloned()
     }
@@ -233,7 +248,7 @@ impl BakeEnv {
         &self,
         key: (usize, u32),
     ) -> Option<crate::regexp::RegExpLiteralSite> {
-        self.shared.regexp_literals.try_read()?.get(&key).copied()
+        self.shared.regexp_literals.read_briefly().or_else(|| self.contend())?.get(&key).copied()
     }
 
     /// The hidden class of an object-literal site of `fid` whose first key
@@ -245,7 +260,7 @@ impl BakeEnv {
     ) -> Option<crate::handles::ObjectLayout> {
         self.shared
             .object_literal_layouts
-            .try_read()?
+            .read_briefly().or_else(|| self.contend())?
             .get(&(fid, first_key))
             .copied()
     }
@@ -257,7 +272,7 @@ impl BakeEnv {
     ) -> Option<crate::array::elements::ElementSlabHandle> {
         self.shared
             .array_boilerplates
-            .try_read()?
+            .read_briefly().or_else(|| self.contend())?
             .get(&key)
             .copied()
     }
@@ -265,7 +280,7 @@ impl BakeEnv {
     /// The global declarative binding `name`: its cell and whether it is
     /// constant.
     pub(crate) fn global_lexical(&self, name: &str) -> Option<(crate::UpvalueCell, bool)> {
-        self.shared.global_lexicals.try_read()?.get(name).copied()
+        self.shared.global_lexicals.read_briefly().or_else(|| self.contend())?.get(name).copied()
     }
 
     /// The global declarative record's name-set identity.
@@ -279,7 +294,7 @@ impl BakeEnv {
     pub(crate) fn simple_constructor_field_count(&self, fid: u32) -> Option<usize> {
         self.shared
             .simple_constructor_init_cache
-            .try_read()?
+            .read_briefly().or_else(|| self.contend())?
             .get(&fid)?
             .as_ref()
             .map(|init| init.fields.len())
@@ -290,14 +305,14 @@ impl BakeEnv {
     pub(crate) fn simple_constructor_shape(&self, fid: u32, root: ShapeId) -> Option<ShapeHandle> {
         self.shared
             .simple_constructor_shape_cache
-            .try_read()?
+            .read_briefly().or_else(|| self.contend())?
             .get(&(fid, root))
             .copied()
     }
 
     /// Every final hidden class the simple constructor `fid` reaches.
     pub(crate) fn simple_constructor_shapes(&self, fid: u32) -> Vec<ShapeHandle> {
-        let Some(shapes) = self.shared.simple_constructor_shape_cache.try_read() else {
+        let Some(shapes) = self.shared.simple_constructor_shape_cache.read_briefly().or_else(|| self.contend()) else {
             return Vec::new();
         };
         shapes
@@ -315,7 +330,7 @@ impl BakeEnv {
         let address = self
             .shared
             .function_entries
-            .try_read()?
+            .read_briefly().or_else(|| self.contend())?
             .get(&function.id)
             .copied()?;
         // SAFETY: directory addresses name registry-lifetime entry cells.
@@ -334,7 +349,7 @@ impl BakeEnv {
     fn closure_context_cell(&self, function_id: u32) -> usize {
         self.shared
             .closure_context_cells
-            .try_read()
+            .read_briefly().or_else(|| self.contend())
             .and_then(|cells| cells.get(&function_id).copied())
             .unwrap_or(0)
     }
@@ -393,7 +408,7 @@ impl BakeEnv {
             self.string_prototype,
             self.active_realm_id,
         );
-        let memo = self.shared.jit_intrinsic_programs.try_read()?;
+        let memo = self.shared.jit_intrinsic_programs.read_briefly().or_else(|| self.contend())?;
         let (built, programs) = memo.get(&key.atom().id().raw())?;
         (*built == stamp).then(|| (programs.clone(), shapes))
     }

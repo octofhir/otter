@@ -3342,6 +3342,8 @@ impl<'a> Codegen<'a> {
         }
         let exit = self.eager_exit(node, DeoptReason::WrongShape);
         let done = self.ops.new_dynamic_label();
+        // A proved receiver that lacks the suffix storage an append needs.
+        let grow = plan.grows().then(|| self.ops.new_dynamic_label());
         let view = self.view;
         let stored_value = if plan.is_double() {
             self.allocation.node(node).gp_temps[2]
@@ -3495,15 +3497,17 @@ impl<'a> Codegen<'a> {
                     Op::GuardExtensible { field, .. } => {
                         // The appended slot fits the storage the receiver
                         // already has, and the receiver may still grow.
+                        // Storage it lacks the committed store allocates.
                         if !field.is_inline() {
+                            let short = grow.unwrap_or(next);
                             dynasm!(self.ops ; .arch aarch64
                                 ; ldr w16, [X(receiver), view.field_layout.slab_handle_byte]
-                                ; cbz w16, =>next
+                                ; cbz w16, =>short
                                 ; and x17, X(receiver), #0xffff_ffff_0000_0000
                                 ; add x16, x17, x16
                                 ; ldr w16, [x16, view.field_layout.slab_capacity_byte]);
                             self.load_immediate(17, u64::from(field.index()));
-                            dynasm!(self.ops ; .arch aarch64 ; cmp w17, w16 ; b.hs =>next);
+                            dynasm!(self.ops ; .arch aarch64 ; cmp w17, w16 ; b.hs =>short);
                         }
                         // A fresh receiver ran no code since its allocation,
                         // so it is still extensible; an exact guarded shape
@@ -3598,8 +3602,53 @@ impl<'a> Codegen<'a> {
         if last.is_none() {
             dynasm!(self.ops ; .arch aarch64 ; b =>exit);
         }
+        if let Some(grow) = grow {
+            // Every guard before the append held, so the committed store
+            // makes the same append, allocating the storage, and runs no
+            // JavaScript.
+            let slot = self.property_ic_slot(node, byte_pc)?;
+            self.defer(move |codegen| {
+                dynasm!(codegen.ops ; .arch aarch64 ; =>grow);
+                codegen.emit_committed_call(
+                    node,
+                    abi::STUB_JIT_STORE_PROPERTY,
+                    &[
+                        CommittedArgument::Value(receiver),
+                        CommittedArgument::Value(value),
+                        CommittedArgument::Address(slot.0, slot.1),
+                    ],
+                    None,
+                )?;
+                dynasm!(codegen.ops ; .arch aarch64 ; b =>done);
+                Ok(())
+            });
+        }
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         Ok(())
+    }
+
+    /// The IC slot of the property site at `byte_pc` in `node`'s function.
+    fn property_ic_slot(
+        &self,
+        node: NodeId,
+        byte_pc: u32,
+    ) -> Result<(u64, RelocationTarget), Unsupported> {
+        let view = self.view_of(node);
+        let slot = view
+            .property_accesses
+            .get(&byte_pc)
+            .map(|access| access.ic_slot)
+            .filter(|&slot| slot != 0)
+            .ok_or(Unsupported::OperandShape(
+                "graph property site without an IC slot",
+            ))?;
+        Ok((
+            slot,
+            RelocationTarget::PropertyIcSlot {
+                function_id: view.code_block.id,
+                byte_pc,
+            },
+        ))
     }
 
     /// `W(destination)` = the code unit of the string `X(receiver)` at the
@@ -3832,27 +3881,13 @@ impl<'a> Codegen<'a> {
         node: NodeId,
         pc: u32,
     ) -> Result<(u64, RelocationTarget), Unsupported> {
-        let view = self.view_of(node);
-        let byte_pc = view
+        let byte_pc = self
+            .view_of(node)
             .instructions
             .get(pc as usize)
             .map(|instruction| instruction.byte_pc)
             .ok_or(Unsupported::OperandShape("graph property site pc"))?;
-        let slot = view
-            .property_accesses
-            .get(&byte_pc)
-            .map(|access| access.ic_slot)
-            .filter(|&slot| slot != 0)
-            .ok_or(Unsupported::OperandShape(
-                "graph property site without an IC slot",
-            ))?;
-        Ok((
-            slot,
-            RelocationTarget::PropertyIcSlot {
-                function_id: view.code_block.id,
-                byte_pc,
-            },
-        ))
+        self.property_ic_slot(node, byte_pc)
     }
 
     /// `X(destination)` = the named property at `pc` of `X(receiver)`, both

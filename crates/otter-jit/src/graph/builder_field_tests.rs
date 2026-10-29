@@ -33,6 +33,7 @@ use otter_vm::{
 };
 
 use super::{Kind, Repr, build};
+use crate::graph::ir::NamedStorePlan;
 use crate::graph::{BaselineSupport, bytecode::Analysis};
 
 #[path = "builder_field_type_tests.rs"]
@@ -245,7 +246,7 @@ fn store_graph(op: Op, programs: Vec<JitCacheIrProgram>) -> super::Built {
 }
 
 #[test]
-fn overflow_appends_keep_a_collecting_completion_inside_the_graph() {
+fn overflow_appends_specialize_with_a_collecting_completion() {
     let inline = transition_program(128, FieldLocation::inline(3));
     let overflow = transition_program(256, FieldLocation::overflow(0));
     let growing_overflow = transition_program(384, FieldLocation::overflow(17));
@@ -260,14 +261,20 @@ fn overflow_appends_keep_a_collecting_completion_inside_the_graph() {
             .graph
             .nodes
             .iter()
-            .find(|node| matches!(node.kind, Kind::StorePropertyCached { .. }))
-            .expect("suffix append keeps its committed allocating miss");
-        assert_eq!(store.kind, Kind::StorePropertyCached { pc: 0 });
+            .find(|node| matches!(node.kind, Kind::StoreNamedProperty { .. }))
+            .expect("a suffix append specializes on its proved shapes");
+        assert!(matches!(
+            store.kind,
+            Kind::StoreNamedProperty {
+                plan: NamedStorePlan::GrowingPrograms,
+                ..
+            }
+        ));
         assert!(store.kind.properties().may_collect);
         assert!(store.kind.properties().can_throw);
         assert!(
             store.eager.is_some(),
-            "the collecting store owns its recovery state"
+            "the collecting completion owns its recovery state"
         );
         assert!(
             store
@@ -276,20 +283,11 @@ fn overflow_appends_keep_a_collecting_completion_inside_the_graph() {
                 .all(|&input| built.graph.node(input).repr == Repr::Tagged)
         );
         assert!(
-            !built
-                .graph
-                .nodes
-                .iter()
-                .any(|node| matches!(node.kind, Kind::StoreNamedProperty { .. } | Kind::Deopt(_))),
-            "an allocation-required append completes without an eager shape miss"
-        );
-        assert!(
-            !built
-                .graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == Kind::WriteBarrier),
-            "the cached store owns its hit's dynamic storage barrier; the source receiver is not necessarily its parent"
+            !built.graph.nodes.iter().any(|node| matches!(
+                node.kind,
+                Kind::StorePropertyCached { .. } | Kind::Generic { .. } | Kind::Deopt(_)
+            )),
+            "a proved receiver lacking storage completes through the committed store"
         );
     }
 }

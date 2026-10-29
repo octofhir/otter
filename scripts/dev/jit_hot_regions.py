@@ -5,8 +5,9 @@ region holds each sampled pc.
 usage: jit_hot_regions.py <sample.txt> <perf.map> <jit-artifacts-dir> [top]
 The run must have written both `--perf-basic-prof` and `--jit-artifacts`, so
 a code object's perf-map name `[... cN]` matches its artifact directory
-`*-cN` and an offset into it names an `asm.txt` region. A pc in no code
-object (a shared routine) is credited as `routine <- ` the region of the
+`*-cN` and an offset into it names an `asm.txt` region. A pc before the first
+region is `(prologue)`, past the last one `(out of line)` (deferred paths,
+exits, the epilogue); a pc in no code object (a shared routine) is credited as `routine <- ` the region of the
 nearest caller frame that is in one.
 """
 import bisect, collections, glob, os, re, sys
@@ -73,9 +74,14 @@ def region_of(pc):
     start, _, name, code_id = codes[i]
     # A caller frame's pc is a return address: credit the call before it.
     offset = pc - start
-    for lo, hi, region in regions_of(code_id):
+    found = regions_of(code_id)
+    for lo, hi, region in found:
         if lo <= offset < hi:
             return f"{name} {region}"
+    if found and offset < found[0][0]:
+        return f"{name} (prologue)"
+    if found and offset >= max(hi for _, hi, _ in found):
+        return f"{name} (out of line)"
     return f"{name} (no region)"
 
 by_node = collections.Counter()

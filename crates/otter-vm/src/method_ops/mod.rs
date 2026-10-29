@@ -1998,20 +1998,24 @@ impl Interpreter {
         key: AtomizedPropertyKey<'_>,
         slot: crate::feedback::PropertyFeedbackSlot<'_>,
     ) -> Option<Value> {
+        let mut obj = obj;
         if slot.is_megamorphic() {
             // The site has given up, but the receiver's class and the method
             // name still name one slot. Answer from the shared table rather
             // than sending a megamorphic call site down the `[[Get]]` ladder.
-            return self
-                .resolve_property_data_slot(obj, key)
-                .map(|resolved| resolved.value);
+            return match self.resolve_property_load_preparing(&mut obj, key) {
+                crate::property_cache::PropertyLoad::Data(resolved) => Some(resolved.value),
+                _ => None,
+            };
         }
         if let Some(value) = slot.probe_load(obj, &self.gc_heap) {
             slot.record_hit();
             return Some(value);
         }
         slot.record_miss();
-        let load = self.resolve_property_load(obj, key);
+        // Preparing a dictionary-mode prototype allocates; callers re-read
+        // the receiver from its root.
+        let load = self.resolve_property_load_preparing(&mut obj, key);
         self.update_load_ic(slot, obj, &load);
         match load {
             crate::property_cache::PropertyLoad::Data(resolved) => Some(resolved.value),

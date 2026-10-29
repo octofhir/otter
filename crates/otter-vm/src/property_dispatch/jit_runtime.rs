@@ -123,7 +123,11 @@ impl Interpreter {
             // A saturated site still reads one slot per receiver class. The
             // shared `(shape, atom)` table answers it without the ladder; only
             // a pair nothing has resolved falls through.
-            match self.resolve_property_load(obj, atomized_key) {
+            let mut prepared = obj;
+            let load = self.resolve_property_load_preparing(&mut prepared, atomized_key);
+            receiver = Value::object(prepared);
+            self.set_scoped(receiver_root, receiver);
+            match load {
                 crate::property_cache::PropertyLoad::Data(resolved) => {
                     slot.record_hit();
                     return Ok(resolved.value);

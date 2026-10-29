@@ -17,7 +17,7 @@ fn method_feedback_declines_a_wide_dictionary_holder_without_losing_its_data() {
         .expect("caller context");
     interpreter.with_handle_scope(|interpreter, scope| {
         let prototype = interpreter.scoped_object_bare(scope).expect("prototype");
-        for index in 0..crate::object::MAX_FAST_PROPERTIES {
+        for index in 0..crate::object::MAX_NAMED_FAST_PROPERTIES {
             let mut object = interpreter.escape_scoped(prototype).as_object().unwrap();
             interpreter
                 .create_data_property(
@@ -55,7 +55,7 @@ fn method_feedback_declines_a_wide_dictionary_holder_without_losing_its_data() {
             crate::object::with_properties(prototype, interpreter.gc_heap(), |properties| {
                 properties.keys().count()
             }),
-            crate::object::MAX_FAST_PROPERTIES as usize + 1,
+            crate::object::MAX_NAMED_FAST_PROPERTIES as usize + 1,
             "the real holder exceeds ordinary migration capacity"
         );
         let descriptor =

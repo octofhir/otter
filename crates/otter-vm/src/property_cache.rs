@@ -783,6 +783,26 @@ impl crate::Interpreter {
         }
     }
 
+    /// [`Self::resolve_property_load`], giving the receiver's chain its hidden
+    /// classes (MakePrototypesFast) and resolving once more when a
+    /// dictionary-mode prototype on it left the load unanswered: a cache
+    /// names no such prototype, so it would resolve by name on every access.
+    /// The preparation allocates; `obj` is rooted and refreshed.
+    pub(crate) fn resolve_property_load_preparing(
+        &mut self,
+        obj: &mut JsObject,
+        key: AtomizedPropertyKey<'_>,
+    ) -> PropertyLoad {
+        let load = self.resolve_property_load(*obj, key);
+        if !matches!(load, PropertyLoad::Other)
+            || !object::chain_has_describable_dictionary_prototype(*obj, &self.gc_heap)
+        {
+            return load;
+        }
+        self.make_prototypes_fast(obj);
+        self.resolve_property_load(*obj, key)
+    }
+
     /// [`Self::resolve_property_load`] for a dictionary-mode receiver: its own
     /// key table answers by atom, then ordinary data along its chain. No
     /// hidden class names the receiver, so the shared table records nothing;

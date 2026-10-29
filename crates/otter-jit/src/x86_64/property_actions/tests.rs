@@ -86,11 +86,11 @@ impl Fixture {
     fn new(capacity: u8) -> Self {
         let atom = if capacity == 4 { 0 } else { ATOM };
         let cells = vec![CANARY; 1024];
-        let table = vec![0_u64; 512 * 4 * 9];
+        let table = vec![0_u64; 512 * 4 * 10];
         let validity = Box::new(1);
         let cache = JitPropertyActionCache {
             table_addr: table.as_ptr() as usize,
-            entry_bytes: 72,
+            entry_bytes: 80,
             set_mask: 511,
             ways: 4,
             receiver_shape_id_byte: 0,
@@ -100,14 +100,16 @@ impl Fixture {
             load_slot_byte: 14,
             store_slot_byte: 16,
             load_writable_byte: 18,
-            holder_shape_byte: 20,
-            holder_root_byte: 24,
-            target_shape_byte: 28,
-            store_owner_byte: 32,
-            holder_shape_id_byte: 40,
-            target_shape_id_byte: 48,
-            load_validity_byte: 56,
-            store_validity_byte: 64,
+            load_word_byte: 20,
+            store_word_byte: 24,
+            holder_shape_byte: 28,
+            holder_root_byte: 32,
+            target_shape_byte: 36,
+            store_owner_byte: 40,
+            holder_shape_id_byte: 48,
+            target_shape_id_byte: 56,
+            load_validity_byte: 64,
+            store_validity_byte: 72,
             shape_id_byte: SHAPE_ID_BYTE,
             hash_multiplier: 0x9e37_79b9_7f4a_7c15,
             hash_atom_shift: 32,
@@ -121,15 +123,15 @@ impl Fixture {
             validity,
             view: snapshot(),
             cache,
-            entry: (set * 4 + 3) * 72,
+            entry: (set * 4 + 3) * 80,
             capacity,
             atom,
         };
-        let start = set * 4 * 72;
+        let start = set * 4 * 80;
         for way in 0..3 {
             // Identical low 32 shape bits must not select these collisions.
-            fixture.table_u64(start + way * 72, RECEIVER_ID ^ (1_u64 << 41));
-            fixture.table_u32(start + way * 72 + 8, atom);
+            fixture.table_u64(start + way * 80, RECEIVER_ID ^ (1_u64 << 41));
+            fixture.table_u32(start + way * 80 + 8, atom);
         }
         fixture.table_u64(fixture.entry, RECEIVER_ID);
         fixture.table_u32(fixture.entry + 8, atom);
@@ -198,6 +200,15 @@ impl Fixture {
                 expected,
                 "shape at {shape}"
             );
+        }
+    }
+    /// The table's resolved word of `slot` in this fixture's layout.
+    fn word(&self, slot: u16) -> u32 {
+        use otter_vm::jit::slot_word;
+        if slot < u16::from(self.capacity) {
+            self.view.field_layout.inline_values_byte + u32::from(slot) * 8
+        } else {
+            u32::from(slot - u16::from(self.capacity)) * 8 | slot_word::SLAB
         }
     }
     fn bank_byte(&self, object: usize, slab: usize, slot: u16) -> usize {
@@ -271,8 +282,9 @@ impl Fixture {
             otter_vm::jit::PropertyLoadAction::OwnData as u8,
         );
         self.table_u16(self.entry + 14, slot);
-        self.table_u32(self.entry + 20, self.address(SHAPE) as u32);
-        self.table_u64(self.entry + 40, RECEIVER_ID);
+        self.table_u32(self.entry + 20, self.word(slot));
+        self.table_u32(self.entry + 28, self.address(SHAPE) as u32);
+        self.table_u64(self.entry + 48, RECEIVER_ID);
     }
     fn inherited_load_and_append(&mut self, load_slot: u16, store_slot: u16) {
         self.table_u8(
@@ -280,11 +292,12 @@ impl Fixture {
             otter_vm::jit::PropertyLoadAction::InheritedData as u8,
         );
         self.table_u16(self.entry + 14, load_slot);
+        self.table_u32(self.entry + 20, self.word(load_slot));
         self.table_u8(self.entry + 18, 1);
-        self.table_u32(self.entry + 20, self.address(HOLDER_SHAPE) as u32);
-        self.table_u32(self.entry + 24, self.address(ROOT) as u32);
-        self.table_u64(self.entry + 40, HOLDER_ID);
-        self.table_u64(self.entry + 56, self.validity.as_ref() as *const u32 as u64);
+        self.table_u32(self.entry + 28, self.address(HOLDER_SHAPE) as u32);
+        self.table_u32(self.entry + 32, self.address(ROOT) as u32);
+        self.table_u64(self.entry + 48, HOLDER_ID);
+        self.table_u64(self.entry + 64, self.validity.as_ref() as *const u32 as u64);
         self.cell_u32(
             SHAPE + self.view.shape_prototype_byte as usize,
             self.address(HOLDER) as u32,
@@ -301,10 +314,10 @@ impl Fixture {
             otter_vm::jit::PropertyStoreAction::AddOwn as u8,
         );
         self.table_u16(self.entry + 16, slot);
-        self.table_u32(self.entry + 28, self.address(TARGET) as u32);
-        self.table_u64(self.entry + 48, TARGET_ID);
+        self.table_u32(self.entry + 36, self.address(TARGET) as u32);
+        self.table_u64(self.entry + 56, TARGET_ID);
         self.table_u64(
-            self.entry + 64,
+            self.entry + 72,
             if chain {
                 self.validity.as_ref() as *const u32 as u64
             } else {
@@ -460,6 +473,7 @@ fn own_data_reads_readonly_and_current_suffix_while_store_requires_its_action() 
             otter_vm::jit::PropertyStoreAction::OwnWritable as u8,
         );
         f.table_u16(f.entry + 16, slot);
+        f.table_u32(f.entry + 24, f.word(slot) | otter_vm::jit::slot_word::ANY);
         f.table_u8(f.entry + 18, 1);
         assert_eq!(f.run(PropertySourceAccess::Store, f.atom, value + 2).0, 1);
         assert_eq!(f.cells[second / 8], value + 2);
@@ -476,6 +490,7 @@ fn own_data_reads_readonly_and_current_suffix_while_store_requires_its_action() 
         assert_eq!(f.run(PropertySourceAccess::Store, f.atom, value + 3).0, 1);
         let before_inline = f.cells.clone();
         f.table_u16(f.entry + 16, 0);
+        f.table_u32(f.entry + 24, f.word(0) | otter_vm::jit::slot_word::ANY);
         assert_eq!(f.run(PropertySourceAccess::Store, f.atom, value + 4).0, 1);
         let mut expected = before_inline;
         expected[f.bank_byte(0, REPLACEMENT_SLAB, 0) / 8] = value + 4;
@@ -509,7 +524,7 @@ fn every_miss_finishes_before_any_slot_or_shape_effect() {
                 );
                 *f.validity = 0;
             }
-            8 => f.table_u32(f.entry + 28, 0),
+            8 => f.table_u32(f.entry + 36, 0),
             9 => f.table_u64(
                 f.entry + f.cache.target_shape_id_byte as usize,
                 TARGET_ID ^ (1_u64 << 32),
@@ -543,8 +558,8 @@ fn every_miss_finishes_before_any_slot_or_shape_effect() {
         f.inherited_load_and_append(0, 5);
         match refusal {
             0 => *f.validity = 0,
-            1 => f.table_u32(f.entry + 24, 0),
-            2 => f.table_u32(f.entry + 20, f.address(SHAPE) as u32),
+            1 => f.table_u32(f.entry + 32, 0),
+            2 => f.table_u32(f.entry + 28, f.address(SHAPE) as u32),
             3 => f.table_u64(
                 f.entry + f.cache.holder_shape_id_byte as usize,
                 HOLDER_ID ^ (1_u64 << 32),

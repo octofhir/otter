@@ -29,7 +29,7 @@
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
 use otter_vm::{
     JitCompileSnapshot,
-    jit::{JitPropertyActionCache, PropertyLoadAction, PropertyStoreAction},
+    jit::{JitPropertyActionCache, PropertyLoadAction, PropertyStoreAction, slot_word},
     value::tag,
 };
 
@@ -220,18 +220,15 @@ pub(crate) fn emit_action_probe(
                 // never reused shape id proves its state as well as its layout.
                 ; mov r10, [r10 + cache.shape_id_byte as i32]
                 ; cmp r10, [Rq(entry) + cache.holder_shape_id_byte as i32] ; jne =>miss
-                ; movzx Rd(identity), WORD [Rq(entry) + cache.load_slot_byte as i32]);
-            emit_slot_storage(ops, view, shape, identity, base, miss);
+                ; mov Rd(identity), [Rq(entry) + cache.load_word_byte as i32]);
+            emit_word_load(ops, view, shape, identity, base, destination, miss);
             dynasm!(ops ; .arch x64
-                ; mov Rq(destination), [Rq(base) + Rq(identity) * 8]
                 ; jmp =>canonical
-                // The matched key already proved the receiver's exact shape,
-                // whose address the key decode left in `shape`.
+                // The matched key already proved the receiver's exact shape.
                 ; =>own
-                ; movzx Rd(identity), WORD [Rq(entry) + cache.load_slot_byte as i32]);
-            emit_slot_storage_of_shape(ops, view, receiver, shape, identity, base, miss);
+                ; mov Rd(identity), [Rq(entry) + cache.load_word_byte as i32]);
+            emit_word_load(ops, view, receiver, identity, base, destination, miss);
             dynasm!(ops ; .arch x64
-                ; mov Rq(destination), [Rq(base) + Rq(identity) * 8]
                 ; jmp =>canonical
                 // Absent from the whole chain: the proof (none for a `null`
                 // prototype the receiver shape fixes) authorizes `undefined`.
@@ -285,19 +282,141 @@ pub(crate) fn emit_action_probe(
                 ; mov Rd(entry), [Rq(entry) + cache.store_owner_byte as i32]
             );
             super::field_type::emit_observe(ops, relocations, view, entry, value);
+            // An overwrite of a value its field already covers needs no
+            // observation; an uncovered one is observed only where the
+            // summary tracks value shapes, and otherwise completes in the
+            // runtime.
+            let observe = ops.new_dynamic_label();
             dynasm!(ops ; .arch x64 ; jmp =>appended
                 ; =>own
-                ; movzx Rd(identity), WORD [Rq(entry) + cache.store_slot_byte as i32]);
-            emit_slot_storage_of_shape(ops, view, receiver, shape, identity, base, miss);
+                ; mov Rd(identity), [Rq(entry) + cache.store_word_byte as i32]
+                ; test Rd(identity), Rd(identity) ; jz =>miss);
+            emit_covered(ops, value, identity, observe, miss);
+            emit_word_store(ops, view, receiver, value, identity, base, miss);
+            dynasm!(ops ; .arch x64 ; jmp =>done ; =>observe);
+            emit_word_store(ops, view, receiver, value, identity, base, miss);
             dynasm!(ops ; .arch x64
-                ; mov [Rq(base) + Rq(identity) * 8], Rq(value)
-                ; mov Rd(entry), [Rq(entry) + cache.store_owner_byte as i32]
-            );
+                ; mov Rd(entry), [Rq(entry) + cache.store_owner_byte as i32]);
             super::field_type::emit_observe(ops, relocations, view, entry, value);
             dynasm!(ops ; .arch x64
                 ; jmp =>done);
         }
     }
+}
+
+/// `Rq(destination)` = the slot of `holder` that `Rd(word)` resolves
+/// ([`otter_vm::jit::slot_word`]); a slab slot beyond the object's current
+/// slab goes to `miss`, before the destination is written.
+fn emit_word_load(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    holder: u8,
+    word: u8,
+    base: u8,
+    destination: u8,
+    miss: DynamicLabel,
+) {
+    let slab = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64
+        ; test Rd(word), Rd(word) ; jz =>miss
+        ; test Rd(word), slot_word::SLAB as i32 ; jnz =>slab
+        ; movzx r10d, Rw(word)
+        ; mov Rq(destination), [Rq(holder) + r10]
+        ; jmp =>done
+        ; =>slab);
+    emit_word_slab(ops, view, holder, word, base, miss);
+    dynasm!(ops ; .arch x64 ; mov Rq(destination), [Rq(base) + Rq(word)] ; =>done);
+}
+
+/// `Rq(base)` = `holder`'s slab words and `Rq(word)` the byte offset of the
+/// slab slot `Rd(word)` resolves, inside the slab's capacity, else `miss`.
+fn emit_word_slab(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    holder: u8,
+    word: u8,
+    base: u8,
+    miss: DynamicLabel,
+) {
+    dynasm!(ops ; .arch x64
+        ; and Rd(word), slot_word::OFFSET_MASK as i32
+        ; mov Rd(base), [Rq(holder) + view.field_layout.slab_handle_byte as i32]
+        ; test Rd(base), Rd(base) ; jz =>miss);
+    emit_load_u64(ops, 10, 0xffff_ffff_0000_0000);
+    dynasm!(ops ; .arch x64
+        ; and r10, Rq(holder) ; add Rq(base), r10
+        ; mov r10d, [Rq(base) + view.field_layout.slab_capacity_byte as i32]
+        ; shl r10d, 3 ; cmp Rd(word), r10d ; jae =>miss
+        ; add Rq(base), view.field_layout.slab_words_byte as i32);
+}
+
+/// Fall through when `Rd(word)` covers `Rq(value)`'s class, so the store
+/// needs no observation; else go to `observe` when the summary tracks value
+/// shapes, or to `miss`.
+fn emit_covered(
+    ops: &mut Assembler,
+    value: u8,
+    word: u8,
+    observe: DynamicLabel,
+    miss: DynamicLabel,
+) {
+    let covered = ops.new_dynamic_label();
+    let uncovered = ops.new_dynamic_label();
+    let number = ops.new_dynamic_label();
+    let other = ops.new_dynamic_label();
+    let undefined = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64
+        ; test Rd(word), slot_word::ANY as i32 ; jnz =>covered
+        ; mov r10, Rq(value) ; sar r10, tag::NUMBER_TAG.trailing_zeros() as i8
+        ; cmp r10, -1 ; jne =>number
+        ; test Rd(word), slot_word::INT32 as i32 ; jnz =>covered
+        ; jmp =>uncovered
+        ; =>number);
+    emit_load_u64(ops, 10, tag::NUMBER_TAG);
+    dynasm!(ops ; .arch x64
+        ; test Rq(value), r10 ; jz =>other
+        ; test Rd(word), slot_word::DOUBLE as i32 ; jnz =>covered
+        ; jmp =>uncovered
+        ; =>other);
+    emit_load_u64(ops, 10, crate::entry::VALUE_NULL);
+    dynasm!(ops ; .arch x64
+        ; cmp Rq(value), r10 ; jne =>undefined
+        ; test Rd(word), slot_word::NULL as i32 ; jnz =>covered
+        ; jmp =>uncovered
+        ; =>undefined);
+    emit_load_u64(ops, 10, crate::entry::VALUE_UNDEFINED);
+    dynasm!(ops ; .arch x64
+        ; cmp Rq(value), r10 ; jne =>uncovered
+        ; test Rd(word), slot_word::UNDEFINED as i32 ; jnz =>covered
+        ; =>uncovered
+        ; test Rd(word), slot_word::OBSERVE as i32 ; jnz =>observe
+        ; jmp =>miss
+        ; =>covered);
+}
+
+/// Store `Rq(value)` into the slot of `receiver` that `Rd(word)` resolves;
+/// a slab slot beyond the current slab goes to `miss` before anything is
+/// written.
+fn emit_word_store(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    value: u8,
+    word: u8,
+    base: u8,
+    miss: DynamicLabel,
+) {
+    let slab = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64
+        ; test Rd(word), slot_word::SLAB as i32 ; jnz =>slab
+        ; movzx r10d, Rw(word)
+        ; mov [Rq(receiver) + r10], Rq(value)
+        ; jmp =>done
+        ; =>slab);
+    emit_word_slab(ops, view, receiver, word, base, miss);
+    dynasm!(ops ; .arch x64 ; mov [Rq(base) + Rq(word)], Rq(value) ; =>done);
 }
 
 /// `slot` becomes relative to the currently selected live bank.

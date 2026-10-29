@@ -271,6 +271,8 @@ pub(crate) struct MapEntry {
 
 const MAP_ENTRY_LIVE: u32 = 1 << 0;
 const MAP_ENTRY_INDEXED: u32 = 1 << 1;
+/// The key is an object hashed by its current address, not by `hash`.
+const MAP_ENTRY_IDENTITY: u32 = 1 << 2;
 
 pub(crate) const MAP_BODY_TABLE_OFFSET: usize = std::mem::offset_of!(MapBody, table);
 pub(crate) const MAP_ENTRY_KEY_OFFSET: usize = std::mem::offset_of!(MapEntry, key);
@@ -301,7 +303,14 @@ impl table::TableEntry for MapEntry {
     }
 
     fn entry_hash(&self) -> Option<u64> {
+        if self.flags & MAP_ENTRY_IDENTITY != 0 {
+            return Some(identity_key_hash(self.key));
+        }
         (self.flags & MAP_ENTRY_INDEXED != 0).then_some(self.hash)
+    }
+
+    fn identity_key(&self) -> Option<u64> {
+        (self.flags & MAP_ENTRY_IDENTITY != 0).then(|| self.key.to_bits())
     }
 
     fn next(&self) -> u32 {
@@ -335,12 +344,15 @@ impl crate::pelt::PeltField for MapEntry {
 impl MapEntry {
     fn live(key_hash: MapKey, key: Value, value: Value) -> Self {
         let hash = map_key_hash(&key_hash);
+        let identity = matches!(key_hash, MapKey::ObjectValue(_));
         Self {
             key,
             value,
             hash: hash.unwrap_or(0),
             next: table::EMPTY,
-            flags: MAP_ENTRY_LIVE | (u32::from(hash.is_some()) * MAP_ENTRY_INDEXED),
+            flags: MAP_ENTRY_LIVE
+                | (u32::from(hash.is_some()) * MAP_ENTRY_INDEXED)
+                | (u32::from(identity) * MAP_ENTRY_IDENTITY),
         }
     }
 
@@ -487,9 +499,16 @@ fn map_key_hash(key: &MapKey) -> Option<u64> {
             hash = fx_hash_word(hash, 5);
             hash = fx_hash_word(hash, *value_hash);
         }
-        MapKey::Symbol(_) | MapKey::ObjectValue(_) => return None,
+        MapKey::ObjectValue(value) => return Some(identity_key_hash(*value)),
+        MapKey::Symbol(_) => return None,
     }
     Some(avalanche_map_hash(hash.rotate_left(26)))
+}
+
+/// Hash of an object key by its current address. A collection that moves
+/// the object stales its table's chains (`OrderedTableBody::refresh_chains`).
+fn identity_key_hash(key: Value) -> u64 {
+    avalanche_map_hash(fx_hash_word(fx_hash_word(0, 6), key.to_bits()).rotate_left(26))
 }
 
 pub(crate) const MAP_FX_HASH_MULTIPLIER: u64 = 0xf135_7aea_2e62_a9c5;
@@ -521,6 +540,10 @@ fn avalanche_map_hash(mut hash: u64) -> u64 {
 /// (which is append-plus-tombstone, so indices are stable for the life of
 /// the entry).
 fn map_find_entry(body: &MapBody, key: &MapKey, heap: &otter_gc::GcHeap) -> Option<usize> {
+    if let Some(table) = table::body_of(body.table) {
+        // SAFETY: the handle names a live table payload no borrow reaches.
+        unsafe { (*table).refresh_chains() };
+    }
     let entries = body.entries();
     let Some(hash) = map_key_hash(key) else {
         return entries.iter().position(|e| e.key_matches(key, heap));
@@ -545,6 +568,7 @@ fn map_index_remove(body: &mut MapBody, key: &MapKey, entry_idx: usize) {
     if let Some(hash) = map_key_hash(key)
         && let Some(table) = body.table_mut()
     {
+        table.refresh_chains();
         table.unlink(hash, entry_idx);
     }
 }
@@ -893,6 +917,13 @@ impl table::TableEntry for SetEntry {
         map_key_hash(self.key_hash.as_ref()?)
     }
 
+    fn identity_key(&self) -> Option<u64> {
+        match &self.key_hash {
+            Some(MapKey::ObjectValue(value)) => Some(value.to_bits()),
+            _ => None,
+        }
+    }
+
     fn next(&self) -> u32 {
         self.next
     }
@@ -948,8 +979,10 @@ impl SetEntry {
 /// fallback for identity keys.
 fn set_find_entry(body: &SetBody, key: &MapKey, heap: &otter_gc::GcHeap) -> Option<usize> {
     if let Some(hash) = map_key_hash(key) {
-        let entries = body.entries();
         let table = table::body_of(body.table)?;
+        // SAFETY: the handle names a live table payload no borrow reaches.
+        unsafe { (*table).refresh_chains() };
+        let entries = body.entries();
         // SAFETY: the handle names a live table payload.
         let mut current = unsafe { (*table).bucket_head(hash) };
         while current != table::EMPTY {
@@ -971,6 +1004,7 @@ fn set_index_remove(body: &mut SetBody, key: &MapKey, entry_idx: usize) {
     if let Some(hash) = map_key_hash(key)
         && let Some(table) = body.table_mut()
     {
+        table.refresh_chains();
         table.unlink(hash, entry_idx);
     }
 }

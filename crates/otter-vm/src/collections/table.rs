@@ -29,9 +29,13 @@
 //!   whatever the previous tenant left in it.
 //! - Bucket count is a power of two and at least one, so a bucket index
 //!   is `hash & bucket_mask`.
-//! - Only keys that hash are chained. A key whose hash moves under GC
-//!   (symbol, object identity) is appended unchained and found by the
-//!   caller's linear scan — the same split the `FxHashMap` index made.
+//! - Only keys that hash are chained. An object key hashes by its current
+//!   address: a collection that moves one marks the chains stale, and every
+//!   chain use first rebuilds stale chains from the entries' current hashes,
+//!   so a lookup stays O(1) amortized over collections. A structural key
+//!   (string, number) never changes bucket, so a stale chain still reaches
+//!   it. A symbol key is appended unchained and found by the caller's
+//!   linear scan.
 //! - Old space: a table lives as long as the collection that owns it, so
 //!   a semispace copy of one is pure overhead, and an old-space body does
 //!   not move.
@@ -62,6 +66,10 @@ pub trait TableEntry: Sized + 'static {
     /// chainable and must be found by linear scan.
     fn entry_hash(&self) -> Option<u64>;
 
+    /// The word an address-hashed key's hash is computed from, `None` for
+    /// any other entry: a collection that changes it stales the chains.
+    fn identity_key(&self) -> Option<u64>;
+
     /// Index of the next entry in the same bucket, or [`EMPTY`].
     fn next(&self) -> u32;
 
@@ -82,6 +90,9 @@ pub struct OrderedTableBody<E> {
     len: u32,
     /// `bucket_count - 1`; bucket count is a power of two.
     bucket_mask: u32,
+    /// Nonzero once a collection moved a key hashed by its address: the
+    /// chains no longer match the entries' hashes.
+    stale: u32,
     _entry: PhantomData<E>,
 }
 
@@ -130,6 +141,7 @@ impl<E: TableEntry> OrderedTableBody<E> {
             capacity: u32::try_from(capacity).expect("table capacity exceeds u32"),
             len: 0,
             bucket_mask: u32::try_from(buckets - 1).expect("bucket count exceeds u32"),
+            stale: 0,
             _entry: PhantomData,
         }
     }
@@ -246,6 +258,32 @@ impl<E: TableEntry> OrderedTableBody<E> {
         index
     }
 
+    /// Rebuild every chain from the entries' current hashes when a
+    /// collection moved an address-hashed key. Linear, in place, no
+    /// allocation; runs at most once per collection that moved such a key.
+    pub fn refresh_chains(&mut self) {
+        if self.stale == 0 {
+            return;
+        }
+        self.init_buckets();
+        for index in 0..self.len() {
+            // SAFETY: `index < len`; each borrow ends before the next.
+            let hash = unsafe { (*self.entries_ptr().add(index)).entry_hash() };
+            let next = match hash {
+                Some(hash) => {
+                    let bucket = self.bucket_of(hash);
+                    let head = self.buckets()[bucket];
+                    self.buckets_mut()[bucket] = index as u32;
+                    head
+                }
+                None => EMPTY,
+            };
+            // SAFETY: as above.
+            unsafe { (*self.entries_ptr().add(index)).set_next(next) };
+        }
+        self.stale = 0;
+    }
+
     fn bucket_of(&self, hash: u64) -> usize {
         (hash as u32 & self.bucket_mask) as usize
     }
@@ -315,8 +353,14 @@ impl<E: TableEntry> otter_gc::SafeTraceable for OrderedTableBody<E> {
     const TYPE_TAG: u8 = E::TABLE_TYPE_TAG;
 
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
+        let mut moved = false;
         for entry in self.entries_mut() {
+            let before = entry.identity_key();
             entry.trace_entry(visitor);
+            moved |= before != entry.identity_key();
+        }
+        if moved {
+            self.stale = 1;
         }
     }
 

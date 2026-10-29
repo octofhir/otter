@@ -505,14 +505,34 @@ impl ElementSlabBody {
 impl otter_gc::SafeTraceable for ElementSlabBody {
     const TYPE_TAG: u8 = ELEMENT_SLAB_BODY_TYPE_TAG;
 
+    /// Every live tagged slot. An old slab — one a scavenge just promoted —
+    /// marks each slot still holding a young child dirty: the remembered
+    /// re-trace reads only the dirty interval, and a slab initialized while
+    /// young carries none, so a child that stays young past the promotion
+    /// (one a root already copied) would otherwise never be updated again.
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         if self.kind != DenseElementKind::Tagged {
             return;
         }
+        // SAFETY: a traced body sits one GC header past its cell's start.
+        let old = unsafe {
+            !(*(std::ptr::from_mut(self).cast::<u8>())
+                .sub(std::mem::size_of::<otter_gc::GcHeader>())
+                .cast::<otter_gc::GcHeader>())
+            .is_young()
+        };
         for index in 0..self.len() {
             // SAFETY: the tagged live prefix is initialized and lives in this
             // GC cell, so the collector may rewrite each slot in place.
-            unsafe { (&mut *self.values_ptr().add(index)).trace_value_slot_mut(visitor) };
+            let value = unsafe { &mut *self.values_ptr().add(index) };
+            value.trace_value_slot_mut(visitor);
+            if old
+                && let Some(raw) = value.as_raw_gc()
+                // SAFETY: the visitor has returned a current, live cell offset.
+                && unsafe { (*raw.as_header_ptr()).is_young() }
+            {
+                self.mark_dirty_range(index, index + 1);
+            }
         }
     }
 

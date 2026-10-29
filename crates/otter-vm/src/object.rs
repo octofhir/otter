@@ -4467,6 +4467,27 @@ pub(crate) fn lookup_own_atom(
     })
 }
 
+/// Whether a prototype on `obj`'s chain is in dictionary mode with storage
+/// a hidden class can describe ([`dictionary_ordered_slot_attrs`]). Reads
+/// only.
+#[must_use]
+pub(crate) fn chain_has_describable_dictionary_prototype(
+    obj: JsObject,
+    heap: &otter_gc::GcHeap,
+) -> bool {
+    let mut current = prototype(obj, heap);
+    for _ in 0..PROTO_CHAIN_HARD_CAP {
+        let Some(link) = current else {
+            return false;
+        };
+        if heap.read_payload(link, dictionary_describable) {
+            return true;
+        }
+        current = prototype(link, heap);
+    }
+    false
+}
+
 /// The own data property `atom` names on the dictionary-mode `obj`, read
 /// from its key table: `None` for a shaped object, an absent key or an
 /// accessor.
@@ -7165,6 +7186,20 @@ impl SlotName {
     }
 }
 
+/// Whether a dictionary-mode body's storage can be described by a hidden
+/// class: no lookup fact but a non-ordinary [[Prototype]] (a function value,
+/// which leaves own named storage ordinary), and a slot per key, at most the
+/// named-property limit — a prototype collects its class's methods, so the
+/// keyed-addition limit does not apply.
+fn dictionary_describable(body: &ObjectBody) -> bool {
+    let facts = ShapeState::OPAQUE_LOOKUP_MASK & !ShapeState::OPAQUE_PROTOTYPE_MASK;
+    let count = body.dict_key_count();
+    body.is_dictionary()
+        && body.state().bits() & facts == 0
+        && count <= MAX_NAMED_FAST_PROPERTIES as usize
+        && body.slots().len() == count
+}
+
 /// Ordered `(key, flags, is_accessor)` for every own string-keyed slot of a
 /// dictionary-mode object, in slot order, when its storage can be described by
 /// a hidden class instead.
@@ -7178,17 +7213,11 @@ pub(crate) fn dictionary_ordered_slot_attrs(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
 ) -> Option<Vec<(SlotName, PropertyFlags, bool)>> {
-    // A non-ordinary [[Prototype]] (a function value) leaves own named
-    // storage ordinary; every other lookup fact keeps the dictionary.
-    let facts = ShapeState::OPAQUE_LOOKUP_MASK & !ShapeState::OPAQUE_PROTOTYPE_MASK;
     heap.read_payload(obj, |body| {
-        if !body.is_dictionary() || body.state().bits() & facts != 0 {
+        if !dictionary_describable(body) {
             return None;
         }
         let count = body.dict_key_count();
-        if count > MAX_FAST_PROPERTIES as usize || body.slots().len() != count {
-            return None;
-        }
         Some(
             (0..count)
                 .map(|offset| {

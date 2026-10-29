@@ -121,6 +121,9 @@ impl Interpreter {
                     property_slot,
                     obj,
                 );
+                // A missed resolution may have prepared the receiver's chain,
+                // which allocates.
+                receiver = interp.iteration_anchor(receiver_anchor);
             }
             if method.is_undefined()
                 && let Some(slot) = property_slot

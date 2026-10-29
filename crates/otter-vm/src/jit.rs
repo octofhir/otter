@@ -738,6 +738,9 @@ pub struct JitCompileSnapshot {
     /// The atom is available to baseline shared probes; `shared` preserves the
     /// optimizing tier's existing terminal-feedback admission.
     pub property_accesses: rustc_hash::FxHashMap<u32, JitPropertyAccess>,
+    /// The IC slot address of every keyed element site, keyed by byte PC:
+    /// a megamorphic one keeps its shape cache there.
+    pub element_ic_slots: rustc_hash::FxHashMap<u32, u64>,
     /// Direct physical hit proofs for schema-owned binding sites, keyed by
     /// byte-PC. See [`BindingHitProof`].
     pub binding_hit_proofs: rustc_hash::FxHashMap<u32, BindingHitProof>,
@@ -2558,6 +2561,7 @@ impl JitCompileSnapshot {
             own_receiver_plan: None,
             property_action_cache: None,
             property_accesses: rustc_hash::FxHashMap::default(),
+            element_ic_slots: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             context_allocations: rustc_hash::FxHashMap::default(),
             closure_allocations: rustc_hash::FxHashMap::default(),

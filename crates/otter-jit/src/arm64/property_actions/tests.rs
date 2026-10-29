@@ -646,3 +646,50 @@ fn shape_directory_reads_live_banks_and_rejects_accessor_and_shared_suffix() {
         put_offset(&mut arena, RECEIVER_SHAPE + 24, directory);
     }
 }
+
+#[test]
+fn own_hits_fill_the_keyed_site_cache_under_the_key_atom() {
+    use otter_vm::jit::PROPERTY_IC_LAYOUT as IC;
+    let proof = AtomicU32::new(1);
+    let mut arena = vec![0u64; 640];
+    let mut view = snapshot();
+    prepare(&mut arena, &mut view, &proof);
+    put(&mut arena, ROW + 12, PropertyLoadAction::OwnData as u8);
+    put(&mut arena, ROW + 13, PropertyStoreAction::Unknown as u8);
+    put_offset(&mut arena, ROW + 28, RECEIVER_SHAPE);
+    put(&mut arena, ROW + 48, 7u64);
+    let mut table = vec![0u64; 2 * IC.site_cache_entries as usize];
+    let mut slot = vec![0u64; 64];
+    slot[IC.site_cache_byte as usize / 8] = table.as_mut_ptr() as u64;
+    let mut ops = Assembler::new().unwrap();
+    let entry = ops.offset();
+    let miss = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    let mut relocations = RelocationCapture::default();
+    dynasm!(ops ; .arch aarch64 ; mov x12, x0 ; mov x2, x1 ; mov w14, wzr);
+    emit_site_load(
+        &mut ops,
+        &mut relocations,
+        &view,
+        14,
+        12,
+        [10, 11, 13, 15],
+        0,
+        false,
+        Some(SiteFill::Keyed { site: 2, atom: 14 }),
+        miss,
+    );
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+    emit_load_u64(&mut ops, 0, POISON);
+    dynasm!(ops ; .arch aarch64 ; =>done ; ret);
+    let code =
+        CompiledCode::new(&crate::CodeMemory::new(), ops.finalize().unwrap(), entry).unwrap();
+    // SAFETY: this allocation-free emitted leaf has exactly this platform ABI.
+    let call: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.entry_ptr()) };
+    let value = call(address(&arena, RECEIVER), slot.as_ptr() as u64);
+    assert_eq!(value, Value::number_i32(11).to_bits());
+    // Shape identity 7 XOR atom 0 selects entry 7: the identity, then the
+    // slot word with the atom in its high half.
+    assert_eq!(table[14], 7);
+    assert_eq!(table[15], u64::from(view.field_layout.inline_values_byte));
+}

@@ -1555,6 +1555,24 @@ impl Interpreter {
                 self.record_element_bounds_feedback(function, instr.instruction_pc, recv, key);
             }
         }
+        // A string key read from an object: generated code serves the site
+        // from its own shape cache, which the shared table's hits fill.
+        if let (Some(recv_reg), Some(key_reg)) =
+            (function.register(instr, 1), function.register(instr, 2))
+            && let (Ok(&recv), Ok(&key)) = (
+                read_register(&(*top_frame!()), recv_reg),
+                read_register(&(*top_frame!()), key_reg),
+            )
+            && key.is_string()
+            && recv.as_object().is_some()
+            && let Some(slot) = context.property_feedback_slot(
+                function_id,
+                instr.instruction_pc,
+                crate::property_ic::PropertyIcKind::Load,
+            )
+        {
+            slot.native().allocate_site_cache();
+        }
         // A symbol or integer index read from an ordinary object
         // goes through the site's cache bound to that key.
         if let (Some(recv_reg), Some(key_reg)) =

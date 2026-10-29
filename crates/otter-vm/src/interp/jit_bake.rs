@@ -1049,6 +1049,8 @@ impl Baker<'_> {
             else {
                 continue;
             };
+            view.element_ic_slots
+                .insert(byte_pc, slot.native().address());
             // The cache recorded at binding whether its key is a symbol or
             // which integer index it spells.
             let Some((atom, index)) = slot.native().keyed_name() else {

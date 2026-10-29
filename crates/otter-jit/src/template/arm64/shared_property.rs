@@ -246,7 +246,7 @@ fn emit_store_probe(
         [PROBE_STORE_RECEIVER, PROBE_STORE_VALUE],
         [15, 11, 13, 14],
         false,
-        Some(PROBE_STORE_SLOT),
+        Some(property_actions::SiteFill::Named(PROBE_STORE_SLOT)),
         miss,
     );
     // Both paths leave the compressed child (zero for an overwrite) in
@@ -286,6 +286,9 @@ fn emit_store_probe(
 
 /// Keyed load probe result on a hit.
 pub(crate) const PROBE_KEYED_RESULT: u8 = 0;
+/// Keyed load probe input: the site's slot address, or zero; the result
+/// word carries it in.
+pub(crate) const PROBE_KEYED_SITE: u8 = PROBE_KEYED_RESULT;
 /// The registers the keyed load probe writes besides `x16` and `x17`: its
 /// result and its temporaries.
 pub(crate) const PROBE_KEYED_LOAD_CLOBBERS: [u8; 7] = [PROBE_KEYED_RESULT, 3, 11, 12, 13, 14, 15];
@@ -342,7 +345,9 @@ fn emit_keyed_load_probe(
         miss,
     );
     dynasm!(ops ; .arch aarch64 ; mov x17, xzr ; ret ; =>object);
-    property_actions::emit_load(
+    // An object's own hit also fills the site's cache, whose slot address
+    // the caller leaves in the result word (zero for none).
+    property_actions::emit_site_load(
         ops,
         relocations,
         view,
@@ -351,6 +356,10 @@ fn emit_keyed_load_probe(
         [13, 14, 15, 3],
         PROBE_KEYED_RESULT,
         false,
+        Some(property_actions::SiteFill::Keyed {
+            site: PROBE_KEYED_SITE,
+            atom: 11,
+        }),
         miss,
     );
     dynasm!(ops ; .arch aarch64
@@ -697,7 +706,7 @@ fn emit_load_handlers(
         [13, 14, 15, 3],
         0,
         false,
-        Some(LOAD_SLOT),
+        Some(property_actions::SiteFill::Named(LOAD_SLOT)),
         miss,
     );
     dynasm!(ops ; .arch aarch64 ; b =>loaded);

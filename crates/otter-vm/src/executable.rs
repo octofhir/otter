@@ -691,6 +691,7 @@ impl CodeBlock {
             own_receiver_plan: None,
             property_action_cache: None,
             property_accesses: rustc_hash::FxHashMap::default(),
+            element_ic_slots: rustc_hash::FxHashMap::default(),
             binding_hit_proofs: rustc_hash::FxHashMap::default(),
             context_allocations: rustc_hash::FxHashMap::default(),
             closure_allocations: rustc_hash::FxHashMap::default(),

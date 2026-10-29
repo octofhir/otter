@@ -3810,6 +3810,23 @@ impl<'a> Codegen<'a> {
 
     /// The IC slot of the named-property site at `pc` of the body `node`
     /// belongs to, with its relocation.
+    /// The IC slot address of the keyed element site `node` belongs to.
+    fn element_site_slot(&self, node: NodeId) -> Option<(u64, RelocationTarget)> {
+        let view = self.view_of(node);
+        let byte_pc = view
+            .instructions
+            .get(self.graph.node(node).pc as usize)?
+            .byte_pc;
+        let slot = *view.element_ic_slots.get(&byte_pc)?;
+        Some((
+            slot,
+            RelocationTarget::PropertyIcSlot {
+                function_id: view.code_block.id,
+                byte_pc,
+            },
+        ))
+    }
+
     fn property_site_slot(
         &self,
         node: NodeId,

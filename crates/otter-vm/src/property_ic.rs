@@ -767,7 +767,34 @@ pub struct PropertyIcLayout {
     pub entry_owner_byte: u32,
     /// Entry `u64` validity word address.
     pub entry_validity_byte: u32,
+    /// Pointer to the site cache of a named megamorphic site, or null.
+    pub site_cache_byte: u32,
+    /// Power-of-two entry count of a site cache.
+    pub site_cache_entries: u32,
+    /// Bytes per site cache entry: the `u64` shape identity, then the
+    /// `u64` slot word.
+    pub site_cache_entry_bytes: u32,
 }
+
+/// Entries of a named megamorphic site's own direct-mapped cache.
+pub const SITE_CACHE_ENTRIES: usize = 32;
+
+/// One entry of a site cache: a receiver shape identity and the shared
+/// table's slot word for the site's atom on it
+/// ([`crate::property_cache::slot_word`]). Shape identities are never
+/// reused, so an entry never needs invalidation: the words it copies are
+/// immutable per shape except for a store's covered value classes, which
+/// only widen, so a copy is at worst narrower than the table's row.
+#[repr(C)]
+pub struct SiteCacheEntry {
+    shape_id: AtomicU64,
+    word: AtomicU64,
+}
+
+/// A named megamorphic site's cache, indexed by the low bits of the
+/// receiver's shape identity. Generated code alone fills and reads it, on
+/// the isolate thread.
+type SiteCache = [SiteCacheEntry; SITE_CACHE_ENTRIES];
 
 /// One named-property site: a `(feedback, extra)` slot pair with the
 /// polymorphic array inline.
@@ -797,6 +824,8 @@ pub struct PropertyIcSlot {
     /// One proof word dropped while a compiler thread was copying, released
     /// once none is.
     retired: AtomicU64,
+    /// The site cache of a named megamorphic site; null otherwise.
+    site_cache: std::sync::atomic::AtomicPtr<SiteCache>,
     kind: PropertyIcKind,
 }
 
@@ -820,6 +849,9 @@ impl PropertyIcSlot {
         entry_owner_byte: std::mem::offset_of!(IcEntry, owner) as u32,
 
         entry_validity_byte: std::mem::offset_of!(IcEntry, validity) as u32,
+        site_cache_byte: std::mem::offset_of!(Self, site_cache) as u32,
+        site_cache_entries: SITE_CACHE_ENTRIES as u32,
+        site_cache_entry_bytes: std::mem::size_of::<SiteCacheEntry>() as u32,
     };
 
     /// A cold slot of `kind`.
@@ -843,8 +875,23 @@ impl PropertyIcSlot {
             version: AtomicU32::new(0),
             readers: AtomicU32::new(0),
             retired: AtomicU64::new(0),
+            site_cache: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
             kind,
         }
+    }
+
+    /// Give a named site that turned megamorphic its own cache. A keyed
+    /// site's atom is not fixed, so it keeps none.
+    fn allocate_site_cache(&self) {
+        if self.state() & STATE_KEYED_BOUND != 0 || !self.site_cache.load(Ordering::Relaxed).is_null()
+        {
+            return;
+        }
+        let cache: Box<SiteCache> = Box::new(std::array::from_fn(|_| SiteCacheEntry {
+            shape_id: AtomicU64::new(0),
+            word: AtomicU64::new(0),
+        }));
+        self.site_cache.store(Box::into_raw(cache), Ordering::Relaxed);
     }
 
     /// Start rewriting the entries: the version turns odd.
@@ -1355,6 +1402,7 @@ impl PropertyIcSlot {
         self.state.store(state, Ordering::Relaxed);
         self.refresh_inline();
         self.end_write();
+        self.allocate_site_cache();
         for word in dropped {
             self.release_validity(word);
         }
@@ -1724,6 +1772,12 @@ impl PropertyIcSlot {
 
 impl Drop for PropertyIcSlot {
     fn drop(&mut self) {
+        let cache = *self.site_cache.get_mut();
+        if !cache.is_null() {
+            // SAFETY: the cache was boxed for this slot alone, and generated
+            // code that names the slot dies with it.
+            drop(unsafe { Box::from_raw(cache) });
+        }
         for entry in &self.entries {
             let word = entry.clear();
             if word != 0 {
@@ -1736,6 +1790,8 @@ impl Drop for PropertyIcSlot {
 }
 
 const _: () = {
+    assert!(SITE_CACHE_ENTRIES.is_power_of_two());
+    assert!(std::mem::size_of::<SiteCacheEntry>() == 16);
     assert!(std::mem::size_of::<IcEntry>() == 32);
     assert!(std::mem::offset_of!(IcEntry, validity) == 24);
     assert!(std::mem::offset_of!(PropertyIcSlot, inline_shape) == 0);

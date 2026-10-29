@@ -238,7 +238,7 @@ fn emit_store_probe(
         ; =>megamorphic
         ; ldr w3, [X(PROBE_STORE_SLOT), IC.atom_byte]
     );
-    property_actions::emit_store(
+    property_actions::emit_site_store(
         ops,
         relocations,
         view,
@@ -246,6 +246,7 @@ fn emit_store_probe(
         [PROBE_STORE_RECEIVER, PROBE_STORE_VALUE],
         [15, 11, 13, 14],
         false,
+        Some(PROBE_STORE_SLOT),
         miss,
     );
     // Both paths leave the compressed child (zero for an overwrite) in
@@ -687,7 +688,7 @@ fn emit_load_handlers(
         ; =>megamorphic
         ; ldr w11, [X(LOAD_SLOT), IC.atom_byte]
     );
-    property_actions::emit_load(
+    property_actions::emit_site_load(
         ops,
         relocations,
         view,
@@ -696,6 +697,7 @@ fn emit_load_handlers(
         [13, 14, 15, 3],
         0,
         false,
+        Some(LOAD_SLOT),
         miss,
     );
     dynasm!(ops ; .arch aarch64 ; b =>loaded);

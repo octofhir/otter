@@ -2279,13 +2279,17 @@ impl<'a> Codegen<'a> {
                 let atom = *atom;
                 let exit = self.eager_exit(node, DeoptReason::OwnDataMiss);
                 let view = self.view_of(node);
+                // The load's own named site, whose cache serves its shapes.
+                let site = self.property_site_slot(node, self.graph.node(node).pc).ok();
                 crate::arm64::shape_lookup::emit_load(
                     &mut self.ops,
+                    &mut self.relocations,
                     view,
                     atom,
                     Self::gp(input(0)),
                     allocation.gp_temps[..4].try_into().unwrap(),
                     Self::gp(result.expect("shape lookup result")),
+                    site,
                     exit,
                 );
             }
@@ -3856,6 +3860,7 @@ impl<'a> Codegen<'a> {
         );
         let (slot, target) = self.property_site_slot(node, pc)?;
         let done = self.ops.new_dynamic_label();
+        let shared = self.ops.new_dynamic_label();
         emit_load_symbol_u64(
             &mut self.ops,
             &mut self.relocations,
@@ -3863,6 +3868,18 @@ impl<'a> Codegen<'a> {
             slot,
             target.clone(),
         );
+        // The site's own cache first, then the shared table's probe.
+        let view = self.view_of(node);
+        crate::arm64::property_actions::emit_site_cache_load(
+            &mut self.ops,
+            view,
+            receiver,
+            PROBE_SLOT,
+            [13, 14, 11],
+            destination,
+            shared,
+        );
+        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>shared);
         crate::template::arm64::shared_property::emit_call(
             &mut self.ops,
             &mut self.relocations,
@@ -3903,6 +3920,7 @@ impl<'a> Codegen<'a> {
         debug_assert_eq!(probe.clobbers, PROBE_STORE_CLOBBERS);
         let (slot, target) = self.property_site_slot(node, pc)?;
         let done = self.ops.new_dynamic_label();
+        let shared = self.ops.new_dynamic_label();
         emit_load_symbol_u64(
             &mut self.ops,
             &mut self.relocations,
@@ -3910,6 +3928,28 @@ impl<'a> Codegen<'a> {
             slot,
             target.clone(),
         );
+        // The site's own cache first, then the shared table's probe.
+        let view = self.view_of(node);
+        crate::arm64::property_actions::emit_site_cache_store(
+            &mut self.ops,
+            view,
+            [receiver, value],
+            PROBE_STORE_SLOT,
+            [13, 14, 11],
+            shared,
+        );
+        {
+            use crate::template::arm64::values::{CellTest, emit_cell_test};
+            emit_cell_test(&mut self.ops, value, CellTest::IsNotCell, done);
+            crate::template::arm64::values::emit_write_barrier_preserving(
+                &mut self.ops,
+                &mut self.relocations,
+                view,
+                receiver,
+                value,
+            );
+        }
+        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>shared);
         crate::template::arm64::shared_property::emit_call(
             &mut self.ops,
             &mut self.relocations,

@@ -226,6 +226,105 @@ pub(super) fn bank_of_shape(
         ; =>inline ; add XSP(base), XSP(holder), #view.field_layout.inline_values_byte ; =>ready);
 }
 
+/// Select the site cache entry of `X(receiver)`'s shape, or go to
+/// `fallback`: `X(word)` becomes the entry's slot word, `X(identity)` the
+/// shape identity. The site's slot address is in `X(site)`; nothing but the
+/// temporaries, `x16` and `x17` is written.
+fn emit_site_entry(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    cache: JitPropertyActionCache,
+    receiver: u8,
+    site: u8,
+    [identity, table, word]: [u8; 3],
+    fallback: DynamicLabel,
+) {
+    use otter_vm::jit::PROPERTY_IC_LAYOUT as IC;
+    debug_assert_eq!(IC.site_cache_entry_bytes, 16);
+    dynasm!(ops ; .arch aarch64
+        ; tst X(receiver), #0xfffe_0000_0000_0007 ; b.ne =>fallback ; cbz X(receiver), =>fallback
+        ; ldrb w16, [X(receiver)] ; cmp w16, #OBJECT_BODY_TYPE_TAG ; b.ne =>fallback
+        ; ldr w16, [X(receiver), view.object_shape_byte] ; cbz w16, =>fallback
+        ; and x17, X(receiver), #0xffff_ffff_0000_0000 ; add x16, x17, x16
+        ; ldr X(identity), [x16, cache.shape_id_byte]
+        ; ldr X(table), [X(site), IC.site_cache_byte] ; cbz X(table), =>fallback
+        ; and XSP(word), X(identity), #u64::from(IC.site_cache_entries - 1)
+        ; add X(table), X(table), X(word), lsl #4
+        ; ldp x17, X(word), [X(table)]
+        ; cmp x17, X(identity) ; b.ne =>fallback);
+}
+
+/// `X(destination)` = the named property of `X(receiver)` from the cache of
+/// the site whose slot address is in `X(site)`, inline-bank own data only;
+/// anything else goes to `fallback` with nothing written but the
+/// temporaries, `x16` and `x17`.
+pub(crate) fn emit_site_cache_load(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    site: u8,
+    temps @ [_, _, word]: [u8; 3],
+    destination: u8,
+    fallback: DynamicLabel,
+) {
+    let Some(cache) = layout(view) else {
+        dynasm!(ops ; .arch aarch64 ; b =>fallback);
+        return;
+    };
+    emit_site_entry(ops, view, cache, receiver, site, temps, fallback);
+    dynasm!(ops ; .arch aarch64
+        ; tbnz W(word), SLOT_WORD_SLAB_BIT, =>fallback
+        ; and x16, X(word), #u64::from(slot_word::OFFSET_MASK)
+        ; ldr X(destination), [X(receiver), x16]);
+}
+
+/// Store `X(value)` into the named property of `X(receiver)` through the
+/// cache of the site whose slot address is in `X(site)`: an inline-bank own
+/// overwrite of a value its field already covers. Anything else goes to
+/// `fallback` before anything is written; the caller owns the value
+/// barrier.
+pub(crate) fn emit_site_cache_store(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    [receiver, value]: [u8; 2],
+    site: u8,
+    temps @ [_, _, word]: [u8; 3],
+    fallback: DynamicLabel,
+) {
+    let Some(cache) = layout(view) else {
+        dynasm!(ops ; .arch aarch64 ; b =>fallback);
+        return;
+    };
+    emit_site_entry(ops, view, cache, receiver, site, temps, fallback);
+    emit_covered(ops, value, word, fallback, fallback);
+    dynasm!(ops ; .arch aarch64
+        ; tbnz W(word), SLOT_WORD_SLAB_BIT, =>fallback
+        ; and x16, X(word), #u64::from(slot_word::OFFSET_MASK)
+        ; str X(value), [X(receiver), x16]);
+}
+
+/// Copy the matched row's receiver shape identity and `W(word)` into the
+/// cache of the site whose slot address `X(site)` holds, when it has one.
+/// Writes `X(scratch)`, `x16` and `x17`.
+fn emit_site_fill(
+    ops: &mut Assembler,
+    cache: JitPropertyActionCache,
+    site: u8,
+    entry: u8,
+    word: u8,
+    scratch: u8,
+) {
+    use otter_vm::jit::PROPERTY_IC_LAYOUT as IC;
+    debug_assert_eq!(IC.site_cache_entry_bytes, 16);
+    dynasm!(ops ; .arch aarch64
+        ; ldr x16, [X(site), IC.site_cache_byte] ; cbz x16, >skip
+        ; ldr x17, [X(entry), cache.receiver_shape_id_byte]
+        ; and XSP(scratch), x17, #u64::from(IC.site_cache_entries - 1)
+        ; add x16, x16, X(scratch), lsl #4
+        ; stp x17, X(word), [x16]
+        ; skip:);
+}
+
 /// `X(destination)` = the slot of `holder` that `W(word)` resolves
 /// ([`otter_vm::property_cache::slot_word`]); a slab slot beyond the
 /// object's current slab goes to `miss`, before the destination is written.
@@ -346,9 +445,38 @@ pub(crate) fn emit_load(
     view: &JitCompileSnapshot,
     atom: u8,
     receiver: u8,
+    temps: [u8; 4],
+    destination: u8,
+    own_only: bool,
+    miss: DynamicLabel,
+) {
+    emit_site_load(
+        ops,
+        relocations,
+        view,
+        atom,
+        receiver,
+        temps,
+        destination,
+        own_only,
+        None,
+        miss,
+    );
+}
+
+/// [`emit_load`] for a named site whose slot address `site` holds: an own
+/// hit is also copied into the site's cache ([`emit_site_fill`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_site_load(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    atom: u8,
+    receiver: u8,
     temps @ [holder, slot, entry, base]: [u8; 4],
     destination: u8,
     own_only: bool,
+    site: Option<u8>,
     miss: DynamicLabel,
 ) {
     registers(&[receiver], temps);
@@ -401,6 +529,9 @@ pub(crate) fn emit_load(
         ; b =>canonical
         // The matched key already proved the receiver's exact shape.
         ; =>own ; ldr W(slot), [X(entry), cache.load_word_byte]);
+    if let Some(site) = site {
+        emit_site_fill(ops, cache, site, entry, slot, base);
+    }
     emit_word_load(ops, view, receiver, slot, base, destination, miss);
     dynasm!(ops ; .arch aarch64
         ; b =>canonical
@@ -429,9 +560,37 @@ pub(crate) fn emit_store(
     relocations: &mut RelocationCapture,
     view: &JitCompileSnapshot,
     atom: u8,
+    inputs: [u8; 2],
+    temps: [u8; 4],
+    own_only: bool,
+    miss: DynamicLabel,
+) {
+    emit_site_store(
+        ops,
+        relocations,
+        view,
+        atom,
+        inputs,
+        temps,
+        own_only,
+        None,
+        miss,
+    );
+}
+
+/// [`emit_store`] for a named site whose slot address `site` holds: an own
+/// overwrite's row is also copied into the site's cache
+/// ([`emit_site_fill`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_site_store(
+    ops: &mut Assembler,
+    relocations: &mut RelocationCapture,
+    view: &JitCompileSnapshot,
+    atom: u8,
     [receiver, value]: [u8; 2],
     temps @ [holder, slot, entry, base]: [u8; 4],
     own_only: bool,
+    site: Option<u8>,
     miss: DynamicLabel,
 ) {
     registers(&[receiver, value], temps);
@@ -486,6 +645,9 @@ pub(crate) fn emit_store(
     let overwritten = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; b =>done
         ; =>own ; ldr W(slot), [X(entry), cache.store_word_byte] ; cbz W(slot), =>miss);
+    if let Some(site) = site {
+        emit_site_fill(ops, cache, site, entry, slot, base);
+    }
     emit_covered(ops, value, slot, observe, miss);
     emit_word_store(ops, view, receiver, value, slot, base, miss);
     dynasm!(ops ; .arch aarch64 ; b =>overwritten ; =>observe);

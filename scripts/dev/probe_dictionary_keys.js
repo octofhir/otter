@@ -31,4 +31,33 @@ function run() {
   out.push(acc.a3, acc['a' + 3], Object.getOwnPropertyDescriptor(acc, 'a4').value);
   return out;
 }
+function writes() {
+  'use strict';
+  const out = [];
+  const d = make(300, 'k');
+  for (let r = 0; r < 50; r++) for (let i = 0; i < 300; i++) d['k' + i] = { r, i };
+  out.push(d.k5.r, d['k' + 299].i);
+  Object.defineProperty(d, 'k7', { writable: false });
+  try { d['k' + 7] = 1; out.push('nothrow'); } catch (e) { out.push(e.constructor.name, d.k7.i); }
+  let seen = 0;
+  Object.defineProperty(d, 'k8', { set(v) { seen += v; }, get() { return seen; } });
+  for (let i = 0; i < 100; i++) d['k' + 8] = 2;
+  out.push(d.k8);
+  const f = make(200, 'f');
+  Object.freeze(f);
+  try { f['f' + 3] = 9; out.push('nothrow'); } catch (e) { out.push(e.constructor.name, f.f3); }
+  const proto = make(200, 'm');
+  function C() {}
+  C.prototype = proto;
+  const inst = new C();
+  for (let i = 0; i < 200; i++) { proto['m' + i] = i * 2; }
+  out.push(inst.m10, inst['m' + 199]);
+  for (let r = 0; r < 3; r++) for (let i = 0; i < 200; i++) inst['m' + i] = -i;
+  out.push(inst.m10, proto.m10, Object.keys(inst).length);
+  const g = make(400, 'g');
+  for (let r = 0; r < 200; r++) { g['g' + (r % 400)] = 'x'.repeat(r % 7) + r; if (r % 50 === 0) new Array(10000).fill(r); }
+  out.push(g.g0, g.g199, Object.values(g).filter((v) => typeof v === 'string').length);
+  return out;
+}
 console.log(JSON.stringify(run()));
+console.log(JSON.stringify(writes()));

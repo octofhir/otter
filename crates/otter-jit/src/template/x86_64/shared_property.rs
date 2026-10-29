@@ -523,8 +523,9 @@ fn emit_keyed_load(
         // A dictionary-mode receiver's own data property, by its key table.
         ; =>dictionary
     );
-    emit_dictionary_own_load(ops, view, KEYED_LOAD_RECEIVER, 9, 0, [2, 7, 8], generic);
+    emit_dictionary_slot(ops, view, KEYED_LOAD_RECEIVER, 9, [7, 8, 2], false, generic);
     dynasm!(ops ; .arch x64
+        ; mov rax, [rdi]
         ; xor edx, edx
         ; ret
         // A name the table does not hold, an absent own key or an accessor:
@@ -550,39 +551,44 @@ fn emit_keyed_load(
         ; ret);
 }
 
-/// `destination` = the own data property `atom` names on the
+/// `slot` = the address of the own data property `atom` names on the
 /// dictionary-mode object in `receiver`; `absent` for an opaque lookup, an
-/// absent key or an accessor. Writes only `destination`, the three
-/// temporaries, `r10` and `r11`.
-fn emit_dictionary_own_load(
+/// absent key or an accessor. A `write` also goes to `absent` for a
+/// prototype, whose writes retire proofs, and for a read-only slot or one a
+/// compiled proof reads. Writes only `slot`, `metas`, `index`, `r10` and
+/// `r11`.
+fn emit_dictionary_slot(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     receiver: u8,
     atom: u8,
-    destination: u8,
-    [metas, table, index]: [u8; 3],
+    [slot, metas, index]: [u8; 3],
+    write: bool,
     absent: DynamicLabel,
 ) {
     let layout = otter_vm::object::DictionaryLayout::current();
     let field = otter_vm::object::FieldLayout::current();
     let chain = ops.new_dynamic_label();
     let found = ops.new_dynamic_label();
-    let slab = ops.new_dynamic_label();
+    let suffix = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
+    let mut refused = otter_vm::object::ShapeState::OPAQUE_LOOKUP_MASK;
+    if write {
+        refused |= otter_vm::object::ShapeState::PROTOTYPE_MASK;
+    }
     emit_load_u64(ops, 10, CAGE_MASK);
     dynasm!(ops ; .arch x64
         ; and r10, Rq(receiver)
         ; mov r11d, [Rq(receiver) + view.object_shape_byte as i32]
         ; add r11, r10
-        ; test BYTE [r11 + view.shape_state_byte as i32],
-            otter_vm::object::ShapeState::OPAQUE_LOOKUP_MASK as i8
+        ; test BYTE [r11 + view.shape_state_byte as i32], refused as i8
         ; jnz =>absent
         ; mov Rd(metas), [Rq(receiver) + layout.exotic_byte as i32]
         ; test Rd(metas), Rd(metas) ; jz =>absent
         ; add Rq(metas), r10
-        ; mov Rd(table), [Rq(metas) + layout.keys_byte as i32]
-        ; test Rd(table), Rd(table) ; jz =>absent
-        ; add Rq(table), r10
+        ; mov Rd(slot), [Rq(metas) + layout.keys_byte as i32]
+        ; test Rd(slot), Rd(slot) ; jz =>absent
+        ; add Rq(slot), r10
         ; mov Rd(metas), [Rq(metas) + layout.metas_byte as i32]
         ; test Rd(metas), Rd(metas) ; jz =>absent
         ; add Rq(metas), r10
@@ -592,43 +598,54 @@ fn emit_dictionary_own_load(
     dynasm!(ops ; .arch x64
         ; imul Rq(index), r11
         ; shr Rq(index), 32
-        ; mov r11d, [Rq(table) + layout.mask_byte as i32]
+        ; mov r11d, [Rq(slot) + layout.mask_byte as i32]
         ; and Rd(index), r11d
-        ; lea Rq(table), [Rq(table) + layout.buckets_byte as i32]
-        ; mov Rd(index), [Rq(table) + Rq(index) * 4]
+        ; lea Rq(slot), [Rq(slot) + layout.buckets_byte as i32]
+        ; mov Rd(index), [Rq(slot) + Rq(index) * 4]
         // The entry records follow the `mask + 1` buckets.
         ; add r11d, 1
-        ; lea Rq(table), [Rq(table) + r11 * 4]
+        ; lea Rq(slot), [Rq(slot) + r11 * 4]
         ; =>chain
         ; cmp Rd(index), -1
         ; je =>absent
         ; mov r11d, Rd(index)
         ; shl r11, layout.entry_shift as i8
-        ; add r11, Rq(table)
+        ; add r11, Rq(slot)
         ; cmp [r11 + layout.entry_atom_byte as i32], Rd(atom)
         ; je =>found
         ; mov Rd(index), [r11 + layout.entry_next_byte as i32]
         ; jmp =>chain
         ; =>found
         // The entry index is the slot index; its metadata says data or
-        // accessor.
+        // accessor, and for a write, writable and unwatched.
         ; imul r11d, Rd(index), layout.meta_bytes as i32
         ; add r11, Rq(metas)
         ; cmp BYTE [r11 + (layout.metas_records_byte + layout.meta_accessor_byte) as i32], 0
         ; jne =>absent
+    );
+    if write {
+        dynasm!(ops ; .arch x64
+            ; cmp BYTE [r11 + (layout.metas_records_byte + layout.meta_watched_byte) as i32], 0
+            ; jne =>absent
+            ; test BYTE [r11 + (layout.metas_records_byte + layout.meta_flags_byte) as i32],
+                otter_vm::object::PropertyFlags::WRITABLE as i8
+            ; jz =>absent
+        );
+    }
+    dynasm!(ops ; .arch x64
         ; mov r11d, [Rq(receiver) + view.object_shape_byte as i32]
         ; add r11, r10
         ; movzx r11d, BYTE [r11 + view.shape_inline_capacity_byte as i32]
         ; cmp Rd(index), r11d
-        ; jae =>slab
-        ; mov Rq(destination), [Rq(receiver) + Rq(index) * 8 + field.inline_values_byte as i32]
+        ; jae =>suffix
+        ; lea Rq(slot), [Rq(receiver) + Rq(index) * 8 + field.inline_values_byte as i32]
         ; jmp =>done
-        ; =>slab
+        ; =>suffix
         ; sub Rd(index), r11d
         ; mov r11d, [Rq(receiver) + field.slab_handle_byte as i32]
         ; test r11d, r11d ; jz =>absent
         ; add r11, r10
-        ; mov Rq(destination), [r11 + Rq(index) * 8 + field.slab_words_byte as i32]
+        ; lea Rq(slot), [r11 + Rq(index) * 8 + field.slab_words_byte as i32]
         ; =>done
     );
 }
@@ -695,16 +712,11 @@ fn emit_keyed_load_probe(
             otter_vm::object::ShapeState::DICTIONARY_MASK as i8
         ; jz =>shaped
     );
-    emit_dictionary_own_load(
-        ops,
-        view,
-        KEYED_LOAD_RECEIVER,
-        9,
-        PROBE_KEYED_RESULT,
-        [2, 7, 8],
-        miss,
-    );
-    dynasm!(ops ; .arch x64 ; jmp =>loaded ; =>shaped);
+    emit_dictionary_slot(ops, view, KEYED_LOAD_RECEIVER, 9, [7, 8, 2], false, miss);
+    dynasm!(ops ; .arch x64
+        ; mov Rq(PROBE_KEYED_RESULT), [rdi]
+        ; jmp =>loaded
+        ; =>shaped);
     // An Array reads its named bag.
     emit_array_bag(ops, view, 2, object, miss);
     emit_action_probe(
@@ -793,6 +805,31 @@ fn emit_keyed_store(
     let object = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>label ; sub rsp, 8);
     emit_key_atom(ops, relocations, view, KEYED_STORE_KEY, 9, true, miss, miss);
+    // A dictionary-mode receiver's writable own data slot is written in
+    // place; its shape owns no field summary, so only the barrier follows.
+    let shaped = ops.new_dynamic_label();
+    emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64
+        ; test Rq(KEYED_STORE_RECEIVER), r11 ; jnz =>shaped
+        ; test Rq(KEYED_STORE_RECEIVER), Rq(KEYED_STORE_RECEIVER) ; jz =>shaped
+        ; cmp BYTE [Rq(KEYED_STORE_RECEIVER)], crate::entry::OBJECT_BODY_TYPE_TAG as i8
+        ; jne =>shaped
+        ; mov r11d, [Rq(KEYED_STORE_RECEIVER) + view.object_shape_byte as i32]
+        ; test r11d, r11d ; jz =>shaped
+    );
+    emit_load_u64(ops, 10, CAGE_MASK);
+    dynasm!(ops ; .arch x64
+        ; and r10, Rq(KEYED_STORE_RECEIVER)
+        ; add r10, r11
+        ; test BYTE [r10 + view.shape_state_byte as i32],
+            otter_vm::object::ShapeState::DICTIONARY_MASK as i8
+        ; jz =>shaped
+    );
+    emit_dictionary_slot(ops, view, KEYED_STORE_RECEIVER, 9, [0, 7, 8], true, miss);
+    dynasm!(ops ; .arch x64
+        ; mov [rax], Rq(KEYED_STORE_VALUE)
+        ; jmp =>stored
+        ; =>shaped);
     // An Array's own named data lives in its bag, written in place.
     emit_array_bag(ops, view, KEYED_STORE_RECEIVER, object, miss);
     emit_action_probe(

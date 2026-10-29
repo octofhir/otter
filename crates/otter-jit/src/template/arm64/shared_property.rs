@@ -346,8 +346,17 @@ fn emit_keyed_load_probe(
         ; ldrb w16, [x16, view.shape_state_byte]
         ; tbz w16, otter_vm::object::ShapeState::DICTIONARY_MASK.trailing_zeros(), =>shaped
     );
-    emit_dictionary_own_load(ops, view, KEYED_LOAD_RECEIVER, 11, PROBE_KEYED_RESULT, miss);
+    emit_dictionary_slot(
+        ops,
+        view,
+        KEYED_LOAD_RECEIVER,
+        11,
+        [13, 14, 12, 15, 3],
+        false,
+        miss,
+    );
     dynasm!(ops ; .arch aarch64
+        ; ldr X(PROBE_KEYED_RESULT), [x13]
         ; mov x17, xzr
         ; ret
         ; =>shaped
@@ -550,8 +559,17 @@ fn emit_keyed_load(
         // A dictionary-mode receiver's own data property, by its key table.
         ; =>dictionary
     );
-    emit_dictionary_own_load(ops, view, KEYED_LOAD_RECEIVER, 11, 0, generic);
+    emit_dictionary_slot(
+        ops,
+        view,
+        KEYED_LOAD_RECEIVER,
+        11,
+        [13, 14, 12, 15, 3],
+        false,
+        generic,
+    );
     dynasm!(ops ; .arch aarch64
+        ; ldr x0, [x13]
         ; mov x1, xzr
         ; ret
         // A name the table does not hold, an absent own key or an accessor:
@@ -580,81 +598,98 @@ fn emit_keyed_load(
     );
 }
 
-/// `X(destination)` = the own data property `W(atom)` names on the
-/// dictionary-mode object in `X(receiver)`, whose shape state byte is in
-/// `w16`; `absent` for an opaque lookup, an absent key or an accessor.
-/// Writes only `X(destination)`, `x3`, `x12` to `x15`, `x16` and `x17`.
-fn emit_dictionary_own_load(
+/// `X(slot)` = the address of the own data property `W(atom)` names on
+/// the dictionary-mode object in `X(receiver)`, whose shape state byte is
+/// in `w16`; `absent` for an opaque lookup, an absent key or an accessor.
+/// A `write` also goes to `absent` for a prototype, whose writes retire
+/// proofs, and for a read-only slot or one a compiled proof reads. Writes
+/// only `X(slot)`, the four other temporaries, `x16` and `x17`.
+fn emit_dictionary_slot(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     receiver: u8,
     atom: u8,
-    destination: u8,
+    [slot, table, metas, index, base]: [u8; 5],
+    write: bool,
     absent: DynamicLabel,
 ) {
     let layout = otter_vm::object::DictionaryLayout::current();
     let field = otter_vm::object::FieldLayout::current();
     let found = ops.new_dynamic_label();
     let chain = ops.new_dynamic_label();
-    let slab = ops.new_dynamic_label();
+    let suffix = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
+    let mut refused = otter_vm::object::ShapeState::OPAQUE_LOOKUP_MASK;
+    if write {
+        refused |= otter_vm::object::ShapeState::PROTOTYPE_MASK;
+    }
     dynasm!(ops ; .arch aarch64
-        ; tst w16, u32::from(otter_vm::object::ShapeState::OPAQUE_LOOKUP_MASK)
+        ; tst w16, u32::from(refused)
         ; b.ne =>absent
         ; and x17, X(receiver), #0xffff_ffff_0000_0000
-        ; ldr w13, [X(receiver), layout.exotic_byte]
-        ; cbz w13, =>absent
-        ; add x13, x17, x13
-        ; ldr w14, [x13, layout.keys_byte]
-        ; cbz w14, =>absent
-        ; add x14, x17, x14
-        ; ldr w12, [x13, layout.metas_byte]
-        ; cbz w12, =>absent
-        ; add x12, x17, x12
+        ; ldr W(slot), [X(receiver), layout.exotic_byte]
+        ; cbz W(slot), =>absent
+        ; add X(slot), x17, X(slot)
+        ; ldr W(table), [X(slot), layout.keys_byte]
+        ; cbz W(table), =>absent
+        ; add X(table), x17, X(table)
+        ; ldr W(metas), [X(slot), layout.metas_byte]
+        ; cbz W(metas), =>absent
+        ; add X(metas), x17, X(metas)
     );
-    super::values::emit_load_u64(ops, 15, layout.hash_multiplier);
+    super::values::emit_load_u64(ops, index, layout.hash_multiplier);
     dynasm!(ops ; .arch aarch64
-        ; mov w3, W(atom)
-        ; mul x15, x3, x15
-        ; lsr x15, x15, #32
-        ; ldr w16, [x14, layout.mask_byte]
-        ; and w15, w15, w16
-        ; add x3, x14, layout.buckets_byte
-        ; ldr w15, [x3, x15, lsl #2]
+        ; mov W(base), W(atom)
+        ; mul X(index), X(base), X(index)
+        ; lsr X(index), X(index), #32
+        ; ldr w16, [X(table), layout.mask_byte]
+        ; and W(index), W(index), w16
+        ; add XSP(base), XSP(table), layout.buckets_byte
+        ; ldr W(index), [X(base), X(index), lsl #2]
         // The entry records follow the `mask + 1` buckets.
         ; add w16, w16, #1
-        ; add x3, x3, x16, lsl #2
+        ; add X(base), X(base), x16, lsl #2
         ; =>chain
-        ; cmn w15, #1
+        ; cmn WSP(index), #1
         ; b.eq =>absent
-        ; add x16, x3, x15, lsl layout.entry_shift
-        ; ldr w13, [x16, layout.entry_atom_byte]
-        ; cmp w13, W(atom)
+        ; add x16, X(base), X(index), lsl layout.entry_shift
+        ; ldr W(slot), [x16, layout.entry_atom_byte]
+        ; cmp W(slot), W(atom)
         ; b.eq =>found
-        ; ldr w15, [x16, layout.entry_next_byte]
+        ; ldr W(index), [x16, layout.entry_next_byte]
         ; b =>chain
         ; =>found
         // The entry index is the slot index; its metadata says data or
-        // accessor.
+        // accessor, and for a write, writable and unwatched.
         ; mov w16, layout.meta_bytes
-        ; madd x16, x15, x16, x12
-        ; ldrb w13, [x16, layout.metas_records_byte + layout.meta_accessor_byte]
-        ; cbnz w13, =>absent
+        ; madd x16, X(index), x16, X(metas)
+        ; ldrb W(slot), [x16, layout.metas_records_byte + layout.meta_accessor_byte]
+        ; cbnz W(slot), =>absent
+    );
+    if write {
+        dynasm!(ops ; .arch aarch64
+            ; ldrb W(slot), [x16, layout.metas_records_byte + layout.meta_watched_byte]
+            ; cbnz W(slot), =>absent
+            ; ldrb W(slot), [x16, layout.metas_records_byte + layout.meta_flags_byte]
+            ; tbz W(slot), otter_vm::object::PropertyFlags::WRITABLE.trailing_zeros(), =>absent
+        );
+    }
+    dynasm!(ops ; .arch aarch64
         ; ldr w16, [X(receiver), view.object_shape_byte]
         ; add x16, x17, x16
         ; ldrb w16, [x16, view.shape_inline_capacity_byte]
-        ; cmp w15, w16
-        ; b.hs =>slab
-        ; add x16, X(receiver), x15, lsl #3
-        ; ldr X(destination), [x16, field.inline_values_byte]
+        ; cmp W(index), w16
+        ; b.hs =>suffix
+        ; add X(slot), X(receiver), X(index), lsl #3
+        ; add XSP(slot), XSP(slot), field.inline_values_byte
         ; b =>done
-        ; =>slab
-        ; sub w15, w15, w16
+        ; =>suffix
+        ; sub W(index), W(index), w16
         ; ldr w16, [X(receiver), field.slab_handle_byte]
         ; cbz w16, =>absent
         ; add x16, x17, x16
-        ; add x16, x16, x15, lsl #3
-        ; ldr X(destination), [x16, field.slab_words_byte]
+        ; add X(slot), x16, X(index), lsl #3
+        ; add XSP(slot), XSP(slot), field.slab_words_byte
         ; =>done
     );
 }
@@ -672,6 +707,48 @@ fn emit_keyed_store(
     let object = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label ; stp x29, x30, [sp, #-16]! ; mov x29, sp);
     emit_key_atom(ops, relocations, view, KEYED_STORE_KEY, 3, miss, miss);
+    // A dictionary-mode receiver's writable own data slot is written in
+    // place; its shape owns no field summary, so only the barrier follows.
+    let shaped = ops.new_dynamic_label();
+    let primitive = ops.new_dynamic_label();
+    emit_cell_test(ops, KEYED_STORE_RECEIVER, CellTest::IsNotCell, shaped);
+    dynasm!(ops ; .arch aarch64
+        ; cbz X(KEYED_STORE_RECEIVER), =>shaped
+        ; ldrb w16, [X(KEYED_STORE_RECEIVER)]
+        ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
+        ; b.ne =>shaped
+        ; ldr w16, [X(KEYED_STORE_RECEIVER), view.object_shape_byte]
+        ; cbz w16, =>shaped
+        ; and x17, X(KEYED_STORE_RECEIVER), #0xffff_ffff_0000_0000
+        ; add x16, x17, x16
+        ; ldrb w16, [x16, view.shape_state_byte]
+        ; tbz w16, otter_vm::object::ShapeState::DICTIONARY_MASK.trailing_zeros(), =>shaped
+    );
+    emit_dictionary_slot(
+        ops,
+        view,
+        KEYED_STORE_RECEIVER,
+        3,
+        [13, 14, 15, 11, 0],
+        true,
+        miss,
+    );
+    dynasm!(ops ; .arch aarch64 ; str X(KEYED_STORE_VALUE), [x13]);
+    emit_cell_test(ops, KEYED_STORE_VALUE, CellTest::IsNotCell, primitive);
+    super::values::emit_write_barrier(
+        ops,
+        relocations,
+        view,
+        KEYED_STORE_RECEIVER,
+        KEYED_STORE_VALUE,
+    );
+    dynasm!(ops ; .arch aarch64
+        ; =>primitive
+        ; mov x1, xzr
+        ; ldp x29, x30, [sp], #16
+        ; ret
+        ; =>shaped
+    );
     // An Array's own named data lives in its bag, written in place.
     emit_array_bag(ops, view, KEYED_STORE_RECEIVER, object, miss);
     property_actions::emit_store(

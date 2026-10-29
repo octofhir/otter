@@ -1347,9 +1347,10 @@ fn dict_key_hash(atom: crate::property_atom::AtomId) -> u32 {
     ((u64::from(atom.raw()).wrapping_mul(DICT_KEY_HASH_MULTIPLIER)) >> 32) as u32
 }
 
-/// The words generated code reads a dictionary-mode object's own data
-/// properties through: its sidecar's key table and slot metadata, and the
-/// key table's hash. Offsets count from each cell's header.
+/// The words generated code reads and writes a dictionary-mode object's own
+/// data properties through: its sidecar's key table and slot metadata, and
+/// the key table's hash. Offsets count from each cell's header. A dictionary
+/// shape owns no field summaries, so a value write observes nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DictionaryLayout {
     /// The object body's compressed sidecar handle.
@@ -1375,6 +1376,11 @@ pub struct DictionaryLayout {
     pub meta_bytes: u32,
     /// A metadata record's accessor flag byte.
     pub meta_accessor_byte: u32,
+    /// A metadata record's [`PropertyFlags`] byte.
+    pub meta_flags_byte: u32,
+    /// A metadata record's byte that is nonzero while a compiled proof reads
+    /// the slot's value.
+    pub meta_watched_byte: u32,
     /// The bucket hash: the high word of the atom times this.
     pub hash_multiplier: u64,
 }
@@ -1397,6 +1403,8 @@ impl DictionaryLayout {
             metas_records_byte: header + std::mem::size_of::<SlotMetaBody>() as u32,
             meta_bytes: std::mem::size_of::<SlotMeta>() as u32,
             meta_accessor_byte: std::mem::offset_of!(SlotMeta, is_accessor) as u32,
+            meta_flags_byte: std::mem::offset_of!(SlotMeta, flags) as u32,
+            meta_watched_byte: std::mem::offset_of!(SlotMeta, watched) as u32,
             hash_multiplier: DICT_KEY_HASH_MULTIPLIER,
         }
     }

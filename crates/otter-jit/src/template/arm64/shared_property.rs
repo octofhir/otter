@@ -296,8 +296,9 @@ pub(crate) const PROBE_KEYED_LOAD_CLOBBERS: [u8; 7] = [PROBE_KEYED_RESULT, 3, 11
 /// The keyed load's shaped table hit for an optimized site, receiver in
 /// [`KEYED_LOAD_RECEIVER`] and key in [`KEYED_LOAD_KEY`]: `x17 == 0` with the
 /// value in [`PROBE_KEYED_RESULT`], else `x17 != 0` and the site takes the
-/// full routine. A key whose atom is unrecorded, a dictionary-mode receiver
-/// and a table miss all decline; nothing is called. Both inputs survive and
+/// full routine. A dictionary-mode receiver reads its own key table. A key
+/// whose atom is unrecorded, an absent or accessor dictionary key and a
+/// table miss all decline; nothing is called. Both inputs survive and
 /// only [`PROBE_KEYED_LOAD_CLOBBERS`], `x16` and `x17` are written.
 fn emit_keyed_load_probe(
     ops: &mut Assembler,
@@ -328,10 +329,31 @@ fn emit_keyed_load_probe(
         ; cmn w11, #1
         ; b.eq =>miss
         ; =>ready
+    );
+    // The table holds no dictionary-mode object's keys: such a receiver
+    // reads its own key table.
+    let shaped = ops.new_dynamic_label();
+    emit_cell_test(ops, KEYED_LOAD_RECEIVER, CellTest::IsNotCell, shaped);
+    dynasm!(ops ; .arch aarch64
+        ; cbz X(KEYED_LOAD_RECEIVER), =>shaped
+        ; ldrb w16, [X(KEYED_LOAD_RECEIVER)]
+        ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
+        ; b.ne =>shaped
+        ; ldr w16, [X(KEYED_LOAD_RECEIVER), view.object_shape_byte]
+        ; cbz w16, =>shaped
+        ; and x17, X(KEYED_LOAD_RECEIVER), #0xffff_ffff_0000_0000
+        ; add x16, x17, x16
+        ; ldrb w16, [x16, view.shape_state_byte]
+        ; tbz w16, otter_vm::object::ShapeState::DICTIONARY_MASK.trailing_zeros(), =>shaped
+    );
+    emit_dictionary_own_load(ops, view, KEYED_LOAD_RECEIVER, 11, PROBE_KEYED_RESULT, miss);
+    dynasm!(ops ; .arch aarch64
+        ; mov x17, xzr
+        ; ret
+        ; =>shaped
         ; mov x12, X(KEYED_LOAD_RECEIVER)
     );
-    // The table holds no dictionary-mode object's keys, so its probe misses
-    // such a receiver by shape identity; an Array reads its named bag.
+    // An Array reads its named bag.
     emit_array_bag(ops, view, 12, object, miss);
     property_actions::emit_load(
         ops,
@@ -477,6 +499,7 @@ fn emit_keyed_load(
     let generic = ops.new_dynamic_label();
     let object = ops.new_dynamic_label();
     let shaped = ops.new_dynamic_label();
+    let dictionary = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label);
     // The key's atom first: interning records it on the string, so the
     // own-data walk below reads it back instead of hashing the units again.
@@ -494,7 +517,7 @@ fn emit_keyed_load(
         ; and x17, X(KEYED_LOAD_RECEIVER), #0xffff_ffff_0000_0000
         ; add x16, x17, x16
         ; ldrb w16, [x16, view.shape_state_byte]
-        ; tbnz w16, otter_vm::object::ShapeState::DICTIONARY_MASK.trailing_zeros(), =>generic
+        ; tbnz w16, otter_vm::object::ShapeState::DICTIONARY_MASK.trailing_zeros(), =>dictionary
         ; =>shaped
     );
     emit_array_bag(ops, view, KEYED_LOAD_RECEIVER, object, miss);
@@ -524,8 +547,15 @@ fn emit_keyed_load(
     dynasm!(ops ; .arch aarch64
         ; mov x1, xzr
         ; ret
-        // A name the table does not hold: the generic own-data walk, whose
-        // pair is the routine's result.
+        // A dictionary-mode receiver's own data property, by its key table.
+        ; =>dictionary
+    );
+    emit_dictionary_own_load(ops, view, KEYED_LOAD_RECEIVER, 11, 0, generic);
+    dynasm!(ops ; .arch aarch64
+        ; mov x1, xzr
+        ; ret
+        // A name the table does not hold, an absent own key or an accessor:
+        // the generic own-data walk, whose pair is the routine's result.
         ; =>generic
         ; str x30, [sp, #-16]!
         ; mov x1, X(KEYED_LOAD_RECEIVER)
@@ -547,6 +577,85 @@ fn emit_keyed_load(
         ; =>miss
         ; movz x1, 1
         ; ret
+    );
+}
+
+/// `X(destination)` = the own data property `W(atom)` names on the
+/// dictionary-mode object in `X(receiver)`, whose shape state byte is in
+/// `w16`; `absent` for an opaque lookup, an absent key or an accessor.
+/// Writes only `X(destination)`, `x3`, `x12` to `x15`, `x16` and `x17`.
+fn emit_dictionary_own_load(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    atom: u8,
+    destination: u8,
+    absent: DynamicLabel,
+) {
+    let layout = otter_vm::object::DictionaryLayout::current();
+    let field = otter_vm::object::FieldLayout::current();
+    let found = ops.new_dynamic_label();
+    let chain = ops.new_dynamic_label();
+    let slab = ops.new_dynamic_label();
+    let done = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64
+        ; tst w16, u32::from(otter_vm::object::ShapeState::OPAQUE_LOOKUP_MASK)
+        ; b.ne =>absent
+        ; and x17, X(receiver), #0xffff_ffff_0000_0000
+        ; ldr w13, [X(receiver), layout.exotic_byte]
+        ; cbz w13, =>absent
+        ; add x13, x17, x13
+        ; ldr w14, [x13, layout.keys_byte]
+        ; cbz w14, =>absent
+        ; add x14, x17, x14
+        ; ldr w12, [x13, layout.metas_byte]
+        ; cbz w12, =>absent
+        ; add x12, x17, x12
+    );
+    super::values::emit_load_u64(ops, 15, layout.hash_multiplier);
+    dynasm!(ops ; .arch aarch64
+        ; mov w3, W(atom)
+        ; mul x15, x3, x15
+        ; lsr x15, x15, #32
+        ; ldr w16, [x14, layout.mask_byte]
+        ; and w15, w15, w16
+        ; add x3, x14, layout.buckets_byte
+        ; ldr w15, [x3, x15, lsl #2]
+        // The entry records follow the `mask + 1` buckets.
+        ; add w16, w16, #1
+        ; add x3, x3, x16, lsl #2
+        ; =>chain
+        ; cmn w15, #1
+        ; b.eq =>absent
+        ; add x16, x3, x15, lsl layout.entry_shift
+        ; ldr w13, [x16, layout.entry_atom_byte]
+        ; cmp w13, W(atom)
+        ; b.eq =>found
+        ; ldr w15, [x16, layout.entry_next_byte]
+        ; b =>chain
+        ; =>found
+        // The entry index is the slot index; its metadata says data or
+        // accessor.
+        ; mov w16, layout.meta_bytes
+        ; madd x16, x15, x16, x12
+        ; ldrb w13, [x16, layout.metas_records_byte + layout.meta_accessor_byte]
+        ; cbnz w13, =>absent
+        ; ldr w16, [X(receiver), view.object_shape_byte]
+        ; add x16, x17, x16
+        ; ldrb w16, [x16, view.shape_inline_capacity_byte]
+        ; cmp w15, w16
+        ; b.hs =>slab
+        ; add x16, X(receiver), x15, lsl #3
+        ; ldr X(destination), [x16, field.inline_values_byte]
+        ; b =>done
+        ; =>slab
+        ; sub w15, w15, w16
+        ; ldr w16, [X(receiver), field.slab_handle_byte]
+        ; cbz w16, =>absent
+        ; add x16, x17, x16
+        ; add x16, x16, x15, lsl #3
+        ; ldr X(destination), [x16, field.slab_words_byte]
+        ; =>done
     );
 }
 

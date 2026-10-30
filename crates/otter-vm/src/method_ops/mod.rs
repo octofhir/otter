@@ -3491,6 +3491,7 @@ impl Interpreter {
 /// runs ToString(searchString=arg0) before ToNumber(position=arg1)
 /// (§22.1.3.9 steps 3-4), whereas `split` coerces ToUint32(limit=arg1) before
 /// ToString(separator=arg0) (§22.1.3.21 steps 6-7).
+#[inline]
 fn string_method_coercion_order(name: &str) -> &'static [(usize, bool)] {
     match name {
         "indexOf" | "lastIndexOf" => &[(0, false), (1, true)],
@@ -3516,6 +3517,7 @@ fn string_method_coercion_order(name: &str) -> &'static [(usize, bool)] {
 /// Whether any argument of `name` needs a coercion that can run user code or
 /// convert a non-number primitive; a call without one reaches its body with
 /// the arguments as they are.
+#[inline]
 pub(crate) fn string_method_args_need_coercion(name: &str, args: ValueWindow<'_>) -> bool {
     string_method_coercion_order(name)
         .iter()

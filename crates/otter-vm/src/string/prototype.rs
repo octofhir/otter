@@ -3154,14 +3154,39 @@ fn native_string_method(
     })
 }
 
+/// One method's entry, inlined into its bridge with `name` constant: a
+/// method without symbol-method dispatch on a string receiver whose
+/// arguments need no coercion runs `body` at once; every other call takes
+/// [`native_string_method`].
+#[inline(always)]
+fn string_method_entry(
+    name: &'static str,
+    body: StringNativeFn,
+    ctx: &mut NativeCtx<'_>,
+    args: ValueWindow<'_>,
+) -> Result<Value, NativeError> {
+    let dispatches = matches!(
+        name,
+        "replace" | "replaceAll" | "split" | "match" | "search" | "matchAll"
+    );
+    let receiver = *ctx.this_value();
+    if !dispatches
+        && receiver.is_string()
+        && !crate::method_ops::string_method_args_need_coercion(name, args)
+    {
+        return body(ctx, &receiver, args);
+    }
+    native_string_method(name, ctx, args)
+}
+
 /// Generate a per-method trampoline + spec-table entry. The
 /// trampoline binds the JavaScript method name into a `fn`-pointer
 /// shape that fits `NativeCall::Static` without dynamic dispatch.
 macro_rules! string_prototype_methods {
-    ($($bridge:ident => $name:literal, $length:literal;)*) => {
+    ($($bridge:ident => $name:literal, $length:literal, $impl:ident;)*) => {
         $(
             pub(crate) fn $bridge(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-                native_string_method($name, ctx, args)
+                string_method_entry($name, $impl, ctx, args)
             }
         )*
 
@@ -3184,56 +3209,56 @@ macro_rules! string_prototype_methods {
 }
 
 string_prototype_methods!(
-    bridge_char_at         => "charAt",         1;
-    bridge_char_code_at    => "charCodeAt",     1;
-    bridge_code_point_at   => "codePointAt",    1;
-    bridge_at              => "at",             1;
-    bridge_slice           => "slice",          2;
-    bridge_substring       => "substring",      2;
-    bridge_index_of        => "indexOf",        1;
-    bridge_last_index_of   => "lastIndexOf",    1;
-    bridge_includes        => "includes",       1;
-    bridge_starts_with     => "startsWith",     1;
-    bridge_ends_with       => "endsWith",       1;
-    bridge_concat          => "concat",         1;
-    bridge_repeat          => "repeat",         1;
-    bridge_pad_start       => "padStart",       1;
-    bridge_pad_end         => "padEnd",         1;
-    bridge_trim            => "trim",           0;
-    bridge_trim_start      => "trimStart",      0;
-    bridge_trim_end        => "trimEnd",        0;
-    bridge_trim_left       => "trimLeft",       0;
-    bridge_trim_right      => "trimRight",      0;
-    bridge_is_well_formed  => "isWellFormed",   0;
-    bridge_to_well_formed  => "toWellFormed",   0;
-    bridge_substr          => "substr",         2;
-    bridge_anchor          => "anchor",         1;
-    bridge_big             => "big",            0;
-    bridge_blink           => "blink",          0;
-    bridge_bold            => "bold",           0;
-    bridge_fixed           => "fixed",          0;
-    bridge_fontcolor       => "fontcolor",      1;
-    bridge_fontsize        => "fontsize",       1;
-    bridge_italics         => "italics",        0;
-    bridge_link            => "link",           1;
-    bridge_small           => "small",          0;
-    bridge_strike          => "strike",         0;
-    bridge_sub             => "sub",            0;
-    bridge_sup             => "sup",            0;
-    bridge_to_lower_case   => "toLowerCase",    0;
-    bridge_to_upper_case   => "toUpperCase",    0;
-    bridge_to_locale_lower => "toLocaleLowerCase", 0;
-    bridge_to_locale_upper => "toLocaleUpperCase", 0;
-    bridge_replace         => "replace",        2;
-    bridge_replace_all     => "replaceAll",     2;
-    bridge_split           => "split",          2;
-    bridge_match           => "match",          1;
-    bridge_match_all       => "matchAll",       1;
-    bridge_search          => "search",         1;
-    bridge_locale_compare  => "localeCompare",  1;
-    bridge_normalize       => "normalize",      0;
-    bridge_to_string       => "toString",       0;
-    bridge_value_of        => "valueOf",        0;
+    bridge_char_at => "charAt", 1, impl_char_at;
+    bridge_char_code_at => "charCodeAt", 1, impl_char_code_at;
+    bridge_code_point_at => "codePointAt", 1, impl_code_point_at;
+    bridge_at => "at", 1, impl_at;
+    bridge_slice => "slice", 2, impl_slice;
+    bridge_substring => "substring", 2, impl_substring;
+    bridge_index_of => "indexOf", 1, impl_index_of;
+    bridge_last_index_of => "lastIndexOf", 1, impl_last_index_of;
+    bridge_includes => "includes", 1, impl_includes;
+    bridge_starts_with => "startsWith", 1, impl_starts_with;
+    bridge_ends_with => "endsWith", 1, impl_ends_with;
+    bridge_concat => "concat", 1, impl_concat;
+    bridge_repeat => "repeat", 1, impl_repeat;
+    bridge_pad_start => "padStart", 1, impl_pad_start;
+    bridge_pad_end => "padEnd", 1, impl_pad_end;
+    bridge_trim => "trim", 0, impl_trim;
+    bridge_trim_start => "trimStart", 0, impl_trim_start;
+    bridge_trim_end => "trimEnd", 0, impl_trim_end;
+    bridge_trim_left => "trimLeft", 0, impl_trim_start;
+    bridge_trim_right => "trimRight", 0, impl_trim_end;
+    bridge_is_well_formed => "isWellFormed", 0, impl_is_well_formed;
+    bridge_to_well_formed => "toWellFormed", 0, impl_to_well_formed;
+    bridge_substr => "substr", 2, impl_substr;
+    bridge_anchor => "anchor", 1, impl_anchor;
+    bridge_big => "big", 0, impl_big;
+    bridge_blink => "blink", 0, impl_blink;
+    bridge_bold => "bold", 0, impl_bold;
+    bridge_fixed => "fixed", 0, impl_fixed;
+    bridge_fontcolor => "fontcolor", 1, impl_fontcolor;
+    bridge_fontsize => "fontsize", 1, impl_fontsize;
+    bridge_italics => "italics", 0, impl_italics;
+    bridge_link => "link", 1, impl_link;
+    bridge_small => "small", 0, impl_small;
+    bridge_strike => "strike", 0, impl_strike;
+    bridge_sub => "sub", 0, impl_sub;
+    bridge_sup => "sup", 0, impl_sup;
+    bridge_to_lower_case => "toLowerCase", 0, impl_to_lower_case;
+    bridge_to_upper_case => "toUpperCase", 0, impl_to_upper_case;
+    bridge_to_locale_lower => "toLocaleLowerCase", 0, impl_to_locale_lower_case;
+    bridge_to_locale_upper => "toLocaleUpperCase", 0, impl_to_locale_upper_case;
+    bridge_replace => "replace", 2, impl_replace;
+    bridge_replace_all => "replaceAll", 2, impl_replace_all;
+    bridge_split => "split", 2, impl_split;
+    bridge_match => "match", 1, impl_match;
+    bridge_match_all => "matchAll", 1, impl_match_all;
+    bridge_search => "search", 1, impl_search;
+    bridge_locale_compare => "localeCompare", 1, impl_locale_compare;
+    bridge_normalize => "normalize", 0, impl_normalize;
+    bridge_to_string => "toString", 0, impl_to_string;
+    bridge_value_of => "valueOf", 0, impl_to_string;
 );
 
 #[cfg(test)]

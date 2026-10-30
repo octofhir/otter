@@ -345,11 +345,12 @@ pub(crate) fn compile_function_impl(
     let uses_mapped_arguments = body_needs_arguments_object && !function_is_strict && simple_params;
     // A mapped object aliases the formals only where the aliasing can be
     // observed: the object escapes or is written, a formal is assigned, or a
-    // direct eval or a legacy `f.arguments` read can reach either. Otherwise
-    // its elements always equal the formals and the formals stay plain.
+    // direct eval can reach either. Otherwise its elements always equal the
+    // formals and the formals stay plain. A legacy `f.arguments` read builds
+    // a separate object from the activation's actual arguments, so it
+    // observes no alias.
     let aliased_formals = uses_mapped_arguments
         && (contains_direct_eval
-            || parent.dot_arguments_observed
             || facts.is_none_or(|facts| {
                 facts.arguments_escapes()
                     || formal_parameter_bound_names(params)

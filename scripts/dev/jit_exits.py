@@ -3,12 +3,16 @@
 Rust frame that generated code called: which runtime entries the compiled
 program spends its non-generated time in.
 
-usage: jit_exits.py <sample.txt> [top]
+usage: jit_exits.py <sample.txt> [top] [entry-substring] [frames]
+With an entry substring, ranks instead the `frames` (default 3) named frames
+below that entry: what the entry spends its own runtime time in.
 """
 import collections, re, sys
 
 text = open(sys.argv[1]).read()
 top = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+focus = sys.argv[3] if len(sys.argv) > 3 else None
+frames = int(sys.argv[4]) if len(sys.argv) > 4 else 3
 graph = text.split("Call graph:", 1)[1].split("Total number in stack", 1)[0]
 thread = graph.split("otter-isolate", 1)[1]
 thread = re.split(r"\n    \d+ Thread_", thread, maxsplit=1)[0]
@@ -46,8 +50,13 @@ for i, (depth, count, name) in enumerate(entries):
     entry = None
     for k in range(len(stack) - 1, 0, -1):
         if stack[k - 1][1].startswith("???") and not stack[k][1].startswith("???"):
-            entry = stack[k][1]
+            entry = k
             break
-    cats[short(entry) if entry else "(not under generated code)"] += own
+    if focus is not None:
+        if entry is not None and focus in stack[entry][1]:
+            path = [short(n) for _, n in stack[entry + 1 : entry + 1 + frames]]
+            cats[" > ".join(path) or "(self)"] += own
+        continue
+    cats[short(stack[entry][1]) if entry is not None else "(not under generated code)"] += own
 for name, n in cats.most_common(top):
     print(f"{n:6d} {100 * n / total:5.1f}%  {name}")

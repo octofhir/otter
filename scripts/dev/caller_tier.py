@@ -3,11 +3,14 @@
 generated-code frame above them, from a macOS `sample` report of the
 otter-isolate thread and the run's `--perf-basic-prof` map.
 
-usage: caller_tier.py <sample.txt> <perf.map> <regex>
+usage: caller_tier.py <sample.txt> <perf.map> <regex> [--name]
+`--name` reports the calling code object's full perf-map name (JS function
+and tier) instead of its tier alone.
 """
 import bisect, collections, re, sys
 
 text, perf, rx = open(sys.argv[1]).read(), sys.argv[2], re.compile(sys.argv[3])
+by_name = "--name" in sys.argv[4:]
 ranges = []
 for line in open(perf):
     parts = line.rstrip('\n').split(' ', 2)
@@ -19,6 +22,8 @@ starts = [r[0] for r in ranges]
 def tier(addr):
     i = bisect.bisect_right(starts, addr) - 1
     if i >= 0 and ranges[i][0] <= addr < ranges[i][0] + ranges[i][1]:
+        if by_name:
+            return ranges[i][2]
         m = re.search(r'\[(\w+)', ranges[i][2])
         return m.group(1) if m else ranges[i][2]
     return None
@@ -43,5 +48,5 @@ for line in thread.splitlines()[1:]:
         caller = next((tier(a) for _, _, a in reversed(stack[:-1]) if a and tier(a)), 'none')
         counts[caller] += count
 total = sum(counts.values())
-for k, n in counts.most_common():
+for k, n in counts.most_common(40):
     print(f"{n:6d} {100*n/max(total,1):5.1f}%  {k}")

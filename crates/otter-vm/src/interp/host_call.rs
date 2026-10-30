@@ -142,8 +142,6 @@ impl HostTurn<'_> {
 pub(crate) struct CallerContext<'a> {
     admitted: Option<&'a ExecutionContext>,
     frame: *mut Frame,
-    /// `frame` is the caller's own record, not the native's.
-    caller_frame: bool,
     /// The caller's owner from the isolate's stable owner cache, which keeps
     /// its address while any execution is in progress; `None` for the
     /// admitted context.
@@ -151,48 +149,60 @@ pub(crate) struct CallerContext<'a> {
 }
 
 impl Interpreter {
-    /// The innermost function, inlined or not, running at `return_pc` of the
-    /// generated code object `code_object_id`; `None` without a record there.
-    /// A native's caller resolves its source owner from it on every call
-    /// that asks, so the last site is kept.
-    fn innermost_function_at_return(&self, code_object_id: u32, return_pc: u64) -> Option<u32> {
-        if let Some((code, pc, function_id)) = self.caller_function_cache.get()
+    /// The source owner of the innermost function, inlined or not, running
+    /// at `return_pc` of the generated code object `code_object_id` whose
+    /// record names `outer` (`None`: `admitted` owns it). Natives called from
+    /// a hot site ask on every call, so the last site's answer is kept.
+    fn caller_owner_at_return(
+        &self,
+        admitted: Option<&ExecutionContext>,
+        code_object_id: u32,
+        return_pc: u64,
+        outer: u32,
+    ) -> Option<*const ExecutionContext> {
+        let admitted_key = admitted.map_or(0, |context| std::ptr::from_ref(context).addr());
+        if let Some((code, pc, key, owner)) = self.caller_owner_cache.get()
             && code == code_object_id
             && pc == return_pc
+            && key == admitted_key
         {
-            return function_id;
+            return owner;
         }
         let function_id = self
             .jit_code_registry
             .return_pc_record(u64::from(code_object_id), return_pc)
             .and_then(|record| record.inline_frames.last())
-            .map(|inline| inline.function_id);
-        self.caller_function_cache
-            .set(Some((code_object_id, return_pc, function_id)));
-        function_id
+            .map_or(outer, |inline| inline.function_id);
+        let owner = self.caller_source_owner(admitted, function_id);
+        self.caller_owner_cache
+            .set(Some((code_object_id, return_pc, admitted_key, owner)));
+        owner
+    }
+
+    /// The source owner of `function_id`, or `None` when `admitted` owns it.
+    fn caller_source_owner(
+        &self,
+        admitted: Option<&ExecutionContext>,
+        function_id: u32,
+    ) -> Option<*const ExecutionContext> {
+        if admitted.is_some_and(|context| context.covers_function(function_id)) {
+            return None;
+        }
+        self.stable_foreign_owner(function_id).ok()
     }
 }
 
 impl<'a> CallerContext<'a> {
     fn new(turn: &HostTurn<'a>) -> Self {
-        Self {
-            admitted: turn.context,
-            frame: turn.frame,
-            caller_frame: false,
-            resolved: std::cell::OnceCell::new(),
-        }
+        Self::of_host_frame(turn.context, turn.frame)
     }
 
-    /// The caller context of a native that compiled code calls without a
-    /// frame of its own: `frame` is the calling function's published record.
-    pub(crate) fn of_caller_frame(
-        admitted: Option<&'a ExecutionContext>,
-        frame: *mut Frame,
-    ) -> Self {
+    /// The caller context of a native running in the published Host record
+    /// `frame`, such as the exit record of a direct native entry.
+    pub(crate) fn of_host_frame(admitted: Option<&'a ExecutionContext>, frame: *mut Frame) -> Self {
         Self {
             admitted,
             frame,
-            caller_frame: true,
             resolved: std::cell::OnceCell::new(),
         }
     }
@@ -209,17 +219,6 @@ impl<'a> CallerContext<'a> {
     }
 
     fn resolve(&self, vm: &Interpreter) -> Option<*const ExecutionContext> {
-        if self.caller_frame {
-            // SAFETY: the calling record stays published for the whole body.
-            let function_id = unsafe { &*self.frame }.header.function_id;
-            if self
-                .admitted
-                .is_some_and(|context| context.covers_function(function_id))
-            {
-                return None;
-            }
-            return vm.stable_foreign_owner(function_id).ok();
-        }
         let mut child = self.frame;
         loop {
             // SAFETY: the host frame stays published for the whole native
@@ -235,19 +234,15 @@ impl<'a> CallerContext<'a> {
             }
             // SAFETY: as above; the callee stays anchored at its machine frame.
             let return_pc = unsafe { callee.return_pc_into_caller() };
-            let function_id = if frame.code_object_id == 0 || return_pc == 0 {
-                frame.header.function_id
-            } else {
-                vm.innermost_function_at_return(frame.code_object_id, return_pc)
-                    .unwrap_or(frame.header.function_id)
-            };
-            if self
-                .admitted
-                .is_some_and(|context| context.covers_function(function_id))
-            {
-                return None;
+            if frame.code_object_id == 0 || return_pc == 0 {
+                return vm.caller_source_owner(self.admitted, frame.header.function_id);
             }
-            return vm.stable_foreign_owner(function_id).ok();
+            return vm.caller_owner_at_return(
+                self.admitted,
+                frame.code_object_id,
+                return_pc,
+                frame.header.function_id,
+            );
         }
     }
 }
@@ -336,7 +331,19 @@ fn finish_native_result(
     ctx: &mut JitCtx,
     result: Result<Value, crate::NativeError>,
 ) -> HostStep {
-    HostStep::Complete(match result {
+    HostStep::Complete(finish_native_pair(vm, stack, context, ctx, result))
+}
+
+/// A native body's result as one completion; a failure projects through
+/// `context` while the native's frame is still published.
+pub(super) fn finish_native_pair(
+    vm: &mut Interpreter,
+    stack: &ActivationStack,
+    context: Option<&ExecutionContext>,
+    ctx: &mut JitCtx,
+    result: Result<Value, crate::NativeError>,
+) -> NativeResultPair {
+    match result {
         Ok(value) => NativeResultPair::success(value),
         Err(error) => {
             let projected =
@@ -346,7 +353,20 @@ fn finish_native_result(
             vm.record_throw_site();
             finish_projection(vm, ctx, projected)
         }
-    })
+    }
+}
+
+/// An admission failure of a native call (its work budget): terminal, never
+/// materialized as a JavaScript error.
+#[cold]
+#[inline(never)]
+pub(super) fn finish_fatal(
+    vm: &mut Interpreter,
+    ctx: &mut JitCtx,
+    error: VmError,
+) -> NativeResultPair {
+    vm.record_throw_site();
+    finish_projection(vm, ctx, Err(error))
 }
 
 /// Publish a classify request whose span lives in the current host frame.

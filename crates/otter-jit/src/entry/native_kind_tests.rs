@@ -278,19 +278,18 @@ fn same_source_whole_compilation_exposes_both_hit_and_miss_code_cost() {
             .nodes
             .iter()
             .filter_map(|node| match &node.kind {
-                crate::graph::ir::Kind::CallJs { plan, .. } => Some(Some(*plan)),
-                crate::graph::ir::Kind::CallStaticNative => Some(None),
+                crate::graph::ir::Kind::CallJs { plan, .. } => Some(*plan),
                 _ => None,
             })
             .collect();
-        // A site that only reached native functions calls their static body
-        // without the trampoline; any other site keeps the generic call.
+        // A site that only reached native functions enters the native
+        // selector; any other site keeps the generic call.
         assert_eq!(
             kinds,
             [if selected {
-                None
+                crate::call_linkage::CallPlan::Native
             } else {
-                Some(crate::call_linkage::CallPlan::Generic)
+                crate::call_linkage::CallPlan::Generic
             }]
         );
         sizes.push((

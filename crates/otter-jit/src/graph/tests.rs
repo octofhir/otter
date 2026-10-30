@@ -791,7 +791,6 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::LoadKeyedCached { pc: 0 },
         Kind::BuiltinMethod(crate::intrinsic_calls::IntrinsicMethodForm::RegExpTest),
         Kind::BuiltinMethod(crate::intrinsic_calls::IntrinsicMethodForm::StringReplace),
-        Kind::CallStaticNative,
         Kind::LoadTaggedField(8),
         Kind::StoreTaggedField(8),
         Kind::WriteBarrier,
@@ -1016,7 +1015,6 @@ fn listed(kind: &super::ir::Kind) {
         | K::StoreKeyedCached { .. }
         | K::LoadKeyedCached { .. }
         | K::BuiltinMethod(_)
-        | K::CallStaticNative
         | K::LoadTaggedField(_)
         | K::StoreTaggedField(_)
         | K::WriteBarrier

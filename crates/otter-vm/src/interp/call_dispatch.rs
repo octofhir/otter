@@ -518,6 +518,7 @@ impl Interpreter {
         // been borrowed by its entries; with no execution left they go.
         if enclosing.is_none() {
             self.owner_cache.borrow_mut().release_retired();
+            self.caller_owner_cache.set(None);
         }
         if let Some(call) = stack.take_pending() {
             self.release_prepared_inputs(call);

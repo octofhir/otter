@@ -288,12 +288,17 @@ pub struct NativeFunctionBody {
 }
 
 /// One body layout for VM invocation, generated guards and callee dispatch.
+/// Byte offset, from a NativeFunction cell, of its immutable entry-kind byte.
+pub(crate) const NATIVE_FUNCTION_KIND_BYTE: usize = otter_gc::header::HEADER_SIZE
+    + std::mem::offset_of!(NativeFunctionBody, call_header)
+    + call_header::KIND_OFFSET;
+
 pub(crate) fn jit_call_layout() -> crate::jit::JitNativeCallLayout {
     let header = (otter_gc::header::HEADER_SIZE
         + std::mem::offset_of!(NativeFunctionBody, call_header)) as u32;
     crate::jit::JitNativeCallLayout {
         identity_byte: header + call_header::NATIVE_REF_OFFSET as u32,
-        kind_byte: header + call_header::KIND_OFFSET as u32,
+        kind_byte: NATIVE_FUNCTION_KIND_BYTE as u32,
         flags_byte: header + call_header::FLAGS_OFFSET as u32,
         payload_byte: header + call_header::PAYLOAD_OFFSET as u32,
         captures_byte: (otter_gc::header::HEADER_SIZE

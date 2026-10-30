@@ -20,4 +20,13 @@ var counts = {}; for (var i = 0; i < 20000; i++) { var t = str.call(tags[i % tag
 out.push(Object.keys(counts).length, counts['[object Array]']);
 var hits = 0; for (var i = 0; i < 20000; i++) if (has.call(dict, 'k' + (i % 50))) hits++;
 out.push(hits);
+function fn() {} fn.custom = 1; var arrowf = () => 0; var namedLen = function named(a, b) {}; delete namedLen.name;
+out.push([has.call(fn, 'custom'), has.call(fn, 'prototype'), has.call(fn, 'name'), has.call(fn, 'length'), has.call(fn, 'nope'),
+  has.call(arrowf, 'prototype'), has.call(namedLen, 'name'), has.call(namedLen, 'length'), has.call(fn, 'zz' + built), has.call(class Q {}, 'prototype')].join(','));
+var plain = Object.create(null); var tagged = Object.create({ [Symbol.toStringTag]: 'Inherited' });
+out.push(str.call(plain), str.call(tagged), str.call(Object.create(tagged)));
+Object.defineProperty(String.prototype, Symbol.toStringTag, { value: 'Str', configurable: true }); out.push(str.call('x'), str.call(new String('y')));
+delete String.prototype[Symbol.toStringTag];
+Object.defineProperty(Number.prototype, Symbol.toStringTag, { get: function () { return typeof this; }, configurable: true }); out.push(str.call(5));
+delete Number.prototype[Symbol.toStringTag]; out.push(str.call(5), str.call(true));
 console.log(out.join('\n'));

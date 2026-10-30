@@ -2120,6 +2120,9 @@ impl Interpreter {
         context: &ExecutionContext,
         o: Value,
     ) -> Result<Value, CommittedValueError> {
+        if let Some(result) = self.direct_object_to_string(o) {
+            return result;
+        }
         self.with_handle_scope(|interp, scope| {
             let input_root = interp.scoped_value(scope, o);
             let input = interp.escape_scoped(input_root);
@@ -2178,6 +2181,79 @@ impl Interpreter {
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?,
             ))
         })
+    }
+
+    /// `Object.prototype.toString` of a value whose `@@toStringTag` lookup runs
+    /// nothing: a String, Number or Boolean primitive (whose wrapper owns no
+    /// symbol, so the lookup starts at its prototype) or an ordinary object,
+    /// over a chain of ordinary objects whose tags are absent or data. A
+    /// builtin tag answers with its canonical interned result. `None` leaves
+    /// every other value, and an accessor tag, to the specification steps.
+    fn direct_object_to_string(&mut self, o: Value) -> Option<Result<Value, CommittedValueError>> {
+        use crate::realm_intrinsics::Intrinsic;
+        let first = if o.is_string() {
+            self.realm_intrinsics.get(Intrinsic::StringPrototype)?
+        } else if o.is_number() {
+            self.realm_intrinsics.get(Intrinsic::NumberPrototype)?
+        } else if o.is_boolean() {
+            self.realm_intrinsics.get(Intrinsic::BooleanPrototype)?
+        } else {
+            o.as_object()?
+        };
+        let builtin = crate::object_statics::builtin_to_string_tag_value(o, self).ok()?;
+        let heap = &self.gc_heap;
+        let mut explicit = None;
+        let mut link = Some(first);
+        for _ in 0..object::PROTO_CHAIN_HARD_CAP {
+            let Some(current) = link else { break };
+            if !crate::object_statics::has_ordinary_own_lookup(current, heap)
+                || object::state(current, heap).is_opaque()
+            {
+                return None;
+            }
+            match object::lookup_own_well_known_symbol(current, heap, WellKnown::ToStringTag) {
+                object::PropertyLookup::Absent => {}
+                object::PropertyLookup::Data { value, .. } => {
+                    explicit = Some(value);
+                    break;
+                }
+                object::PropertyLookup::Accessor { .. } => return None,
+            }
+            match object::prototype_value(current, heap) {
+                None => link = None,
+                Some(prototype) => link = Some(prototype.as_object()?),
+            }
+        }
+        if let Some(tag) = explicit.and_then(|tag| tag.as_string(heap)) {
+            let display = format!("[object {}]", tag.to_lossy_string(heap));
+            return Some(
+                JsString::from_str(&display, self.gc_heap_mut())
+                    .map(Value::string)
+                    .map_err(|error| CommittedValueError::JavaScript(error.into())),
+            );
+        }
+        let display = match builtin {
+            "Object" => "[object Object]",
+            "Array" => "[object Array]",
+            "Function" => "[object Function]",
+            "String" => "[object String]",
+            "Number" => "[object Number]",
+            "Boolean" => "[object Boolean]",
+            "Arguments" => "[object Arguments]",
+            "Error" => "[object Error]",
+            "Date" => "[object Date]",
+            "RegExp" => "[object RegExp]",
+            _ => return None,
+        };
+        Some(
+            crate::object::shape_interner::ShapeInterner::intern_key_with_roots(
+                self.gc_heap_mut(),
+                display,
+                &mut |_| {},
+            )
+            .map(|(handle, _)| Value::string_gc(handle))
+            .map_err(|error| CommittedValueError::JavaScript(error.into())),
+        )
     }
 
     /// §23.1.3.32 `Array.prototype.toLocaleString`. Unlike `toString`

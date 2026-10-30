@@ -3448,6 +3448,57 @@ impl GcHeap {
         Ok(())
     }
 
+    /// Drop `bytes` from the front of a cell's trailing storage in place: its
+    /// header and the `fixed` bytes that start the cell (header included)
+    /// move forward by `bytes`, and the vacated range becomes a free filler,
+    /// so the trailing words after the dropped ones stay where they are. The
+    /// moved header keeps its flags. Returns the cell's new offset; `None`
+    /// leaves the cell untouched when it cannot move: on a large-object page,
+    /// while remembered (the remembered list names it by offset), or while
+    /// marking or sweeping walk cells by address.
+    ///
+    /// # Safety
+    ///
+    /// `cell` names a live cell whose only reference the caller rewrites to
+    /// the returned offset; `fixed` covers the header and the cell's fixed
+    /// part, which its trailing storage follows.
+    pub unsafe fn trim_cell_start(
+        &mut self,
+        cell: RawGc,
+        fixed: usize,
+        bytes: usize,
+    ) -> Option<RawGc> {
+        if bytes == 0
+            || !bytes.is_multiple_of(crate::page::CELL_SIZE)
+            || self.marking.is_marking()
+            || self.sweeping.is_some()
+        {
+            return None;
+        }
+        // SAFETY: per docstring, `cell` names a live in-cage header.
+        unsafe {
+            let header = cage_base().add(cell.0 as usize) as *mut GcHeader;
+            let space = crate::page::Page::space_of(header as *const u8);
+            if matches!(space, crate::page::SpaceKind::Large | crate::page::SpaceKind::NewLarge)
+                || (*header).is_remembered()
+            {
+                return None;
+            }
+            let size = (*header).size_bytes() as usize;
+            if fixed + bytes > size {
+                return None;
+            }
+            let moved = header.cast::<u8>().add(bytes);
+            std::ptr::copy(header.cast::<u8>(), moved, fixed);
+            moved
+                .add(crate::header::HEADER_SIZE_BYTES_OFFSET)
+                .cast::<u32>()
+                .write_unaligned((size - bytes) as u32);
+            header.write(GcHeader::new_free(bytes as u32));
+            Some(RawGc(cell.0 + bytes as u32))
+        }
+    }
+
     /// `OTTER_GC_VERIFY`: before a scavenge, every young child an old cell
     /// holds is reached by a trace the scavenge runs: of a remembered parent
     /// or of a young cell, either of which may walk storage it keeps out of

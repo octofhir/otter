@@ -3094,7 +3094,9 @@ impl Interpreter {
         // per-element get/set/delete protocol. `is_fully_dense` rules out holes,
         // which would otherwise make the spec's `Get` read an inherited value.
         if let Some(arr) = o.as_array()
-            && crate::array::is_fully_dense(arr, self.gc_heap())
+            && ((!self.array_index_accessor_protector
+                && crate::array::is_dense_over_length(arr, self.gc_heap()))
+                || crate::array::is_fully_dense(arr, self.gc_heap()))
         {
             let cur = crate::array::len(arr, self.gc_heap());
             if cur > 0

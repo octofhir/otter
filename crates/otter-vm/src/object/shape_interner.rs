@@ -4,6 +4,8 @@
 //! - `ShapeInterner` owns the isolate's one id, transition and state-variant table.
 //! - Heap-only preparation registers roots and interns every append transition.
 //! - Root tracing, turn pins, weak pruning and restored-page rebuilding share that owner.
+//! - A weak `[[Prototype]]`-change cache maps a shape and a lineage root to the
+//!   shape its slots replay to there.
 //!
 //! # Invariants
 //! - The heap's `IsolateNames` owns exactly one interner; no heap pointer is retained.
@@ -53,6 +55,9 @@ pub(crate) struct WeakShapeTables {
     children: FxHashMap<ShapeId, smallvec::SmallVec<[ShapeHandle; 2]>>,
     /// Rooted state variants are weak and keyed by stable source identity.
     state_variants: FxHashMap<(ShapeId, ShapeState), ShapeHandle>,
+    /// A shape's slots replayed onto another lineage root (a `[[Prototype]]`
+    /// change), keyed by the source and the root; weak like the variants.
+    prototype_variants: FxHashMap<(ShapeId, ShapeId), ShapeHandle>,
     /// Transitions out of each provisional shape: the tree slack tracking
     /// finishes in place.
     provisional_children: FxHashMap<ShapeId, smallvec::SmallVec<[ShapeHandle; 2]>>,
@@ -277,6 +282,45 @@ impl ShapeInterner {
         Ok(result)
     }
 
+    /// The shape `source`'s slots took when replayed onto `root`, if that
+    /// replay was recorded and both are still the shapes it was keyed by.
+    pub(crate) fn prototype_variant(
+        heap: &GcHeap,
+        source: ShapeHandle,
+        root: ShapeHandle,
+    ) -> Option<ShapeHandle> {
+        let key = (
+            heap.read_payload(source, ShapeBody::id),
+            heap.read_payload(root, ShapeBody::id),
+        );
+        Self::of(heap)
+            .tables
+            .borrow()
+            .prototype_variants
+            .get(&key)
+            .copied()
+    }
+
+    /// Record that `source`'s slots replayed onto `root` give `result`. The
+    /// replay depends on nothing else: the source's ordered keys and
+    /// attributes, and the root's prototype, capacity and state.
+    pub(crate) fn record_prototype_variant(
+        heap: &GcHeap,
+        source: ShapeHandle,
+        root: ShapeHandle,
+        result: ShapeHandle,
+    ) {
+        let key = (
+            heap.read_payload(source, ShapeBody::id),
+            heap.read_payload(root, ShapeBody::id),
+        );
+        Self::of(heap)
+            .tables
+            .borrow_mut()
+            .prototype_variants
+            .insert(key, result);
+    }
+
     pub(crate) fn handle_for_id(
         heap: &impl crate::heap_read::HeapRead,
         id: ShapeId,
@@ -487,6 +531,7 @@ impl ShapeInterner {
             transitions,
             children,
             state_variants,
+            prototype_variants,
             provisional_children,
             ..
         } = &mut *tables;
@@ -499,6 +544,11 @@ impl ShapeInterner {
         });
         state_variants.retain(|(source, _), result| {
             handles_by_id.contains_key(source) && heap.is_marked(result.raw())
+        });
+        prototype_variants.retain(|(source, root), result| {
+            handles_by_id.contains_key(source)
+                && handles_by_id.contains_key(root)
+                && heap.is_marked(result.raw())
         });
         if dead.is_empty() {
             return;

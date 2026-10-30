@@ -141,12 +141,19 @@ impl Interpreter {
             shape_body::inline_capacity_of(shape),
             target,
         )?;
+        use crate::object::shape_interner::ShapeInterner;
         let new_shape = if shape_body::is_dictionary_of(shape) {
             shape_body::dictionary_of(root)
+        } else if let Some(cached) = ShapeInterner::prototype_variant(&self.gc_heap, shape, root) {
+            // Objects of one layout moved to one prototype take one shape:
+            // the replay ran once.
+            cached
         } else {
             let ordered = object::shape_ordered_slot_attrs(&self.gc_heap, shape);
             let mut no_extra = |_: &mut dyn FnMut(*mut RawGc)| {};
-            self.replay_slots_from(root, obj, &ordered, &mut no_extra)?
+            let replayed = self.replay_slots_from(root, obj, &ordered, &mut no_extra)?;
+            ShapeInterner::record_prototype_variant(&self.gc_heap, shape, root, replayed);
+            replayed
         };
         object::install_prototype_shape(*obj, &mut self.gc_heap, new_shape);
         Ok(true)

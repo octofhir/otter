@@ -33,11 +33,15 @@ fn receiver(vm: &mut Interpreter, root: ShapeHandle, fields: usize) -> Value {
             )
             .expect("receiver's source fields");
     }
-    let object = vm
-        .alloc_runtime_rooted_object_with_shape(root, &mut [], &mut [])
-        .expect("physical receiver cell");
-    let values = vec![Value::UNDEFINED; fields];
-    object::install_fresh_shape_with_slots(object, &mut vm.gc_heap, shape, &values, fields);
+    let mut values = vec![Value::UNDEFINED; fields];
+    let object = object::alloc_object_with_shape_and_values_roots(
+        &mut vm.gc_heap,
+        shape,
+        &mut values,
+        otter_gc::SitePlacement::Young(0),
+        &mut |_| {},
+    )
+    .expect("physical receiver cell");
     Value::object(object)
 }
 fn ticket(layout: ConstructorLayout, receiver: Value) -> Frame {

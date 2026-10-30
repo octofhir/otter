@@ -22,9 +22,10 @@
 //!   reduction is named here, beside the identity it is proved by, never by
 //!   a stub id or property name in the compiler.
 //! - A declaration with [`JitLeafBuiltin::this_operand`] reads the call's
-//!   `this` as its first operand word. Only an explicit-receiver call
-//!   (`CallWithThis`) may lower it; plain calls and shaped method sites, which
-//!   pass no receiver word, keep the canonical path for it. Its entry proves
+//!   `this` as its first operand word. Baseline code lowers it only at an
+//!   explicit-receiver call (`CallWithThis`); plain calls and shaped method
+//!   sites pass no receiver word there. The optimizing tier also lowers a
+//!   method site, on the receiver it read the method from. Its entry proves
 //!   the receiver's own type and misses on anything else.
 //! - Every declared leaf id resolves through the shared runtime-stub inventory
 //!   ([`crate::runtime_stubs::leaf_entry_shape`]): pure reads, or in-place
@@ -281,6 +282,10 @@ const JIT_LEAF_BUILTINS: &[JitLeafBuiltin] = {
         receiver_leaf(
             crate::array_prototype::native_includes,
             abi::STUB_ARRAY_INCLUDES_LEAF.id,
+        ),
+        receiver_leaf(
+            crate::object_statics::native_prototype_has_own_property,
+            abi::STUB_OBJECT_HAS_OWN_PROPERTY_LEAF.id,
         ),
         receiver_leaf(
             crate::bootstrap_collections::map_proto_get,

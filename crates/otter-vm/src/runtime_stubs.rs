@@ -896,6 +896,12 @@ pub const ARRAY_INCLUDES_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     entry: array_includes_leaf,
 };
 
+/// Callable ABI entry: leaf `Object.prototype.hasOwnProperty` of a string key.
+pub const OBJECT_HAS_OWN_PROPERTY_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
+    descriptor: crate::native_abi::STUB_OBJECT_HAS_OWN_PROPERTY_LEAF,
+    entry: object_has_own_property_leaf,
+};
+
 /// Callable ABI entry: leaf `Number(value)` call of a non-string primitive; anything else misses.
 pub const NUMBER_CALL_LEAF: LeafNoAllocStub2 = LeafNoAllocStub2 {
     descriptor: crate::native_abi::STUB_NUMBER_CALL_LEAF,
@@ -1315,6 +1321,9 @@ pub const fn leaf_no_alloc_stub2_by_id(id: RuntimeStubId) -> Option<LeafNoAllocS
         }
         id if id == crate::native_abi::STUB_ARRAY_INDEX_OF_LEAF.id => Some(ARRAY_INDEX_OF_LEAF),
         id if id == crate::native_abi::STUB_ARRAY_INCLUDES_LEAF.id => Some(ARRAY_INCLUDES_LEAF),
+        id if id == crate::native_abi::STUB_OBJECT_HAS_OWN_PROPERTY_LEAF.id => {
+            Some(OBJECT_HAS_OWN_PROPERTY_LEAF)
+        }
         id if id == crate::native_abi::STUB_OBJECT_GET_PROTOTYPE_OF_LEAF.id => {
             Some(OBJECT_GET_PROTOTYPE_OF_LEAF)
         }
@@ -3570,6 +3579,52 @@ pub extern "C" fn array_index_of_leaf(
     };
     index_of().map_or_else(NativeResultPair::miss, |index| {
         NativeResultPair::success(Value::number(crate::NumberValue::from_i32(index)))
+    })
+}
+
+/// Leaf `Object.prototype.hasOwnProperty(key)` with an object receiver whose
+/// own lookup is its named slots and a flat string key. Every own string key
+/// of such an object is an interned name, so a key no name spells is absent
+/// and any other reads the own slots by its atom. Any other receiver or key
+/// misses, with nothing observed.
+#[must_use]
+pub extern "C" fn object_has_own_property_leaf(
+    heap: *const otter_gc::GcHeap,
+    recv_bits: u64,
+    key_bits: u64,
+) -> NativeResultPair {
+    let _guard = LeafNoAllocGuard::new(heap);
+    let has_own = || {
+        let heap = heap_ref(heap)?;
+        let obj = Value::from_abi_bits(recv_bits).as_object()?;
+        let key = Value::from_abi_bits(key_bits).as_string(heap)?;
+        if !key.is_flat_or_latin1(heap)
+            || !crate::object_statics::has_ordinary_own_lookup(obj, heap)
+        {
+            return None;
+        }
+        let names = crate::isolate_names::names(heap);
+        let atom = heap
+            .read_payload(key.handle(), crate::string::JsStringBody::cached_atom)
+            .or_else(|| crate::string::gc_body::lookup_atom_in_place(heap, key.handle(), names))
+            .filter(|&atom| atom != crate::property_atom::AtomId::NONE);
+        let Some(atom) = atom else {
+            return Some(false);
+        };
+        let name = names.spelling(atom)?.clone();
+        let lookup = crate::object::lookup_own_atom(
+            obj,
+            heap,
+            crate::property_atom::AtomizedPropertyKey::new(
+                crate::property_atom::PropertyAtom::new(atom),
+                &name,
+            ),
+        )
+        .lookup;
+        Some(!matches!(lookup, crate::object::PropertyLookup::Absent))
+    };
+    has_own().map_or_else(NativeResultPair::miss, |present| {
+        NativeResultPair::success(Value::boolean(present))
     })
 }
 

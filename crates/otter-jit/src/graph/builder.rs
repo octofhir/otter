@@ -4738,6 +4738,32 @@ impl<'a> Builder<'a> {
             && !self.exited_for(ExitReason::TypeMismatch)
         {
             let identity_left = self.exited_for(ExitReason::IdentityGuard);
+            // `native.call(thisArg, ...)` of the one native the site applied
+            // the intrinsic to: its leaf on `thisArg` and the rest.
+            if let Some(target) = site.native
+                && !identity_left
+                && let Some(declaration) =
+                    super::native_leaf::admit(self.view, target, arguments.len().saturating_sub(1))
+            {
+                self.add(
+                    Kind::CheckFunctionPrototypeCall(instruction.byte_pc),
+                    &[callee],
+                    Repr::None,
+                );
+                let (this_arg, rest) = match arguments.split_first() {
+                    Some((&this_arg, rest)) => (this_arg, rest),
+                    None => (self.undefined, &[][..]),
+                };
+                let rest: SmallVec<[NodeId; 8]> = rest.iter().copied().collect();
+                return self.emit_native_leaf_call(
+                    instruction,
+                    target,
+                    declaration,
+                    this,
+                    this_arg,
+                    &rest,
+                );
+            }
             let plan = site
                 .callee
                 .filter(|callee| !identity_left || self.constant_closure_of(this, callee.plan))
@@ -5072,11 +5098,11 @@ impl<'a> Builder<'a> {
                 .property_accesses
                 .get(&byte_pc)
                 .is_some_and(|site| site.shared);
-        // A reducible builtin the site saw, read like a named load: when the
-        // method read is that native, its graph operation runs, so an inlined
-        // body stays inlined. Once a reduced operand was not of the expected
-        // type here, the baseline operation takes the call, as it does for
-        // every other leaf method, whose misses it commits.
+        // A registry builtin the site saw, read like a named load: when the
+        // method read is that native, its graph operation or its leaf runs on
+        // the receiver read here, so an inlined body stays inlined. Once an
+        // operand was not of the expected type here, the baseline operation
+        // takes the call and commits its misses.
         // A guard on the namespace's shape proves the same native the named
         // read checks; an exotic receiver's guard names a builtin of its own.
         let exotic_guard = self
@@ -5097,8 +5123,6 @@ impl<'a> Builder<'a> {
             && !self.exited_for(ExitReason::TypeMismatch)
             && let Some((target, declaration)) =
                 self.admitted_native_leaf(instruction, arguments.len())
-            && declaration.reduction != otter_vm::jit_static_native::JitBuiltinReduction::Leaf
-            && !declaration.this_operand
         {
             let receiver = self.read(receiver);
             let receiver = self.tagged(receiver);
@@ -5110,10 +5134,10 @@ impl<'a> Builder<'a> {
                 })
                 .collect();
             let callee = self.named_lookup(byte_pc, receiver);
-            return self.emit_reduced_method_call(
+            return self.emit_native_leaf_call(
                 instruction,
+                target,
                 declaration,
-                target.builtin_native_ref,
                 callee,
                 receiver,
                 &arguments,
@@ -5185,38 +5209,6 @@ impl<'a> Builder<'a> {
         }
         let callee = self.named_lookup(byte_pc, receiver);
         self.emit_call_with_receiver(instruction, callee, receiver, &arguments, None);
-    }
-
-    /// A reducible builtin's method call whose method was read like a named
-    /// load: the method read is checked to be the site's native, leaving
-    /// eagerly otherwise, and its registry reduction runs. After an identity
-    /// exit the recompile keeps the ordinary method call.
-    fn emit_reduced_method_call(
-        &mut self,
-        instruction: &Instruction,
-        declaration: &otter_vm::jit_static_native::JitLeafBuiltin,
-        native_ref: u32,
-        callee: NodeId,
-        receiver: NodeId,
-        arguments: &[NodeId],
-    ) {
-        self.add(
-            Kind::CheckNative(native_ref, DeoptReason::WrongValue),
-            &[callee],
-            Repr::None,
-        );
-        let destination = instruction.writes[0];
-        match self.reduce_builtin(declaration, receiver, arguments) {
-            Some(result) => self.write(destination, result),
-            None => self.emit_receiver_call(
-                instruction,
-                callee,
-                receiver,
-                arguments,
-                None,
-                Some(destination),
-            ),
-        }
     }
 
     /// A method call whose receivers had several observed shapes: the

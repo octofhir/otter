@@ -1356,6 +1356,9 @@ pub struct JitFunctionPrototypeCallSite {
     /// site called one; `None` for a site that called several, whose call
     /// still becomes an ordinary call of the function it is applied to.
     pub callee: Option<JitDirectCallee>,
+    /// The declared leaf of the one native the site applied the intrinsic
+    /// to, when it applied only that native and it has one.
+    pub native: Option<JitStaticNativeCall>,
 }
 
 /// A callee the compiler may splice into a caller's `Op::Call` site.

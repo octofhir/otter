@@ -1998,6 +1998,7 @@ impl Baker<'_> {
                         matches!(
                             target.target,
                             feedback::OrdinaryCallTarget::FunctionPrototypeCall(_)
+                                | feedback::OrdinaryCallTarget::FunctionPrototypeCallNative(_)
                         )
                     }) =>
                 {
@@ -2009,6 +2010,7 @@ impl Baker<'_> {
                             jit::JitFunctionPrototypeCallSite {
                                 proof,
                                 callee: None,
+                                native: None,
                             },
                         );
                     }
@@ -2046,6 +2048,38 @@ impl Baker<'_> {
                     feedback::OrdinaryCallTarget::FunctionPrototypeCall(_)
                 );
                 let callee_fid = match target.target {
+                    // `native.call(...)`: the site keeps the intrinsic's proof
+                    // and calls the native it is applied to.
+                    feedback::OrdinaryCallTarget::FunctionPrototypeCallNative(stub_id) => {
+                        let native = crate::jit_static_native::jit_leaf_builtin(stub_id)
+                            .zip(crate::jit_static_native::jit_static_call_ref_in(
+                                stub_id,
+                                &self.env.heap,
+                            ))
+                            .map(
+                                |(declaration, builtin_native_ref)| jit::JitStaticNativeCall {
+                                    builtin_native_ref,
+                                    leaf_stub_id: stub_id,
+                                    argument_count: declaration.argument_count,
+                                },
+                            );
+                        if let Some(proof) =
+                            self.function_prototype_call_proof(view, context, op, instruction_pc)
+                        {
+                            view.function_prototype_calls
+                                .entry(call_byte_pc)
+                                .and_modify(|site| {
+                                    site.callee = None;
+                                    site.native = None;
+                                })
+                                .or_insert(jit::JitFunctionPrototypeCallSite {
+                                    proof,
+                                    callee: None,
+                                    native,
+                                });
+                        }
+                        continue;
+                    }
                     feedback::OrdinaryCallTarget::Native => {
                         view.native_calls
                             .insert(call_byte_pc, jit::JitNativeCall::Native);
@@ -2244,10 +2278,14 @@ impl Baker<'_> {
                             // the proof alone.
                             view.function_prototype_calls
                                 .entry(call_byte_pc)
-                                .and_modify(|site| site.callee = None)
+                                .and_modify(|site| {
+                                    site.callee = None;
+                                    site.native = None;
+                                })
                                 .or_insert(jit::JitFunctionPrototypeCallSite {
                                     proof,
                                     callee: Some(callee),
+                                    native: None,
                                 });
                         }
                     } else {

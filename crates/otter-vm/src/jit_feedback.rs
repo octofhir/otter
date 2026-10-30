@@ -139,6 +139,10 @@ pub(crate) enum OrdinaryCallTarget {
     /// `%Function.prototype.call%` invoked with this bytecode function as
     /// its receiver: the function the call actually ran.
     FunctionPrototypeCall(u32),
+    /// `%Function.prototype.call%` invoked with a native function as its
+    /// receiver: that native's declared leaf entry id, or `0` for a native
+    /// without one, which the site calls as whichever native it is applied to.
+    FunctionPrototypeCallNative(crate::native_abi::RuntimeStubId),
     /// Any NativeFunction reached through its live Host native kernel.
     /// Kind-only feedback carries no callback identity or moving handle.
     Native,
@@ -184,6 +188,7 @@ const CALL_TARGET_STATIC_NATIVE: u8 = 1;
 const CALL_TARGET_FUNCTION_PROTOTYPE_CALL: u8 = 2;
 const CALL_TARGET_NATIVE: u8 = 3;
 const CALL_TARGET_INTRINSIC: u8 = 4;
+const CALL_TARGET_FUNCTION_PROTOTYPE_CALL_NATIVE: u8 = 5;
 
 const fn call_target_kind(target: OrdinaryCallTarget) -> u8 {
     match target {
@@ -192,6 +197,9 @@ const fn call_target_kind(target: OrdinaryCallTarget) -> u8 {
         OrdinaryCallTarget::FunctionPrototypeCall(_) => CALL_TARGET_FUNCTION_PROTOTYPE_CALL,
         OrdinaryCallTarget::Native => CALL_TARGET_NATIVE,
         OrdinaryCallTarget::Intrinsic(_) => CALL_TARGET_INTRINSIC,
+        OrdinaryCallTarget::FunctionPrototypeCallNative(_) => {
+            CALL_TARGET_FUNCTION_PROTOTYPE_CALL_NATIVE
+        }
     }
 }
 
@@ -202,6 +210,7 @@ const fn call_target_payload(target: OrdinaryCallTarget) -> u32 {
         OrdinaryCallTarget::FunctionPrototypeCall(fid) => fid,
         OrdinaryCallTarget::Native => 0,
         OrdinaryCallTarget::Intrinsic(kind) => kind.feedback_payload(),
+        OrdinaryCallTarget::FunctionPrototypeCallNative(stub_id) => stub_id,
     }
 }
 
@@ -227,6 +236,9 @@ fn unpack_call_target(packed: u64, kind: u8) -> CallTargetCount {
                 "kind-only native feedback has no identity payload"
             );
             OrdinaryCallTarget::Native
+        }
+        CALL_TARGET_FUNCTION_PROTOTYPE_CALL_NATIVE => {
+            OrdinaryCallTarget::FunctionPrototypeCallNative(payload)
         }
         CALL_TARGET_INTRINSIC => OrdinaryCallTarget::Intrinsic(
             crate::IntrinsicCallKind::from_feedback_payload(payload)

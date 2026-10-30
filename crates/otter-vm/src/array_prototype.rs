@@ -2252,7 +2252,8 @@ impl Interpreter {
         // is then one table read, with no spelling hashed.
         let atom = self.builtin_tag_atoms[index];
         if atom != crate::property_atom::AtomId::NONE
-            && let Some(handle) = crate::isolate_names::IsolateNames::of(&self.gc_heap).key_string(atom)
+            && let Some(handle) =
+                crate::isolate_names::IsolateNames::of(&self.gc_heap).key_string(atom)
         {
             return Some(Ok(Value::string_gc(handle)));
         }
@@ -4907,7 +4908,6 @@ pub(crate) const BUILTIN_TAG_RESULTS: [(&str, &str); 10] = [
     ("Date", "[object Date]"),
     ("RegExp", "[object RegExp]"),
 ];
-
 
 /// Dispatches callback-based `Array.prototype` NativeCtx methods.
 pub(crate) fn array_callback_native_dispatch(

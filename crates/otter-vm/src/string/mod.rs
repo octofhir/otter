@@ -501,6 +501,19 @@ impl JsString {
     /// # Errors
     /// Surfaces [`OutOfMemory`] verbatim.
     pub fn slice(self, start: u32, length: u32, heap: &mut GcHeap) -> Result<Self, OutOfMemory> {
+        // An empty or one-unit Latin-1 result is the heap's shared string:
+        // a substring's identity is unobservable, so short tokens cost no
+        // allocation.
+        let start = start.min(self.cached_len);
+        let length = length.min(self.cached_len - start);
+        if length <= 1 {
+            let first = (length == 1)
+                .then(|| self.char_code_at(start, heap))
+                .flatten();
+            if let Some(shared) = Self::shared_unit_string(length as usize, first, heap) {
+                return Ok(shared);
+            }
+        }
         let mut source = self.handle;
         let mut scope = otter_gc::RootScope::new(heap);
         // SAFETY: `source` precedes the scope and remains stationary through

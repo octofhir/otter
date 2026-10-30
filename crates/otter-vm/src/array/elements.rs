@@ -344,6 +344,25 @@ impl ElementSlabBody {
         self.mark_dirty_range(index, index + 1);
     }
 
+    /// Account for the `count` leading slots the collector trimmed off this
+    /// tagged slab (`GcHeap::trim_cell_start`): the moved header now
+    /// precedes what was slot `count`, so capacity, length and the dirty
+    /// interval all lose those slots.
+    pub(crate) fn drop_trimmed_head(&mut self, count: usize) {
+        debug_assert_eq!(self.kind, DenseElementKind::Tagged);
+        let count = u32::try_from(count).expect("trimmed slots exceed u32");
+        self.capacity -= count;
+        self.len -= count;
+        if self.dirty_start < self.dirty_end {
+            self.dirty_start = self.dirty_start.saturating_sub(count);
+            self.dirty_end = self.dirty_end.saturating_sub(count);
+            if self.dirty_start >= self.dirty_end {
+                self.dirty_start = u32::MAX;
+                self.dirty_end = 0;
+            }
+        }
+    }
+
     /// Move the `count` slots at `from` to `to`, overlapping or not, leaving
     /// what a `set` of each moved value in order would. Tagged and packed
     /// numeric words move as one block, the tagged destination range marked

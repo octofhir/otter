@@ -3665,6 +3665,9 @@ pub extern "C" fn array_shift_leaf(
     array_shift_leaf_inner(heap, recv_bits)
 }
 
+/// Longest array whose holes [`array_shift_leaf`] scans before shifting.
+const SHIFT_LEAF_SCAN_LIMIT: usize = 128;
+
 fn array_shift_leaf_inner(heap: *mut otter_gc::GcHeap, recv_bits: u64) -> NativeResultPair {
     let Some(heap) = heap_mut(heap) else {
         return NativeResultPair::miss();
@@ -3675,7 +3678,10 @@ fn array_shift_leaf_inner(heap: *mut otter_gc::GcHeap, recv_bits: u64) -> Native
     let len = crate::array::len(arr, heap);
     // Every moved index must be a present own element: a hole anywhere in the
     // range would make the spec's per-index `Get` read an inherited value.
+    // This leaf cannot see the prototype-index protector that would excuse
+    // the scan, so a long array goes to the method, which can.
     if len == 0
+        || len > SHIFT_LEAF_SCAN_LIMIT
         || !crate::array::is_fully_dense(arr, heap)
         || !dense_range_is_fast(arr, heap, 0, len)
     {

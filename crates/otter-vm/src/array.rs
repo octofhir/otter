@@ -1990,6 +1990,9 @@ fn truncate_array_body_to(body: &mut ArrayBody, len: usize) {
 #[must_use]
 pub(crate) fn dense_shift(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
     ensure_private_elements(arr, heap).expect("copying shared array elements");
+    if let Some(head) = trim_dense_head(arr, heap) {
+        return head;
+    }
     heap.with_payload(arr, |body| {
         debug_assert!(body.exotic.is_null(), "dense shift over an exotic array");
         if body.dense_len() == 0 {
@@ -2004,6 +2007,39 @@ pub(crate) fn dense_shift(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Value {
             head
         }
     })
+}
+
+/// Remove the head of a fully dense tagged array without moving any other
+/// element: the collector moves the slab's start one element forward
+/// (`GcHeap::trim_cell_start`), as a queue's shift wants. `None` leaves the
+/// array untouched when its storage cannot move that way.
+fn trim_dense_head(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Option<Value> {
+    let slab = heap.read_payload(arr, |body| body.slab);
+    if slab.is_null()
+        || elements::is_shared(slab)
+        || elements::kind_of(slab) != DenseElementKind::Tagged
+    {
+        return None;
+    }
+    let body = elements::body_of(slab)?;
+    // SAFETY: the array keeps its private slab live for these reads.
+    let (len, head) = unsafe { ((*body).len(), (*body).get(0)?) };
+    let fixed = std::mem::size_of::<otter_gc::GcHeader>()
+        + std::mem::size_of::<elements::ElementSlabBody>();
+    // SAFETY: the array holds the slab's only reference and republishes it
+    // below; the slab's header and fixed body precede its tagged words.
+    let moved = unsafe { heap.trim_cell_start(slab.raw(), fixed, std::mem::size_of::<Value>())? };
+    // SAFETY: the collector returned the moved cell's offset.
+    let slab = unsafe { elements::ElementSlabHandle::from_offset(moved.0) };
+    // SAFETY: the moved header names the same live slab body.
+    unsafe { (*elements::body_of(slab)?).drop_trimmed_head(1) };
+    heap.with_payload(arr, |body| {
+        body.slab = slab;
+        body.set_dense_len(len - 1);
+        body.set_length(len - 1);
+        body.refresh_element_cache();
+    });
+    Some(if head.is_hole() { Value::undefined() } else { head })
 }
 
 /// Insert `value` at the head of a fully dense array, sliding the rest up.
@@ -2165,6 +2201,18 @@ pub(crate) fn is_fully_dense(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
                         .is_none_or(|values| !values.iter().any(|value| value.is_hole()))
                 }),
             }
+    })
+}
+
+/// `true` when the array's dense storage covers its whole logical length
+/// and it has no rare indexed state, holes allowed. While no prototype holds
+/// an indexed property a hole reads `undefined` and moving it keeps it a
+/// hole, so the dense shift and unshift are then the spec loop without
+/// [`is_fully_dense`]'s scan.
+#[must_use]
+pub(crate) fn is_dense_over_length(arr: JsArray, heap: &otter_gc::GcHeap) -> bool {
+    heap.read_payload(arr, |body| {
+        body.exotic.is_null() && body.length() == body.dense_len()
     })
 }
 

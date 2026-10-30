@@ -11,4 +11,9 @@ var u = []; for (var i = 0; i < 300; i++) u.unshift({ u: i }); out.push(u.length
 var junk = []; for (var i = 0; i < 40000; i++) junk.push({ j: i });
 var m = 0; for (var i = 0; i < u.length; i++) m += u[i].u; out.push(m);
 var p = [1, 2, 3, 4, 5, 6, 7, 8]; p.splice(2, 3); p.splice(1, 0, 'a', 'b', 'c', 'd'); out.push(JSON.stringify(p));
+var long = []; for (var i = 0; i < 400; i++) long[i] = i % 5 ? { v: i } : undefined; delete long[3]; delete long[10];
+var firsts = []; for (var i = 0; i < 12; i++) { var x = long.shift(); firsts.push(x === undefined ? 'u' : x.v); }
+out.push(firsts.join(','), long.length, 0 in long, JSON.stringify(long[0]));
+Array.prototype[2] = 'proto'; var lp = []; for (var i = 0; i < 300; i++) lp[i] = { v: i }; delete lp[2];
+var y = lp.shift(); out.push(y.v, lp[1], lp.hasOwnProperty(1), lp.length); delete Array.prototype[2];
 console.log(out.join('\n'));

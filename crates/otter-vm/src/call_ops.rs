@@ -871,7 +871,13 @@ impl Interpreter {
         let source = self.callable_context(context, *callee)?;
         self.enter_sync_reentry()?;
         let floor = stack.floor();
-        stack.stage_call(*callee, this_value, None, args, None);
+        // One copy of the arguments into the staged span.
+        let staged: Result<(), std::convert::Infallible> =
+            stack.stage_call_with(*callee, this_value, None, None, |staged| {
+                staged.extend_from_slice(&args);
+                Ok(())
+            });
+        let Ok(()) = staged;
         let result = self.execute_prepared_call(source.as_ref(), stack);
         self.release_frames_above(stack, floor);
         self.leave_sync_reentry();

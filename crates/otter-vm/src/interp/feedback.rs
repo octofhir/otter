@@ -537,6 +537,37 @@ impl Interpreter {
         } {
             return;
         }
+        // An accessor the receiver owns is read from its own slot behind the
+        // receiver's hidden class, as an own method is.
+        if !shape.is_null() {
+            let own = crate::object::lookup_own_atom(receiver, &self.gc_heap, key);
+            if let (
+                Some(hit),
+                crate::object::PropertyLookup::Accessor {
+                    getter: own_getter,
+                    setter: own_setter,
+                    ..
+                },
+            ) = (own.hit, own.lookup)
+            {
+                let function = if setter { own_setter } else { own_getter };
+                let Some(function_id) = function
+                    .and_then(|function| function.as_closure(&self.gc_heap))
+                    .map(crate::closure::JsClosure::function_id)
+                else {
+                    self.saturate_method_site_feedback(site);
+                    return;
+                };
+                self.shape_runtime.register_shape(&self.gc_heap, shape);
+                let method_site = MethodSite {
+                    recv_shape: crate::object::shape_id(receiver, &self.gc_heap),
+                    prototype: crate::MethodLookupProof::own(),
+                    method_field: crate::object::field_location(hit.shape, u32::from(hit.slot)),
+                };
+                self.record_method_target_feedback(site, function_id, method_site);
+                return;
+            }
+        }
         let resolved = (!shape.is_null())
             .then(|| crate::cache_ir::resolve_atom_inherited_accessor(receiver, &self.gc_heap, key))
             .flatten();

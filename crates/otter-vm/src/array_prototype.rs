@@ -2162,6 +2162,17 @@ impl Interpreter {
                 .as_string(interp.gc_heap())
                 .map(|s| s.to_lossy_string(interp.gc_heap()));
             let display = format!("[object {}]", tag.as_deref().unwrap_or(builtin_tag));
+            if tag.is_none() {
+                // A builtin tag spells one of a few results: answer with its
+                // canonical interned string rather than a fresh one per call.
+                let (handle, _) = crate::object::shape_interner::ShapeInterner::intern_key_with_roots(
+                    interp.gc_heap_mut(),
+                    &display,
+                    &mut |_| {},
+                )
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                return Ok(Value::string_gc(handle));
+            }
             Ok(Value::string(
                 JsString::from_str(&display, interp.gc_heap_mut())
                     .map_err(|error| CommittedValueError::JavaScript(error.into()))?,

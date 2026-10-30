@@ -721,21 +721,25 @@ fn native_prototype_has_own_property(
         && (key.is_string() || key.is_symbol())
         && has_ordinary_own_lookup(obj, ctx.heap())
     {
-        let heap = ctx.heap();
-        // An ASCII key is read in place, as the `&str` it already is.
-        if let Some(present) = key.as_string(heap).and_then(|string| {
-            string.with_latin1(heap, |bytes| {
-                std::str::from_utf8(bytes)
-                    .ok()
-                    .filter(|_| bytes.is_ascii())
-                    .map(|name| {
-                        !matches!(
-                            crate::object::lookup_own(obj, heap, name),
-                            PropertyLookup::Absent
-                        )
-                    })
-            })?
-        }) {
+        // Every own string key of an ordinary object is an interned name: a
+        // key no name holds is absent, and any other reads the own slots by
+        // its atom, as a named load does, without hashing its spelling.
+        if let Some(string) = key.as_string(ctx.heap()) {
+            let present = match ctx.cx.interp.interned_string_key(string) {
+                None => false,
+                Some((atom, name)) => !matches!(
+                    crate::object::lookup_own_atom(
+                        obj,
+                        ctx.heap(),
+                        crate::property_atom::AtomizedPropertyKey::new(
+                            crate::property_atom::PropertyAtom::new(atom),
+                            &name,
+                        ),
+                    )
+                    .lookup,
+                    PropertyLookup::Absent
+                ),
+            };
             return Ok(Value::boolean(present));
         }
         let present = has_own_property(obj, ctx.heap(), Some(key))

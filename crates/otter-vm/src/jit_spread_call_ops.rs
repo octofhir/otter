@@ -746,73 +746,58 @@ impl Interpreter {
                 .get(crate::symbol::WellKnown::Iterator);
             let iterator_anchor =
                 interp.push_iteration_anchor(iterator_method.unwrap_or(Value::undefined())) - 1;
-            let obj = if kind == ArgumentsObjectKind::Mapped {
-                let parameter_map = mapped
+            let mapped_kind = kind == ArgumentsObjectKind::Mapped;
+            let parameter_map = mapped_kind
+                && mapped
                     .as_ref()
                     .is_some_and(|(_, entries)| !entries.is_empty());
-                let shape = interp.arguments_object_shape(
-                    stack,
-                    elements_len,
-                    true,
-                    parameter_map,
-                    iterator_method.map(|_| iterator_symbol),
-                )?;
-                let obj = interp.allocate_arguments_receiver(stack, shape)?;
-                // Allocation can relocate every pending argument. Read the
-                // canonical anchors only after the receiver exists.
-                let callee = interp.iteration_anchor(callee_anchor);
-                let iterator_root = interp.iteration_anchor(iterator_anchor);
-                let elements: SmallVec<[Value; 4]> = (elements_start
-                    ..elements_start + elements_len)
-                    .map(|index| interp.iteration_anchor(index))
-                    .collect();
-                let iterator_root = iterator_method.map(|_| iterator_root);
-                let mapped = match &mapped {
-                    Some((anchor, entries)) => Some(crate::object::MappedArguments {
-                        context: interp
-                            .iteration_anchor(*anchor)
-                            .as_context()
-                            .ok_or(VmError::InvalidOperand)?,
-                        entries: entries.clone(),
-                    }),
-                    None => None,
-                };
-                crate::arguments_object::initialize_mapped(
-                    obj,
-                    &mut interp.gc_heap,
-                    elements,
-                    callee,
-                    mapped,
-                    iterator_root,
-                    shape,
-                )?
+            let shape = interp.arguments_object_shape(
+                stack,
+                elements_len,
+                mapped_kind,
+                parameter_map,
+                iterator_method.map(|_| iterator_symbol),
+            )?;
+            // A mapped object's `callee` is the function; an unmapped one's
+            // the realm's shared restricted accessor cell.
+            let callee_anchor = if mapped_kind {
+                callee_anchor
             } else {
-                let shape = interp.arguments_object_shape(
-                    stack,
-                    elements_len,
-                    false,
-                    false,
-                    iterator_method.map(|_| iterator_symbol),
-                )?;
-                let callee = interp.restricted_callee_cell(stack)?;
-                let callee_cell_anchor = interp.push_iteration_anchor(callee) - 1;
-                let obj = interp.allocate_arguments_receiver(stack, shape)?;
-                let callee = interp.iteration_anchor(callee_cell_anchor);
-                let iterator_root = interp.iteration_anchor(iterator_anchor);
-                let elements: SmallVec<[Value; 4]> = (elements_start
-                    ..elements_start + elements_len)
-                    .map(|index| interp.iteration_anchor(index))
-                    .collect();
-                let iterator_root = iterator_method.map(|_| iterator_root);
-                crate::arguments_object::initialize_unmapped(
-                    obj,
-                    &mut interp.gc_heap,
-                    elements,
-                    callee,
-                    iterator_root,
-                    shape,
-                )?
+                let cell = interp.restricted_callee_cell(stack)?;
+                interp.push_iteration_anchor(cell) - 1
             };
+            // Every allocation above can relocate the pending values: read
+            // the canonical anchors only now.
+            let callee = interp.iteration_anchor(callee_anchor);
+            let iterator_root = iterator_method.map(|_| interp.iteration_anchor(iterator_anchor));
+            let elements: SmallVec<[Value; 4]> = (elements_start..elements_start + elements_len)
+                .map(|index| interp.iteration_anchor(index))
+                .collect();
+            let mapped = match &mapped {
+                Some((anchor, entries)) if mapped_kind => Some(crate::object::MappedArguments {
+                    context: interp
+                        .iteration_anchor(*anchor)
+                        .as_context()
+                        .ok_or(VmError::InvalidOperand)?,
+                    entries: entries.clone(),
+                }),
+                _ => None,
+            };
+            let roots = interp.collect_allocation_roots(stack);
+            let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
+                for &slot in &roots {
+                    visitor(slot);
+                }
+            };
+            let obj = crate::arguments_object::allocate(
+                &mut interp.gc_heap,
+                shape,
+                &elements,
+                callee,
+                iterator_root,
+                mapped,
+                &mut external_visit,
+            )?;
             Ok(Value::object(obj))
         };
         let result = collect(self);
@@ -846,22 +831,6 @@ impl Interpreter {
 
     /// Allocate the slotless receiver whose footprint the arguments shape owns.
     /// Pending inputs live in iteration anchors and are reread by the caller.
-    fn allocate_arguments_receiver(
-        &mut self,
-        stack: &ActivationStack,
-        shape: crate::object::ShapeHandle,
-    ) -> Result<crate::object::JsObject, VmError> {
-        let root = crate::object::shape_body::lineage_root_of(&self.gc_heap, shape);
-        let roots = self.collect_allocation_roots(stack);
-        let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-            for &slot in &roots {
-                visitor(slot);
-            }
-        };
-        crate::object::alloc_object_with_shape_roots(&mut self.gc_heap, root, &mut external_visit)
-            .map_err(VmError::from)
-    }
-
     fn spread_arguments(
         &self,
         stack: &ActivationStack,

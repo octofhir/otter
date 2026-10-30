@@ -3556,24 +3556,6 @@ pub(crate) fn place_generalized_object(
     })
 }
 
-/// Install `shape` on a fresh, slotless object together with a value for
-/// every slot it names, in shape order, reserving room for `capacity` slots.
-///
-/// The shape fixes the object's slot count, so it goes on in the same payload
-/// borrow that writes the slots, after the only allocation (the slab
-/// reservation): no collection ever sees a counted slot unwritten. Capacity
-/// is not observable — later fields become visible at their own
-/// `StoreProperty` operations.
-pub(crate) fn install_fresh_shape_with_slots(
-    obj: JsObject,
-    heap: &mut GcHeap,
-    shape: ShapeHandle,
-    values: &[Value],
-    capacity: usize,
-) {
-    install_fresh_shape(obj, heap, shape, values, capacity, true);
-}
-
 /// [`install_fresh_shape_with_slots`] for a constructor receiver whose
 /// store-only body overwrites every slot before anything can read it: the
 /// `undefined` placeholders are never field values, so no field summary

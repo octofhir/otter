@@ -80,10 +80,6 @@ pub(crate) struct IsolateNames {
     /// The canonical key string of each atom, by atom id; null where no
     /// shape has keyed the atom.
     key_strings: Vec<Cell<JsStringHandle>>,
-    #[expect(
-        dead_code,
-        reason = "read by integer keyed access through its stable address"
-    )]
     index_atoms: Box<IndexAtomCache>,
 }
 
@@ -151,6 +147,28 @@ impl IsolateNames {
     #[inline]
     pub(crate) fn names_mut(&mut self) -> &mut NameInterner {
         &mut self.names
+    }
+
+    /// The atom spelling the canonical decimal of the non-negative `index`,
+    /// when some name does: from the integer-key cache, else from the
+    /// interner, caching the hit. An atom is permanent, so a cached line
+    /// never goes stale; an unspelled index is not cached, since a later
+    /// name may spell it.
+    pub(crate) fn index_atom(&mut self, index: i32) -> Option<AtomId> {
+        debug_assert!(index >= 0);
+        let line = &mut self.index_atoms.entries[index as usize & (INDEX_ATOM_CACHE_ENTRIES - 1)];
+        if line.key == index && line.atom_plus_one != 0 {
+            return Some(AtomId::from_global(line.atom_plus_one - 1));
+        }
+        let atom = self.names.lookup(itoa::Buffer::new().format(index));
+        if atom == AtomId::NONE {
+            return None;
+        }
+        *line = IndexAtomEntry {
+            key: index,
+            atom_plus_one: atom.raw() + 1,
+        };
+        Some(atom)
     }
 
     /// `atom`'s canonical key string, once a shape has keyed it.

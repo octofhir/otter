@@ -723,19 +723,6 @@ impl PropertyActionCache {
 }
 
 impl crate::Interpreter {
-    /// Resolve a live named data slot using the one key/action cache.
-    #[must_use]
-    pub(crate) fn resolve_property_data_slot(
-        &self,
-        obj: JsObject,
-        key: AtomizedPropertyKey<'_>,
-    ) -> Option<cache_ir::ResolvedDataSlot> {
-        match self.resolve_property_load(obj, key) {
-            PropertyLoad::Data(resolved) => Some(resolved),
-            PropertyLoad::Absent(_) | PropertyLoad::Other => None,
-        }
-    }
-
     /// Resolve a named load using the one key/action cache: a live data slot,
     /// a key absent from the receiver and its whole ordinary chain, or
     /// neither (accessors, proxies, opaque lookup). Records the answer.

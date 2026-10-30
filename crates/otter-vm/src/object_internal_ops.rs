@@ -305,8 +305,9 @@ impl Interpreter {
     }
 
     /// The atom a keyed access's property key names hidden-class slots by:
-    /// an interned string's, with its spelling, or a symbol's, minted on
-    /// first use, with the symbol. `None` for any other key.
+    /// an interned string's or a canonical integer's, with its spelling, or
+    /// a symbol's, minted on first use, with the symbol. `None` for any
+    /// other key, and for a string or integer no name spells.
     pub(crate) fn keyed_property_atom(
         &mut self,
         key: Value,
@@ -317,6 +318,16 @@ impl Interpreter {
     )> {
         if let Some(string) = key.as_string(&self.gc_heap) {
             let (atom, name) = self.interned_string_key(string)?;
+            return Some((atom, Some(name), None));
+        }
+        // A canonical integer key's name is its decimal spelling: the
+        // isolate's integer-key cache answers its atom without formatting.
+        if let Some(index) = key.as_i32().filter(|index| *index >= 0) {
+            let atom = crate::isolate_names::IsolateNames::of_mut(&mut self.gc_heap)
+                .index_atom(index)?;
+            let name = crate::isolate_names::names(&self.gc_heap)
+                .spelling(atom)?
+                .clone();
             return Some((atom, Some(name), None));
         }
         let symbol = key.as_symbol(&self.gc_heap)?;

@@ -19,6 +19,18 @@ use super::*;
 use crate::property_atom::PropertyAtom;
 use crate::{Interpreter, Value};
 
+/// The live data slot a load of `key` on `obj` resolves, if any.
+fn resolved_data_slot(
+    vm: &Interpreter,
+    obj: JsObject,
+    key: AtomizedPropertyKey<'_>,
+) -> Option<cache_ir::ResolvedDataSlot> {
+    match vm.resolve_property_load(obj, key) {
+        PropertyLoad::Data(resolved) => Some(resolved),
+        PropertyLoad::Absent(_) | PropertyLoad::Other => None,
+    }
+}
+
 fn key<'a>(vm: &mut Interpreter, name: &'a str) -> AtomizedPropertyKey<'a> {
     AtomizedPropertyKey::new(
         PropertyAtom::new(crate::isolate_names::names_mut(&mut vm.gc_heap).intern(name)),
@@ -36,7 +48,7 @@ fn shared_store_keeps_geometry_and_numeric_summary_across_value_categories() {
             .unwrap();
         let property = key(vm, "x");
         let shape = object::shape(receiver, &vm.gc_heap);
-        vm.resolve_property_data_slot(receiver, property).unwrap();
+        resolved_data_slot(vm, receiver, property).unwrap();
         for physical in [Value::double(0.0), Value::double(1.25), Value::TRUE] {
             assert_eq!(
                 vm.property_cache
@@ -45,7 +57,7 @@ fn shared_store_keeps_geometry_and_numeric_summary_across_value_categories() {
                 Some(PropertyStoreAction::OwnWritable)
             );
             assert_eq!(object::shape(receiver, &vm.gc_heap), shape);
-            let resolved = vm.resolve_property_data_slot(receiver, property).unwrap();
+            let resolved = resolved_data_slot(vm, receiver, property).unwrap();
             assert_eq!(resolved.value, physical);
         }
         assert_eq!(
@@ -58,7 +70,7 @@ fn shared_store_keeps_geometry_and_numeric_summary_across_value_categories() {
 #[test]
 fn inherited_numeric_load_and_own_append_keep_independent_values() {
     vm_numeric_actions(|vm, mut first, second, property| {
-        let resolved = vm.resolve_property_data_slot(second, property).unwrap();
+        let resolved = resolved_data_slot(vm, second, property).unwrap();
         assert_eq!(resolved.hops, 1);
         let source = object::shape(second, &vm.gc_heap);
         let child = vm.shape_child(source, property.name()).unwrap();
@@ -146,7 +158,7 @@ fn inherited_load_and_own_append_preserve_independent_slots_and_writability() {
             vm.property_cache.probe_load(second, &vm.gc_heap, key),
             PropertyProbe::Unknown
         ));
-        let resolved = vm.resolve_property_data_slot(second, key).unwrap();
+        let resolved = resolved_data_slot(vm, second, key).unwrap();
         assert_eq!(resolved.hops, 1);
         assert_eq!(resolved.hit.slot, 1);
         assert!(resolved.is_writable, "actual inherited descriptor");
@@ -321,7 +333,7 @@ fn full_gc_clears_weak_loads_and_keeps_the_actual_append_word_live() {
             let mut receiver = object::alloc_object_old_for_fixture(&mut vm.gc_heap).unwrap();
             let receiver_root = vm.scoped_value(inner, Value::object(receiver));
             assert!(object::set_prototype(&mut receiver, &mut vm.gc_heap, Some(holder)).unwrap());
-            let resolved = vm.resolve_property_data_slot(receiver, weak_key).unwrap();
+            let resolved = resolved_data_slot(vm, receiver, weak_key).unwrap();
             assert_eq!(resolved.value, Value::number_i32(113));
             assert_eq!(vm.escape_scoped(holder_root).as_object().unwrap(), holder);
             assert_eq!(

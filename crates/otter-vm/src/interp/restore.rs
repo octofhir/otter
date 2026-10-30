@@ -174,6 +174,7 @@ impl Interpreter {
             simple_constructor_absence: rustc_hash::FxHashMap::default(),
             function_constructor_layouts: rustc_hash::FxHashMap::default(),
             arguments_shape_cache: rustc_hash::FxHashMap::default(),
+            dynamic_functions: Default::default(),
             max_stack_depth: crate::DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
             allow_blocking_atomics_wait: false,

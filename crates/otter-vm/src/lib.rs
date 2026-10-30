@@ -118,6 +118,7 @@ pub mod cache_ir;
 pub mod class_constructor;
 mod class_ops;
 pub mod deopt;
+mod dynamic_function_cache;
 pub mod dynamic_import;
 pub mod error_classes;
 mod error_ops;
@@ -1000,6 +1001,8 @@ pub struct Interpreter {
     /// above.
     arguments_shape_cache:
         rustc_hash::FxHashMap<(u32, arguments_object::ArgumentsShapeKind), object::ShapeHandle>,
+    /// Chunks linked from `new Function` sources, reused by the same text.
+    dynamic_functions: dynamic_function_cache::DynamicFunctionCache,
     max_stack_depth: u32,
     /// Active synchronous host/interpreter JavaScript re-entry depth. Generated
     /// calls use the immutable effective activation limit computed when their

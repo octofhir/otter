@@ -55,7 +55,7 @@ use crate::{
 
 /// §20.2.1.1.1 CreateDynamicFunction `kind` parameter: which function
 /// goal symbol the synthesised source compiles under.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DynamicFunctionKind {
     /// `Function(...)` — `normal`.
     Normal,
@@ -514,50 +514,23 @@ impl Interpreter {
     pub(crate) fn build_dynamic_function_from_parts(
         &mut self,
         stack: &mut ActivationStack,
-        parts: Vec<String>,
+        mut parts: Vec<String>,
         kind: DynamicFunctionKind,
     ) -> Result<Value, VmError> {
-        let (params, body): (Vec<&str>, &str) = if parts.is_empty() {
-            (Vec::new(), "")
-        } else {
-            let body = parts.last().expect("non-empty checked above").as_str();
-            let params: Vec<&str> = parts[..parts.len() - 1]
-                .iter()
-                .map(String::as_str)
-                .collect();
-            (params, body)
+        let body = parts.pop().unwrap_or_default();
+        let source = crate::dynamic_function_cache::DynamicFunctionSource {
+            kind,
+            realm: self.active_realm_id,
+            params: parts.join(","),
+            body,
         };
-        let params_joined = params.join(",");
-        let prefix = kind.source_prefix();
-        // §20.2.1.1.1 steps 20-21 — the parameter text and the body text
-        // are each parsed on their own before the assembled source is.
-        // Without that, a parameter list that swallows the generated
-        // `) {` (an unterminated comment, an open template literal, a
-        // nested `function (`) assembles into a program that parses,
-        // and the caller smuggles source past the parameter list.
-        let probe_options = EvalCompileOptions {
-            function_constructor: true,
-            ..EvalCompileOptions::default()
+        let context = match self.dynamic_functions.lookup(&source, &self.code_space) {
+            Some(context) => context,
+            None => self.link_dynamic_function(source)?,
         };
-        let params_probe = format!("({prefix} anonymous({params_joined}\n) {{\n\n}})");
-        self.compile_escaped_source(&params_probe, probe_options.clone())?;
-        let body_probe = format!("({prefix} anonymous(\n) {{\n{body}\n}})");
-        self.compile_escaped_source(&body_probe, probe_options)?;
-        let source = format!("({prefix} anonymous({params_joined}\n) {{\n{body}\n}})");
-        let module = self.compile_escaped_source(
-            &source,
-            EvalCompileOptions {
-                function_constructor: true,
-                ..EvalCompileOptions::default()
-            },
-        )?;
-        let sources = self.sources_for_dynamic_module(&module, source)?;
-        let context = self
-            .link_evictable_module(module, sources)
-            .map_err(|error| self.err_link(error))?;
-        // Running the synthesised module's `<main>` returns the
-        // function value (the parenthesised expression is the
-        // program's completion).
+        // Running the synthesised module's `<main>` returns a fresh
+        // function value (the parenthesised expression is the program's
+        // completion).
         let main = context.exec_main();
         let self_value = self.main_self_closure(&context, main.id, Value::undefined())?;
         let floor = stack.floor();
@@ -570,6 +543,45 @@ impl Interpreter {
         let result = self.dispatch_loop_above_rooted(&context, stack, floor);
         self.release_frames_above(stack, floor);
         result
+    }
+
+    /// Compile and link the `kind`-prefixed program of `source`, and cache
+    /// the chunk for later calls with the same text.
+    fn link_dynamic_function(
+        &mut self,
+        source: crate::dynamic_function_cache::DynamicFunctionSource,
+    ) -> Result<ExecutionContext, VmError> {
+        let prefix = source.kind.source_prefix();
+        let (params, body) = (&source.params, &source.body);
+        // §20.2.1.1.1 steps 20-21 — the parameter text and the body text
+        // are each parsed on their own before the assembled source is.
+        // Without that, a parameter list that swallows the generated
+        // `) {` (an unterminated comment, an open template literal, a
+        // nested `function (`) assembles into a program that parses,
+        // and the caller smuggles source past the parameter list.
+        let probe_options = EvalCompileOptions {
+            function_constructor: true,
+            ..EvalCompileOptions::default()
+        };
+        let params_probe = format!("({prefix} anonymous({params}\n) {{\n\n}})");
+        self.compile_escaped_source(&params_probe, probe_options.clone())?;
+        let body_probe = format!("({prefix} anonymous(\n) {{\n{body}\n}})");
+        self.compile_escaped_source(&body_probe, probe_options)?;
+        let text = format!("({prefix} anonymous({params}\n) {{\n{body}\n}})");
+        let module = self.compile_escaped_source(
+            &text,
+            EvalCompileOptions {
+                function_constructor: true,
+                ..EvalCompileOptions::default()
+            },
+        )?;
+        let sources = self.sources_for_dynamic_module(&module, text)?;
+        let context = self
+            .link_evictable_module(module, sources)
+            .map_err(|error| self.err_link(error))?;
+        self.dynamic_functions
+            .insert(source, context.function_base());
+        Ok(context)
     }
 
     fn function_constructor_arg_to_string(

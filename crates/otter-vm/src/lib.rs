@@ -1006,6 +1006,9 @@ pub struct Interpreter {
         rustc_hash::FxHashMap<(u32, arguments_object::ArgumentsShapeKind), object::ShapeHandle>,
     /// Chunks linked from `new Function` sources, reused by the same text.
     dynamic_functions: dynamic_function_cache::DynamicFunctionCache,
+    /// Atom of each interned `Object.prototype.toString` builtin-tag result
+    /// (`array_prototype::BUILTIN_TAG_RESULTS` order), `NONE` until first used.
+    builtin_tag_atoms: [property_atom::AtomId; 10],
     max_stack_depth: u32,
     /// Active synchronous host/interpreter JavaScript re-entry depth. Generated
     /// calls use the immutable effective activation limit computed when their

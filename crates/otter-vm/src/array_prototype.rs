@@ -2245,28 +2245,29 @@ impl Interpreter {
                     .map_err(|error| CommittedValueError::JavaScript(error.into())),
             );
         }
-        let display = match builtin {
-            "Object" => "[object Object]",
-            "Array" => "[object Array]",
-            "Function" => "[object Function]",
-            "String" => "[object String]",
-            "Number" => "[object Number]",
-            "Boolean" => "[object Boolean]",
-            "Arguments" => "[object Arguments]",
-            "Error" => "[object Error]",
-            "Date" => "[object Date]",
-            "RegExp" => "[object RegExp]",
-            _ => return None,
-        };
-        Some(
-            crate::object::shape_interner::ShapeInterner::intern_key_with_roots(
-                self.gc_heap_mut(),
-                display,
-                &mut |_| {},
-            )
-            .map(|(handle, _)| Value::string_gc(handle))
-            .map_err(|error| CommittedValueError::JavaScript(error.into())),
-        )
+        let index = BUILTIN_TAG_RESULTS
+            .iter()
+            .position(|(tag, _)| *tag == builtin)?;
+        // The interned result's atom, found once per isolate: its key string
+        // is then one table read, with no spelling hashed.
+        let atom = self.builtin_tag_atoms[index];
+        if atom != crate::property_atom::AtomId::NONE
+            && let Some(handle) = crate::isolate_names::IsolateNames::of(&self.gc_heap).key_string(atom)
+        {
+            return Some(Ok(Value::string_gc(handle)));
+        }
+        let interned = crate::object::shape_interner::ShapeInterner::intern_key_with_roots(
+            self.gc_heap_mut(),
+            BUILTIN_TAG_RESULTS[index].1,
+            &mut |_| {},
+        );
+        Some(match interned {
+            Ok((handle, atom)) => {
+                self.builtin_tag_atoms[index] = atom;
+                Ok(Value::string_gc(handle))
+            }
+            Err(error) => Err(CommittedValueError::JavaScript(error.into())),
+        })
     }
 
     /// §23.1.3.32 `Array.prototype.toLocaleString`. Unlike `toString`
@@ -4891,6 +4892,22 @@ impl ArrayCallbackKind {
         matches!(self, Self::Reduce | Self::ReduceRight)
     }
 }
+
+/// `Object.prototype.toString`'s result for each builtin tag a receiver
+/// without `@@toStringTag` takes, in [`Interpreter::builtin_tag_atoms`] order.
+pub(crate) const BUILTIN_TAG_RESULTS: [(&str, &str); 10] = [
+    ("Object", "[object Object]"),
+    ("Array", "[object Array]"),
+    ("Function", "[object Function]"),
+    ("String", "[object String]"),
+    ("Number", "[object Number]"),
+    ("Boolean", "[object Boolean]"),
+    ("Arguments", "[object Arguments]"),
+    ("Error", "[object Error]"),
+    ("Date", "[object Date]"),
+    ("RegExp", "[object RegExp]"),
+];
+
 
 /// Dispatches callback-based `Array.prototype` NativeCtx methods.
 pub(crate) fn array_callback_native_dispatch(

@@ -9,6 +9,8 @@
 //!   `Set` keying, `Array.prototype.includes`, `String.prototype.includes`.
 //! - [`same_value_non_numeric`] — §7.2.13. Shared tail of the two
 //!   operations above.
+//! - [`StrictMatcher`] — §7.2.15 `IsStrictlyEqual` against one fixed value,
+//!   decided once for a scan over many (`Array.prototype.indexOf`).
 //! - [`crate::Interpreter::is_array`] — §7.2.2 `IsArray` resolves one Proxy
 //!   target chain and recognises lifetime-branded canonical array prototypes.
 //! - [`is_callable`] — §7.2.3 `IsCallable`. Recognises every
@@ -182,6 +184,97 @@ pub fn same_value_non_numeric(x: &Value, y: &Value, heap: &otter_gc::GcHeap) -> 
     // spec's `SameValueNonNumber` reduction (identity for
     // heap-shared shapes).
     x == y
+}
+
+/// `IsStrictlyEqual(element, search)` for one fixed `search`, with the
+/// comparison its type selects decided once: a scan over many elements then
+/// compares words for a value strict equality compares by identity, numbers
+/// as numbers, and string contents only after their handles and lengths
+/// differ and agree.
+#[derive(Clone, Copy)]
+pub(crate) enum StrictMatcher {
+    /// An Object, Symbol, Boolean, `null` or `undefined`: the same value word.
+    Identity(u64),
+    /// A Number other than NaN (NaN equals nothing).
+    Number(f64),
+    /// NaN.
+    Never,
+    /// A String: its word, length and contents.
+    String(u64, crate::string::JsString),
+    /// A BigInt: the general comparison.
+    General(Value),
+}
+
+impl StrictMatcher {
+    #[must_use]
+    pub(crate) fn new(search: Value, heap: &otter_gc::GcHeap) -> Self {
+        if let Some(number) = search.as_number() {
+            let number = number.as_f64();
+            return if number.is_nan() {
+                Self::Never
+            } else {
+                Self::Number(number)
+            };
+        }
+        if let Some(string) = search.as_string(heap) {
+            return Self::String(search.to_bits(), string);
+        }
+        if search.is_big_int() {
+            return Self::General(search);
+        }
+        Self::Identity(search.to_bits())
+    }
+
+    /// Whether `IsStrictlyEqual(element, search)` holds.
+    #[inline]
+    #[must_use]
+    pub(crate) fn matches(&self, element: &Value, heap: &otter_gc::GcHeap) -> bool {
+        match *self {
+            Self::Identity(word) => element.to_bits() == word,
+            Self::Number(number) => element.as_number().is_some_and(|e| e.as_f64() == number),
+            Self::Never => false,
+            Self::String(word, string) => {
+                element.to_bits() == word
+                    || element
+                        .as_string(heap)
+                        .is_some_and(|e| e.len() == string.len() && e.equals(string, heap))
+            }
+            Self::General(search) => is_strictly_equal(element, &search, heap),
+        }
+    }
+
+    /// The first index of `values` holding a match, `Ok(None)` when none
+    /// does, or `Err(index)` at a hole met before any match. One loop per
+    /// comparison kind.
+    #[must_use]
+    pub(crate) fn scan(
+        &self,
+        values: &[Value],
+        heap: &otter_gc::GcHeap,
+    ) -> Result<Option<usize>, usize> {
+        fn first(
+            values: &[Value],
+            mut matches: impl FnMut(&Value) -> bool,
+        ) -> Result<Option<usize>, usize> {
+            for (index, value) in values.iter().enumerate() {
+                if value.is_hole() {
+                    return Err(index);
+                }
+                if matches(value) {
+                    return Ok(Some(index));
+                }
+            }
+            Ok(None)
+        }
+        match *self {
+            Self::Identity(word) => first(values, |value| value.to_bits() == word),
+            Self::Number(number) => first(values, |value| {
+                value.as_number().is_some_and(|e| e.as_f64() == number)
+            }),
+            Self::Never => first(values, |_| false),
+            _ => first(values, |value| self.matches(value, heap)),
+        }
+    }
 }
 
 /// §7.2.15 IsStrictlyEqual ( x, y )

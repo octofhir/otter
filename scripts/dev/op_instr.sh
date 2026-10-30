@@ -107,6 +107,9 @@ case_body() {
     isext) echo 's = (s + (Object.isExtensible(pobj) ? 1 : 0)) | 0;' ;;
     isextpoly) echo 's = (s + (nfns[i & 1](pobj) ? 1 : 0)) | 0;' ;;
     otostrcall) echo 's = (s + otostr.call(pobj).length) | 0;' ;;
+    arrforeach) echo 'smallarr.forEach((v) => { s = (s + v) | 0; });' ;;
+    arrsome) echo 's = (s + (smallarr.some((v) => v === 9) ? 1 : 0)) | 0;' ;;
+    strreplacefn) echo 's = (s + "a-b".replace("-", () => "+").length) | 0;' ;;
     switchs) echo 'switch (keys[i & 7]) { case "k0": s = (s + 1) | 0; break; case "k1": s = (s + 2) | 0; break; default: s = (s + 3) | 0; }' ;;
     *) echo "unknown case $1" >&2; exit 1 ;;
   esac

@@ -4924,6 +4924,26 @@ pub(crate) const BUILTIN_TAG_RESULTS: [(&str, &str); 10] = [
     ("RegExp", "[object RegExp]"),
 ];
 
+/// Index visit order of a callback method: a dense ladder up or down, or a
+/// listed sparse set behind an optional dense prefix.
+enum CallbackIndices {
+    Up(std::ops::Range<usize>),
+    Down(std::iter::Rev<std::ops::Range<usize>>),
+    Listed(std::iter::Chain<std::ops::Range<usize>, std::vec::IntoIter<usize>>),
+}
+
+impl Iterator for CallbackIndices {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            Self::Up(indices) => indices.next(),
+            Self::Down(indices) => indices.next(),
+            Self::Listed(indices) => indices.next(),
+        }
+    }
+}
+
 /// Dispatches callback-based `Array.prototype` NativeCtx methods.
 fn array_callback_native_dispatch(
     kind: ArrayCallbackKind,
@@ -5089,18 +5109,18 @@ fn array_callback_native_dispatch(
         // mid-walk). A pathological `length` (> MAX_ARRAY_LIKE_PROBE_LEN)
         // falls back to the sparse present-index set across the prototype
         // chain so the walk never runs billions of `HasProperty` probes.
-        let index_iter: Box<dyn Iterator<Item = usize>> = if len <= MAX_ARRAY_LIKE_PROBE_LEN {
+        let index_iter = if len <= MAX_ARRAY_LIKE_PROBE_LEN {
             if reverse {
-                Box::new((0..len).rev())
+                CallbackIndices::Down((0..len).rev())
             } else {
-                Box::new(0..len)
+                CallbackIndices::Up(0..len)
             }
         } else if visit_all && reverse {
             // `findLast` / `findLastIndex` must visit absent indices too.
             // For pathological array-like lengths we cannot probe the whole
             // range, but the spec-observable first reverse callback is the
             // clamped final index.
-            Box::new(std::iter::once(len.saturating_sub(1)))
+            CallbackIndices::Listed((0..0).chain(vec![len.saturating_sub(1)]))
         } else {
             let mut indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
             let mut current = receiver;
@@ -5135,9 +5155,9 @@ fn array_callback_native_dispatch(
                 // possible, so the dense prefix runs first and the
                 // present-index set covers what lies beyond it.
                 v.retain(|index| *index >= MAX_ARRAY_LIKE_PROBE_LEN);
-                Box::new((0..MAX_ARRAY_LIKE_PROBE_LEN).chain(v))
+                CallbackIndices::Listed((0..MAX_ARRAY_LIKE_PROBE_LEN).chain(v))
             } else {
-                Box::new(v.into_iter())
+                CallbackIndices::Listed((0..0).chain(v))
             }
         };
 

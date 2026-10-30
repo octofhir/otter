@@ -687,6 +687,102 @@ pub unsafe extern "C" fn call_native_entry(_ctx: *mut JitCtx) -> NativeResultPai
         native_end = sym costs::NATIVE_END);
 }
 
+/// Largest actual count a native passes to [`call_from_native`]; a longer
+/// span goes through the request mailbox, whose trampoline probes the stack.
+pub(crate) const NATIVE_TO_JS_MAX_ARGUMENTS: usize = 64;
+
+/// Call `callee` with `receiver` and the `count` values at `arguments` from
+/// a native body, through the JavaScript call ABI of [`call_generic_entry`]
+/// on the live context: the span is pushed on this stack and a compiled
+/// current generation is entered directly, its prologue building the one
+/// frame of the call; any other callee is classified as a generated call's
+/// would be. Returns the completion as such a caller receives it, `Continue`
+/// included.
+///
+/// # Safety
+/// `ctx` is the live context of the running execution and its innermost
+/// published record is not generated code (the callee's return address
+/// points here). `arguments` holds `count` initialized values, at most
+/// [`NATIVE_TO_JS_MAX_ARGUMENTS`], read before anything can collect.
+#[cfg(target_arch = "aarch64")]
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn call_from_native(
+    _ctx: *mut JitCtx,
+    _callee: u64,
+    _receiver: u64,
+    _count: u32,
+    _arguments: *const Value,
+) -> NativeResultPair {
+    core::arch::naked_asm!(
+        "stp x29, x30, [sp, #-16]!",
+        "mov x29, sp",
+        "mov w9, w3",
+        "add x10, x9, #1",
+        "and x10, x10, #-2",
+        "lsl x10, x10, #3",
+        "sub sp, sp, x10",
+        "mov x11, #0",
+        "1:",
+        "cmp x11, x9",
+        "b.hs 2f",
+        "ldr x12, [x4, x11, lsl #3]",
+        "str x12, [sp, x11, lsl #3]",
+        "add x11, x11, #1",
+        "b 1b",
+        "2:",
+        "mov x3, #{undefined}",
+        "mov x4, x9",
+        "bl {generic}",
+        "mov sp, x29",
+        "ldp x29, x30, [sp], #16",
+        "ret",
+        undefined = const Value::UNDEFINED.to_abi_bits(),
+        generic = sym call_generic_entry,
+    );
+}
+
+/// [`call_from_native`] for the x86-64 System V convention; the span sits
+/// above the return address, as the JavaScript call ABI expects.
+///
+/// # Safety
+/// As on AArch64.
+#[cfg(all(target_arch = "x86_64", not(target_os = "windows")))]
+#[unsafe(naked)]
+pub(crate) unsafe extern "C" fn call_from_native(
+    _ctx: *mut JitCtx,
+    _callee: u64,
+    _receiver: u64,
+    _count: u32,
+    _arguments: *const Value,
+) -> NativeResultPair {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "mov r9d, ecx",
+        "lea rax, [r9 + 1]",
+        "and rax, -2",
+        "shl rax, 3",
+        "sub rsp, rax",
+        "xor r10d, r10d",
+        "1:",
+        "cmp r10, r9",
+        "jae 2f",
+        "mov r11, [r8 + r10 * 8]",
+        "mov [rsp + r10 * 8], r11",
+        "inc r10",
+        "jmp 1b",
+        "2:",
+        "mov rcx, {undefined}",
+        "mov r8, r9",
+        "call {generic}",
+        "mov rsp, rbp",
+        "pop rbp",
+        "ret",
+        undefined = const Value::UNDEFINED.to_abi_bits(),
+        generic = sym call_generic_entry,
+    );
+}
+
 /// The AArch64 trampoline body; only host-entry address materialization
 /// differs between object formats.
 #[cfg(target_arch = "aarch64")]

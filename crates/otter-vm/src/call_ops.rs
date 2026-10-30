@@ -868,6 +868,9 @@ impl Interpreter {
         {
             return self.run_native_sync_rooted(stack, context, native, this_value, args);
         }
+        if let Some(result) = self.call_in_live_execution(stack, *callee, this_value, &args) {
+            return result;
+        }
         let source = self.callable_context(context, *callee)?;
         self.enter_sync_reentry()?;
         let floor = stack.floor();
@@ -882,6 +885,88 @@ impl Interpreter {
         self.release_frames_above(stack, floor);
         self.leave_sync_reentry();
         result
+    }
+
+    /// [`Self::run_callable_sync_rooted`] inside a running execution: the
+    /// call enters `callee` through the JavaScript call ABI on the live
+    /// context, as a generated call site does, so a compiled callee's
+    /// prologue builds the one frame of the call and nothing is staged,
+    /// classified or rebuilt per call. When the innermost record is generated
+    /// code (a runtime helper of its), a Host record goes between: it names
+    /// no return address into that code, so the generated record keeps its
+    /// stamped helper recipe. `None` leaves the call to a fresh execution: no
+    /// execution is running, a request mailbox is in flight, or the span is
+    /// long.
+    fn call_in_live_execution(
+        &mut self,
+        stack: &mut ActivationStack,
+        callee: Value,
+        this_value: Value,
+        args: &[Value],
+    ) -> Option<Result<Value, VmError>> {
+        let ctx = self.jit_context?.as_ptr();
+        // SAFETY: a set jit_context names the live context of the running
+        // execution, which outlives this call.
+        let caller = unsafe {
+            let frame = (*ctx).native_frame;
+            if frame.is_null()
+                || (*ctx).pending_call.caller_return_pc != 0
+                || args.len() > crate::native_abi::NATIVE_TO_JS_MAX_ARGUMENTS
+            {
+                return None;
+            }
+            frame
+        };
+        if let Err(error) = self.enter_sync_reentry() {
+            return Some(Err(error));
+        }
+        // SAFETY: as above.
+        let completion = if unsafe { (*caller).code_object_id } == 0 {
+            // SAFETY: as above; the caller's record has no generated code.
+            unsafe { enter_from_native(ctx, callee, this_value, args) }
+        } else {
+            let mut record = crate::native_abi::Frame::new(
+                crate::native_abi::VmFrameHeader {
+                    function_id: crate::native_abi::HostCallKind::Native as u32,
+                    pc: 0,
+                    register_count: 0,
+                    kind: crate::native_abi::NativeFrameKind::Host,
+                    flags: crate::native_abi::NativeFrameFlags::empty(),
+                },
+                std::ptr::NonNull::<Value>::dangling().as_ptr() as u64,
+                callee,
+                this_value,
+            );
+            record.caller = caller as u64;
+            // SAFETY: as above; the record stays published, and in place,
+            // until the call returns.
+            unsafe {
+                (*ctx).native_frame = &raw mut record;
+                let completion = enter_from_native(ctx, callee, this_value, args);
+                (*ctx).native_frame = caller;
+                completion
+            }
+        };
+        if let Some(call) = stack.take_pending() {
+            self.release_prepared_inputs(call);
+        }
+        self.leave_sync_reentry();
+        Some(
+            match completion.validate(crate::native_abi::NativeResultDomain::Execution) {
+                Some(crate::native_abi::NativeResultStatus::Success) => {
+                    Ok(completion.payload_value())
+                }
+                Some(crate::native_abi::NativeResultStatus::Throw) => {
+                    self.set_pending_uncaught_throw(completion.payload_value());
+                    Err(VmError::Uncaught)
+                }
+                // SAFETY: the context's error slot outlives the execution.
+                Some(crate::native_abi::NativeResultStatus::Fatal) => {
+                    Err(unsafe { (*(*ctx).error).take() }.unwrap_or(VmError::InvalidOperand))
+                }
+                _ => Err(VmError::InvalidOperand),
+            },
+        )
     }
 
     /// [`Self::run_callable_sync_rooted`] of a native body: the body runs
@@ -1152,4 +1237,46 @@ impl Interpreter {
         self.invoke(stack, context, &method, callee, args, dst)
             .map_err(CommittedValueError::JavaScript)
     }
+}
+
+/// Enter `callee` from a native body whose record is the innermost published
+/// one, through [`crate::native_abi::call_from_native`]. A callee that
+/// retired itself for a tail call it staged returns `Continue`; that call is
+/// entered in its place, as a generated caller does.
+///
+/// # Safety
+/// `ctx` is the live context of the running execution; its innermost record
+/// has no generated code; `args` obeys the thunk's bound.
+unsafe fn enter_from_native(
+    ctx: *mut crate::native_abi::JitCtx,
+    callee: Value,
+    this_value: Value,
+    args: &[Value],
+) -> crate::native_abi::NativeResultPair {
+    use crate::native_abi::NativeFrameFlags;
+    // SAFETY: the caller's contract; the span is read before anything
+    // collects, and the callee and receiver travel in the call ABI registers.
+    let mut completion = unsafe {
+        crate::native_abi::call_from_native(
+            ctx,
+            callee.to_abi_bits(),
+            this_value.to_abi_bits(),
+            args.len() as u32,
+            args.as_ptr(),
+        )
+    };
+    while completion.is_continue() {
+        // SAFETY: as above.
+        unsafe {
+            let request = &mut (*ctx).pending_call;
+            let staged = request.header.flags.bits()
+                & (NativeFrameFlags::TIER_ENTRY | NativeFrameFlags::TAIL_CALL)
+                != 0;
+            if request.caller_return_pc == 0 && !staged {
+                request.caller = (*ctx).native_frame as u64;
+            }
+            completion = crate::native_abi::call_trampoline(ctx);
+        }
+    }
+    completion
 }

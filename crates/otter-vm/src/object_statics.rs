@@ -746,6 +746,40 @@ fn native_prototype_has_own_property(
             .map_err(|err| object_native_error(ctx.cx.interp, "hasOwnProperty", err))?;
         return Ok(Value::boolean(present));
     }
+    // A closure's own keys are its bag's plus the synthesized `prototype`
+    // and metadata: any other key needs only the bag, by atom.
+    if let (Some(closure), Some(string)) = (
+        this_value.as_closure(ctx.heap()),
+        args.first().and_then(|key| key.as_string(ctx.heap())),
+    ) {
+        match ctx.cx.interp.interned_string_key(string) {
+            // No bag key and no synthesized name is a never-interned one.
+            None => return Ok(Value::FALSE),
+            Some((atom, name))
+                if &*name != "prototype"
+                    && crate::function_metadata::ordinary_function_metadata_key(&name)
+                        .is_none() =>
+            {
+                let heap = ctx.heap();
+                let present = closure.own_props(heap).is_some_and(|bag| {
+                    !matches!(
+                        crate::object::lookup_own_atom(
+                            bag,
+                            heap,
+                            crate::property_atom::AtomizedPropertyKey::new(
+                                crate::property_atom::PropertyAtom::new(atom),
+                                &name,
+                            ),
+                        )
+                        .lookup,
+                        PropertyLookup::Absent
+                    )
+                });
+                return Ok(Value::boolean(present));
+            }
+            Some(_) => {}
+        }
+    }
     if let Some(context) = ctx.execution_context().cloned() {
         let key_result = ctx.with_turn_parts(|interp, stack| {
             interp.to_property_key_sync(
@@ -2498,7 +2532,7 @@ fn native_to_property_key(
 
 /// Whether `target`'s own properties are exactly its named slots: no string
 /// wrapper indices, mapped arguments, host lookup or module namespace.
-fn has_ordinary_own_lookup(target: JsObject, gc_heap: &otter_gc::GcHeap) -> bool {
+pub(crate) fn has_ordinary_own_lookup(target: JsObject, gc_heap: &otter_gc::GcHeap) -> bool {
     use crate::object::ShapeState;
     let exotic = ShapeState::STRING_WRAPPER_MASK
         | ShapeState::MAPPED_ARGUMENTS_MASK

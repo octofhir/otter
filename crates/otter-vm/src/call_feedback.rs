@@ -77,7 +77,7 @@ impl Interpreter {
 
     /// The function a call of `callee` with `receiver` as `this` runs when
     /// `callee` is `%Function.prototype.call%` and `receiver` a bytecode
-    /// function.
+    /// function, or that it runs a native one.
     pub(crate) fn function_prototype_call_target(
         &self,
         callee: crate::Value,
@@ -91,6 +91,11 @@ impl Interpreter {
         });
         if !is_call {
             return None;
+        }
+        if let Some(native) = receiver.as_native_function() {
+            let leaf = crate::jit_static_native::jit_static_call_target(native, &self.gc_heap)
+                .map_or(0, |entry| entry.leaf_stub_id);
+            return Some(OrdinaryCallTarget::FunctionPrototypeCallNative(leaf));
         }
         receiver
             .as_function()

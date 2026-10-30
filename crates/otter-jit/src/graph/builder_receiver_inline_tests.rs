@@ -315,6 +315,7 @@ fn evaluated_call_intrinsic_and_target_identity_keep_the_original_call_exit() {
                 call_native_ref: 49,
             },
             callee: Some(plan(&body, JitDirectCallThisMode::SloppyGlobal)),
+            native: None,
         },
     );
     caller

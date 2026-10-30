@@ -710,7 +710,7 @@ fn native_prototype_to_locale_string(
     native_prototype_to_string(ctx, args)
 }
 
-fn native_prototype_has_own_property(
+pub(crate) fn native_prototype_has_own_property(
     ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {

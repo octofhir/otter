@@ -1404,6 +1404,12 @@ runtime_stubs! {
     STUB_ARRAY_INCLUDES_LEAF = 139 => "array_includes_leaf",
         LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
         Never, NativePair, Probe;
+
+    /// Leaf `Object.prototype.hasOwnProperty` of a flat string key on an object
+    /// whose own lookup is its named slots; anything else misses.
+    STUB_OBJECT_HAS_OWN_PROPERTY_LEAF = 140 => "object_has_own_property_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
 }
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

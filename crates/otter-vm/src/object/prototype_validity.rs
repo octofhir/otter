@@ -61,7 +61,7 @@ pub(crate) struct MethodLookupProof {
 }
 
 impl MethodLookupProof {
-    #[cfg(test)]
+    /// The proof of a slot the receiver owns: its hidden class alone fixes it.
     pub(crate) fn own() -> Self {
         Self {
             validity: None,

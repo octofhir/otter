@@ -138,6 +138,28 @@ impl Interpreter {
     /// committed and the receiver is then re-read from the traced frame. This
     /// prevents a moving collection from leaving a stale receiver in a Rust
     /// local. Dispatch owns PC advancement.
+    /// The String `value` as one contiguous run of units: a rope or a slice
+    /// of one is flattened in place, its handle rooted across the
+    /// allocation and read back. `None` for any other value.
+    pub(crate) fn contiguous_string(
+        &mut self,
+        value: Value,
+    ) -> Result<Option<crate::string::JsString>, CommittedValueError> {
+        let Some(string) = value.as_string(&self.gc_heap) else {
+            return Ok(None);
+        };
+        if string.is_contiguous(&self.gc_heap) {
+            return Ok(Some(string));
+        }
+        self.with_handle_scope(|interp, scope| {
+            let rooted = interp.scoped_value(scope, value);
+            string
+                .flatten_in_place(&mut interp.gc_heap)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+            Ok(interp.escape_scoped(rooted).as_string(&interp.gc_heap))
+        })
+    }
+
     pub(crate) fn load_element_values(
         &mut self,
         stack: &mut ActivationStack,
@@ -160,9 +182,12 @@ impl Interpreter {
             return Ok(Value::undefined());
         }
         // A string's own index below its length is its one-unit string,
-        // the heap's shared one for a Latin-1 unit.
-        if let (Some(string), Some(index)) = (recv.as_string(&self.gc_heap), idx_value_raw.as_i32())
+        // the heap's shared one for a Latin-1 unit. A rope is flattened in
+        // place first: indexing walks it otherwise, once per read.
+        if recv.is_string()
+            && let Some(index) = idx_value_raw.as_i32()
             && let Ok(index) = u32::try_from(index)
+            && let Some(string) = self.contiguous_string(recv)?
             && let Some(unit) = string.char_code_at(index, &self.gc_heap)
             && let Some(shared) =
                 crate::string::JsString::shared_unit_string(1, Some(unit), &self.gc_heap)

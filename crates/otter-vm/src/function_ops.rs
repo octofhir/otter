@@ -1192,12 +1192,17 @@ impl Interpreter {
     }
 
     /// The fixed `prototype` of a target that inherits the built-in
-    /// `@@hasInstance`, walking a class's `extends` chain to its base.
+    /// `@@hasInstance`, walking a class's `extends` chain or a function's
+    /// `[[Prototype]]` overrides to `%Function.prototype%`.
     fn fixed_has_instance_prototype(&self, target: &Value) -> Option<Value> {
         let heap = &self.gc_heap;
         let has_instance = crate::symbol::WellKnown::HasInstance;
         let own_prototype = if let Some(class) = target.as_class_constructor() {
             Value::object(class.prototype(heap))
+        } else if let Some(closure) = target.as_closure(heap) {
+            // An ordinary function's `prototype` is a non-configurable data
+            // property: its slot is the property.
+            closure.prototype_slot(heap)?.0
         } else {
             let native = target.as_native_function()?;
             let bag = native.own_properties_bag(heap);
@@ -1225,6 +1230,27 @@ impl Interpreter {
                     return Some(own_prototype);
                 }
                 current = parent;
+                continue;
+            }
+            // `%Function.prototype%[@@hasInstance]` is non-writable and
+            // non-configurable: a function reaching it without an own
+            // `@@hasInstance` on the way runs OrdinaryHasInstance.
+            if let Some(closure) = current.as_closure(heap) {
+                if closure
+                    .own_props(heap)
+                    .is_some_and(|bag| object::has_own_well_known_symbol(bag, heap, has_instance))
+                {
+                    return None;
+                }
+                match closure.proto_override(heap) {
+                    None => return Some(own_prototype),
+                    Some(parent)
+                        if parent.as_object() == self.realm_intrinsics.function_prototype() =>
+                    {
+                        return Some(own_prototype);
+                    }
+                    Some(parent) => current = parent,
+                }
                 continue;
             }
             let native = current.as_native_function()?;

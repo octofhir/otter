@@ -208,6 +208,27 @@ impl Interpreter {
         string: JsString,
         name: &str,
     ) -> Result<Value, CommittedValueError> {
+        self.load_string_primitive_property_key(
+            stack,
+            context,
+            receiver,
+            string,
+            name,
+            &VmPropertyKey::String(name),
+        )
+    }
+
+    /// [`Self::load_string_primitive_property`] with the key `name` already
+    /// in the form the lookup wants, such as a site's atom.
+    pub(crate) fn load_string_primitive_property_key(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        receiver: &Value,
+        string: JsString,
+        name: &str,
+        key: &VmPropertyKey<'_>,
+    ) -> Result<Value, CommittedValueError> {
         // §10.4.3.5 StringGetOwnProperty: only indices below the length are
         // own; any other index continues to `%String.prototype%`.
         if let Some(unit) = string_index_property_name(name)
@@ -221,7 +242,7 @@ impl Interpreter {
         if name == "length" {
             return Ok(Value::number_u32(string.len()));
         }
-        self.load_from_constructor_prototype(stack, context, "String", receiver, name)
+        self.load_from_string_prototype(stack, context, receiver, key)
     }
 
     /// [`Self::function_user_bag_with_stack_roots`] for a store whose
@@ -1277,6 +1298,9 @@ impl Interpreter {
         }
     }
 
+    /// `[[Get]]` of `name` with the primitive or collection `receiver` from the
+    /// prototype its kind names (`proto_name`'s realm intrinsic, or a
+    /// collection's prototype override).
     fn load_from_constructor_prototype(
         &mut self,
         stack: &mut ActivationStack,
@@ -1285,22 +1309,59 @@ impl Interpreter {
         receiver: &Value,
         name: &str,
     ) -> Result<Value, CommittedValueError> {
+        let proto = match self.collection_prototype_override_value(receiver) {
+            Some(proto) => proto,
+            None => self
+                .constructor_prototype_value(proto_name)
+                .map_err(CommittedValueError::Fatal)?,
+        };
+        self.load_from_prototype(
+            stack,
+            context,
+            proto,
+            receiver,
+            &VmPropertyKey::String(name),
+        )
+    }
+
+    /// [`Self::load_from_constructor_prototype`] of a String primitive with
+    /// the key already in lookup form: `%String.prototype%`'s chain.
+    fn load_from_string_prototype(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        receiver: &Value,
+        key: &VmPropertyKey<'_>,
+    ) -> Result<Value, CommittedValueError> {
+        let proto = match self
+            .realm_intrinsics
+            .get(crate::realm_intrinsics::Intrinsic::StringPrototype)
+        {
+            Some(proto) => Value::object(proto),
+            None => self
+                .constructor_prototype_value("String")
+                .map_err(CommittedValueError::Fatal)?,
+        };
+        self.load_from_prototype(stack, context, proto, receiver, key)
+    }
+
+    /// `[[Get]]` of `key` starting at `proto`, with `receiver` the receiver
+    /// of any getter. The prototype may be any object: an Array, a function
+    /// or a proxy answers through its own `[[Get]]`.
+    fn load_from_prototype(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: &ExecutionContext,
+        proto: Value,
+        receiver: &Value,
+        key: &VmPropertyKey<'_>,
+    ) -> Result<Value, CommittedValueError> {
+        if !proto.is_object_type() {
+            return Ok(Value::undefined());
+        }
         self.with_handle_scope(|interp, scope| {
             let receiver_root = interp.scoped_value(scope, *receiver);
-
-            let proto = match interp.collection_prototype_override_value(receiver) {
-                Some(proto) => proto,
-                None => interp
-                    .constructor_prototype_value(proto_name)
-                    .map_err(CommittedValueError::Fatal)?,
-            };
-            // The prototype may be any object: an Array, a function or a
-            // proxy answers through its own `[[Get]]`.
-            if !proto.is_object_type() {
-                return Ok(Value::undefined());
-            }
-            let key = VmPropertyKey::String(name);
-            match interp.ordinary_get_value(stack, Some(context), proto, *receiver, &key, 0)? {
+            match interp.ordinary_get_value(stack, Some(context), proto, *receiver, key, 0)? {
                 VmGetOutcome::Value(value) => Ok(value),
                 VmGetOutcome::InvokeGetter { getter } => interp
                     .run_callable_sync_rooted(

@@ -735,6 +735,16 @@ impl Interpreter {
         rhs_handle: Local<'_>,
     ) -> Result<Option<Value>, CommittedValueError> {
         let rhs = self.escape_scoped(rhs_handle);
+        // A closure whose `prototype` slot holds an object answers from it:
+        // the slot exists only for a function with that non-configurable
+        // data property, so nothing observable runs, and no code chunk needs
+        // resolving.
+        if let Some(closure) = rhs.as_closure(&self.gc_heap)
+            && let Some((value, _)) = closure.prototype_slot(&self.gc_heap)
+            && value.as_object().is_some()
+        {
+            return Ok(Some(value));
+        }
         if rhs.is_object() || rhs.is_proxy() {
             let key = VmPropertyKey::String("prototype");
             return match self.ordinary_get_value(stack, Some(context), rhs, rhs, &key, 0)? {

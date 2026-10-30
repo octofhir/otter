@@ -3560,13 +3560,15 @@ pub extern "C" fn array_index_of_leaf(
     value_bits: u64,
 ) -> NativeResultPair {
     let _guard = LeafNoAllocGuard::new(heap);
-    array_search_leaf(
-        heap,
-        recv_bits,
-        value_bits,
-        crate::abstract_ops::is_strictly_equal,
-    )
-    .map_or_else(NativeResultPair::miss, |index| {
+    let index_of = || {
+        let heap = heap_ref(heap)?;
+        let arr = Value::from_abi_bits(recv_bits).as_array()?;
+        let matcher =
+            crate::abstract_ops::StrictMatcher::new(Value::from_abi_bits(value_bits), heap);
+        let found = crate::array::plain_dense_index_of(arr, heap, &matcher, 0)?;
+        found.map_or(Some(-1), |index| i32::try_from(index).ok())
+    };
+    index_of().map_or_else(NativeResultPair::miss, |index| {
         NativeResultPair::success(Value::number(crate::NumberValue::from_i32(index)))
     })
 }

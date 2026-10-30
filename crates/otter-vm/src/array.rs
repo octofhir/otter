@@ -2446,29 +2446,84 @@ pub(crate) fn with_plain_dense_values<R>(
     heap: &otter_gc::GcHeap,
     f: impl FnOnce(&mut dyn Iterator<Item = Value>) -> R,
 ) -> Option<R> {
+    with_plain_dense_range(arr, heap, |length| 0..length, f)
+}
+
+/// [`with_plain_dense_values`] of the elements in the index range `range`
+/// picks for the array's length: a hole outside that range does not matter,
+/// so a read of a few elements costs only those. The range is clamped to the
+/// length.
+pub(crate) fn with_plain_dense_range<R>(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    range: impl FnOnce(usize) -> std::ops::Range<usize>,
+    f: impl FnOnce(&mut dyn Iterator<Item = Value>) -> R,
+) -> Option<R> {
     heap.read_payload(arr, |body| {
         let count = body.dense_len();
         if !body.exotic.is_null() || body.accessors().is_some() || body.length() != count {
             return None;
         }
+        let range = range(count);
+        let range = range.start.min(count)..range.end.min(count).max(range.start.min(count));
         let Some(slab) = elements::body_of(body.slab) else {
             return (count == 0).then(|| f(&mut std::iter::empty()));
         };
         // SAFETY: the array body keeps the slab reachable for this borrow.
         let slab = unsafe { &*slab };
         if let Some(values) = slab.tagged_slice() {
-            let values = values.get(..count)?;
+            let values = values.get(..count)?.get(range)?;
             if values.iter().any(|value| value.is_hole()) {
                 return None;
             }
             return Some(f(&mut values.iter().copied()));
         }
-        if (0..count).any(|index| slab.get(index).is_none_or(Value::is_hole)) {
+        if range
+            .clone()
+            .any(|index| slab.get(index).is_none_or(Value::is_hole))
+        {
             return None;
         }
         Some(f(
-            &mut (0..count).map(|index| slab.get(index).unwrap_or(Value::UNDEFINED))
+            &mut range.map(|index| slab.get(index).unwrap_or(Value::UNDEFINED))
         ))
+    })
+}
+
+/// `Array.prototype.indexOf` of the value `matcher` stands for, from index
+/// `from`, over a plain array with no hole from there to the match: the
+/// first matching index, or `Some(None)` when none matches. `None` leaves the
+/// search to its specification steps (any other array, or a hole read).
+pub(crate) fn plain_dense_index_of(
+    arr: JsArray,
+    heap: &otter_gc::GcHeap,
+    matcher: &crate::abstract_ops::StrictMatcher,
+    from: usize,
+) -> Option<Option<usize>> {
+    heap.read_payload(arr, |body| {
+        let count = body.dense_len();
+        if !body.exotic.is_null() || body.accessors().is_some() || body.length() != count {
+            return None;
+        }
+        let Some(slab) = elements::body_of(body.slab) else {
+            return (count == 0).then_some(None);
+        };
+        // SAFETY: the array body keeps the slab reachable for this borrow.
+        let slab = unsafe { &*slab };
+        let from = from.min(count);
+        if let Some(values) = slab.tagged_slice() {
+            return matcher
+                .scan(values.get(from..count)?, heap)
+                .ok()
+                .map(|found| found.map(|offset| from + offset));
+        }
+        for index in from..count {
+            let value = slab.get(index).filter(|value| !value.is_hole())?;
+            if matcher.matches(&value, heap) {
+                return Some(Some(index));
+            }
+        }
+        Some(None)
     })
 }
 

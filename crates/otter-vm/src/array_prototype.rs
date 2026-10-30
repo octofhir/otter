@@ -1127,6 +1127,18 @@ pub(crate) fn array_linear_search(
                 (len_i + n as i64).max(0)
             };
             let search = interp.iteration_anchor(search_anchor);
+            let o = interp.iteration_anchor(anchor_base);
+            if let Some(array) = o.as_array()
+                && crate::array::len(array, interp.gc_heap()) == len
+                && let Some(found) = crate::array::plain_dense_index_of(
+                    array,
+                    interp.gc_heap(),
+                    &crate::abstract_ops::StrictMatcher::new(search, interp.gc_heap()),
+                    k as usize,
+                )
+            {
+                return Ok(found.map_or(-1, |index| index as i64));
+            }
             if let Some(found) = packed_scan(interp, &mut |values, heap| {
                 values
                     .enumerate()
@@ -3619,8 +3631,8 @@ impl Interpreter {
     }
 
     /// `slice` with Number or absent bounds of a receiver whose element
-    /// reads are unobservable ([`Self::slice_source_values`]): nothing
-    /// observable runs, so the result is a copy of those values. `None`
+    /// reads are unobservable ([`Self::slice_source_range`]): nothing
+    /// observable runs, so the result is a copy of the sliced values. `None`
     /// leaves every other case to the specification steps.
     fn dense_slice(
         &mut self,
@@ -3631,24 +3643,29 @@ impl Interpreter {
         if self.active_realm_id != 0 {
             return None;
         }
-        let bound = |value: Option<&Value>, default: f64| match value {
-            None => Some(default),
-            Some(value) if value.is_undefined() => Some(default),
-            Some(value) => value.as_f64(),
+        // `Some(None)` for an absent or undefined bound, which takes its
+        // default; any non-Number leaves for ToIntegerOrInfinity.
+        let bound = |value: Option<&Value>| match value {
+            None => Some(None),
+            Some(value) if value.is_undefined() => Some(None),
+            Some(value) => value.as_f64().map(Some),
         };
-        let values = self.slice_source_values(receiver)?;
-        let len = values.len() as f64;
-        let relative = |value: f64| {
-            let integer = if value.is_nan() { 0.0 } else { value.trunc() };
-            if integer < 0.0 {
-                (len + integer).max(0.0)
-            } else {
-                integer.min(len)
-            }
+        let (start, end) = (bound(args.first())?, bound(args.get(1))?);
+        let range = move |length: usize| {
+            let len = length as f64;
+            let relative = |value: f64| {
+                let integer = if value.is_nan() { 0.0 } else { value.trunc() };
+                if integer < 0.0 {
+                    (len + integer).max(0.0)
+                } else {
+                    integer.min(len)
+                }
+            };
+            let start = start.map_or(0.0, relative) as usize;
+            let end = end.map_or(len, relative) as usize;
+            start..end.max(start)
         };
-        let start = relative(bound(args.first(), 0.0)?) as usize;
-        let end = relative(bound(args.get(1), len)?) as usize;
-        let copied = values.get(start..end.max(start)).unwrap_or(&[]);
+        let copied = self.slice_source_range(receiver, range)?;
         Some(
             self.alloc_stack_rooted_array_from_values(
                 stack,
@@ -3660,24 +3677,27 @@ impl Interpreter {
         )
     }
 
-    /// Every element `slice` reads from `receiver`, when none of those reads
-    /// and no species lookup is observable: a plain array without holes
-    /// whose `ArraySpeciesCreate` is `%Array%`, or an unmodified arguments
-    /// object (own data indices and `length`; not an Array, so its
+    /// The elements `slice` reads from `receiver` in the index range
+    /// `range` picks for its length, when none of those reads and no species
+    /// lookup is observable: a plain array without holes in that range whose
+    /// `ArraySpeciesCreate` is `%Array%`, or an unmodified arguments object
+    /// (own data indices and `length`; not an Array, so its
     /// `ArraySpeciesCreate` is `ArrayCreate`).
-    fn slice_source_values(&self, receiver: Value) -> Option<SmallVec<[Value; 8]>> {
+    fn slice_source_range(
+        &self,
+        receiver: Value,
+        range: impl FnOnce(usize) -> std::ops::Range<usize>,
+    ) -> Option<SmallVec<[Value; 8]>> {
         let Some(array) = receiver.as_array() else {
-            return self.arguments_object_direct_list(receiver);
+            let values = self.arguments_object_direct_list(receiver)?;
+            let range = range(values.len());
+            return values.get(range).map(SmallVec::from_slice);
         };
         let heap = &self.gc_heap;
         if !crate::array::is_ordinary_dense(array, heap) || !self.array_species_is_default() {
             return None;
         }
-        let values = crate::array::with_plain_dense_values(array, heap, |values| {
-            let values: SmallVec<[Value; 8]> = values.collect();
-            values
-        })?;
-        (!values.iter().any(|value| value.is_hole())).then_some(values)
+        crate::array::with_plain_dense_range(array, heap, range, |values| values.collect())
     }
 
     /// `splice` of a plain array without holes whose `ArraySpeciesCreate` is

@@ -217,6 +217,7 @@ impl Interpreter {
             function_constructor_layouts: rustc_hash::FxHashMap::default(),
             arguments_shape_cache: rustc_hash::FxHashMap::default(),
             dynamic_functions: Default::default(),
+            builtin_tag_atoms: [crate::property_atom::AtomId::NONE; 10],
             max_stack_depth: DEFAULT_MAX_STACK_DEPTH,
             sync_reentry_depth: 0,
             allow_blocking_atomics_wait: false,

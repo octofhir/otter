@@ -131,7 +131,26 @@ pub fn call(
             // the heap — re-read the target from the rooted argument
             // slot afterwards so the local copy is never stale.
             expect_object_value(args.first()).map_err(CommittedValueError::JavaScript)?;
-            let key = coerce_property_key(interp, stack, context, args.get(1))?;
+            // An interned, non-numeric string key reads by its atom: no
+            // spelling is built, and no coercion runs for a string.
+            let interned = args
+                .get(1)
+                .and_then(|key| key.as_string(interp.gc_heap()))
+                .and_then(|key| interp.interned_string_key(key))
+                .filter(|(_, name)| {
+                    crate::property_dispatch::canonical_numeric_index_string(name).is_none()
+                });
+            let atomized;
+            let key = match &interned {
+                Some((atom, name)) => {
+                    atomized = crate::property_atom::AtomizedPropertyKey::new(
+                        crate::property_atom::PropertyAtom::new(*atom),
+                        name,
+                    );
+                    VmPropertyKey::Atom(atomized)
+                }
+                None => coerce_property_key(interp, stack, context, args.get(1))?,
+            };
             let target =
                 expect_object_value(args.first()).map_err(CommittedValueError::JavaScript)?;
             let receiver = args.get(2).cloned().unwrap_or(target);

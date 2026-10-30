@@ -2168,12 +2168,13 @@ impl Interpreter {
             if tag.is_none() {
                 // A builtin tag spells one of a few results: answer with its
                 // canonical interned string rather than a fresh one per call.
-                let (handle, _) = crate::object::shape_interner::ShapeInterner::intern_key_with_roots(
-                    interp.gc_heap_mut(),
-                    &display,
-                    &mut |_| {},
-                )
-                .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
+                let (handle, _) =
+                    crate::object::shape_interner::ShapeInterner::intern_key_with_roots(
+                        interp.gc_heap_mut(),
+                        &display,
+                        &mut |_| {},
+                    )
+                    .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
                 return Ok(Value::string_gc(handle));
             }
             Ok(Value::string(
@@ -3617,22 +3618,17 @@ impl Interpreter {
         })
     }
 
-    /// `slice` of a plain array without holes whose `ArraySpeciesCreate` is
-    /// `%Array%`, with Number or absent bounds: nothing observable runs, so
-    /// the result is the dense values' copy. `None` leaves every other case
-    /// to the specification steps.
+    /// `slice` with Number or absent bounds of a receiver whose element
+    /// reads are unobservable ([`Self::slice_source_values`]): nothing
+    /// observable runs, so the result is a copy of those values. `None`
+    /// leaves every other case to the specification steps.
     fn dense_slice(
         &mut self,
         stack: &ActivationStack,
         receiver: Value,
         args: ValueWindow<'_>,
     ) -> Option<Result<Value, VmError>> {
-        let array = receiver.as_array()?;
-        let heap = &self.gc_heap;
-        if self.active_realm_id != 0
-            || !crate::array::is_ordinary_dense(array, heap)
-            || !self.array_species_is_default()
-        {
+        if self.active_realm_id != 0 {
             return None;
         }
         let bound = |value: Option<&Value>, default: f64| match value {
@@ -3640,13 +3636,7 @@ impl Interpreter {
             Some(value) if value.is_undefined() => Some(default),
             Some(value) => value.as_f64(),
         };
-        let values = crate::array::with_plain_dense_values(array, heap, |values| {
-            let values: SmallVec<[Value; 8]> = values.collect();
-            values
-        })?;
-        if values.iter().any(|value| value.is_hole()) {
-            return None;
-        }
+        let values = self.slice_source_values(receiver)?;
         let len = values.len() as f64;
         let relative = |value: f64| {
             let integer = if value.is_nan() { 0.0 } else { value.trunc() };
@@ -3668,6 +3658,26 @@ impl Interpreter {
             )
             .map(Value::array),
         )
+    }
+
+    /// Every element `slice` reads from `receiver`, when none of those reads
+    /// and no species lookup is observable: a plain array without holes
+    /// whose `ArraySpeciesCreate` is `%Array%`, or an unmodified arguments
+    /// object (own data indices and `length`; not an Array, so its
+    /// `ArraySpeciesCreate` is `ArrayCreate`).
+    fn slice_source_values(&self, receiver: Value) -> Option<SmallVec<[Value; 8]>> {
+        let Some(array) = receiver.as_array() else {
+            return self.arguments_object_direct_list(receiver);
+        };
+        let heap = &self.gc_heap;
+        if !crate::array::is_ordinary_dense(array, heap) || !self.array_species_is_default() {
+            return None;
+        }
+        let values = crate::array::with_plain_dense_values(array, heap, |values| {
+            let values: SmallVec<[Value; 8]> = values.collect();
+            values
+        })?;
+        (!values.iter().any(|value| value.is_hole())).then_some(values)
     }
 
     /// `splice` of a plain array without holes whose `ArraySpeciesCreate` is
@@ -4088,7 +4098,11 @@ impl Interpreter {
                 len,
                 actual_start,
                 actual_delete_count,
-                &arguments.iter().skip(2).map(|argument| interp.escape_scoped(*argument)).collect::<SmallVec<[Value; 8]>>(),
+                &arguments
+                    .iter()
+                    .skip(2)
+                    .map(|argument| interp.escape_scoped(*argument))
+                    .collect::<SmallVec<[Value; 8]>>(),
             ) {
                 return removed.map_err(CommittedValueError::JavaScript);
             }

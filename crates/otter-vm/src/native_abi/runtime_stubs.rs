@@ -1367,47 +1367,38 @@ runtime_stubs! {
         Alloc, CommittedValue2, 2, RuntimeStubEffects::allocating(true, true),
         Status, NativePair, Committed;
 
-    /// A call of the static native body of the callee in `values[0]` with the
-    /// receiver in `values[1]` and the rest as arguments, run without the native
-    /// call trampoline's frame: `(jit_ctx, values, count) -> value`. Generated
-    /// code proved the callee a native function of the static entry kind; its
-    /// body may run JavaScript.
-    STUB_JIT_STATIC_NATIVE_CALL = 134 => "jit_static_native_call",
-        Reentrant, ReentrantValueSpan, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
-        Status, NativePair, Committed;
-
     /// Leaf `Object.is`: §7.2.11 SameValue, every argument pair answers.
-    STUB_OBJECT_IS_LEAF = 135 => "object_is_leaf",
+    STUB_OBJECT_IS_LEAF = 134 => "object_is_leaf",
         LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
         Never, NativePair, Probe;
 
     /// Leaf `String.prototype.charAt` at an int32 index: a one-unit Latin-1 or
     /// empty result is the heap's shared string; any other unit misses.
-    STUB_STRING_CHAR_AT_LEAF = 136 => "string_char_at_leaf",
+    STUB_STRING_CHAR_AT_LEAF = 135 => "string_char_at_leaf",
         LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
         Never, NativePair, Probe;
 
     /// Leaf `String.fromCharCode` of one int32 code whose unit is Latin-1: the
     /// heap's shared one-unit string; any other code misses.
-    STUB_STRING_FROM_CHAR_CODE_LEAF = 137 => "string_from_char_code_leaf",
+    STUB_STRING_FROM_CHAR_CODE_LEAF = 136 => "string_from_char_code_leaf",
         LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
         Never, NativePair, Probe;
 
     /// Leaf `Array.prototype.indexOf` of one value over a hole-free plain dense
     /// array; anything else misses.
-    STUB_ARRAY_INDEX_OF_LEAF = 138 => "array_index_of_leaf",
+    STUB_ARRAY_INDEX_OF_LEAF = 137 => "array_index_of_leaf",
         LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
         Never, NativePair, Probe;
 
     /// Leaf `Array.prototype.includes` of one value over a hole-free plain dense
     /// array; anything else misses.
-    STUB_ARRAY_INCLUDES_LEAF = 139 => "array_includes_leaf",
+    STUB_ARRAY_INCLUDES_LEAF = 138 => "array_includes_leaf",
         LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
         Never, NativePair, Probe;
 
     /// Leaf `Object.prototype.hasOwnProperty` of a flat string key on an object
     /// whose own lookup is its named slots; anything else misses.
-    STUB_OBJECT_HAS_OWN_PROPERTY_LEAF = 140 => "object_has_own_property_leaf",
+    STUB_OBJECT_HAS_OWN_PROPERTY_LEAF = 139 => "object_has_own_property_leaf",
         LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
         Never, NativePair, Probe;
 }

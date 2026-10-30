@@ -89,6 +89,7 @@ impl Interpreter {
         owners.clear();
         if !self.jit_has_native_frames() {
             owners.release_retired();
+            self.caller_owner_cache.set(None);
         }
         drop(owners);
         let mut retained = self.code_space.evictable_retained_bytes();

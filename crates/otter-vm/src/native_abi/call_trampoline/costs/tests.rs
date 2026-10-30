@@ -229,8 +229,9 @@ fn macho_linked_coordinates_cover_the_owned_native_control_flow() {
     #[cfg(target_arch = "aarch64")]
     {
         assert_eq!(word(&bytes, 4), 0x0100_000c, "actual ARM64 executable");
-        arm64_branches_stay_with_their_body(generic_code, generic, &[publisher]);
-        arm64_branches_stay_with_their_body(native_code, native, &[publisher]);
+        let direct = on_disk(crate::interp::native_entry::native_exit_entry as *const () as usize);
+        arm64_branches_stay_with_their_body(generic_code, generic, &[publisher, native]);
+        arm64_branches_stay_with_their_body(native_code, native, &[publisher, direct]);
         arm64_branches_stay_with_their_body(publisher_code, publisher, &[trampoline]);
         arm64_branches_stay_with_their_body(trampoline_code, trampoline, &[]);
     }

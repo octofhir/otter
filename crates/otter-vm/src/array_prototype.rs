@@ -711,10 +711,11 @@ const fn method(
 }
 
 fn native_array_method(
-    name: &'static str,
+    tag: ArrayMethodTag,
     ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
+    let name = tag.name();
     let receiver = *ctx.this_value();
     // §22.1.3 step 1 — every generic `Array.prototype.*` opens with
     // `ToObject(this value)`, which throws a TypeError on `null` /
@@ -725,60 +726,54 @@ fn native_array_method(
             reason: "Array.prototype method called on null or undefined".to_string(),
         });
     }
-    let Some(exec) = ctx.execution_context().cloned() else {
+    let Some(exec) = ctx.execution_context() else {
         return Err(NativeError::TypeError {
             name,
             reason: "Array.prototype method requires an execution context".to_string(),
         });
     };
-    let Some(tag) = ArrayMethodTag::from_name(name) else {
-        return Err(NativeError::TypeError {
-            name,
-            reason: "unknown Array.prototype method".to_string(),
-        });
-    };
     ctx.with_turn_parts(|interp, stack| {
         interp
-            .array_live_method_dispatch(stack, &exec, tag, receiver, args, &mut [])
+            .array_live_method_dispatch(stack, exec, tag, receiver, args, &mut [])
             .map_err(|err| err.into_native(interp, name))
     })
 }
 macro_rules! native_array {
-    ($fn_name:ident, $js_name:literal) => {
+    ($fn_name:ident, $tag:ident) => {
         pub(crate) fn $fn_name(
             ctx: &mut NativeCtx<'_>,
             args: ValueWindow<'_>,
         ) -> Result<Value, NativeError> {
-            native_array_method($js_name, ctx, args)
+            native_array_method(ArrayMethodTag::$tag, ctx, args)
         }
     };
 }
 
-native_array!(native_pop, "pop");
-native_array!(native_shift, "shift");
-native_array!(native_unshift, "unshift");
-native_array!(native_slice, "slice");
-native_array!(native_concat, "concat");
-native_array!(native_join, "join");
-native_array!(native_includes, "includes");
-native_array!(native_index_of, "indexOf");
-native_array!(native_last_index_of, "lastIndexOf");
-native_array!(native_at, "at");
-native_array!(native_reverse, "reverse");
-native_array!(native_fill, "fill");
-native_array!(native_flat, "flat");
-native_array!(native_splice, "splice");
-native_array!(native_sort, "sort");
-native_array!(native_to_string, "toString");
-native_array!(native_copy_within, "copyWithin");
-native_array!(native_to_reversed, "toReversed");
-native_array!(native_to_spliced, "toSpliced");
-native_array!(native_to_sorted, "toSorted");
-native_array!(native_with, "with");
-native_array!(native_to_locale_string, "toLocaleString");
-native_array!(native_keys_iter, "keys");
-native_array!(native_values_iter, "values");
-native_array!(native_entries_iter, "entries");
+native_array!(native_pop, Pop);
+native_array!(native_shift, Shift);
+native_array!(native_unshift, Unshift);
+native_array!(native_slice, Slice);
+native_array!(native_concat, Concat);
+native_array!(native_join, Join);
+native_array!(native_includes, Includes);
+native_array!(native_index_of, IndexOf);
+native_array!(native_last_index_of, LastIndexOf);
+native_array!(native_at, At);
+native_array!(native_reverse, Reverse);
+native_array!(native_fill, Fill);
+native_array!(native_flat, Flat);
+native_array!(native_splice, Splice);
+native_array!(native_sort, Sort);
+native_array!(native_to_string, ToString);
+native_array!(native_copy_within, CopyWithin);
+native_array!(native_to_reversed, ToReversed);
+native_array!(native_to_spliced, ToSpliced);
+native_array!(native_to_sorted, ToSorted);
+native_array!(native_with, With);
+native_array!(native_to_locale_string, ToLocaleString);
+native_array!(native_keys_iter, Keys);
+native_array!(native_values_iter, Values);
+native_array!(native_entries_iter, Entries);
 
 /// `true` when `method` is exactly the original `%Array.prototype%` builtin
 /// installed for `name` — i.e. an un-monkey-patched native whose static
@@ -4850,24 +4845,6 @@ enum ArrayCallbackKind {
 }
 
 impl ArrayCallbackKind {
-    fn from_name(name: &str) -> Option<Self> {
-        Some(match name {
-            "forEach" => Self::ForEach,
-            "map" => Self::Map,
-            "filter" => Self::Filter,
-            "some" => Self::Some,
-            "every" => Self::Every,
-            "find" => Self::Find,
-            "findIndex" => Self::FindIndex,
-            "findLast" => Self::FindLast,
-            "findLastIndex" => Self::FindLastIndex,
-            "reduce" => Self::Reduce,
-            "reduceRight" => Self::ReduceRight,
-            "flatMap" => Self::FlatMap,
-            _ => return None,
-        })
-    }
-
     fn name(self) -> &'static str {
         match self {
             Self::ForEach => "forEach",
@@ -4948,15 +4925,11 @@ pub(crate) const BUILTIN_TAG_RESULTS: [(&str, &str); 10] = [
 ];
 
 /// Dispatches callback-based `Array.prototype` NativeCtx methods.
-pub(crate) fn array_callback_native_dispatch(
-    name: &str,
+fn array_callback_native_dispatch(
+    kind: ArrayCallbackKind,
     ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
-    let kind = ArrayCallbackKind::from_name(name).ok_or_else(|| NativeError::TypeError {
-        name: "Array.prototype callback",
-        reason: format!("unknown callback method '{name}'"),
-    })?;
     let raw_receiver = *ctx.this_value();
     if raw_receiver.is_null() || raw_receiver.is_undefined() {
         return Err(NativeError::TypeError {
@@ -4966,7 +4939,6 @@ pub(crate) fn array_callback_native_dispatch(
     }
     let context = ctx
         .execution_context()
-        .cloned()
         .ok_or_else(|| NativeError::TypeError {
             name: "Array.prototype callback",
             reason: "missing execution context".to_string(),
@@ -5172,7 +5144,7 @@ pub(crate) fn array_callback_native_dispatch(
         let mut acc = Value::undefined();
         let mut found_idx: Option<usize> = None;
         let mut found_val = Value::undefined();
-        let mut bool_acc: bool = matches!(name, "every");
+        let mut bool_acc: bool = kind == ArrayCallbackKind::Every;
         let mut target_index = 0usize;
         let mut reduce_has_init = args.len() >= 2;
         if reduce_kind && reduce_has_init {
@@ -5454,46 +5426,46 @@ pub(crate) fn array_callback_native_dispatch(
 }
 
 fn native_for_each(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("forEach", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::ForEach, ctx, args)
 }
 fn native_map(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("map", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::Map, ctx, args)
 }
 fn native_filter(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("filter", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::Filter, ctx, args)
 }
 fn native_some(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("some", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::Some, ctx, args)
 }
 fn native_every(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("every", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::Every, ctx, args)
 }
 fn native_find(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("find", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::Find, ctx, args)
 }
 fn native_find_index(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("findIndex", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::FindIndex, ctx, args)
 }
 fn native_find_last(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("findLast", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::FindLast, ctx, args)
 }
 fn native_find_last_index(
     ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("findLastIndex", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::FindLastIndex, ctx, args)
 }
 fn native_reduce(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("reduce", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::Reduce, ctx, args)
 }
 fn native_reduce_right(
     ctx: &mut NativeCtx<'_>,
     args: ValueWindow<'_>,
 ) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("reduceRight", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::ReduceRight, ctx, args)
 }
 fn native_flat_map(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    array_callback_native_dispatch("flatMap", ctx, args)
+    array_callback_native_dispatch(ArrayCallbackKind::FlatMap, ctx, args)
 }
 
 #[cfg(test)]

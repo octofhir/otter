@@ -22,6 +22,7 @@ pub(crate) mod jit_intrinsic_properties;
 mod jit_retraining;
 mod logical_frames;
 mod modules;
+pub(crate) mod native_entry;
 mod protos;
 mod prototype_shapes;
 mod restore;

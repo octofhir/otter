@@ -192,6 +192,13 @@ pub struct NativeCallInfo {
 }
 
 impl NativeCallInfo {
+    /// The receiver slot a native reads its `this` from. A frame that
+    /// publishes it in its register window has the collector rewrite it in
+    /// place, with no extra root registration.
+    pub(crate) fn this_slot(&self) -> *mut Value {
+        std::ptr::addr_of!(self.this_value).cast_mut()
+    }
+
     /// Ordinary function/method call metadata.
     #[must_use]
     pub fn call(this_value: Value) -> Self {
@@ -400,8 +407,9 @@ impl<'rt> NativeCtx<'rt> {
     }
 
     /// Return the execution context active for this native call, when present.
+    /// It outlives the call, so the borrow does not hold the native context.
     #[must_use]
-    pub fn execution_context(&self) -> Option<&ExecutionContext> {
+    pub fn execution_context(&self) -> Option<&'rt ExecutionContext> {
         self.context_ref()
     }
 

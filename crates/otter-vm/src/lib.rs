@@ -1181,9 +1181,11 @@ pub struct Interpreter {
     /// install and retained while any native frame can name them.
     jit_code_registry: Box<jit_registry::JitCodeRegistry>,
     /// The last generated return site a native's caller was resolved at:
-    /// `(code object, return pc)` and the innermost function there. Code
-    /// object ids are never reused, so an entry never goes stale.
-    caller_function_cache: std::cell::Cell<Option<(u32, u64, Option<u32>)>>,
+    /// `(code object, return pc, admitted context address)` and the source
+    /// owner found there (`None`: the admitted context). Code object ids are
+    /// never reused; the owner stays valid until the owner cache releases
+    /// its retired owners, which clears this entry too.
+    caller_owner_cache: std::cell::Cell<Option<(u32, u64, usize, Option<*const ExecutionContext>)>>,
     /// Optimizing compilations handed to the isolate's compiler threads,
     /// with the roots each snapshot embeds until its result is installed.
     jit_compile_queue: jit_compile_queue::OptimizingCompileQueue,

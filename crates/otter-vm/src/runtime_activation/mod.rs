@@ -25,7 +25,6 @@ mod deopt;
 mod exceptions;
 mod forward_arguments;
 mod iterators;
-mod native_calls;
 #[cfg(test)]
 mod new_error_tests;
 mod regexp_values;

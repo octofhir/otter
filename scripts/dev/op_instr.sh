@@ -29,6 +29,8 @@ function argsf() { return arguments.length + arguments[0]; }
 function restf(...xs) { return xs.length + xs[0]; }
 const bound = big.bind(null);
 const gobj = { get v() { return 3; } };
+const nfns = [Object.isExtensible, Object.isFrozen];
+const otostr = Object.prototype.toString;
 let out = 0;
 JS
 case_body() {
@@ -94,6 +96,17 @@ case_body() {
     arrfilter) echo 's = (s + smallarr.filter((v) => v > 1).length) | 0;' ;;
     arrindexof) echo 's = (s + smallarr.indexOf(3)) | 0;' ;;
     objkeys) echo 's = (s + Object.keys(pobj).length) | 0;' ;;
+    otostr) echo 's = (s + pobj.toString().length) | 0;' ;;
+    getproto) echo 's = (s + (Object.getPrototypeOf(pobj) === P.prototype ? 1 : 0)) | 0;' ;;
+    jsonstr) echo 's = (s + JSON.stringify(pair).length) | 0;' ;;
+    strupper) echo 's = (s + keys[i & 1023].toUpperCase().length) | 0;' ;;
+    isarr) echo 's = (s + (Array.isArray(keep) ? 1 : 0)) | 0;' ;;
+    objassign) echo 's = (s + 1) | 0; keep[i & 1023] = Object.assign({}, pobj);' ;;
+    mathmax) echo 's = (s + Math.max(s & 7, 3, i & 15)) | 0;' ;;
+    strfromcc) echo 's = (s + String.fromCharCode(65 + (i & 15)).length) | 0;' ;;
+    isext) echo 's = (s + (Object.isExtensible(pobj) ? 1 : 0)) | 0;' ;;
+    isextpoly) echo 's = (s + (nfns[i & 1](pobj) ? 1 : 0)) | 0;' ;;
+    otostrcall) echo 's = (s + otostr.call(pobj).length) | 0;' ;;
     switchs) echo 'switch (keys[i & 7]) { case "k0": s = (s + 1) | 0; break; case "k1": s = (s + 2) | 0; break; default: s = (s + 3) | 0; }' ;;
     *) echo "unknown case $1" >&2; exit 1 ;;
   esac

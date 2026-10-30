@@ -244,7 +244,11 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         "b.ne 9f",
         "ldrb w9, [x1]",
         "cmp w9, #{closure_tag}",
+        "b.eq 5f",
+        "cmp w9, #{native_tag}",
         "b.ne 9f",
+        "b {native}",
+        "5:",
         "ldr w12, [x1, #{closure_fid}]",
         "2:",
         "ldr x9, [x0, #{thread}]",
@@ -292,10 +296,12 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         number_tag = const crate::value::tag::NUMBER_TAG,
         other_tag = const crate::value::tag::OTHER_TAG,
         closure_tag = const crate::closure::JS_CLOSURE_BODY_TYPE_TAG,
+        native_tag = const crate::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG,
         closure_fid = const BODY + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET,
         undefined = const Value::UNDEFINED.to_abi_bits(),
         pending_return_pc = const std::mem::offset_of!(JitCtx, pending_call) + REQUEST_CALLER_RETURN_PC_OFFSET as usize,
         publisher = sym call_request_entry,
+        native = sym call_native_entry,
         generic_end = sym costs::GENERIC_END,
     );
 }
@@ -380,11 +386,19 @@ unsafe extern "C" fn call_request_entry(_ctx: *mut JitCtx) -> NativeResultPair {
     );
 }
 
+/// Stack the direct native entry needs below the caller's span: its exit
+/// record and the Rust entry's own frame. A body that recurses deeper meets
+/// the ordinary limit checks of the calls it makes.
+const NATIVE_EXIT_RESERVE: usize = 512 + std::mem::size_of::<super::Frame>();
+
 #[cfg(target_arch = "aarch64")]
 macro_rules! native_entry {
     ($page:literal, $offset:literal) => {
-        /// Enter a proved NativeFunction through the private actual-only JS convention.
-        /// Its live target, captures, realm and constructability remain Host-kernel data.
+        /// Enter a proved NativeFunction through the private actual-only JS
+        /// convention. A `[[Call]]` of a plain static body with room on the
+        /// stack runs directly under one exit record over its actuals in
+        /// place ([`crate::interp::native_entry`]). Construction, every other
+        /// kind and a handed-over tail anchor select the canonical Host kernel.
         ///
         /// # Safety
         /// The callee must be a NativeFunction and all private JS operands and the
@@ -392,10 +406,32 @@ macro_rules! native_entry {
         /// The original hardware return is transferred before any collecting boundary.
         #[unsafe(naked)]
         pub unsafe extern "C" fn call_native_entry(_ctx: *mut JitCtx) -> NativeResultPair {
-            core::arch::naked_asm!($page, $offset, "b {publisher}",
+            core::arch::naked_asm!(
+                "cmp x3, #{undefined}",
+                "b.ne 8f",
+                "ldrb w16, [x1, #{kind_byte}]",
+                "cbnz w16, 8f",
+                "ldr x16, [x0, #{pending_return_pc}]",
+                "cbnz x16, 8f",
+                "ldr x16, [x0, #{stack_limit}]",
+                "sub x17, sp, #{reserve}",
+                "cmp x17, x16",
+                "b.lo 8f",
+                "mov w3, w4",
+                "mov x4, sp",
+                "mov x5, x30",
+                "b {direct}",
+                "8:",
+                $page, $offset, "b {publisher}",
                 ".if {apple}", ".alt_entry {native_end}", ".endif",
                 ".global {native_end}", "{native_end}:",
                 apple = const cfg!(target_vendor = "apple") as u8,
+                undefined = const Value::UNDEFINED.to_abi_bits(),
+                kind_byte = const crate::native_function::NATIVE_FUNCTION_KIND_BYTE,
+                pending_return_pc = const std::mem::offset_of!(JitCtx, pending_call) + REQUEST_CALLER_RETURN_PC_OFFSET as usize,
+                stack_limit = const std::mem::offset_of!(JitCtx, native_stack_limit),
+                reserve = const NATIVE_EXIT_RESERVE,
+                direct = sym crate::interp::native_entry::native_exit_entry,
                 host = sym crate::interp::host_call::host_call_entry,
                 publisher = sym call_request_entry,
                 native_end = sym costs::NATIVE_END);
@@ -441,8 +477,13 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         "jnz 9f",
         "test rsi, {other_tag}",
         "jnz 9f",
-        "cmp byte ptr [rsi], {closure_tag}",
-        "jne 9f",
+        "movzx eax, byte ptr [rsi]",
+        "cmp eax, {closure_tag}",
+        "je 5f",
+        "cmp eax, {native_tag}",
+        "je {native}",
+        "jmp 9f",
+        "5:",
         "mov r10d, [rsi + {closure_fid}]",
         "2:",
         "mov rax, [rdi + {thread}]",
@@ -493,10 +534,12 @@ pub unsafe extern "C" fn call_generic_entry(_ctx: *mut JitCtx) -> NativeResultPa
         number_tag = const crate::value::tag::NUMBER_TAG,
         other_tag = const crate::value::tag::OTHER_TAG,
         closure_tag = const crate::closure::JS_CLOSURE_BODY_TYPE_TAG,
+        native_tag = const crate::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG,
         closure_fid = const BODY + crate::closure::CLOSURE_BODY_FUNCTION_ID_OFFSET,
         undefined = const Value::UNDEFINED.to_abi_bits(),
         pending_return_pc = const std::mem::offset_of!(JitCtx, pending_call) + REQUEST_CALLER_RETURN_PC_OFFSET as usize,
         publisher = sym call_request_entry,
+        native = sym call_native_entry,
         generic_end = sym costs::GENERIC_END,
     );
 }
@@ -598,8 +641,9 @@ unsafe extern "C" fn call_request_entry(_ctx: *mut JitCtx) -> NativeResultPair {
     );
 }
 
-/// Enter a proved NativeFunction through the private actual-only JS convention.
-/// Its live target, captures, realm and constructability remain Host-kernel data.
+/// Enter a proved NativeFunction through the private actual-only JS convention;
+/// see the AArch64 entry. On Windows the C completion pair returns through
+/// memory, so every call takes the Host kernel there.
 ///
 /// # Safety
 /// The callee must be a NativeFunction and all private JS operands and the
@@ -608,10 +652,36 @@ unsafe extern "C" fn call_request_entry(_ctx: *mut JitCtx) -> NativeResultPair {
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 pub unsafe extern "C" fn call_native_entry(_ctx: *mut JitCtx) -> NativeResultPair {
-    core::arch::naked_asm!("lea r9, [rip + {host}]", "jmp {publisher}",
+    core::arch::naked_asm!(
+        ".if {windows}",
+        "jmp 8f",
+        ".endif",
+        "cmp rcx, {undefined}",
+        "jne 8f",
+        "cmp byte ptr [rsi + {kind_byte}], 0",
+        "jne 8f",
+        "cmp qword ptr [rdi + {pending_return_pc}], 0",
+        "jne 8f",
+        "lea rax, [rsp - {reserve}]",
+        "cmp rax, [rdi + {stack_limit}]",
+        "jb 8f",
+        "mov ecx, r8d",
+        "lea r8, [rsp + 8]",
+        "mov r9, [rsp]",
+        "jmp {direct}",
+        "8:",
+        "lea r9, [rip + {host}]",
+        "jmp {publisher}",
         ".if {apple}", ".alt_entry {native_end}", ".endif",
         ".global {native_end}", "{native_end}:",
         apple = const cfg!(target_vendor = "apple") as u8,
+        windows = const cfg!(target_os = "windows") as u8,
+        undefined = const Value::UNDEFINED.to_abi_bits(),
+        kind_byte = const crate::native_function::NATIVE_FUNCTION_KIND_BYTE,
+        pending_return_pc = const std::mem::offset_of!(JitCtx, pending_call) + REQUEST_CALLER_RETURN_PC_OFFSET as usize,
+        stack_limit = const std::mem::offset_of!(JitCtx, native_stack_limit),
+        reserve = const NATIVE_EXIT_RESERVE,
+        direct = sym crate::interp::native_entry::native_exit_entry,
         host = sym crate::interp::host_call::host_call_entry,
         publisher = sym call_request_entry,
         native_end = sym costs::NATIVE_END);

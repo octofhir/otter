@@ -2043,6 +2043,16 @@ impl Interpreter {
                 Some(elems)
             })
         });
+        // Latin-1 strings (and holes, `undefined` and `null`, which join as
+        // nothing) with a Latin-1 separator: no ToString runs, so the result
+        // is their bytes, written once.
+        if let Some(elems) = dense_snapshot.as_ref()
+            && let Some(joined) = join_latin1_strings(elems, &separator, &self.gc_heap)
+        {
+            return JsString::from_latin1(&joined, self.gc_heap_mut())
+                .map(Value::string)
+                .map_err(|error| CommittedValueError::JavaScript(error.into()));
+        }
         if let Some(mut elems) = dense_snapshot {
             // An element's ToString can scavenge; the not-yet-visited snapshot
             // values must follow their cells.
@@ -4892,6 +4902,34 @@ impl ArrayCallbackKind {
     fn is_reduce(self) -> bool {
         matches!(self, Self::Reduce | Self::ReduceRight)
     }
+}
+
+/// The bytes `join` of `elements` with `separator` produces when every
+/// element is a contiguous Latin-1 string, a hole, `undefined` or `null` and
+/// the separator is Latin-1; `None` for anything else, which takes the
+/// ToString of each element.
+fn join_latin1_strings(
+    elements: &[Value],
+    separator: &[u16],
+    heap: &otter_gc::GcHeap,
+) -> Option<Vec<u8>> {
+    let separator: Vec<u8> = separator
+        .iter()
+        .map(|&unit| u8::try_from(unit).ok())
+        .collect::<Option<_>>()?;
+    let mut joined = Vec::new();
+    for (index, element) in elements.iter().enumerate() {
+        if index > 0 {
+            joined.extend_from_slice(&separator);
+        }
+        if element.is_hole() || element.is_undefined() || element.is_null() {
+            continue;
+        }
+        element
+            .as_string(heap)?
+            .with_latin1(heap, |bytes| joined.extend_from_slice(bytes))?;
+    }
+    Some(joined)
 }
 
 /// `Object.prototype.toString`'s result for each builtin tag a receiver

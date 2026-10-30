@@ -159,6 +159,16 @@ impl Interpreter {
         {
             return Ok(Value::undefined());
         }
+        // A string's own index below its length is its one-unit string,
+        // the heap's shared one for a Latin-1 unit.
+        if let (Some(string), Some(index)) = (recv.as_string(&self.gc_heap), idx_value_raw.as_i32())
+            && let Ok(index) = u32::try_from(index)
+            && let Some(unit) = string.char_code_at(index, &self.gc_heap)
+            && let Some(shared) =
+                crate::string::JsString::shared_unit_string(1, Some(unit), &self.gc_heap)
+        {
+            return Ok(Value::string(shared));
+        }
         if let Some(obj) = recv.as_object()
             && let Some(value) = self.ordinary_keyed_load(obj, idx_value_raw)
         {

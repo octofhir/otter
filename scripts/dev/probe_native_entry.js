@@ -81,4 +81,41 @@ out.push(hot((i) => boundKeys(objs[i & 63]).length, 20000));
 // `new` on a native constructor at a hot site.
 out.push(hot((i) => new Array(i & 7).length + new Date(0).getTime(), 20000));
 
+// Callbacks entered from natives: throws, proper tail calls, deopts, and
+// every callable kind.
+function tailHelper(v) { return v * 3; }
+out.push(hot((i) => [1, 2, i & 7].map(function (v) { return tailHelper(v); }).join(), 20000));
+function wide(a, b, c, d, e, f) { return a + b + c + d + e + f; }
+out.push(hot((i) => [1, 2, i & 7].map(function (v) { return wide(v, 1, 2, 3, 4, 5); }).join(), 20000));
+out.push(hot((i) => [1, 2, i & 7].map((v) => wide(v, 1, 2, 3, 4, 5)).join(), 20000));
+const boundTail = tailHelper.bind(null);
+out.push(hot((i) => [1, 2, i & 7].map(function (v) { return boundTail(v); }).join(), 20000));
+out.push(hot((i) => [1, 2, i & 7].map(function (v) { return String(v); }).join(), 20000));
+out.push(hot((i) => [1, 2, i & 7].map(function (v) { return Reflect.apply(tailHelper, null, [v]); }).join(), 20000));
+let cbThrown = 0;
+for (let i = 0; i < 20000; i++) {
+  try { [1, 2, 3].forEach((v) => { if (v === 2 && (i & 3) === 0) throw new Error('x' + i); }); } catch (e) { cbThrown++; }
+}
+out.push(cbThrown);
+let mixed = 0;
+for (let i = 0; i < 30000; i++) {
+  const vals = i < 25000 ? [1, 2, 3] : [1.5, 'a', null];
+  vals.forEach((v) => { mixed = (mixed + (typeof v === 'number' ? v * 2 : 1)) | 0; });
+}
+out.push(mixed);
+const proxied = new Proxy((v) => v + 1, {});
+const boundCb = function (v) { return v + this.k; }.bind({ k: 10 });
+out.push(hot((i) => [i & 3, 1].map(proxied).concat([2].map(boundCb)).join(), 20000));
+let classErr = '';
+try { [1].forEach(class K {}); } catch (e) { classErr = e.constructor.name; }
+out.push(classErr);
+out.push(hot((i) => [5, 1, 4, i & 7, 2].sort((a, b) => a - b).join(), 20000));
+out.push(hot((i) => ('a-b-' + (i & 7)).replace(/-/g, (m) => '+').length, 20000));
+const getterObj = { get g() { return this.k * 2; }, k: 4 };
+out.push(hot((i) => Reflect.get(getterObj, 'g') + Object.getOwnPropertyDescriptor(getterObj, 'g').get.call({ k: i & 3 }), 20000));
+function deepCb() { return [0].forEach(deepCb); }
+let cbOverflow = '';
+try { deepCb(); } catch (e) { cbOverflow = e.constructor.name; }
+out.push(cbOverflow);
+
 console.log(out.join('\n'));

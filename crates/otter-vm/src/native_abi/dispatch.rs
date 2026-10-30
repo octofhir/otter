@@ -315,6 +315,13 @@ impl NativeResultPair {
         }
     }
 
+    /// Whether this completion asks its caller to enter the pending
+    /// request, by its status alone, as a generated caller tests it.
+    #[must_use]
+    pub const fn is_continue(&self) -> bool {
+        self.status == NativeResultStatus::Continue as u64
+    }
+
     /// Continue the state machine owned by the result domain.
     ///
     /// An execution entry requests `JitCtx::pending_call`; a structured

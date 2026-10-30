@@ -286,6 +286,9 @@ pub fn parse_int(input: &str, mut radix: i32) -> NumberValue {
     }
     let n = match i64::from_str_radix(&digits, radix as u32) {
         Ok(v) => v as f64,
+        // Past `i64`, a decimal digit run is the correctly rounded double
+        // its spelling names.
+        Err(_) if radix == 10 => digits.parse::<f64>().unwrap_or(f64::NAN),
         Err(_) => {
             // Overflow — manual reconstruction.
             let mut acc = 0.0f64;

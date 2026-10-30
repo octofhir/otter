@@ -215,6 +215,18 @@ pub(crate) fn number_parse_int_native(
     // and is observable through a user `toString`/`valueOf`/
     // `@@toPrimitive` override.
     let arg = args.first().cloned().unwrap_or(Value::undefined());
+    // A String of decimal digits, after at most a sign, with no radix or
+    // radix 10: no coercion is observable and the digits are the answer.
+    let decimal_radix = match args.get(1) {
+        None => true,
+        Some(radix) => radix.is_undefined() || radix.as_f64() == Some(10.0),
+    };
+    if decimal_radix
+        && let Some(string) = arg.as_string(ctx.heap())
+        && let Some(Some(value)) = string.with_latin1(ctx.heap(), parse_decimal_digits)
+    {
+        return Ok(Value::number(value));
+    }
     let context = native_context(ctx, "parseInt")?;
     let s = ctx.with_turn_parts(|interp, stack| {
         interp
@@ -236,6 +248,37 @@ pub(crate) fn number_parse_int_native(
         _ => 0,
     };
     Ok(Value::number(crate::number::parse::parse_int(&s, radix)))
+}
+
+/// `parseInt` of Latin-1 `bytes` in radix 10 when they are an optional
+/// sign, then 1 to 15 decimal digits (exact in a double), then anything
+/// that is not a digit. `None` for every other input — leading whitespace,
+/// a `0x` prefix, no digit, more digits — which takes the general parser.
+fn parse_decimal_digits(bytes: &[u8]) -> Option<crate::NumberValue> {
+    let (negative, digits) = match bytes.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        Some((b'+', rest)) => (false, rest),
+        _ => (false, bytes),
+    };
+    let count = digits
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit())
+        .count();
+    if count == 0
+        || count > 15
+        || (digits.first() == Some(&b'0') && matches!(digits.get(1), Some(b'x' | b'X')))
+    {
+        return None;
+    }
+    let magnitude = digits[..count]
+        .iter()
+        .fold(0u64, |acc, digit| acc * 10 + u64::from(digit - b'0'));
+    let value = magnitude as f64;
+    Some(crate::NumberValue::from_f64(if negative {
+        -value
+    } else {
+        value
+    }))
 }
 
 fn number_parse_float_native(

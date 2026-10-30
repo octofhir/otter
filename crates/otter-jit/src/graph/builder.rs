@@ -4788,7 +4788,10 @@ impl<'a> Builder<'a> {
     }
 
     /// The passive exact-arity leaf a call site saw, when this site may still
-    /// speculate on its callee's identity.
+    /// speculate on its callee's identity and on its operands. A leaf that
+    /// missed here left optimized code; the baseline operation then takes
+    /// the call, trying the leaf and calling the native on a miss, so the
+    /// recompile never leaves again for the same operands.
     fn admitted_native_leaf(
         &self,
         instruction: &Instruction,
@@ -4798,7 +4801,7 @@ impl<'a> Builder<'a> {
         &'static otter_vm::jit_static_native::JitLeafBuiltin,
     )> {
         let target = *self.view.native_calls.get(&instruction.byte_pc)?.leaf()?;
-        if self.exited_for(ExitReason::IdentityGuard) {
+        if self.exited_for(ExitReason::IdentityGuard) || self.exited_for(ExitReason::TypeMismatch) {
             return None;
         }
         super::native_leaf::admit(self.view, target, argument_count)

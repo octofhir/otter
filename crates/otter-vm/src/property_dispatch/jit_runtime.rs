@@ -116,6 +116,17 @@ impl Interpreter {
                 None => {}
             }
             let receiver = self.escape_scoped(receiver_root);
+            // A String's prototype lookup reads by the site's atom.
+            if let Some(string) = receiver.as_string(&self.gc_heap) {
+                return self.load_string_primitive_property_key(
+                    stack,
+                    context,
+                    &receiver,
+                    string,
+                    atomized_key.name(),
+                    &crate::VmPropertyKey::Atom(atomized_key),
+                );
+            }
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
             return Ok(result);
         };

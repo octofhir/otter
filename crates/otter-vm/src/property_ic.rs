@@ -134,16 +134,29 @@ pub enum IcHandlerKind {
     /// Call the getter of the receiver's own accessor slot, which its shape
     /// guarantees holds an accessor.
     OwnAccessor = 7,
-    /// Read the own data property of a dictionary-mode receiver from its key
-    /// table. The shared dictionary shape names the receiver's mode and
-    /// prototype, not its keys: the handler finds the slot by the atom its
-    /// `field` word holds, and misses on an absent key or an accessor.
+    /// Read the own property the site's atom names from a dictionary-mode
+    /// receiver's key table. The shared dictionary shape names the
+    /// receiver's mode and prototype, not its keys: the handler finds the
+    /// slot by atom, answers own data (and, in the VM, an own getter), and
+    /// misses on an absent key.
     DictionaryField = 8,
     /// A typed view's `length`: the intrinsic `%TypedArray.prototype%`
     /// getter the holder `prototype(aux)` owns, authorized by the entry's
     /// chain proof from the view's lookup start. Generated code reads the
     /// view's count; the VM calls the getter.
     TypedArrayLength = 9,
+    /// [`Self::DictionaryField`], and a key the receiver's table lacks is
+    /// absent along the chain the entry's proof covers (or the shape's
+    /// `null` prototype fixes): `undefined`.
+    DictionaryNonExistent = 10,
+    /// [`Self::DictionaryField`], and a key the receiver's table lacks is
+    /// the data field `field` of the holder `prototype(aux)`, authorized by
+    /// the entry's chain proof.
+    DictionaryPrototypeField = 11,
+    /// [`Self::DictionaryField`], and a key the receiver's table lacks is
+    /// the accessor in slot `slot` of the holder `prototype(aux)`, authorized
+    /// by the entry's chain proof: its getter.
+    DictionaryPrototypeAccessor = 12,
 }
 
 impl IcHandlerKind {
@@ -158,12 +171,27 @@ impl IcHandlerKind {
             7 => Self::OwnAccessor,
             8 => Self::DictionaryField,
             9 => Self::TypedArrayLength,
+            10 => Self::DictionaryNonExistent,
+            11 => Self::DictionaryPrototypeField,
+            12 => Self::DictionaryPrototypeAccessor,
             _ => Self::Empty,
         }
     }
 
     const fn is_store(self) -> bool {
         matches!(self, Self::StoreField | Self::StoreTransition)
+    }
+
+    /// Whether the handler first looks the site's atom up in a
+    /// dictionary-mode receiver's own key table.
+    pub(crate) const fn reads_receiver_table(self) -> bool {
+        matches!(
+            self,
+            Self::DictionaryField
+                | Self::DictionaryNonExistent
+                | Self::DictionaryPrototypeField
+                | Self::DictionaryPrototypeAccessor
+        )
     }
 }
 
@@ -177,6 +205,22 @@ pub enum TransitionGuard {
     ChainMissing = 1,
     /// The direct prototype owns writable data of the key.
     PrototypeWritable = 2,
+}
+
+/// What the prototype chain of a dictionary-mode receiver answers for a key
+/// its own key table lacks. Every receiver of one dictionary shape shares
+/// the prototype, so one answer serves them all.
+#[derive(Debug, Clone)]
+pub(crate) enum DictionaryChain {
+    /// No provable answer: an absent own key misses.
+    Unknown,
+    /// Absent along the chain under the proof, or `None` when the shape's
+    /// `null` prototype proves it.
+    Absent(Option<Arc<PrototypeValidity>>),
+    /// Ordinary data a prototype owns.
+    Data(crate::cache_ir::ResolvedDataSlot),
+    /// An accessor a prototype owns.
+    Accessor(crate::cache_ir::ResolvedAccessorSlot),
 }
 
 /// The empty shape word. Shape handles are 8-aligned non-zero cage offsets,
@@ -247,7 +291,7 @@ pub struct IcEntry {
     slot: AtomicU16,
     aux: AtomicU32,
     owner: AtomicU32,
-
+    atom: AtomicU32,
     validity: AtomicU64,
 }
 
@@ -261,7 +305,7 @@ impl IcEntry {
             slot: AtomicU16::new(0),
             aux: AtomicU32::new(0),
             owner: AtomicU32::new(0),
-
+            atom: AtomicU32::new(0),
             validity: AtomicU64::new(0),
         }
     }
@@ -282,9 +326,9 @@ impl IcEntry {
         self.slot.load(Ordering::Relaxed)
     }
 
-    /// The atom a [`IcHandlerKind::DictionaryField`] entry reads.
-    fn dictionary_atom(&self) -> AtomId {
-        AtomId::from_global(self.field.load(Ordering::Relaxed))
+    /// The key a dictionary-mode receiver's table is searched for.
+    fn table_atom(&self) -> AtomId {
+        AtomId::from_global(self.atom.load(Ordering::Relaxed))
     }
 
     fn aux(&self) -> ShapeHandle {
@@ -317,6 +361,7 @@ impl IcEntry {
             && self.slot() == handler.slot
             && self.aux.load(Ordering::Relaxed) == handler.aux.offset()
             && self.owner.load(Ordering::Relaxed) == handler.owner.offset()
+            && self.atom.load(Ordering::Relaxed) == handler.atom
             && self.validity_word() == validity
     }
 
@@ -337,6 +382,7 @@ impl IcEntry {
         self.slot.store(handler.slot, Ordering::Relaxed);
         self.aux.store(handler.aux.offset(), Ordering::Relaxed);
         self.owner.store(handler.owner.offset(), Ordering::Relaxed);
+        self.atom.store(handler.atom, Ordering::Relaxed);
         self.shape.store(key, Ordering::Relaxed);
         old
     }
@@ -351,6 +397,7 @@ impl IcEntry {
             slot: AtomicU16::new(self.slot.load(Ordering::Relaxed)),
             aux: AtomicU32::new(self.aux.load(Ordering::Relaxed)),
             owner: AtomicU32::new(self.owner.load(Ordering::Relaxed)),
+            atom: AtomicU32::new(self.atom.load(Ordering::Relaxed)),
             validity: AtomicU64::new(self.validity.load(Ordering::Relaxed)),
         }
     }
@@ -384,6 +431,8 @@ impl IcEntry {
             .store(other.aux.load(Ordering::Relaxed), Ordering::Relaxed);
         self.owner
             .store(other.owner.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.atom
+            .store(other.atom.load(Ordering::Relaxed), Ordering::Relaxed);
         self.validity
             .store(other.validity.swap(0, Ordering::Relaxed), Ordering::Relaxed);
         other.reset();
@@ -407,6 +456,7 @@ impl IcEntry {
         self.slot.store(0, Ordering::Relaxed);
         self.aux.store(0, Ordering::Relaxed);
         self.owner.store(0, Ordering::Relaxed);
+        self.atom.store(0, Ordering::Relaxed);
     }
 
     fn transition_guard(&self) -> TransitionGuard {
@@ -449,7 +499,9 @@ pub(crate) struct IcHandler {
     slot: u16,
     aux: ShapeHandle,
     owner: ShapeHandle,
-
+    /// The key a dictionary-mode receiver's table is searched for; zero for
+    /// every other kind.
+    atom: u32,
     validity: Option<Arc<PrototypeValidity>>,
     transition: TransitionGuard,
 }
@@ -507,7 +559,7 @@ impl IcHandler {
                 slot: resolved.hit.slot,
                 aux: ShapeHandle::null(),
                 owner: ShapeHandle::null(),
-
+                atom: 0,
                 validity: None,
                 transition: TransitionGuard::OwnAdd,
             });
@@ -523,7 +575,7 @@ impl IcHandler {
             slot: resolved.hit.slot,
             aux: resolved.holder_root,
             owner: ShapeHandle::null(),
-
+            atom: 0,
             validity: Some(resolved.validity.clone()?),
             transition: TransitionGuard::OwnAdd,
         })
@@ -550,7 +602,7 @@ impl IcHandler {
             slot: resolved.hit.slot,
             aux: resolved.holder_root,
             owner: ShapeHandle::null(),
-
+            atom: 0,
             validity: Some(resolved.validity.clone()),
             transition: TransitionGuard::OwnAdd,
         })
@@ -587,7 +639,7 @@ impl IcHandler {
             slot: hit.slot,
             aux: ShapeHandle::null(),
             owner: ShapeHandle::null(),
-
+            atom: 0,
             validity: None,
             transition: TransitionGuard::OwnAdd,
         })
@@ -607,33 +659,77 @@ impl IcHandler {
             slot: 0,
             aux: ShapeHandle::null(),
             owner: ShapeHandle::null(),
-
+            atom: 0,
             validity,
             transition: TransitionGuard::OwnAdd,
         })
     }
 
-    /// The handler reading the own data property `atom` of receivers with the
-    /// dictionary shape `receiver_shape` from their key tables. An opaque
-    /// lookup (mapped arguments) has none.
+    /// The handler for the site's key on receivers with the dictionary shape
+    /// `receiver_shape`: their own key table answers first, then `chain`,
+    /// which the shape's prototype fixes for every receiver of the shape. An
+    /// opaque lookup (mapped arguments) has none.
     #[must_use]
-    pub(crate) fn load_dictionary(receiver_shape: ShapeHandle, atom: AtomId) -> Option<Self> {
+    pub(crate) fn load_dictionary(
+        receiver_shape: ShapeHandle,
+        atom: AtomId,
+        chain: DictionaryChain,
+    ) -> Option<Self> {
         if receiver_shape.is_null() || atom == AtomId::NONE {
             return None;
         }
         let state = object::shape_body::state_of(receiver_shape);
-        (state.is_dictionary() && !state.is_opaque()).then(|| Self {
+        if !state.is_dictionary() || state.is_opaque() {
+            return None;
+        }
+        let mut handler = Self {
             receiver_shape,
             projection: PropertyStorageProjection::Receiver,
             kind: IcHandlerKind::DictionaryField,
-            field: FieldLocation::from_cache_key(atom.raw()),
+            field: FieldLocation::from_cache_key(0),
             slot: 0,
             aux: ShapeHandle::null(),
             owner: ShapeHandle::null(),
-
+            atom: atom.raw(),
             validity: None,
             transition: TransitionGuard::OwnAdd,
-        })
+        };
+        match chain {
+            DictionaryChain::Unknown => {}
+            DictionaryChain::Absent(validity) => {
+                handler.kind = IcHandlerKind::DictionaryNonExistent;
+                handler.validity = validity;
+            }
+            DictionaryChain::Data(resolved) => {
+                if resolved.hit.shape.is_null() || resolved.holder_root.is_null() {
+                    return Some(handler);
+                }
+                let Some(validity) = resolved.validity else {
+                    return Some(handler);
+                };
+                handler.kind = IcHandlerKind::DictionaryPrototypeField;
+                handler.field =
+                    object::field_location(resolved.hit.shape, u32::from(resolved.hit.slot));
+                handler.slot = resolved.hit.slot;
+                handler.aux = resolved.holder_root;
+                handler.validity = Some(validity);
+            }
+            DictionaryChain::Accessor(resolved) => {
+                if resolved.hit.shape.is_null()
+                    || resolved.holder_root.is_null()
+                    || resolved.getter.is_none()
+                {
+                    return Some(handler);
+                }
+                handler.kind = IcHandlerKind::DictionaryPrototypeAccessor;
+                handler.field =
+                    object::field_location(resolved.hit.shape, u32::from(resolved.hit.slot));
+                handler.slot = resolved.hit.slot;
+                handler.aux = resolved.holder_root;
+                handler.validity = Some(resolved.validity);
+            }
+        }
+        Some(handler)
     }
 
     /// Select the object's role without granting array-chain absence or append.
@@ -704,7 +800,7 @@ impl IcHandler {
                 slot: hit.slot,
                 aux: ShapeHandle::null(),
                 owner,
-
+                atom: 0,
                 validity: None,
                 transition: TransitionGuard::OwnAdd,
             },
@@ -753,6 +849,7 @@ impl IcHandler {
             slot: transition.slot,
             aux: to_shape,
             owner,
+            atom: 0,
             validity,
             transition: guard,
         })
@@ -773,7 +870,7 @@ impl IcHandler {
             slot: 0,
             aux: ShapeHandle::null(),
             owner: ShapeHandle::null(),
-
+            atom: 0,
             validity: None,
             transition: TransitionGuard::OwnAdd,
         }
@@ -823,6 +920,8 @@ pub struct PropertyIcLayout {
     /// Entry `u32` defining store owner: zero for shaped Top or a VM-only
     /// dictionary append with a null auxiliary target.
     pub entry_owner_byte: u32,
+    /// Entry `u32` atom a dictionary-mode receiver's table is searched for.
+    pub entry_atom_byte: u32,
     /// Entry `u64` validity word address.
     pub entry_validity_byte: u32,
     /// Pointer to the site cache of a named megamorphic site, or null.
@@ -907,6 +1006,7 @@ impl PropertyIcSlot {
         entry_kind_byte: std::mem::offset_of!(IcEntry, kind) as u32,
         entry_aux_byte: std::mem::offset_of!(IcEntry, aux) as u32,
         entry_owner_byte: std::mem::offset_of!(IcEntry, owner) as u32,
+        entry_atom_byte: std::mem::offset_of!(IcEntry, atom) as u32,
 
         entry_validity_byte: std::mem::offset_of!(IcEntry, validity) as u32,
         site_cache_byte: std::mem::offset_of!(Self, site_cache) as u32,
@@ -1276,14 +1376,26 @@ impl PropertyIcSlot {
         match entry.kind() {
             IcHandlerKind::OwnField => Some(true),
             IcHandlerKind::OwnAccessor => Some(true),
-            IcHandlerKind::DictionaryField => {
-                object::load_dictionary_data(obj, heap, entry.dictionary_atom()).map(|_| true)
+            kind if kind.reads_receiver_table() => {
+                match object::lookup_dictionary_own(obj, heap, entry.table_atom())? {
+                    object::DictionaryOwn::Data(_) | object::DictionaryOwn::Accessor(_) => {
+                        Some(true)
+                    }
+                    object::DictionaryOwn::Absent => match kind {
+                        IcHandlerKind::DictionaryNonExistent => {
+                            entry.proof_holds().then_some(false)
+                        }
+                        IcHandlerKind::DictionaryPrototypeField
+                        | IcHandlerKind::DictionaryPrototypeAccessor => {
+                            entry.proof_holds().then_some(true)
+                        }
+                        _ => None,
+                    },
+                }
             }
             IcHandlerKind::PrototypeField
             | IcHandlerKind::PrototypeAccessor
-            | IcHandlerKind::TypedArrayLength => {
-                entry.proof_holds().then_some(true)
-            }
+            | IcHandlerKind::TypedArrayLength => entry.proof_holds().then_some(true),
             IcHandlerKind::NonExistent => entry.proof_holds().then_some(false),
             _ => None,
         }
@@ -1360,8 +1472,28 @@ impl PropertyIcSlot {
             IcHandlerKind::NonExistent if entry.proof_holds() => {
                 Some(LoadHit::Value(Value::undefined()))
             }
-            IcHandlerKind::DictionaryField => {
-                object::load_dictionary_data(obj, heap, entry.dictionary_atom()).map(LoadHit::Value)
+            kind if kind.reads_receiver_table() => {
+                match object::lookup_dictionary_own(obj, heap, entry.table_atom())? {
+                    object::DictionaryOwn::Data(value) => Some(LoadHit::Value(value)),
+                    object::DictionaryOwn::Accessor(Some(getter)) => Some(LoadHit::Getter(getter)),
+                    object::DictionaryOwn::Accessor(None) => {
+                        Some(LoadHit::Value(Value::undefined()))
+                    }
+                    object::DictionaryOwn::Absent if entry.proof_holds() => match kind {
+                        IcHandlerKind::DictionaryNonExistent => {
+                            Some(LoadHit::Value(Value::undefined()))
+                        }
+                        IcHandlerKind::DictionaryPrototypeField => Some(LoadHit::Value(
+                            object::load_proven_data_slot(holder()?, heap, entry.slot()),
+                        )),
+                        IcHandlerKind::DictionaryPrototypeAccessor => {
+                            object::load_proven_getter(holder()?, heap, entry.slot())
+                                .map(LoadHit::Getter)
+                        }
+                        _ => None,
+                    },
+                    object::DictionaryOwn::Absent => None,
+                }
             }
             _ => None,
         }
@@ -1618,13 +1750,18 @@ impl PropertyIcSlot {
                         IcEntryVariant::OwnData
                     }
                     (IcHandlerKind::PrototypeField, _) => IcEntryVariant::InheritedData,
-                    (
-                        IcHandlerKind::PrototypeAccessor | IcHandlerKind::TypedArrayLength,
-                        _,
-                    ) => IcEntryVariant::InheritedAccessor,
+                    (IcHandlerKind::PrototypeAccessor | IcHandlerKind::TypedArrayLength, _) => {
+                        IcEntryVariant::InheritedAccessor
+                    }
                     (IcHandlerKind::OwnAccessor, _) => IcEntryVariant::OwnAccessor,
                     (IcHandlerKind::NonExistent, _) => IcEntryVariant::NonExistent,
-                    (IcHandlerKind::DictionaryField, _) => IcEntryVariant::DictionaryData,
+                    (
+                        IcHandlerKind::DictionaryField
+                        | IcHandlerKind::DictionaryNonExistent
+                        | IcHandlerKind::DictionaryPrototypeField
+                        | IcHandlerKind::DictionaryPrototypeAccessor,
+                        _,
+                    ) => IcEntryVariant::DictionaryData,
                     (IcHandlerKind::StoreTransition, TransitionGuard::OwnAdd) => {
                         IcEntryVariant::OwnAddTransition
                     }
@@ -1645,7 +1782,9 @@ impl PropertyIcSlot {
                     slot: (!transition
                         && !matches!(
                             entry.kind(),
-                            IcHandlerKind::NonExistent | IcHandlerKind::DictionaryField
+                            IcHandlerKind::NonExistent
+                                | IcHandlerKind::DictionaryField
+                                | IcHandlerKind::DictionaryNonExistent
                         ))
                     .then(|| entry.slot()),
                     to_shape_id: (transition && !entry.aux().is_null())
@@ -1698,23 +1837,57 @@ impl PropertyIcSlot {
                 }
                 _ => {}
             }
-            if entry.kind() == IcHandlerKind::DictionaryField {
-                // The receiver's key table holds the slot; the shape proves
-                // only its mode and prototype.
-                if entry.projection() == PropertyStorageProjection::Receiver
-                    && let Some(shape) = proofs.dictionary_shape(receiver)
-                {
-                    programs.push(crate::jit::JitCacheIrProgram {
-                        ops: vec![
-                            JitCacheIrOp::GuardShape { object: 0, shape },
-                            JitCacheIrOp::LoadDictionaryField {
-                                object: 0,
-                                atom: entry.dictionary_atom().raw(),
-                            },
-                        ]
-                        .into(),
-                    });
+            if entry.kind().reads_receiver_table() {
+                // The receiver's key table answers first; the shape proves
+                // only its mode and prototype. A key the table lacks takes
+                // the second program: the chain answer the entry caches. An
+                // inherited getter has no lowering; its receivers leave.
+                if entry.projection() != PropertyStorageProjection::Receiver {
+                    continue;
                 }
+                let Some(shape) = proofs.dictionary_shape(receiver) else {
+                    continue;
+                };
+                programs.push(crate::jit::JitCacheIrProgram {
+                    ops: vec![
+                        JitCacheIrOp::GuardShape { object: 0, shape },
+                        JitCacheIrOp::LoadDictionaryField { object: 0, atom },
+                    ]
+                    .into(),
+                });
+                let validity = match cell {
+                    None => None,
+                    Some(cell) => match proofs.validity(cell) {
+                        Some(validity) => Some(validity),
+                        None => continue,
+                    },
+                };
+                let mut absent = vec![
+                    JitCacheIrOp::GuardShape { object: 0, shape },
+                    JitCacheIrOp::GuardDictionaryAbsent { object: 0, atom },
+                ];
+                match (entry.kind(), validity) {
+                    (IcHandlerKind::DictionaryNonExistent, validity) => {
+                        absent.extend(
+                            validity
+                                .map(|validity| JitCacheIrOp::GuardPrototypeValidity { validity }),
+                        );
+                        absent.push(JitCacheIrOp::LoadUndefined);
+                    }
+                    (IcHandlerKind::DictionaryPrototypeField, Some(validity)) => {
+                        let Some(root) = proofs.shape(entry.aux()) else {
+                            continue;
+                        };
+                        let field = entry.field();
+                        absent.extend([
+                            JitCacheIrOp::GuardPrototypeValidity { validity },
+                            JitCacheIrOp::LoadPrototypeHolder { root, result: 1 },
+                            JitCacheIrOp::LoadField { object: 1, field },
+                        ]);
+                    }
+                    _ => continue,
+                }
+                programs.push(crate::jit::JitCacheIrProgram { ops: absent.into() });
                 continue;
             }
             let Some(shape) = proofs.shape(receiver) else {
@@ -1791,6 +1964,9 @@ impl PropertyIcSlot {
                 | IcHandlerKind::TypedArrayLength
                 | IcHandlerKind::OwnAccessor
                 | IcHandlerKind::DictionaryField
+                | IcHandlerKind::DictionaryNonExistent
+                | IcHandlerKind::DictionaryPrototypeField
+                | IcHandlerKind::DictionaryPrototypeAccessor
                 | IcHandlerKind::Empty => continue,
             };
             if entry.projection() == PropertyStorageProjection::LookupStart {

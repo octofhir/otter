@@ -476,6 +476,52 @@ impl Codegen<'_> {
         );
     }
 
+    /// Fall through when the key table of the dictionary-mode object in
+    /// `Rq(receiver)`, whose shape a guard proved, lacks `atom`; jump to
+    /// `present` when it holds the key (data or accessor) or has no table.
+    /// Writes only the three temporaries, `r10` and `r11`.
+    fn emit_dictionary_absent(
+        &mut self,
+        receiver: u8,
+        atom: u32,
+        [base, keys, index]: [u8; 3],
+        present: DynamicLabel,
+    ) {
+        let layout = otter_vm::object::DictionaryLayout::current();
+        let hash = (u64::from(atom).wrapping_mul(layout.hash_multiplier) >> 32) as u32;
+        let chain = self.ops.new_dynamic_label();
+        let absent = self.ops.new_dynamic_label();
+        self.load_immediate(10, 0xffff_ffff_0000_0000);
+        dynasm!(self.ops ; .arch x64
+            ; and r10, Rq(receiver)
+            ; mov Rd(keys), [Rq(receiver) + layout.exotic_byte as i32]
+            ; test Rd(keys), Rd(keys) ; jz =>present
+            ; add Rq(keys), r10
+            ; mov Rd(base), [Rq(keys) + layout.keys_byte as i32]
+            ; test Rd(base), Rd(base) ; jz =>present
+            ; add Rq(base), r10
+            ; mov Rd(index), hash as i32
+            ; mov r11d, [Rq(base) + layout.mask_byte as i32]
+            ; and Rd(index), r11d
+            ; lea Rq(base), [Rq(base) + layout.buckets_byte as i32]
+            ; mov Rd(index), [Rq(base) + Rq(index) * 4]
+            // The entry records follow the `mask + 1` buckets.
+            ; add r11d, 1
+            ; lea Rq(base), [Rq(base) + r11 * 4]
+            ; =>chain
+            ; cmp Rd(index), -1
+            ; je =>absent
+            ; mov r11d, Rd(index)
+            ; shl r11, layout.entry_shift as i8
+            ; add r11, Rq(base)
+            ; cmp DWORD [r11 + layout.entry_atom_byte as i32], atom as i32
+            ; je =>present
+            ; mov Rd(index), [r11 + layout.entry_next_byte as i32]
+            ; jmp =>chain
+            ; =>absent
+        );
+    }
+
     fn emit_prototype_holder(&mut self, receiver: u8, holder: u8, root: u32, miss: DynamicLabel) {
         self.load_immediate(10, 0xffff_ffff_0000_0000);
         self.load_immediate(11, u64::from(root));
@@ -668,6 +714,20 @@ impl Codegen<'_> {
                             [holder, metas, index],
                             destination.expect("named load result"),
                             next,
+                        );
+                        dynasm!(self.ops ; .arch x64 ; jmp =>done);
+                        committed = true;
+                    }
+                    Op::GuardDictionaryAbsent { object: 0, atom } if value.is_none() => {
+                        let [metas, index] = table.ok_or(Unsupported::OperandShape(
+                            "x86 graph dictionary absence temporaries",
+                        ))?;
+                        self.emit_dictionary_absent(receiver, atom, [holder, metas, index], next);
+                    }
+                    Op::LoadUndefined if value.is_none() => {
+                        self.load_immediate(
+                            destination.expect("named load result"),
+                            crate::entry::VALUE_UNDEFINED,
                         );
                         dynasm!(self.ops ; .arch x64 ; jmp =>done);
                         committed = true;

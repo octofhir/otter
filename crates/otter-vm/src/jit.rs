@@ -1620,6 +1620,18 @@ pub enum JitCacheIrOp {
         /// Raw atom id the key table is probed for.
         atom: u32,
     },
+    /// Continue only while the key table of a dictionary-mode object whose
+    /// shape an earlier guard proved lacks the own key `atom` names; a
+    /// present key (data or accessor) misses.
+    GuardDictionaryAbsent {
+        /// Shape-proved dictionary-mode object operand.
+        object: u8,
+        /// Raw atom id the key table is probed for.
+        atom: u32,
+    },
+    /// Terminal: the load's result is `undefined`, the answer every
+    /// preceding guard proved (a key absent from the receiver and its chain).
+    LoadUndefined,
     /// Write an exotic body's own data property into its tagged slot once
     /// the slot's guard proves it writable. A receiver of another cell type
     /// or a failed guard misses before any effect. Terminal; the value's

@@ -791,10 +791,11 @@ impl crate::Interpreter {
     }
 
     /// [`Self::resolve_property_load`] for a dictionary-mode receiver: its own
-    /// key table answers by atom, then ordinary data along its chain. No
-    /// hidden class names the receiver, so the shared table records nothing;
-    /// the site's handler for the receiver's dictionary shape reads the table
-    /// again (`IcHandlerKind::DictionaryField`).
+    /// key table answers by atom, then ordinary data or absence along its
+    /// chain. No hidden class names the receiver, so the shared table records
+    /// nothing; the site's handler for the receiver's dictionary shape reads
+    /// the table again and then the chain answer it caches
+    /// ([`Self::dictionary_chain`]).
     ///
     /// An own hit reports a non-writable slot: a dictionary slot changes
     /// through the key table's write path, which honours the compiled proofs
@@ -817,11 +818,50 @@ impl crate::Interpreter {
                     is_writable: false,
                 })
             }
-            (_, object::PropertyLookup::Absent) => object::prototype(obj, heap)
-                .and_then(|first| cache_ir::resolve_inherited_atom_data_slot(first, heap, key))
-                .map_or(PropertyLoad::Other, PropertyLoad::Data),
+            (_, object::PropertyLookup::Absent) => match self.dictionary_chain(obj, key) {
+                crate::property_ic::DictionaryChain::Data(resolved) => PropertyLoad::Data(resolved),
+                crate::property_ic::DictionaryChain::Absent(proof) => PropertyLoad::Absent(proof),
+                crate::property_ic::DictionaryChain::Accessor(_)
+                | crate::property_ic::DictionaryChain::Unknown => PropertyLoad::Other,
+            },
             _ => PropertyLoad::Other,
         }
+    }
+
+    /// What the chain past the dictionary-mode `obj` answers for `key`,
+    /// whatever `obj`'s own table holds: every receiver of its dictionary
+    /// shape shares the prototype, so one site entry serves them all.
+    pub(crate) fn dictionary_chain(
+        &self,
+        obj: JsObject,
+        key: AtomizedPropertyKey<'_>,
+    ) -> crate::property_ic::DictionaryChain {
+        use crate::property_ic::DictionaryChain;
+        let heap = &self.gc_heap;
+        if key.symbol_handle().is_some() || key.atom().id() == AtomId::NONE {
+            return DictionaryChain::Unknown;
+        }
+        let Some(first) = object::prototype(obj, heap) else {
+            return if object::prototype_value(obj, heap).is_none() {
+                DictionaryChain::Absent(None)
+            } else {
+                DictionaryChain::Unknown
+            };
+        };
+        if let Some(resolved) = cache_ir::resolve_inherited_atom_data_slot(first, heap, key) {
+            self.shape_runtime
+                .register_shape(heap, resolved.holder_root);
+            return DictionaryChain::Data(resolved);
+        }
+        if let Some(resolved) = cache_ir::resolve_inherited_atom_accessor(first, heap, key) {
+            self.shape_runtime
+                .register_shape(heap, resolved.holder_root);
+            return DictionaryChain::Accessor(resolved);
+        }
+        cache_ir::resolve_absent_atom_from(first, heap, key)
+            .map_or(DictionaryChain::Unknown, |proof| {
+                DictionaryChain::Absent(Some(proof))
+            })
     }
 
     /// Complete a named load through one source-preserving storage projection.
@@ -953,7 +993,8 @@ impl crate::Interpreter {
         let start_shape = object::keyed_shape(start, &self.gc_heap);
         // A typed view whose `length` reaches the intrinsic getter reads its
         // count in generated code.
-        let handler = if projection == crate::property_ic::PropertyStorageProjection::TypedArrayStart
+        let handler = if projection
+            == crate::property_ic::PropertyStorageProjection::TypedArrayStart
             && crate::bootstrap_typed_array::is_intrinsic_length_getter(getter, &self.gc_heap)
         {
             crate::property_ic::IcHandler::load_typed_array_length(start_shape, &resolved)
@@ -1274,24 +1315,32 @@ impl crate::Interpreter {
 
     /// Cache update for an ordinary receiver that missed its site: install
     /// the handler of the resolved data slot, or of a key the receiver and
-    /// its whole chain lack. Neither allocates nor runs code.
+    /// its whole chain lack; a dictionary-mode receiver gets its shape's
+    /// table-then-chain handler. Neither allocates nor runs code.
     pub(crate) fn update_load_ic(
         &self,
         slot: crate::feedback::PropertyFeedbackSlot<'_>,
         obj: JsObject,
+        key: AtomizedPropertyKey<'_>,
         load: &PropertyLoad,
     ) {
         if slot.is_megamorphic() {
             return;
         }
+        if object::state(obj, &self.gc_heap).is_dictionary() {
+            // The receiver's table answers first; the chain answer serves
+            // every receiver of the shape that lacks the key.
+            if let Some(handler) = crate::property_ic::IcHandler::load_dictionary(
+                object::shape(obj, &self.gc_heap),
+                key.atom().id(),
+                self.dictionary_chain(obj, key),
+            ) {
+                slot.install(handler);
+            }
+            return;
+        }
         let shape = object::keyed_shape(obj, &self.gc_heap);
         let handler = match load {
-            PropertyLoad::Data(resolved) if resolved.hops == 0 && shape.is_null() => {
-                crate::property_ic::IcHandler::load_dictionary(
-                    object::shape(obj, &self.gc_heap),
-                    resolved.hit.atom_id,
-                )
-            }
             PropertyLoad::Data(resolved) => {
                 crate::property_ic::IcHandler::load_resolved(shape, resolved)
             }

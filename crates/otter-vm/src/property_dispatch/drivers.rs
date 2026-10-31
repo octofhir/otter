@@ -145,7 +145,7 @@ impl Interpreter {
             // miss pays a probe instead of another chain walk; a megamorphic
             // site walks at most once per receiver class and name.
             let load = self.resolve_property_load(obj, atomized_key);
-            self.update_load_ic(slot, obj, &load);
+            self.update_load_ic(slot, obj, atomized_key, &load);
             let value = match load {
                 crate::property_cache::PropertyLoad::Data(resolved) => Some(resolved.value),
                 crate::property_cache::PropertyLoad::Absent(_) => Some(Value::undefined()),

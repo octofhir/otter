@@ -365,8 +365,8 @@ pub(crate) fn own_data_store(
 /// proves its receiver and reads one data slot through generated operations:
 /// the receiver (operand 0) or its holder (operand 1) — a guarded prototype
 /// holder, a pinned intrinsic prototype or a typed view's lookup start —
-/// ending in one field read, or a
-/// closure's own `prototype` slot.
+/// ending in one field read, a closure's own `prototype` slot, or a
+/// dictionary-mode receiver's own table or proven absence.
 pub(crate) fn named_load_programs(
     view: &JitCompileSnapshot,
     byte_pc: u32,
@@ -386,6 +386,24 @@ pub(crate) fn named_load_programs(
             JitCacheIrOp::GuardShape { object: 0, .. },
             JitCacheIrOp::LoadDictionaryField { object: 0, .. },
         ] = *program.ops
+        {
+            continue;
+        }
+        // A key that dictionary-mode receiver's table lacks, absent along
+        // the chain too.
+        if let [
+            JitCacheIrOp::GuardShape { object: 0, .. },
+            JitCacheIrOp::GuardDictionaryAbsent { object: 0, .. },
+            ref rest @ ..,
+        ] = *program.ops
+            && matches!(
+                rest,
+                [JitCacheIrOp::LoadUndefined]
+                    | [
+                        JitCacheIrOp::GuardPrototypeValidity { .. },
+                        JitCacheIrOp::LoadUndefined
+                    ]
+            )
         {
             continue;
         }
@@ -419,6 +437,9 @@ pub(crate) fn named_load_programs(
                 } if index == 0 => holder = true,
                 JitCacheIrOp::LoadPrototypeHolder { result: 1, .. } => holder = true,
                 JitCacheIrOp::GuardPrototypeValidity { .. } => {}
+                // A dictionary-mode receiver's table lacks the key its
+                // prototype holder serves.
+                JitCacheIrOp::GuardDictionaryAbsent { object: 0, .. } if index == 1 => {}
                 JitCacheIrOp::GuardShape { object, .. }
                     if object == 0 || (object == 1 && holder) => {}
                 JitCacheIrOp::GuardDictionaryLayout { object: 1, .. } if holder => {}
@@ -459,10 +480,13 @@ pub(crate) fn named_load_programs(
         })
         .collect();
     let dictionary = selected.iter().any(|&index| {
-        programs[index as usize]
-            .ops
-            .iter()
-            .any(|op| matches!(op, JitCacheIrOp::LoadDictionaryField { .. }))
+        programs[index as usize].ops.iter().any(|op| {
+            matches!(
+                op,
+                JitCacheIrOp::LoadDictionaryField { .. }
+                    | JitCacheIrOp::GuardDictionaryAbsent { .. }
+            )
+        })
     });
     Some(NamedLoadPrograms {
         programs: selected,

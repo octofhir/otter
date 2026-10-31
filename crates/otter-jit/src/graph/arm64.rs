@@ -4534,6 +4534,23 @@ impl<'a> Codegen<'a> {
                             dynasm!(self.ops ; .arch aarch64 ; b =>done);
                         }
                     }
+                    Op::GuardDictionaryAbsent { object: 0, atom } => {
+                        let [entries, metas] = table.ok_or(Unsupported::OperandShape(
+                            "graph dictionary absence temporaries",
+                        ))?;
+                        self.emit_dictionary_absent(
+                            receiver,
+                            atom,
+                            [holder, scratch, entries, metas],
+                            next,
+                        );
+                    }
+                    Op::LoadUndefined => {
+                        self.load_immediate(destination, VALUE_UNDEFINED);
+                        if !final_program {
+                            dynasm!(self.ops ; .arch aarch64 ; b =>done);
+                        }
+                    }
                     Op::LoadBodySlot { object: 0, slot } if slot.is_generated(false) => {
                         self.emit_body_slot_receiver(receiver, slot, next);
                         dynasm!(self.ops
@@ -4642,6 +4659,58 @@ impl<'a> Codegen<'a> {
             ; add XSP(entry), XSP(entry), field.slab_words_byte
             ; ldr X(destination), [X(entry)]
             ; =>loaded
+        );
+    }
+
+    /// Fall through when the key table of the dictionary-mode object in
+    /// `X(receiver)`, whose shape a guard proved, lacks `atom`; branch to
+    /// `present` when it holds the key (data or accessor) or has no table.
+    /// Writes only the four temporaries, `x16` and `x17`.
+    fn emit_dictionary_absent(
+        &mut self,
+        receiver: u8,
+        atom: u32,
+        [entry, index, base, keys]: [u8; 4],
+        present: DynamicLabel,
+    ) {
+        let layout = otter_vm::object::DictionaryLayout::current();
+        let hash = (u64::from(atom).wrapping_mul(layout.hash_multiplier) >> 32) as u32;
+        let chain = self.ops.new_dynamic_label();
+        let absent = self.ops.new_dynamic_label();
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+            ; ldr W(keys), [X(receiver), layout.exotic_byte]
+            ; cbz W(keys), =>present
+            ; add X(keys), x17, X(keys)
+            ; ldr W(keys), [X(keys), layout.keys_byte]
+            ; cbz W(keys), =>present
+            ; add X(keys), x17, X(keys)
+        );
+        self.load_immediate(index, u64::from(hash));
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; ldr w16, [X(keys), layout.mask_byte]
+            ; and W(index), W(index), w16
+            ; add XSP(base), XSP(keys), layout.buckets_byte
+            ; ldr W(index), [X(base), X(index), lsl #2]
+            // The entry records follow the `mask + 1` buckets.
+            ; add w16, w16, #1
+            ; add X(base), X(base), x16, lsl #2
+        );
+        self.load_immediate(17, u64::from(atom));
+        dynasm!(self.ops
+            ; .arch aarch64
+            ; =>chain
+            ; cmn WSP(index), #1
+            ; b.eq =>absent
+            ; add X(entry), X(base), X(index), lsl layout.entry_shift
+            ; ldr w16, [X(entry), layout.entry_atom_byte]
+            ; cmp w16, w17
+            ; b.eq =>present
+            ; ldr W(index), [X(entry), layout.entry_next_byte]
+            ; b =>chain
+            ; =>absent
         );
     }
 

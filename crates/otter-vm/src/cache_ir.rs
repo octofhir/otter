@@ -11,17 +11,21 @@
 //!   property lives and what it holds.
 //! - [`resolve_inherited_atom_data_slot`] — the same answer for a receiver
 //!   known only by its prototype, before it owns the key.
-//! - [`resolve_absent_atom`] — a key no link of an ordinary chain owns.
+//! - [`resolve_absent_atom`] — a key no link of an ordinary chain owns;
+//!   [`resolve_absent_atom_from`] the same for the chain past a receiver.
 //! - [`ResolvedAccessorSlot`] / [`resolve_atom_inherited_accessor`] — an
-//!   accessor a prototype owns, and the getter and setter its cell holds.
+//!   accessor a prototype owns, and the getter and setter its cell holds;
+//!   [`resolve_inherited_atom_accessor`] the same from the first prototype.
 //!
 //! # Invariants
 //!
 //! - Resolution neither allocates nor runs JavaScript.
 //! - Proxies, opaque lookup state and dictionary holders are not resolved;
-//!   their callers complete the ordinary `[[Get]]`/`[[Set]]`. Accessors are
-//!   resolved only by [`resolve_atom_inherited_accessor`], for a caller that
-//!   invokes the getter or setter itself.
+//!   their callers complete the ordinary `[[Get]]`/`[[Set]]`. A dictionary
+//!   receiver's own table is the caller's; the chain past it resolves through
+//!   the `*_from` / `resolve_inherited_*` entry points. Accessors are resolved
+//!   only by the accessor resolvers, for a caller that invokes the getter or
+//!   setter itself.
 //! - An inherited or absent answer carries the chain proof of its first
 //!   prototype. Any mutation of a link (including adding the key) invalidates
 //!   it, and an invalid proof is never revived.
@@ -183,7 +187,17 @@ pub(crate) fn resolve_atom_inherited_accessor(
     ) {
         return None;
     }
-    let first = object::prototype(obj, heap)?;
+    resolve_inherited_atom_accessor(object::prototype(obj, heap)?, heap, key)
+}
+
+/// Resolve an accessor that a receiver without the key inherits from the
+/// chain starting at `first`, its prototype, with that chain's proof.
+#[must_use]
+pub(crate) fn resolve_inherited_atom_accessor(
+    first: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+) -> Option<ResolvedAccessorSlot> {
     let validity = chain_validity(first, heap)?;
     let mut proto = first;
     for _ in 0..object::PROTO_CHAIN_HARD_CAP {
@@ -235,7 +249,17 @@ pub(crate) fn resolve_absent_atom(
     if object::prototype_value(obj, heap).is_none() {
         return Some(None);
     }
-    let first = object::prototype(obj, heap)?;
+    resolve_absent_atom_from(object::prototype(obj, heap)?, heap, key).map(Some)
+}
+
+/// Resolve a key that the whole ordinary chain starting at `first`, a
+/// receiver's prototype, lacks, with that chain's proof.
+#[must_use]
+pub(crate) fn resolve_absent_atom_from(
+    first: JsObject,
+    heap: &otter_gc::GcHeap,
+    key: AtomizedPropertyKey<'_>,
+) -> Option<Arc<PrototypeValidity>> {
     let validity = chain_validity(first, heap)?;
     let mut proto = first;
     for _ in 0..object::PROTO_CHAIN_HARD_CAP {
@@ -248,7 +272,7 @@ pub(crate) fn resolve_absent_atom(
             return None;
         }
         if object::prototype_value(proto, heap).is_none() {
-            return Some(Some(validity));
+            return Some(validity);
         }
         proto = object::prototype(proto, heap)?;
     }

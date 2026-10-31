@@ -85,7 +85,7 @@ impl Interpreter {
                 } else {
                     slot.record_miss();
                     let load = self.resolve_property_load(obj, key);
-                    self.update_load_ic(slot, obj, &load);
+                    self.update_load_ic(slot, obj, key, &load);
                     match load {
                         crate::property_cache::PropertyLoad::Data(_) => Some(true),
                         crate::property_cache::PropertyLoad::Absent(_) => Some(false),

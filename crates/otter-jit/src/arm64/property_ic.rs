@@ -5,7 +5,8 @@
 //! - [`emit_select_entry`] — the source receiver selects a current storage
 //!   shape through the shared checked projection key.
 //! - [`emit_slot_load`] — own field, prototype field under its chain proof,
-//!   nonexistent key, a typed view's intrinsic `length`.
+//!   nonexistent key, a typed view's intrinsic `length`, and a dictionary-mode
+//!   receiver's own key table followed by its shape's chain answer.
 //! - [`emit_slot_store`] — own-field store and add-transition (write, shape
 //!   publication), returning the actual storage parent and optional child
 //!   shape for the caller's barriers.
@@ -281,6 +282,7 @@ pub(crate) fn emit_slot_load(
     let prototype = ops.new_dynamic_label();
     let field = ops.new_dynamic_label();
     let typed_length = ops.new_dynamic_label();
+    let dictionary = ops.new_dynamic_label();
     emit_select_entry(
         ops,
         view,
@@ -299,12 +301,28 @@ pub(crate) fn emit_slot_load(
         ; b.eq =>prototype
         ; cmp w16, Kind::TypedArrayLength as u32
         ; b.eq =>typed_length
+        ; cmp w16, Kind::DictionaryField as u32
+        ; b.eq =>dictionary
+        ; sub w17, w16, Kind::DictionaryNonExistent as u32
+        ; cmp w17, (Kind::DictionaryPrototypeAccessor as u32) - (Kind::DictionaryNonExistent as u32)
+        ; b.ls =>dictionary
         ; cmp w16, Kind::NonExistent as u32
         ; b.ne =>miss
     );
     emit_entry_proof(ops, entry, false, miss);
     emit_load_u64(ops, destination, VALUE_UNDEFINED);
-    dynasm!(ops ; .arch aarch64 ; b =>done ; =>prototype);
+    dynasm!(ops ; .arch aarch64 ; b =>done ; =>dictionary);
+    emit_dictionary_load(
+        ops,
+        view,
+        receiver,
+        [entry, index, holder],
+        destination,
+        prototype,
+        miss,
+        done,
+    );
+    dynasm!(ops ; .arch aarch64 ; =>prototype);
     emit_entry_proof(ops, entry, true, miss);
     dynasm!(ops ; .arch aarch64
         ; and x17, X(receiver), #0xffff_ffff_0000_0000
@@ -333,6 +351,105 @@ pub(crate) fn emit_slot_load(
     dynasm!(ops ; .arch aarch64 ; cmp X(index), x16 ; b.hi =>miss);
     crate::template::arm64::values::emit_box_int32(ops, index, 16);
     dynasm!(ops ; .arch aarch64 ; mov X(destination), X(index) ; b =>done);
+}
+
+/// The dictionary handler at `X(entry)` for the dictionary-mode receiver in
+/// `X(receiver)`: own data the key table holds for the entry's atom lands in
+/// `X(destination)` and jumps to `done`; an own accessor misses. A key the
+/// table lacks continues with the entry's chain answer: `undefined` under
+/// its proof, or the prototype field at `prototype` (which reads the proof,
+/// the holder and the field from the same entry words), else `miss`.
+/// Writes `X(index)`, `X(holder)`, `x16`, `x17` and, on a hit, `destination`.
+#[allow(clippy::too_many_arguments)]
+fn emit_dictionary_load(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    [entry, index, holder]: [u8; 3],
+    destination: u8,
+    prototype: DynamicLabel,
+    miss: DynamicLabel,
+    done: DynamicLabel,
+) {
+    let layout = otter_vm::object::DictionaryLayout::current();
+    let field = view.field_layout;
+    let chain = ops.new_dynamic_label();
+    let found = ops.new_dynamic_label();
+    let suffix = ops.new_dynamic_label();
+    let absent = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64
+        ; and x17, X(receiver), #0xffff_ffff_0000_0000
+        ; ldr W(holder), [X(receiver), layout.exotic_byte]
+        ; cbz W(holder), =>miss
+        ; add X(holder), x17, X(holder)
+        ; ldr W(holder), [X(holder), layout.keys_byte]
+        ; cbz W(holder), =>miss
+        ; add X(holder), x17, X(holder)
+        ; ldr W(index), [X(entry), IC.entry_atom_byte]
+    );
+    emit_load_u64(ops, 17, layout.hash_multiplier);
+    dynasm!(ops ; .arch aarch64
+        ; mul X(index), X(index), x17
+        ; lsr X(index), X(index), 32
+        ; ldr w16, [X(holder), layout.mask_byte]
+        ; and W(index), W(index), w16
+        ; add XSP(holder), XSP(holder), layout.buckets_byte
+        ; ldr W(index), [X(holder), X(index), lsl #2]
+        // The entry records follow the `mask + 1` buckets.
+        ; add w16, w16, #1
+        ; add X(holder), X(holder), x16, lsl #2
+        ; =>chain
+        ; cmn WSP(index), #1
+        ; b.eq =>absent
+        ; add x17, X(holder), X(index), lsl layout.entry_shift
+        ; ldr w16, [x17, layout.entry_atom_byte]
+        ; ldr w17, [X(entry), IC.entry_atom_byte]
+        ; cmp w16, w17
+        ; b.eq =>found
+        ; add x17, X(holder), X(index), lsl layout.entry_shift
+        ; ldr W(index), [x17, layout.entry_next_byte]
+        ; b =>chain
+        // The entry index is the slot index; its metadata says data or
+        // accessor.
+        ; =>found
+        ; and x17, X(receiver), #0xffff_ffff_0000_0000
+        ; ldr W(holder), [X(receiver), layout.exotic_byte]
+        ; add X(holder), x17, X(holder)
+        ; ldr W(holder), [X(holder), layout.metas_byte]
+        ; cbz W(holder), =>miss
+        ; add X(holder), x17, X(holder)
+        ; mov w16, layout.meta_bytes
+        ; madd x16, X(index), x16, X(holder)
+        ; ldrb w16, [x16, layout.metas_records_byte + layout.meta_accessor_byte]
+        ; cbnz w16, =>miss
+        ; ldr w16, [X(receiver), view.object_shape_byte]
+        ; add x16, x17, x16
+        ; ldrb w16, [x16, view.shape_inline_capacity_byte]
+        ; cmp W(index), w16
+        ; b.hs =>suffix
+        ; add X(holder), X(receiver), X(index), lsl #3
+        ; add XSP(holder), XSP(holder), field.inline_values_byte
+        ; ldr X(destination), [X(holder)]
+        ; b =>done
+        ; =>suffix
+        ; sub W(index), W(index), w16
+        ; ldr w16, [X(receiver), field.slab_handle_byte]
+        ; cbz w16, =>miss
+        ; add x16, x17, x16
+        ; add x16, x16, X(index), lsl #3
+        ; add x16, x16, field.slab_words_byte
+        ; ldr X(destination), [x16]
+        ; b =>done
+        ; =>absent
+        ; ldrb w16, [X(entry), IC.entry_kind_byte]
+        ; cmp w16, Kind::DictionaryPrototypeField as u32
+        ; b.eq =>prototype
+        ; cmp w16, Kind::DictionaryNonExistent as u32
+        ; b.ne =>miss
+    );
+    emit_entry_proof(ops, entry, false, miss);
+    emit_load_u64(ops, destination, VALUE_UNDEFINED);
+    dynasm!(ops ; .arch aarch64 ; b =>done);
 }
 
 /// Complete a store of `X(value)` through the slot at `X(slot)`: on a hit

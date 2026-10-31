@@ -4470,24 +4470,38 @@ pub(crate) fn chain_has_describable_dictionary_prototype(
     false
 }
 
-/// The own data property `atom` names on the dictionary-mode `obj`, read
-/// from its key table: `None` for a shaped object, an absent key or an
-/// accessor.
+/// The own property `atom` names on a dictionary-mode object, read from its
+/// key table.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum DictionaryOwn {
+    /// The table lacks the key.
+    Absent,
+    /// Own data.
+    Data(Value),
+    /// An own accessor and its getter.
+    Accessor(Option<Value>),
+}
+
+/// The own property `atom` names on the dictionary-mode `obj`; `None` for a
+/// shaped object.
 #[must_use]
-pub(crate) fn load_dictionary_data(
+pub(crate) fn lookup_dictionary_own(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
     atom: crate::property_atom::AtomId,
-) -> Option<Value> {
+) -> Option<DictionaryOwn> {
     heap.read_payload(obj, |body| {
         if !body.is_dictionary() {
             return None;
         }
-        let offset = body.dictionary_index_get(atom)?;
-        match body.slot_lookup_at(heap, offset as usize) {
-            PropertyLookup::Data { value, .. } => Some(value),
-            _ => None,
-        }
+        let Some(offset) = body.dictionary_index_get(atom) else {
+            return Some(DictionaryOwn::Absent);
+        };
+        Some(match body.slot_lookup_at(heap, offset as usize) {
+            PropertyLookup::Data { value, .. } => DictionaryOwn::Data(value),
+            PropertyLookup::Accessor { getter, .. } => DictionaryOwn::Accessor(getter),
+            PropertyLookup::Absent => DictionaryOwn::Absent,
+        })
     })
 }
 

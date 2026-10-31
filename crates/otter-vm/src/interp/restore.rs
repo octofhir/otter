@@ -155,6 +155,7 @@ impl Interpreter {
             array_index_accessor_protector: false,
             array_buffer_detach_protector: false,
             typed_array_length_protector: false,
+            array_species_default: std::cell::Cell::new(None),
             preparing_stack_trace: false,
             array_index_accessor_protector_epoch: 0,
             interrupt: {

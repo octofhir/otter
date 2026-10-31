@@ -42,6 +42,7 @@ impl Interpreter {
         {
             self.activate_typed_array_length_protector();
         }
+        self.observe_array_species_key(target, key.string_name());
         let mut target =
             self.with_handle_scope(|interp, scope| -> Result<Value, CommittedValueError> {
                 let target = interp.scoped_value(scope, target);

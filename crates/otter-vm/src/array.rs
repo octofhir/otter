@@ -883,6 +883,87 @@ pub(crate) fn from_values_with_roots(
     alloc_body_with_adopted_elements(heap, body, placement, external_visit)
 }
 
+/// `Array.prototype.slice` of a plain array (no sidecar, no indexed
+/// accessor, length equal to its dense length) without a hole in the index
+/// range `range` picks for its length: one slab of the source's
+/// representation sized to the range, its words copied, under a fresh shell.
+/// `None` for any other array. `source` is a root slot the allocations
+/// rewrite when it moves.
+pub(crate) fn slice_plain_dense(
+    heap: &mut GcHeap,
+    source: &mut JsArray,
+    range: impl FnOnce(usize) -> std::ops::Range<usize>,
+    external_visit: &mut RootSlotVisitor<'_>,
+) -> Option<Result<JsArray, otter_gc::OutOfMemory>> {
+    let (start, count, kind) = heap.read_payload(*source, |body| {
+        let len = body.dense_len();
+        if !body.exotic.is_null() || body.accessors().is_some() || body.length() != len {
+            return None;
+        }
+        let range = range(len);
+        let start = range.start.min(len);
+        let end = range.end.min(len).max(start);
+        if start == end {
+            return Some((start, 0, DenseElementKind::Tagged));
+        }
+        // SAFETY: the array body keeps its slab reachable for this borrow.
+        let slab = unsafe { &*elements::body_of(body.slab)? };
+        if slab.has_hole_in(start, end) {
+            return None;
+        }
+        let kind = if slab.kind() == DenseElementKind::Tagged {
+            DenseElementKind::Tagged
+        } else {
+            DenseElementKind::PackedDouble
+        };
+        Some((start, end - start, kind))
+    })?;
+    if count == 0 {
+        return Some(from_values_with_roots(
+            heap,
+            &mut [],
+            otter_gc::SitePlacement::Young(0),
+            external_visit,
+        ));
+    }
+    let source_slot = std::ptr::from_mut(source).cast::<RawGc>();
+    let mut visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+        external_visit(visitor);
+        visitor(source_slot);
+    };
+    let slab = match elements::alloc_element_slab(
+        heap,
+        count,
+        kind,
+        otter_gc::SitePlacement::Young(0),
+        &mut visit,
+    ) {
+        Ok(slab) => slab,
+        Err(error) => return Some(Err(error)),
+    };
+    // The allocation may have moved the source and its slab: read both again.
+    let source_slab = heap.read_payload(*source, |body| body.slab);
+    let target = elements::body_of(slab).expect("fresh element slab");
+    let from = elements::body_of(source_slab).expect("a sliced array keeps its slab");
+    // SAFETY: the fresh slab is reachable only through `slab`; the source
+    // slab is a distinct live cell nothing else borrows here.
+    unsafe { (*target).copy_hole_free_range(&*from, start, count) };
+    record_slab_contents(heap, slab, count);
+    let mut body = ArrayBody {
+        ..Default::default()
+    };
+    body.set_length(count);
+    body.adopt_slab(slab, 0);
+    body.set_dense_len(count);
+    body.refresh_element_cache();
+    Some(alloc_body_with_adopted_elements(
+        heap,
+        body,
+        otter_gc::SitePlacement::Young(0),
+        &mut visit,
+    ))
+}
+
 /// Allocation-buffer bytes [`place_tagged_array`] takes for `len` elements:
 /// the shell and, for a non-empty array, its slab.
 pub(crate) fn tagged_array_cell_bytes(len: usize) -> usize {
@@ -3027,6 +3108,32 @@ mod tests {
         assert_eq!(dense_element_kind(a, &heap), DenseElementKind::PackedDouble);
         assert_eq!(get(a, &heap, 0).as_f64(), Some(0.0));
         assert_eq!(get(a, &heap, 5).as_f64(), Some(5.0));
+
+        // A slice copies the range's words into its own slab of the same
+        // representation; a hole inside the range refuses it.
+        let mut source = a;
+        let sliced = slice_plain_dense(&mut heap, &mut source, |_| 2..5, &mut external_visit)
+            .expect("plain dense range")
+            .unwrap();
+        assert_eq!(len(sliced, &heap), 3);
+        assert_eq!(
+            dense_element_kind(sliced, &heap),
+            DenseElementKind::PackedDouble
+        );
+        assert_eq!(get(sliced, &heap, 0).as_f64(), Some(2.0));
+        assert_eq!(get(sliced, &heap, 2).as_f64(), Some(4.0));
+        set(sliced, &mut heap, 0, Value::boolean(true)).unwrap();
+        assert_eq!(
+            get(source, &heap, 2).as_f64(),
+            Some(2.0),
+            "the source keeps its words"
+        );
+        set_length(source, &mut heap, 9).unwrap();
+        assert!(slice_plain_dense(&mut heap, &mut source, |_| 4..8, &mut external_visit).is_none());
+        let tail = slice_plain_dense(&mut heap, &mut source, |_| 1..3, &mut external_visit)
+            .expect("hole-free prefix range")
+            .unwrap();
+        assert_eq!(get(tail, &heap, 1).as_f64(), Some(2.0));
     }
 
     #[test]

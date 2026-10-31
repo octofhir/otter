@@ -477,6 +477,59 @@ impl ElementSlabBody {
         self.len = len as u32;
     }
 
+    /// Fill a fresh private slab of `source`'s representation with the
+    /// `count` live slots of `source` from `start`, none of them a hole, and
+    /// publish them: one word copy, no per-slot conversion.
+    pub(crate) fn copy_hole_free_range(&mut self, source: &Self, start: usize, count: usize) {
+        self.assert_private();
+        assert!(self.len == 0 && count <= self.capacity() && start + count <= source.len());
+        match source.kind {
+            DenseElementKind::Empty => unreachable!("materialized slab cannot be empty"),
+            DenseElementKind::Tagged => {
+                assert_eq!(self.kind, DenseElementKind::Tagged);
+                // SAFETY: both ranges lie in initialized storage of distinct
+                // cells; slot words are plain Values.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source.values_ptr().add(start),
+                        self.values_ptr(),
+                        count,
+                    );
+                }
+                self.mark_dirty_range(0, count);
+            }
+            DenseElementKind::PackedDouble | DenseElementKind::HoleyDouble => {
+                assert!(self.kind.is_numeric());
+                // SAFETY: as above, for the numeric data words; the fresh
+                // bitmap is zero, matching a hole-free range.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        source.doubles_ptr().add(start),
+                        self.doubles_ptr(),
+                        count,
+                    );
+                }
+            }
+        }
+        self.set_len(count);
+    }
+
+    /// Whether the live slots `[start, end)` hold a hole.
+    #[must_use]
+    pub(crate) fn has_hole_in(&self, start: usize, end: usize) -> bool {
+        match self.kind {
+            DenseElementKind::Empty => true,
+            DenseElementKind::Tagged => self
+                .tagged_slice()
+                .and_then(|values| values.get(start..end))
+                .is_none_or(|values| values.iter().any(|value| value.is_hole())),
+            DenseElementKind::PackedDouble => end > self.len(),
+            DenseElementKind::HoleyDouble => {
+                end > self.len() || (start..end).any(|index| self.hole_bit(index))
+            }
+        }
+    }
+
     /// The tagged word of slot `index`.
     ///
     /// # Safety

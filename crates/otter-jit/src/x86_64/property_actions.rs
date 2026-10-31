@@ -154,10 +154,10 @@ pub(crate) fn emit_action_probe(
         ; test Rd(shape), Rd(shape) ; jz =>miss
         ; add Rq(shape), r10
     );
-    // The table records loads only for shaped receivers with ordinary
-    // lookup and stores only for shapes whose stores stay in place: a
-    // dictionary, opaque or prototype receiver's shape id keys no such fact,
-    // and shape state is immutable, so neither probe tests state.
+    // The table records loads for shaped receivers with ordinary lookup,
+    // chain answers for dictionary shapes (whose actions say so and probe the
+    // receiver's own table first), and stores only for shapes whose stores
+    // stay in place; shape state is immutable, so neither probe tests state.
     dynasm!(ops ; .arch x64
         ; mov Rq(identity), [Rq(shape) + cache.shape_id_byte as i32]);
 
@@ -194,10 +194,19 @@ pub(crate) fn emit_action_probe(
             let absent = ops.new_dynamic_label();
             let undefined = ops.new_dynamic_label();
             let canonical = ops.new_dynamic_label();
+            let inherited = ops.new_dynamic_label();
+            let dictionary = ops.new_dynamic_label();
             dynasm!(ops ; .arch x64
                 ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::OwnData as i8 ; je =>own
                 ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::NonExistent as i8 ; je =>absent
-                ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::InheritedData as i8 ; jne =>miss
+                ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::InheritedData as i8 ; je =>inherited
+                ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::DictionaryNonExistent as i8 ; je =>dictionary
+                ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::DictionaryInheritedData as i8 ; jne =>miss
+                ; =>dictionary);
+            emit_dictionary_absent(ops, receiver, atom, [shape, identity, base], miss);
+            dynasm!(ops ; .arch x64
+                ; cmp BYTE [Rq(entry) + cache.load_action_byte as i32], PropertyLoadAction::DictionaryNonExistent as i8 ; je =>absent
+                ; =>inherited
                 ; mov r10, [Rq(entry) + cache.load_validity_byte as i32]
                 ; test r10, r10 ; jz =>miss
                 ; cmp DWORD [r10], 0 ; je =>miss
@@ -307,6 +316,52 @@ pub(crate) fn emit_action_probe(
 /// `Rq(destination)` = the slot of `holder` that `Rd(word)` resolves
 /// ([`otter_vm::jit::slot_word`]); a slab slot beyond the object's current
 /// slab goes to `miss`, before the destination is written.
+/// Fall through when the key table of the dictionary-mode receiver in
+/// `Rq(receiver)`, whose shape the matched row keys, lacks the atom in
+/// `Rd(atom)`; jump to `miss` when it holds the key or has no table.
+/// Writes the three temporaries, `r10` and `r11`.
+fn emit_dictionary_absent(
+    ops: &mut Assembler,
+    receiver: u8,
+    atom: u8,
+    [table, index, record]: [u8; 3],
+    miss: DynamicLabel,
+) {
+    let layout = otter_vm::object::DictionaryLayout::current();
+    let chain = ops.new_dynamic_label();
+    let absent = ops.new_dynamic_label();
+    emit_load_u64(ops, 11, 0xffff_ffff_0000_0000);
+    dynasm!(ops ; .arch x64
+        ; and r11, Rq(receiver)
+        ; mov Rd(table), [Rq(receiver) + layout.exotic_byte as i32]
+        ; test Rd(table), Rd(table) ; jz =>miss
+        ; add Rq(table), r11
+        ; mov Rd(table), [Rq(table) + layout.keys_byte as i32]
+        ; test Rd(table), Rd(table) ; jz =>miss
+        ; add Rq(table), r11
+        ; mov Rd(index), Rd(atom));
+    emit_load_u64(ops, 10, layout.hash_multiplier);
+    dynasm!(ops ; .arch x64
+        ; imul Rq(index), r10
+        ; shr Rq(index), 32
+        ; mov r10d, [Rq(table) + layout.mask_byte as i32]
+        ; and Rd(index), r10d
+        ; lea Rq(table), [Rq(table) + layout.buckets_byte as i32]
+        ; mov Rd(index), [Rq(table) + Rq(index) * 4]
+        // The entry records follow the `mask + 1` buckets.
+        ; add r10d, 1
+        ; lea Rq(table), [Rq(table) + r10 * 4]
+        ; =>chain
+        ; cmp Rd(index), -1 ; je =>absent
+        ; mov Rd(record), Rd(index)
+        ; shl Rq(record), layout.entry_shift as i8
+        ; add Rq(record), Rq(table)
+        ; cmp [Rq(record) + layout.entry_atom_byte as i32], Rd(atom) ; je =>miss
+        ; mov Rd(index), [Rq(record) + layout.entry_next_byte as i32]
+        ; jmp =>chain
+        ; =>absent);
+}
+
 fn emit_word_load(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,

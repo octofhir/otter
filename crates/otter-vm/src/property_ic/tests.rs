@@ -1073,6 +1073,20 @@ fn dictionary_receivers_of_one_shape_share_a_key_table_handler() {
         "a key the table lacks takes the shape-proved absence"
     );
 
+    // A key both tables lack resolves once and the shared row, keyed by the
+    // shape every receiver shares, answers the other receiver.
+    let missing = crate::isolate_names::names_mut(vm.gc_heap_mut()).intern("zz");
+    let missing = AtomizedPropertyKey::new(PropertyAtom::new(missing), "zz");
+    assert!(matches!(
+        vm.resolve_property_load(first, missing),
+        crate::property_cache::PropertyLoad::Absent(None)
+    ));
+    assert!(matches!(
+        vm.property_cache
+            .probe_dictionary_chain(second, vm.gc_heap(), missing),
+        Some(crate::property_ic::DictionaryChain::Absent(None))
+    ));
+
     assert!(object::delete(&mut first, vm.gc_heap_mut(), "k3").unwrap());
     let heap = vm.gc_heap();
     assert_eq!(object::shape(first, heap), shape);

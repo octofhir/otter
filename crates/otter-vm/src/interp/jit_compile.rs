@@ -402,9 +402,10 @@ impl Interpreter {
             0
         };
         let perf_name = debug.perf_map_enabled().then(|| {
-            owner
-                .function(fid)
-                .map_or_else(|| "<unknown>".to_string(), |function| function.name.clone())
+            owner.function(fid).map_or_else(
+                || "<unknown>".to_string(),
+                |function| format!("{}@{}", function.name, function.span.0),
+            )
         });
         let cancellation = crate::JitCompileCancellation::default();
         let pending = crate::jit_compile_queue::PendingCompile {
@@ -855,9 +856,10 @@ impl Interpreter {
             0
         };
         let perf_name = debug.perf_map_enabled().then(|| {
-            owner
-                .function(fid)
-                .map_or_else(|| "<unknown>".to_string(), |function| function.name.clone())
+            owner.function(fid).map_or_else(
+                || "<unknown>".to_string(),
+                |function| format!("{}@{}", function.name, function.span.0),
+            )
         });
         let cancellation = crate::JitCompileCancellation::default();
         let pending = crate::jit_compile_queue::PendingCompile {
@@ -1048,7 +1050,8 @@ impl Interpreter {
         self.retain_template_compile_outcome(fid, outcome)
     }
 
-    /// Name one installed code object of function `name` in the perf map.
+    /// Name one installed code object of function `name` (`name@source-offset`)
+    /// in the perf map.
     fn record_jit_perf_map(&mut self, name: &str, code: &dyn jit::JitFunctionCode, tier: &str) {
         let Some(address) = code.native_code_address() else {
             return;

@@ -1976,7 +1976,7 @@ impl Interpreter {
         // Preparing a dictionary-mode prototype allocates; callers re-read
         // the receiver from its root.
         let load = self.resolve_property_load_preparing(&mut obj, key);
-        self.update_load_ic(slot, obj, &load);
+        self.update_load_ic(slot, obj, key, &load);
         match load {
             crate::property_cache::PropertyLoad::Data(resolved) => Some(resolved.value),
             crate::property_cache::PropertyLoad::Absent(_)

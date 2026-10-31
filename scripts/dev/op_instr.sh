@@ -31,6 +31,10 @@ const bound = big.bind(null);
 const gobj = { get v() { return 3; } };
 const nfns = [Object.isExtensible, Object.isFrozen];
 const otostr = Object.prototype.toString;
+const ptarget = { a: 1, __flags: { b: 2 } };
+const pexcluded = ['then', 'catch', 'inspect', 'toJSON'];
+const pxy = new Proxy(ptarget, { get(t, p) { if (typeof p === 'string' && pexcluded.indexOf(p) === -1 && !Reflect.has(t, p)) throw Error(p); return Reflect.get(t, p); } });
+const pxyplain = new Proxy(ptarget, {});
 let out = 0;
 JS
 case_body() {
@@ -110,6 +114,10 @@ case_body() {
     arrforeach) echo 'smallarr.forEach((v) => { s = (s + v) | 0; });' ;;
     arrsome) echo 's = (s + (smallarr.some((v) => v === 9) ? 1 : 0)) | 0;' ;;
     strreplacefn) echo 's = (s + "a-b".replace("-", () => "+").length) | 0;' ;;
+    proxyget) echo 's = (s + pxy.a) | 0;' ;;
+    proxyplain) echo 's = (s + pxyplain.a) | 0;' ;;
+    reflectget) echo 's = (s + Reflect.get(ptarget, "a")) | 0;' ;;
+    reflecthas) echo 's = (s + (Reflect.has(ptarget, "a") ? 1 : 0)) | 0;' ;;
     switchs) echo 'switch (keys[i & 7]) { case "k0": s = (s + 1) | 0; break; case "k1": s = (s + 2) | 0; break; default: s = (s + 3) | 0; }' ;;
     *) echo "unknown case $1" >&2; exit 1 ;;
   esac

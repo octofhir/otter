@@ -5,7 +5,8 @@
 //! - [`emit_select_entry`] — the source receiver selects a current storage
 //!   shape through the shared checked projection key.
 //! - [`emit_slot_load`] — own field, prototype field under its chain proof,
-//!   nonexistent key, a typed view's intrinsic `length`.
+//!   nonexistent key, a typed view's intrinsic `length`, and a dictionary-mode
+//!   receiver's own key table followed by its shape's chain answer.
 //! - [`emit_slot_store`] — own-field store and add-transition (write, shape
 //!   publication), returning the actual storage parent and optional child
 //!   shape for the caller's barriers.
@@ -273,6 +274,7 @@ pub(crate) fn emit_slot_load(
     let inline = ops.new_dynamic_label();
     let field_loaded = ops.new_dynamic_label();
     let typed_length = ops.new_dynamic_label();
+    let dictionary = ops.new_dynamic_label();
     let layout = view.field_layout;
     emit_select_entry(
         ops,
@@ -289,10 +291,25 @@ pub(crate) fn emit_slot_load(
         ; cmp r10d, Kind::OwnField as i32 ; je =>own
         ; cmp r10d, Kind::PrototypeField as i32 ; je =>prototype
         ; cmp r10d, Kind::TypedArrayLength as i32 ; je =>typed_length
+        ; cmp r10d, Kind::DictionaryField as i32 ; je =>dictionary
+        ; cmp r10d, Kind::DictionaryNonExistent as i32 ; je =>dictionary
+        ; cmp r10d, Kind::DictionaryPrototypeField as i32 ; je =>dictionary
+        ; cmp r10d, Kind::DictionaryPrototypeAccessor as i32 ; je =>dictionary
         ; cmp r10d, Kind::NonExistent as i32 ; jne =>miss);
     emit_entry_proof(ops, entry, false, miss);
     emit_load_u64(ops, destination, VALUE_UNDEFINED);
-    dynasm!(ops ; .arch x64 ; jmp =>done ; =>prototype);
+    dynasm!(ops ; .arch x64 ; jmp =>done ; =>dictionary);
+    emit_dictionary_load(
+        ops,
+        view,
+        receiver,
+        [entry, index, holder],
+        destination,
+        prototype,
+        miss,
+        done,
+    );
+    dynasm!(ops ; .arch x64 ; =>prototype);
     emit_entry_proof(ops, entry, true, miss);
     emit_load_u64(ops, 11, CAGE_MASK);
     dynasm!(ops ; .arch x64
@@ -323,6 +340,104 @@ pub(crate) fn emit_slot_load(
     crate::x86_64::values::emit_typed_view_count(ops, view.typed_array_length, receiver, miss);
     dynasm!(ops ; .arch x64 ; cmp r10, i32::MAX ; ja =>miss);
     crate::x86_64::values::emit_box_int32(ops, 10, destination, 11);
+    dynasm!(ops ; .arch x64 ; jmp =>done);
+}
+
+/// The dictionary handler at `Rq(entry)` for the dictionary-mode receiver in
+/// `Rq(receiver)`: own data the key table holds for the entry's atom lands in
+/// `Rq(destination)` and jumps to `done`; an own accessor misses. A key the
+/// table lacks continues with the entry's chain answer: `undefined` under
+/// its proof, or the prototype field at `prototype` (which reads the proof,
+/// the holder and the field from the same entry words), else `miss`.
+/// Writes `Rq(index)`, `Rq(holder)`, `r10`, `r11` and, on a hit,
+/// `destination`.
+#[allow(clippy::too_many_arguments)]
+fn emit_dictionary_load(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    [entry, index, holder]: [u8; 3],
+    destination: u8,
+    prototype: DynamicLabel,
+    miss: DynamicLabel,
+    done: DynamicLabel,
+) {
+    let layout = otter_vm::object::DictionaryLayout::current();
+    let field = view.field_layout;
+    let chain = ops.new_dynamic_label();
+    let found = ops.new_dynamic_label();
+    let suffix = ops.new_dynamic_label();
+    let absent = ops.new_dynamic_label();
+    emit_load_u64(ops, 11, CAGE_MASK);
+    dynasm!(ops ; .arch x64
+        ; and r11, Rq(receiver)
+        ; mov Rd(holder), [Rq(receiver) + layout.exotic_byte as i32]
+        ; test Rd(holder), Rd(holder) ; jz =>miss
+        ; add Rq(holder), r11
+        ; mov Rd(holder), [Rq(holder) + layout.keys_byte as i32]
+        ; test Rd(holder), Rd(holder) ; jz =>miss
+        ; add Rq(holder), r11
+        ; mov Rd(index), [Rq(entry) + IC.entry_atom_byte as i32]
+    );
+    emit_load_u64(ops, 10, layout.hash_multiplier);
+    dynasm!(ops ; .arch x64
+        ; imul Rq(index), r10
+        ; shr Rq(index), 32
+        ; mov r10d, [Rq(holder) + layout.mask_byte as i32]
+        ; and Rd(index), r10d
+        ; lea Rq(holder), [Rq(holder) + layout.buckets_byte as i32]
+        ; mov Rd(index), [Rq(holder) + Rq(index) * 4]
+        // The entry records follow the `mask + 1` buckets.
+        ; add r10d, 1
+        ; lea Rq(holder), [Rq(holder) + r10 * 4]
+        ; =>chain
+        ; cmp Rd(index), -1
+        ; je =>absent
+        ; mov r10d, Rd(index)
+        ; shl r10, layout.entry_shift as i8
+        ; add r10, Rq(holder)
+        ; mov r11d, [Rq(entry) + IC.entry_atom_byte as i32]
+        ; cmp [r10 + layout.entry_atom_byte as i32], r11d
+        ; je =>found
+        ; mov Rd(index), [r10 + layout.entry_next_byte as i32]
+        ; jmp =>chain
+        // The entry index is the slot index; its metadata says data or
+        // accessor.
+        ; =>found
+    );
+    emit_load_u64(ops, 11, CAGE_MASK);
+    dynasm!(ops ; .arch x64
+        ; and r11, Rq(receiver)
+        ; mov Rd(holder), [Rq(receiver) + layout.exotic_byte as i32]
+        ; add Rq(holder), r11
+        ; mov Rd(holder), [Rq(holder) + layout.metas_byte as i32]
+        ; test Rd(holder), Rd(holder) ; jz =>miss
+        ; add Rq(holder), r11
+        ; imul r10d, Rd(index), layout.meta_bytes as i32
+        ; add r10, Rq(holder)
+        ; cmp BYTE [r10 + (layout.metas_records_byte + layout.meta_accessor_byte) as i32], 0
+        ; jne =>miss
+        ; mov r10d, [Rq(receiver) + view.object_shape_byte as i32]
+        ; add r10, r11
+        ; movzx r10d, BYTE [r10 + view.shape_inline_capacity_byte as i32]
+        ; cmp Rd(index), r10d
+        ; jae =>suffix
+        ; mov Rq(destination), [Rq(receiver) + Rq(index) * 8 + field.inline_values_byte as i32]
+        ; jmp =>done
+        ; =>suffix
+        ; sub Rd(index), r10d
+        ; mov r10d, [Rq(receiver) + field.slab_handle_byte as i32]
+        ; test r10d, r10d ; jz =>miss
+        ; add r10, r11
+        ; mov Rq(destination), [r10 + Rq(index) * 8 + field.slab_words_byte as i32]
+        ; jmp =>done
+        ; =>absent
+        ; movzx r10d, BYTE [Rq(entry) + IC.entry_kind_byte as i32]
+        ; cmp r10d, Kind::DictionaryPrototypeField as i32 ; je =>prototype
+        ; cmp r10d, Kind::DictionaryNonExistent as i32 ; jne =>miss
+    );
+    emit_entry_proof(ops, entry, false, miss);
+    emit_load_u64(ops, destination, VALUE_UNDEFINED);
     dynasm!(ops ; .arch x64 ; jmp =>done);
 }
 

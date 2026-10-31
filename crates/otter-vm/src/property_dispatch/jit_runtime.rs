@@ -173,7 +173,7 @@ impl Interpreter {
         self.set_scoped(receiver_root, receiver);
         let obj = migrating;
         let load = self.resolve_property_load(obj, atomized_key);
-        self.update_load_ic(slot, obj, &load);
+        self.update_load_ic(slot, obj, atomized_key, &load);
         match load {
             crate::property_cache::PropertyLoad::Data(resolved) => return Ok(resolved.value),
             crate::property_cache::PropertyLoad::Absent(_) => return Ok(Value::undefined()),
@@ -278,7 +278,7 @@ impl Interpreter {
             ),
         };
         let load = self.resolve_property_load(obj, key);
-        self.update_load_ic(slot, obj, &load);
+        self.update_load_ic(slot, obj, key, &load);
         match load {
             crate::property_cache::PropertyLoad::Data(resolved) => Some(resolved.value),
             crate::property_cache::PropertyLoad::Absent(_) => Some(Value::undefined()),

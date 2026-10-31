@@ -1026,8 +1026,15 @@ fn dictionary_receivers_of_one_shape_share_a_key_table_handler() {
         _ => panic!("own dictionary data resolves"),
     }
 
+    // The receivers' `null` prototype, which their shape fixes, proves the
+    // key absent past their tables without a chain proof.
+    let chain = vm.dictionary_chain(first, property);
+    assert!(matches!(
+        chain,
+        crate::property_ic::DictionaryChain::Absent(None)
+    ));
     let slot = PropertyIcSlot::new(PropertyIcKind::Load);
-    let handler = IcHandler::load_dictionary(shape, atom).expect("dictionary handler");
+    let handler = IcHandler::load_dictionary(shape, atom, chain).expect("dictionary handler");
     assert_eq!(slot.install(handler), InstallOutcome::Installed);
     let heap = vm.gc_heap();
     assert_eq!(slot.probe_load(first, heap), Some(Value::number_i32(3)));
@@ -1054,10 +1061,25 @@ fn dictionary_receivers_of_one_shape_share_a_key_table_handler() {
             },
         ]
     );
+    assert!(
+        matches!(
+            programs[1].ops.as_ref(),
+            [
+                JitCacheIrOp::GuardShape { object: 0, .. },
+                JitCacheIrOp::GuardDictionaryAbsent { object: 0, .. },
+                JitCacheIrOp::LoadUndefined,
+            ]
+        ),
+        "a key the table lacks takes the shape-proved absence"
+    );
 
     assert!(object::delete(&mut first, vm.gc_heap_mut(), "k3").unwrap());
     let heap = vm.gc_heap();
     assert_eq!(object::shape(first, heap), shape);
-    assert_eq!(slot.probe_load(first, heap), None, "a deleted key misses");
+    assert_eq!(
+        slot.probe_load(first, heap),
+        Some(Value::undefined()),
+        "a deleted key reads the chain's absence"
+    );
     assert_eq!(slot.probe_load(second, heap), Some(Value::number_i32(103)));
 }

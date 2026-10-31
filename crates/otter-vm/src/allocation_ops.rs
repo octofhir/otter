@@ -805,6 +805,40 @@ impl Interpreter {
         Ok(array)
     }
 
+    /// [`crate::array::slice_plain_dense`] of `source` under the stack's
+    /// roots, with the realm's array prototype override applied; `None` for
+    /// an array it does not take.
+    pub(crate) fn alloc_stack_rooted_array_slice(
+        &mut self,
+        stack: &ActivationStack,
+        mut source: crate::array::JsArray,
+        range: impl FnOnce(usize) -> std::ops::Range<usize>,
+    ) -> Option<Result<crate::array::JsArray, VmError>> {
+        let roots = self.collect_allocation_roots(stack);
+        let prototype = self.current_array_prototype_override();
+        let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            for &slot in &roots {
+                visitor(slot);
+            }
+            if let Some(prototype) = &prototype {
+                prototype.trace_value_slots(visitor);
+            }
+        };
+        let array = match crate::array::slice_plain_dense(
+            &mut self.gc_heap,
+            &mut source,
+            range,
+            &mut external_visit,
+        )? {
+            Ok(array) => array,
+            Err(error) => return Some(Err(VmError::from(error))),
+        };
+        Some(
+            self.register_array_prototype_override(array)
+                .map_err(VmError::from),
+        )
+    }
+
     pub(crate) fn alloc_stack_rooted_iterator_state(
         &mut self,
         stack: &ActivationStack,

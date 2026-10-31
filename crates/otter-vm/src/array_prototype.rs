@@ -3672,6 +3672,16 @@ impl Interpreter {
             let end = end.map_or(len, relative) as usize;
             start..end.max(start)
         };
+        if let Some(array) = receiver.as_array() {
+            if !crate::array::is_ordinary_dense(array, &self.gc_heap)
+                || !self.array_species_is_default()
+            {
+                return None;
+            }
+            return self
+                .alloc_stack_rooted_array_slice(stack, array, range)
+                .map(|result| result.map(Value::array));
+        }
         let copied = self.slice_source_range(receiver, range)?;
         Some(
             self.alloc_stack_rooted_array_from_values(
@@ -3757,6 +3767,16 @@ impl Interpreter {
     /// `%Array%`: `%Array.prototype%.constructor` is `%Array%` and its
     /// `@@species` is the original getter, which answers `this`.
     fn array_species_is_default(&self) -> bool {
+        if let Some(default) = self.array_species_default.get() {
+            return default;
+        }
+        let default = self.compute_array_species_default();
+        self.array_species_default.set(Some(default));
+        default
+    }
+
+    /// [`Self::array_species_is_default`] from the intrinsics themselves.
+    fn compute_array_species_default(&self) -> bool {
         let heap = &self.gc_heap;
         let (Some(prototype), Some(array)) = (
             self.realm_intrinsics.array_prototype(),

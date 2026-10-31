@@ -25,6 +25,8 @@ const dict = {}; for (const k of keys) dict[k] = 1;
 const re = /k1[0-9]+/, re2 = /k(\d)(\d)/;
 const smallarr = [1, 2, 3, 4];
 const pair = [1, 2];
+const arr8 = [1, 2, 3, 4, 5, 6, 7, 8];
+const sarr = ['a', 'b', 'c', 'd'];
 function argsf() { return arguments.length + arguments[0]; }
 function restf(...xs) { return xs.length + xs[0]; }
 const bound = big.bind(null);
@@ -114,6 +116,10 @@ case_body() {
     arrforeach) echo 'smallarr.forEach((v) => { s = (s + v) | 0; });' ;;
     arrsome) echo 's = (s + (smallarr.some((v) => v === 9) ? 1 : 0)) | 0;' ;;
     strreplacefn) echo 's = (s + "a-b".replace("-", () => "+").length) | 0;' ;;
+    arrslice) echo 's = (s + 1) | 0; keep[i & 1023] = arr8.slice(1);' ;;
+    arrconcat) echo 's = (s + 1) | 0; keep[i & 1023] = arr8.concat(pair);' ;;
+    arrsplice) echo 's = (s + 1) | 0; const t = arr8.slice(); t.splice(2, 3); keep[i & 1023] = t;' ;;
+    arrjoin) echo 's = (s + sarr.join(",").length) | 0;' ;;
     proxyget) echo 's = (s + pxy.a) | 0;' ;;
     proxyplain) echo 's = (s + pxyplain.a) | 0;' ;;
     reflectget) echo 's = (s + Reflect.get(ptarget, "a")) | 0;' ;;

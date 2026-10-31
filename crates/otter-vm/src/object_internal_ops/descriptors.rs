@@ -1159,6 +1159,35 @@ impl Interpreter {
                 .any(|realm| holds(&realm.realm_intrinsics))
     }
 
+    /// Forget the memoized `ArraySpeciesCreate` default when a mutation of
+    /// the key on `target` may change it: `constructor` of any realm's
+    /// `%Array.prototype%`, or a symbol key (`name` is `None`) of any realm's
+    /// `%Array%`.
+    pub(crate) fn observe_array_species_key(&self, target: Value, name: Option<&str>) {
+        let mut realms = std::iter::once(&self.realm_intrinsics).chain(
+            self.extra_realms
+                .iter()
+                .map(|realm| &realm.realm_intrinsics),
+        );
+        let affects = match name {
+            Some("constructor") => target.as_object().is_some_and(|object| {
+                realms.any(|intrinsics| intrinsics.array_prototype() == Some(object))
+            }),
+            Some(_) => false,
+            None => {
+                target.as_native_function().is_some()
+                    && realms.any(|intrinsics| {
+                        intrinsics
+                            .callable(crate::IntrinsicCallKind::Array)
+                            .is_some_and(|array| Value::native_function(array) == target)
+                    })
+            }
+        };
+        if affects {
+            self.array_species_default.set(None);
+        }
+    }
+
     /// `true` when `target` is a realm prototype that an ordinary dense array
     /// inherits from, so an indexed property defined on it becomes visible
     /// through that array's holes.

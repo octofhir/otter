@@ -105,10 +105,12 @@ impl Interpreter {
         {
             self.activate_array_index_accessor_protector();
         }
+        self.observe_array_species_key(*target, key.string_name());
         // A typed view's `length` resolves through its realm's kind
         // prototype to `%TypedArray.prototype%`'s getter; any definition of
         // `length` on that chain may answer it instead.
-        if key.string_name() == Some("length") && self.is_realm_typed_array_length_prototype(*target)
+        if key.string_name() == Some("length")
+            && self.is_realm_typed_array_length_prototype(*target)
         {
             self.activate_typed_array_length_protector();
         }

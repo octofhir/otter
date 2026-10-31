@@ -945,6 +945,12 @@ pub struct Interpreter {
     /// redefined or lost `length` or changed its own [[Prototype]]. While it
     /// stays `false`, generated `.length` reads a view's count directly.
     typed_array_length_protector: bool,
+    /// Memoized `ArraySpeciesCreate` default of the default realm's plain
+    /// arrays (`%Array.prototype%.constructor` is `%Array%` and its
+    /// `@@species` is the original getter); `None` until computed and after
+    /// any store, definition or deletion of a realm's
+    /// `%Array.prototype%.constructor` or symbol key of `%Array%`.
+    array_species_default: std::cell::Cell<Option<bool>>,
     /// `true` while `Error.prepareStackTrace` runs: a stack read inside it
     /// formats with the default renderer instead of re-entering the hook.
     preparing_stack_trace: bool,

@@ -138,6 +138,9 @@ impl Interpreter {
         if key == "length" && self.is_realm_typed_array_length_prototype(Value::object(object)) {
             self.activate_typed_array_length_protector();
         }
+        if key == "constructor" {
+            self.observe_array_species_key(Value::object(object), Some(key));
+        }
     }
 
     /// Descriptor-aware data assignment that advances the object's GC-managed

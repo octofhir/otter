@@ -297,14 +297,9 @@ impl Codegen<'_> {
                 let typed = self.view_of(node).typed_array_length;
                 self.emit_cell_guard(receiver, exit);
                 dynasm!(self.ops ; .arch x64
-                    ; cmp BYTE [Rq(receiver)], typed.type_tag as i8 ; jne =>exit
-                    ; cmp DWORD [Rq(receiver) + typed.expando_byte as i32], 0 ; jne =>exit
-                    ; cmp QWORD [Rq(receiver) + typed.data_byte as i32], 0 ; je =>exit
-                    ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
-                    ; mov r10, [r10 + crate::entry::VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET as i32]
-                    ; test r10, r10 ; jz =>exit
-                    ; cmp BYTE [r10], 0 ; jne =>exit
-                    ; mov r10, QWORD [Rq(receiver) + typed.length_byte as i32]
+                    ; cmp BYTE [Rq(receiver)], typed.type_tag as i8 ; jne =>exit);
+                crate::x86_64::values::emit_typed_view_length(&mut self.ops, typed, receiver, exit);
+                dynasm!(self.ops ; .arch x64
                     ; cmp r10, i32::MAX ; ja =>exit
                     ; mov Rd(destination), r10d);
             }

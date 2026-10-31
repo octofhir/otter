@@ -3,6 +3,7 @@
 //! # Contents
 //! - [`emit_number_index`] accepts either legal numeric Value encoding.
 //! - [`emit_exact_int32`] and [`emit_float64_int32`] preserve semantic Int32 facts.
+//! - [`emit_index_key_atom`] names a nonnegative Int32 key's property atom.
 //!
 //! # Invariants
 //! - Index projection accepts `0..=i32::MAX`, treating negative zero as zero.
@@ -10,6 +11,8 @@
 //! - The original key survives misses and hits with a distinct destination.
 //! - Only explicit outputs/FP scratches and reserved x16/x17 change.
 //! - Neither projection proves the physical Int32 tag of its input Value.
+//! - An Int32 key's atom comes only from a matching line of the isolate's
+//!   integer-key cache, whose hits are permanent; an unmatched line declines.
 
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::value::tag::{DOUBLE_ENCODE_OFFSET, NUMBER_TAG};
@@ -92,6 +95,27 @@ pub(crate) fn emit_number_index(
         ; =>integer
         ; mov W(destination), W(source) ; tbnz W(destination), #31, =>miss
         ; =>done);
+}
+
+/// `W(atom)` = the property atom spelling the nonnegative Int32 key in
+/// `X(key)`, from the isolate's integer-key cache (`x20` holds the live
+/// `JitCtx`); any other key, or an index the cache does not hold, goes to
+/// `miss`. Only `W(atom)`, x16 and x17 change; the key survives.
+pub(crate) fn emit_index_key_atom(ops: &mut Assembler, key: u8, atom: u8, miss: DynamicLabel) {
+    debug_assert!(![16, 17].contains(&key) && ![16, 17, key].contains(&atom));
+    let layout = otter_vm::jit::IndexAtomCacheLayout::CURRENT;
+    dynasm!(ops ; .arch aarch64
+        ; asr x16, X(key), #49 ; cmn x16, #1 ; b.ne =>miss
+        ; tbnz W(key), #31, =>miss
+        ; ldr x16, [x20, crate::entry::THREAD_OFFSET]
+        ; ldr x16, [x16, crate::entry::VM_THREAD_INDEX_ATOMS_OFFSET]
+        ; and w17, W(key), #layout.mask
+        ; add x16, x16, x17, lsl layout.entry_shift
+        ; ldr w17, [x16, layout.key_byte]
+        ; cmp w17, W(key) ; b.ne =>miss
+        ; ldr W(atom), [x16, layout.atom_byte]
+        ; cbz W(atom), =>miss
+        ; sub WSP(atom), WSP(atom), #1);
 }
 
 #[cfg(test)]

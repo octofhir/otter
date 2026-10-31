@@ -384,6 +384,19 @@ impl Interpreter {
         std::ptr::addr_of!(self.array_buffer_detach_protector)
     }
 
+    /// Stable address of the typed-array length protector byte (non-zero
+    /// once some view's `length` may resolve elsewhere). Generated `.length`
+    /// reads a view's count only while it reads zero.
+    #[must_use]
+    pub fn jit_typed_array_length_protector_addr(&self) -> *const bool {
+        std::ptr::addr_of!(self.typed_array_length_protector)
+    }
+
+    /// Latch the typed-array length protector; it never resets.
+    pub(crate) fn activate_typed_array_length_protector(&mut self) {
+        self.typed_array_length_protector = true;
+    }
+
     /// Detach `buffer` (§25.1.3.5 DetachArrayBuffer), first invalidating the
     /// detach protector so no generated access reads a view's cached base.
     pub fn detach_array_buffer(&mut self, buffer: crate::binary::array_buffer::JsArrayBuffer) {

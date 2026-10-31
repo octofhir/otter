@@ -280,7 +280,8 @@ pub(crate) fn emit_site_cache_load(
 
 /// `X(destination)` = `X(receiver)[X(key)]` from the cache of the keyed
 /// site whose slot address is in `X(site)` (zero for none), for a string
-/// or symbol key with a recorded atom and an inline-bank own data slot;
+/// or symbol key with a recorded atom or a nonnegative Int32 key the
+/// integer-key cache names, and an inline-bank own data slot;
 /// anything else goes to `fallback` with nothing written but the
 /// temporaries, `x16` and `x17`.
 #[allow(clippy::too_many_arguments)]
@@ -300,9 +301,16 @@ pub(crate) fn emit_keyed_site_cache_load(
     };
     let symbol = ops.new_dynamic_label();
     let ready = ops.new_dynamic_label();
+    let cell = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64
         ; cbz X(site), =>fallback
         ; ldr X(table), [X(site), IC.site_cache_byte] ; cbz X(table), =>fallback
+        // A nonnegative Int32 key names its decimal spelling's atom.
+        ; tst X(key), #0xfffe_0000_0000_0007 ; b.eq =>cell);
+    crate::arm64::index::emit_index_key_atom(ops, key, atom, fallback);
+    dynasm!(ops ; .arch aarch64
+        ; b =>ready
+        ; =>cell
         // The key is a string or a symbol: its recorded atom, or a decline.
         ; ldrb w16, [X(key)]
         ; cmp w16, u32::from(view.string_layout.string_type_tag) ; b.ne =>symbol

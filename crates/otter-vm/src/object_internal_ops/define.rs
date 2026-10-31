@@ -105,6 +105,13 @@ impl Interpreter {
         {
             self.activate_array_index_accessor_protector();
         }
+        // A typed view's `length` resolves through its realm's kind
+        // prototype to `%TypedArray.prototype%`'s getter; any definition of
+        // `length` on that chain may answer it instead.
+        if key.string_name() == Some("length") && self.is_realm_typed_array_length_prototype(*target)
+        {
+            self.activate_typed_array_length_protector();
+        }
         let (target, descriptor) = self.with_handle_scope(
             |interp, scope| -> Result<(Value, object::PartialPropertyDescriptor), CommittedValueError> {
                 let target_handle = interp.scoped_value(scope, *target);

@@ -939,6 +939,12 @@ pub struct Interpreter {
     /// it stays `false`, a fixed-length typed array's cached element base is
     /// live, so generated element access needs no per-buffer detach proof.
     array_buffer_detach_protector: bool,
+    /// `true` once a typed view's `length` may no longer resolve to the
+    /// count the intrinsic `%TypedArray%.prototype` getter reads: a view was
+    /// given another [[Prototype]], or a realm's typed-array prototype gained,
+    /// redefined or lost `length` or changed its own [[Prototype]]. While it
+    /// stays `false`, generated `.length` reads a view's count directly.
+    typed_array_length_protector: bool,
     /// `true` while `Error.prepareStackTrace` runs: a stack read inside it
     /// formats with the default renderer instead of re-entering the hook.
     preparing_stack_trace: bool,

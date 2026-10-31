@@ -16,6 +16,8 @@
 //!   callable hit.
 //! - Concat: the nursery string-concatenation fit every `Add` site shares
 //!   instead of inlining it.
+//! - Keyed load, string case: a string receiver's Latin-1 unit at an Int32
+//!   index is its shared one-unit string.
 //! - Keyed load and store, name case: a string key probes the shared action
 //!   table under its atom, recorded in the string or found by the interning
 //!   leaf and then recorded. A load the table misses on a dictionary-mode
@@ -378,7 +380,13 @@ fn emit_key_atom(
 ) {
     let ready = ops.new_dynamic_label();
     let symbol = ops.new_dynamic_label();
+    let cell = ops.new_dynamic_label();
     let atom_byte = view.string_layout.atom_byte as i32;
+    // A nonnegative Int32 key names the atom of its decimal spelling.
+    emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64 ; test Rq(key), r11 ; jz =>cell);
+    crate::x86_64::index::emit_index_key_atom(ops, key, atom, miss);
+    dynasm!(ops ; .arch x64 ; jmp =>ready ; =>cell);
     emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
     dynasm!(ops ; .arch x64
         ; test Rq(key), r11 ; jnz =>miss
@@ -445,6 +453,18 @@ fn emit_keyed_load(
     let shaped = ops.new_dynamic_label();
     let dictionary = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64 ; =>label);
+    // A string's Latin-1 unit at an Int32 index is its shared one-unit
+    // string.
+    let not_string = ops.new_dynamic_label();
+    crate::x86_64::string_unit::emit_unit_string_load(
+        ops,
+        view,
+        [KEYED_LOAD_RECEIVER, KEYED_LOAD_KEY],
+        [7, 8],
+        0,
+        not_string,
+    );
+    dynasm!(ops ; .arch x64 ; xor edx, edx ; ret ; =>not_string);
     // The key's atom first: interning records it on the string, so the
     // own-data walk below reads it back instead of hashing the units again.
     // Entered by `call`: `rsp` is eight bytes past alignment.
@@ -677,6 +697,12 @@ fn emit_keyed_load_probe(
     dynasm!(ops ; .arch x64
         ; push rcx ; push rdi ; push r8 ; push r9 ; push rdx
         ; mov rdx, Rq(KEYED_LOAD_RECEIVER));
+    // A nonnegative Int32 key names its decimal spelling's atom.
+    let cell = ops.new_dynamic_label();
+    emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
+    dynasm!(ops ; .arch x64 ; test Rq(key), r11 ; jz =>cell);
+    crate::x86_64::index::emit_index_key_atom(ops, key, 9, miss);
+    dynasm!(ops ; .arch x64 ; jmp =>ready ; =>cell);
     emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
     dynasm!(ops ; .arch x64
         ; test Rq(key), r11 ; jnz =>miss

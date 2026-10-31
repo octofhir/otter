@@ -38,6 +38,20 @@ impl Interpreter {
         std::ptr::from_ref(&*self.number_strings)
     }
 
+    /// Address of the isolate's integer-key atom cache generated keyed
+    /// accesses read.
+    #[must_use]
+    pub fn jit_index_atoms_addr(&self) -> *const u8 {
+        crate::isolate_names::IsolateNames::of(&self.gc_heap).index_atoms_addr()
+    }
+
+    /// Address of the shared one-unit Latin-1 strings generated element
+    /// loads of a string read, or null before they are installed.
+    #[must_use]
+    pub fn jit_unit_strings_addr(&self) -> *const crate::Value {
+        crate::string::JsString::unit_strings_addr(&self.gc_heap)
+    }
+
     /// Decimal text of `f`, through the number-string cache: a number
     /// converted again while its entry stands reuses that string.
     fn cached_number_string(

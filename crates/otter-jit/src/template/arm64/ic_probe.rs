@@ -7,7 +7,8 @@
 //!   intrinsic-prototype primitives of static intrinsic-prototype reads.
 //! - [`emit_property_transition_shape_barrier`] — the child-shape edge barrier
 //!   after an add-transition commit.
-//! - [`emit_exotic_length_fast`] / [`emit_typed_view_length`] — the `.length`
+//! - [`emit_exotic_length_fast`] / [`emit_typed_view_length`] /
+//!   [`emit_typed_view_count`] — the `.length`
 //!   reads no IC handler describes: arrays, strings and plain typed views.
 //! - [`emit_closure_prototype_load`] — a closure's own `prototype` slot.
 //! - [`emit_element_address`] / [`emit_element_read`] / [`emit_element_write`]
@@ -293,10 +294,34 @@ pub(crate) fn emit_exotic_length_fast(
 
 /// With `X(receiver)` a typed view cell, load its element count into
 /// `X(out)` when that count is its `length`: the view owns no named property,
-/// its storage is a fixed-length local buffer and no buffer was ever
-/// detached (see [`otter_vm::JitTypedArrayLengthLayout`]). Otherwise branch to
-/// `miss`. Reads the native context from `x20`; clobbers `x16`.
+/// its storage is a fixed-length local buffer, no buffer was ever detached
+/// (see [`otter_vm::JitTypedArrayLengthLayout`]) and the typed-array length
+/// protector holds, so `length` resolves to the intrinsic getter. Otherwise
+/// branch to `miss`. Reads the native context from `x20`; clobbers `x16`.
 pub(crate) fn emit_typed_view_length(
+    ops: &mut Assembler,
+    view: &JitCompileSnapshot,
+    receiver: u8,
+    out: u8,
+    miss: DynamicLabel,
+) {
+    dynasm!(ops
+        ; .arch aarch64
+        ; ldr x16, [x20, THREAD_OFFSET]
+        ; ldr x16, [x16, crate::entry::VM_THREAD_TYPED_ARRAY_LENGTH_PROTECTOR_CELL_OFFSET]
+        ; cbz x16, =>miss
+        ; ldrb w16, [x16]
+        ; cbnz w16, =>miss
+    );
+    emit_typed_view_count(ops, view, receiver, out, miss);
+}
+
+/// With `X(receiver)` a typed view cell whose `length` is known to reach the
+/// intrinsic getter, load the count that getter answers into `X(out)`: the
+/// view owns no named property, its storage is a fixed-length local buffer
+/// and no buffer was ever detached. Otherwise branch to `miss`. Reads the
+/// native context from `x20`; clobbers `x16`.
+pub(crate) fn emit_typed_view_count(
     ops: &mut Assembler,
     view: &JitCompileSnapshot,
     receiver: u8,

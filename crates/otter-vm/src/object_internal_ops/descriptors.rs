@@ -1135,6 +1135,30 @@ impl Interpreter {
         })
     }
 
+    /// `true` when `target` is on the chain a typed view of a realm's own
+    /// kind prototype resolves `length` through: a kind's `%XArray.prototype%`
+    /// or the `%TypedArray.prototype%` they inherit from.
+    pub(crate) fn is_realm_typed_array_length_prototype(&self, target: Value) -> bool {
+        use crate::realm_intrinsics::Intrinsic;
+        let Some(object) = target.as_object() else {
+            return false;
+        };
+        let holds = |intrinsics: &crate::realm_intrinsics::RealmIntrinsics| {
+            let first = Intrinsic::typed_array_prototype(crate::binary::TypedArrayKind::Int8);
+            Intrinsic::ALL[first as usize..].iter().any(|&slot| {
+                intrinsics.get(slot).is_some_and(|prototype| {
+                    prototype == object
+                        || object::prototype(prototype, &self.gc_heap) == Some(object)
+                })
+            })
+        };
+        holds(&self.realm_intrinsics)
+            || self
+                .extra_realms
+                .iter()
+                .any(|realm| holds(&realm.realm_intrinsics))
+    }
+
     /// `true` when `target` is a realm prototype that an ordinary dense array
     /// inherits from, so an indexed property defined on it becomes visible
     /// through that array's holes.

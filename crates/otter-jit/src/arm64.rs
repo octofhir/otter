@@ -38,6 +38,7 @@ pub(crate) mod property_actions;
 pub(crate) mod property_ic;
 mod receiver_allocation;
 pub(crate) mod shape_lookup;
+pub(crate) mod string_unit;
 
 /// Whether this CPU implements the ARMv8.3 JavaScript conversion
 /// (`FJCVTZS`), which computes ECMAScript ToInt32 of a double in one

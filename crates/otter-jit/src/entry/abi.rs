@@ -86,6 +86,12 @@ pub(crate) const VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, array_buffer_detach_protector_cell) as u32;
 pub(crate) const VM_THREAD_NUMBER_STRINGS_OFFSET: u32 =
     std::mem::offset_of!(VmThread, number_strings) as u32;
+pub(crate) const VM_THREAD_INDEX_ATOMS_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, index_atoms) as u32;
+pub(crate) const VM_THREAD_TYPED_ARRAY_LENGTH_PROTECTOR_CELL_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, typed_array_length_protector_cell) as u32;
+pub(crate) const VM_THREAD_UNIT_STRINGS_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, unit_strings) as u32;
 pub(crate) const VM_THREAD_ACTIVE_REALM_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, active_realm_cell) as u32;
 pub(crate) const GLOBAL_THIS_OFFSET_PTR_OFFSET: u32 =

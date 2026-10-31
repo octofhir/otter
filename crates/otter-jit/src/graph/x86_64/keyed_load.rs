@@ -108,6 +108,18 @@ impl Codegen<'_> {
             ; jmp =>done
             ; =>other
         );
+        // A string's Latin-1 unit at an Int32 index is its shared one-unit
+        // string.
+        let not_string = self.ops.new_dynamic_label();
+        crate::x86_64::string_unit::emit_unit_string_load(
+            &mut self.ops,
+            self.view,
+            [receiver, key],
+            [index, base],
+            destination,
+            not_string,
+        );
+        dynasm!(self.ops ; .arch x64 ; jmp =>done ; =>not_string);
         self.emit_keyed_table_load(node, [receiver, key], destination, runtime, done);
         dynasm!(self.ops ; .arch x64 ; =>runtime);
         self.emit_committed_call(
@@ -125,8 +137,8 @@ impl Codegen<'_> {
 
     /// A name key's load through the code object's keyed table routine: the
     /// value in `Rq(destination)` and on to `loaded` on a hit, else to
-    /// `missed` with every register as it was. Only a string or symbol key is
-    /// offered.
+    /// `missed` with every register as it was. Only a string, symbol or
+    /// nonnegative Int32 key is offered.
     fn emit_keyed_table_load(
         &mut self,
         node: NodeId,
@@ -138,9 +150,14 @@ impl Codegen<'_> {
         use crate::template::x86_64::shared_property::{KEYED_LOAD_KEY, KEYED_LOAD_RECEIVER};
         let string_tag = self.view.string_layout.string_type_tag;
         let name = self.ops.new_dynamic_label();
+        let cell = self.ops.new_dynamic_label();
         self.load_immediate(10, tag::NOT_CELL_MASK);
         dynasm!(self.ops ; .arch x64
-            ; test Rq(key), r10 ; jnz =>missed
+            ; test Rq(key), r10 ; jz =>cell
+            // A nonnegative Int32 key names its decimal spelling's atom.
+            ; mov r10, Rq(key) ; sar r10, 49 ; cmp r10, -1 ; jne =>missed
+            ; test Rd(key), Rd(key) ; jns =>name ; jmp =>missed
+            ; =>cell
             ; cmp BYTE [Rq(key)], string_tag as i8 ; je =>name
             ; cmp BYTE [Rq(key)], otter_vm::symbol::SYMBOL_BODY_TYPE_TAG as i8 ; jne =>missed
             ; =>name

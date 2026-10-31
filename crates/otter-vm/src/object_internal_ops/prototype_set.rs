@@ -81,6 +81,13 @@ impl Interpreter {
         if self.is_realm_element_prototype(*target) {
             self.activate_array_index_accessor_protector();
         }
+        // A view on another prototype, or a kind prototype on another
+        // chain, may resolve `length` past `%TypedArray.prototype%`.
+        if target.as_typed_array(&self.gc_heap).is_some()
+            || self.is_realm_typed_array_length_prototype(*target)
+        {
+            self.activate_typed_array_length_protector();
+        }
         self.with_handle_scope(|interp, scope| {
             let target = interp.scoped_value(scope, *target);
             let proto = interp.scoped_value(scope, *proto);

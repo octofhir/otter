@@ -135,6 +135,9 @@ impl Interpreter {
         {
             self.activate_array_index_accessor_protector();
         }
+        if key == "length" && self.is_realm_typed_array_length_prototype(Value::object(object)) {
+            self.activate_typed_array_length_protector();
+        }
     }
 
     /// Descriptor-aware data assignment that advances the object's GC-managed

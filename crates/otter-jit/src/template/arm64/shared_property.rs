@@ -19,6 +19,8 @@
 //!   committed method resolution, which also records call feedback.
 //! - Concat: the nursery string-concatenation fit every `Add` site shares
 //!   instead of inlining it.
+//! - Keyed load, string case: a string receiver's Latin-1 unit at an Int32
+//!   index is its shared one-unit string.
 //! - Keyed load and store, name case: a string key probes the shared action
 //!   table under its atom, recorded in the string or found by the interning
 //!   leaf and then recorded. A dictionary-mode receiver, which the table
@@ -310,8 +312,12 @@ fn emit_keyed_load_probe(
     let ready = ops.new_dynamic_label();
     let symbol = ops.new_dynamic_label();
     let key = KEYED_LOAD_KEY;
-    // The key's recorded atom, or a decline.
-    emit_cell_test(ops, key, CellTest::IsNotCell, miss);
+    let cell = ops.new_dynamic_label();
+    // The key's recorded atom, or a decline: a nonnegative Int32 key names
+    // its decimal spelling's.
+    emit_cell_test(ops, key, CellTest::IsCell, cell);
+    crate::arm64::index::emit_index_key_atom(ops, key, 11, miss);
+    dynasm!(ops ; .arch aarch64 ; b =>ready ; =>cell);
     dynasm!(ops ; .arch aarch64
         ; cbz X(key), =>miss
         ; ldrb w16, [X(key)]
@@ -421,8 +427,12 @@ fn emit_key_atom(
     let unrecorded = ops.new_dynamic_label();
     let ready = ops.new_dynamic_label();
     let symbol = ops.new_dynamic_label();
+    let cell = ops.new_dynamic_label();
     let atom_byte = view.string_layout.atom_byte;
-    emit_cell_test(ops, key, CellTest::IsNotCell, miss);
+    // A nonnegative Int32 key names the atom of its decimal spelling.
+    emit_cell_test(ops, key, CellTest::IsCell, cell);
+    crate::arm64::index::emit_index_key_atom(ops, key, atom, miss);
+    dynasm!(ops ; .arch aarch64 ; b =>ready ; =>cell);
     dynasm!(ops ; .arch aarch64
         ; cbz X(key), =>miss
         ; ldrb w16, [X(key)]
@@ -510,6 +520,18 @@ fn emit_keyed_load(
     let shaped = ops.new_dynamic_label();
     let dictionary = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64 ; =>label);
+    // A string's Latin-1 unit at an Int32 index is its shared one-unit
+    // string.
+    let not_string = ops.new_dynamic_label();
+    crate::arm64::string_unit::emit_unit_string_load(
+        ops,
+        view,
+        [KEYED_LOAD_RECEIVER, KEYED_LOAD_KEY],
+        [13, 14],
+        0,
+        not_string,
+    );
+    dynasm!(ops ; .arch aarch64 ; mov x1, xzr ; ret ; =>not_string);
     // The key's atom first: interning records it on the string, so the
     // own-data walk below reads it back instead of hashing the units again.
     emit_key_atom(ops, relocations, view, KEYED_LOAD_KEY, 11, generic, miss);

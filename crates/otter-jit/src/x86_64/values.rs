@@ -4,6 +4,8 @@
 //! - Immediate words and artifact-aware symbol loads.
 //! - Typed runtime-stub address loads into the call scratch register.
 //! - Int32 and purified Double boxing with explicit scratch ownership.
+//! - [`emit_typed_view_length`] / [`emit_typed_view_count`]: a typed view's
+//!   count as its `length`.
 //!
 //! # Invariants
 //! - Address-bearing immediates carry their one relocation identity.
@@ -198,4 +200,44 @@ mod tests {
             }
         }
     }
+}
+
+/// With `Rq(receiver)` a typed view cell, load its element count into r10
+/// when that count is its `length`: the typed-array length protector holds,
+/// so `length` resolves to the intrinsic getter, and
+/// [`emit_typed_view_count`] reads it. Otherwise jump to `miss`. Reads the
+/// native context from `r15`; clobbers r10.
+pub(crate) fn emit_typed_view_length(
+    ops: &mut Assembler,
+    layout: otter_vm::jit::JitTypedArrayLengthLayout,
+    receiver: u8,
+    miss: dynasmrt::DynamicLabel,
+) {
+    dynasm!(ops ; .arch x64
+        ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
+        ; mov r10, [r10 + crate::entry::VM_THREAD_TYPED_ARRAY_LENGTH_PROTECTOR_CELL_OFFSET as i32]
+        ; test r10, r10 ; jz =>miss
+        ; cmp BYTE [r10], 0 ; jne =>miss);
+    emit_typed_view_count(ops, layout, receiver, miss);
+}
+
+/// With `Rq(receiver)` a typed view cell whose `length` is known to reach
+/// the intrinsic getter, load the count it answers into r10: the view owns
+/// no named property, its storage is a fixed-length local buffer and no
+/// buffer was ever detached. Otherwise jump to `miss`. Reads the native
+/// context from `r15`; clobbers r10.
+pub(crate) fn emit_typed_view_count(
+    ops: &mut Assembler,
+    layout: otter_vm::jit::JitTypedArrayLengthLayout,
+    receiver: u8,
+    miss: dynasmrt::DynamicLabel,
+) {
+    dynasm!(ops ; .arch x64
+        ; cmp DWORD [Rq(receiver) + layout.expando_byte as i32], 0 ; jne =>miss
+        ; cmp QWORD [Rq(receiver) + layout.data_byte as i32], 0 ; je =>miss
+        ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
+        ; mov r10, [r10 + crate::entry::VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET as i32]
+        ; test r10, r10 ; jz =>miss
+        ; cmp BYTE [r10], 0 ; jne =>miss
+        ; mov r10, QWORD [Rq(receiver) + layout.length_byte as i32]);
 }

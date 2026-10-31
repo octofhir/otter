@@ -571,6 +571,15 @@ fn ta_byte_offset_getter(
 }
 
 /// §22.2.6.18 `get %TypedArray%.prototype.length`.
+/// Whether `getter` is the intrinsic `get %TypedArray%.prototype.length`,
+/// whose result is the view's count.
+pub(crate) fn is_intrinsic_length_getter(getter: Value, heap: &otter_gc::GcHeap) -> bool {
+    getter
+        .as_native_function()
+        .and_then(|native| native.static_fn(heap))
+        .is_some_and(|f| std::ptr::fn_addr_eq(f, ta_length_getter as crate::native_function::NativeFastFn))
+}
+
 fn ta_length_getter(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
     let t = ctx
         .this_value()

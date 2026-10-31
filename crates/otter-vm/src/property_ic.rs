@@ -13,7 +13,8 @@
 //!   [`PROFILED_PROPERTY_PIC_CAPACITY`] `(shape, handler)` entries.
 //! - [`IcHandler`] / [`IcHandlerKind`] — what to do once a shape matched:
 //!   own field, prototype field, nonexistent, own-field store, transition,
-//!   or a dictionary-mode receiver's key-table read.
+//!   a dictionary-mode receiver's key-table read, or a typed view's
+//!   intrinsic `length`.
 //! - [`PropertyIcStats`] — aggregate counters for diagnostics and tests.
 //!
 //! # Invariants
@@ -138,6 +139,11 @@ pub enum IcHandlerKind {
     /// prototype, not its keys: the handler finds the slot by the atom its
     /// `field` word holds, and misses on an absent key or an accessor.
     DictionaryField = 8,
+    /// A typed view's `length`: the intrinsic `%TypedArray.prototype%`
+    /// getter the holder `prototype(aux)` owns, authorized by the entry's
+    /// chain proof from the view's lookup start. Generated code reads the
+    /// view's count; the VM calls the getter.
+    TypedArrayLength = 9,
 }
 
 impl IcHandlerKind {
@@ -151,6 +157,7 @@ impl IcHandlerKind {
             6 => Self::PrototypeAccessor,
             7 => Self::OwnAccessor,
             8 => Self::DictionaryField,
+            9 => Self::TypedArrayLength,
             _ => Self::Empty,
         }
     }
@@ -547,6 +554,19 @@ impl IcHandler {
             validity: Some(resolved.validity.clone()),
             transition: TransitionGuard::OwnAdd,
         })
+    }
+
+    /// The handler for a typed view's `length` resolved through its lookup
+    /// start to the intrinsic getter: [`Self::load_inherited_accessor`]
+    /// whose hit generated code serves from the view's count.
+    #[must_use]
+    pub(crate) fn load_typed_array_length(
+        start_shape: ShapeHandle,
+        resolved: &crate::cache_ir::ResolvedAccessorSlot,
+    ) -> Option<Self> {
+        let mut handler = Self::load_inherited_accessor(start_shape, resolved)?;
+        handler.kind = IcHandlerKind::TypedArrayLength;
+        handler.projected(PropertyStorageProjection::TypedArrayStart)
     }
 
     /// The load handler for an accessor the receiver owns at `hit`, read
@@ -1259,7 +1279,9 @@ impl PropertyIcSlot {
             IcHandlerKind::DictionaryField => {
                 object::load_dictionary_data(obj, heap, entry.dictionary_atom()).map(|_| true)
             }
-            IcHandlerKind::PrototypeField | IcHandlerKind::PrototypeAccessor => {
+            IcHandlerKind::PrototypeField
+            | IcHandlerKind::PrototypeAccessor
+            | IcHandlerKind::TypedArrayLength => {
                 entry.proof_holds().then_some(true)
             }
             IcHandlerKind::NonExistent => entry.proof_holds().then_some(false),
@@ -1330,7 +1352,9 @@ impl PropertyIcSlot {
             IcHandlerKind::OwnAccessor => {
                 object::load_proven_getter(obj, heap, entry.slot()).map(LoadHit::Getter)
             }
-            IcHandlerKind::PrototypeAccessor if entry.proof_holds() => {
+            IcHandlerKind::PrototypeAccessor | IcHandlerKind::TypedArrayLength
+                if entry.proof_holds() =>
+            {
                 object::load_proven_getter(holder()?, heap, entry.slot()).map(LoadHit::Getter)
             }
             IcHandlerKind::NonExistent if entry.proof_holds() => {
@@ -1594,7 +1618,10 @@ impl PropertyIcSlot {
                         IcEntryVariant::OwnData
                     }
                     (IcHandlerKind::PrototypeField, _) => IcEntryVariant::InheritedData,
-                    (IcHandlerKind::PrototypeAccessor, _) => IcEntryVariant::InheritedAccessor,
+                    (
+                        IcHandlerKind::PrototypeAccessor | IcHandlerKind::TypedArrayLength,
+                        _,
+                    ) => IcEntryVariant::InheritedAccessor,
                     (IcHandlerKind::OwnAccessor, _) => IcEntryVariant::OwnAccessor,
                     (IcHandlerKind::NonExistent, _) => IcEntryVariant::NonExistent,
                     (IcHandlerKind::DictionaryField, _) => IcEntryVariant::DictionaryData,
@@ -1761,6 +1788,7 @@ impl PropertyIcSlot {
                 }
                 IcHandlerKind::NonExistent
                 | IcHandlerKind::PrototypeAccessor
+                | IcHandlerKind::TypedArrayLength
                 | IcHandlerKind::OwnAccessor
                 | IcHandlerKind::DictionaryField
                 | IcHandlerKind::Empty => continue,

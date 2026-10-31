@@ -11,11 +11,12 @@ function mk(proto, i) {
   return o;
 }
 function run(label, objs, read, n) {
-  let acc = '';
+  let last = [];
   for (let r = 0; r < n; r++) {
-    for (let i = 0; i < objs.length; i++) acc = String(read(objs[i]));
+    last = [];
+    for (let i = 0; i < objs.length; i++) last.push(String(read(objs[i])));
   }
-  out.push(label + ' ' + acc);
+  out.push(label + ' ' + last.join(','));
 }
 const base = { enter: null, get g() { return 'pg' + this.a; } };
 const objs = []; for (let i = 0; i < 40; i++) objs.push(mk(base, i));
@@ -64,7 +65,7 @@ const exportsList = [];
 for (let i = 0; i < 30; i++) {
   const e = {}; Object.defineProperty(e, '__esModule', { value: true });
   Object.defineProperty(e, 'isScope', { enumerable: true, configurable: true, get() { return 'scope' + i; } });
-  e.x = 1; delete e.x; e['p' + i] = i;
+  e.x = 1; e['p' + i] = i; delete e.x;
   exportsList.push(e);
 }
 function reexport(e) { return e.isScope; }
@@ -76,4 +77,30 @@ const nulls = []; for (let i = 0; i < 20; i++) { const o = Object.create(null); 
 run('null-absent', nulls, absent, 200);
 nulls[2].noScope = 'n2';
 run('null-absent-own', nulls.slice(0, 4), absent, 20);
+// megamorphic sites: dictionary receivers of many prototypes
+const protos = []; const mega = [];
+for (let p = 0; p < 12; p++) {
+  const proto = { ['m' + p]: p, enter: 'e' + p };
+  protos.push(proto);
+  for (let i = 0; i < 3; i++) { const o = Object.create(proto); o.a = p * 10 + i; o['k' + i] = 2; o.b = 1; delete o.a; mega.push(o); }
+}
+function megaAbsent(o) { return o.noScope; }
+function megaInherited(o) { return o.enter; }
+for (let w = 0; w < 3; w++) { run('mega-absent', mega, megaAbsent, 200); run('mega-inherited', mega, megaInherited, 200); }
+mega[4].noScope = 'own4'; mega[4].enter = 'own-enter4';
+run('mega-absent-own', mega.slice(3, 6), megaAbsent, 30);
+run('mega-inherited-own', mega.slice(3, 6), megaInherited, 30);
+protos[2].noScope = 'proto2';
+run('mega-absent-proto', mega.slice(5, 9), megaAbsent, 30);
+protos[2].enter = 'changed2';
+run('mega-inherited-proto', mega.slice(5, 9), megaInherited, 30);
+delete protos[2].noScope; delete mega[4].noScope;
+run('mega-absent-deleted', mega.slice(3, 9), megaAbsent, 30);
+Object.prototype.noScope = 'op';
+run('mega-absent-object-proto', mega.slice(0, 4), megaAbsent, 30);
+delete Object.prototype.noScope;
+run('mega-absent-object-proto-deleted', mega.slice(0, 4), megaAbsent, 30);
+Object.setPrototypeOf(mega[0], other);
+run('mega-reproto', mega.slice(0, 3), megaInherited, 30);
+run('mega-reproto-absent', mega.slice(0, 3), megaAbsent, 30);
 console.log(out.join('\n'));

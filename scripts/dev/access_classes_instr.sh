@@ -22,7 +22,8 @@ const sym = Symbol('s'); const sobj = { [sym]: 1 };
 const keep = [];
 const mproto = { enter: null, get g() { return 1; } };
 const mdicts = []; for (let i = 0; i < 64; i++) { const o = Object.create(mproto); o.a = i; o.b = 1; o['k' + i] = 2; delete o.b; mdicts.push(o); }
-const mexports = []; for (let i = 0; i < 64; i++) { const e = {}; Object.defineProperty(e, 'isScope', { enumerable: true, configurable: true, get() { return 1; } }); e.x = 1; delete e.x; e['p' + i] = i; mexports.push(e); }
+const mexports = []; for (let i = 0; i < 64; i++) { const e = {}; Object.defineProperty(e, 'isScope', { enumerable: true, configurable: true, get() { return 1; } }); e.x = 1; e['p' + i] = i; delete e.x; mexports.push(e); }
+const megadicts = []; for (let p = 0; p < 16; p++) { const proto = { ['m' + p]: p, enter: null }; for (let i = 0; i < 4; i++) { const o = Object.create(proto); o.a = i; o['k' + i] = 2; o.b = 1; delete o.a; megadicts.push(o); } }
 JS
 case_body() {
   case $1 in
@@ -40,6 +41,8 @@ case_body() {
     fncall) echo 's = (s + fn1.call(null, 1)) | 0;' ;;
     holeload) echo 's = (s + (holes[i & 7] | 0)) | 0;' ;;
     symload) echo 's = (s + sobj[sym]) | 0;' ;;
+    megadictabsent) echo 's = (s + (megadicts[i & 63].noScope === undefined ? 1 : 0)) | 0;' ;;
+    megadictproto) echo 's = (s + (megadicts[i & 63].enter === null ? 1 : 0)) | 0;' ;;
     mdictabsent) echo 's = (s + (mdicts[i & 63].noScope === undefined ? 1 : 0)) | 0;' ;;
     mdictproto) echo 's = (s + (mdicts[i & 63].enter === null ? 1 : 0)) | 0;' ;;
     mdictprotoget) echo 's = (s + mdicts[i & 63].g) | 0;' ;;
@@ -48,7 +51,7 @@ case_body() {
     *) echo "unknown case $1" >&2; exit 1 ;;
   esac
 }
-CASES=${*:-tlen strchar intkey intkeydict intkeyset dictload dictprotoget dictprotoabsent mdictabsent mdictproto mdictprotoget mdictown mdictownget megastr wmget fncall holeload symload}
+CASES=${*:-tlen strchar intkey intkeydict intkeyset dictload dictprotoget dictprotoabsent mdictabsent mdictproto mdictprotoget mdictown mdictownget megadictabsent megadictproto megastr wmget fncall holeload symload}
 for c in empty $CASES; do
   { cat "$D/prelude.js"
     echo "function f(n) { let s = 0; for (let i = 0; i < n; i++) { $(case_body $c) } return s; }"

@@ -7,6 +7,9 @@
 //!
 //! # Invariants
 //! Exact immutable shape identity fixes own descriptors and the first prototype.
+//! A dictionary shape fixes only the mode and the prototype: its rows hold
+//! the chain answer (absence or inherited data) for a key the receiver's own
+//! table lacks, which every probe checks first, and key no store fact.
 //! A key can simultaneously load an inherited slot and append an own slot;
 //! those actions have separate slots and nonreviving validity proofs. Generated
 //! probes do not allocate or reenter. Target shapes are traced in their actual
@@ -153,6 +156,14 @@ pub enum PropertyLoadAction {
     /// under the chain proof (none when the receiver's shape fixes a `null`
     /// prototype).
     NonExistent = 4,
+    /// A dictionary-mode receiver of the keyed shape: the key the receiver's
+    /// own table lacks is absent along its chain, `undefined` under the chain
+    /// proof (none for a `null` prototype). An own key misses.
+    DictionaryNonExistent = 5,
+    /// A dictionary-mode receiver of the keyed shape: the key the receiver's
+    /// own table lacks is a holder data slot under the chain proof. An own
+    /// key misses.
+    DictionaryInheritedData = 6,
 }
 
 /// Selected live shared-table store action, independently authorized from loads.
@@ -353,7 +364,9 @@ impl PropertyActionCache {
     /// Publish `entry` at `index` with its slot words resolved.
     fn publish(&self, index: usize, mut entry: PropertyActionEntry) {
         entry.load_word = match entry.load_action {
-            PropertyLoadAction::OwnData | PropertyLoadAction::InheritedData => {
+            PropertyLoadAction::OwnData
+            | PropertyLoadAction::InheritedData
+            | PropertyLoadAction::DictionaryInheritedData => {
                 slot_word(entry.holder_shape, entry.load_slot)
             }
             _ => 0,
@@ -474,6 +487,107 @@ impl PropertyActionCache {
     /// Publish one load fact without discarding an independent append action.
     /// `absent` carries the chain proof of a key no link owns (`Some(None)`
     /// for a `null` prototype); it is ignored when `resolved` is present.
+    /// Record the chain answer every receiver of the dictionary-mode `obj`'s
+    /// shape shares for `key`: its prototype is the shape's, so the row holds
+    /// for any receiver whose own table lacks the key. Only absence and
+    /// inherited data are recorded; the row keys no store fact.
+    pub(crate) fn record_dictionary_chain(
+        &self,
+        obj: JsObject,
+        heap: &otter_gc::GcHeap,
+        key: AtomizedPropertyKey<'_>,
+        chain: &crate::property_ic::DictionaryChain,
+    ) {
+        use crate::property_ic::DictionaryChain;
+        let state = object::state(obj, heap);
+        if key.atom().id() == AtomId::NONE || !state.is_dictionary() || state.is_opaque() {
+            return;
+        }
+        let (action, validity, resolved) = match chain {
+            DictionaryChain::Absent(proof) => (
+                PropertyLoadAction::DictionaryNonExistent,
+                proof.clone(),
+                None,
+            ),
+            DictionaryChain::Data(resolved)
+                if resolved.validity.is_some() && !resolved.holder_root.is_null() =>
+            {
+                (
+                    PropertyLoadAction::DictionaryInheritedData,
+                    resolved.validity.clone(),
+                    Some(resolved),
+                )
+            }
+            _ => return,
+        };
+        // The row keys the shared dictionary shape, not the object's own
+        // layout identity: every receiver of the shape shares the answer.
+        let shape = object::shape_body::id_of(object::shape(obj, heap));
+        let index = self.record_way(shape, key.atom().id());
+        let mut entry = self.entries[index].get();
+        entry.clear_load();
+        entry.load_action = action;
+        entry.load_validity = validity.as_ref().map_or(0, |cell| cell.address());
+        if let Some(resolved) = resolved {
+            entry.load_slot = resolved.hit.slot;
+            entry.holder_shape = resolved.hit.shape;
+            entry.holder_shape_id = resolved.hit.shape_id;
+            entry.holder_root = resolved.holder_root;
+        }
+        self.update_owners(index, |owners| owners.load = validity);
+        self.publish(index, entry);
+    }
+
+    /// The chain answer the dictionary-mode `obj`'s shape recorded for `key`,
+    /// while its proof and holder still hold.
+    pub(crate) fn probe_dictionary_chain(
+        &self,
+        obj: JsObject,
+        heap: &otter_gc::GcHeap,
+        key: AtomizedPropertyKey<'_>,
+    ) -> Option<crate::property_ic::DictionaryChain> {
+        use crate::property_ic::DictionaryChain;
+        if key.atom().id() == AtomId::NONE {
+            return None;
+        }
+        let shape = object::shape_body::id_of(object::shape(obj, heap));
+        let index = self.find(shape, key.atom().id())?;
+        let entry = self.entries[index].get();
+        let validity = self.load_owner(index);
+        match entry.load_action {
+            PropertyLoadAction::DictionaryNonExistent => validity
+                .as_ref()
+                .is_none_or(|cell| cell.is_valid())
+                .then_some(DictionaryChain::Absent(validity)),
+            PropertyLoadAction::DictionaryInheritedData
+                if validity.as_ref().is_some_and(|cell| cell.is_valid()) =>
+            {
+                let object::shape_body::ShapePrototype::Object(holder) =
+                    object::shape_body::prototype_of(entry.holder_root)
+                else {
+                    return None;
+                };
+                if object::shape(holder, heap) != entry.holder_shape
+                    || object::shape_id(holder, heap) != entry.holder_shape_id
+                {
+                    return None;
+                }
+                let value = object::load_proven_data_slot(holder, heap, entry.load_slot);
+                Some(DictionaryChain::Data(cache_ir::ResolvedDataSlot {
+                    hops: 1,
+                    hit: entry.hit(),
+                    value,
+                    is_writable: false,
+                    validity,
+                    holder_root: entry.holder_root,
+                    holder_root_id: heap
+                        .read_payload(entry.holder_root, object::shape_body::ShapeBody::id),
+                }))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn record_load(
         &self,
         obj: JsObject,
@@ -818,7 +932,15 @@ impl crate::Interpreter {
                     is_writable: false,
                 })
             }
-            (_, object::PropertyLookup::Absent) => match self.dictionary_chain(obj, key) {
+            (_, object::PropertyLookup::Absent) => match self
+                .property_cache
+                .probe_dictionary_chain(obj, heap, key)
+                .unwrap_or_else(|| {
+                    let chain = self.dictionary_chain(obj, key);
+                    self.property_cache
+                        .record_dictionary_chain(obj, heap, key, &chain);
+                    chain
+                }) {
                 crate::property_ic::DictionaryChain::Data(resolved) => PropertyLoad::Data(resolved),
                 crate::property_ic::DictionaryChain::Absent(proof) => PropertyLoad::Absent(proof),
                 crate::property_ic::DictionaryChain::Accessor(_)

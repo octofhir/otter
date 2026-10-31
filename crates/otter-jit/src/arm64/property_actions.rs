@@ -3,7 +3,8 @@
 //! # Contents
 //! - One ordinary receiver/key decode and bounded set scan for both tiers.
 //! - Independent live data loads, absent-key loads, writable own stores and
-//!   add-own stores.
+//!   add-own stores; a dictionary-mode receiver's absent or inherited keys
+//!   behind a probe of its own key table.
 //! - Current shape-selected inline/slab bank resolution before any effect.
 //!
 //! # Invariants
@@ -139,10 +140,10 @@ fn key(
         ; and x16, X(receiver), #0xffff_ffff_0000_0000
         ; ldr W(holder), [X(receiver), view.object_shape_byte] ; cbz W(holder), =>miss
         ; add X(holder), x16, X(holder));
-    // The table records loads only for shaped receivers with ordinary
-    // lookup and stores only for shapes whose stores stay in place: a
-    // dictionary, opaque or prototype receiver's shape id keys no such fact,
-    // and shape state is immutable, so neither probe tests state.
+    // The table records loads for shaped receivers with ordinary lookup,
+    // chain answers for dictionary shapes (whose actions say so and probe the
+    // receiver's own table first), and stores only for shapes whose stores
+    // stay in place; shape state is immutable, so neither probe tests state.
     dynasm!(ops ; .arch aarch64 ; ldr X(slot), [X(holder), cache.shape_id_byte]);
     emit_set_address(ops, relocations, cache, [slot, atom], entry);
     let found = ops.new_dynamic_label();
@@ -587,11 +588,22 @@ pub(crate) fn emit_site_load(
         emit_word_load(ops, view, receiver, slot, base, destination, miss);
         return;
     }
+    let inherited = ops.new_dynamic_label();
+    let dictionary = ops.new_dynamic_label();
     dynasm!(ops ; .arch aarch64
         ; ldrb w16, [X(entry), cache.load_action_byte]
         ; cmp w16, #PropertyLoadAction::OwnData as u32 ; b.eq =>own
         ; cmp w16, #PropertyLoadAction::NonExistent as u32 ; b.eq =>absent
-        ; cmp w16, #PropertyLoadAction::InheritedData as u32 ; b.ne =>miss
+        ; cmp w16, #PropertyLoadAction::InheritedData as u32 ; b.eq =>inherited
+        ; cmp w16, #PropertyLoadAction::DictionaryNonExistent as u32 ; b.eq =>dictionary
+        ; cmp w16, #PropertyLoadAction::DictionaryInheritedData as u32 ; b.ne =>miss
+        ; =>dictionary
+    );
+    emit_dictionary_absent(ops, receiver, atom, [holder, slot, base], miss);
+    dynasm!(ops ; .arch aarch64
+        ; ldrb w16, [X(entry), cache.load_action_byte]
+        ; cmp w16, #PropertyLoadAction::DictionaryNonExistent as u32 ; b.eq =>absent
+        ; =>inherited
         ; ldr x16, [X(entry), cache.load_validity_byte] ; cbz x16, =>miss
         ; ldr w16, [x16] ; cbz w16, =>miss
         ; and x17, X(receiver), #0xffff_ffff_0000_0000
@@ -634,6 +646,48 @@ pub(crate) fn emit_site_load(
     );
 
     dynasm!(ops ; .arch aarch64 ; =>done);
+}
+
+/// Fall through when the key table of the dictionary-mode receiver in
+/// `X(receiver)`, whose shape the matched row keys, lacks the atom in
+/// `W(atom)`; branch to `miss` when it holds the key or has no table.
+/// Writes the three temporaries, `x16` and `x17`.
+fn emit_dictionary_absent(
+    ops: &mut Assembler,
+    receiver: u8,
+    atom: u8,
+    [table, index, record]: [u8; 3],
+    miss: DynamicLabel,
+) {
+    let layout = otter_vm::object::DictionaryLayout::current();
+    let chain = ops.new_dynamic_label();
+    let absent = ops.new_dynamic_label();
+    dynasm!(ops ; .arch aarch64
+        ; and x17, X(receiver), #0xffff_ffff_0000_0000
+        ; ldr W(table), [X(receiver), layout.exotic_byte] ; cbz W(table), =>miss
+        ; add X(table), x17, X(table)
+        ; ldr W(table), [X(table), layout.keys_byte] ; cbz W(table), =>miss
+        ; add X(table), x17, X(table)
+        ; mov W(index), W(atom));
+    emit_load_u64(ops, 17, layout.hash_multiplier);
+    dynasm!(ops ; .arch aarch64
+        ; mul X(index), X(index), x17
+        ; lsr X(index), X(index), 32
+        ; ldr w16, [X(table), layout.mask_byte]
+        ; and W(index), W(index), w16
+        ; add XSP(table), XSP(table), layout.buckets_byte
+        ; ldr W(index), [X(table), X(index), lsl #2]
+        // The entry records follow the `mask + 1` buckets.
+        ; add w16, w16, #1
+        ; add X(table), X(table), x16, lsl #2
+        ; =>chain
+        ; cmn WSP(index), #1 ; b.eq =>absent
+        ; add X(record), X(table), X(index), lsl layout.entry_shift
+        ; ldr w16, [X(record), layout.entry_atom_byte]
+        ; cmp w16, W(atom) ; b.eq =>miss
+        ; ldr W(index), [X(record), layout.entry_next_byte]
+        ; b =>chain
+        ; =>absent);
 }
 
 /// Complete an own writable store or no-allocation append. W(slot) is the

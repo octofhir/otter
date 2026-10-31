@@ -354,6 +354,30 @@ impl JsString {
     ///
     /// # Errors
     /// Surfaces [`OutOfMemory`] verbatim.
+    /// The shared one-unit Latin-1 strings as `Value` words indexed by
+    /// unit, once all are installed; null before. Their slab lives in old
+    /// space, which never moves a body, and the collector rewrites its
+    /// entries in place, so generated code may keep this address.
+    #[must_use]
+    pub(crate) fn unit_strings_addr(heap: &GcHeap) -> *const crate::Value {
+        let raw = heap.embedder_root(UNIT_STRINGS_SLOT);
+        if raw.is_null() {
+            return std::ptr::null();
+        }
+        // SAFETY: only `install_unit_strings` fills this slot, with a value
+        // slab of every unit string plus the empty one.
+        let Some(body) = crate::value_slab::body_of(unsafe { raw.cast() }) else {
+            return std::ptr::null();
+        };
+        // SAFETY: `body_of` names the live slab payload.
+        unsafe {
+            if (*body).len() <= EMPTY_STRING_INDEX {
+                return std::ptr::null();
+            }
+            (*body).values_ptr()
+        }
+    }
+
     pub(crate) fn install_unit_strings(heap: &mut GcHeap) -> Result<(), OutOfMemory> {
         if !heap.embedder_root(UNIT_STRINGS_SLOT).is_null() {
             return Ok(());

@@ -362,6 +362,28 @@ impl Interpreter {
     /// compare its interned id instead of string contents. A spelling
     /// nothing has interned carries [`crate::property_atom::AtomId::NONE`],
     /// which no own string key has.
+    /// The atomized key of the Int32 property key `index`, spelled in
+    /// `digits`. A nonnegative index finds its atom through the isolate's
+    /// integer-key cache and leaves it there for generated keyed accesses.
+    pub(crate) fn index_atomized_key<'a>(
+        &mut self,
+        index: i32,
+        digits: &'a mut itoa::Buffer,
+    ) -> crate::property_atom::AtomizedPropertyKey<'a> {
+        let name: &'a str = digits.format(index);
+        let atom = if index >= 0 {
+            crate::isolate_names::IsolateNames::of_mut(&mut self.gc_heap)
+                .index_atom(index)
+                .unwrap_or(crate::property_atom::AtomId::NONE)
+        } else {
+            crate::isolate_names::names(&self.gc_heap).lookup(name)
+        };
+        crate::property_atom::AtomizedPropertyKey::new(
+            crate::property_atom::PropertyAtom::new(atom),
+            name,
+        )
+    }
+
     pub(crate) fn atomized_key<'a>(
         &self,
         name: &'a str,

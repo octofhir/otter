@@ -90,6 +90,18 @@ pub struct VmThread {
     /// ([`crate::string::number_strings::NumberStrings`]). Generated
     /// `ToString` of a Number reads them before converting.
     pub number_strings: u64,
+    /// Address of the isolate's integer-key atom cache
+    /// ([`crate::isolate_names::IndexAtomCacheLayout`]). Generated keyed
+    /// accesses read an Int32 key's atom from it.
+    pub index_atoms: u64,
+    /// Address of the isolate's shared one-unit Latin-1 strings as `Value`
+    /// words indexed by unit, or zero before they exist. Generated element
+    /// loads of a string read their result from it.
+    pub unit_strings: u64,
+    /// Address of the isolate's typed-array length protector byte (non-zero
+    /// once some view's `length` may resolve past the intrinsic getter).
+    /// Generated `.length` reads a view's count only while it reads zero.
+    pub typed_array_length_protector_cell: u64,
 }
 
 impl VmThread {
@@ -111,6 +123,9 @@ impl VmThread {
             array_buffer_detach_protector_cell: 0,
             cage_base: otter_gc::cage_base() as u64,
             number_strings: 0,
+            index_atoms: 0,
+            unit_strings: 0,
+            typed_array_length_protector_cell: 0,
         }
     }
 }
@@ -666,7 +681,7 @@ impl Frame {
     }
 }
 
-const _: [(); 104] = [(); std::mem::size_of::<VmThread>()];
+const _: [(); 128] = [(); std::mem::size_of::<VmThread>()];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 12] = [(); std::mem::size_of::<VmFrameHeader>()];
 const _: [(); 136] = [(); std::mem::size_of::<Frame>()];
@@ -680,6 +695,9 @@ const _: [(); 64] = [(); std::mem::offset_of!(VmThread, array_index_protector_ce
 const _: [(); 72] = [(); std::mem::offset_of!(VmThread, active_realm_cell)];
 const _: [(); 80] = [(); std::mem::offset_of!(VmThread, array_buffer_detach_protector_cell)];
 const _: [(); 96] = [(); std::mem::offset_of!(VmThread, number_strings)];
+const _: [(); 104] = [(); std::mem::offset_of!(VmThread, index_atoms)];
+const _: [(); 112] = [(); std::mem::offset_of!(VmThread, unit_strings)];
+const _: [(); 120] = [(); std::mem::offset_of!(VmThread, typed_array_length_protector_cell)];
 const _: [(); 4] = [(); std::mem::offset_of!(VmFrameHeader, pc)];
 const _: [(); 8] = [(); std::mem::offset_of!(VmFrameHeader, register_count)];
 const _: [(); 11] = [(); std::mem::offset_of!(VmFrameHeader, flags)];

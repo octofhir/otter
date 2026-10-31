@@ -921,6 +921,15 @@ impl Interpreter {
             {
                 return Ok(());
             }
+            // An existing writable own slot is also recorded for the class,
+            // so generated keyed stores of the same key write it in place.
+            if let Some((_, hit)) =
+                crate::property_ic::IcHandler::store_existing_hit(obj, &self.gc_heap, key)
+            {
+                object::store_proven_data_slot(obj, &mut self.gc_heap, hit.slot, value);
+                self.property_cache.record_own_store(hit);
+                return Ok(());
+            }
             if let crate::property_cache::PropertyLoad::Data(resolved) =
                 self.resolve_property_load(obj, key)
                 && resolved.hops == 0
@@ -1028,7 +1037,7 @@ impl Interpreter {
             VmPropertyKey::OwnedString(string.to_key_spelling(&self.gc_heap))
         } else if let Some(index) = property_key.as_i32() {
             // An integer key is spelled on the stack, not allocated.
-            VmPropertyKey::Atom(self.atomized_key(digits.format(index)))
+            VmPropertyKey::Atom(self.index_atomized_key(index, &mut digits))
         } else if let Some(number) = property_key.as_number() {
             VmPropertyKey::OwnedString(number.to_display_string())
         } else {

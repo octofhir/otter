@@ -331,7 +331,7 @@ impl Codegen<'_> {
 
     /// A name key's store through the code object's keyed table routine:
     /// to `stored` when it stored, else to `missed` with every register as
-    /// it was. Only a string or symbol key is offered.
+    /// it was. Only a string, symbol or nonnegative Int32 key is offered.
     fn emit_keyed_table_store(
         &mut self,
         node: NodeId,
@@ -344,10 +344,18 @@ impl Codegen<'_> {
         };
         let string_tag = self.view.string_layout.string_type_tag;
         let name = self.ops.new_dynamic_label();
+        let cell = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
             ; tst X(key), #0xfffe_0000_0000_0007
+            ; b.eq =>cell
+            // A nonnegative Int32 key names its decimal spelling's atom.
+            ; asr x16, X(key), #49
+            ; cmn x16, #1
             ; b.ne =>missed
+            ; tbz W(key), #31, =>name
+            ; b =>missed
+            ; =>cell
             ; ldrb w16, [X(key)]
             ; cmp w16, u32::from(string_tag)
             ; b.eq =>name

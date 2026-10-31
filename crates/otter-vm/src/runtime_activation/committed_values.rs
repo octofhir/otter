@@ -395,7 +395,7 @@ impl Interpreter {
                         }
                     } else if let Some(index) = result.as_i32() {
                         // An integer key is spelled on the stack, not allocated.
-                        VmPropertyKey::Atom(self.atomized_key(digits.format(index)))
+                        VmPropertyKey::Atom(self.index_atomized_key(index, &mut digits))
                     } else if let Some(number) = result.as_number() {
                         VmPropertyKey::OwnedString(number.to_display_string())
                     } else {

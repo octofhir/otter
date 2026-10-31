@@ -13,12 +13,12 @@ at the end.
 
 ## The one rule: refactor toward the reference engines, never patch
 
-otter today does 2.16x node's instructions on WTB. That gap is architecture,
-not tuning. Every slice:
+otter does 1.96x node's instructions on WTB. That gap is architecture, not
+tuning. Every slice:
 
 1. **Decompose first.** Measure where otter's instructions go for the
-   subsystem (profile shares, `op_instr.sh` per-operation counts against
-   node). Write the numbers down in the memory note.
+   subsystem (profile shares, per-operation counts against node). Write the
+   numbers down in the memory note.
 2. **Read the reference end to end** before writing code: the V8, JSC and
    SpiderMonkey files listed for that slice below, in `~/work/engines`
    (sparse checkouts; add a directory with `git sparse-checkout add` when a
@@ -42,209 +42,231 @@ not tuning. Every slice:
 ## Measuring
 
 - **Instructions are the primary metric** (WTB runs 20 fixed samples per
-  target, so a whole run is fixed work, and other sessions on this machine
-  make wall time swing 2–3x):
-  `scripts/dev/web_tooling_instr.sh <before-bin> <after-bin> <out>`.
-  Whole-run counts include bundle parse/compile; compare like with like.
-  Repeat a target 3 times and take the median before calling a ±2% move.
-- Wall clock, when the machine is quiet (check `uptime`, load < 3):
-  `scripts/dev/web_tooling_matrix.sh <bin> <out>` (runs/s, otter and node).
+  target, so a whole run is fixed work; other sessions on this machine make
+  wall time swing 2–3x):
+  `scripts/dev/web_tooling_instr_one.sh <bin|node> <out> [target...]`, then
+  `scripts/dev/instr_ratio.py <after> <before>` (per target + geomean).
+  Node's counts: `benchmarks/results/dom0/node.txt`. Whole-run counts
+  include bundle parse/compile; compare like with like. Noise is ±1–2%;
+  repeat a target 3 times and take the median before calling a small move.
+- Wall clock, when the machine is quiet (`uptime`, load < 3):
+  `scripts/dev/web_tooling_matrix.sh <bin> <out>`.
 - Per-operation instructions against node and bun:
-  `scripts/dev/op_instr.sh <bin> [N] [case...]` (cases include the native,
-  callback, property, element and call families). Probes must run inside
+  `scripts/dev/op_instr.sh <bin> [N] [case...]`, and for property/element
+  access classes `scripts/dev/access_classes_instr.sh <bin>` (tlen, strchar,
+  intkey, intkeydict, intkeyset, dictload, dictprotoget, dictprotoabsent,
+  megastr, wmget, fncall, holeload, symload). Probes must run inside
   functions; top-level loops take other paths.
 - Profiles: `scripts/dev/web_tooling_profile.sh <bin> <dir>`, then
   `scripts/dev/web_tooling_hot.py <dir> self|exits N`; drill down with
-  `jit_exits.py <sample> N <entry> <frames>`, `children_of.py`,
-  `caller_tier.py` (needs `--perf-basic-prof`), `isolate_self.py`,
-  `sample_isolate.sh` (retries when `sample` attaches early).
+  `jit_exits.py`, `children_of.py`, `caller_tier.py` (needs
+  `--perf-basic-prof`), `jit_hot_regions.py` (self time per graph node),
+  `isolate_self.py`, `sample_isolate.sh`.
+- Runtime-miss census: `benchmarks/results/dom0/census.patch` (+
+  `access_census.rs.diag`, `census_agg.py`) is a diagnostic build that counts
+  receiver/holder/property kinds reaching the runtime access paths. Apply it
+  with `patch -p1`, keep `.keep` copies, restore before measuring.
 - Octane: `scripts/dev/wallclock_matrix.sh target/release/otter benchmarks/results/<slice>/m 5`.
 
-## Standings (2026-10-30, HEAD 1038d2bc6)
+## Standings (2026-10-31, access slice in the working tree)
 
-WTB retired instructions, whole run, otter / node (`benchmarks/results/nabi/instr_vs_node.txt`):
+WTB retired instructions, whole run, otter / node
+(`benchmarks/results/dom0/otter1c.txt` vs `node.txt`):
 
 | target | otter | node | x |
 |---|---|---|---|
-| coffeescript | 129.2G | 42.5G | 3.04 |
-| babel | 99.3G | 33.9G | 2.93 |
-| lebab | 101.2G | 35.3G | 2.87 |
-| postcss | 127.3G | 44.3G | 2.87 |
-| babel-minify | 87.7G | 32.3G | 2.71 |
-| uglify-js | 101.3G | 37.8G | 2.68 |
-| chai | 76.9G | 29.0G | 2.65 |
-| acorn | 80.5G | 30.7G | 2.62 |
-| buble | 98.5G | 38.1G | 2.58 |
-| jshint | 70.4G | 30.3G | 2.33 |
-| prettier | 95.9G | 46.0G | 2.09 |
-| esprima | 78.1G | 42.5G | 1.84 |
-| prepack | 89.7G | 49.0G | 1.83 |
-| source-map | 79.6G | 45.0G | 1.77 |
-| espree | 65.6G | 39.9G | 1.64 |
-| typescript | 59.3G | 39.2G | 1.51 |
-| terser | 41.8G | 28.7G | 1.46 |
-| babylon | 44.3G | 41.5G | 1.07 |
+| coffeescript | 125.4G | 42.6G | 2.95 |
+| lebab | 99.8G | 35.3G | 2.83 |
+| chai | 77.6G | 29.0G | 2.68 |
+| babel-minify | 84.8G | 32.6G | 2.60 |
+| uglify-js | 97.2G | 38.0G | 2.56 |
+| buble | 84.8G | 37.7G | 2.25 |
+| jshint | 67.3G | 30.4G | 2.22 |
+| postcss | 88.4G | 43.2G | 2.05 |
+| acorn | 78.5G | 38.5G | 2.04 |
+| babel | 88.3G | 43.9G | 2.01 |
+| prettier | 93.0G | 48.2G | 1.93 |
+| prepack | 85.4G | 48.9G | 1.75 |
+| esprima | 65.0G | 37.6G | 1.73 |
+| espree | 62.8G | 37.6G | 1.67 |
+| source-map | 76.4G | 46.0G | 1.66 |
+| typescript | 57.3G | 39.7G | 1.44 |
+| terser | 36.6G | 28.9G | 1.26 |
+| babylon | 41.2G | 41.5G | 0.99 |
 
-Geomean 2.16x. Wall runs/s was 3.88x node on a quiet machine (2026-10-30
-morning). Octane matrix 1.43x node, 1.80x bun.
+Geomean 1.96x (2.16x at HEAD ccfb0627b; the access slice is 0.924 of HEAD).
+Octane matrix 1.43x node, 1.80x bun (2026-10-30).
 
-### Where otter's time goes (WTB mean of 18 profiles, first Rust frame below generated code)
+### Where otter's time goes (WTB mean of 18 profiles at HEAD, before the access slice)
 
 | share | where | what it is |
 |---|---|---|
 | 37% | generated code | compiled JS itself |
 | 17% | `native_exit_entry` | bodies of natives called from JS, including the Rust loop of callback methods |
-| 6.0% | `jit_load_property_stub` | 5.1% in `jit_runtime_load_property_value`: named-load IC misses |
-| 4.9% | `jit_load_element_stub` | element loads: `load_element_values`, `resolve_property_load`, generic `[[Get]]`, keyed atomization, feedback recording |
+| 6.0% | `jit_load_property_stub` | named-load IC misses |
+| 4.9% | `jit_load_element_stub` | element loads |
 | 4.3% | `otter_native_invoke` | Host-kernel calls: `call`/`apply`/`bind`, constructs, non-static natives |
-| 3.6% | `jit_store_property_stub` | 3.1% in `jit_runtime_store_property_value` |
-| 2.8% | `jit_store_element_stub` | `store_element_values` |
-| 2.3% | `jit_object_protocol_value_stub` | `instanceof` 0.9%, `in`/has-property 0.4% |
+| 3.6% | `jit_store_property_stub` | named-store misses |
+| 2.8% | `jit_store_element_stub` | element stores |
+| 2.3% | `jit_object_protocol_value_stub` | `instanceof`, `in` |
 | 2.0% | `jit_string_method_stub` | string methods |
 | 1.3% | `jit_resolve_method_stub` | method resolution misses |
 
-Node runs almost all of this inside generated code: IC handlers, builtins
-compiled as code, callbacks inlined into the caller's loop. That is the
-whole gap.
+Re-profile after the access slice lands; the access rows shrank.
+
+## Step 0: land the access slice in the working tree
+
+Uncommitted, measured, gates not run (memory note
+`session_2026_10_31_access_slice.md`): Int32 keys → atoms through the
+isolate integer-key cache read by generated code (`VmThread.index_atoms`),
+`str[i]` → shared one-unit strings (`VmThread.unit_strings`,
+`arm64|x86_64/string_unit.rs`), the typed-array eager-expando bug in named
+[[Set]], and the typed-array `.length` shadowing bug (length protector +
+`IcHandlerKind::TypedArrayLength`). Saved binaries: `otter-dom0` (HEAD),
+`otter-dom1c` (slice).
+
+Run the gates below (x86: Rosetta run of `probe_access_classes.js`, the
+typed-length handler is only compile-checked), then one commit with the
+WTB table (0.924 geomean; postcss 0.694, esprima 0.838, terser 0.856,
+buble 0.858, babel 0.897) and the per-op numbers (intkey 805→94,
+intkeyset 3122→126, intkeydict 845→152, strchar 574→31, Buffer blit
+11288→841 per call).
 
 ## Slice queue, largest first
 
-### 1. Property and element access handled in generated code (≈20% of otter)
+### 1. Why generated code costs 2x node's (37% of otter; 60–70% on babylon/espree/acorn)
 
-Today a load/store that the site's monomorphic or inline shape check does
-not answer calls a runtime stub, which re-resolves the property in Rust on
-every call (`property_dispatch/jit_runtime.rs`,
-`property_dispatch/elements.rs`, `property_cache.rs`). Getters, prototype
-hits, absent properties, dictionary objects, primitives and new shapes all
-land there.
+node retires about half of otter's instructions, and the largest single
+bucket is compiled JS itself. Nobody has measured why. Diagnose before
+porting; the answer decides the slice.
 
-Read first:
-- V8: `v8/src/ic/accessor-assembler.cc` (`LoadIC_Noninlined`,
-  `HandleLoadICHandlerCase`, `HandleLoadICSmiHandlerCase`, the keyed paths),
-  `v8/src/ic/handler-configuration.h` (one Smi handler word: kind, field
-  index, in-object bit, holder), `v8/src/ic/stub-cache.{h,cc}`,
-  `v8/src/ic/ic.cc` (`ComputeHandler`, `UpdateMegamorphicCache`),
-  `v8/src/ic/keyed-store-generic.cc`.
-- SpiderMonkey: `gecko-dev/js/src/jit/CacheIR.cpp` (`GetPropIRGenerator`:
-  `tryAttachNative`, proto/getter/missing/DOM/proxy cases, `SetPropIRGenerator`,
-  `GetPropIRGenerator::tryAttachDenseElement*`), `CacheIRCompiler.cpp`.
-- JSC: `WebKit/Source/JavaScriptCore/bytecode/InlineCacheCompiler.cpp`
-  (access cases compiled into one polymorphic stub), `GetByStatus.cpp`.
+Decompose, per target, for coffeescript, lebab, chai (worst ratios) and
+acorn, babylon (generated-code heavy):
 
-Port: every access site owns a handler list compiled to machine code
-(CacheIR-style ops: shape guard, holder/prototype-validity guard, load slot,
-call getter through the JS call entry, absent → undefined, dense element
-with bounds and hole check, dictionary probe). The runtime is entered only
-on a real miss, which attaches a handler; megamorphic sites probe the shared
-table in code. Graph and template use the same handler ops. Start by
-classifying the misses (which receiver/holder/property kinds reach
-`jit_runtime_load_property_value` and `load_element_values`), then port the
-cases in that order. Delete the per-call Rust re-resolution those cases
-replace.
+1. **Tier residency.** Share of samples in interpreter, template code and
+   graph code (`caller_tier.py`, `--perf-basic-prof`). Count deopts and
+   re-compiles per hot function; a function bouncing between tiers costs
+   more than any codegen detail.
+2. **Hot functions side by side.** For the top 10 graph functions by self
+   time, instructions per invocation in otter vs node. Node:
+   `node --print-opt-code --print-opt-code-filter=<fn>` and
+   `--trace-opt --trace-deopt`; otter: the graph dump plus
+   `jit_hot_regions.py` self time per graph node.
+3. **Per-node anatomy.** Classify every instruction of those functions:
+   work, shape/map guard, type guard, boxing/unboxing, spill/reload,
+   move, call prologue/epilogue, safepoint poll, write barrier, frame
+   state. Expected suspects: shape check ~10 instructions vs node's 4,
+   save/restore of every live value around calls (no live-range
+   splitting), Int32/double boxing at every merge, repeated guards on the
+   same value, template code where node has optimized code.
+4. Write the table (bucket × target, otter vs node) in the memory note,
+   then pick the largest bucket as the port.
 
-Targets: named-load misses and element loads off the WTB profile top 10;
-`jit_*_property_stub` + `jit_*_element_stub` from 17% to under 4%.
+Read for the port once the bucket is known:
+- Register allocation: `v8/src/maglev/maglev-regalloc.cc`,
+  `WebKit/Source/JavaScriptCore/b3/air/AirAllocateRegistersByGraphColoring.cpp`,
+  `gecko-dev/js/src/jit/BacktrackingAllocator.cpp`.
+- Guards and maps: `v8/src/maglev/maglev-graph-builder.cc` (known node
+  aspects, `BuildCheckMaps`), `v8/src/compiler/js-native-context-specialization.cc`.
+- Representation: `v8/src/maglev/maglev-phi-representation-selector.cc`,
+  `WebKit/Source/JavaScriptCore/dfg/DFGFixupPhase.cpp`.
+- Tiering: `v8/src/execution/tiering-manager.cc`,
+  `WebKit/Source/JavaScriptCore/jit/JITPlan.cpp`, `bytecode/ExecutionCounter.h`.
 
-### 2. Array iteration builtins in compiled code (most of the 17% under natives)
+Target: generated-code instructions on the five targets within 1.3x of
+node's for the same functions.
+
+### 2. Remaining property/element access classes
+
+The census (memory note) ranks what still reaches the runtime after the
+access slice: dictionary-mode named loads ~25M (DictionaryField,
+dictionary absent and prototype handlers in code), string receivers at
+megamorphic sites 14.5M (`.type` on primitives), slab-growth store
+transitions 10.4M (esprima `entry.range =` on a two-field literal),
+WeakMap.get/has 5.7M, getter calls from handlers, `fn.call/apply` 3.9M,
+the graph CacheIR program for TypedArrayLength.
+
+Read: `v8/src/ic/accessor-assembler.cc` (`HandleLoadICHandlerCase`,
+dictionary and proto cases), `v8/src/ic/handler-configuration.h`,
+`v8/src/ic/stub-cache.cc`, `v8/src/ic/keyed-store-generic.cc`;
+`gecko-dev/js/src/jit/CacheIR.cpp` (`GetPropIRGenerator`,
+`SetPropIRGenerator` add-slot with realloc), `CacheIRCompiler.cpp`;
+`WebKit/Source/JavaScriptCore/bytecode/InlineCacheCompiler.cpp`.
+
+Port each class as a handler kind run by generated code (graph and template
+share the ops); the runtime only attaches. Delete the per-call Rust
+re-resolution for each class ported. Target: `jit_*_property_stub` +
+`jit_*_element_stub` under 4% of WTB.
+
+### 3. Array iteration builtins in compiled code (most of the 17% under natives)
 
 `forEach`/`map`/`filter`/`some`/`every`/`find*`/`reduce*` run a Rust loop
-(`array_prototype.rs` `array_callback_native_dispatch`): iteration anchors,
-`own_data_element_without_accessors`, SmallVec argument lists, and one
-`call_from_native` per element. Per callback ≈520 instructions (node ≈15);
-fixed ≈930 per call (node ≈60). `sort` with a comparator 12187 vs 1940.
+(`array_prototype.rs` `array_callback_native_dispatch`). Per callback ≈520
+instructions (node ≈15); fixed ≈930 per call (node ≈60). `sort` with a
+comparator 12187 vs 1940.
 
-Read first:
-- V8: `v8/src/compiler/js-call-reducer.cc` (`ReduceArrayForEach`,
-  `ReduceArrayMap`, `ReduceArrayFilter`, `ReduceArrayFind`, `ReduceArrayEvery`,
-  `ReduceArrayReduce`: the loop is built in the caller's graph, with
-  checkpoints and continuation frames for deopt), `v8/src/builtins/array-foreach.tq`,
-  `array-map.tq`, `array-reduce.tq` (the non-inlined builtins and their
-  lazy-deopt continuations).
-- JSC: `WebKit/Source/JavaScriptCore/builtins/ArrayPrototype.js` (these
-  methods are JavaScript, compiled and inlined like user code),
-  `dfg/DFGByteCodeParser.cpp` (how builtins are inlined).
+Read: `v8/src/compiler/js-call-reducer.cc` (`ReduceArrayForEach`,
+`ReduceArrayMap`, …, continuation frames), `v8/src/builtins/array-foreach.tq`,
+`array-map.tq`, `array-reduce.tq`;
+`WebKit/Source/JavaScriptCore/builtins/ArrayPrototype.js`,
+`dfg/DFGByteCodeParser.cpp`.
 
-Port: one mechanism. Either self-hosted JavaScript bodies for the callback
-methods (our builtin JS shims, with intrinsics for the dense fast path),
-which the graph tier inlines with the callback like any JS call, or graph
-reductions that build the loop in the caller with deopt continuations.
-Prefer the self-hosted route: it reuses the existing inliner and deopt.
-Delete the Rust callback loop for the methods moved.
+Port: self-hosted JavaScript bodies with intrinsics for the dense path,
+inlined with the callback by the graph tier like any JS call (preferred),
+or graph reductions with deopt continuations. Delete the Rust callback loop
+for the methods moved. Targets (`op_instr.sh` `arrforeach`, `arrmap`,
+`arrfilter`, `arrsome`, `sortsmall`): per callback ≤30, fixed ≤150.
 
-Targets (`op_instr.sh` cases `arrforeach`, `arrmap`, `arrfilter`, `arrsome`,
-`sortsmall`): per callback ≤30 instructions, fixed cost ≤150.
+### 4. Native bodies without dispatch ladders
 
-### 3. Native bodies without dispatch ladders
+Object statics, Math, `array_live_method_dispatch`,
+`Object.prototype.toString` route through generic dispatchers. `Math.cbrt`
+513 (node 8), `Object.isExtensible` 730 (179), `o.toString()` 1011 (~250),
+`Object.keys` 1111 (~100), `JSON.stringify([1,2])` ~8900 (~880),
+`Object.assign({}, o)` ~11900 (~850).
 
-Each builtin family routes through a generic dispatcher: Object statics
-(`object_statics.rs` `native_call`: four ladders plus an eager caller
-context resolve), Math (`math/mod.rs`: `coerce_math_args` + `numbers`
-match), `array_live_method_dispatch`, `Object.prototype.toString` (full
-`@@toStringTag` walk). `Math.cbrt` 513 instructions (node 8),
-`Object.isExtensible` 730 (node 179), `o.toString()` 1011 (node ~250),
-`Object.keys` 1111 (node ~100), `JSON.stringify([1,2])` ~8900 (node ~880),
-`Object.assign({}, o)` ~11900 (node ~850).
-
-Read first: `v8/src/builtins/builtins-utils.h` (`BUILTIN`: one function
-per builtin, arguments in place), `v8/src/builtins/builtins-object.cc`,
-`v8/src/builtins/object.tq`, `v8/src/compiler/js-call-reducer.cc`
-(`ReduceMathUnary`, `ReduceObjectKeys`-style reductions);
+Read: `v8/src/builtins/builtins-utils.h`, `builtins-object.cc`,
+`object.tq`, `js-call-reducer.cc` (`ReduceMathUnary`);
 `WebKit/Source/JavaScriptCore/runtime/ObjectConstructor.cpp`,
-`runtime/MathObject.cpp` (one host function per method);
-`gecko-dev/js/src/jit/InlinableNatives.h`.
+`runtime/MathObject.cpp`; `gecko-dev/js/src/jit/InlinableNatives.h`.
 
-Port: one direct function per method with its own fast path (ToNumber of a
-number is a register move; no SmallVec, no name or enum match, no context
-unless the method can run JS), and graph reductions for the pure ones
-(Math, `Object.is*`, `Array.isArray`, `Object.keys` of a shaped object).
-Delete the ladders.
+Port: one direct function per method with its own fast path, graph
+reductions for the pure ones. Delete the ladders.
 
-### 4. Host-kernel calls (4.3%)
+### 5. Host-kernel calls (4.3%)
 
-`Function.prototype.call/apply`, `Reflect.apply`, `bind`, native
-constructors and non-static natives still go through the request mailbox,
-classifier and a six-register Host frame. Port them onto the direct entry
-(`interp/native_entry.rs`) and the native-to-JS thunk
-(`native_abi::call_from_native`): `call`/`apply` become a JS-ABI tail of
-the target, construct gets its own direct entry.
-Reference: `WebKit/Source/JavaScriptCore/jit/ThunkGenerators.cpp`
-(`nativeForGenerator`), `v8/src/compiler/js-call-reducer.cc`
-(`ReduceFunctionPrototypeCall`/`Apply`).
-
-### 5. Generated code quality (37%; babylon/espree/acorn 60–70%)
-
-Register allocation with live-range splitting, bounds-check elimination,
-polymorphic inlining, unboxed doubles. Reference: `v8/src/maglev/maglev-regalloc.cc`,
-`WebKit/Source/JavaScriptCore/b3/air/` (register allocation),
-`gecko-dev/js/src/jit/BacktrackingAllocator.cpp`. Use `jit_hot_regions.py`
-to find spill/reload and guard density per graph node.
+`call`/`apply`/`Reflect.apply`/`bind`, native constructors and non-static
+natives still use the request mailbox and a six-register Host frame. Move
+them onto `interp/native_entry.rs` and `native_abi::call_from_native`:
+`call`/`apply` become a JS-ABI tail of the target, construct gets its own
+direct entry. Reference: `WebKit/Source/JavaScriptCore/jit/ThunkGenerators.cpp`,
+`js-call-reducer.cc` (`ReduceFunctionPrototypeCall`/`Apply`).
 
 ### 6. Smaller structural items
 
-- Arguments objects allocate an `ExoticSlots` sidecar for one flag: put it
-  in the shape or an in-object field.
-- `slice`/`substring`/`concat`/`Array.prototype.slice`/`push` with growth:
-  inline allocation with a safepoint in the graph.
-- chai: `error_stack_draft` captures positions eagerly; capture the raw
-  frame list and format on first `.stack` read.
-- Graph tier inside `try`: every throw deopts into the interpreter; compile
-  catch handlers.
+- Arguments objects allocate an `ExoticSlots` sidecar for one flag.
+- `slice`/`substring`/`concat`/`push` with growth: inline allocation with a
+  safepoint in the graph.
+- chai: `error_stack_draft` captures positions eagerly; format on first
+  `.stack` read.
+- Graph tier inside `try`: every throw deopts; compile catch handlers.
+- A JIT throw's stack excerpt shows the caller's line while the frame names
+  the callee (seen with `probe_access_classes.js` `writeKey`).
 
 Do not redo:
 - the primitive projected-load IC with `String.prototype` in fast mode
-  (prettier 5.6 → 4.3; patch `benchmarks/results/cb-1030/primitive_projection.patch`);
+  (patch `benchmarks/results/cb-1030/primitive_projection.patch`);
 - numeric field representation via migrations or a universal Double;
-- the native-call entry protocol: it is done (`23c1723e7`, `1038d2bc6`;
-  ≈14 instructions of selector + ≈100 of entry). Remaining native cost is
-  in the bodies (item 3) and callbacks (item 2).
+- the native-call entry protocol (`23c1723e7`, `1038d2bc6`);
+- int-key atomization, `str[i]`, typed-array `.length` (access slice).
 
 ## Loop
 
 1. `just release` (writes the startup image; nothing is measured without
    it). `cp target/release/otter target/saved-bins/otter-<slice>`.
-2. Decompose (above). Read the reference. Port. Delete.
-3. Measure with `web_tooling_instr.sh` against the previous saved binary
-   and `op_instr.sh` for the slice's operations.
+2. Decompose. Read the reference. Port. Delete.
+3. Measure with `web_tooling_instr_one.sh` + `instr_ratio.py` against the
+   previous saved binary and the per-operation scripts.
 4. Gates, one GPG-signed commit, memory note, next slice.
 
 ## Gates per slice
@@ -255,12 +277,16 @@ Do not redo:
   `cargo build --release -p otter-cli --target x86_64-apple-darwin`, then
   `arch -x86_64 target/x86_64-apple-darwin/release/otter <probe>`; delete
   `target/x86_64-apple-darwin` afterwards (`rm -rf`).
-- Probes `scripts/dev/probe_*.js` touched by the slice match node, also
-  under `OTTER_GC_STRESS=64`, in graph, `--jitless` and `--interpreter`
-  modes. A new probe must first fail on a binary with the bug.
+- Probes `scripts/dev/probe_*.js` touched by the slice match node
+  (`probe_access_classes.js` → `benchmarks/results/dom0/pac.node.txt`,
+  `probe_native_entry.js` → `pne.node.txt`), also under
+  `OTTER_GC_STRESS=64`, in graph, `--jitless` and `--interpreter` modes.
+  A new probe must first fail on a binary with the bug.
+- Difftest of the slice's probes against `--interpreter`.
 - Full test262 in the background through a runner copy:
-  `cargo build --release -p otter-test262; cp target/release/otter-test262 target/release/otter-test262-gN; target/release/otter-test262-gN run --max-heap-bytes 536870912 --timeout 10000 --output test262_results/gN_full.json > test262_results/gN_full.log 2>&1; python3 scripts/dev/t262_diff.py test262_results/g39_full.json test262_results/gN_full.json`
+  `cargo build --release -p otter-test262; cp target/release/otter-test262 target/release/otter-test262-gN; target/release/otter-test262-gN run --max-heap-bytes 536870912 --timeout 10000 --output test262_results/gN_full.json > test262_results/gN_full.log 2>&1; python3 scripts/dev/t262_diff.py test262_results/g42_full.json test262_results/gN_full.json`
   must print `before 14 after 14` with no `NEW` lines. Last gate: g42.
+  Background Bash needs `timeout: 7200000`.
 - md5 of each output of `benchmarks/fixtures/fixed-work/{richards,deltablue,crypto,raytrace,earley-boyer,regexp,splay,navier-stokes,box2d,gbemu,mandreel,zlib,ts}.js`
   equals node's.
 - While a background gate runs, never edit sources or rebuild
@@ -292,8 +318,9 @@ Do not redo:
   `target/x86_64-*` with `rm -rf`, never `cargo clean --target`.
 - Diagnostic `eprintln!` builds: keep a `.keep` copy of the file in
   `benchmarks/results/<slice>/` and restore it before measuring.
+- No sudo, dtrace or other tools that prompt for a password.
 
 ## Memory
 
-- The latest session note is `session_2026_10_30_native_entry.md`.
+- The latest session note is `session_2026_10_31_access_slice.md`.
 - Start a new note for each session and link it in `MEMORY.md`.

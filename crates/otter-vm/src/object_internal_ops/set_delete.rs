@@ -38,6 +38,10 @@ impl Interpreter {
         if hops >= object::PROTO_CHAIN_HARD_CAP {
             return Ok(true);
         }
+        if key.string_name() == Some("length") && self.is_realm_typed_array_length_prototype(target)
+        {
+            self.activate_typed_array_length_protector();
+        }
         let mut target =
             self.with_handle_scope(|interp, scope| -> Result<Value, CommittedValueError> {
                 let target = interp.scoped_value(scope, target);
@@ -356,19 +360,23 @@ impl Interpreter {
                     let receiver = this.iteration_anchor(receiver_slot);
                     return this.ordinary_set_on_receiver(stack, context, key, value, &receiver);
                 }
-                let mut bag = crate::property_dispatch::typed_array_ensure_expando(this, &t)
-                    .map_err(CommittedValueError::JavaScript)?;
                 // OrdinarySet on the expando: an own non-writable
                 // data property rejects, an own accessor invokes
-                // its setter (receiver = the typed array), and a
-                // fresh key requires the bag to be extensible.
-                let t = anchored_ta(this);
+                // its setter (receiver = the typed array), and an
+                // own miss continues on the prototype. Only a
+                // definition on the receiver materializes the bag:
+                // an empty one would hide the view's lookup start.
+                let bag = t.expando(&this.gc_heap);
                 let receiver = this.iteration_anchor(receiver_slot);
                 let same_receiver = receiver
                     .as_typed_array(&this.gc_heap)
                     .is_some_and(|r| r == t);
-                match object::lookup_own(bag, &this.gc_heap, &name) {
+                let own = bag.map_or(object::PropertyLookup::Absent, |bag| {
+                    object::lookup_own(bag, &this.gc_heap, &name)
+                });
+                match own {
                     object::PropertyLookup::Data { flags, .. } => {
+                        let mut bag = bag.expect("an own data property lives in the bag");
                         if !flags.writable() {
                             return Ok(false);
                         }

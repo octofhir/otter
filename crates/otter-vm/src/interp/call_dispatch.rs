@@ -489,6 +489,10 @@ impl Interpreter {
         thread.array_buffer_detach_protector_cell =
             self.jit_array_buffer_detach_protector_addr() as u64;
         thread.number_strings = self.jit_number_strings_addr() as u64;
+        thread.index_atoms = self.jit_index_atoms_addr() as u64;
+        thread.unit_strings = self.jit_unit_strings_addr() as u64;
+        thread.typed_array_length_protector_cell =
+            self.jit_typed_array_length_protector_addr() as u64;
         let marker = 0_u8;
         let mut error = None;
         let mut ctx = JitCtx {

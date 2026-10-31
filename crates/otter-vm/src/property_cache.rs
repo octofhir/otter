@@ -950,12 +950,19 @@ impl crate::Interpreter {
             .register_shape(&self.gc_heap, object::shape(start, &self.gc_heap));
         self.shape_runtime
             .register_shape(&self.gc_heap, resolved.holder_root);
+        let start_shape = object::keyed_shape(start, &self.gc_heap);
+        // A typed view whose `length` reaches the intrinsic getter reads its
+        // count in generated code.
+        let handler = if projection == crate::property_ic::PropertyStorageProjection::TypedArrayStart
+            && crate::bootstrap_typed_array::is_intrinsic_length_getter(getter, &self.gc_heap)
+        {
+            crate::property_ic::IcHandler::load_typed_array_length(start_shape, &resolved)
+        } else {
+            crate::property_ic::IcHandler::load_inherited_accessor(start_shape, &resolved)
+                .and_then(|handler| handler.projected(projection))
+        };
         if !slot.is_megamorphic()
-            && let Some(handler) = crate::property_ic::IcHandler::load_inherited_accessor(
-                object::keyed_shape(start, &self.gc_heap),
-                &resolved,
-            )
-            && let Some(handler) = handler.projected(projection)
+            && let Some(handler) = handler
         {
             slot.install(handler);
         }

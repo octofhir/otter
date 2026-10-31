@@ -3651,39 +3651,17 @@ impl<'a> Codegen<'a> {
         destination: u8,
         miss: DynamicLabel,
     ) {
-        let p = self.view.string_layout;
-        let map = p.map_atom_word as u32;
-        let [flat, seq_latin1, done] = std::array::from_fn(|_| self.ops.new_dynamic_label());
+        let map = self.view.string_layout.map_atom_word as u32;
         self.emit_cell_receiver(receiver, miss);
         dynasm!(self.ops ; .arch aarch64 ; ldr w16, [X(receiver), JIT_MAP_WORD_BYTE]);
         self.emit_compare_w16(map);
-        dynasm!(self.ops ; .arch aarch64
-            ; b.ne =>miss
-            ; ldr w17, [X(receiver), p.string_len_byte]
-            ; cmp W(index), w17
-            ; b.hs =>miss
-            ; mov X(base), X(receiver)
-            ; mov w17, W(index)
-            ; ldrb w16, [X(receiver), p.string_repr_byte]
-            ; cmp w16, u32::from(p.sliced_tag)
-            ; b.ne =>flat
-            // A slice views its flat parent from a start offset.
-            ; ldr w16, [X(receiver), p.sliced_parent_byte]
-            ; ldr w17, [X(receiver), p.sliced_start_byte]
-            ; add w17, w17, W(index)
-            ; and XSP(base), X(receiver), #0xffff_ffff_0000_0000
-            ; add X(base), X(base), x16
-            ; ldrb w16, [X(base), p.string_repr_byte]
-            ; =>flat
-            ; cmp w16, u32::from(p.seq_latin1_tag) ; b.eq =>seq_latin1
-            ; cmp w16, u32::from(p.seq_flat_tag) ; b.ne =>miss
-            ; add x16, XSP(base), p.string_body_size
-            ; ldrh W(destination), [x16, w17, uxtw #1]
-            ; b =>done
-            ; =>seq_latin1
-            ; add x16, XSP(base), p.string_body_size
-            ; ldrb W(destination), [x16, w17, uxtw]
-            ; =>done
+        dynasm!(self.ops ; .arch aarch64 ; b.ne =>miss);
+        crate::arm64::string_unit::emit_code_unit(
+            &mut self.ops,
+            self.view,
+            [receiver, index, base],
+            destination,
+            miss,
         );
     }
 

@@ -307,7 +307,7 @@ impl Interpreter {
                     VmPropertyKey::OwnedString(key.to_key_spelling(&self.gc_heap))
                 } else if let Some(index) = idx_value.as_i32() {
                     // An integer key is spelled on the stack, not allocated.
-                    VmPropertyKey::Atom(self.atomized_key(digits.format(index)))
+                    VmPropertyKey::Atom(self.index_atomized_key(index, &mut digits))
                 } else if let Some(number) = idx_value.as_number() {
                     VmPropertyKey::OwnedString(number.to_display_string())
                 } else {

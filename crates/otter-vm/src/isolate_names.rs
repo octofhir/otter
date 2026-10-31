@@ -12,6 +12,8 @@
 //! - [`IsolateNames`] — the interner, the dense canonical key strings and
 //!   the integer-key atom cache and the one weak shape interner.
 //! - [`names`] / [`names_mut`] — the interner of a heap's isolate.
+//! - [`IndexAtomCacheLayout`] — the integer-key atom cache as generated
+//!   keyed accesses read it, through `VmThread::index_atoms`.
 //!
 //! # Invariants
 //! - One value per heap: the shape runtime installs it when it creates the
@@ -22,7 +24,9 @@
 //!   long as the isolate; the heap visits it as a root of every marking.
 //! - `key_strings` is indexed by atom id; a null entry is an atom no shape
 //!   has keyed yet. An entry, once set, never changes.
-//! - The integer-key atom cache box never moves for the heap's life.
+//! - The integer-key atom cache box never moves for the heap's life. A line
+//!   whose key matches holds that key's permanent atom plus one, so
+//!   generated code may trust a hit without any other check.
 //! - Shape tables hold only old-space handles; current-turn pins are strong,
 //!   and all remaining shape entries are pruned before physical sweep.
 //!
@@ -59,6 +63,34 @@ struct IndexAtomEntry {
 struct IndexAtomCache {
     entries: [IndexAtomEntry; INDEX_ATOM_CACHE_ENTRIES],
 }
+
+/// Where generated code finds an Int32 key's line in the integer-key atom
+/// cache: line `key & mask`, `1 << entry_shift` bytes each, holding the key
+/// at `key_byte` and its atom plus one (zero: none) at `atom_byte`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexAtomCacheLayout {
+    /// Line-index mask; lines are a power of two.
+    pub mask: u32,
+    /// `log2` of the line size in bytes.
+    pub entry_shift: u32,
+    /// Byte offset of the line's `i32` key.
+    pub key_byte: u32,
+    /// Byte offset of the line's atom plus one.
+    pub atom_byte: u32,
+}
+
+impl IndexAtomCacheLayout {
+    /// The layout of this build.
+    pub const CURRENT: Self = Self {
+        mask: INDEX_ATOM_CACHE_ENTRIES as u32 - 1,
+        entry_shift: std::mem::size_of::<IndexAtomEntry>().trailing_zeros(),
+        key_byte: std::mem::offset_of!(IndexAtomEntry, key) as u32,
+        atom_byte: std::mem::offset_of!(IndexAtomEntry, atom_plus_one) as u32,
+    };
+}
+
+const _: () = assert!(std::mem::size_of::<IndexAtomEntry>().is_power_of_two());
+const _: () = assert!(std::mem::offset_of!(IndexAtomCache, entries) == 0);
 
 impl IndexAtomCache {
     fn new() -> Box<Self> {
@@ -169,6 +201,12 @@ impl IsolateNames {
             atom_plus_one: atom.raw() + 1,
         };
         Some(atom)
+    }
+
+    /// Address of the integer-key atom cache, which never moves.
+    #[must_use]
+    pub(crate) fn index_atoms_addr(&self) -> *const u8 {
+        std::ptr::from_ref::<IndexAtomCache>(&self.index_atoms).cast()
     }
 
     /// `atom`'s canonical key string, once a shape has keyed it.

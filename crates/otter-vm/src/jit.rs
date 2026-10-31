@@ -81,6 +81,8 @@ pub use crate::property_ic::{
     PropertyIcLayout, PropertyStorageProjection,
 };
 
+pub use crate::isolate_names::IndexAtomCacheLayout;
+
 /// Native layout of every named-property IC slot generated code reads.
 pub const PROPERTY_IC_LAYOUT: PropertyIcLayout = crate::property_ic::PropertyIcSlot::LAYOUT;
 

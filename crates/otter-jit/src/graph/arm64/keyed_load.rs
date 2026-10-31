@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - [`Codegen::emit_load_keyed_cached`] reads an Array's dense storage of
-//!   any kind inline, a name key through the keyed table probe and, when it
+//!   any kind inline, a string's Latin-1 unit as its shared one-unit string,
+//!   a name key through the keyed table probe and, when it
 //!   declines, the code object's keyed table routine, and every other load
 //!   in the runtime.
 //!
@@ -124,6 +125,18 @@ impl Codegen<'_> {
             ; b =>done
             ; =>other
         );
+        // A string's Latin-1 unit at an Int32 index is its shared one-unit
+        // string.
+        let not_string = self.ops.new_dynamic_label();
+        crate::arm64::string_unit::emit_unit_string_load(
+            &mut self.ops,
+            self.view,
+            [receiver, key],
+            [index, base],
+            destination,
+            not_string,
+        );
+        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>not_string);
         self.emit_keyed_table_load(node, [receiver, key], destination, runtime, done);
         dynasm!(self.ops ; .arch aarch64 ; =>runtime);
         self.emit_committed_call(
@@ -141,8 +154,8 @@ impl Codegen<'_> {
 
     /// A name key's load through the code object's keyed table routine:
     /// the value in `X(destination)` and on to `loaded` on a hit, else to
-    /// `missed` with every register as it was. Only a string or symbol key is
-    /// offered.
+    /// `missed` with every register as it was. Only a string, symbol or
+    /// nonnegative Int32 key is offered.
     fn emit_keyed_table_load(
         &mut self,
         node: NodeId,
@@ -154,10 +167,18 @@ impl Codegen<'_> {
         use crate::template::arm64::shared_property::{KEYED_LOAD_KEY, KEYED_LOAD_RECEIVER};
         let string_tag = self.view.string_layout.string_type_tag;
         let name = self.ops.new_dynamic_label();
+        let cell = self.ops.new_dynamic_label();
         dynasm!(self.ops
             ; .arch aarch64
             ; tst X(key), #0xfffe_0000_0000_0007
+            ; b.eq =>cell
+            // A nonnegative Int32 key names its decimal spelling's atom.
+            ; asr x16, X(key), #49
+            ; cmn x16, #1
             ; b.ne =>missed
+            ; tbz W(key), #31, =>name
+            ; b =>missed
+            ; =>cell
             ; ldrb w16, [X(key)]
             ; cmp w16, u32::from(string_tag)
             ; b.eq =>name

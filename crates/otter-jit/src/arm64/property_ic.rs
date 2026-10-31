@@ -5,7 +5,7 @@
 //! - [`emit_select_entry`] — the source receiver selects a current storage
 //!   shape through the shared checked projection key.
 //! - [`emit_slot_load`] — own field, prototype field under its chain proof,
-//!   nonexistent key.
+//!   nonexistent key, a typed view's intrinsic `length`.
 //! - [`emit_slot_store`] — own-field store and add-transition (write, shape
 //!   publication), returning the actual storage parent and optional child
 //!   shape for the caller's barriers.
@@ -137,9 +137,11 @@ pub(crate) fn emit_select_entry(
     );
     if let Some(start) = start {
         let array = ops.new_dynamic_label();
+        let typed = ops.new_dynamic_label();
         let native = ops.new_dynamic_label();
         let class = ops.new_dynamic_label();
         let bag = ops.new_dynamic_label();
+        let typed_layout = view.typed_array_length;
         let layout = view.closure_call_layout;
         let native_layout = view.native_call_layout;
         // A closure's bag mirrors its [[Prototype]], override or not.
@@ -148,6 +150,8 @@ pub(crate) fn emit_select_entry(
             ; =>projected
             ; cmp w16, u32::from(view.array_layout.type_tag)
             ; b.eq =>array
+            ; cmp w16, u32::from(typed_layout.type_tag)
+            ; b.eq =>typed
             ; cmp w16, u32::from(otter_vm::native_function::NATIVE_FUNCTION_BODY_TYPE_TAG)
             ; b.eq =>native
             ; cmp w16, u32::from(view.class_constructor_layout.type_tag)
@@ -192,6 +196,16 @@ pub(crate) fn emit_select_entry(
             ; add X(start), x17, X(start)
             ; ldr w17, [X(start), view.object_shape_byte]
             ; orr w17, w17, #Projection::ArrayExpando as u32
+            ; b =>keyed
+            // A typed view's named lookup starts at its proven prototype,
+            // recorded while it owns no named property.
+            ; =>typed
+            ; ldr W(start), [X(receiver), typed_layout.lookup_start_byte]
+            ; cbz W(start), =>miss
+            ; and x17, X(receiver), #0xffff_ffff_0000_0000
+            ; add X(start), x17, X(start)
+            ; ldr w17, [X(start), view.object_shape_byte]
+            ; orr w17, w17, #Projection::TypedArrayStart as u32
             ; b =>keyed
         );
     }
@@ -266,6 +280,7 @@ pub(crate) fn emit_slot_load(
     let own = ops.new_dynamic_label();
     let prototype = ops.new_dynamic_label();
     let field = ops.new_dynamic_label();
+    let typed_length = ops.new_dynamic_label();
     emit_select_entry(
         ops,
         view,
@@ -282,6 +297,8 @@ pub(crate) fn emit_slot_load(
         ; b.eq =>own
         ; cmp w16, Kind::PrototypeField as u32
         ; b.eq =>prototype
+        ; cmp w16, Kind::TypedArrayLength as u32
+        ; b.eq =>typed_length
         ; cmp w16, Kind::NonExistent as u32
         ; b.ne =>miss
     );
@@ -306,9 +323,16 @@ pub(crate) fn emit_slot_load(
     emit_field_bank(ops, view, holder, index, miss);
     dynasm!(ops ; .arch aarch64
         ; ldr X(destination), [x16, X(index), lsl #3]
+        ; b =>done
+        // The chain still reaches the intrinsic getter: the view's count.
+        ; =>typed_length
     );
-
-    dynasm!(ops ; .arch aarch64 ; b =>done);
+    emit_entry_proof(ops, entry, true, miss);
+    crate::template::arm64::ic_probe::emit_typed_view_count(ops, view, receiver, index, miss);
+    emit_load_u64(ops, 16, i32::MAX as u64);
+    dynasm!(ops ; .arch aarch64 ; cmp X(index), x16 ; b.hi =>miss);
+    crate::template::arm64::values::emit_box_int32(ops, index, 16);
+    dynasm!(ops ; .arch aarch64 ; mov X(destination), X(index) ; b =>done);
 }
 
 /// Complete a store of `X(value)` through the slot at `X(slot)`: on a hit

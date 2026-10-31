@@ -1479,38 +1479,10 @@ impl Interpreter {
     }
 }
 
-/// Lazy-allocate and cache the TypedArray expando through the VM handle arena.
-///
-/// The typed-array body is re-read from its scoped handle after allocating the
-/// bag, so a nursery move can never make `set_expando` target a stale body.
-/// The returned bag is current at scope exit and callers hand it immediately to
-/// descriptor/store code; any later allocating operation owns its own roots.
-pub(crate) fn typed_array_ensure_expando(
-    interp: &mut Interpreter,
-    t: &crate::binary::typed_array::JsTypedArray,
-) -> Result<JsObject, VmError> {
-    if let Some(existing) = t.expando(&interp.gc_heap) {
-        return Ok(existing);
-    }
-    interp.with_handle_scope(|interp, scope| {
-        let typed_array = interp.scoped_value(scope, Value::typed_array(*t));
-        let bag = interp.scoped_object_bare(scope)?;
-        let current_t = interp
-            .escape_scoped(typed_array)
-            .as_typed_array(&interp.gc_heap)
-            .ok_or(VmError::TypeMismatch)?;
-        let current_bag = interp
-            .escape_scoped(bag)
-            .as_object()
-            .ok_or(VmError::TypeMismatch)?;
-        current_t.set_expando(&mut interp.gc_heap, current_bag);
-        Ok(current_bag)
-    })
-}
-
-/// Public-crate variant of `typed_array_ensure_expando` so static
-/// callers (e.g. `Object.defineProperty`) can lazily materialise
-/// the bag without going through `Interpreter`.
+/// Lazily materialize a typed view's expando bag, the storage of its own
+/// named properties, from heap-only callers (e.g. `Object.defineProperty`).
+/// Only a definition on the view itself materializes it: an empty bag would
+/// hide the view's lookup start.
 pub(crate) fn typed_array_ensure_expando_pub(
     heap: &mut otter_gc::GcHeap,
     t: &crate::binary::typed_array::JsTypedArray,

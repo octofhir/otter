@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs/s of otter and node on each Web Tooling Benchmark target (real parsers,
-# compilers, minifiers and formatters; 20 fixed samples each), one fresh
+# compilers, minifiers and formatters; 20 one-iteration samples each), one fresh
 # process per target. Bun rejects the bundle (`const Terser` reassignment).
 # usage: scripts/dev/web_tooling_matrix.sh <otter-binary> <out-file> [target...]
 # Needs the full bundle: benchmarks/.suite-cache/web-tooling-benchmark/dist/cli.js
@@ -21,6 +21,20 @@ old = '''    } else if (false) {
 if old in s:
     s = s.replace(old, '''    } else if (typeof globalThis.WTB_ONLY == "string") {
       return [globalThis.WTB_ONLY];''')
+# Benchmark.js repeats a sample until it lasts `minTime` (50 ms), whatever
+# `maxTime`: a faster engine would run more iterations and more work. A
+# minimum below any clock reading makes every sample exactly one iteration,
+# so a run is the same work on every engine and every build.
+old_options = """const defaultOptions = {
+  maxTime: 0,
+  minSamples: 20
+};"""
+assert old_options in s, "harness options moved"
+s = s.replace(old_options, """const defaultOptions = {
+  maxTime: 0,
+  minTime: 1e-9,
+  minSamples: 20
+};""")
 open(f"{d}/cli-one.js", "w").write(s)
 open(f"{d}/one.js", "w").write('globalThis.WTB_ONLY = process.argv[2];\nrequire("./cli-one.js");\n')
 EOF

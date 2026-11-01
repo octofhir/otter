@@ -1401,6 +1401,18 @@ runtime_stubs! {
     STUB_OBJECT_HAS_OWN_PROPERTY_LEAF = 139 => "object_has_own_property_leaf",
         LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
         Never, NativePair, Probe;
+
+    /// Allocating `String.prototype.slice` of a primitive string with Int32 or
+    /// absent bounds: `(receiver, start, end)`.
+    STUB_STRING_SLICE_ALLOC = 140 => "string_slice_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Probe;
+
+    /// Allocating `String.prototype.substring` of a primitive string with Int32
+    /// or absent bounds: `(receiver, start, end)`.
+    STUB_STRING_SUBSTRING_ALLOC = 141 => "string_substring_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Probe;
 }
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.

@@ -782,6 +782,10 @@ pub(crate) enum Kind {
     /// miss eagerly resumes this CallWithThis with its evaluated inputs.
     /// The C call clobbers registers but cannot collect or reenter.
     NativeLeaf(otter_vm::native_abi::RuntimeStubId),
+    /// A registry builtin's allocating entry on three tagged operand words
+    /// (an `AllocValue3` probe): its result, or a resume of the call it
+    /// reduced on a miss.
+    NativeAllocLeaf(otter_vm::native_abi::RuntimeStubId),
     /// `[[Call]]` of input0 with `undefined` as receiver and the remaining
     /// inputs as arguments, through the JavaScript call ABI, or with
     /// `construct` its `[[Construct]]` with input0 as `new.target`. With a
@@ -1209,6 +1213,7 @@ impl Kind {
             Self::AllocationGroup(_)
             | Self::PrimitiveAdd
             | Self::NumberToString
+            | Self::NativeAllocLeaf(_)
             | Self::BigIntBinary(_)
             | Self::NativeNewContext(_)
             | Self::CopyContext
@@ -1454,7 +1459,7 @@ impl Kind {
                 abi::STUB_JIT_CALL_GENERIC,
                 abi::STUB_JIT_CALL_NATIVE,
             ],
-            Self::NativeLeaf(stub) => stub
+            Self::NativeLeaf(stub) | Self::NativeAllocLeaf(stub) => stub
                 .checked_sub(1)
                 .and_then(|index| abi::RUNTIME_STUB_DESCRIPTORS.get(index as usize))
                 .map_or(&[], std::slice::from_ref),
@@ -1520,6 +1525,15 @@ impl Kind {
                 result: ResultPolicy::Register,
                 gp_temps: 2,
                 fp_temps: 1,
+                fixed_gp_clobbers: SmallVec::new(),
+            },
+            Self::NativeAllocLeaf(_) => Constraints {
+                inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
+                result: ResultPolicy::Register,
+                // The inline substring carve: four buffer registers, the
+                // range's start and count.
+                gp_temps: 6,
+                fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
             Self::BigIntBinary(_) => Constraints {

@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - Empty identity, short width-preserving flat concatenation and bounded Cons.
+//! - A short Latin-1 substring of a sequential Latin-1 string.
 //! - VM-owned payload length/hash and complete initialized cell publication.
 //! - Allocation-site placement: tracked young cells, old cells, or a site
 //!   record read at run time by code many sites share.
@@ -167,6 +168,51 @@ fn emit_depth(
 /// header, the map and a zero atom, the summed length and a zero hash, and
 /// `kind` with a zero depth. The last word is zeroed first, so trailing
 /// padding is initialized before any payload byte lands.
+/// `Rd(count)` units of the sequential Latin-1 string `source` from unit
+/// `Rd(from)`, carved as a young sequential Latin-1 string: `Rq(r.candidate)`
+/// holds it. The caller proved the source's representation, the range and a
+/// short count; a full buffer misses before any write. `from`, `count` and
+/// `source` survive.
+pub(crate) fn emit_substring_latin1(
+    ops: &mut Assembler,
+    context: u8,
+    p: JitStringLayout,
+    source: AllocationValue,
+    [from, count]: [u8; 2],
+    r: LabRegisters,
+    slow: DynamicLabel,
+) {
+    debug_assert_eq!(r.size, 11);
+    let align = (otter_vm::jit::JIT_CELL_SIZE - 1) as i32;
+    dynasm!(ops ; .arch x64
+        ; lea Rd(r.size),[Rq(count)+p.string_body_size as i32+align]
+        ; and Rd(r.size),!align);
+    emit_bump_probe_in(ops, context, ALLOC_WINDOW_LAB_OFFSET, r, slow);
+    dynasm!(ops ; .arch x64 ; mov QWORD [Rq(r.candidate)+Rq(r.size)-8],0);
+    emit_load_u64(ops, 10, p.young_header_word);
+    dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)],r10
+        ; mov [Rq(r.candidate)+otter_vm::jit::JIT_HEADER_SIZE_BYTE as i32],Rd(r.size));
+    emit_load_u64(ops, 10, p.map_atom_word);
+    // The length's word also holds the zero hash.
+    dynasm!(ops ; .arch x64 ; mov [Rq(r.candidate)+8],r10
+        ; mov Rd(r.scratch),Rd(count)
+        ; mov [Rq(r.candidate)+p.string_len_byte as i32],Rq(r.scratch)
+        ; mov DWORD [Rq(r.candidate)+p.string_repr_byte as i32],i32::from(p.seq_latin1_tag));
+    emit_value(ops, r.end, source);
+    dynasm!(ops ; .arch x64
+        ; mov r10d,Rd(from)
+        ; lea Rq(r.end),[Rq(r.end)+r10+p.string_body_size as i32]
+        ; lea Rq(r.buffer),[Rq(r.candidate)+p.string_body_size as i32]
+        ; mov Rd(r.size),Rd(count));
+    emit_copy_loop(ops, r, false, true);
+    let young = ConcatPlacement::Site(otter_vm::jit::JitAllocationSite {
+        id: 0,
+        record: 0,
+        mode: JitSiteMode::Young,
+    });
+    publish(ops, context, r, young);
+}
+
 fn initialize(
     ops: &mut Assembler,
     context: u8,

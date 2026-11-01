@@ -6,7 +6,9 @@
 //!
 //! # Invariants
 //! Exact JavaScript arity, or one the row's reduction admits, and the
-//! existing native identity guard precede the call. The admitted entry has no effects, allocation, collection or reentry.
+//! existing native identity guard precede the call. The admitted entry has no effects, allocation, collection or reentry,
+//! except a row reducing to its allocating entry, which the graph calls as
+//! an allocating probe at a safepoint.
 //! Its two boxed operands follow the sole heap/value/value C ABI and result
 //! Probe domain. A miss precedes effects and resumes the current CallWithThis;
 //! this module never owns a second builtin table or runtime semantic kernel.
@@ -47,6 +49,20 @@ pub(super) fn admit(
     argument_count: usize,
 ) -> Option<&'static otter_vm::jit_static_native::JitLeafBuiltin> {
     let declaration = otter_vm::jit_static_native::jit_leaf_builtin(target.leaf_stub_id)?;
+    if declaration.reduction == otter_vm::jit_static_native::JitBuiltinReduction::AllocatingEntry {
+        // The graph's allocating probe owns the call: three operand words.
+        let stub = otter_vm::runtime_stubs::alloc_value_stub_by_id(target.leaf_stub_id)?;
+        return (view.native_call_layout.identity_byte != 0
+            && stub.entry_addr().is_some()
+            && stub.descriptor.signature == abi::RuntimeStubSignature::AllocValue3
+            && stub.descriptor.result_domain == abi::NativeResultDomain::Probe
+            && declaration
+                .reduction
+                .admits(declaration.argument_count, argument_count)
+            && target.argument_count == declaration.argument_count
+            && declaration.operand_words() <= 3)
+            .then_some(declaration);
+    }
     entry(target.leaf_stub_id).ok()?;
     (view.native_call_layout.identity_byte != 0
         && (argument_count == usize::from(declaration.argument_count)

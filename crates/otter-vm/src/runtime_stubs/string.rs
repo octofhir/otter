@@ -4,6 +4,8 @@
 //! - Scoped collecting concatenation over explicit Number/String operands,
 //!   placed for the calling instruction's allocation site.
 //! - A Number's decimal string through the isolate's cache.
+//! - `String.prototype.slice` / `substring` of a primitive string with
+//!   Int32 or absent bounds.
 //! - Pure UTF-16 or numeric primitive ordering using canonical VM algorithms.
 //!
 //! # Invariants
@@ -80,6 +82,115 @@ fn number_to_string(
         Ok(string) => NativeResultPair::success(Value::string(string)),
         Err(crate::VmError::OutOfMemory { .. }) => NativeResultPair::out_of_memory(),
         Err(_) => NativeResultPair::miss(),
+    }
+}
+
+/// `receiver.slice(start, end)` of a primitive string, each bound an Int32
+/// or `undefined`; any other operand misses before an effect.
+#[must_use]
+pub extern "C" fn string_slice_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    receiver: u64,
+    start: u64,
+    end: u64,
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
+        ctx,
+        substring(ctx, safepoint, [receiver, start, end], SubstringForm::Slice),
+    )
+}
+
+/// `receiver.substring(start, end)` of a primitive string, each bound an
+/// Int32 or `undefined`; any other operand misses before an effect.
+#[must_use]
+pub extern "C" fn string_substring_alloc(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    receiver: u64,
+    start: u64,
+    end: u64,
+) -> NativeResultPair {
+    record_alloc_value_stub_result(
+        ctx,
+        substring(
+            ctx,
+            safepoint,
+            [receiver, start, end],
+            SubstringForm::Substring,
+        ),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum SubstringForm {
+    /// §22.1.3.23: a negative bound counts from the end; `end < start` is empty.
+    Slice,
+    /// §22.1.3.25: bounds clamp to `[0, len]` and swap when reversed.
+    Substring,
+}
+
+/// The `[from, to)` unit range `form` selects of a string of `len` units.
+fn substring_range(
+    form: SubstringForm,
+    len: u32,
+    start: Option<i32>,
+    end: Option<i32>,
+) -> (u32, u32) {
+    let len = i64::from(len);
+    let (start, end) = (start.map_or(0, i64::from), end.map_or(len, i64::from));
+    let (from, to) = match form {
+        SubstringForm::Slice => {
+            let relative = |n: i64| if n < 0 { (len + n).max(0) } else { n.min(len) };
+            let (from, to) = (relative(start), relative(end));
+            (from, to.max(from))
+        }
+        SubstringForm::Substring => {
+            let (a, b) = (start.clamp(0, len), end.clamp(0, len));
+            (a.min(b), a.max(b))
+        }
+    };
+    (from as u32, to as u32)
+}
+
+fn substring(
+    ctx: *mut RuntimeStubAllocContext,
+    safepoint: SafepointId,
+    bits: [u64; 3],
+    form: SubstringForm,
+) -> NativeResultPair {
+    let Some(ctx) = alloc_context_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    let Some(vm) = alloc_interpreter_mut(ctx) else {
+        return NativeResultPair::miss();
+    };
+    let values = bits.map(Value::from_abi_bits);
+    let bound = |value: Value| -> Option<Option<i32>> {
+        if value.is_undefined() {
+            Some(None)
+        } else {
+            value.as_i32().map(Some)
+        }
+    };
+    let (Some(start), Some(end)) = (bound(values[1]), bound(values[2])) else {
+        return NativeResultPair::miss();
+    };
+    let Some(string) = values[0].as_string(&vm.gc_heap) else {
+        return NativeResultPair::miss();
+    };
+    let (from, to) = substring_range(form, string.len(), start, end);
+    // SAFETY: exact current typed call packet and immutable safepoint remain
+    // published until the slice's allocation ends.
+    let Ok(roots) = (unsafe { alloc_value_stub_call_roots(ctx, safepoint, values) }) else {
+        return NativeResultPair::miss();
+    };
+    let _roots = vm
+        .gc_heap
+        .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
+    match string.slice(from, to - from, &mut vm.gc_heap) {
+        Ok(slice) => NativeResultPair::success(Value::string(slice)),
+        Err(_) => NativeResultPair::out_of_memory(),
     }
 }
 

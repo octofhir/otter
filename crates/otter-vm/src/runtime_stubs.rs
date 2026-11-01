@@ -1118,6 +1118,18 @@ pub const NUMBER_TO_STRING_ALLOC: AllocValueStub = AllocValueStub {
     entry: Some(number_to_string_alloc),
 };
 
+/// ABI descriptor for `String.prototype.slice` of a primitive string.
+pub const STRING_SLICE_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: crate::native_abi::STUB_STRING_SLICE_ALLOC,
+    entry: Some(string_slice_alloc),
+};
+
+/// ABI descriptor for `String.prototype.substring` of a primitive string.
+pub const STRING_SUBSTRING_ALLOC: AllocValueStub = AllocValueStub {
+    descriptor: crate::native_abi::STUB_STRING_SUBSTRING_ALLOC,
+    entry: Some(string_substring_alloc),
+};
+
 /// ABI descriptor for guarded `Array(length)` allocation.
 pub const ARRAY_CONSTRUCT_ALLOC: AllocValueStub = AllocValueStub {
     descriptor: STUB_ARRAY_CONSTRUCT_ALLOC,
@@ -1132,7 +1144,9 @@ pub const REST_ARRAY_ALLOC: AllocValueStub = AllocValueStub {
 
 mod string;
 pub(crate) use string::primitive_string_order;
-pub use string::{number_to_string_alloc, string_concat_alloc};
+pub use string::{
+    number_to_string_alloc, string_concat_alloc, string_slice_alloc, string_substring_alloc,
+};
 mod bigint;
 pub use bigint::bigint_binary_alloc;
 
@@ -1398,6 +1412,10 @@ pub const fn alloc_value_stub_by_id(id: RuntimeStubId) -> Option<AllocValueStub>
         id if id == STUB_STRING_CONCAT_ALLOC.id => Some(STRING_CONCAT_ALLOC),
         id if id == crate::native_abi::STUB_NUMBER_TO_STRING_ALLOC.id => {
             Some(NUMBER_TO_STRING_ALLOC)
+        }
+        id if id == crate::native_abi::STUB_STRING_SLICE_ALLOC.id => Some(STRING_SLICE_ALLOC),
+        id if id == crate::native_abi::STUB_STRING_SUBSTRING_ALLOC.id => {
+            Some(STRING_SUBSTRING_ALLOC)
         }
         id if id == crate::native_abi::STUB_ALLOC_GROUP_ENSURE.id => Some(ALLOC_GROUP_ENSURE),
         id if id == STUB_ARRAY_CONSTRUCT_ALLOC.id => Some(ARRAY_CONSTRUCT_ALLOC),

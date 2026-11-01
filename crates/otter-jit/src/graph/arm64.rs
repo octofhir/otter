@@ -2646,6 +2646,7 @@ impl<'a> Codegen<'a> {
             Kind::AllocationProjection(byte) => self.emit_allocation_projection(node, *byte),
             Kind::PrimitiveAdd => self.emit_primitive_add(node)?,
             Kind::NumberToString => self.emit_number_to_string(node)?,
+            Kind::NativeAllocLeaf(stub) => self.emit_native_alloc_leaf(node, *stub)?,
             Kind::BigIntBinary(operator) => self.emit_bigint_binary(node, *operator)?,
             Kind::PrimitiveCompare(condition) => self.emit_primitive_compare(node, *condition)?,
             Kind::NewObject | Kind::NewNullPrototypeObject | Kind::NewArrayEmpty => {

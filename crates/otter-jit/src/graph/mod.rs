@@ -113,7 +113,7 @@ use crate::optimizing::{CompileFailure, OptimizedCode, OptimizedMetadata, check_
 use crate::{CompiledCode, Unsupported};
 
 /// Bounded inline prototype traversal before committed runtime completion.
-const INSTANCEOF_CHAIN_BOUND: u32 = 32;
+pub(crate) const INSTANCEOF_CHAIN_BOUND: u32 = 32;
 
 /// Graph nodes past which a body's code exceeds the ±32 KiB reach of the
 /// near form's `tbz`/`tbnz` exits even at about forty bytes a node.

@@ -1873,6 +1873,26 @@ pub(crate) fn emit_operation<'a>(
             value0,
             value1,
         } => {
+            // `instanceof` calls the shared routine; a case it does not
+            // decide completes in the runtime.
+            let done = ops.new_dynamic_label();
+            if operation == otter_vm::native_abi::ObjectProtocolValueOp::Instanceof
+                && let (Some(result), Some(value1)) = (result, value1)
+            {
+                use crate::arm64::instanceof::{ROUTINE_TARGET, ROUTINE_VALUE};
+                let miss = ops.new_dynamic_label();
+                emit_load_reg(ops, ROUTINE_VALUE, value0)?;
+                emit_load_reg(ops, ROUTINE_TARGET, value1)?;
+                shared_property::emit_call(
+                    ops,
+                    relocations,
+                    shared_property,
+                    crate::routines::Routine::Instanceof,
+                );
+                dynasm!(ops ; .arch aarch64 ; cbnz x17, =>miss);
+                emit_store_reg(ops, 16, result)?;
+                dynasm!(ops ; .arch aarch64 ; b =>done ; =>miss);
+            }
             protocol::emit_object_protocol_value(
                 ops,
                 relocations,
@@ -1884,6 +1904,7 @@ pub(crate) fn emit_operation<'a>(
                 committed_throw,
                 fatal,
             )?;
+            dynasm!(ops ; .arch aarch64 ; =>done);
         }
         TemplateOp::DeleteOp {
             opcode,

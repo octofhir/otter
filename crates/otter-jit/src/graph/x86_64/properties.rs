@@ -1162,16 +1162,10 @@ impl Codegen<'_> {
         destination: u8,
     ) -> Result<(), Unsupported> {
         let view = self.view_of(node);
-        let layout = view.closure_call_layout;
         let miss = self.ops.new_dynamic_label();
         let yes = self.ops.new_dynamic_label();
         let no = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
-        let symbols_absent = self.ops.new_dynamic_label();
-        let proved = self.ops.new_dynamic_label();
-        let validate = self.ops.new_dynamic_label();
-        let walk = self.ops.new_dynamic_label();
-        let step = self.ops.new_dynamic_label();
         let pc = self.graph.node(node).pc;
         let cell = view.instructions.get(pc as usize).and_then(|instruction| {
             let byte_pc = instruction.byte_pc;
@@ -1185,88 +1179,15 @@ impl Codegen<'_> {
                 )
             })
         });
-        let target_byte = otter_vm::jit::JIT_INSTANCEOF_CELL_TARGET_OFFSET as i32;
-        let prototype_byte = otter_vm::jit::JIT_INSTANCEOF_CELL_PROTOTYPE_OFFSET as i32;
-        if view.cage_base == 0 || layout.prototype_byte == 0 {
-            dynasm!(self.ops ; .arch x64 ; jmp =>miss);
-        } else {
-            emit_load_symbol_u64(
-                &mut self.ops,
-                &mut self.relocations,
-                cage,
-                view.cage_base as u64,
-                RelocationTarget::GcCageBase,
-            );
-            if let Some((address, relocation)) = cell.clone() {
-                // The target this site last proved, and its prototype.
-                emit_load_symbol_u64(
-                    &mut self.ops,
-                    &mut self.relocations,
-                    10,
-                    address,
-                    relocation,
-                );
-                dynasm!(self.ops ; .arch x64
-                    ; cmp Rq(target), [r10 + target_byte] ; jne =>validate
-                    ; mov Rq(prototype), [r10 + prototype_byte] ; jmp =>proved
-                    ; =>validate);
-            }
-            self.emit_cell_guard(target, miss);
-            dynasm!(self.ops ; .arch x64
-                ; mov Rd(rare), Rd(target) ; add Rq(rare), Rq(cage)
-                ; cmp BYTE [Rq(rare)], otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG as i8 ; jne =>miss
-                ; movzx r10d, BYTE [Rq(rare) + otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE as i32]
-                ; and r10d, !u32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS) as i32
-                ; cmp r10d, otter_vm::closure::CLOSURE_LOOKUP_ORDINARY as i32 ; jne =>miss
-                ; mov Rd(rare), [Rq(rare) + layout.rare_byte as i32] ; test Rd(rare), Rd(rare) ; jz =>miss
-                ; add Rq(rare), Rq(cage)
-                // Any `prototype` but an ordinary object completes in the runtime.
-                ; cmp BYTE [Rq(rare) + layout.prototype_ordinary_byte as i32], 0 ; je =>miss
-                ; mov Rq(prototype), [Rq(rare) + layout.prototype_byte as i32]
-                ; mov r10d, [Rq(rare) + layout.own_props_byte as i32] ; test r10d, r10d ; jz =>symbols_absent
-                ; add r10, Rq(cage)
-                // A symbol key in the bag's hidden class or side table may
-                // be `@@hasInstance`.
-                ; mov r11d, [r10 + view.object_shape_byte as i32] ; add r11, Rq(cage)
-                ; cmp BYTE [r11 + otter_vm::object::SHAPE_SYMBOL_KEYS_BYTE as i32], 0 ; jne =>miss
-                ; mov r10d, [r10 + view.object_exotic_handle_byte as i32]
-                ; test r10d, r10d ; jz =>proved ; add r10, Rq(cage)
-                ; cmp DWORD [r10 + otter_vm::object::EXOTIC_SLOTS_SYMBOL_PROPS_BYTE as i32], 0 ; jne =>miss
-                ; jmp =>proved
-                ; =>symbols_absent);
-            if let Some((address, relocation)) = cell {
-                // A closure without own properties is cached; the flag asks
-                // the VM to empty the cell before the closure changes.
-                emit_load_symbol_u64(
-                    &mut self.ops,
-                    &mut self.relocations,
-                    10,
-                    address,
-                    relocation,
-                );
-                dynasm!(self.ops ; .arch x64
-                    ; mov [r10 + target_byte], Rq(target)
-                    ; mov [r10 + prototype_byte], Rq(prototype)
-                    ; mov BYTE [Rq(rare) + layout.instanceof_cached_byte as i32], 1);
-            }
-            dynasm!(self.ops ; .arch x64 ; =>proved);
-            self.emit_cell_guard(value, no);
-            dynasm!(self.ops ; .arch x64 ; mov Rd(cursor), Rd(value) ; add Rq(cursor), Rq(cage)
-                ; movzx r10d, BYTE [Rq(cursor)] ; cmp r10d, crate::entry::OBJECT_BODY_TYPE_TAG as i32 ; je =>walk);
-            for primitive in view.primitive_cell_type_tags {
-                dynasm!(self.ops ; .arch x64 ; cmp r10d, primitive as i32 ; je =>no);
-            }
-            dynasm!(self.ops ; .arch x64 ; jmp =>miss
-                ; =>walk ; mov Rd(budget), crate::graph::INSTANCEOF_CHAIN_BOUND as i32
-                ; =>step);
-            self.emit_shape_state(cursor);
-            dynasm!(self.ops ; .arch x64 ; test r10b, ShapeState::OPAQUE_LOOKUP_MASK as i8 ; jnz =>miss);
-            crate::x86_64::fields::emit_load_prototype(&mut self.ops, view, 10, cursor, cage);
-            dynasm!(self.ops ; .arch x64 ; test r10d, r10d ; jz =>no
-                ; lea Rq(cursor), [Rq(cage) + r10] ; cmp Rq(cursor), Rq(prototype) ; je =>yes
-                ; cmp BYTE [Rq(cursor)], crate::entry::OBJECT_BODY_TYPE_TAG as i8 ; jne =>miss
-                ; dec Rd(budget) ; jnz =>step ; jmp =>miss);
-        }
+        crate::x86_64::instanceof::emit_ordinary_has_instance(
+            &mut self.ops,
+            &mut self.relocations,
+            view,
+            cell,
+            [value, target],
+            [cage, rare, prototype, cursor, budget],
+            [yes, no, miss],
+        );
         self.emit_boolean_outcomes([yes, no], destination, done);
         dynasm!(self.ops ; .arch x64 ; =>miss);
         // A native target (a builtin constructor), or a closure whose

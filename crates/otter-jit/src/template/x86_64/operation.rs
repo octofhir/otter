@@ -868,17 +868,40 @@ pub(crate) fn emit_operation(
             result,
             value0,
             value1,
-        } => protocol::emit_object_protocol_value(
-            ops,
-            relocations,
-            transitions,
-            operation,
-            result,
-            value0,
-            value1,
-            committed_throw,
-            fatal,
-        ),
+        } => {
+            // `instanceof` calls the shared routine; a case it does not
+            // decide completes in the runtime.
+            let done = ops.new_dynamic_label();
+            if operation == abi::ObjectProtocolValueOp::Instanceof
+                && let (Some(result), Some(value1)) = (result, value1)
+            {
+                use crate::x86_64::instanceof::{ROUTINE_TARGET, ROUTINE_VALUE};
+                let miss = ops.new_dynamic_label();
+                emit_load_reg(ops, ROUTINE_VALUE, value0);
+                emit_load_reg(ops, ROUTINE_TARGET, value1);
+                super::shared_property::emit_call(
+                    ops,
+                    relocations,
+                    shared_property,
+                    crate::routines::Routine::Instanceof,
+                );
+                dynasm!(ops ; .arch x64 ; test r11, r11 ; jnz =>miss);
+                emit_store_reg(ops, 0, result);
+                dynasm!(ops ; .arch x64 ; jmp =>done ; =>miss);
+            }
+            protocol::emit_object_protocol_value(
+                ops,
+                relocations,
+                transitions,
+                operation,
+                result,
+                value0,
+                value1,
+                committed_throw,
+                fatal,
+            );
+            dynasm!(ops ; .arch x64 ; =>done);
+        }
         TemplateOp::LoadLiteral { dst } => {
             let target = view
                 .literal_cells

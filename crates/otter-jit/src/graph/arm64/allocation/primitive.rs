@@ -66,6 +66,118 @@ impl Codegen<'_> {
     /// `ToString` of a Number: a small integer's string by value, any other
     /// Number's by its bits' entry; an empty or other entry reaches the
     /// collecting Probe, which converts and fills it.
+    /// A registry builtin's allocating entry on the node's three operand
+    /// words; a miss resumes the call it reduced. `slice` and `substring`
+    /// of a sequential Latin-1 string with Int32 or absent bounds and a short
+    /// result carve it from the nursery buffer first.
+    pub(in crate::graph::arm64) fn emit_native_alloc_leaf(
+        &mut self,
+        node: NodeId,
+        stub: abi::RuntimeStubId,
+    ) -> Result<(), crate::Unsupported> {
+        let descriptor = otter_vm::runtime_stubs::alloc_value_stub_by_id(stub)
+            .ok_or(crate::Unsupported::OperandShape(
+                "graph allocating builtin entry",
+            ))?
+            .descriptor;
+        let values = self.primitive_operands::<3>(node)?;
+        let destination = Self::gp(
+            self.allocation
+                .node(node)
+                .result
+                .expect("allocating builtin result"),
+        );
+        let slice = stub == abi::STUB_STRING_SLICE_ALLOC.id;
+        if !slice && stub != abi::STUB_STRING_SUBSTRING_ALLOC.id {
+            return self.emit_probe_allocation(node, descriptor, values, Some(destination));
+        }
+        let a = self.allocation.node(node);
+        let regs = LabRegisters {
+            buffer: a.gp_temps[0],
+            candidate: a.gp_temps[1],
+            end: a.gp_temps[2],
+            scratch: a.gp_temps[3],
+            size: 17,
+        };
+        let (from, count) = (a.gp_temps[4], a.gp_temps[5]);
+        let p = self.view_of(node).string_layout;
+        let slow = self.ops.new_dynamic_label();
+        let done = self.ops.new_dynamic_label();
+        let [source, start, end] = values;
+        let len = regs.scratch;
+        crate::arm64::allocation::emit_value(&mut self.ops, regs.buffer, source);
+        dynasm!(self.ops ; .arch aarch64
+            ; tst X(regs.buffer), #0xfffe_0000_0000_0007 ; b.ne =>slow
+            ; cbz X(regs.buffer), =>slow
+            ; ldrb w17, [X(regs.buffer)] ; cmp w17, u32::from(p.string_type_tag) ; b.ne =>slow
+            ; ldrb w17, [X(regs.buffer), p.string_repr_byte]
+            ; cmp w17, u32::from(p.seq_latin1_tag) ; b.ne =>slow
+            ; ldr W(len), [X(regs.buffer), p.string_len_byte]);
+        // Each bound: absent is its default, an Int32 itself, anything else
+        // takes the entry.
+        for (register, value, default) in [(from, start, None), (count, end, Some(len))] {
+            let absent = self.ops.new_dynamic_label();
+            let read = self.ops.new_dynamic_label();
+            crate::arm64::allocation::emit_value(&mut self.ops, register, value);
+            self.load_immediate(16, crate::entry::VALUE_UNDEFINED);
+            dynasm!(self.ops ; .arch aarch64
+                ; cmp X(register), x16 ; b.eq =>absent
+                ; asr x16, X(register), super::super::INT32_TAG_SHIFT
+                ; cmn x16, 1 ; b.ne =>slow
+                ; sxtw X(register), W(register) ; b =>read ; =>absent);
+            match default {
+                None => dynasm!(self.ops ; .arch aarch64 ; mov X(register), xzr),
+                Some(len) => dynasm!(self.ops ; .arch aarch64 ; mov W(register), W(len)),
+            }
+            dynasm!(self.ops ; .arch aarch64 ; =>read);
+        }
+        if slice {
+            // A negative bound counts from the end; the range is never reversed.
+            for register in [from, count] {
+                dynasm!(self.ops ; .arch aarch64
+                    ; tbz X(register), 63, >positive
+                    ; add X(register), X(register), X(len)
+                    ; cmp X(register), xzr ; csel X(register), X(register), xzr, gt
+                    ; b >bounded
+                    ; positive:
+                    ; cmp X(register), X(len) ; csel X(register), X(register), X(len), lt
+                    ; bounded:);
+            }
+            dynasm!(self.ops ; .arch aarch64
+                ; subs X(count), X(count), X(from) ; csel X(count), X(count), xzr, gt);
+        } else {
+            // Both bounds clamp to the string; a reversed pair swaps.
+            for register in [from, count] {
+                dynasm!(self.ops ; .arch aarch64
+                    ; cmp X(register), xzr ; csel X(register), X(register), xzr, gt
+                    ; cmp X(register), X(len) ; csel X(register), X(register), X(len), lt);
+            }
+            dynasm!(self.ops ; .arch aarch64
+                ; cmp X(from), X(count)
+                ; csel x16, X(from), X(count), lt
+                ; csel X(count), X(count), X(from), lt
+                ; mov X(from), x16
+                ; sub X(count), X(count), X(from));
+        }
+        // Empty and one-unit results are the heap's shared strings.
+        dynasm!(self.ops ; .arch aarch64
+            ; cmp XSP(count), 2 ; b.lt =>slow
+            ; cmp XSP(count), u32::from(p.short_concat_latin1) ; b.hi =>slow);
+        crate::arm64::allocation::emit_substring_latin1(
+            &mut self.ops,
+            20,
+            p,
+            source,
+            [from, count],
+            regs,
+            slow,
+        );
+        dynasm!(self.ops ; .arch aarch64 ; mov X(destination), X(regs.candidate) ; b =>done ; =>slow);
+        self.emit_probe_allocation(node, descriptor, values, Some(destination))?;
+        dynasm!(self.ops ; .arch aarch64 ; =>done);
+        Ok(())
+    }
+
     pub(in crate::graph::arm64) fn emit_number_to_string(
         &mut self,
         node: NodeId,

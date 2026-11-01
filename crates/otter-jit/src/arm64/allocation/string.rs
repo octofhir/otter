@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - Empty identity, short width-preserving flat concatenation and bounded Cons.
+//! - A short Latin-1 substring of a sequential Latin-1 string.
 //! - VM-owned payload length/hash and complete initialized cell publication.
 //! - Allocation-site placement: tracked young cells, old cells, or a site
 //!   record read at run time by code many sites share.
@@ -132,6 +133,50 @@ pub(crate) fn emit_concat(
         ; b =>done ; =>empty_b ; mov X(r.candidate),X(r.buffer) ; =>done);
     old_cons
 }
+/// `W(count)` units of the sequential Latin-1 string `source` from unit
+/// `W(from)`, carved as a young sequential Latin-1 string: `X(r.candidate)`
+/// holds it. The caller proved the source's representation, the range and a
+/// short count; a full buffer misses before any write. `from`, `count` and
+/// `source` survive.
+pub(crate) fn emit_substring_latin1(
+    ops: &mut Assembler,
+    context: u8,
+    p: JitStringLayout,
+    source: AllocationValue,
+    [from, count]: [u8; 2],
+    r: LabRegisters,
+    slow: DynamicLabel,
+) {
+    debug_assert_eq!(r.size, 17);
+    let align = otter_gc_cell_mask();
+    dynasm!(ops ; .arch aarch64
+        ; add WSP(r.size), WSP(count), p.string_body_size + align
+        ; and WSP(r.size), W(r.size), !align);
+    emit_bump_probe_in(ops, context, ALLOC_WINDOW_LAB_OFFSET, r, slow);
+    dynasm!(ops ; .arch aarch64 ; add x16, X(r.candidate), X(r.size) ; stur xzr, [x16, -8]);
+    emit_load_u64(ops, 16, p.young_header_word);
+    dynasm!(ops ; .arch aarch64 ; orr x16, x16, X(r.size), lsl u32::from(p.cell_size_shift)
+        ; str x16, [X(r.candidate)]);
+    emit_load_u64(ops, 16, p.map_atom_word);
+    // The length's word also holds the zero hash.
+    dynasm!(ops ; .arch aarch64 ; str x16, [X(r.candidate), 8]
+        ; mov W(r.scratch), W(count) ; str X(r.scratch), [X(r.candidate), p.string_len_byte]
+        ; movz w16, u32::from(p.seq_latin1_tag) ; str w16, [X(r.candidate), p.string_repr_byte]);
+    emit_value(ops, r.end, source);
+    dynasm!(ops ; .arch aarch64
+        ; add XSP(r.end), XSP(r.end), p.string_body_size
+        ; add XSP(r.end), XSP(r.end), W(from), uxtw
+        ; add XSP(r.buffer), XSP(r.candidate), p.string_body_size
+        ; mov W(r.size), W(count));
+    emit_copy_loop(ops, r, false, true);
+    let young = ConcatPlacement::Site(otter_vm::jit::JitAllocationSite {
+        id: 0,
+        record: 0,
+        mode: JitSiteMode::Young,
+    });
+    publish(ops, context, r, young);
+}
+
 fn classify(
     ops: &mut Assembler,
     p: JitStringLayout,

@@ -79,6 +79,9 @@ pub(crate) fn can_defer_frame(
 pub(crate) fn allocation_exit_reason(kind: &Kind) -> ExitReason {
     match kind {
         Kind::NewReceiver(_) => ExitReason::ReceiverAllocationMiss,
+        // An operand the builtin's entry does not take: the recompile calls
+        // the native instead of reducing again.
+        Kind::NativeAllocLeaf(_) => ExitReason::TypeMismatch,
         _ => ExitReason::AllocationMiss,
     }
 }

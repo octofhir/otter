@@ -486,6 +486,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::NewReceiver(_) => Effects::writes(&[H::Dependencies], &[H::Movement]),
         Kind::PrimitiveAdd
         | Kind::NumberToString
+        | Kind::NativeAllocLeaf(_)
         | Kind::BigIntBinary(_)
         | Kind::NewObject
         | Kind::NewNullPrototypeObject

@@ -4799,9 +4799,12 @@ impl<'a> Builder<'a> {
             self.write(instruction.writes[0], result);
             return;
         }
-        // A reduction admitting a count its leaf does not take, refused
-        // here, calls the proved native.
-        if arguments.len() != usize::from(declaration.argument_count) {
+        // A reduction admitting a count its leaf does not take, or an
+        // allocating entry, refused here, calls the proved native.
+        if arguments.len() != usize::from(declaration.argument_count)
+            || declaration.reduction
+                == otter_vm::jit_static_native::JitBuiltinReduction::AllocatingEntry
+        {
             return self.emit_receiver_call(
                 instruction,
                 callee,
@@ -4924,6 +4927,23 @@ impl<'a> Builder<'a> {
                     Kind::StringCharCodeAt { code_point },
                     &[this, index],
                     Repr::Int32,
+                ))
+            }
+            // The entry allocates its result at a safepoint; operands it
+            // does not take miss before any effect and resume the call.
+            R::AllocatingEntry => {
+                if !declaration.this_operand {
+                    return None;
+                }
+                let mut inputs: SmallVec<[NodeId; 3]> = smallvec::smallvec![self.tagged(this)];
+                for &argument in arguments {
+                    inputs.push(self.tagged(argument));
+                }
+                inputs.resize(3, self.undefined);
+                Some(self.add(
+                    Kind::NativeAllocLeaf(declaration.leaf_stub_id),
+                    &inputs,
+                    Repr::Tagged,
                 ))
             }
         }

@@ -57,6 +57,11 @@ pub enum JitBuiltinReduction {
     StringCharCodeAt,
     /// `String.prototype.codePointAt` at a unit that is no lead surrogate.
     StringCodePointAt,
+    /// The optimizing tier calls the row's allocating entry (an
+    /// `AllocValue3` probe) on `this` and the arguments, absent ones
+    /// `undefined`, at a safepoint; a miss resumes the call. No tier calls it
+    /// frame-free as a leaf.
+    AllocatingEntry,
 }
 
 impl JitBuiltinReduction {
@@ -66,6 +71,7 @@ impl JitBuiltinReduction {
     pub const fn admits(self, declared: u8, argument_count: usize) -> bool {
         match self {
             Self::Math(MathMethod::Min | MathMethod::Max) => argument_count >= 1,
+            Self::AllocatingEntry => argument_count <= declared as usize,
             _ => argument_count == declared as usize,
         }
     }
@@ -268,6 +274,13 @@ const JIT_LEAF_BUILTINS: &[JitLeafBuiltin] = {
             abi::STUB_STRING_CODE_POINT_AT_LEAF.id,
         )
         .reducing(JitBuiltinReduction::StringCodePointAt),
+        receiver_leaf2(string::bridge_slice, abi::STUB_STRING_SLICE_ALLOC.id)
+            .reducing(JitBuiltinReduction::AllocatingEntry),
+        receiver_leaf2(
+            string::bridge_substring,
+            abi::STUB_STRING_SUBSTRING_ALLOC.id,
+        )
+        .reducing(JitBuiltinReduction::AllocatingEntry),
         receiver_leaf(string::bridge_index_of, abi::STUB_STRING_INDEX_OF_LEAF.id),
         receiver_leaf(string::bridge_includes, abi::STUB_STRING_INCLUDES_LEAF.id),
         receiver_leaf(
@@ -374,6 +387,21 @@ mod tests {
     fn every_declaration_resolves_a_leaf_that_fits_its_operand_words() {
         let interpreter = crate::Interpreter::new().expect("fixture interpreter bootstrap");
         for row in JIT_LEAF_BUILTINS {
+            if row.reduction == JitBuiltinReduction::AllocatingEntry {
+                // The graph's allocating probe calls it on three words.
+                let stub = crate::runtime_stubs::alloc_value_stub_by_id(row.leaf_stub_id);
+                assert!(
+                    stub.is_some_and(|stub| stub.entry_addr().is_some()
+                        && stub.descriptor.signature
+                            == crate::native_abi::RuntimeStubSignature::AllocValue3)
+                        && row.this_operand
+                        && row.operand_words() <= 3,
+                    "{} must name an allocating probe taking its operands",
+                    crate::native_abi::runtime_stub_name(row.leaf_stub_id)
+                );
+                assert!(jit_static_call_ref(row.leaf_stub_id, &interpreter.gc_heap).is_some());
+                continue;
+            }
             let shape = crate::runtime_stubs::leaf_entry_shape(row.leaf_stub_id);
             assert!(
                 shape.is_some_and(|shape| row.operand_words() <= usize::from(shape.words)),

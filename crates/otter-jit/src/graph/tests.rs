@@ -899,6 +899,9 @@ fn every_kind() -> Vec<super::ir::Kind> {
     ] {
         kinds.push(Kind::NativeLeaf(stub.id));
     }
+    kinds.push(Kind::NativeAllocLeaf(
+        otter_vm::native_abi::STUB_STRING_SLICE_ALLOC.id,
+    ));
     for kind in &kinds {
         listed(kind);
     }
@@ -941,6 +944,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::NewRestArray(_)
         | K::PrimitiveAdd
         | K::NumberToString
+        | K::NativeAllocLeaf(_)
         | K::BigIntBinary(_)
         | K::PrimitiveCompare(_)
         | K::Int32Add

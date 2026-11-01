@@ -46,7 +46,7 @@ pub(crate) use receiver_dynamic::{
 };
 
 mod string;
-pub(crate) use string::emit_concat;
+pub(crate) use string::{emit_concat, emit_substring_latin1};
 
 mod bigint;
 pub(crate) use bigint::{emit_bigint64, emit_unbox_bigint64};

@@ -19,11 +19,15 @@ tuning. Every slice:
 1. **Decompose first.** Measure where otter's instructions go for the
    subsystem (profile shares, per-operation counts against node). Write the
    numbers down in the memory note.
-2. **Read the reference end to end** before writing code: the V8, JSC and
+2. **Read the reference end to end** before writing code — no exceptions,
+   not even for a "small" fast path: the V8, JSC and
    SpiderMonkey files listed for that slice below, in `~/work/engines`
    (sparse checkouts; add a directory with `git sparse-checkout add` when a
    file is missing). Note how they lay out the data, where the fast path
-   lives (generated code vs C++), and what the slow path does.
+   lives (inline at the site, one shared builtin, or C++), what feedback it
+   records, and what the slow path does; write that in the session note
+   before the first line of code. When a measurement surprises, read the
+   reference again instead of guessing.
 3. **Port the architecture**, adapted to our object model, in one slice.
    Delete what it replaces in the same slice: no flags, toggles, bridges,
    second copies, versioned formats, fallback "just in case" paths.
@@ -46,7 +50,8 @@ tuning. Every slice:
   wall time swing 2–3x):
   `scripts/dev/web_tooling_instr_one.sh <bin|node> <out> [target...]`, then
   `scripts/dev/instr_ratio.py <after> <before>` (per target + geomean).
-  Node's counts: `benchmarks/results/dom0/node.txt`. Whole-run counts
+  Node's counts on the fixed-work harness:
+  `benchmarks/results/gen1/node_fixed.txt`. Whole-run counts
   include bundle parse/compile; compare like with like. Noise is ±1–2%;
   repeat a target 3 times and take the median before calling a small move.
 - Wall clock, when the machine is quiet (`uptime`, load < 3):
@@ -68,33 +73,42 @@ tuning. Every slice:
   with `patch -p1`, keep `.keep` copies, restore before measuring.
 - Octane: `scripts/dev/wallclock_matrix.sh target/release/otter benchmarks/results/<slice>/m 5`.
 
-## Standings (2026-11-01, HEAD 5e0a0e60e)
+## Standings (2026-11-01, HEAD 245c2d283, fixed-work harness)
 
 WTB retired instructions, whole run, otter / node
-(`benchmarks/results/gen1/otter1e.txt` vs `benchmarks/results/dom0/node.txt`):
+(`benchmarks/results/gen1/fixed_gen1f.txt` vs `benchmarks/results/gen1/node_fixed.txt`):
 
 | target | otter | node | x |
 |---|---|---|---|
-| lebab | 97.6G | 35.3G | 2.77 |
-| coffeescript | 111.3G | 42.6G | 2.61 |
-| uglify-js | 95.8G | 38.0G | 2.52 |
-| chai | 65.8G | 29.0G | 2.27 |
-| buble | 84.2G | 37.7G | 2.23 |
-| jshint | 63.4G | 30.4G | 2.09 |
-| postcss | 86.9G | 43.2G | 2.01 |
-| acorn | 77.5G | 38.5G | 2.01 |
-| babel-minify | 63.6G | 32.6G | 1.95 |
-| prettier | 91.8G | 48.2G | 1.90 |
-| esprima | 63.9G | 37.6G | 1.70 |
-| source-map | 75.7G | 46.0G | 1.65 |
-| espree | 61.5G | 37.6G | 1.63 |
-| babel | 70.4G | 43.9G | 1.60 |
-| prepack | 73.7G | 48.8G | 1.51 |
-| typescript | 54.1G | 39.7G | 1.36 |
-| terser | 36.7G | 28.9G | 1.27 |
-| babylon | 40.1G | 41.5G | 0.97 |
+| lebab | 97.9G | 25.0G | 3.91 |
+| coffeescript | 108.9G | 30.6G | 3.56 |
+| chai | 65.4G | 20.3G | 3.22 |
+| jshint | 63.8G | 22.0G | 2.90 |
+| acorn | 77.5G | 27.7G | 2.80 |
+| babel-minify | 63.7G | 24.2G | 2.63 |
+| prettier | 92.5G | 36.3G | 2.55 |
+| source-map | 75.9G | 31.8G | 2.39 |
+| esprima | 63.8G | 27.0G | 2.36 |
+| uglify-js | 87.4G | 37.6G | 2.33 |
+| buble | 83.7G | 37.6G | 2.23 |
+| prepack | 73.7G | 33.3G | 2.21 |
+| babel | 70.8G | 32.1G | 2.21 |
+| espree | 61.4G | 29.2G | 2.10 |
+| postcss | 87.0G | 43.0G | 2.02 |
+| typescript | 54.5G | 29.3G | 1.86 |
+| terser | 28.9G | 16.4G | 1.77 |
+| babylon | 40.0G | 29.1G | 1.38 |
 
-Geomean 1.83x (1.96x at 334bf2ae3). Last test262 gate: g47 (14 failures).
+Geomean 2.40x. Last test262 gate: g48 (14 failures).
+
+Every otter/node figure before 2026-11-01 is understated: Benchmark.js
+repeats a sample until it lasts 50 ms whatever `maxTime` says, so node (and
+any otter build under 50 ms per iteration) ran extra iterations. The
+generator in `scripts/dev/web_tooling_matrix.sh` now pins one iteration per
+sample (`minTime: 1e-9`); regenerate `dist/cli-one.js` before measuring
+(`benchmarks/results/gen1/gen_one.py <dist>` runs just the generator). The
+compile cache keys on bundle and binary: do one warm pass before measuring
+a new build. Whole-process counts include the JIT compiler threads.
 
 ### Where the gap is (diagnosis 2026-10-31, memory note `session_2026_10_31b_gen_code_diagnosis.md`)
 
@@ -233,7 +247,8 @@ Do not redo:
 - Array `slice` allocate-then-copy and the memoized species default
   (b6fd094fb);
 - `String.prototype.slice` / `substring` allocating entries with the inline
-  Latin-1 carve (5e0a0e60e).
+  Latin-1 carve (5e0a0e60e);
+- baseline `instanceof` through one shared routine (245c2d283).
 
 ## Loop
 
@@ -261,8 +276,8 @@ Do not redo:
   A new probe must first fail on a binary with the bug.
 - Difftest of the slice's probes against `--interpreter`.
 - Full test262 in the background through a runner copy:
-  `cargo build --release -p otter-test262; cp target/release/otter-test262 target/release/otter-test262-gN; target/release/otter-test262-gN run --max-heap-bytes 536870912 --timeout 10000 --output test262_results/gN_full.json > test262_results/gN_full.log 2>&1; python3 scripts/dev/t262_diff.py test262_results/g47_full.json test262_results/gN_full.json`
-  must print `before 14 after 14` with no `NEW` lines. Last gate: g47.
+  `cargo build --release -p otter-test262; cp target/release/otter-test262 target/release/otter-test262-gN; target/release/otter-test262-gN run --max-heap-bytes 536870912 --timeout 10000 --output test262_results/gN_full.json > test262_results/gN_full.log 2>&1; python3 scripts/dev/t262_diff.py test262_results/g48_full.json test262_results/gN_full.json`
+  must print `before 14 after 14` with no `NEW` lines. Last gate: g48.
   Background Bash needs `timeout: 7200000`.
 - md5 of each output of `benchmarks/fixtures/fixed-work/{richards,deltablue,crypto,raytrace,earley-boyer,regexp,splay,navier-stokes,box2d,gbemu,mandreel,zlib,ts}.js`
   equals node's.

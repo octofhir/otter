@@ -133,6 +133,9 @@ pub(crate) fn emit_routine(
         RoutineObject::FieldObserve => {
             unreachable!("the field-observation routine is the graph tier's")
         }
+        RoutineObject::Instanceof => {
+            unreachable!("the instanceof routine has its own emitter")
+        }
     }
     let second = ops.offset().0;
     match object {

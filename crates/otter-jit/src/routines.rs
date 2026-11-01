@@ -2,7 +2,8 @@
 //! carrying its own copy, and the code space that owns them.
 //!
 //! The truthiness routine decides `ToBoolean` of the values optimized code
-//! does not test inline, and the field-observation routine widens a field
+//! does not test inline, the `instanceof` routine runs `OrdinaryHasInstance`
+//! for baseline sites, and the field-observation routine widens a field
 //! summary an optimized store did not find holding its value. The named-property routines select a site's IC slot handler, probe the
 //! isolate's shared action table and, on a miss, enter the committed runtime
 //! operation. Each is emitted once per isolate, when a site first calls it,
@@ -73,6 +74,9 @@ pub(crate) enum Routine {
     /// The widening of a field summary an optimized store's inline test did
     /// not find holding its value, preserving every register.
     FieldObserve,
+    /// `OrdinaryHasInstance` of a baseline `instanceof` site's value and
+    /// target, reporting a miss for every case it does not decide.
+    Instanceof,
 }
 
 impl Routine {
@@ -91,6 +95,7 @@ impl Routine {
             Self::Truthy => "truthy",
             Self::StoreTail => "storeTail",
             Self::FieldObserve => "fieldObserve",
+            Self::Instanceof => "instanceof",
         }
     }
 
@@ -106,6 +111,7 @@ impl Routine {
             Self::Truthy => RoutineObject::Truthy,
             Self::StoreTail => RoutineObject::StoreTail,
             Self::FieldObserve => RoutineObject::FieldObserve,
+            Self::Instanceof => RoutineObject::Instanceof,
         }
     }
 
@@ -131,10 +137,11 @@ pub(crate) enum RoutineObject {
     Truthy,
     StoreTail,
     FieldObserve,
+    Instanceof,
 }
 
 impl RoutineObject {
-    const COUNT: usize = 9;
+    const COUNT: usize = 10;
     const ALL: [Self; Self::COUNT] = [
         Self::Load,
         Self::Store,
@@ -145,6 +152,7 @@ impl RoutineObject {
         Self::Truthy,
         Self::StoreTail,
         Self::FieldObserve,
+        Self::Instanceof,
     ];
 
     /// Stable name for profilers.
@@ -159,6 +167,7 @@ impl RoutineObject {
             Self::Truthy => "routine:truthy",
             Self::StoreTail => "routine:storeTail",
             Self::FieldObserve => "routine:fieldObserve",
+            Self::Instanceof => "routine:instanceof",
         }
     }
 }
@@ -377,6 +386,9 @@ fn emit(
         RoutineObject::FieldObserve => {
             crate::arm64::field_type::emit_routine(&mut ops, &mut relocations, view)
         }
+        RoutineObject::Instanceof => {
+            crate::arm64::instanceof::emit_routine(&mut ops, &mut relocations, view)
+        }
         _ => crate::template::arm64::shared_property::emit_routine(
             &mut ops,
             &mut relocations,
@@ -404,6 +416,9 @@ fn emit(
         }
         RoutineObject::FieldObserve => {
             crate::x86_64::field_type::emit_routine(&mut ops, &mut relocations, view)
+        }
+        RoutineObject::Instanceof => {
+            crate::x86_64::instanceof::emit_routine(&mut ops, &mut relocations, view)
         }
         _ => crate::template::x86_64::shared_property::emit_routine(
             &mut ops,

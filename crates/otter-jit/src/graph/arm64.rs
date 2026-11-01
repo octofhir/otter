@@ -76,7 +76,6 @@ use otter_vm::value::tag;
 use otter_vm::{JitCompileSnapshot, ObjectProtocolValueOp, object::ShapeState};
 use rustc_hash::FxHashMap;
 
-use super::INSTANCEOF_CHAIN_BOUND;
 use super::builder::Built;
 use super::call::{CommittedArgument, IntrinsicMethod};
 use super::emission::{Emission, ExitSite};
@@ -4007,18 +4006,11 @@ impl<'a> Codegen<'a> {
         [cage, rare, prototype, cursor, budget]: [u8; 5],
         destination: u8,
     ) -> Result<(), Unsupported> {
-        use crate::template::arm64::values::{CellTest, emit_cell_test};
         let view = self.view_of(node);
-        let layout = view.closure_call_layout;
         let yes = self.ops.new_dynamic_label();
         let no = self.ops.new_dynamic_label();
         let miss = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
-        let step = self.ops.new_dynamic_label();
-        let not_object = self.ops.new_dynamic_label();
-        let proved = self.ops.new_dynamic_label();
-        let validate = self.ops.new_dynamic_label();
-        let symbols_absent = self.ops.new_dynamic_label();
         let pc = self.graph.node(node).pc;
         let byte_pc = view
             .instructions
@@ -4039,125 +4031,15 @@ impl<'a> Codegen<'a> {
             otter_vm::jit::JIT_INSTANCEOF_CELL_PROTOTYPE_OFFSET
                 == otter_vm::jit::JIT_INSTANCEOF_CELL_TARGET_OFFSET + 8
         );
-        if view.cage_base == 0 || layout.prototype_byte == 0 {
-            dynasm!(self.ops ; .arch aarch64 ; b =>miss);
-        } else {
-            if let Some((address, relocation)) = cell.clone() {
-                // The target this site last proved, and its prototype.
-                emit_load_symbol_u64(
-                    &mut self.ops,
-                    &mut self.relocations,
-                    16,
-                    address,
-                    relocation,
-                );
-                dynasm!(self.ops
-                    ; .arch aarch64
-                    ; ldp x17, X(prototype), [x16, otter_vm::jit::JIT_INSTANCEOF_CELL_TARGET_OFFSET as i32]
-                    ; cmp X(target), x17
-                    ; b.ne =>validate
-                    ; and XSP(cage), X(target), #0xffff_ffff_0000_0000
-                    ; b =>proved
-                    ; =>validate
-                );
-            }
-            let named_lookup = otter_vm::closure::CLOSURE_NAMED_LOOKUP_BYTE;
-            // Target: an ordinary closure whose own properties hold no
-            // `@@hasInstance` override. A cell value is its header's full
-            // address, and its cage is the address's high half.
-            emit_cell_test(&mut self.ops, target, CellTest::IsNotCell, miss);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; cbz X(target), =>miss
-                ; and XSP(cage), X(target), #0xffff_ffff_0000_0000
-                ; ldrb w16, [X(target)]
-                ; cmp w16, u32::from(otter_vm::closure::JS_CLOSURE_BODY_TYPE_TAG)
-                ; b.ne =>miss
-                ; ldrb w16, [X(target), named_lookup]
-                ; and w16, w16, !u32::from(otter_vm::closure::CLOSURE_LOOKUP_OWN_PROPS)
-                ; cmp w16, u32::from(otter_vm::closure::CLOSURE_LOOKUP_ORDINARY)
-                ; b.ne =>miss
-                // `prototype` lives in the rare record; without one, or
-                // while it holds the hole, the runtime allocates it. Any
-                // value but an ordinary object completes in the runtime.
-                ; ldr W(rare), [X(target), layout.rare_byte]
-                ; cbz W(rare), =>miss
-                ; add X(rare), X(cage), X(rare)
-                ; ldrb w16, [X(rare), layout.prototype_ordinary_byte]
-                ; cbz w16, =>miss
-                ; ldr X(prototype), [X(rare), layout.prototype_byte]
-                ; ldr w16, [X(rare), layout.own_props_byte]
-                ; cbz w16, =>symbols_absent
-                ; add x16, X(cage), x16
-                // A symbol key in the bag's hidden class or side table may
-                // be `@@hasInstance`.
-                ; ldr w17, [x16, view.object_shape_byte]
-                ; add x17, X(cage), x17
-                ; ldrb w17, [x17, otter_vm::object::SHAPE_SYMBOL_KEYS_BYTE]
-                ; cbnz w17, =>miss
-                ; ldr w16, [x16, view.object_exotic_handle_byte]
-                ; cbz w16, =>proved
-                ; add x16, X(cage), x16
-                ; ldr w16, [x16, otter_vm::object::EXOTIC_SLOTS_SYMBOL_PROPS_BYTE]
-                ; cbnz w16, =>miss
-                ; b =>proved
-                ; =>symbols_absent
-            );
-            if let Some((address, relocation)) = cell {
-                // A closure without own properties is cached; the flag asks
-                // the VM to empty the cell before the closure changes.
-                emit_load_symbol_u64(
-                    &mut self.ops,
-                    &mut self.relocations,
-                    16,
-                    address,
-                    relocation,
-                );
-                dynasm!(self.ops
-                    ; .arch aarch64
-                    ; stp X(target), X(prototype), [x16, otter_vm::jit::JIT_INSTANCEOF_CELL_TARGET_OFFSET as i32]
-                    ; mov w16, #1
-                    ; strb w16, [X(rare), layout.instanceof_cached_byte]
-                );
-            }
-            dynasm!(self.ops ; .arch aarch64 ; =>proved);
-            // Value: a non-cell answers false, a primitive cell answers
-            // false, an ordinary object is walked, any other cell misses.
-            emit_cell_test(&mut self.ops, value, CellTest::IsNotCell, no);
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; cbz X(value), =>miss
-                ; ldrb w16, [X(value)]
-                ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
-                ; b.ne =>not_object
-                ; mov X(cursor), X(value)
-                ; movz W(budget), INSTANCEOF_CHAIN_BOUND
-                // One link: the cursor's shape fixes its prototype unless
-                // its lookup is opaque.
-                ; =>step
-                ; ldr w16, [X(cursor), view.object_shape_byte]
-                ; add x16, X(cage), x16
-                ; ldrb w17, [x16, view.shape_state_byte]
-                ; tst w17, u32::from(ShapeState::OPAQUE_LOOKUP_MASK)
-                ; b.ne =>miss
-                ; ldr w16, [x16, view.shape_prototype_byte]
-                ; cbz w16, =>no
-                ; add X(cursor), X(cage), x16
-                ; cmp X(cursor), X(prototype)
-                ; b.eq =>yes
-                ; ldrb w16, [X(cursor)]
-                ; cmp w16, crate::entry::OBJECT_BODY_TYPE_TAG
-                ; b.ne =>miss
-                ; subs W(budget), WSP(budget), #1
-                ; b.ne =>step
-                ; b =>miss
-                ; =>not_object
-            );
-            for primitive_tag in view.primitive_cell_type_tags {
-                dynasm!(self.ops ; .arch aarch64 ; cmp w16, u32::from(primitive_tag) ; b.eq =>no);
-            }
-            dynasm!(self.ops ; .arch aarch64 ; b =>miss);
-        }
+        crate::arm64::instanceof::emit_ordinary_has_instance(
+            &mut self.ops,
+            &mut self.relocations,
+            view,
+            cell,
+            [value, target],
+            [cage, rare, prototype, cursor, budget],
+            [yes, no, miss],
+        );
         self.emit_boolean_outcomes([yes, no], destination, done);
         dynasm!(self.ops ; .arch aarch64 ; =>miss);
         // A native target (a builtin constructor), or a closure whose

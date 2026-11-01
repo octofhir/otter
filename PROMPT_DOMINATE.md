@@ -68,115 +68,84 @@ tuning. Every slice:
   with `patch -p1`, keep `.keep` copies, restore before measuring.
 - Octane: `scripts/dev/wallclock_matrix.sh target/release/otter benchmarks/results/<slice>/m 5`.
 
-## Standings (2026-10-31, access slice in the working tree)
+## Standings (2026-11-01, HEAD 5e0a0e60e)
 
 WTB retired instructions, whole run, otter / node
-(`benchmarks/results/dom0/otter1c.txt` vs `node.txt`):
+(`benchmarks/results/gen1/otter1e.txt` vs `benchmarks/results/dom0/node.txt`):
 
 | target | otter | node | x |
 |---|---|---|---|
-| coffeescript | 125.4G | 42.6G | 2.95 |
-| lebab | 99.8G | 35.3G | 2.83 |
-| chai | 77.6G | 29.0G | 2.68 |
-| babel-minify | 84.8G | 32.6G | 2.60 |
-| uglify-js | 97.2G | 38.0G | 2.56 |
-| buble | 84.8G | 37.7G | 2.25 |
-| jshint | 67.3G | 30.4G | 2.22 |
-| postcss | 88.4G | 43.2G | 2.05 |
-| acorn | 78.5G | 38.5G | 2.04 |
-| babel | 88.3G | 43.9G | 2.01 |
-| prettier | 93.0G | 48.2G | 1.93 |
-| prepack | 85.4G | 48.9G | 1.75 |
-| esprima | 65.0G | 37.6G | 1.73 |
-| espree | 62.8G | 37.6G | 1.67 |
-| source-map | 76.4G | 46.0G | 1.66 |
-| typescript | 57.3G | 39.7G | 1.44 |
-| terser | 36.6G | 28.9G | 1.26 |
-| babylon | 41.2G | 41.5G | 0.99 |
+| lebab | 97.6G | 35.3G | 2.77 |
+| coffeescript | 111.3G | 42.6G | 2.61 |
+| uglify-js | 95.8G | 38.0G | 2.52 |
+| chai | 65.8G | 29.0G | 2.27 |
+| buble | 84.2G | 37.7G | 2.23 |
+| jshint | 63.4G | 30.4G | 2.09 |
+| postcss | 86.9G | 43.2G | 2.01 |
+| acorn | 77.5G | 38.5G | 2.01 |
+| babel-minify | 63.6G | 32.6G | 1.95 |
+| prettier | 91.8G | 48.2G | 1.90 |
+| esprima | 63.9G | 37.6G | 1.70 |
+| source-map | 75.7G | 46.0G | 1.65 |
+| espree | 61.5G | 37.6G | 1.63 |
+| babel | 70.4G | 43.9G | 1.60 |
+| prepack | 73.7G | 48.8G | 1.51 |
+| typescript | 54.1G | 39.7G | 1.36 |
+| terser | 36.7G | 28.9G | 1.27 |
+| babylon | 40.1G | 41.5G | 0.97 |
 
-Geomean 1.96x (2.16x at HEAD ccfb0627b; the access slice is 0.924 of HEAD).
-Octane matrix 1.43x node, 1.80x bun (2026-10-30).
+Geomean 1.83x (1.96x at 334bf2ae3). Last test262 gate: g47 (14 failures).
 
-### Where otter's time goes (WTB mean of 18 profiles at HEAD, before the access slice)
+### Where the gap is (diagnosis 2026-10-31, memory note `session_2026_10_31b_gen_code_diagnosis.md`)
 
-| share | where | what it is |
-|---|---|---|
-| 37% | generated code | compiled JS itself |
-| 17% | `native_exit_entry` | bodies of natives called from JS, including the Rust loop of callback methods |
-| 6.0% | `jit_load_property_stub` | named-load IC misses |
-| 4.9% | `jit_load_element_stub` | element loads |
-| 4.3% | `otter_native_invoke` | Host-kernel calls: `call`/`apply`/`bind`, constructs, non-static natives |
-| 3.6% | `jit_store_property_stub` | named-store misses |
-| 2.8% | `jit_store_element_stub` | element stores |
-| 2.3% | `jit_object_protocol_value_stub` | `instanceof`, `in` |
-| 2.0% | `jit_string_method_stub` | string methods |
-| 1.3% | `jit_resolve_method_stub` | method resolution misses |
-
-Re-profile after the access slice lands; the access rows shrank.
-
-## Step 0: land the access slice in the working tree
-
-Uncommitted, measured, gates not run (memory note
-`session_2026_10_31_access_slice.md`): Int32 keys → atoms through the
-isolate integer-key cache read by generated code (`VmThread.index_atoms`),
-`str[i]` → shared one-unit strings (`VmThread.unit_strings`,
-`arm64|x86_64/string_unit.rs`), the typed-array eager-expando bug in named
-[[Set]], and the typed-array `.length` shadowing bug (length protector +
-`IcHandlerKind::TypedArrayLength`). Saved binaries: `otter-dom0` (HEAD),
-`otter-dom1c` (slice).
-
-Run the gates below (x86: Rosetta run of `probe_access_classes.js`, the
-typed-length handler is only compile-checked), then one commit with the
-WTB table (0.924 geomean; postcss 0.694, esprima 0.838, terser 0.856,
-buble 0.858, babel 0.897) and the per-op numbers (intkey 805→94,
-intkeyset 3122→126, intkeydict 845→152, strchar 574→31, Buffer blit
-11288→841 per call).
+Same method on both engines (`sample` + each engine's `--perf-basic-prof`):
+`scripts/dev/web_tooling_anatomy.sh`, `jit_anatomy.py`, `js_fn_profile.py`,
+`js_fn_compare.py`, `node_sizes.py`. Over coffeescript, lebab, chai, acorn
+and babylon, otter's surplus over node was runtime stubs and IC misses called
+from generated code +129G, generated code itself +66G, native bodies +60G.
+Inside generated code no bucket dominates: boxing, polls, barriers and tier
+churn are each under 2%; the call boundary (prologue, call, spill, move) is
+22–37% but a call costs only ~1.4x node's.
 
 ## Slice queue, largest first
 
-### 1. Why generated code costs 2x node's (37% of otter; 60–70% on babylon/espree/acorn)
+### 1. Getter calls from handlers (babel-minify ~9%)
 
-node retires about half of otter's instructions, and the largest single
-bucket is compiled JS itself. Nobody has measured why. Diagnose before
-porting; the answer decides the slice.
+Census (`benchmarks/results/gen1/census2`): babel-minify 6.85M own getters on
+dictionary-mode re-export objects (`Object.defineProperty(exports, k, {get})`)
+and inherited getters; each runs through `jit_load_property_stub` and a Rust
+call (~1080 instructions, node ~176). The graph's `try_accessor_call` needs a
+method target whose guard proves a fast receiver shape; `note_accessor_target`
+skips dictionary receivers. Port: getter targets for dictionary holders (the
+receiver as holder, guarded by identity or its dictionary layout), and the
+template/generic routine returning the getter for a direct JS call instead of
+the runtime call. Read `v8/src/ic/accessor-assembler.cc`
+(`CallGetterIfAccessor`), `js-native-context-specialization.cc`
+(`InlinePropertyGetterCall`).
 
-Decompose, per target, for coffeescript, lebab, chai (worst ratios) and
-acorn, babylon (generated-code heavy):
+### 1b. Other measured classes
 
-1. **Tier residency.** Share of samples in interpreter, template code and
-   graph code (`caller_tier.py`, `--perf-basic-prof`). Count deopts and
-   re-compiles per hot function; a function bouncing between tiers costs
-   more than any codegen detail.
-2. **Hot functions side by side.** For the top 10 graph functions by self
-   time, instructions per invocation in otter vs node. Node:
-   `node --print-opt-code --print-opt-code-filter=<fn>` and
-   `--trace-opt --trace-deopt`; otter: the graph dump plus
-   `jit_hot_regions.py` self time per graph node.
-3. **Per-node anatomy.** Classify every instruction of those functions:
-   work, shape/map guard, type guard, boxing/unboxing, spill/reload,
-   move, call prologue/epilogue, safepoint poll, write barrier, frame
-   state. Expected suspects: shape check ~10 instructions vs node's 4,
-   save/restore of every live value around calls (no live-range
-   splitting), Int32/double boxing at every merge, repeated guards on the
-   same value, template code where node has optimized code.
-4. Write the table (bucket × target, otter vs node) in the memory note,
-   then pick the largest bucket as the port.
+- buble: integer keys of large offsets on plain objects (magic-string
+  `byStart[pos]`) thrash the 1024-entry direct-mapped index-atom cache
+  (`isolate_names.rs`): load 1090 vs node 234, store 3092 vs 727
+  (`benchmarks/results/gen1/probe/bigint_keys.js`).
+- esprima: 4M slab-growth stores (`entry.range =` on a two-field literal).
+- prettier: 12.4M `.type` reads of strings at megamorphic sites (megastr 280
+  vs 121).
+- chai: `Proxy` get trap (2884 vs 211 per plain get), `Reflect.get/has`
+  (~1100 vs ~110), `captureStackTrace` 4.9%.
+- WeakMap/WeakSet receivers are not intrinsic-prototype receivers in generated
+  code (`JitIntrinsicPrototype::is_generated_receiver`), so `wm.get` method
+  loads reach the runtime (~3M in babel, babel-minify).
+- Array `splice` 4019 vs 798, `concat` 2931 vs 1423, `join` 2424 vs 1343
+  (`op_instr.sh arrsplice arrconcat arrjoin`); the remaining slice/concat
+  cost is the generic native entry and `array_live_method_dispatch`.
+- The allocating builtin-entry mechanism (`JitBuiltinReduction::AllocatingEntry`,
+  `Kind::NativeAllocLeaf`) takes any `AllocValue3` probe: further allocating
+  natives (`substr`, `trim`, `toLowerCase`, `Array.prototype.slice`) can join
+  it.
 
-Read for the port once the bucket is known:
-- Register allocation: `v8/src/maglev/maglev-regalloc.cc`,
-  `WebKit/Source/JavaScriptCore/b3/air/AirAllocateRegistersByGraphColoring.cpp`,
-  `gecko-dev/js/src/jit/BacktrackingAllocator.cpp`.
-- Guards and maps: `v8/src/maglev/maglev-graph-builder.cc` (known node
-  aspects, `BuildCheckMaps`), `v8/src/compiler/js-native-context-specialization.cc`.
-- Representation: `v8/src/maglev/maglev-phi-representation-selector.cc`,
-  `WebKit/Source/JavaScriptCore/dfg/DFGFixupPhase.cpp`.
-- Tiering: `v8/src/execution/tiering-manager.cc`,
-  `WebKit/Source/JavaScriptCore/jit/JITPlan.cpp`, `bytecode/ExecutionCounter.h`.
-
-Target: generated-code instructions on the five targets within 1.3x of
-node's for the same functions.
-
-### 2. Remaining property/element access classes
+### 2. Remaining property/element access classes (dictionary absent/inherited loads landed: 6f964a893, b0a07d716)
 
 The census (memory note) ranks what still reaches the runtime after the
 access slice: dictionary-mode named loads ~25M (DictionaryField,
@@ -258,7 +227,13 @@ Do not redo:
   (patch `benchmarks/results/cb-1030/primitive_projection.patch`);
 - numeric field representation via migrations or a universal Double;
 - the native-call entry protocol (`23c1723e7`, `1038d2bc6`);
-- int-key atomization, `str[i]`, typed-array `.length` (access slice).
+- int-key atomization, `str[i]`, typed-array `.length` (access slice);
+- dictionary-receiver absent and inherited loads, polymorphic and megamorphic
+  (6f964a893, b0a07d716);
+- Array `slice` allocate-then-copy and the memoized species default
+  (b6fd094fb);
+- `String.prototype.slice` / `substring` allocating entries with the inline
+  Latin-1 carve (5e0a0e60e).
 
 ## Loop
 
@@ -277,6 +252,8 @@ Do not redo:
   `cargo build --release -p otter-cli --target x86_64-apple-darwin`, then
   `arch -x86_64 target/x86_64-apple-darwin/release/otter <probe>`; delete
   `target/x86_64-apple-darwin` afterwards (`rm -rf`).
+- Before writing a new probe in `scripts/dev`, check `git ls-files` for the
+  name.
 - Probes `scripts/dev/probe_*.js` touched by the slice match node
   (`probe_access_classes.js` → `benchmarks/results/dom0/pac.node.txt`,
   `probe_native_entry.js` → `pne.node.txt`), also under
@@ -284,8 +261,8 @@ Do not redo:
   A new probe must first fail on a binary with the bug.
 - Difftest of the slice's probes against `--interpreter`.
 - Full test262 in the background through a runner copy:
-  `cargo build --release -p otter-test262; cp target/release/otter-test262 target/release/otter-test262-gN; target/release/otter-test262-gN run --max-heap-bytes 536870912 --timeout 10000 --output test262_results/gN_full.json > test262_results/gN_full.log 2>&1; python3 scripts/dev/t262_diff.py test262_results/g42_full.json test262_results/gN_full.json`
-  must print `before 14 after 14` with no `NEW` lines. Last gate: g42.
+  `cargo build --release -p otter-test262; cp target/release/otter-test262 target/release/otter-test262-gN; target/release/otter-test262-gN run --max-heap-bytes 536870912 --timeout 10000 --output test262_results/gN_full.json > test262_results/gN_full.log 2>&1; python3 scripts/dev/t262_diff.py test262_results/g47_full.json test262_results/gN_full.json`
+  must print `before 14 after 14` with no `NEW` lines. Last gate: g47.
   Background Bash needs `timeout: 7200000`.
 - md5 of each output of `benchmarks/fixtures/fixed-work/{richards,deltablue,crypto,raytrace,earley-boyer,regexp,splay,navier-stokes,box2d,gbemu,mandreel,zlib,ts}.js`
   equals node's.
@@ -322,5 +299,5 @@ Do not redo:
 
 ## Memory
 
-- The latest session note is `session_2026_10_31_access_slice.md`.
+- The latest session note is `session_2026_10_31b_gen_code_diagnosis.md`.
 - Start a new note for each session and link it in `MEMORY.md`.

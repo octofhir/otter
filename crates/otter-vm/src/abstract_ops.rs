@@ -246,7 +246,6 @@ impl StrictMatcher {
     /// The first index of `values` holding a match, `Ok(None)` when none
     /// does, or `Err(index)` at a hole met before any match. One loop per
     /// comparison kind.
-    #[must_use]
     pub(crate) fn scan(
         &self,
         values: &[Value],

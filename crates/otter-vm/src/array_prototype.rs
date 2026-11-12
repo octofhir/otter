@@ -5025,7 +5025,7 @@ fn array_callback_native_dispatch(
         // during iteration, so a callback that mutates the receiver is
         // observed in spec order and a Function / exotic receiver's indexed
         // properties are seen (the previous one-shot snapshot saw neither).
-        let len_result = length_of_array_like(interp, stack, &context, &receiver);
+        let len_result = length_of_array_like(interp, stack, context, &receiver);
         let len = match len_result {
             Ok(len) => len,
             Err(err) => {
@@ -5051,7 +5051,7 @@ fn array_callback_native_dispatch(
                     0
                 };
                 let created =
-                    interp.array_species_create(stack, &context, receiver, species_len, &mut []);
+                    interp.array_species_create(stack, context, receiver, species_len, &mut []);
                 match created {
                     Ok(created) => Some(created),
                     Err(err) => {
@@ -5077,7 +5077,7 @@ fn array_callback_native_dispatch(
             let probe_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
             let result = interp.flatten_into_array(
                 stack,
-                &context,
+                context,
                 target,
                 receiver,
                 probe_len,
@@ -5106,7 +5106,7 @@ fn array_callback_native_dispatch(
             this_arg
         };
         let callback_fast_path =
-            array_callback_fast_path(&context, interp.gc_heap(), kind, callback);
+            array_callback_fast_path(context, interp.gc_heap(), kind, callback);
         if let Some(result) = try_dense_array_callback_fast_path(
             interp,
             kind,
@@ -5270,7 +5270,7 @@ fn array_callback_native_dispatch(
                             || {
                                 let has_result = interp.ordinary_has_property_value(
                                     stack,
-                                    Some(&context),
+                                    Some(context),
                                     receiver,
                                     &crate::VmPropertyKey::String(&key),
                                     0,
@@ -5281,7 +5281,7 @@ fn array_callback_native_dispatch(
                             };
                         if present {
                             let get_result =
-                                interp.get_property_value_for_call(stack, &context, receiver, &key);
+                                interp.get_property_value_for_call(stack, context, receiver, &key);
                             let v = get_result.map_err(|err| {
                                 err.into_native(interp, "Array.prototype callback")
                             })?;
@@ -5294,7 +5294,7 @@ fn array_callback_native_dispatch(
                     let key = idx.to_string();
                     let has_result = interp.ordinary_has_property_value(
                         stack,
-                        Some(&context),
+                        Some(context),
                         receiver,
                         &crate::VmPropertyKey::String(&key),
                         0,
@@ -5303,7 +5303,7 @@ fn array_callback_native_dispatch(
                         .map_err(|err| err.into_native(interp, "Array.prototype callback"))?;
                     if has {
                         let get_result =
-                            interp.get_property_value_for_call(stack, &context, receiver, &key);
+                            interp.get_property_value_for_call(stack, context, receiver, &key);
                         let v = get_result
                             .map_err(|err| err.into_native(interp, "Array.prototype callback"))?;
                         (true, v)
@@ -5354,7 +5354,7 @@ fn array_callback_native_dispatch(
                     };
                     interp.run_callable_sync_rooted(
                         stack,
-                        Some(&context),
+                        Some(context),
                         &callback,
                         cb_this,
                         cb_args,
@@ -5380,7 +5380,7 @@ fn array_callback_native_dispatch(
                             });
                         }
                         let create_result = interp
-                            .create_data_property_array_index(stack, &context, target, idx, result);
+                            .create_data_property_array_index(stack, context, target, idx, result);
                         create_result.map_err(|err| err.into_native(interp, "map"))?;
                     }
                     ArrayCallbackKind::Filter if result.to_boolean(interp.gc_heap()) => {
@@ -5393,7 +5393,7 @@ fn array_callback_native_dispatch(
                         }
                         let create_result = interp.create_data_property_array_index(
                             stack,
-                            &context,
+                            context,
                             target,
                             target_index,
                             v,

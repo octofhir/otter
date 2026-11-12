@@ -726,6 +726,41 @@ room for closing builds; binaries, observations and user caches were retained.
 The full closing gate is being run separately; this slice makes no performance
 or full-workspace correctness claim.
 
+## Native allocation-group recovery fixture restored
+
+The first full-gate attempt stopped in `allocation_group_recovery`, before the
+release/differential stages. An isolated checkout of pre-find commit `5e8b8bc54`
+reproduced the same failure with its own target directory. Baseline compilation
+disabled debug information and incremental storage to limit disk use; optimization,
+debug assertions, default features and the pinned toolchain were unchanged.
+
+Two fixture defects were confirmed:
+
+1. The actual emitted comparison is `StrictEqual { negate: false, same_value:
+   false }`; the fixture expected its older spelling without `same_value`.
+   The comparison still reads the real AllocationGroup/AllocationProjection
+   values and feeds the original branch. The test now checks the complete
+   current mode, including `same_value: false`, and prints actual IR on failure.
+2. After correcting only that expectation in the isolated baseline, preparation
+   failed at `fill never advances prematurely`. LOS exhaustion can run real
+   collections and promote the already-prepared young input. A diagnostic check
+   confirmed its rooted offset changed while the fixture retained the old page
+   identity. Preparing/aging the input after LOS pressure removes that stale
+   assumption. Both zero-free-page assertions remain explicit.
+
+The source program, normal-policy native admission, exact current generation,
+live tagged group members, nonempty machine-code regions, typed ensure relocation,
+canonical root homes, actual failed-minor collector records, first-source resume
+PC, completed-prefix object identity and initialized-cell checks remain enforced.
+No production collector, safepoint, native ABI or JIT lowering was changed.
+
+The restored test passes, including **10/10 separate process runs**. Artifacts:
+`/private/tmp/otter-allocation-group-{baseline,baseline-pressure,repro,pressure-repro,after}.log`
+and `/private/tmp/otter-allocation-group-repeats.json`. The isolated checkout and
+target are `/private/tmp/otter-engine-before-find` and
+`/private/tmp/otter-engine-baseline-target`. Verification is on macOS ARM64;
+x86_64 execution is not claimed. The full gate was restarted after this correction.
+
 ## Confirmed next tasks
 
 1. **P1: finish the current workspace closing gate.** The 12 VM lint blockers are

@@ -674,6 +674,58 @@ Workspace Clippy `--locked --offline --workspace --all-targets --all-features --
 dedicated `/private/tmp/otter-scanner-target`; the full closing gate remains
 outstanding. No build or execution speedup is claimed for lint-only changes.
 
+## FindViaPredicate observes Get without HasProperty
+
+The next public-boundary reproduction found a semantic error shared by `find`,
+`findIndex`, `findLast`, and `findLastIndex`. For a Proxy whose `has` returns false
+and whose `get` supplies an indexed value, all four methods invoked `has` and
+passed `undefined` to their predicate. Node instead performed indexed Get in
+forward/reverse order without invoking `has`. A throwing `has` also incorrectly
+escaped from the search. The new runtime regression failed before the fix with
+`Error: find invoked has`; the shared JS fixture passed in Node.
+
+The owner is the existing `array_callback_native_dispatch` driver. The find family
+now bypasses presence checks and reads every visited index with Get. Methods
+that skip absent elements retain HasProperty before Get. The direct read of a
+present own dense element is unchanged; this patch adds no allocation to that
+path and does not change root carriers, barriers, Value layout, or JIT ABI.
+Getter/callback errors still leave through the driver's existing cleanup path.
+
+One fixture, `otter-difftest/corpus/array_find_property_protocol.js`, is shared
+with a public runtime integration test. It checks all four search methods,
+forward/reverse order, Proxy trap observability, callback receiver identity,
+early-match return identity, abrupt Get completion, holes, own/inherited getters,
+and preservation of HasProperty in seven other callback methods. Getter and
+callback allocation checks retain object identities across moving collection.
+The existing pathological-length findLast tests remain unchanged and pass;
+the broader large-length approximation policy was not redesigned in this slice.
+
+Validation:
+
+- New runtime regression: failed before, passed after, under interpreter,
+  Template and production tier policies. Both existing maximum-index tests pass.
+  These are semantic policy comparisons, not a new assertion of hot-code native
+  admission; existing native-admission assertions were not weakened.
+- VM **1305** and JIT **349** unit tests pass with all features. Default CLI and
+  Test262 runner builds, strict workspace Clippy, formatting and diff checks pass.
+- Test262 `built-ins/Array/prototype/find` selects all four method families:
+  **94 passed before and after**. All 94 exact path/outcome pairs and semantic
+  configurations match. This subset did not detect the Proxy-has defect; the
+  added regression covers that gap.
+- The existing `scripts/dev/gc-stress.py` ran the shared fixture under interpreter,
+  Template and production policies at every stride **1–16: 48/48 passed**.
+  `results.json` reports `status: passed`, with unchanged executable/source hashes
+  and exact completion/console agreement against the unstressed interpreter.
+
+Artifacts: `/private/tmp/otter-find-{before,after,comparison}.json`,
+`/private/tmp/otter-find-regression-{before,after}.log`,
+`/private/tmp/otter-find-core-tests.log`, `/private/tmp/otter-find-clippy.log`, and
+`/private/tmp/otter-find-stress/`. Builds use the same dedicated target. Only its
+session-owned incremental data was removed after all Cargo jobs finished to make
+room for closing builds; binaries, observations and user caches were retained.
+The full closing gate is being run separately; this slice makes no performance
+or full-workspace correctness claim.
+
 ## Confirmed next tasks
 
 1. **P1: finish the current workspace closing gate.** The 12 VM lint blockers are

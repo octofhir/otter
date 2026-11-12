@@ -34,6 +34,8 @@
 //! - Callback and comparator paths append above the current activation floor;
 //!   sort operands live in traced anchors while merge buffers store only stable
 //!   anchor indices.
+//! - FindViaPredicate reads every visited index with Get, without HasProperty;
+//!   callback methods that skip absent indices retain HasProperty before Get.
 //! - Pathological array-like lengths are guarded before any dense
 //!   materialisation.
 
@@ -5257,14 +5259,12 @@ fn array_callback_native_dispatch(
                     {
                         (true, value)
                     } else {
-                        // A present own element (data or accessor) reads through
-                        // the ordinary `[[Get]]`. An absent index (hole / beyond
-                        // the element store but `< len`) is not skipped outright:
-                        // §10.4.2.4 [[Get]] walks the Array.prototype chain, so an
-                        // inherited `Array.prototype[k]` is observed; a hole with
-                        // no inherited value reads as absent.
+                        // FindViaPredicate performs Get even for holes. Other
+                        // callbacks first check presence, including inherited
+                        // Array.prototype indices, then read present elements.
                         let key = idx.to_string();
-                        let present = crate::array::has_own_element(arr, interp.gc_heap(), idx)
+                        let present = visit_all
+                            || crate::array::has_own_element(arr, interp.gc_heap(), idx)
                             || crate::array::get_index_accessor(arr, interp.gc_heap(), idx as u32)
                                 .is_some()
                             || {
@@ -5292,13 +5292,20 @@ fn array_callback_native_dispatch(
                     }
                 } else {
                     let key = idx.to_string();
-                    let has_result = interp.ordinary_has_property_value(
-                        stack,
-                        Some(context),
-                        receiver,
-                        &crate::VmPropertyKey::String(&key),
-                        0,
-                    );
+                    // A Proxy can return a value from Get even when its has trap
+                    // would report false or throw. FindViaPredicate must not
+                    // observe that trap at all.
+                    let has_result = if visit_all {
+                        Ok(true)
+                    } else {
+                        interp.ordinary_has_property_value(
+                            stack,
+                            Some(context),
+                            receiver,
+                            &crate::VmPropertyKey::String(&key),
+                            0,
+                        )
+                    };
                     let has = has_result
                         .map_err(|err| err.into_native(interp, "Array.prototype callback"))?;
                     if has {

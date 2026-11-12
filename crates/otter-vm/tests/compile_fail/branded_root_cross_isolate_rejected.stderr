@@ -5,7 +5,7 @@ error[E0521]: borrowed data escapes outside of closure
    |             ---- `root` declared here, outside of the closure body
 10 |
 11 |         otter_gc::with_gc_session(&mut right, |right_session| {
-   |                                                ------------- `right_session` is a reference that is only valid in the closure body
+   |                                                ------------- `right_session` is only valid in the closure body
 12 |             let _ = root.get(&right_session);
    |                     ^^^^^^^^^^^^^^^^^^^^^^^^ `right_session` escapes the closure body here
    |
@@ -19,7 +19,7 @@ error[E0521]: borrowed data escapes outside of closure
  8 |     otter_gc::with_gc_session(&mut left, |mut left_session| {
    |                                           ----------------
    |                                           |
-   |                                           `left_session` is a reference that is only valid in the closure body
+   |                                           `left_session` is only valid in the closure body
    |                                           has type `GcSession<'1, '_>`
 ...
 12 |             let _ = root.get(&right_session);

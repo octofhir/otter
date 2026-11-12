@@ -9,24 +9,45 @@ error[E0277]: `*mut GcHeader` cannot be sent between threads safely
   = help: within `GcHeap`, the trait `Send` is not implemented for `*mut GcHeader`
 note: required because it appears within the type `PhantomData<*mut GcHeader>`
  --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
 note: required because it appears within the type `alloc::raw_vec::RawVec<*mut GcHeader>`
  --> $RUST/alloc/src/raw_vec/mod.rs
-  |
-  | pub(crate) struct RawVec<T, A: Allocator = Global> {
-  |                   ^^^^^^
-note: required because it appears within the type `VecDeque<*mut GcHeader>`
- --> $RUST/alloc/src/collections/vec_deque/mod.rs
-  |
-  | pub struct VecDeque<
-  |            ^^^^^^^^
+note: required because it appears within the type `Vec<*mut GcHeader>`
+ --> $RUST/alloc/src/vec/mod.rs
 note: required because it appears within the type `otter_gc::marking::MarkingState`
  --> $WORKSPACE/crates/otter-gc/src/marking.rs
   |
   | pub struct MarkingState {
   |            ^^^^^^^^^^^^
+note: required because it appears within the type `GcHeap`
+ --> $WORKSPACE/crates/otter-gc/src/heap.rs
+  |
+  | pub struct GcHeap {
+  |            ^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/heap_is_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>(_t: T) {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `(dyn IsolateData + 'static)` cannot be sent between threads safely
+ --> tests/compile_fail/heap_is_not_send.rs:9:17
+  |
+9 |     assert_send(heap);
+  |     ----------- ^^^^ `(dyn IsolateData + 'static)` cannot be sent between threads safely
+  |     |
+  |     required by a bound introduced by this call
+  |
+  = help: the trait `Send` is not implemented for `(dyn IsolateData + 'static)`
+  = note: required for `std::ptr::Unique<(dyn IsolateData + 'static)>` to implement `Send`
+note: required because it appears within the type `Box<(dyn IsolateData + 'static)>`
+ --> $RUST/alloc/src/boxed.rs
+note: required because it appears within the type `isolate_data::IsolateDataSlot`
+ --> $WORKSPACE/crates/otter-gc/src/isolate_data.rs
+  |
+  | pub(crate) struct IsolateDataSlot {
+  |                   ^^^^^^^^^^^^^^^
+note: required because it appears within the type `Option<isolate_data::IsolateDataSlot>`
+ --> $RUST/core/src/option.rs
 note: required because it appears within the type `GcHeap`
  --> $WORKSPACE/crates/otter-gc/src/heap.rs
   |
@@ -54,19 +75,10 @@ note: required because it appears within the type `ExtraRoots`
   |            ^^^^^^^^^^
 note: required because it appears within the type `PhantomData<ExtraRoots>`
  --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
 note: required because it appears within the type `alloc::raw_vec::RawVec<ExtraRoots>`
  --> $RUST/alloc/src/raw_vec/mod.rs
-  |
-  | pub(crate) struct RawVec<T, A: Allocator = Global> {
-  |                   ^^^^^^
 note: required because it appears within the type `Vec<ExtraRoots>`
  --> $RUST/alloc/src/vec/mod.rs
-  |
-  | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
-  |            ^^^
 note: required because it appears within the type `GcHeap`
  --> $WORKSPACE/crates/otter-gc/src/heap.rs
   |
@@ -89,24 +101,12 @@ error[E0277]: `*const (dyn FrameRoots + 'static)` cannot be sent between threads
   = help: within `GcHeap`, the trait `Send` is not implemented for `*const (dyn FrameRoots + 'static)`
 note: required because it appears within the type `Option<*const (dyn FrameRoots + 'static)>`
  --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
 note: required because it appears within the type `PhantomData<Option<*const (dyn FrameRoots + 'static)>>`
  --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
 note: required because it appears within the type `alloc::raw_vec::RawVec<Option<*const (dyn FrameRoots + 'static)>>`
  --> $RUST/alloc/src/raw_vec/mod.rs
-  |
-  | pub(crate) struct RawVec<T, A: Allocator = Global> {
-  |                   ^^^^^^
 note: required because it appears within the type `Vec<Option<*const (dyn FrameRoots + 'static)>>`
  --> $RUST/alloc/src/vec/mod.rs
-  |
-  | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
-  |            ^^^
 note: required because it appears within the type `FrameRootProviders`
  --> $WORKSPACE/crates/otter-gc/src/frame_roots.rs
   |
@@ -139,24 +139,50 @@ note: required because it appears within the type `frame_roots::ScopeSlot`
   |        ^^^^^^^^^
 note: required because it appears within the type `PhantomData<frame_roots::ScopeSlot>`
  --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
 note: required because it appears within the type `alloc::raw_vec::RawVec<frame_roots::ScopeSlot>`
  --> $RUST/alloc/src/raw_vec/mod.rs
-  |
-  | pub(crate) struct RawVec<T, A: Allocator = Global> {
-  |                   ^^^^^^
 note: required because it appears within the type `Vec<frame_roots::ScopeSlot>`
  --> $RUST/alloc/src/vec/mod.rs
-  |
-  | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
-  |            ^^^
 note: required because it appears within the type `FrameRootProviders`
  --> $WORKSPACE/crates/otter-gc/src/frame_roots.rs
   |
   | pub struct FrameRootProviders {
   |            ^^^^^^^^^^^^^^^^^^
+note: required because it appears within the type `GcHeap`
+ --> $WORKSPACE/crates/otter-gc/src/heap.rs
+  |
+  | pub struct GcHeap {
+  |            ^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/heap_is_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>(_t: T) {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*const otter_gc::trace::TraceTable` cannot be sent between threads safely
+ --> tests/compile_fail/heap_is_not_send.rs:9:17
+  |
+9 |     assert_send(heap);
+  |     ----------- ^^^^ `*const otter_gc::trace::TraceTable` cannot be sent between threads safely
+  |     |
+  |     required by a bound introduced by this call
+  |
+  = help: within `heap::sweep::OldSweep`, the trait `Send` is not implemented for `*const otter_gc::trace::TraceTable`
+note: required because it appears within the type `heap::sweep::OldSweep`
+ --> $WORKSPACE/crates/otter-gc/src/heap/sweep.rs
+  |
+  | pub(super) struct OldSweep {
+  |                   ^^^^^^^^
+  = note: required for `std::ptr::Unique<heap::sweep::OldSweep>` to implement `Send`
+note: required because it appears within the type `Box<heap::sweep::OldSweep>`
+ --> $RUST/alloc/src/boxed.rs
+note: required because it appears within the type `heap::sweeping::SweepCycle`
+ --> $WORKSPACE/crates/otter-gc/src/heap/sweeping.rs
+  |
+  | pub(super) struct SweepCycle {
+  |                   ^^^^^^^^^^
+note: required because it appears within the type `Option<heap::sweeping::SweepCycle>`
+ --> $RUST/core/src/option.rs
 note: required because it appears within the type `GcHeap`
  --> $WORKSPACE/crates/otter-gc/src/heap.rs
   |
@@ -180,29 +206,14 @@ error[E0277]: `(dyn Any + 'static)` cannot be sent between threads safely
   = note: required for `std::ptr::Unique<(dyn Any + 'static)>` to implement `Send`
 note: required because it appears within the type `Box<(dyn Any + 'static)>`
  --> $RUST/alloc/src/boxed.rs
-  |
-  | pub struct Box<
-  |            ^^^
 note: required because it appears within the type `Option<Box<(dyn Any + 'static)>>`
  --> $RUST/core/src/option.rs
-  |
-  | pub enum Option<T> {
-  |          ^^^^^^
 note: required because it appears within the type `PhantomData<Option<Box<(dyn Any + 'static)>>>`
  --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
 note: required because it appears within the type `alloc::raw_vec::RawVec<Option<Box<(dyn Any + 'static)>>>`
  --> $RUST/alloc/src/raw_vec/mod.rs
-  |
-  | pub(crate) struct RawVec<T, A: Allocator = Global> {
-  |                   ^^^^^^
 note: required because it appears within the type `Vec<Option<Box<(dyn Any + 'static)>>>`
  --> $RUST/alloc/src/vec/mod.rs
-  |
-  | pub struct Vec<T, #[unstable(feature = "allocator_api", issue = "32838")] A: Allocator = Global> {
-  |            ^^^
 note: required because it appears within the type `HostRefTable`
  --> $WORKSPACE/crates/otter-gc/src/host_refs.rs
   |

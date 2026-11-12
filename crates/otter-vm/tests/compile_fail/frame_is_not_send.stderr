@@ -5,13 +5,8 @@ error[E0277]: `*mut otter_vm::Value` cannot be sent between threads safely
   |                   ^^^^^^^^^^^^^^^ `*mut otter_vm::Value` cannot be sent between threads safely
   |
   = help: within `Frame`, the trait `Send` is not implemented for `*mut otter_vm::Value`
-note: required because it appears within the type `RegisterWindow`
- --> src/register_stack.rs
-  |
-  | pub struct RegisterWindow {
-  |            ^^^^^^^^^^^^^^
 note: required because it appears within the type `Frame`
- --> src/frame_state.rs
+ --> src/native_abi/frame.rs
   |
   | pub struct Frame {
   |            ^^^^^
@@ -30,16 +25,88 @@ error[E0277]: `*const ()` cannot be sent between threads safely
   = help: within `Frame`, the trait `Send` is not implemented for `*const ()`
 note: required because it appears within the type `PhantomData<*const ()>`
  --> $RUST/core/src/marker.rs
-  |
-  | pub struct PhantomData<T: PointeeSized>;
-  |            ^^^^^^^^^^^
 note: required because it appears within the type `otter_vm::Value`
  --> src/value/mod.rs
   |
   | pub struct Value(u64, std::marker::PhantomData<*const ()>);
   |            ^^^^^
 note: required because it appears within the type `Frame`
- --> src/frame_state.rs
+ --> src/native_abi/frame.rs
+  |
+  | pub struct Frame {
+  |            ^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/frame_is_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*const ObjectBody` cannot be sent between threads safely
+ --> tests/compile_fail/frame_is_not_send.rs:8:19
+  |
+8 |     assert_send::<otter_vm::Frame>();
+  |                   ^^^^^^^^^^^^^^^ `*const ObjectBody` cannot be sent between threads safely
+  |
+  = help: within `Frame`, the trait `Send` is not implemented for `*const ObjectBody`
+note: required because it appears within the type `PhantomData<*const ObjectBody>`
+ --> $RUST/core/src/marker.rs
+note: required because it appears within the type `otter_gc::compressed::Gc<ObjectBody>`
+ --> $WORKSPACE/crates/otter-gc/src/compressed.rs
+  |
+  | pub struct Gc<T: ?Sized> {
+  |            ^^
+note: required because it appears within the type `Frame`
+ --> src/native_abi/frame.rs
+  |
+  | pub struct Frame {
+  |            ^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/frame_is_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*const otter_vm::constructor_layout::ConstructorLayoutBody` cannot be sent between threads safely
+ --> tests/compile_fail/frame_is_not_send.rs:8:19
+  |
+8 |     assert_send::<otter_vm::Frame>();
+  |                   ^^^^^^^^^^^^^^^ `*const otter_vm::constructor_layout::ConstructorLayoutBody` cannot be sent between threads safely
+  |
+  = help: within `Frame`, the trait `Send` is not implemented for `*const otter_vm::constructor_layout::ConstructorLayoutBody`
+note: required because it appears within the type `PhantomData<*const otter_vm::constructor_layout::ConstructorLayoutBody>`
+ --> $RUST/core/src/marker.rs
+note: required because it appears within the type `otter_gc::compressed::Gc<otter_vm::constructor_layout::ConstructorLayoutBody>`
+ --> $WORKSPACE/crates/otter-gc/src/compressed.rs
+  |
+  | pub struct Gc<T: ?Sized> {
+  |            ^^
+note: required because it appears within the type `Frame`
+ --> src/native_abi/frame.rs
+  |
+  | pub struct Frame {
+  |            ^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/frame_is_not_send.rs:5:19
+  |
+5 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*const ContextBody` cannot be sent between threads safely
+ --> tests/compile_fail/frame_is_not_send.rs:8:19
+  |
+8 |     assert_send::<otter_vm::Frame>();
+  |                   ^^^^^^^^^^^^^^^ `*const ContextBody` cannot be sent between threads safely
+  |
+  = help: within `Frame`, the trait `Send` is not implemented for `*const ContextBody`
+note: required because it appears within the type `PhantomData<*const ContextBody>`
+ --> $RUST/core/src/marker.rs
+note: required because it appears within the type `otter_gc::compressed::Gc<ContextBody>`
+ --> $WORKSPACE/crates/otter-gc/src/compressed.rs
+  |
+  | pub struct Gc<T: ?Sized> {
+  |            ^^
+note: required because it appears within the type `Frame`
+ --> src/native_abi/frame.rs
   |
   | pub struct Frame {
   |            ^^^^^

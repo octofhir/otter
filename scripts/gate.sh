@@ -132,10 +132,22 @@ step "difftest: interpreter vs tiers vs gc-stress"
 # The full report is megabytes of per-case observations; keep it on disk and
 # surface only the verdict. Any mismatch fails the gate.
 difftest_report=$(mktemp)
-cargo build --release -q -p otter-cli
+otter_binary=$(cargo build --release -q -p otter-cli --bin otter \
+    --message-format=json-render-diagnostics | python3 -c '
+import json, sys
+executable = None
+for line in sys.stdin:
+    message = json.loads(line)
+    if (message.get("reason") == "compiler-artifact"
+            and message["target"]["name"] == "otter"):
+        executable = message.get("executable")
+if executable is None:
+    sys.exit("Cargo did not produce the Otter executable")
+print(executable)
+')
 # A cargo build links the binary without its startup image; write it back so
 # difftest runs the executable as it ships, restoring instead of bootstrapping.
-target/release/otter startup-image target/release/otter
+"$otter_binary" startup-image "$otter_binary"
 cargo run --release -q -p otter-difftest -- "$@" >"$difftest_report"
 python3 - "$difftest_report" <<'PY'
 import json, sys

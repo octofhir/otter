@@ -4,6 +4,7 @@
 //! - Runs each committed corpus program through fresh `otter -p` processes.
 //! - Compares completion/console output, thrown diagnostics, ordering, and exit.
 //! - Emits a deterministic JSON report suitable for CI retention.
+//! - Reports completed cases to stderr without mixing progress into JSON stdout.
 //!
 //! # Invariants
 //! - Interpreter-only is the semantic oracle.
@@ -193,8 +194,10 @@ fn main() {
         eprintln!("no JavaScript corpus files in {}", args.corpus.display());
         std::process::exit(2);
     }
+    let total = files.len();
     let mut cases = Vec::new();
     for path in files {
+        let started = Instant::now();
         let source = fs::read_to_string(&path).expect("read corpus source");
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let oracle = run(&otter, &source, &name, &Mode::InterpreterOnly, timeout);
@@ -207,6 +210,18 @@ fn main() {
             })
             .collect();
         let mismatch = mismatch(&oracle, &candidates);
+        let timeouts = std::iter::once(&oracle)
+            .chain(candidates.iter().map(|(_, observation)| observation))
+            .filter(|observation| observation.timed_out)
+            .count();
+        eprintln!(
+            "[{}/{}] {}: {} ({:.2}s, timeouts={timeouts})",
+            cases.len() + 1,
+            total,
+            name,
+            if mismatch.is_none() { "PASS" } else { "FAIL" },
+            started.elapsed().as_secs_f64(),
+        );
         cases.push(CaseResult {
             case: name,
             passed: mismatch.is_none(),

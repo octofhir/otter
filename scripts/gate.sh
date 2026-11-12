@@ -148,7 +148,9 @@ print(executable)
 # A cargo build links the binary without its startup image; write it back so
 # difftest runs the executable as it ships, restoring instead of bootstrapping.
 "$otter_binary" startup-image "$otter_binary"
-cargo run --release -q -p otter-difftest -- "$@" >"$difftest_report"
+echo "full report: $difftest_report"
+difftest_status=0
+cargo run --release -q -p otter-difftest -- "$@" >"$difftest_report" || difftest_status=$?
 python3 - "$difftest_report" <<'PY'
 import json, sys
 
@@ -161,7 +163,9 @@ if failed:
             print(f"  MISMATCH {case['case']}: {case['mismatch']}")
     sys.exit(1)
 PY
-echo "full report: $difftest_report"
+if (( difftest_status != 0 )); then
+    exit "$difftest_status"
+fi
 
 step "kernel ledger"
 TIERS="${TIERS:-template production-tiered}" bash scripts/cost.sh

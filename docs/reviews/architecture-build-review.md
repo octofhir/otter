@@ -539,7 +539,7 @@ future-incompatibility warnings remain.
 This continuation uses macOS ARM64 and the existing `beta-2026-10-18` toolchain.
 The local checkout actually started at `7b8f80bda`, not `d3337f755`. At the user's
 separate request, all 28 local commits were rebased onto fetched `origin/main`
-(`d3337f755`); the current HEAD is `ebb80d228`. Three native-stub inventory
+(`d3337f755`); the post-rebase HEAD was `ebb80d228`. Three native-stub inventory
 conflicts were resolved by moving additions/removal into the authoritative table.
 All 141 descriptors, eight ABI/effect fields, diagnostic symbols, and dense ids
 were checked against the previous branch. Backup:
@@ -806,16 +806,139 @@ The release full gate retains its existing watchdog policy.
 The isolated pre-find baseline also reproduces the same 10 compile-fail fixture
 mismatches, confirming those diagnostic updates were unrelated to FindViaPredicate.
 Release bytecode verifier/adversarial checks, 23 code-space tests, snapshot
-boundary and four artifact-agreement tests pass. The full differential verdict
-and remaining ledger stage must be recorded separately after they finish.
+boundary and four artifact-agreement tests pass.
+
+## Closing differential verdict and retained failure evidence
+
+The complete `scripts/gate.sh` invocation at engine commit `36c2c7344` exited
+**1** at its differential stage: **79 passed / 120 failed**, across all **199**
+committed corpus paths and six process modes per path. Its 20 s per-process
+watchdog was unchanged. All 199 interpreter oracles completed. There were
+**233 timed-out candidate observations**: 120 at GC stride 1, 70 at stride 4,
+and 43 at stride 16. These remain failed observations; no cap was increased and
+no corpus program was removed. The full checked GC corpus at strides 1–16 is
+still outstanding.
+
+One of those 120 cases, `parameter_entry_widening.js`, also had a completed
+normal-tier semantic divergence. After calling `label(1, "!")`, the later numeric
+loop incorrectly begins concatenating strings. Interpreter and Template print
+the expected `800060000` final numeric total. Three additional normal-tier runs
+reproduce the corruption, with different concatenation start points. This is a
+separate optimizing-tier correctness issue, not a timeout classification.
+
+An isolated pre-find `5e8b8bc54` release build reproduces the same error **3/3**.
+Both builds' unpatched Cargo CLI artifacts were compared without startup images:
+interpreter/Template outputs agree, and all three production outputs match
+byte-for-byte between baseline and current. The baseline disables debug
+information and incremental storage only; optimization, default features,
+toolchain and lockfile are unchanged. This is correctness evidence, not a
+performance comparison. Baseline `arithmetic.js` also exceeds the same 20 s
+stride-1/slot-verification cap without an image. That sample confirms an inherited
+stress-timeout problem; the other timed-out paths were not individually baselined.
+
+The baseline's separately patched startup-image executable instead exits with
+SIGSEGV before user source in all policies. Those failed observations are retained
+and excluded from the JIT comparison; the raw executable succeeds. This additional
+image/profile interaction needs isolation rather than a claimed passing baseline
+for the shipped restore path.
+
+A ten-line `label` reproduction and captured JIT artifacts narrow the arithmetic
+defect to `graph::builder::visit_binary`: string-concat feedback permits a
+`NumberToString` on one proved numeric operand while the other operand is still
+unknown. That operand can be numeric too. The captured inline IR converts a
+numeric sum to a string before `PrimitiveAdd`, whose second input later has
+Int32 Select representation. Historical concat feedback does not prove current
+string operands. No lowering, allocation contract, deopt ABI or native-admission
+assertion was changed during this investigation.
+
+The newly added `array_find_property_protocol.js` passes all six release modes,
+including GC strides 1, 4 and 16, with exact `ok:find-property-protocol` output.
+The other completed candidate observations agree with their interpreter oracle;
+this is tier agreement, not an external conformance or full-workspace claim.
+
+Evidence is retained in `/private/tmp/otter-engine-full-gate-closing.log`,
+`/private/tmp/otter-engine-full-difftest.json`,
+`/private/tmp/otter-engine-full-difftest-failures.json`, and
+`/private/tmp/otter-parameter-current-repeats.json`,
+`/private/tmp/otter-parameter-raw-comparison.json`, and
+`/private/tmp/otter-arithmetic-baseline-raw-stress.json`. Reduced source and native
+artifacts: `/private/tmp/otter-parameter-minimal.js`,
+`/private/tmp/otter-parameter-minimal-events.json` (48 events, no truncation), and
+`/private/tmp/otter-parameter-minimal-artifacts/`. The failed image run is retained
+in `/private/tmp/otter-parameter-baseline-observations.json`.
+
+The original gate did not reach its kernel ledger. A separate run encountered
+the sandbox's denied `time -l` read of `kern.clockrate`; it remains a failed
+measurement run in `/private/tmp/otter-engine-kernel-ledger.log`. Repeating the
+unchanged script outside that sandbox passed **30/30** kernel/tier combinations
+(15 kernels, Template/production, 20 samples plus 8 warmup invocations) and exited
+0: `/private/tmp/otter-engine-kernel-ledger-unsandboxed.log`. This neither changes
+the failed differential verdict nor establishes a before/after speedup.
+
+The failed run also exposed a reporting defect: `set -e` stopped the gate before
+it printed its temporary JSON path or parsed the failure summary. The gate now
+prints that path before execution and retains a nonzero runner status while
+rendering the report. The runner reports each completed case's PASS/FAIL,
+elapsed time and timeout count to stderr; stdout remains one JSON report.
+Comparison logic, GC verification, mode selection, watchdog and exit policy are
+unchanged. Real process smoke tests check a passing arithmetic source and a
+deliberate 1 ms watchdog failure: the latter retains valid JSON and exit 1,
+reporting six timed-out processes rather than agreement. Formatting, shell
+syntax, strict workspace all-target/all-feature Clippy and the runner's three
+existing rejection/agreement tests pass. Artifacts:
+`/private/tmp/otter-difftest-observability-{pass,timeout}.{json,stderr}`.
+
+## Large FindViaPredicate ranges: separate confirmed defect
+
+Read-only follow-up probes found that the callback driver's pathological-length
+approximation also changes `find*` semantics. This remains outside the committed
+Get/HasProperty correction and has not been fixed or added to the running gate.
+
+With `length: 2 ** 26`, a Proxy containing index `0: 'first'` and a predicate that
+immediately returns true should let `find` return `'first'` and `findIndex` return
+`0`. Node v24.16.0 does so without metadata traps. All three Otter policies instead
+throw `TypeError: Array.prototype callback: Object.getPrototypeOf: cannot operate
+on a value of type proxy`. The driver's preliminary prototype enumeration runs
+before the first indexed Get, even though FindViaPredicate needs no enumeration.
+
+For an ordinary object with the same length, an element at `2 ** 26 - 2`, and a
+predicate that matches its second invocation, Node returns that element (or
+index `67108862`) after two calls. Otter's `findLast` returns `undefined` and
+`findLastIndex` returns `-1`, both after only one call. The `visit_all && reverse`
+branch constructs a singleton index list and silently truncates the search.
+
+The source and exact observations are retained at
+`/private/tmp/otter-find-large-probe.js`,
+`/private/tmp/otter-find-large-{actual,reference}.txt`, and
+`/private/tmp/otter-find-large-observations.json`. The last report checks
+interpreter, Template and production policies against the same debug executable.
+These are public CLI reproductions, not new passing regressions.
+
+The intended owner remains the existing callback driver: lazy ordered ranges
+can preserve early termination without allocating an index vector or walking
+prototypes. Before removing the approximation, verify interruption and work
+budget enforcement for repeated callbacks, including native and compiled
+predicates. A huge range must remain cancellable; silently skipping indices is
+not a substitute. The other callback methods' sparse approximation needs its own
+scope and validation rather than an incidental broad rewrite.
 
 ## Confirmed next tasks
 
-1. **P1: finish the current workspace closing gate.** VM lint blockers, native
-   allocation-group preparation, compile-fail diagnostics and executable-path
-   ownership have been corrected. Complete release and differential validation,
-   then the separate full checked GC corpus at strides 1–16.
-2. **P1: repeat build measurements on an idle host.** At least three alternating
+1. **P0: fix premature string coercion in optimized Add.** Use the preserved
+   reduced reproduction and native artifacts; require current operand proof
+   before conversion and retain native admission, effect order and moving roots.
+2. **P1: diagnose the GC-stress watchdog failures.** Keep exact failed paths and
+   limits. Re-run the full closing gate after correcting the causes, then the
+   separate full checked GC corpus at strides 1–16. Do not turn timeouts into
+   passing agreement or hide them by filtering the corpus.
+3. **P1: isolate baseline startup-image SIGSEGV.** Compare raw/restored launches
+   under the same release profile before attributing the failure to image or
+   debug-information settings. Current shipped-image conformance is not inferred
+   from the raw baseline comparison.
+4. **P1: correct large FindViaPredicate ranges.** Retain exact forward/reverse
+   indexed Get order and early termination, with interruption/budget proof and
+   public regressions. Preserve the already-fixed Get-without-HasProperty rule.
+5. **P1: repeat build measurements on an idle host.** At least three alternating
    before/after clean-build pairs, a separate linking measurement, and a restorative
    build between incremental triggers. Do not promise a 50% LOC reduction without
    identifying the responsibilities actually removed and the checks preserved.

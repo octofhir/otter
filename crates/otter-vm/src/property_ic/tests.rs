@@ -1018,7 +1018,10 @@ fn dictionary_receivers_of_one_shape_share_a_key_table_handler() {
     match vm.resolve_property_load(first, property) {
         crate::property_cache::PropertyLoad::Data(resolved) => {
             assert_eq!((resolved.hops, resolved.value), (0, Value::number_i32(3)));
-            assert!(!resolved.is_writable, "a dictionary slot is written by its table");
+            assert!(
+                !resolved.is_writable,
+                "a dictionary slot is written by its table"
+            );
         }
         _ => panic!("own dictionary data resolves"),
     }

@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - [`OpStep`] — where the dispatch loop continues after one opcode.
+//! - `top_frame!` — one short-borrow expansion shared by opcode handlers.
 //! - [`OpRun`] — the activation state an opcode reads: its chunk, stack,
 //!   frame, CodeBlock, floor and source-work meter.
 //! - One `Interpreter::op_*` handler per opcode family: inline caches,
@@ -51,6 +52,15 @@ pub(super) struct OpRun<'r, 'c> {
     pub(super) source_work: &'r mut PendingSourceWork<'c>,
 }
 
+// The dispatcher supplies a live activation pointer. Keep each borrow short:
+// handlers may reenter the VM or mutate the stack between uses.
+macro_rules! top_frame {
+    ($ptr:expr) => {
+        // SAFETY: the caller's OpRun owns this live activation for the operation.
+        unsafe { &mut *$ptr }
+    };
+}
+
 impl Interpreter {
     /// `Op::ReturnValue`, `Op::Return`.
     #[inline(never)]
@@ -65,15 +75,8 @@ impl Interpreter {
         let floor: ActivationFloor = run.floor;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let src = instr.reg(0);
-        let value = top_frame!()
+        let value = top_frame!(top_ptr)
             .registers
             .get(src as usize)
             .cloned()
@@ -116,17 +119,10 @@ impl Interpreter {
         let floor: ActivationFloor = run.floor;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (value_reg, ctx_reg) = (instr.reg(0), instr.reg(1));
         let coord = otter_bytecode::ContextCoord::from_imm32(instr.imm(2))
             .ok_or(VmError::InvalidOperand)?;
-        let frame = &(*top_frame!());
+        let frame = &(*top_frame!(top_ptr));
         let value = *read_register(frame, value_reg)?;
         let ctx = *read_register(frame, ctx_reg)?;
         let derived_this = self.derived_this_slot_value(ctx, coord)?;
@@ -221,18 +217,16 @@ impl Interpreter {
         let jit_installed: bool = run.jit_installed;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let native_target = jit_installed
             .then(|| {
                 function
                     .register(instr, 1)
-                    .and_then(|register| top_frame!().registers.get(register as usize).copied())
+                    .and_then(|register| {
+                        top_frame!(top_ptr)
+                            .registers
+                            .get(register as usize)
+                            .copied()
+                    })
                     .and_then(|callee| self.native_call_target(callee))
             })
             .flatten();
@@ -273,16 +267,9 @@ impl Interpreter {
         let jit_installed: bool = run.jit_installed;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let native_target = jit_installed
             .then(|| {
-                let frame = &(*top_frame!());
+                let frame = &(*top_frame!(top_ptr));
                 let operand = |index| {
                     function
                         .register(instr, index)
@@ -461,18 +448,16 @@ impl Interpreter {
         let jit_installed: bool = run.jit_installed;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let native_target = jit_installed
             .then(|| {
                 function
                     .register(instr, 1)
-                    .and_then(|register| top_frame!().registers.get(register as usize).copied())
+                    .and_then(|register| {
+                        top_frame!(top_ptr)
+                            .registers
+                            .get(register as usize)
+                            .copied()
+                    })
                     .and_then(|callee| self.native_call_target(callee))
             })
             .flatten();
@@ -503,18 +488,16 @@ impl Interpreter {
         let jit_installed: bool = run.jit_installed;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let native_target = jit_installed
             .then(|| {
                 function
                     .register(instr, 1)
-                    .and_then(|register| top_frame!().registers.get(register as usize).copied())
+                    .and_then(|register| {
+                        top_frame!(top_ptr)
+                            .registers
+                            .get(register as usize)
+                            .copied()
+                    })
                     .and_then(|callee| self.native_construct_target(callee))
             })
             .flatten();
@@ -585,18 +568,16 @@ impl Interpreter {
         let jit_installed: bool = run.jit_installed;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let native_target = jit_installed
             .then(|| {
                 function
                     .register(instr, 1)
-                    .and_then(|register| top_frame!().registers.get(register as usize).copied())
+                    .and_then(|register| {
+                        top_frame!(top_ptr)
+                            .registers
+                            .get(register as usize)
+                            .copied()
+                    })
                     .and_then(|callee| {
                         callee
                             .as_native_function()
@@ -665,18 +646,16 @@ impl Interpreter {
         let jit_installed: bool = run.jit_installed;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let native_target = jit_installed
             .then(|| {
                 function
                     .register(instr, 1)
-                    .and_then(|register| top_frame!().registers.get(register as usize).copied())
+                    .and_then(|register| {
+                        top_frame!(top_ptr)
+                            .registers
+                            .get(register as usize)
+                            .copied()
+                    })
                     .and_then(|callee| {
                         callee
                             .as_native_function()
@@ -687,7 +666,7 @@ impl Interpreter {
         let direct_construct_fid = if jit_installed {
             register_operand(function.operand(instr, 1))
                 .ok()
-                .and_then(|register| top_frame!().registers.get(register as usize))
+                .and_then(|register| top_frame!(top_ptr).registers.get(register as usize))
                 .copied()
                 .and_then(|value| {
                     value
@@ -742,18 +721,16 @@ impl Interpreter {
         let jit_installed: bool = run.jit_installed;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let native_target = jit_installed
             .then(|| {
                 function
                     .register(instr, 1)
-                    .and_then(|register| top_frame!().registers.get(register as usize).copied())
+                    .and_then(|register| {
+                        top_frame!(top_ptr)
+                            .registers
+                            .get(register as usize)
+                            .copied()
+                    })
                     .and_then(|callee| {
                         callee
                             .as_native_function()
@@ -764,7 +741,7 @@ impl Interpreter {
         let direct_construct_fid = if jit_installed {
             register_operand(function.operand(instr, 1))
                 .ok()
-                .and_then(|register| top_frame!().registers.get(register as usize))
+                .and_then(|register| top_frame!(top_ptr).registers.get(register as usize))
                 .copied()
                 .and_then(|value| {
                     value
@@ -835,15 +812,8 @@ impl Interpreter {
         let floor: ActivationFloor = run.floor;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let src = instr.reg(0);
-        let value = top_frame!()
+        let value = top_frame!(top_ptr)
             .registers
             .get(src as usize)
             .cloned()
@@ -881,20 +851,13 @@ impl Interpreter {
         let floor: ActivationFloor = run.floor;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let src = instr.reg(1);
-        let awaited = *read_register(&(*top_frame!()), src)?;
+        let awaited = *read_register(&(*top_frame!(top_ptr)), src)?;
         // A suspended async activation completes with its result
         // promise, rooted across the await's allocations.
         let result = self
-            .frame_cold(&(*top_frame!()))
+            .frame_cold(&(*top_frame!(top_ptr)))
             .and_then(|cold| cold.async_state.as_ref())
             .map_or(Value::undefined(), |state| {
                 Value::promise(state.result_promise)
@@ -940,17 +903,10 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (kind_dst, value_dst, src) = instr.reg3();
-        let yielded = *read_register(&(*top_frame!()), src)?;
+        let yielded = *read_register(&(*top_frame!(top_ptr)), src)?;
         let owner = self
-            .frame_generator_owner(&(*top_frame!()))
+            .frame_generator_owner(&(*top_frame!(top_ptr)))
             .ok_or(VmError::TypeMismatch)?;
         let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
         frame.advance_pc()?;
@@ -1001,17 +957,10 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (kind_dst, value_dst, src) = instr.reg3();
-        let yielded = *read_register(&(*top_frame!()), src)?;
+        let yielded = *read_register(&(*top_frame!(top_ptr)), src)?;
         let owner = self
-            .frame_generator_owner(&(*top_frame!()))
+            .frame_generator_owner(&(*top_frame!(top_ptr)))
             .ok_or(VmError::TypeMismatch)?;
         let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
         frame.advance_pc()?;
@@ -1058,17 +1007,10 @@ impl Interpreter {
         let stack: &mut ActivationStack = &mut *run.stack;
         let top_ptr: *mut Frame = run.top_ptr;
         let function_id: u32 = run.function_id;
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let owner = self
-            .frame_generator_owner(&(*top_frame!()))
+            .frame_generator_owner(&(*top_frame!(top_ptr)))
             .ok_or(VmError::TypeMismatch)?;
-        let callee = top_frame!().self_value;
+        let callee = top_frame!(top_ptr).self_value;
         let frame = stack.last_mut().ok_or_else(|| VmError::InvalidOperand)?;
         frame.advance_pc()?;
         let popped = stack.pop().expect("frame present");
@@ -1135,13 +1077,6 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         // Hot fast path: an already-primitive source (the dominant
         // case — numeric loop operands) is its own ToPrimitive
         // result. Skip the hint-token decode and the parked-ladder
@@ -1150,10 +1085,10 @@ impl Interpreter {
         // resume path — where `src` stays non-primitive — intact.
         let dst = instr.reg(0);
         let src = instr.reg(1);
-        let recv = *read_register(&(*top_frame!()), src)?;
+        let recv = *read_register(&(*top_frame!(top_ptr)), src)?;
         if recv.is_primitive() {
-            write_register(&mut (*top_frame!()), dst, recv)?;
-            top_frame!().advance_pc()?;
+            write_register(&mut (*top_frame!(top_ptr)), dst, recv)?;
+            top_frame!(top_ptr).advance_pc()?;
             return Ok(OpStep::Activation);
         }
         (match self.drive_to_primitive(stack, context, function.operand_view(instr)) {
@@ -1234,21 +1169,14 @@ impl Interpreter {
         let top_idx: usize = run.top_idx;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         // §7.4.8 IteratorStepValue — a throw out of `next` or out
         // of the result's getters sets the record's [[Done]], so
         // a handler's IteratorClose leaves it alone.
         let iter_reg = instr.reg(2);
-        let cursor = crate::iterator_record::RecordCursor::read(&(*top_frame!()), iter_reg)?;
+        let cursor = crate::iterator_record::RecordCursor::read(&(*top_frame!(top_ptr)), iter_reg)?;
         if cursor != crate::iterator_record::RecordCursor::Generic {
             if let crate::iterator_record::RecordCursor::Fast(_) = cursor {
-                let array = *read_register(&(*top_frame!()), iter_reg)?;
+                let array = *read_register(&(*top_frame!(top_ptr)), iter_reg)?;
                 self.record_element_family_feedback(function, instr.instruction_pc, array);
             }
             let (value, done) = match self.step_fast_array_record(context, stack, top_idx, iter_reg)
@@ -1259,13 +1187,13 @@ impl Interpreter {
                     return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
                 }
             };
-            let frame = &mut (*top_frame!());
+            let frame = &mut (*top_frame!(top_ptr));
             write_register(frame, instr.reg(0), value)?;
             write_register(frame, instr.reg(1), Value::boolean(done))?;
             frame.advance_pc()?;
             return Ok(OpStep::Activation);
         }
-        let iterator = *read_register(&(*top_frame!()), iter_reg)?;
+        let iterator = *read_register(&(*top_frame!(top_ptr)), iter_reg)?;
         let operands = function.operand_view(instr);
         match self.drive_iterator_next(stack, context, operands) {
             Ok(true) => return Ok(OpStep::Activation),
@@ -1282,7 +1210,7 @@ impl Interpreter {
         }
         let value_dst = instr.reg(0);
         let done_dst = instr.reg(1);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         if let Err(e) = self.run_iterator_next_regs(frame, value_dst, done_dst, iter_reg) {
             self.iterator_mark_done(iterator);
             return Err(e);
@@ -1303,13 +1231,6 @@ impl Interpreter {
         let top_idx: usize = run.top_idx;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         match self.close_iterator_record(context, stack, top_idx, instr.reg(0), false) {
             Ok(()) => {}
             Err(CommittedValueError::JavaScript(error)) => return Err(error),
@@ -1317,7 +1238,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         }
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -1335,13 +1256,6 @@ impl Interpreter {
         let top_idx: usize = run.top_idx;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         match self.close_iterator_record(context, stack, top_idx, instr.reg(0), true) {
             Ok(()) => {}
             Err(CommittedValueError::JavaScript(error)) => return Err(error),
@@ -1349,7 +1263,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         }
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -1365,17 +1279,10 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let result_reg = instr.reg(0);
         let called_reg = instr.reg(1);
         let iter_reg = instr.reg(2);
-        let iterator = *read_register(&(*top_frame!()), iter_reg)?;
+        let iterator = *read_register(&(*top_frame!(top_ptr)), iter_reg)?;
         // §7.4.11 steps 3-5: an iterator without a `return`
         // is already closed, and the caller skips the await.
         let outcome = match self.async_iterator_return_call(stack, context, iterator) {
@@ -1385,7 +1292,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         match outcome {
             Some(result) => {
                 write_register(frame, result_reg, result)?;
@@ -1410,15 +1317,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let value_reg = instr.reg(0);
-        let value = *read_register(&(*top_frame!()), value_reg)?;
+        let value = *read_register(&(*top_frame!(top_ptr)), value_reg)?;
         // §7.4.11 step 8 — the awaited `return` result is an
         // Object or the close is a TypeError.
         if !value.is_object() && !value.is_proxy() {
@@ -1426,7 +1326,7 @@ impl Interpreter {
                 self.err_type(("iterator `return` did not yield an object".to_string()).into())
             );
         }
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -1534,22 +1434,15 @@ impl Interpreter {
         let jit_installed: bool = run.jit_installed;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let operands = function.operand_view(instr);
         if jit_installed
             && let Some(recv_reg) = function.register(instr, 1)
-            && let Ok(recv) = read_register(&(*top_frame!()), recv_reg)
+            && let Ok(recv) = read_register(&(*top_frame!(top_ptr)), recv_reg)
         {
             let recv = *recv;
             self.record_element_family_feedback(function, instr.instruction_pc, recv);
             if let Some(key_reg) = function.register(instr, 2)
-                && let Ok(key) = read_register(&(*top_frame!()), key_reg)
+                && let Ok(key) = read_register(&(*top_frame!(top_ptr)), key_reg)
             {
                 let key = *key;
                 self.record_element_bounds_feedback(function, instr.instruction_pc, recv, key);
@@ -1560,8 +1453,8 @@ impl Interpreter {
         if let (Some(recv_reg), Some(key_reg)) =
             (function.register(instr, 1), function.register(instr, 2))
             && let (Ok(&recv), Ok(&key)) = (
-                read_register(&(*top_frame!()), recv_reg),
-                read_register(&(*top_frame!()), key_reg),
+                read_register(&(*top_frame!(top_ptr)), recv_reg),
+                read_register(&(*top_frame!(top_ptr)), key_reg),
             )
             && key.is_string()
             && recv.as_object().is_some()
@@ -1578,15 +1471,15 @@ impl Interpreter {
         if let (Some(recv_reg), Some(key_reg)) =
             (function.register(instr, 1), function.register(instr, 2))
             && let (Ok(&recv), Ok(&key)) = (
-                read_register(&(*top_frame!()), recv_reg),
-                read_register(&(*top_frame!()), key_reg),
+                read_register(&(*top_frame!(top_ptr)), recv_reg),
+                read_register(&(*top_frame!(top_ptr)), key_reg),
             )
             && (key.is_symbol() || key.as_i32().is_some_and(|index| index >= 0))
             && let Some(value) =
                 self.keyed_name_load(context, function_id, instr.instruction_pc, recv, key)
             && let Some(dst) = function.register(instr, 0)
         {
-            let frame = &mut (*top_frame!());
+            let frame = &mut (*top_frame!(top_ptr));
             write_register(frame, dst, value)?;
             frame.advance_pc()?;
             return Ok(OpStep::Activation);
@@ -1624,13 +1517,6 @@ impl Interpreter {
         let top_idx: usize = run.top_idx;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let home_reg = instr.reg(1);
         let name_idx = instr.const_word(2);
@@ -1638,7 +1524,7 @@ impl Interpreter {
             .property_atom(name_idx)
             .ok_or_else(|| VmError::InvalidOperand)?
             .name();
-        let home = *read_register(&(*top_frame!()), home_reg)?;
+        let home = *read_register(&(*top_frame!(top_ptr)), home_reg)?;
         (match self.run_load_super_property(
             context,
             stack,
@@ -1669,16 +1555,9 @@ impl Interpreter {
         let top_idx: usize = run.top_idx;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, home_reg, key_reg) = instr.reg3();
-        let home = *read_register(&(*top_frame!()), home_reg)?;
-        let key_raw = *read_register(&(*top_frame!()), key_reg)?;
+        let home = *read_register(&(*top_frame!(top_ptr)), home_reg)?;
+        let key_raw = *read_register(&(*top_frame!(top_ptr)), key_reg)?;
         (match self.run_load_super_property(
             context,
             stack,
@@ -1709,13 +1588,6 @@ impl Interpreter {
         let top_idx: usize = run.top_idx;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let home_reg = instr.reg(0);
         let name_idx = instr.const_word(1);
         let value_reg = instr.reg(2);
@@ -1723,9 +1595,9 @@ impl Interpreter {
             .property_atom(name_idx)
             .ok_or_else(|| VmError::InvalidOperand)?
             .name();
-        let home = *read_register(&(*top_frame!()), home_reg)?;
-        let value = *read_register(&(*top_frame!()), value_reg)?;
-        let strict = context.function_is_strict(top_frame!().function_id);
+        let home = *read_register(&(*top_frame!(top_ptr)), home_reg)?;
+        let value = *read_register(&(*top_frame!(top_ptr)), value_reg)?;
+        let strict = context.function_is_strict(top_frame!(top_ptr).function_id);
         (match self.run_store_super_property(
             context,
             stack,
@@ -1757,18 +1629,11 @@ impl Interpreter {
         let top_idx: usize = run.top_idx;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (home_reg, key_reg, value_reg) = instr.reg3();
-        let home = *read_register(&(*top_frame!()), home_reg)?;
-        let key_raw = *read_register(&(*top_frame!()), key_reg)?;
-        let value = *read_register(&(*top_frame!()), value_reg)?;
-        let strict = context.function_is_strict(top_frame!().function_id);
+        let home = *read_register(&(*top_frame!(top_ptr)), home_reg)?;
+        let key_raw = *read_register(&(*top_frame!(top_ptr)), key_reg)?;
+        let value = *read_register(&(*top_frame!(top_ptr)), value_reg)?;
+        let strict = context.function_is_strict(top_frame!(top_ptr).function_id);
         (match self.run_store_super_property(
             context,
             stack,
@@ -1892,24 +1757,17 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let strict = op == Op::StoreElementStrict;
         let recv_reg = instr.reg(0);
         let idx_reg = instr.reg(1);
         let src_reg = instr.reg(2);
         if let Some(feedback) = feedback {
-            let value = *read_register(&(*top_frame!()), src_reg)?;
+            let value = *read_register(&(*top_frame!(top_ptr)), src_reg)?;
             feedback.record_arith(value, value);
         }
         if jit_installed {
-            let recv = *read_register(&(*top_frame!()), recv_reg)?;
-            let key = *read_register(&(*top_frame!()), idx_reg)?;
+            let recv = *read_register(&(*top_frame!(top_ptr)), recv_reg)?;
+            let key = *read_register(&(*top_frame!(top_ptr)), idx_reg)?;
             self.record_element_family_feedback(function, instr.instruction_pc, recv);
             self.record_element_bounds_feedback(function, instr.instruction_pc, recv, key);
         }
@@ -1917,7 +1775,7 @@ impl Interpreter {
         // view, then end the frame borrow before `[[Set]]` can
         // allocate, collect, or synchronously re-enter JavaScript.
         let (function_id, receiver, key, value) = {
-            let frame = ActiveFrameRef::from_frame(&(*top_frame!()));
+            let frame = ActiveFrameRef::from_frame(&(*top_frame!(top_ptr)));
             (
                 frame.function_id(),
                 frame.read(recv_reg)?,
@@ -1938,7 +1796,7 @@ impl Interpreter {
                 value,
             ) {
                 Ok(true) => {
-                    top_frame!().advance_pc()?;
+                    top_frame!(top_ptr).advance_pc()?;
                     return Ok(OpStep::Activation);
                 }
                 Ok(false) => {}
@@ -1950,7 +1808,7 @@ impl Interpreter {
         }
         // The store above may have collected: re-read the operands.
         let (receiver, key, value) = {
-            let frame = ActiveFrameRef::from_frame(&(*top_frame!()));
+            let frame = ActiveFrameRef::from_frame(&(*top_frame!(top_ptr)));
             (
                 frame.read(recv_reg)?,
                 frame.read(idx_reg)?,
@@ -1967,7 +1825,7 @@ impl Interpreter {
         });
         // The synchronous helper completed the full effect (or
         // threw), so publish exactly one resume increment.
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -1983,16 +1841,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, lhs, rhs) = instr.reg3();
-        let lhs = *read_register(&(*top_frame!()), lhs)?;
-        let rhs = *read_register(&(*top_frame!()), rhs)?;
+        let lhs = *read_register(&(*top_frame!(top_ptr)), lhs)?;
+        let rhs = *read_register(&(*top_frame!(top_ptr)), rhs)?;
         let result = match self.object_protocol_value(
             stack,
             context,
@@ -2006,7 +1857,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -2026,16 +1877,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, lhs, rhs) = instr.reg3();
-        let lhs = *read_register(&(*top_frame!()), lhs)?;
-        let rhs = *read_register(&(*top_frame!()), rhs)?;
+        let lhs = *read_register(&(*top_frame!(top_ptr)), lhs)?;
+        let rhs = *read_register(&(*top_frame!(top_ptr)), rhs)?;
         let result = match self.object_protocol_value(
             stack,
             context,
@@ -2049,7 +1893,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -2068,13 +1912,6 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let operands = function.operand_view(instr);
         if match self.drive_delete_property_proxy(stack, context, operands) {
             Ok(value) => value,
@@ -2091,12 +1928,12 @@ impl Interpreter {
         let key = context
             .property_atom(name_idx)
             .ok_or_else(|| VmError::InvalidOperand)?;
-        let strict = context.function_is_strict(top_frame!().function_id);
+        let strict = context.function_is_strict(top_frame!(top_ptr).function_id);
         // `delete` has an object fast path that bypasses the
         // §28.3 MOP funnel; trigger deferred-namespace
         // evaluation here (named delete is never symbol-like
         // unless the key is "then").
-        let receiver = *read_register(&(*top_frame!()), obj_reg)?;
+        let receiver = *read_register(&(*top_frame!(top_ptr)), obj_reg)?;
         if receiver
             .as_object()
             .is_some_and(|o| crate::object::deferred_namespace_target(o, &self.gc_heap).is_some())
@@ -2114,7 +1951,7 @@ impl Interpreter {
                 }
             });
         }
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_delete_property_reg(context, frame, dst, obj_reg, key, strict)?;
         Ok(OpStep::Activation)
     }
@@ -2133,13 +1970,6 @@ impl Interpreter {
         let top_idx: usize = run.top_idx;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let operands = function.operand_view(instr);
         if match self.drive_delete_element_proxy(stack, context, operands) {
             Ok(value) => value,
@@ -2151,13 +1981,13 @@ impl Interpreter {
             return Ok(OpStep::Activation);
         }
         let (dst, obj_reg, idx_reg) = instr.reg3();
-        let strict = context.function_is_strict(top_frame!().function_id);
-        let receiver = *read_register(&(*top_frame!()), obj_reg)?;
+        let strict = context.function_is_strict(top_frame!(top_ptr).function_id);
+        let receiver = *read_register(&(*top_frame!(top_ptr)), obj_reg)?;
         if receiver
             .as_object()
             .is_some_and(|o| crate::object::deferred_namespace_target(o, &self.gc_heap).is_some())
         {
-            let key_val = *read_register(&(*top_frame!()), idx_reg)?;
+            let key_val = *read_register(&(*top_frame!(top_ptr)), idx_reg)?;
             let symbol_like = key_val.as_symbol(&self.gc_heap).is_some()
                 || key_val
                     .as_string(&self.gc_heap)
@@ -2196,16 +2026,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let src = instr.reg(1);
-        let source = *read_register(&(*top_frame!()), src)?;
+        let source = *read_register(&(*top_frame!(top_ptr)), src)?;
         let result = match self.object_protocol_value(
             stack,
             context,
@@ -2219,7 +2042,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -2237,17 +2060,10 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let obj_reg = instr.reg(0);
         let proto_reg = instr.reg(1);
-        let object = *read_register(&(*top_frame!()), obj_reg)?;
-        let prototype = *read_register(&(*top_frame!()), proto_reg)?;
+        let object = *read_register(&(*top_frame!(top_ptr)), obj_reg)?;
+        let prototype = *read_register(&(*top_frame!(top_ptr)), proto_reg)?;
         match self.object_protocol_value(
             stack,
             context,
@@ -2261,7 +2077,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -2300,16 +2116,9 @@ impl Interpreter {
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
         let op = run.function.op(instr);
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let key = (op == Op::LoadArgumentsElement)
-            .then(|| read_register(&(*top_frame!()), instr.reg(1)).copied())
+            .then(|| read_register(&(*top_frame!(top_ptr)), instr.reg(1)).copied())
             .transpose()?;
         let value = match self.read_frame_arguments(context, stack, top_idx, key) {
             Ok(value) => value,
@@ -2318,8 +2127,8 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        write_register(&mut (*top_frame!()), dst, value)?;
-        top_frame!().advance_pc()?;
+        write_register(&mut (*top_frame!(top_ptr)), dst, value)?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -2348,14 +2157,7 @@ impl Interpreter {
         _idx: usize,
     ) -> Result<OpStep, VmError> {
         let top_ptr: *mut Frame = run.top_ptr;
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Dispatch)
     }
 
@@ -2369,15 +2171,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, Value::undefined())?;
         frame.advance_pc()?;
         Ok(OpStep::Dispatch)
@@ -2393,15 +2188,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, Value::hole())?;
         frame.advance_pc()?;
         Ok(OpStep::Dispatch)
@@ -2417,15 +2205,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, Value::boolean(true))?;
         frame.advance_pc()?;
         Ok(OpStep::Dispatch)
@@ -2441,15 +2222,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, Value::boolean(false))?;
         frame.advance_pc()?;
         Ok(OpStep::Dispatch)
@@ -2465,15 +2239,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, Value::null())?;
         frame.advance_pc()?;
         Ok(OpStep::Dispatch)
@@ -2489,16 +2256,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let imm = instr.imm(1);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, Value::number(NumberValue::Smi(imm)))?;
         frame.advance_pc()?;
         Ok(OpStep::Dispatch)
@@ -2515,20 +2275,13 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let idx = instr.const_word(1);
         let bits = context
             .number_constant_bits(idx)
             .ok_or_else(|| VmError::InvalidOperand)?;
         let value = NumberValue::from_f64(f64::from_bits(bits));
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, Value::number(value))?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -2545,17 +2298,10 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let idx = instr.const_word(1);
         let value = self.load_string_constant_value(context, idx)?;
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -2573,16 +2319,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let src = instr.reg(1);
-        let source = *read_register(&(*top_frame!()), src)?;
+        let source = *read_register(&(*top_frame!(top_ptr)), src)?;
         let result = match self.scalar_value(
             stack,
             context,
@@ -2597,7 +2336,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -2613,16 +2352,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let src = instr.reg(1);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
         write_register(frame, dst, Value::boolean(!truthy))?;
         frame.advance_pc()?;
@@ -2639,16 +2371,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let src = instr.reg(1);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         let truthy = read_register(frame, src)?.to_boolean(&self.gc_heap);
         write_register(frame, dst, Value::boolean(truthy))?;
         frame.advance_pc()?;
@@ -2665,15 +2390,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, recv, idx) = instr.reg3();
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_get_string_index_regs(frame, dst, recv, idx)?;
         Ok(OpStep::Activation)
     }
@@ -2690,16 +2408,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let src = instr.reg(1);
-        let source = *read_register(&(*top_frame!()), src)?;
+        let source = *read_register(&(*top_frame!(top_ptr)), src)?;
         let result = match self.scalar_value(
             stack,
             context,
@@ -2714,7 +2425,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -2731,20 +2442,13 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let src = instr.reg(1);
         let test = function
             .imm32(instr, 2)
             .and_then(otter_bytecode::TypeOfTest::decode)
             .ok_or(VmError::InvalidOperand)?;
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         let kind = read_register(frame, src)?.typeof_kind_with_heap(&self.gc_heap);
         write_register(
             frame,
@@ -2765,15 +2469,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
-        let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!()));
+        let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!(top_ptr)));
         self.frame_load_this(&mut frame, dst)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -2791,15 +2488,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
-        let new_target = top_frame!().new_target();
+        let new_target = top_frame!(top_ptr).new_target();
         let result = match self.scalar_value(
             stack,
             context,
@@ -2814,7 +2504,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -2866,17 +2556,10 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let boilerplate = instr.const_word(1);
         let placement = self.literal_site_placement(function.allocation_site_at(idx));
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_new_array_boilerplate_reg(context, frame, dst, boilerplate, placement)?;
         Ok(OpStep::Activation)
     }
@@ -2911,16 +2594,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let idx = instr.const_word(1);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_load_regexp_reg(context, frame, dst, idx)?;
         Ok(OpStep::Activation)
     }
@@ -2936,16 +2612,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let idx = instr.const_word(1);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_load_bigint_reg(context, frame, dst, idx)?;
         Ok(OpStep::Activation)
     }
@@ -2960,15 +2629,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
-        let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!()));
+        let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!(top_ptr)));
         self.frame_load_closure_context(&mut frame, dst)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -2984,15 +2646,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
-        let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!()));
+        let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!(top_ptr)));
         self.frame_load_self(&mut frame, dst)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -3009,16 +2664,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, parent) = (instr.reg(0), instr.reg(1));
         let scope = instr.imm(2) as u32;
-        let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!()));
+        let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!(top_ptr)));
         self.frame_create_context(context, &mut frame, dst, parent, scope)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -3034,15 +2682,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, src) = (instr.reg(0), instr.reg(1));
-        let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!()));
+        let mut frame = ActiveFrameMut::from_frame(&mut (*top_frame!(top_ptr)));
         self.frame_copy_context(&mut frame, dst, src)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -3060,16 +2701,9 @@ impl Interpreter {
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
         let op = run.function.op(instr);
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, ctx) = (instr.reg(0), instr.reg(1));
         let coord = instr.imm(2);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         let value = self.load_context_slot_value(
             context,
             *read_register(frame, ctx)?,
@@ -3093,16 +2727,9 @@ impl Interpreter {
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
         let op = run.function.op(instr);
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (src, ctx) = (instr.reg(0), instr.reg(1));
         let coord = instr.imm(2);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         let (value, target) = (*read_register(frame, src)?, *read_register(frame, ctx)?);
         self.store_context_slot_value(
             context,
@@ -3111,7 +2738,7 @@ impl Interpreter {
             value,
             op == Op::StoreContextSlotChecked,
         )?;
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -3125,19 +2752,12 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (src, ctx) = (instr.reg(0), instr.reg(1));
         let coord = instr.imm(2);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         let (value, target) = (*read_register(frame, src)?, *read_register(frame, ctx)?);
         self.bind_this_context_slot_value(target, coord, value)?;
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -3154,16 +2774,9 @@ impl Interpreter {
         let top_idx: usize = run.top_idx;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         self.collect_rest(&mut *stack, top_idx, function.param_count, dst)?;
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -3178,16 +2791,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let idx = instr.const_word(1);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_make_function_reg(context, frame, dst, idx)?;
         Ok(OpStep::Activation)
     }
@@ -3258,15 +2864,8 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_load_global_this_reg(frame, dst)?;
         Ok(OpStep::Activation)
     }
@@ -3331,16 +2930,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let name_idx = instr.const_word(0);
         let configurable = function.imm32(instr, 1).unwrap_or(0) != 0;
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_declare_global_var_reg(context, frame, name_idx, configurable)?;
         Ok(OpStep::Activation)
     }
@@ -3379,16 +2971,9 @@ impl Interpreter {
         let function_id: u32 = run.function_id;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, ctx) = (instr.reg(0), instr.reg(1));
         let (name_idx, coord) = (instr.const_word(2), instr.imm(3));
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         let value = self.load_lookup_slot_value(
             context,
             function_id,
@@ -3414,13 +2999,6 @@ impl Interpreter {
         let function_id: u32 = run.function_id;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let value_reg = function.reg(instr, 0);
         let ctx = function.reg(instr, 1);
         let name_idx = function
@@ -3428,7 +3006,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?;
         let coord = function.imm32(instr, 3).ok_or(VmError::InvalidOperand)?;
         let fallback = function.imm32(instr, 4).ok_or(VmError::InvalidOperand)?;
-        let frame = &(*top_frame!());
+        let frame = &(*top_frame!(top_ptr));
         let (value, target) = (
             *read_register(frame, value_reg)?,
             *read_register(frame, ctx)?,
@@ -3442,7 +3020,7 @@ impl Interpreter {
             fallback,
             value,
         )?;
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -3458,18 +3036,11 @@ impl Interpreter {
         let function_id: u32 = run.function_id;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, ctx) = (instr.reg(0), instr.reg(1));
         let (name_idx, depth) = (instr.const_word(2), instr.imm(3));
-        let target = *read_register(&(*top_frame!()), ctx)?;
+        let target = *read_register(&(*top_frame!(top_ptr)), ctx)?;
         let value = self.delete_lookup_slot_value(context, function_id, target, name_idx, depth)?;
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -3489,16 +3060,9 @@ impl Interpreter {
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
         let op = run.function.op(instr);
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, ctx) = (instr.reg(0), instr.reg(1));
         let (name_idx, depth) = (instr.const_word(2), instr.imm(3));
-        let target = *read_register(&(*top_frame!()), ctx)?;
+        let target = *read_register(&(*top_frame!(top_ptr)), ctx)?;
         let missing = if op == Op::LoadLookupGlobal {
             otter_bytecode::opcode_schema::BindingMissing::Throw
         } else {
@@ -3519,7 +3083,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -3538,16 +3102,9 @@ impl Interpreter {
         let function_id: u32 = run.function_id;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (value_reg, ctx) = (instr.reg(0), instr.reg(1));
         let (name_idx, mode) = (instr.const_word(2), instr.imm(3));
-        let frame = &(*top_frame!());
+        let frame = &(*top_frame!(top_ptr));
         let (value, target) = (
             *read_register(frame, value_reg)?,
             *read_register(frame, ctx)?,
@@ -3567,7 +3124,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         });
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -3583,19 +3140,12 @@ impl Interpreter {
         let function_id: u32 = run.function_id;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, ctx) = (instr.reg(0), instr.reg(1));
         let (name_idx, depth) = (instr.const_word(2), instr.imm(3));
-        let target = *read_register(&(*top_frame!()), ctx)?;
+        let target = *read_register(&(*top_frame!(top_ptr)), ctx)?;
         let value =
             self.delete_lookup_global_value(context, function_id, target, name_idx, depth)?;
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, value)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -3614,16 +3164,9 @@ impl Interpreter {
         let function_id: u32 = run.function_id;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, ctx) = (instr.reg(0), instr.reg(1));
         let (name_idx, target_imm) = (instr.const_word(2), instr.imm(3));
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         let reference = self.resolve_lookup_ref_value(
             context,
             function_id,
@@ -3649,16 +3192,9 @@ impl Interpreter {
         let function_id: u32 = run.function_id;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (value_reg, reference_reg) = (instr.reg(0), instr.reg(1));
         let (name_idx, mode) = (instr.const_word(2), instr.imm(3));
-        let frame = &(*top_frame!());
+        let frame = &(*top_frame!(top_ptr));
         let (value, reference) = (
             *read_register(frame, value_reg)?,
             *read_register(frame, reference_reg)?,
@@ -3678,7 +3214,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         });
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -3695,18 +3231,11 @@ impl Interpreter {
         let function_id: u32 = run.function_id;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let ctx = instr.reg(0);
         let (name_idx, var_depth) = (instr.const_word(1), instr.imm(2));
-        let target = *read_register(&(*top_frame!()), ctx)?;
+        let target = *read_register(&(*top_frame!(top_ptr)), ctx)?;
         self.declare_eval_var_value(context, function_id, target, name_idx, var_depth)?;
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -3722,22 +3251,15 @@ impl Interpreter {
         let function_id: u32 = run.function_id;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (value_reg, ctx) = (instr.reg(0), instr.reg(1));
         let (name_idx, var_depth) = (instr.const_word(2), instr.imm(3));
-        let frame = &(*top_frame!());
+        let frame = &(*top_frame!(top_ptr));
         let (value, target) = (
             *read_register(frame, value_reg)?,
             *read_register(frame, ctx)?,
         );
         self.store_var_scope_value(context, function_id, target, name_idx, var_depth, value)?;
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -3773,17 +3295,10 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let name_idx = instr.const_word(0);
         let value_reg = instr.reg(1);
         let deletable = function.imm32(instr, 2).unwrap_or(0) != 0;
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_define_global_function_reg(context, frame, name_idx, value_reg, deletable)?;
         Ok(OpStep::Activation)
     }
@@ -3800,16 +3315,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let name_idx = instr.const_word(0);
         let is_const = function.imm32(instr, 1).unwrap_or(0) != 0;
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_declare_global_lex_reg(context, frame, name_idx, is_const)?;
         Ok(OpStep::Activation)
     }
@@ -3853,16 +3361,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let value_reg = instr.reg(0);
         let name_idx = instr.const_word(1);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_init_global_lex_reg(context, frame, value_reg, name_idx)?;
         Ok(OpStep::Activation)
     }
@@ -3902,13 +3403,6 @@ impl Interpreter {
         let top_idx: usize = run.top_idx;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (obj_reg, key_reg, value_reg) = instr.reg3();
         (match self
             .run_define_data_property_regs(context, stack, top_idx, obj_reg, key_reg, value_reg)
@@ -3919,7 +3413,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         });
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -4008,16 +3502,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let src = instr.reg(1);
-        let value = *read_register(&(*top_frame!()), src)?;
+        let value = *read_register(&(*top_frame!(top_ptr)), src)?;
         let result = if value.is_number() {
             value
         } else {
@@ -4029,7 +3516,7 @@ impl Interpreter {
                 }
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -4050,16 +3537,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let src = instr.reg(1);
-        let source = *read_register(&(*top_frame!()), src)?;
+        let source = *read_register(&(*top_frame!(top_ptr)), src)?;
         let result = match self.scalar_value(
             stack,
             context,
@@ -4074,7 +3554,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -4094,16 +3574,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let src = instr.reg(1);
-        let source = *read_register(&(*top_frame!()), src)?;
+        let source = *read_register(&(*top_frame!(top_ptr)), src)?;
         let result = match self.scalar_value(
             stack,
             context,
@@ -4118,7 +3591,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -4171,16 +3644,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -4194,7 +3660,7 @@ impl Interpreter {
                 feedback.record_arith(value, Value::number_i32(delta));
                 feedback.record_arith(result, result);
             }
-            let frame = top_frame!();
+            let frame = top_frame!(top_ptr);
             // SAFETY: `dst` is a schema register.
             unsafe { write_register_unchecked(frame, dst, result) };
             frame.advance_pc_fast();
@@ -4222,16 +3688,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let name_idx = instr.const_word(0);
         let kind = function.imm32(instr, 1).unwrap_or(0);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_validate_global_decl_reg(context, frame, name_idx, kind)?;
         Ok(OpStep::Activation)
     }
@@ -4434,13 +3893,6 @@ impl Interpreter {
         let top_idx: usize = run.top_idx;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (array_reg, iterable_reg) = (instr.reg(0), instr.reg(1));
         match self.spread_append(context, stack, top_idx, array_reg, iterable_reg) {
             Ok(()) => {}
@@ -4449,7 +3901,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         }
-        top_frame!().advance_pc()?;
+        top_frame!(top_ptr).advance_pc()?;
         Ok(OpStep::Activation)
     }
 
@@ -4518,16 +3970,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let name_idx = instr.const_word(1);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_symbol_load_reg(context, frame, dst, name_idx)?;
         Ok(OpStep::Activation)
     }
@@ -4543,16 +3988,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let name_idx = instr.const_word(1);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_temporal_load_reg(context, frame, dst, name_idx)?;
         Ok(OpStep::Activation)
     }
@@ -4625,18 +4063,11 @@ impl Interpreter {
         let jit_installed: bool = run.jit_installed;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let offset = instr.imm(0);
         // `top_idx` is `stack.len() - 1` this tick and no frame was
         // pushed, so the top frame is the executing one.
         // SAFETY: the `is_at_floor` guard proved a live top frame.
-        apply_branch(top_frame!(), offset, &self.interrupt)?;
+        apply_branch(top_frame!(top_ptr), offset, &self.interrupt)?;
         if jit_installed
             && offset < 0
             && let Some(entry) = {
@@ -4669,18 +4100,11 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let offset = instr.imm(0);
         let cond = instr.reg(1);
         // SAFETY: live top frame (see the `is_at_floor` guard); it is
         // the executing frame this tick.
-        let frame = top_frame!();
+        let frame = top_frame!(top_ptr);
         // `cond` is a schema register; SAFETY: see `read_register_unchecked`.
         let taken = unsafe { read_register_unchecked(frame, cond) }.to_boolean(&self.gc_heap);
         if jit_installed && let Some(cell) = feedback {
@@ -4723,18 +4147,11 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let offset = instr.imm(0);
         let cond = instr.reg(1);
         // SAFETY: live top frame (see the `is_at_floor` guard); it is
         // the executing frame this tick.
-        let frame = top_frame!();
+        let frame = top_frame!(top_ptr);
         // `cond` is a schema register; SAFETY: see `read_register_unchecked`.
         let taken = !unsafe { read_register_unchecked(frame, cond) }.to_boolean(&self.gc_heap);
         if jit_installed && let Some(cell) = feedback {
@@ -4767,18 +4184,11 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let offset = instr.imm(0);
         let cond = instr.reg(1);
         // SAFETY: live top frame (see the `is_at_floor` guard); it is
         // the executing frame this tick.
-        let frame = top_frame!();
+        let frame = top_frame!(top_ptr);
         // SAFETY: see `read_register_unchecked`.
         if unsafe { read_register_unchecked(frame, cond) }.is_nullish() {
             apply_branch(frame, offset, &self.interrupt)?;
@@ -4798,18 +4208,11 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let idx = instr.imm(1) as u16;
         // SAFETY: live top frame (see the `is_at_floor` guard); it is
         // the executing frame this tick.
-        let frame = top_frame!();
+        let frame = top_frame!(top_ptr);
         // Both operands are schema registers (the `Imm32` is a local
         // index), bounded by the build-time verifier.
         // SAFETY: see `read_register_unchecked`.
@@ -4831,18 +4234,11 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let src = instr.reg(0);
         let idx = instr.imm(1) as u16;
         // SAFETY: live top frame (see the `is_at_floor` guard); it is
         // the executing frame this tick.
-        let frame = top_frame!();
+        let frame = top_frame!(top_ptr);
         // SAFETY: see `Op::LoadLocal`.
         unsafe {
             let value = read_register_unchecked(frame, src);
@@ -4883,16 +4279,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -4907,7 +4296,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -4944,16 +4333,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -4968,7 +4350,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -5006,16 +4388,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -5030,7 +4405,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -5078,16 +4453,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -5102,7 +4470,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -5150,16 +4518,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -5174,7 +4535,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -5210,17 +4571,10 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, lhs) = (instr.reg(0), instr.reg(1));
         let imm = instr.imm(2);
         // SAFETY: live top frame (see the `is_at_floor` guard).
-        self.run_equal_imm(top_frame!(), dst, lhs, imm, false, feedback)?;
+        self.run_equal_imm(top_frame!(top_ptr), dst, lhs, imm, false, feedback)?;
         Ok(OpStep::Activation)
     }
 
@@ -5239,17 +4593,10 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, lhs) = (instr.reg(0), instr.reg(1));
         let imm = instr.imm(2);
         // SAFETY: live top frame (see the `is_at_floor` guard).
-        self.run_equal_imm(top_frame!(), dst, lhs, imm, true, feedback)?;
+        self.run_equal_imm(top_frame!(top_ptr), dst, lhs, imm, true, feedback)?;
         Ok(OpStep::Activation)
     }
 
@@ -5271,16 +4618,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -5295,7 +4635,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -5343,16 +4683,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -5367,7 +4700,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -5415,16 +4748,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -5439,7 +4765,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -5487,16 +4813,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -5511,7 +4830,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -5559,16 +4878,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -5583,7 +4895,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -5631,16 +4943,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -5655,7 +4960,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -5703,16 +5008,9 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         macro_rules! register {
             ($index:expr) => {{
-                let frame: &Frame = top_frame!();
+                let frame: &Frame = top_frame!(top_ptr);
                 // SAFETY: see `read_register_unchecked`.
                 unsafe { read_register_unchecked(frame, $index) }
             }};
@@ -5727,7 +5025,7 @@ impl Interpreter {
                             feedback.record_arith(result, result);
                         }
                     }
-                    let frame = top_frame!();
+                    let frame = top_frame!(top_ptr);
                     // SAFETY: `dst` is a schema register.
                     unsafe { write_register_unchecked(frame, $dst, result) };
                     frame.advance_pc_fast();
@@ -5846,19 +5144,16 @@ impl Interpreter {
         } else {
             None
         };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let (dst, lhs, rhs) = instr.reg3();
         match op {
             // SAFETY (frame-based arms): live top frame (see the
             // `is_at_floor` guard); it is the executing frame.
-            Op::Equal => self.run_equal_regs(top_frame!(), dst, lhs, rhs, false, feedback)?,
-            Op::NotEqual => self.run_equal_regs(top_frame!(), dst, lhs, rhs, true, feedback)?,
+            Op::Equal => {
+                self.run_equal_regs(top_frame!(top_ptr), dst, lhs, rhs, false, feedback)?
+            }
+            Op::NotEqual => {
+                self.run_equal_regs(top_frame!(top_ptr), dst, lhs, rhs, true, feedback)?
+            }
             Op::LooseEqual => {
                 (match self
                     .run_loose_equal_regs(stack, context, top_ptr, dst, lhs, rhs, false, feedback)
@@ -5886,8 +5181,8 @@ impl Interpreter {
                 });
             }
             Op::SameValue => {
-                let lhs = *read_register(&(*top_frame!()), lhs)?;
-                let rhs = *read_register(&(*top_frame!()), rhs)?;
+                let lhs = *read_register(&(*top_frame!(top_ptr)), lhs)?;
+                let rhs = *read_register(&(*top_frame!(top_ptr)), rhs)?;
                 let result = match self.scalar_value(
                     stack,
                     context,
@@ -5904,7 +5199,7 @@ impl Interpreter {
                         return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
                     }
                 };
-                let frame = &mut (*top_frame!());
+                let frame = &mut (*top_frame!(top_ptr));
                 write_register(frame, dst, result)?;
                 frame.advance_pc_fast();
             }
@@ -5925,16 +5220,9 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let src = instr.reg(1);
-        let source = *read_register(&(*top_frame!()), src)?;
+        let source = *read_register(&(*top_frame!(top_ptr)), src)?;
         let result = match self.scalar_value(
             stack,
             context,
@@ -5949,7 +5237,7 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         };
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         write_register(frame, dst, result)?;
         frame.advance_pc()?;
         Ok(OpStep::Activation)
@@ -5983,17 +5271,10 @@ impl Interpreter {
         let top_ptr: *mut Frame = run.top_ptr;
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let dst = instr.reg(0);
         let function_index = instr.const_word(1);
         let ctx = instr.reg(2);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_make_closure_regs(context, frame, dst, function_index, ctx)?;
         Ok(OpStep::Activation)
     }
@@ -6043,15 +5324,8 @@ impl Interpreter {
         // SAFETY: the loop fetched this index.
         let instr = unsafe { run.function.instr_at_index(idx).unwrap_unchecked() };
         let op = run.function.op(instr);
-        macro_rules! top_frame {
-            () => {
-                // SAFETY: `top_ptr` is this run's live activation; each use
-                // is a fresh, short borrow.
-                unsafe { &mut *top_ptr }
-            };
-        }
         let operands = function.operand_view(instr);
-        let frame = &mut (*top_frame!());
+        let frame = &mut (*top_frame!(top_ptr));
         self.run_static_call_operands(op, context, frame, operands)?;
         Ok(OpStep::Activation)
     }

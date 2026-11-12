@@ -112,19 +112,13 @@ pub(crate) fn restore_run_terminals(ctx: &NativeCtx<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::os::fd::AsRawFd;
+    thread_local! {
+        static RESTORED: std::cell::RefCell<Vec<(RawFd, Vec<u8>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
 
-    /// Stands in for the platform layer: "puts a mode back" by writing its
-    /// bytes to the descriptor, so the test reads what came back, in order.
     fn write_back(fd: RawFd, mode: &[u8]) -> Result<(), i32> {
-        let failed = |error: std::io::Error| error.raw_os_error().unwrap_or(-1);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(format!("/dev/fd/{fd}"))
-            .map_err(failed)?
-            .write_all(mode)
-            .map_err(failed)
+        RESTORED.with_borrow_mut(|restored| restored.push((fd, mode.to_vec())));
+        Ok(())
     }
 
     fn mode(bytes: &'static [u8]) -> impl FnOnce(RawFd) -> Result<Vec<u8>, i32> {
@@ -133,19 +127,19 @@ mod tests {
 
     #[test]
     fn first_modes_go_back_in_reverse_order_once() {
-        let (mut handed_back, first) = std::io::pipe().expect("pipe");
-        let second = first.try_clone().expect("second descriptor");
+        RESTORED.with_borrow_mut(Vec::clear);
+        let (first, second) = (4, 5);
         let modes = TerminalModes::default();
 
         modes
-            .keep(first.as_raw_fd(), mode(b"first "), write_back)
+            .keep(first, mode(b"first "), write_back)
             .expect("first change");
         // Later changes keep the first mode and read nothing.
         modes
-            .keep(first.as_raw_fd(), |_| panic!("read again"), write_back)
+            .keep(first, |_| panic!("read again"), write_back)
             .expect("later change");
         modes
-            .keep(second.as_raw_fd(), mode(b"second "), write_back)
+            .keep(second, mode(b"second "), write_back)
             .expect("change through a second descriptor");
         // A mode that cannot be read is not kept.
         assert_eq!(modes.keep(-1, |_| Err(9), write_back), Err(9));
@@ -153,9 +147,11 @@ mod tests {
         modes.restore();
         // The record is spent: a second hand-back has nothing to give.
         modes.restore();
-        drop((first, second));
-        let mut text = String::new();
-        handed_back.read_to_string(&mut text).expect("read");
-        assert_eq!(text, "second first ");
+        RESTORED.with_borrow(|restored| {
+            assert_eq!(
+                restored.as_slice(),
+                &[(second, b"second ".to_vec()), (first, b"first ".to_vec())]
+            );
+        });
     }
 }

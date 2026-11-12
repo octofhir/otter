@@ -381,14 +381,24 @@ impl ElementSlabBody {
             DenseElementKind::Empty => unreachable!("materialized slab cannot be empty"),
             DenseElementKind::Tagged => {
                 // SAFETY: both ranges lie inside the reserved tagged words.
-                unsafe { std::ptr::copy(self.values_ptr().add(from), self.values_ptr().add(to), count) };
+                unsafe {
+                    std::ptr::copy(
+                        self.values_ptr().add(from),
+                        self.values_ptr().add(to),
+                        count,
+                    )
+                };
                 self.mark_dirty_range(to, to + count);
             }
             DenseElementKind::PackedDouble => {
                 // SAFETY: both ranges lie inside the reserved numeric words;
                 // packed storage has no hole bit to carry.
                 unsafe {
-                    std::ptr::copy(self.doubles_ptr().add(from), self.doubles_ptr().add(to), count);
+                    std::ptr::copy(
+                        self.doubles_ptr().add(from),
+                        self.doubles_ptr().add(to),
+                        count,
+                    );
                 }
             }
             DenseElementKind::HoleyDouble => {
@@ -406,7 +416,9 @@ impl ElementSlabBody {
                         }
                     } else {
                         // SAFETY: both indices lie inside the numeric words.
-                        unsafe { *self.doubles_ptr().add(target) = *self.doubles_ptr().add(source) };
+                        unsafe {
+                            *self.doubles_ptr().add(target) = *self.doubles_ptr().add(source)
+                        };
                         if self.hole_bit(target) {
                             self.clear_hole_bit(target);
                         }

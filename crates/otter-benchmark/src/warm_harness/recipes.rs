@@ -223,7 +223,11 @@ fn prepare_program(source: &WarmSource, program: &Program<'_>) -> Result<Plan, W
             let Argument::StringLiteral(literal) = &call.arguments[0] else {
                 return Err(reject("zlib initializer input is not a literal"));
             };
-            let decoded = literal.value.to_string();
+            let decoded = literal
+                .value
+                .as_str()
+                .ok_or_else(|| reject("zlib initializer must be UTF-8 source"))?
+                .to_owned();
             let integrity = inspect_zlib(&decoded)?;
             plan.embedded.push(WarmEmbeddedScript {
                 container: ast::piece(&source.original, literal.span, WarmPieceRole::Integrity)?,
@@ -310,7 +314,7 @@ impl<'a> Visit<'a> for InputStrings {
             && id.name == "compiler_input"
             && let Some(Expression::StringLiteral(literal)) = &it.init
         {
-            self.input = Some(literal.value.to_string());
+            self.input = literal.value.as_str().map(str::to_owned);
         }
         walk::walk_variable_declarator(self, it);
     }

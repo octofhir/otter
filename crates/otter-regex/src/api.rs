@@ -205,8 +205,8 @@ impl Regex {
         })
     }
 
-    /// Compile a pattern given as a `&str`. Convenience for callers that only
-    /// need parse-time validation (e.g. a literal validator).
+    /// Compile a pattern given as a `&str`. For syntax validation without a
+    /// matcher, use [`crate::validate_utf16`].
     pub fn compile_str(pattern: &str, flags: Flags) -> Result<Self, RegexError> {
         let units: Vec<u16> = pattern.encode_utf16().collect();
         Self::compile_utf16(&units, flags)

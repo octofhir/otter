@@ -62,14 +62,14 @@ pub(crate) fn compile_import(
     // abrupt completion from either propagates synchronously before
     // any import machinery runs.
     let spec_reg = match unwrap_ts_expr(&imp.source) {
-        Expression::StringLiteral(lit) => {
+        Expression::StringLiteral(lit) if lit.value.as_str().is_some() => {
             // Literal import.defer in module code: linker resolves
             // it during fragment merge, opcode reads the deferred
             // namespace and wraps it in a fulfilled promise. In
             // script code there is no module graph state, so
             // it uses the same host dynamic-import promise path as
             // import().
-            let specifier = lit.value.as_str().to_string();
+            let specifier = lit.value.as_str().expect("UTF-8 literal guard").to_owned();
             // Resolve to the canonical target URL so the runtime's
             // per-target deferred-namespace registry hands back the
             // SAME object a static `import defer` of this module

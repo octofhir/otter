@@ -217,8 +217,7 @@ impl Codegen<'_> {
                 dictionary,
                 ..
             } => {
-                let table =
-                    dictionary.then(|| [assigned.gp_temps[1], assigned.gp_temps[2]]);
+                let table = dictionary.then(|| [assigned.gp_temps[1], assigned.gp_temps[2]]);
                 self.emit_named_program(
                     node,
                     byte_pc,

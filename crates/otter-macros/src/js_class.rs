@@ -68,6 +68,8 @@
 //! aliases that hide `Result` are not recognized.
 //!
 //! # Invariants
+//! - Engine types, including inheritance resolver inputs, use the one hidden
+//!   macro-support contract; callers need no direct GC dependency.
 //! - JS names and export shape are explicit at the declaration site;
 //!   the macro never derives a JS name from a Rust identifier.
 //! - Generated glue touches JS values only through `MarshalCx` inside
@@ -1011,7 +1013,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
         glue.extend(quote! {
             fn #parent_proto_ident(
                 global: ::otter_vm::__macro_support::JsObject,
-                heap: &mut ::otter_gc::GcHeap,
+                heap: &mut ::otter_vm::__macro_support::GcHeap,
             ) -> ::otter_vm::__macro_support::JsObject {
                 let parent_name = <#parent as ::otter_vm::__macro_support::marshal::HostClassMeta>::JS_NAME;
                 let ctor = ::otter_vm::__macro_support::object::get(global, heap, parent_name)
@@ -1032,7 +1034,7 @@ fn expand_inner(args: &ClassArgs, class_impl: &mut ItemImpl) -> Result<proc_macr
 
             fn #parent_ctor_ident(
                 global: ::otter_vm::__macro_support::JsObject,
-                heap: &mut ::otter_gc::GcHeap,
+                heap: &mut ::otter_vm::__macro_support::GcHeap,
             ) -> ::otter_vm::__macro_support::Value {
                 let parent_name = <#parent as ::otter_vm::__macro_support::marshal::HostClassMeta>::JS_NAME;
                 ::otter_vm::__macro_support::object::get(global, heap, parent_name)

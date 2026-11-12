@@ -2020,7 +2020,7 @@ mod tests {
         ));
         module.functions[0].spans = crate::SpanTable::default();
         module.template_sites.push(TemplateSite {
-            cooked: vec![Some("x".to_string())],
+            cooked: vec![Some(vec![0x78])],
             raw: Vec::new(),
         });
         assert!(matches!(

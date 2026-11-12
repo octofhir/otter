@@ -1,14 +1,12 @@
-//! In-process differential gate for the template compiler tier.
+//! In-process differential gate for the template tier through the embedding API.
 //!
-//! Runs every committed `otter-difftest` corpus program through one runtime
-//! per [`JitSelection`] and compares completion values, console output, and
-//! error diagnostics against the interpreter-only semantic oracle. This is the
-//! tier-selected counterpart of the process-isolated `otter-difftest` binary:
-//! the template tier has no CLI or environment surface, so the structured
-//! builder selection is the only way to drive it end to end.
+//! # Contents
+//! - Every committed difftest corpus program runs in both interpreter and template tiers.
+//! - Completion, console output and errors are compared; progress identifies slow cases.
 //!
-//! Corpus loops are sized to cross the production cost model, so the test does
-//! not replace policy decisions with a test-only threshold.
+//! # Invariants
+//! - Production tier policy is unchanged; corpus loops must earn native admission.
+//! - Each observation owns a fresh runtime. `otter-difftest` covers process isolation.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -80,7 +78,9 @@ fn template_tier_matches_the_interpreter_oracle_on_the_corpus() {
     for path in corpus_files() {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let source = std::fs::read_to_string(&path).expect("read corpus source");
+        eprintln!("CASE {name}: interpreter");
         let oracle = run(&source, JitSelection::InterpreterOnly);
+        eprintln!("CASE {name}: template");
         let template = run(&source, JitSelection::Template);
         if template != oracle {
             failures.push(format!(

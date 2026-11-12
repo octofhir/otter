@@ -10,6 +10,11 @@ build = "build.rs"
 [[bin]]
 name = "otter-regex-bench"
 path = "src/bin/bench.rs"
+required-features = ["runtime"]
+
+[[test]]
+name = "matching"
+required-features = ["runtime"]
 
 # Dependency allowlist — ZERO Otter crates. The dependency edge is one-way:
 # the VM consumes this engine; this engine never reaches back into the VM/GC.
@@ -18,27 +23,29 @@ path = "src/bin/bench.rs"
 # UCD `\p{...}` property data (General_Category, Script, Script_Extensions,
 # binary properties). ICU4X ships the tables under the permissive Unicode
 # license; already present elsewhere in the workspace dependency graph.
-icu_properties = { version = "2.1", features = ["compiled_data", "alloc"] }
+icu_properties = { version = "2.1", features = ["compiled_data", "alloc"], optional = true }
 # Unicode Simple Case Folding for `i`+`u`/`v` matching (UCD CaseFolding.txt).
-icu_casemap = { version = "2", features = ["compiled_data"] }
+icu_casemap = { version = "2", features = ["compiled_data"], optional = true }
 # Identifier-name validation for named capture groups.
 unicode-ident = "1"
 # Inline capture-slot storage so the backtracker snapshots small capture
 # arrays on its stack without a heap allocation per alternation/quantifier.
-smallvec = { workspace = true }
+smallvec = { workspace = true, optional = true }
 # Vectorized byte and substring search for the scan prefilters over one-byte
 # subjects; already present elsewhere in the workspace dependency graph.
-memchr = "2"
+memchr = { version = "2", optional = true }
 # Machine-code assembly and executable mappings for the native matcher tier;
 # already present elsewhere in the workspace dependency graph.
-dynasm = "5"
-dynasmrt = "5"
+dynasm = { version = "5", optional = true }
+dynasmrt = { version = "5", optional = true }
 
 [features]
-# `unicode` pulls in the property-escape data path. Default-on; a future slim
-# build can drop it — the core matcher needs no property tables.
-default = ["unicode"]
-unicode = []
+# `unicode` enables property escapes and their ICU tables. Otter host compilers
+# retain it; disabling the matcher must not reduce the accepted pattern grammar.
+default = ["unicode", "runtime"]
+# Host compilers share the parser without compiling the matcher or native tier.
+runtime = ["dep:icu_casemap", "dep:smallvec", "dep:memchr", "dep:dynasm", "dep:dynasmrt"]
+unicode = ["dep:icu_properties"]
 
 # The workspace `forbid(unsafe_code)` is lifted for this crate: the native
 # matcher tier emits machine code and calls into it. Everything else follows

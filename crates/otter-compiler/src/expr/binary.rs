@@ -329,8 +329,8 @@ fn compile_binary_to(
     // ToPropertyKey is itself, so only the object operand is evaluated.
     if op == Op::HasProperty
         && let Expression::StringLiteral(name) = &b.left
-        && !name.lone_surrogates
-        && is_named_key(name.value.as_str())
+        && let Some(name) = name.value.as_str()
+        && is_named_key(name)
     {
         let object = compile_expr(cx, &b.right, span)?;
         cx.reset_scratch(mark);
@@ -338,7 +338,7 @@ fn compile_binary_to(
             Some(dst) => dst,
             None => crate::expr::unary::distinct_result_register(cx, object),
         };
-        let name = cx.intern_string_constant(name.value.as_str());
+        let name = cx.intern_string_constant(name);
         cx.emit(
             Op::HasNamedProperty,
             [
@@ -510,15 +510,14 @@ fn typeof_literal_pair<'a, 'b>(
         let Expression::StringLiteral(literal) = unwrap(literal_side) else {
             return None;
         };
-        let kind = otter_bytecode::TypeOfKind::from_name(literal.value.as_str())?;
+        let kind = otter_bytecode::TypeOfKind::from_name(literal.value.as_str()?)?;
         Some((unary.as_ref(), kind))
     };
     pair(left, right).or_else(|| pair(right, left))
 }
 
 /// Whether a literal key is a named property rather than an array index,
-/// spelled exactly (a lone surrogate reaches the lossy oxc spelling as
-/// U+FFFD and keeps the general path).
+/// spelled as UTF-8; an unpaired surrogate keeps the general UTF-16 path.
 fn is_named_key(key: &str) -> bool {
     !key.contains('\u{FFFD}')
         && !key

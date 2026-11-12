@@ -15,6 +15,7 @@
 //! - User-visible coercion and replacement remain observable.
 //! - Optimizing results match the interpreter oracle exactly.
 //! - Warm method hits use generated code without per-call runtime transitions.
+//! - Reduced named calls leave eagerly on identity misses; getters and calls do not replay.
 //! - Optimizing generations count no entries: a probe ran there when it
 //!   entered no Template generation and either performed no interpreter
 //!   property load (a hit) or crossed the committed method boundary (a miss).
@@ -305,21 +306,6 @@ fn guarded_math_matrix(source: &str) -> String {
     results.remove(0)
 }
 
-fn assert_math_method_probe(
-    runtime: &mut Runtime,
-    source: &str,
-    expected: &str,
-    expect_cold: bool,
-) {
-    let before = runtime.execution_stats();
-    assert_eq!(
-        math_completion(runtime, source, "guarded-math-reuse-probe.js"),
-        expected
-    );
-    let after = runtime.execution_stats();
-    assert_math_method_delta(before, after, source, expect_cold);
-}
-
 /// Optimizing generations count no entries. A hit probe called from the
 /// interpreter ran in the optimized generation when it entered no Template
 /// generation and the interpreter performed none of its property loads.
@@ -343,15 +329,11 @@ fn assert_no_template_entry(
     );
 }
 
-/// A cold miss proves optimized execution by calling the method it read
-/// without an interpreted property load: through the committed method
-/// boundary, which only generated code uses, or by the generation's own call
-/// of the replaced method. A hit proves it by [`assert_ran_optimized`].
-fn assert_math_method_delta(
+/// Mapped arguments retain the committed method path, unlike reduced named loads.
+fn assert_committed_math_miss(
     before: RuntimeExecutionStats,
     after: RuntimeExecutionStats,
     source: &str,
-    expect_cold: bool,
 ) {
     assert_no_template_entry(before, after, source);
     assert_eq!(
@@ -362,75 +344,67 @@ fn assert_math_method_delta(
         after.jit_generated_call_deopts, before.jit_generated_call_deopts,
         "{source}"
     );
-    if expect_cold {
-        let committed =
-            after.jit_reentrant_stub_transitions > before.jit_reentrant_stub_transitions;
-        let called = after.native_calls > before.native_calls
-            && (after.property_load_hits, after.property_load_misses)
-                == (before.property_load_hits, before.property_load_misses);
-        assert!(
-            committed || called,
-            "the miss must call the replaced method from optimized code: {source}"
-        );
-    } else {
-        assert_ran_optimized(before, after, source);
-        assert_eq!(
-            after.jit_code_generations, before.jit_code_generations,
-            "{source}"
-        );
-        assert_eq!(
-            (
-                after.jit_runtime_calls - before.jit_runtime_calls,
-                after.jit_to_rust_call_transitions - before.jit_to_rust_call_transitions,
-                after.jit_reentrant_stub_transitions - before.jit_reentrant_stub_transitions,
-            ),
-            (0, 0, 0),
-            "the same optimized generation must regain its hot hit: {source}"
-        );
-    }
+    let committed = after.jit_reentrant_stub_transitions > before.jit_reentrant_stub_transitions;
+    let called = after.native_calls > before.native_calls
+        && (after.property_load_hits, after.property_load_misses)
+            == (before.property_load_hits, before.property_load_misses);
+    assert!(
+        committed || called,
+        "the miss must call the current method from optimized code: {source}"
+    );
 }
 
 #[test]
-fn guarded_math_method_cold_misses_rejoin_without_deopt() {
+fn guarded_math_method_identity_miss_exits_before_calling_the_replacement() {
     let mut runtime = warmed_math_runtime(JitSelection::ProductionTiered);
-    // The declared `abs` entry completes every Number, so `INT32_MIN` is a
-    // hit whose result leaves the Int32 range rather than a miss.
-    assert_math_method_probe(
-        &mut runtime,
-        "guardedInt32MathAbs(Math, -2147483648);",
-        "2147483648",
-        false,
-    );
-    assert_math_method_probe(&mut runtime, "guardedInt32MathAbs(Math, -7);", "7", false);
+    for (source, expected) in [
+        ("guardedInt32MathAbs(Math, -2147483648);", "2147483648"),
+        ("guardedInt32MathAbs(Math, -7);", "7"),
+    ] {
+        let before = runtime.execution_stats();
+        assert_eq!(
+            math_completion(&mut runtime, source, "math-hot.js"),
+            expected
+        );
+        assert_ran_optimized(before, runtime.execution_stats(), source);
+    }
     math_completion(
         &mut runtime,
-        "var guardedOriginalAbs = Math.abs; Math.abs = Math.max;",
-        "guarded-math-replace.js",
+        "var originalAbs = Math.abs; var replacements = 0; Math.abs = x => { replacements++; return x; };",
+        "math-replace.js",
     );
-    assert_math_method_probe(&mut runtime, "guardedInt32MathAbs(Math, -7);", "-7", true);
-    assert_math_method_probe(
-        &mut runtime,
-        "guardedInt32InheritedAbs(guardedInheritedMath, -7);",
-        "-7",
-        true,
+    let before = runtime.execution_stats();
+    assert_eq!(
+        math_completion(
+            &mut runtime,
+            "guardedInt32MathAbs(Math, -7);",
+            "math-miss.js"
+        ),
+        "-7"
     );
-    math_completion(
-        &mut runtime,
-        "Math.abs = guardedOriginalAbs;",
-        "guarded-math-restore.js",
+    // Graph's emit_reduced_method_call emits CheckNative with an eager exit.
+    assert!(runtime.execution_stats().jit_optimized_deopts > before.jit_optimized_deopts);
+    assert_eq!(
+        math_completion(
+            &mut runtime,
+            "JSON.stringify([guardedInt32InheritedAbs(guardedInheritedMath, -7), replacements]);",
+            "math-inherited.js"
+        ),
+        "[-7,2]"
     );
-    assert_math_method_probe(&mut runtime, "guardedInt32MathAbs(Math, -7);", "7", false);
-    assert_math_method_probe(
-        &mut runtime,
-        "guardedInt32InheritedAbs(guardedInheritedMath, -7);",
-        "7",
-        // Restoring a value cannot revive this generation's invalidated cell.
-        true,
+    math_completion(&mut runtime, "Math.abs = originalAbs;", "math-restore.js");
+    assert_eq!(
+        math_completion(
+            &mut runtime,
+            "JSON.stringify([guardedInt32MathAbs(Math, -7), guardedInt32InheritedAbs(guardedInheritedMath, -7), replacements]);",
+            "math-restored.js"
+        ),
+        "[7,7,2]"
     );
 }
 
 #[test]
-fn guarded_math_method_accessor_overrides_reenter_once_without_deopt() {
+fn guarded_math_method_accessor_overrides_run_once() {
     let mut runtime = warmed_math_runtime(JitSelection::ProductionTiered);
     math_completion(
         &mut runtime,
@@ -454,9 +428,7 @@ Object.defineProperty(Math, "abs", {
     .into_iter()
     .enumerate()
     {
-        let before = runtime.execution_stats();
         let result = math_completion(&mut runtime, source, "guarded-math-accessor-probe.js");
-        let after = runtime.execution_stats();
         assert_eq!(result, "7");
         assert_eq!(
             math_completion(
@@ -467,17 +439,6 @@ Object.defineProperty(Math, "abs", {
             (index + 1).to_string(),
             "the getter must execute once before considering boundary telemetry: {source}"
         );
-        if index < 2 {
-            assert_math_method_delta(before, after, source, true);
-        } else {
-            // The first cold lookup records changed holder shapes and may
-            // invalidate that caller through the ordinary feedback policy.
-            assert_eq!(after.jit_optimized_deopts, before.jit_optimized_deopts);
-            assert_eq!(
-                after.jit_generated_call_deopts,
-                before.jit_generated_call_deopts
-            );
-        }
     }
     assert_eq!(
         math_completion(
@@ -566,7 +527,7 @@ for (let warm = 0; warm < 4010; warm++) invokeMappedMath(mappedMath.receiver);
         );
         let after = runtime.execution_stats();
         if selection == JitSelection::ProductionTiered {
-            assert_math_method_delta(before, after, "mapped Math.max replacement", true);
+            assert_committed_math_miss(before, after, "mapped Math.max replacement");
         }
     }
 }

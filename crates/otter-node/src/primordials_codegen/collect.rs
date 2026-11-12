@@ -183,7 +183,7 @@ fn is_primordial(expression: &Expression<'_>) -> Option<Span> {
 fn literal_key(key: &PropertyKey<'_>, computed: bool) -> Option<String> {
     match key {
         PropertyKey::StaticIdentifier(identifier) if !computed => Some(identifier.name.to_string()),
-        PropertyKey::StringLiteral(literal) => Some(literal.value.to_string()),
+        PropertyKey::StringLiteral(literal) => literal.value.as_str().map(str::to_owned),
         _ => None,
     }
 }
@@ -391,9 +391,13 @@ impl<'a> Visit<'a> for Uses<'_> {
         if let Some(span) = is_primordial(&member.object) {
             self.allow(span);
             match &member.expression {
-                Expression::StringLiteral(literal) => {
-                    self.note(literal.value.as_str(), member.span, "literal-member")
-                }
+                Expression::StringLiteral(literal) => match literal.value.as_str() {
+                    Some(name) => self.note(name, member.span, "literal-member"),
+                    None => self.fail(
+                        member.span,
+                        "primordial name contains an unpaired surrogate",
+                    ),
+                },
                 Expression::Identifier(identifier)
                     if identifier.name == "fallback" && self.dynamic_proved =>
                 {

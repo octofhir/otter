@@ -38,6 +38,7 @@ impl CodePointSet {
 
     /// Build from an iterator of inclusive ranges, normalising once. Cheap when
     /// the input is already sorted and disjoint (e.g. a UCD property table).
+    #[cfg(any(feature = "runtime", feature = "unicode"))]
     pub(crate) fn from_ranges(iter: impl Iterator<Item = RangeInclusive<u32>>) -> Self {
         let mut s = Self {
             ranges: iter.collect(),
@@ -48,12 +49,14 @@ impl CodePointSet {
 
     /// The sorted, disjoint ranges.
     #[must_use]
+    #[cfg(any(feature = "runtime", test))]
     pub(crate) fn ranges(&self) -> &[RangeInclusive<u32>] {
         &self.ranges
     }
 
     /// Whether the set has no members.
     #[must_use]
+    #[cfg(feature = "runtime")]
     pub(crate) fn is_empty(&self) -> bool {
         self.ranges.is_empty()
     }
@@ -94,6 +97,7 @@ impl CodePointSet {
 
     /// Whether `cp` is a member (binary search over disjoint ranges).
     #[must_use]
+    #[cfg(any(feature = "runtime", test))]
     pub(crate) fn contains(&self, cp: u32) -> bool {
         self.ranges
             .binary_search_by(|r| {
@@ -183,6 +187,7 @@ pub(crate) struct ClassSet {
     /// it instead of a binary search over `code_points` for the dominant ASCII
     /// range. Zero until finalized, so every compiled class must be finalized
     /// before execution (the lowering pass does this for every `Insn::Class`).
+    #[cfg(feature = "runtime")]
     pub(crate) ascii_lo: u128,
 }
 
@@ -193,6 +198,7 @@ impl ClassSet {
         Self {
             code_points,
             strings: Vec::new(),
+            #[cfg(feature = "runtime")]
             ascii_lo: 0,
         }
     }
@@ -239,6 +245,7 @@ impl ClassSet {
                 .filter(|s| other.strings.contains(*s))
                 .cloned()
                 .collect(),
+            #[cfg(feature = "runtime")]
             ascii_lo: 0,
         }
     }
@@ -255,6 +262,7 @@ impl ClassSet {
                 .filter(|s| !other.strings.contains(*s))
                 .cloned()
                 .collect(),
+            #[cfg(feature = "runtime")]
             ascii_lo: 0,
         }
     }
@@ -267,10 +275,14 @@ impl ClassSet {
         ClassSet {
             code_points: self.code_points.negate(),
             strings: Vec::new(),
+            #[cfg(feature = "runtime")]
             ascii_lo: 0,
         }
     }
+}
 
+#[cfg(feature = "runtime")]
+impl ClassSet {
     /// Close the set under non-unicode case equivalence: add every BMP code
     /// unit whose canonical form ([`crate::casefold::canonicalize`]) is that
     /// of a member. A plain membership test is then §22.2.2.9

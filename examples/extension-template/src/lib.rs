@@ -21,6 +21,8 @@
 //!
 //! # Invariants
 //! - JS names are explicit at every declaration site.
+//! - The consumer depends on runtime/macros only, never directly on VM/GC.
+//!   Its build checks the generated-code dependency boundary.
 //! - Bodies exchange plain Rust data; the generated glue owns GC
 //!   rooting, prototype linkage, and promise plumbing. Verify any new
 //!   surface under `OTTER_GC_STRESS=1..16` (see the crate's tests).
@@ -28,6 +30,8 @@
 //! # See also
 //! - docs site: *Declarative Bindings: Classes, Namespaces,
 //!   Extensions* and *Embedding: Writing an Extension*.
+
+#![forbid(unsafe_code)]
 
 // Binding crates resolve the macro-generated `::otter_vm::…` paths
 // through this alias — the established linking convention.

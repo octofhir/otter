@@ -2258,8 +2258,8 @@ pub struct ClassHintSite {
 /// plus the raw spellings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TemplateSite {
-    /// Cooked values; `None` = invalid escape (undefined).
-    pub cooked: Vec<Option<String>>,
+    /// Exact UTF-16 cooked values; `None` = invalid escape (undefined).
+    pub cooked: Vec<Option<Vec<u16>>>,
     /// Raw source spellings.
     pub raw: Vec<String>,
 }
@@ -2904,14 +2904,14 @@ impl BytecodeModule {
             total = total
                 .saturating_add(
                     (site.cooked.capacity() as u64)
-                        .saturating_mul(std::mem::size_of::<Option<String>>() as u64),
+                        .saturating_mul(std::mem::size_of::<Option<Vec<u16>>>() as u64),
                 )
                 .saturating_add(
                     (site.raw.capacity() as u64)
                         .saturating_mul(std::mem::size_of::<String>() as u64),
                 );
             for cooked in site.cooked.iter().flatten() {
-                total = total.saturating_add(cooked.capacity() as u64);
+                total = total.saturating_add((cooked.capacity() as u64).saturating_mul(2));
             }
             for raw in &site.raw {
                 total = total.saturating_add(raw.capacity() as u64);

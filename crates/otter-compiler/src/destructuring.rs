@@ -380,7 +380,9 @@ pub(crate) fn destructure_object_inner(
                 oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
                     Some(id.name.as_str().to_string())
                 }
-                oxc_ast::ast::PropertyKey::StringLiteral(lit) => Some(lit.value.to_string()),
+                oxc_ast::ast::PropertyKey::StringLiteral(lit) => {
+                    lit.value.as_str().map(str::to_owned)
+                }
                 oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
                     // §6.1.6.1.13 ToString(Number) — `1` and `1.0` both
                     // key as "1". A value with no settled integer

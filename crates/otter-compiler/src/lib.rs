@@ -116,7 +116,7 @@ pub(crate) use functions::*;
 pub(crate) use hoist::*;
 pub(crate) use module_state::{
     ImportBinding, ModuleBuilder, ModuleState, bytecode_source_kind, find_module_import_binding,
-    import_attribute_type, import_target_constant, module_export_name_to_str,
+    import_target_constant, module_export_name_to_str,
 };
 pub(crate) use params::*;
 pub(crate) use scope::{BindingInfo, BindingStorage, LoopFrame, Scope};
@@ -137,7 +137,8 @@ pub(crate) use otter_bytecode::{
     SpanEntry,
 };
 pub(crate) use otter_syntax::{
-    SourceKind as SyntaxSourceKind, SyntaxDiagnostic, SyntaxError, with_program,
+    SourceKind as SyntaxSourceKind, SyntaxDiagnostic, SyntaxError, module_attribute_type,
+    with_program,
 };
 pub(crate) use oxc_ast::ast::{
     AssignmentOperator, AssignmentTarget, BinaryOperator, Expression, LogicalOperator, Program,

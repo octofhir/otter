@@ -3479,8 +3479,10 @@ impl GcHeap {
         unsafe {
             let header = cage_base().add(cell.0 as usize) as *mut GcHeader;
             let space = crate::page::Page::space_of(header as *const u8);
-            if matches!(space, crate::page::SpaceKind::Large | crate::page::SpaceKind::NewLarge)
-                || (*header).is_remembered()
+            if matches!(
+                space,
+                crate::page::SpaceKind::Large | crate::page::SpaceKind::NewLarge
+            ) || (*header).is_remembered()
             {
                 return None;
             }
@@ -3511,7 +3513,12 @@ impl GcHeap {
     /// checked no closer than that, since reading the interval consumes it.
     fn verify_remembered_complete(&self) {
         let trace_table = &self.trace_table;
-        let old_pages = || self.old_space.pages().iter().chain(self.large_space.pages().iter());
+        let old_pages = || {
+            self.old_space
+                .pages()
+                .iter()
+                .chain(self.large_space.pages().iter())
+        };
         let live = |h: *mut GcHeader| {
             // SAFETY: STW pause; `h` is a walkable header.
             unsafe {

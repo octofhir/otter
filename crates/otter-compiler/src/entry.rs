@@ -1108,7 +1108,7 @@ pub(crate) fn compile_program_parts(
     // `eval` completion value (so `eval('"x"')` evaluates to `"x"`).
     for directive in program.directives {
         let dst = cx.alloc_scratch();
-        let const_idx = cx.intern_string_constant(&directive.expression.value);
+        let const_idx = intern_js_string(&mut cx, directive.expression.value);
         cx.emit(
             Op::LoadString,
             [Operand::Register(dst), Operand::ConstIndex(const_idx)],
@@ -1340,8 +1340,8 @@ pub fn compile_module_program(
                 // specifier read as two formats is two targets and two
                 // records, never one shared binding.
                 let request = ImportRequest::new(
-                    decl.source.value.as_str(),
-                    import_attribute_type(decl.with_clause.as_deref()),
+                    otter_syntax::module_literal_text(&decl.source)?,
+                    module_attribute_type(decl.with_clause.as_deref())?,
                 );
                 // TC39 import defer — `import defer * as ns from "x"`
                 // defers evaluation until the namespace is accessed.
@@ -1405,9 +1405,11 @@ pub fn compile_module_program(
                                     oxc_ast::ast::ModuleExportName::IdentifierReference(id) => {
                                         id.name.as_str().to_string()
                                     }
-                                    oxc_ast::ast::ModuleExportName::StringLiteral(lit) => {
-                                        lit.value.as_str().to_string()
-                                    }
+                                    oxc_ast::ast::ModuleExportName::StringLiteral(lit) => lit
+                                        .value
+                                        .as_str()
+                                        .expect("OXC rejects ill-formed module export names")
+                                        .to_owned(),
                                 };
                                 state.imported_names.insert(
                                     alias,
@@ -1491,8 +1493,8 @@ pub fn compile_module_program(
                 // via `state.import_records.get(src)`.
                 // <https://tc39.es/ecma262/#sec-exports>
                 let request = ImportRequest::new(
-                    decl.source.value.as_str(),
-                    import_attribute_type(decl.with_clause.as_deref()),
+                    otter_syntax::module_literal_text(&decl.source)?,
+                    module_attribute_type(decl.with_clause.as_deref())?,
                 );
                 if !state.import_records.contains_key(&request) {
                     let record = allocate_record();
@@ -1545,8 +1547,8 @@ pub fn compile_module_program(
                 // / `export * as ns from "./other"`. Register the
                 // source so the body-compile arm can look it up.
                 let request = ImportRequest::new(
-                    decl.source.value.as_str(),
-                    import_attribute_type(decl.with_clause.as_deref()),
+                    otter_syntax::module_literal_text(&decl.source)?,
+                    module_attribute_type(decl.with_clause.as_deref())?,
                 );
                 if !state.import_records.contains_key(&request) {
                     let record = allocate_record();
@@ -1973,7 +1975,7 @@ pub fn compile_module_program_to_module(
     host: &ModuleHostInfo,
     options: CompileOptions,
 ) -> Result<CompiledModule, CompileError> {
-    let module_metadata = collect_module_metadata(program, host);
+    let module_metadata = collect_module_metadata(program, host)?;
     let bytecode = compile_module_program(program, source_kind, host, options)?;
     let mut metadata = CompiledModuleMetadata::span_only_from_bytecode_with_source(
         &bytecode,

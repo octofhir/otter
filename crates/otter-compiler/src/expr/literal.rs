@@ -34,12 +34,7 @@ pub(crate) fn compile_string_literal_into(
     destination: u16,
 ) -> Result<u16, CompileError> {
     let _ = span;
-    let const_idx = if lit.lone_surrogates {
-        let utf16 = decode_lone_surrogate_string(&lit.value);
-        cx.intern_utf16_string_constant(utf16)
-    } else {
-        cx.intern_string_constant(&lit.value)
-    };
+    let const_idx = intern_js_string(cx, lit.value);
     cx.emit(
         Op::LoadString,
         [
@@ -121,12 +116,13 @@ pub(crate) fn compile_regexp_literal_into(
     let span = (lit.span.start, lit.span.end);
     let pattern_text = lit.regex.pattern.text.as_str();
     let flags_str = lit.regex.flags.to_string();
-    // Compile-time validation: feed the pattern + flags to the matcher engine
+    // Compile-time validation uses the runtime parser, without building a matcher.
+    // Feed the pattern + flags to it
     // so we surface a clean `Unsupported` for patterns it rejects (e.g.
     // unterminated groups). Mirrors the BigIntLiteral approach. The `g`, `y`,
     // and `d` flags live above the matcher per JS spec (§22.2.6.4
     // [`get RegExp.prototype.flags`](https://tc39.es/ecma262/#sec-get-regexp.prototype.flags)),
-    // so we strip them before compiling.
+    // so we strip them before validation.
     let mut engine_flags = otter_regex::Flags::default();
     let mut saw_u = false;
     let mut saw_v = false;
@@ -162,13 +158,13 @@ pub(crate) fn compile_regexp_literal_into(
             span,
         });
     }
-    if let Err(e) = otter_regex::Regex::compile_str(pattern_text, engine_flags) {
+    let pattern_utf16: Vec<u16> = pattern_text.encode_utf16().collect();
+    if let Err(e) = otter_regex::validate_utf16(&pattern_utf16, engine_flags) {
         return Err(CompileError::Unsupported {
             node: format!("RegExpLiteral `/{pattern_text}/{flags_str}` rejected: {e}"),
             span,
         });
     }
-    let pattern_utf16: Vec<u16> = pattern_text.encode_utf16().collect();
     let const_idx = cx.intern_regexp_constant(&pattern_utf16, &flags_str);
     cx.emit(
         Op::LoadRegExp,

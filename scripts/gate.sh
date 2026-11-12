@@ -104,8 +104,19 @@ cargo fmt --all
 step "clippy"
 cargo clippy --all-targets --all-features -- -D warnings
 
+step "host RegExp validation (without runtime matcher)"
+cargo check -p otter-compiler
+cargo test -p otter-regex --no-default-features --features unicode
+
+step "extension boundary (runtime-only consumer)"
+cargo test -p otter-extension-template
+
 step "unit tests (vm, jit, bytecode)"
 cargo test -q -p otter-vm -p otter-jit -p otter-bytecode
+
+step "module boundaries (native reads, UTF-16 requests, moving roots)"
+cargo test -q -p otter-runtime --test jit_module_ops \
+    --test module_request_identity --test gc_module_error_builders
 
 # B1 admission boundary. Every artifact that becomes executable is verified in
 # release code, so the gate must exercise that boundary in a RELEASE build:

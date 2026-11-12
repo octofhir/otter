@@ -33,7 +33,6 @@ sha2 = { workspace = true }
 sha1 = { workspace = true }
 md-5 = "0.10"
 getrandom = { workspace = true }
-flate2 = { workspace = true }
 crc32fast = { workspace = true }
 libz-rs-sys = { workspace = true }
 brotli = { workspace = true }

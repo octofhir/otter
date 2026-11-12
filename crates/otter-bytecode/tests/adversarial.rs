@@ -168,7 +168,7 @@ fn seed_rich() -> BytecodeModule {
     BytecodeModule {
         module: "file:///rich.js".to_string(),
         template_sites: vec![TemplateSite {
-            cooked: vec![Some("a".to_string()), None],
+            cooked: vec![Some(vec![0x61, 0xd800, 0xfffd, 0xdc00]), None],
             raw: vec!["a".to_string(), "\\u{}".to_string()],
         }],
         source_kind: SourceKind::TypeScript,
@@ -1545,4 +1545,22 @@ fn verification_cost_stays_linear_in_handler_nesting() {
         otter_bytecode::verify_module(&nested_module(depth))
             .unwrap_or_else(|error| panic!("legal nesting of depth {depth} was rejected: {error}"));
     }
+}
+
+#[test]
+fn template_utf16_storage_is_accounted_and_round_trips() {
+    let mut module = seed_minimal();
+    module.template_sites.push(TemplateSite {
+        cooked: vec![Some(Vec::new()), None],
+        raw: vec![String::new(), "\\u{}".to_owned()],
+    });
+    let before = module.retained_bytes();
+    let mut units = Vec::with_capacity(32);
+    units.extend([0, 0xd800, 0xfffd, 0xdc00, 0xd83d, 0xde00]);
+    let bytes = units.capacity() as u64 * 2;
+    module.template_sites[0].cooked[0] = Some(units);
+    assert_eq!(module.retained_bytes(), before + bytes);
+    let encoded = encode_module(&module);
+    let decoded = decode_module(&encoded).expect("decode");
+    assert_eq!(decoded.module().template_sites, module.template_sites);
 }

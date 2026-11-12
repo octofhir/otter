@@ -764,6 +764,17 @@ impl Interpreter {
         Ok(self.scoped_value(scope, Value::string(string)))
     }
 
+    /// Allocate exact UTF-16 code units and immediately root the string.
+    /// Prior scoped values remain traced if allocation collects.
+    pub(crate) fn scoped_utf16_string<'s>(
+        &mut self,
+        scope: &'s HandleScope,
+        units: &[u16],
+    ) -> Result<Local<'s>, VmError> {
+        let string = JsString::from_utf16_units(units, &mut self.gc_heap)?;
+        Ok(self.scoped_value(scope, Value::string(string)))
+    }
+
     /// Allocate the string a property-key spelling stands for (see
     /// [`crate::wtf16_escape`]) and root it in `scope`.
     pub(crate) fn scoped_key_string<'s>(

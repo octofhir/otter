@@ -20,7 +20,6 @@ that prove them. Copy it and rename.
 
 ```toml
 [dependencies]
-otter-gc = { version = "…" }
 otter-macros = { version = "…" }
 otter-runtime = { version = "…" }
 ```
@@ -28,6 +27,8 @@ otter-runtime = { version = "…" }
 One line of linking convention at your crate root:
 
 ```rust
+#![forbid(unsafe_code)]
+
 // Macro-generated glue resolves its hidden support path through this alias.
 extern crate otter_runtime as otter_vm;
 ```
@@ -38,7 +39,8 @@ Everything you need is re-exported from `otter_runtime`: the
 `HostedModule`, and the builders.
 
 Generated code refers only to `otter_vm::__macro_support`. That module is an
-opaque macro implementation contract, not an API to import by hand. Handwritten
+opaque macro implementation contract, not an API to import by hand. Declarative
+extensions need neither `otter-gc` nor a direct `otter-vm` dependency. Handwritten
 bindings use the named `Runtime*` types and helpers in `otter_runtime::surface`;
 they do not depend on raw descriptor/bootstrap re-exports at the crate root.
 

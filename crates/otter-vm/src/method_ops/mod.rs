@@ -47,55 +47,15 @@ use crate::{
     symbol_prototype, weak_refs, write_register,
 };
 
-/// Root set for the fast `Array.prototype.*` dispatch path: the live
-/// interpreter roots plus the receiver and argument values, which would
-/// otherwise be invisible to a scavenge triggered inside the array method
-/// (they live only in this stack frame, not in a published VM frame). Mirrors
-/// [`crate::call_ops`]'s native-call root scope.
-struct ArrayFastDispatchRoots<'a> {
+/// Receiver and arguments of an Array/collection fast call, plus interpreter
+/// roots. Read the forwarded receiver from this scope after any collection.
+struct FastDispatchRoots<'a> {
     interp_roots: otter_gc::ExtraRoots,
     recv: Value,
     args: ValueWindow<'a>,
 }
 
-impl otter_gc::ExtraRootSource for ArrayFastDispatchRoots<'_> {
-    fn process_weak(
-        &self,
-        resolve: &mut dyn FnMut(otter_gc::raw::RawGc) -> Option<otter_gc::raw::RawGc>,
-    ) {
-        self.interp_roots.process_weak(resolve);
-    }
-    fn prepare_collection(&self, heap: &otter_gc::GcHeap) {
-        self.interp_roots.prepare_collection(heap);
-    }
-
-    fn sweep_weak(&self, heap: &otter_gc::GcHeap) {
-        self.interp_roots.sweep_weak(heap);
-    }
-
-    fn visit_extra_roots(
-        &self,
-        roots: otter_gc::RootSet,
-        visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc),
-    ) {
-        self.interp_roots.visit(roots, visitor);
-        self.recv.trace_value_slots(visitor);
-        self.args.trace_slots(visitor);
-    }
-}
-
-/// Root scope for the direct Map/Set builtin dispatch. The receiver handle and
-/// the argument values live only in this native stack frame, so a scavenge
-/// triggered by an inserting `set` / `add` would otherwise miss them; rooting
-/// `recv` also lets the caller read the forwarded receiver back after the call
-/// (the spec returns the collection from `Map.prototype.set` / `Set.prototype.add`).
-struct CollectionFastDispatchRoots<'a> {
-    interp_roots: otter_gc::ExtraRoots,
-    recv: Value,
-    args: ValueWindow<'a>,
-}
-
-impl otter_gc::ExtraRootSource for CollectionFastDispatchRoots<'_> {
+impl otter_gc::ExtraRootSource for FastDispatchRoots<'_> {
     fn process_weak(
         &self,
         resolve: &mut dyn FnMut(otter_gc::raw::RawGc) -> Option<otter_gc::raw::RawGc>,
@@ -1776,7 +1736,7 @@ impl Interpreter {
         recv: Value,
         args: ValueWindow<'_>,
     ) -> Result<Value, VmError> {
-        let roots = CollectionFastDispatchRoots {
+        let roots = FastDispatchRoots {
             interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(self),
             recv,
             args,
@@ -1893,7 +1853,7 @@ impl Interpreter {
         recv: Value,
         args: ValueWindow<'_>,
     ) -> Result<Value, CommittedValueError> {
-        let roots = ArrayFastDispatchRoots {
+        let roots = FastDispatchRoots {
             interp_roots: otter_gc::ExtraRoots::new::<Interpreter>(self),
             recv,
             args,

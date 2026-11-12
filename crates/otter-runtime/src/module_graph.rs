@@ -582,7 +582,11 @@ impl<'a> ModuleGraphBuilder<'a> {
 
         let timing_enabled = self.timings.is_some();
         let compile_program = |program: &Program<'_>| {
-            let mut requests = collect_module_requests(program);
+            let mut requests =
+                collect_module_requests(program).map_err(|error| GraphError::Parse {
+                    url: url.clone(),
+                    error,
+                })?;
             // A browser fetches an `import()` target when the call runs, not
             // with the graph that contains it.
             if is_web {
@@ -915,12 +919,15 @@ fn nodes_key_for(fragment: &BytecodeModule) -> String {
 ///
 /// Spec: <https://tc39.es/ecma262/#sec-imports>,
 ///       <https://tc39.es/ecma262/#sec-import-call-runtime-semantics-evaluation>.
-fn collect_module_requests(program: &Program<'_>) -> Vec<ModuleRequest> {
+fn collect_module_requests(program: &Program<'_>) -> Result<Vec<ModuleRequest>, SyntaxError> {
     let mut visitor = ModuleRequestVisitor::default();
     for stmt in &program.body {
         visitor.visit_statement(stmt);
     }
-    visitor.out
+    match visitor.error {
+        Some(error) => Err(error),
+        None => Ok(visitor.out),
+    }
 }
 
 /// Owned dependency request used by the async remote prefetch phase.
@@ -1077,7 +1084,7 @@ pub(crate) fn scan_web_module(
     resolve: impl Fn(&str) -> Option<String>,
 ) -> Result<WebModuleScan, String> {
     with_program(text, SourceKind::JavaScript, |program| {
-        let requests = collect_module_requests(program);
+        let requests = collect_module_requests(program)?;
         let prefetch = requests
             .iter()
             .map(|request| PrefetchRequest {
@@ -1117,11 +1124,12 @@ pub(crate) fn scan_web_module(
             order_resolutions(&mut compiled.bytecode, &requests);
             Some(PrecompiledModule { compiled, requests })
         })();
-        WebModuleScan {
+        Ok(WebModuleScan {
             requests: prefetch,
             compiled,
-        }
+        })
     })
+    .and_then(|result| result)
     .map_err(|error| error.to_string())
 }
 
@@ -1133,6 +1141,10 @@ pub(crate) fn scan_module_requests(
 ) -> Result<Vec<PrefetchRequest>, GraphError> {
     with_program(&text, kind, |program| {
         Ok(collect_module_requests(program)
+            .map_err(|error| GraphError::Parse {
+                url: "<module-prefetch>".to_owned(),
+                error,
+            })?
             .into_iter()
             .map(|request| PrefetchRequest {
                 specifier: request.specifier,
@@ -1166,6 +1178,7 @@ fn resolve_plain_relative_file(specifier: &str, referrer_url: &str) -> Option<St
 
 #[derive(Default)]
 struct ModuleRequestVisitor {
+    error: Option<SyntaxError>,
     out: Vec<ModuleRequest>,
     seen: HashSet<(String, bool)>,
 }
@@ -1182,6 +1195,20 @@ struct ModuleRequest {
 }
 
 impl ModuleRequestVisitor {
+    fn record_static(
+        &mut self,
+        source: &oxc_ast::ast::StringLiteral<'_>,
+        deferred: bool,
+        dynamic: bool,
+        clause: Option<&oxc_ast::ast::WithClause<'_>>,
+    ) {
+        match otter_syntax::module_literal_text(source)
+            .and_then(|text| otter_syntax::module_attribute_type(clause).map(|attr| (text, attr)))
+        {
+            Ok((text, attr)) => self.record_with_type(text, deferred, dynamic, attr),
+            Err(error) => self.error = Some(error),
+        }
+    }
     fn record(&mut self, specifier: &str, deferred: bool, dynamic: bool) {
         self.record_with_type(specifier, deferred, dynamic, None);
     }
@@ -1205,58 +1232,36 @@ impl ModuleRequestVisitor {
     }
 }
 
-/// Extract the `type` attribute value from a `with { … }` clause.
-fn with_clause_type(clause: Option<&oxc_ast::ast::WithClause<'_>>) -> Option<String> {
-    let clause = clause?;
-    clause.with_entries.iter().find_map(|entry| {
-        let key = match &entry.key {
-            oxc_ast::ast::ImportAttributeKey::Identifier(id) => id.name.as_str(),
-            oxc_ast::ast::ImportAttributeKey::StringLiteral(lit) => lit.value.as_str(),
-        };
-        (key == "type").then(|| entry.value.value.as_str().to_string())
-    })
-}
-
 impl<'a> Visit<'a> for ModuleRequestVisitor {
     fn visit_import_declaration(&mut self, decl: &oxc_ast::ast::ImportDeclaration<'a>) {
         if !decl.import_kind.is_type() {
-            self.record_with_type(
-                decl.source.value.as_str(),
+            self.record_static(
+                &decl.source,
                 matches!(decl.phase, Some(oxc_ast::ast::ImportPhase::Defer)),
                 false,
-                with_clause_type(decl.with_clause.as_deref()),
+                decl.with_clause.as_deref(),
             );
         }
     }
 
     fn visit_export_from_declaration(&mut self, decl: &oxc_ast::ast::ExportFromDeclaration<'a>) {
         if !decl.export_kind.is_type() {
-            self.record_with_type(
-                decl.source.value.as_str(),
-                false,
-                false,
-                with_clause_type(decl.with_clause.as_deref()),
-            );
+            self.record_static(&decl.source, false, false, decl.with_clause.as_deref());
         }
     }
 
     fn visit_export_all_declaration(&mut self, decl: &oxc_ast::ast::ExportAllDeclaration<'a>) {
         if !decl.export_kind.is_type() {
-            self.record_with_type(
-                decl.source.value.as_str(),
-                false,
-                false,
-                with_clause_type(decl.with_clause.as_deref()),
-            );
+            self.record_static(&decl.source, false, false, decl.with_clause.as_deref());
         }
     }
 
     fn visit_import_expression(&mut self, imp: &oxc_ast::ast::ImportExpression<'a>) {
-        if let Expression::StringLiteral(lit) = &imp.source {
-            let specifier = lit.value.as_str();
-            if dynamic_literal_should_preload(specifier) {
-                self.record(specifier, true, true);
-            }
+        if let Expression::StringLiteral(lit) = &imp.source
+            && let Some(specifier) = lit.value.as_str()
+            && dynamic_literal_should_preload(specifier)
+        {
+            self.record(specifier, true, true);
         }
         oxc_ast_visit::walk::walk_import_expression(self, imp);
     }
@@ -1339,8 +1344,9 @@ fn commonjs_export_names(program: &Program<'_>) -> Vec<String> {
                 for property in &object.properties {
                     if let ObjectPropertyKind::ObjectProperty(property) = property
                         && let Some(name) = property.key.static_name()
+                        && let Some(name) = name.as_str()
                     {
-                        self.push(&name);
+                        self.push(name);
                     }
                 }
             }
@@ -1361,8 +1367,9 @@ fn commonjs_export_names(program: &Program<'_>) -> Vec<String> {
                     .arguments
                     .get(1)
                     .and_then(|argument| argument.as_expression())
+                && let Some(name) = name.value.as_str()
             {
-                self.push(name.value.as_str());
+                self.push(name);
             }
             oxc_ast_visit::walk::walk_call_expression(self, node);
         }

@@ -761,6 +761,23 @@ target are `/private/tmp/otter-engine-before-find` and
 `/private/tmp/otter-engine-baseline-target`. Verification is on macOS ARM64;
 x86_64 execution is not claimed. The full gate was restarted after this correction.
 
+## Compile-fail diagnostics refreshed without weakening boundaries
+
+The next full-gate attempt found 10 stale trybuild `.stderr` fixtures. Each actual
+diagnostic was reviewed before regeneration. Cross-isolate Root/Weak rejection
+still reports E0521 with the invariant brand; heap/handle/Frame/NativeCtx Send/Sync
+and untraceable Pelt fields still report E0277 at their required bounds; hidden
+TraceTable remains unavailable with E0425. Differences are pinned-rustc wording,
+current internal type chains, and additional non-Send/Sync witnesses.
+
+Only the 10 reviewed `.stderr` files changed. All 19 rejected Rust snippets and
+the four test groups are unchanged; no expected failure was replaced with a
+passing case or a different error class. After regeneration, normal trybuild
+execution **without** `TRYBUILD=overwrite` passes all four groups. The audit diff
+and normal validation logs are `/private/tmp/otter-compilefail-diff.txt` and
+`/private/tmp/otter-compilefail-verified.log`; baseline investigation is retained
+in `/private/tmp/otter-compilefail-baseline.log`.
+
 ## Confirmed next tasks
 
 1. **P1: finish the current workspace closing gate.** The 12 VM lint blockers are

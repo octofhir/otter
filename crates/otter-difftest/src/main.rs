@@ -13,6 +13,8 @@
 //! - Empty corpora, timeouts and signal termination cannot count as agreement.
 //! - GC-stress candidates also enable slot verification; any stale heap/root
 //!   edge becomes a differential failure even when observable output survives.
+//! - The default CLI lives beside this runner, preserving Cargo's selected
+//!   profile, target triple and target directory. `--otter` overrides that path.
 //! - Corpus programs make otherwise-hidden final globals/effects part of their
 //!   canonical completion object; no source rewriting or regex parsing occurs.
 
@@ -28,7 +30,7 @@ use serde::Serialize;
 #[derive(Debug, Parser)]
 #[command(about = "Compare Otter interpreter, baseline, and GC-stress processes")]
 struct Args {
-    /// Otter CLI binary. Defaults to target/release/otter.
+    /// Otter CLI binary. Defaults to the executable beside this runner.
     #[arg(long)]
     otter: Option<PathBuf>,
     /// Corpus directory.
@@ -173,9 +175,11 @@ fn mismatch(oracle: &Observation, candidates: &[(Mode, Observation)]) -> Option<
 
 fn main() {
     let args = Args::parse();
-    let otter = args
-        .otter
-        .unwrap_or_else(|| PathBuf::from("target/release/otter"));
+    let otter = args.otter.unwrap_or_else(|| {
+        std::env::current_exe()
+            .expect("locate differential runner")
+            .with_file_name(format!("otter{}", std::env::consts::EXE_SUFFIX))
+    });
     let timeout = Duration::from_millis(args.timeout_ms);
     let mut modes = vec![Mode::NormalTiering, Mode::TemplateBaseline];
     modes.extend(

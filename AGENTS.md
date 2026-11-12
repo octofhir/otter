@@ -280,6 +280,10 @@ Fast iteration tips:
   Console output and printed completion are compared with the unstressed
   interpreter, including programs whose only observable result is their final value.
   `results.json` must report `status: passed` before the run counts as a gate.
+- The full gate honors `CARGO_TARGET_DIR` and uses Cargo's reported CLI executable
+  for startup-image creation. `otter-difftest` defaults to `otter` beside its own
+  executable (the same profile/target directory); use `--otter <path>` to select
+  another CLI explicitly.
 - Run VM tests: `cargo test -p otter-vm`
 - Run runtime tests: `cargo test -p otter-runtime`
 - Run a single active support crate after porting work there: `cargo test -p otter-modules`, `cargo test -p otter-web`, etc.

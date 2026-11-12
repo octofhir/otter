@@ -679,7 +679,7 @@ outstanding. No build or execution speedup is claimed for lint-only changes.
 The next public-boundary reproduction found a semantic error shared by `find`,
 `findIndex`, `findLast`, and `findLastIndex`. For a Proxy whose `has` returns false
 and whose `get` supplies an indexed value, all four methods invoked `has` and
-passed `undefined` to their predicate. Node instead performed indexed Get in
+passed `undefined` to their predicate. Node v24.16.0 instead performed indexed Get in
 forward/reverse order without invoking `has`. A throwing `has` also incorrectly
 escaped from the search. The new runtime regression failed before the fix with
 `Error: find invoked has`; the shared JS fixture passed in Node.
@@ -778,11 +778,43 @@ and normal validation logs are `/private/tmp/otter-compilefail-diff.txt` and
 `/private/tmp/otter-compilefail-verified.log`; baseline investigation is retained
 in `/private/tmp/otter-compilefail-baseline.log`.
 
+## Gate executables follow Cargo output paths
+
+The full gate previously built into the configured target but then invoked
+`target/release/otter` for startup-image creation. Its differential runner also
+defaulted to that relative path. With a dedicated target this could run a stale
+binary or fail despite a successful fresh build.
+
+The gate now reads the CLI executable from Cargo's compiler-artifact JSON,
+fails if no executable was produced, and quotes that exact path for image
+creation. The differential runner's default CLI is beside its own executable,
+including the platform executable suffix; explicit `--otter` remains available.
+Thus the standard gate keeps the selected target directory, target triple and
+profile without a guessed repository-relative release path. The existing cost
+ledger already obtains its executable from Cargo and needed no change.
+
+Shell syntax checks pass. A real process smoke test with the dedicated target
+ran all selected modes successfully and reported exactly
+`/private/tmp/otter-scanner-target/debug/otter` as its CLI. The report is
+`/private/tmp/otter-engine-target-path-smoke.json`. Two initial debug differential
+runs of the allocation-heavy find fixture hit their 20 s GC-stride-1 watchdog
+under concurrent stress; those reports remain failures, not passes. Separate
+fixture stress validation completed 48/48 with 30 s caps. The path smoke uses a
+small arithmetic corpus to isolate executable selection from GC-stress cost.
+The release full gate retains its existing watchdog policy.
+
+The isolated pre-find baseline also reproduces the same 10 compile-fail fixture
+mismatches, confirming those diagnostic updates were unrelated to FindViaPredicate.
+Release bytecode verifier/adversarial checks, 23 code-space tests, snapshot
+boundary and four artifact-agreement tests pass. The full differential verdict
+and remaining ledger stage must be recorded separately after they finish.
+
 ## Confirmed next tasks
 
-1. **P1: finish the current workspace closing gate.** The 12 VM lint blockers are
-   closed. Full-gate tooling must also use Cargo's actual executable paths rather
-   than assuming `target/release` when `CARGO_TARGET_DIR` is configured.
+1. **P1: finish the current workspace closing gate.** VM lint blockers, native
+   allocation-group preparation, compile-fail diagnostics and executable-path
+   ownership have been corrected. Complete release and differential validation,
+   then the separate full checked GC corpus at strides 1–16.
 2. **P1: repeat build measurements on an idle host.** At least three alternating
    before/after clean-build pairs, a separate linking measurement, and a restorative
    build between incremental triggers. Do not promise a 50% LOC reduction without

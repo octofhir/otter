@@ -1,143 +1,154 @@
-# Архитектура и сборка Otter
+# Otter architecture and build review
 
-## Исходное состояние
+## Initial state
 
 2026-11-12, HEAD `9c47049b721162ce850bf2427becec27d4797056`.
-До работы изменён `vendor/test262`, не отслеживаются `.claude/` и `tests/test262/`;
-они не затронуты. Коммитов нет. AGENTS.md и ES_CONFORMANCE.md прочитаны;
-исторические 99.98% не использованы как доказательство текущей корректности.
-`fff` недоступен, поиск выполнен через `rg`.
+Before this work, `vendor/test262` was modified and `.claude/` and
+`tests/test262/` were untracked; these were left untouched. No commits were made
+in that review pass. AGENTS.md and ES_CONFORMANCE.md were read; the historical
+99.98% was not used as evidence of current correctness. `fff` was unavailable,
+so searches used `rg`.
 
-macOS Darwin 25.6 ARM64, 12 CPU, 36 GiB RAM, в начале 85 GiB свободного диска.
-Load average 9.28 / 6.00 / 5.31: машина занята. Установлен отсутствовавший
-закреплённый `beta-2026-10-18`: rustc/Cargo 1.100.0-beta.7, LLVM 23.1.4.
-Toolchain-файл не менялся. Downloads выполнены до измерений; offline-проба
-на установленном 1.99.1 без jsonc-parser не считается baseline.
+macOS Darwin 25.6 ARM64, 12 CPUs, 36 GiB RAM, initially 85 GiB free disk.
+Load average was 9.28 / 6.00 / 5.31: the host was busy. The missing pinned
+`beta-2026-10-18` toolchain was installed: rustc/Cargo 1.100.0-beta.7, LLVM 23.1.4.
+The toolchain file was unchanged. Downloads finished before measurements;
+the offline attempt with installed 1.99.1 and missing jsonc-parser is not a baseline.
 
-## Workspace по manifests, metadata и исходникам
+## Workspace from manifests, metadata, and source
 
-Стрелка означает «зависит от». Перечислены основные публичные поверхности.
+An arrow means "depends on." The table lists the main public surfaces.
 
-| Crate | Назначение и граница |
+| Crate | Purpose and boundary |
 |---|---|
-| resource | ResourceAccount, лимиты, leases, snapshots |
+| resource | ResourceAccount, limits, leases, snapshots |
 | gc | Heap, GcSession, HandleScope, Local → resource |
 | bytecode | BytecodeModule, verifier, opcode_schema, binary/disasm/dump → resource |
 | syntax | SourceKind, with_program, SyntaxError → OXC |
 | compiler | compile, CompiledModule, CompileOptions → syntax, bytecode, regex validation |
 | regex | validate_utf16, Flags; runtime feature: Regex/MatchScratch/native tier → ICU |
 | vm | Interpreter, Value, NativeCtx, builders, JIT contracts → gc, bytecode, resource, regex, macros |
-| jit | Native compiler/artifacts → vm, bytecode; GC только dev dependency |
+| jit | Native compiler/artifacts → vm, bytecode; GC is a dev dependency only |
 | runtime | Runtime/RuntimeBuilder, Otter, RuntimeHandle → vm, jit, compiler, syntax, gc, bytecode, resource, xml, http-client |
 | http-client | Client/RequestBuilder/Response → hyper, rustls |
-| xml | parse_bytes/parse_utf8, Node, sink; без dependencies |
-| macros | HostClass/js_class и binding generators → syn/quote |
+| xml | parse_bytes/parse_utf8, Node, sink; no dependencies |
+| macros | HostClass/js_class and binding generators → syn/quote |
 | modules | OtterModulesBuilderExt, serve/sql/kv/ffi/xml → runtime, macros, xml |
-| node | Hosted Node modules/globals → runtime, vm; compiler в build script |
-| web | WebApiBuilderExt, wasm/crypto/fetch → runtime, macros; compiler в build script |
+| node | Hosted Node modules/globals → runtime, vm; compiler in the build script |
+| web | WebApiBuilderExt, wasm/crypto/fetch → runtime, macros; compiler in the build script |
 | pm-manifest | PackageManifest, workspace discovery/settings → serde, Tokio |
 | pm-lockfile | Lockfile, LockedPackage, import formats → serde JSON/YAML/TOML |
 | pm-phantom | scan_project/extract_specifiers → manifest, syntax, OXC |
 | pm | Installer, registry, resolution, policy → manifest, lockfile, http-client |
 | cli | otter/otterx → runtime, modules, node, web, PM, syntax, bytecode |
-| vm-codegen | Отдельный gen-pow10, не dependency VM |
-| benchmark | Schema/recorder; engine, rss, warm-harness включаются features |
-| difftest | Process runner без engine dependency |
+| vm-codegen | Standalone gen-pow10, not a VM dependency |
+| benchmark | Schema/recorder; engine, rss, warm-harness are feature gated |
+| difftest | Process runner without an engine dependency |
 | test262 | Runner/report/isolation → runtime, vm |
-| node-compat | run(RunOptions), RunReport, CLI без engine dependency |
-| extension-template | Пример → runtime, macros |
+| node-compat | run(RunOptions), RunReport, CLI without an engine dependency |
+| extension-template | Example → runtime, macros |
 
-Префикс всех имён — `otter-`. Runtime соединяет frontend и VM: VM не зависит
-от compiler, GC не знает VM, JIT потребляет VM-owned контракты. Runtime → Node/Web
-и macros → VM/GC встречаются только в dev dependencies. Bytecode нужен и runtime
-consumers, и host producers Node/Web; поэтому его правка запускает широкий rebuild.
-CLI имеет десять внутренних normal/build зависимостей, runtime — девять.
-Runtime экспортирует advanced Value/NativeCtx API, но утечка через Send RuntimeHandle
-не доказана. Generic monomorphization как причина стоимости также не доказана.
+All crate names have the `otter-` prefix. Runtime joins the frontend and VM:
+VM does not depend on compiler, GC does not know VM, and JIT consumes VM-owned
+contracts. Runtime → Node/Web and macros → VM/GC appear only as dev dependencies.
+Bytecode serves both runtime consumers and Node/Web host producers, so changes
+trigger a broad rebuild. CLI has ten internal normal/build dependencies; runtime
+has nine. Runtime exports advanced Value/NativeCtx APIs, but a leak through the
+Send RuntimeHandle was not established. Generic monomorphization was not
+established as a source of build cost either.
 
-### Почему тяжёлые зависимости остаются
+### Why the heavy dependencies remain
 
-- CLI → web → Wasmtime/Cranelift: `wasm.rs`, `wasm/asm/instance.rs` действительно
-  компилируют модули. `wat` влияет на принимаемые входные байты, не только tooling.
-- CLI → modules → rusqlite/bundled: SQL/KV; runtime/PM → http-client → rustls →
-  aws-lc: TLS для fetch/modules/registry. Удалять без потери функций нельзя.
-- VM → ICU compiled_data/Temporal; compiler → regex → ICU properties:
-  Intl и Unicode RegExp, не неиспользуемые таблицы.
-- JIT → yaxpeax: `artifact/assembly*.rs`; диагностика выключена при исполнении,
-  но входит в стандартную CLI и компилируется всегда.
-- Bytecode serde/serde_json используются контейнерами и `dump::to_json_pretty`;
-  runtime JSON5/JSONC/YAML/TOML — `data_modules.rs`.
-- Criterion — dev dependency. Node `primordials-codegen` и benchmark engine —
-  optional. Tokio features широки, но нужны полной CLI. OXC/syn/clap/serde/dynasm
-  proc macros реально используются. Host/target compiler units собираются отдельно.
-- Дубли syn 2/3, hashbrown 0.14–0.17, num-bigint 0.4/0.5 и wasm tooling имеют
-  разных consumers. CLI включает wasm-encoder 0.251 через Wasmtime и 0.253 через
-  asm/WAT. Metadata с dev/target packages не равен реально собранным units.
+- CLI → web → Wasmtime/Cranelift: `wasm.rs` and `wasm/asm/instance.rs` actually
+  compile modules. `wat` affects accepted input bytes, not just tooling.
+- CLI → modules → rusqlite/bundled provides SQL/KV. Runtime/PM → http-client →
+  rustls → aws-lc provides TLS for fetch/modules/registry. Removing these loses
+  functionality.
+- VM → ICU compiled_data/Temporal and compiler → regex → ICU properties provide
+  Intl and Unicode RegExp support; these are not unused tables.
+- JIT → yaxpeax serves `artifact/assembly*.rs`. Diagnostics are disabled during
+  ordinary execution but ship in the default CLI and are always compiled.
+- Bytecode serde/serde_json serve containers and `dump::to_json_pretty`;
+  runtime JSON5/JSONC/YAML/TOML serve `data_modules.rs`.
+- Criterion is a dev dependency. Node `primordials-codegen` and benchmark engine
+  are optional. Broad Tokio features serve the full CLI. OXC/syn/clap/serde/dynasm
+  proc macros are used. Host and target compiler units build separately.
+- Duplicate syn 2/3, hashbrown 0.14–0.17, num-bigint 0.4/0.5, and wasm tooling
+  have different consumers. CLI includes wasm-encoder 0.251 through Wasmtime and
+  0.253 through asm/WAT. Metadata containing dev/target packages is not the set
+  of units actually built.
 
-## Что изменено
+## Changes implemented
 
-1. Удалены прямые Node → flate2 и phantom → oxc_span: обращений нет,
-   zlib использует libz_rs_sys. Обе библиотеки остаются транзитивно; число packages
-   и features после этих удалений не изменилось (525 packages).
-   Node normal dependencies: 18 → 17, phantom: 10 → 9, с target-specific entries.
-   На первом проходе Web → GC сохранялась из-за generated `::otter_gc`;
-   это ребро устранено в следующем шаге ниже.
-2. По дополнительному запросу обновлено семейство OXC 0.154 → 0.158, без обновления
-   resolver 11.23/toolchain. Consumers переведены на JSStr; старый decoder
-   `U+FFFD + hex` удалён. Host specifiers проверяются, не преобразуются с потерями.
-   По явному разрешению `TemplateSite.cooked` хранит UTF-16; обновлены binary IO,
-   serde shape, accounting, compiler и VM. Старые артефакты несовместимы.
-3. После запроса на сокращение всего workspace убраны дубли в существующем ядре:
-   `dispatch_ops.rs`: 110 одинаковых `top_frame!` → одно определение;
-   `method_ops/mod.rs`: два одинаковых root carriers → FastDispatchRoots;
-   `native_abi/runtime_stubs.rs`: 139 дескрипторов, symbol lookup и dense inventory
-   генерируются из одной таблицы. Все восемь полей, имена, ids и порядок сохранены.
-   У `array::push` обнаружено stale value при GC во время роста slab: теперь
-   используется корректный `push_with_roots`. Две реализации indexed store также
-   сведены к одной. Существующий remembered-array тест воспроизводит ошибку;
-   он теперь сам включает stress, а не зависит от окружения.
-   Нет новых allocations/dynamic dispatch в hit paths, изменений Value layout, barriers,
-   safepoints или deopt ABI.
+1. Removed direct Node → flate2 and phantom → oxc_span dependencies: there were
+   no uses; zlib uses libz_rs_sys. Both libraries remain transitively. Package and
+   feature counts were unchanged by these removals (525 packages). Node normal
+   dependencies went from 18 to 17; phantom from 10 to 9, including target-specific
+   entries. Web → GC initially remained because generated code used `::otter_gc`;
+   a later step below removed that edge.
+2. At the user's additional request, upgraded OXC 0.154 → 0.158 without upgrading
+   resolver 11.23 or the toolchain. Consumers now use JSStr; the old
+   `U+FFFD + hex` decoder was removed. Host specifiers are checked rather than
+   converted lossily. With explicit authorization, `TemplateSite.cooked` now stores
+   UTF-16; binary IO, serde shape, accounting, compiler, and VM were updated.
+   Old artifacts are incompatible.
+3. Following the request to reduce workspace duplication, consolidated existing
+   engine code: 110 identical `top_frame!` definitions in `dispatch_ops.rs` became
+   one; two identical root carriers in `method_ops/mod.rs` became FastDispatchRoots;
+   139 descriptors, symbol lookup, and the dense inventory in
+   `native_abi/runtime_stubs.rs` now come from one table. All eight fields, names,
+   ids, and ordering were preserved. `array::push` had a stale value when slab
+   growth collected; it now uses the correct `push_with_roots`. Two indexed-store
+   implementations were also consolidated. The existing remembered-array test
+   reproduces the bug and now enables stress itself rather than relying on the
+   environment. No allocations/dynamic dispatch were added to hit paths, and
+   Value layout, barriers, safepoints, and deopt ABI were unchanged.
 
-Тесты сокращены по смыслу, не ради зелёного результата: убраны повторные helper
-checks OXC и дубли property-key матрицы, уже покрытой `property_key_code_units`.
-У primordials удалены магические количества 277/192: fixture-проверка состава,
-хешей и проверка idempotent regeneration остаются. Terminal restore проверяется
-без непереносимого открытия `/dev/fd`; порядок и однократность сохранены.
-`eval_value` использует ES Promise job, а не отсутствующий в bare Runtime Web global.
-В `jit_constructor_gc` убрана проверка фиксированных первых байтов пролога:
-sloppy receiver guard законно находится перед ним. Проверки точного code object,
-call-entry offset, native execution, safepoint/return-site и relocation сохранены.
-Math-проверки учитывают существующий `CheckNative` eager exit; replacement/getter
-по-прежнему обязаны исполниться ровно один раз. Удалена дублирующая numeric-leaf
-матрица с неверным обещанием отсутствия повторных Graph deopts: журнал показывает
-сначала ShapeGuard, затем TypeMismatch при новом receiver/callee. Общая differential
-матрица, leaf-hit counters, порядок вычислений и moving-GC проверки остаются;
-уникальные Set miss и rope search перенесены в общую матрицу.
-Shape-directory тест теперь проверяет два effectful `LoadPropertyCached`, а не
-устаревший commoned `LoadShapedProperty`: accessor fallback не должен replay или
-склеивать обращения. Код lowering для этих исправлений не менялся.
-Исправлены lint blockers без подавления lint; большая test-only CompileInput payload
-упакована в Box, production representation не меняется. Исправлен излишний отказ
-OXC helper на неиспользуемом ключе атрибута: сравнивается JSStr, не UTF-8 имя.
+Tests were consolidated by responsibility, not removed to obtain passing results:
+repeated OXC helper checks and property-key cases already covered by
+`property_key_code_units` were removed. Primordials no longer assert magic counts
+277/192; fixture membership, hashes, and idempotent regeneration remain checked.
+Terminal restoration no longer depends on nonportable `/dev/fd` opening; order and
+exactly-once behavior remain checked. `eval_value` uses an ES Promise job instead
+of a Web global absent from bare Runtime. `jit_constructor_gc` no longer asserts
+fixed first prologue bytes: a sloppy receiver guard can legally precede the
+prologue. Exact code-object, call-entry offset, native-execution,
+safepoint/return-site, and relocation assertions remain.
 
-Объём считается по одним и тем же Rust-файлам в `crates/` и `examples/`, включая
-комментарии, тесты и два новых файла OXC, без vendor и parked crates. Перед
-расширенным проходом — 728 130 строк; после — 725 944: **−2 186 строк**.
-В `dispatch_ops.rs` убрано 726 строк, в таблице stubs — 1 202.
-Это первый проход, **не сокращение всего репозитория вдвое**. Перенос строк в макрос
-сам по себе не ускоряет сборку; выигрыш здесь — один владелец повторяемых контрактов.
+Math checks account for the existing `CheckNative` eager exit; replacements and
+getters must still execute exactly once. A duplicate numeric-leaf matrix wrongly
+promised no repeated Graph deopts: events show ShapeGuard followed by TypeMismatch
+for a new receiver/callee. The shared differential matrix, leaf-hit counters,
+evaluation order, and moving-GC checks remain; unique Set-miss and rope-search
+cases moved into the shared matrix. The shape-directory test now checks two
+effectful `LoadPropertyCached` operations rather than an obsolete commoned
+`LoadShapedProperty`: accessor fallback must not replay or merge accesses.
+Lowering code was unchanged for these fixture corrections.
 
-## Измерения
+Lint blockers were fixed without suppression. A large test-only CompileInput
+payload was boxed; production representation was unchanged. An OXC helper's
+unnecessary rejection of an unused attribute key was fixed by comparing JSStr
+instead of requiring a UTF-8 name.
 
-Артефакты: `/tmp/otter-architecture-review/`: metadata, trees, `measurements.jsonl`,
-журналы, parser-probe. Старые timings/CLI binaries сохранены в `saved-artifacts`;
-три собственных build-кэша удалены (около 38 GiB). Финальный `target-migration`
-оставлен. Пользовательский target/caches не удалялись.
+LOC counts cover the same Rust files under `crates/` and `examples/`, including
+comments, tests, and two new OXC files, excluding vendor and parked crates.
+The expanded pass changed 728,130 lines to 725,944: **−2,186 lines**.
+`dispatch_ops.rs` lost 726 lines and the stub table lost 1,202. This was a first
+pass, **not a 50% reduction of the repository**. Moving lines into a macro does
+not itself accelerate builds; the benefit is one owner for repeated contracts.
 
-Измерения CLI: одна `git archive HEAD` копия с патчем after, разные пустые target
-каталоги, profile dev, default features, jobs по умолчанию, заполненный registry
-cache, page cache не сбрасывался. Stable Cargo timings, без self-profile.
+## Measurements
+
+Artifacts are under `/tmp/otter-architecture-review/`: metadata, trees,
+`measurements.jsonl`, logs, and parser-probe. Old timings/CLI binaries were kept
+in `saved-artifacts`; three review-owned build caches were removed (about 38 GiB).
+The final `target-migration` was retained. User target directories/caches were
+not removed.
+
+CLI measurements used one `git archive HEAD` copy with the after patch, separate
+empty target directories, dev profile, default features, default jobs, a populated
+registry cache, and no page-cache reset. Stable Cargo timings were used, without
+self-profile.
 
 ```sh
 cargo metadata --locked --format-version 1
@@ -148,46 +159,48 @@ cargo build --offline --locked -p otter-cli --timings --target-dir "$TARGET"
 cargo check --offline --locked -p otter-cli --timings --target-dir "$TARGET"
 ```
 
-| Наблюдение, с | HEAD | Удаление 2 рёбер | OXC + UTF-16 |
+| Observation, seconds | HEAD | Two dependency edges removed | OXC + UTF-16 |
 |---|---:|---:|---:|
-| Clean build, 1 запуск | 115.38 | 109.51 | 134.19 |
-| Первый check после build, 1 запуск | 66.64 | 75.82 | 90.53 |
+| Clean build, one run | 115.38 | 109.51 | 134.19 |
+| First check after build, one run | 66.64 | 75.82 | 90.53 |
 | No-change check | 0.43 | 0.62 | 0.68 |
-| VM edit, первый sample | 8.97 | 9.43 | 9.80 |
-| Bytecode edit, 2 samples | 9.71 / 9.98 | 12.62 / 9.42 | 13.09 / 9.25 |
-| VM edit после восстановления bytecode | 8.96 | 8.31 | 9.42 |
+| VM edit, first sample | 8.97 | 9.43 | 9.80 |
+| Bytecode edit, two samples | 9.71 / 9.98 | 12.62 / 9.42 | 13.09 / 9.25 |
+| VM edit after restoring bytecode | 8.96 | 8.31 | 9.42 |
 
-Trigger — комментарий в VM/bytecode lib.rs только в копии. Второй VM sample
-включает восстановленный bytecode: это не чистый VM-only rebuild. ABI-типы не
-менялись для измерения. Полная матрица ограничена стоимостью нескольких build trees.
-**Ускорение Rust build/check не подтверждено.** Один запуск на занятой машине
-не доказывает ни улучшение, ни устойчивую регрессию. Таблица относится к этапу OXC,
-не измеряет последующее удаление дублей в ядре.
+The trigger was a comment in VM/bytecode lib.rs in the copy only. The second VM
+sample includes restored bytecode, so it is not a pure VM-only rebuild. ABI types
+were not changed for measurement. The full matrix was limited by the cost of
+multiple build trees. **No Rust build/check speedup was established.** One run
+on a busy host proves neither an improvement nor a stable regression. This table
+covers the OXC stage, not the subsequent engine deduplication.
 
-Baseline timings: ICU experimental 49.10 с (frontend 48.20/codegen 0.90),
-VM 24.12 (14.76/9.36), compiler units 12.88 (3.65/9.23) и 13.97 (4.89/9.08),
-runtime 11.30 (4.97/6.33). aws-lc-sys build script 42.34 с, zstd-sys 13.52,
-Cranelift 21.67. CLI unit 6.95 с — не linker-only measurement. Параллельные units
-не суммируются. After также замедлились неизменённые ICU (58.63) и aws-lc (54.05).
+Baseline timings: ICU experimental 49.10 s (frontend 48.20/codegen 0.90), VM 24.12
+(14.76/9.36), compiler units 12.88 (3.65/9.23) and 13.97 (4.89/9.08), runtime 11.30
+(4.97/6.33). aws-lc-sys build script took 42.34 s, zstd-sys 13.52, Cranelift 21.67.
+The CLI unit's 6.95 s is not a linker-only measurement. Parallel units cannot be
+summed. Unchanged ICU (58.63) and aws-lc (54.05) also slowed in the after run.
 
-Parser-probe: обе версии в одном release binary, 225 Node JS-файлов / 2 842 685
-bytes, SourceType::cjs + allow_return_outside_function, 20 проходов/sample,
-6 чередующихся пар, первая исключена. Diagnostics = 0. Медианы 0.240065 →
-0.190775 с (**−20.5%**), диапазоны 0.237034–0.245666 / 0.188850–0.196062.
-Это parser-only результат, не ускорение всего Otter. Команда в `parser-probe`:
-`RUSTUP_TOOLCHAIN=beta-2026-10-18 cargo build --release --offline`, затем binary.
+Parser-probe placed both versions in one release binary: 225 Node JS files /
+2,842,685 bytes, SourceType::cjs + allow_return_outside_function, 20 passes/sample,
+six alternating pairs with the first excluded. Diagnostics = 0. Medians were
+0.240065 → 0.190775 s (**−20.5%**), ranges 0.237034–0.245666 /
+0.188850–0.196062. This is a parser-only result, not a whole-Otter speedup.
+The command in `parser-probe` was
+`RUSTUP_TOOLCHAIN=beta-2026-10-18 cargo build --release --offline`, then the binary.
 [OXC release](https://github.com/oxc-project/oxc/releases/tag/crates_v0.158.0).
 
-Материализация 2000 ASCII tagged sites, dev interpreter, performance.now без
-startup/parser, 6 чередующихся пар минус прогрев: 109.97 → 109.83 ms;
-значимого runtime-изменения не видно. UTF-16 payload дороже ASCII по памяти:
-accounting считает capacity × 2. Подробности контракта —
+Materializing 2,000 ASCII tagged sites in the dev interpreter, measured with
+performance.now excluding startup/parser, using six alternating pairs minus
+warmup: 109.97 → 109.83 ms. No meaningful runtime change was visible. UTF-16 uses
+more memory for ASCII payloads: accounting charges capacity × 2. Contract details:
 [frontend.md](../site/src/content/docs/engine/frontend.md).
 
-Узкий probe после сокращения ядра: 20 000 object pushes, indexed overwrites и
-reads, пять проходов после прогрева; before — сохранённая OXC 0.158 CLI до этого
-прохода, after — текущая CLI. Оба dev/default, 6 чередующихся пар на tier, первая
-исключена, startup/parser вне таймера; checksum одинаков. Медианы, ms:
+A focused probe after engine deduplication performed 20,000 object pushes,
+indexed overwrites, and reads, five passes after warmup. Before used the saved
+OXC 0.158 CLI from before that pass; after used the current CLI. Both were
+dev/default, six alternating pairs per tier with the first excluded, startup/parser
+outside the timer, and equal checksums. Medians in milliseconds:
 
 | Tier | Before | After |
 |---|---:|---:|
@@ -195,207 +208,224 @@ reads, пять проходов после прогрева; before — сох�
 | Template | 497.18 | 500.96 |
 | Production tier policy | 121.95 | 122.98 |
 
-Команда: `python3 /tmp/otter-architecture-review/followup/array-probe.py`.
-Это smoke benchmark debug binary на занятом host, не доказательство отсутствия
-регрессий в release и не заявка на ускорение. Оптимизированный benchmark ещё нужен.
+Command: `python3 /tmp/otter-architecture-review/followup/array-probe.py`.
+This is a debug-binary smoke benchmark on a busy host, not proof of no release
+regression or a speedup claim. An optimized benchmark is still needed.
 
-## Проверки
+## Validation
 
-Команды используют отдельный `CARGO_TARGET_DIR`, pinned toolchain, offline/locked.
-До сокращения ядра: default CLI build, workspace all-target/all-feature check,
-compiler 145, syntax 13, bytecode 113, phantom 20, Web 11 + 51 integration,
-zlib 2, warm-harness 6 passed. Test262: одинаковые path → outcome до/после на
-локальном corpus: template-literal 59, string 73, module-code 595 passed / 4 skipped.
-Это 727 passed, не полный Test262. Новый UTF-16 runtime test прошёл strides 1–16.
+Commands used a separate `CARGO_TARGET_DIR`, the pinned toolchain, and
+offline/locked execution. Before engine deduplication, the default CLI build,
+workspace all-target/all-feature check, compiler 145, syntax 13, bytecode 113,
+phantom 20, Web 11 + 51 integration, zlib 2, and warm-harness 6 passed. Test262
+had identical before/after path → outcome mappings on the local corpus:
+template-literal 59, string 73, module-code 595 passed / 4 skipped. These are
+727 passes, not full Test262 coverage. The new UTF-16 runtime test passed at
+strides 1–16.
 
-После сокращения ядра: `cargo test -p otter-vm -p otter-jit -p otter-runtime
--p otter-node --lib --all-features --no-fail-fast`: VM 1305, JIT 349,
-runtime 277 + 1 ignored, Node 29 passed. Для IPC/FSEvents тесты запущены с доступом
-к локальным системным API: прежние sandbox failures не были production bugs.
-После повторной сборки frontend: compiler 145, syntax 11, bytecode 113 passed.
-Remembered-array: четыре теста проходят на каждом stride 1–16. Strict workspace
-Clippy и fmt проходят без подавлений. Default CLI собрана; linker предупреждает
-о большом `__eh_frame` в dev binary, proc-macro-error2 — о future incompatibility.
-`bash scripts/gate.sh --quick all` проходит при `OTTER_GC_STRESS=1`: GC,
-constructors, Math, native leaves и property tests. Дополнительные runtime tests:
-eval 5, OXC 2, property-key 1, class-value 1, XML 6 passed; OXC — также на strides
-1–16. Полные журналы этого прохода находятся в `followup/`.
+After engine deduplication,
+`cargo test -p otter-vm -p otter-jit -p otter-runtime -p otter-node --lib --all-features --no-fail-fast`
+passed VM 1305, JIT 349, runtime 277 + 1 ignored, and Node 29. IPC/FSEvents tests
+ran with access to local system APIs: earlier sandbox failures were not production
+bugs. After rebuilding the frontend, compiler 145, syntax 11, and bytecode 113
+passed. All four remembered-array tests passed at every stride 1–16. Strict
+workspace Clippy and fmt passed without suppression. The default CLI built;
+the linker warned about a large `__eh_frame` in the dev binary and
+proc-macro-error2 reported future incompatibility.
 
-Старые native-leaf и shape-directory failures воспроизведены отдельно на HEAD/OXC
-0.154 в `target-baseline-followup`, без общих workspace artifacts с текущей сборкой.
-Math/constructor failures также воспроизведены до исправления fixtures.
-Это отделяет исправления старых тестов от GC-багфикса и OXC-миграции.
+`bash scripts/gate.sh --quick all` passed with `OTTER_GC_STRESS=1`, covering GC,
+constructors, Math, native leaves, and properties. Additional runtime tests passed:
+eval 5, OXC 2, property-key 1, class-value 1, XML 6; OXC also passed strides 1–16.
+Full logs for that pass are in `followup/`.
 
-Ранее fmt и strict Clippy падали на HEAD; старые предупреждения теперь исправлены,
-а не подавлены. Предыдущий differential был прерван после трёх минут; полный
-диагностический запуск после OXC-миграции прошёл за 743.75 с: это не был deadlock.
-Полный differential после GC-исправления: 198 программ, interpreter vs Template,
-включая completion, console и ошибки — passed (`integration-final.log`).
-Полный checked/release GC corpus и другие ОС/архитектуры пока не проверены.
+Old native-leaf and shape-directory failures were reproduced separately on
+HEAD/OXC 0.154 in `target-baseline-followup`, without sharing workspace artifacts
+with the current build. Math/constructor failures were also reproduced before
+fixture corrections. This separates old-test corrections from the GC bug fix
+and OXC migration.
 
-## Риски и границы результата
+Fmt and strict Clippy had failed on the earlier HEAD; those warnings were fixed,
+not suppressed. An earlier differential run was interrupted after three minutes;
+the full diagnostic run after OXC migration completed in 743.75 s, demonstrating
+that it was not deadlocked. The full differential run after the GC fix passed:
+198 programs, interpreter vs Template, including completion, console output, and
+errors (`integration-final.log`). The full checked/release GC corpus and other
+OS/architecture combinations were not checked.
 
-- UTF-16 меняет один текущий bytecode/serde format без compatibility layer;
-  старые сохранённые модули нужно пересоздать. ASCII cooked payload стал больше.
-- Главный риск таблицы stubs — неверный descriptor. Сравнены все 139 строк,
-  восемь полей, имена и порядок; ABI и validation tests сохранены.
-- Общий путь array stores меняет rooting при allocation. Проверены regression,
-  strides 1–16 и три runtime tiers; полный optimized GC gate остаётся необходимым.
-- −50% LOC не достигнуто. Не удалялись пользовательские возможности, vendor,
-  GC/JIT safety tests или parked reference code ради этого числа.
+## Risks and scope
 
-## Следующий выполненный шаг: frontend без RegExp matcher
+- UTF-16 changes the single current bytecode/serde format without a compatibility
+  layer; saved old modules must be rebuilt. ASCII cooked payloads are larger.
+- Incorrect descriptors are the main stub-table risk. All 139 rows, eight fields,
+  names, and order were compared; ABI and validation tests remain.
+- The shared array-store path changes rooting during allocation. The regression,
+  strides 1–16, and three runtime tiers were checked; the full optimized GC gate
+  is still required.
+- A 50% LOC reduction was not achieved. User functionality, vendor code, GC/JIT
+  safety tests, and parked reference code were not removed to reach that number.
 
-`compiler/expr/literal.rs` использует `validate_utf16`, вызывающий тот же
-`parser::parse`, что и `Regex::compile_utf16`. Убраны IR lowering и создание
-NativeTier из literal validation; один UTF-16 buffer используется и для проверки,
-и для bytecode constant. Второго parser, нового crate и публичного AST нет.
+## Subsequent completed step: frontend without the RegExp matcher
 
-`otter-regex` имеет default-on `runtime` feature. Workspace compiler сохраняет
-`unicode`, но не matcher; VM явно включает `runtime`. Native matching и стандартная
-CLI не урезаны. ICU casemap, memchr, smallvec и assembler dependencies относятся
-к runtime; Unicode property tables остаются у parser. В compiler-only normal/build
-графе **97 → 86 packages**: ушли dynasm/dynasmrt, их вспомогательные зависимости,
-ICU casemap/data, libc/memmap2. Это не удаление этих библиотек из полной CLI.
+`compiler/expr/literal.rs` uses `validate_utf16`, which calls the same
+`parser::parse` as `Regex::compile_utf16`. Literal validation no longer lowers IR
+or creates NativeTier; one UTF-16 buffer serves validation and the bytecode
+constant. There is no second parser, new crate, or public AST.
 
-Parser-only использует тот же внутренний AST. Только его payload-типы имеют
-обоснованный conditional `dead_code` allow: validation не читает matcher operands;
-runtime по-прежнему проверяется без этого allow. Методы lowering и ASCII bitmap
-вообще не компилируются без `runtime`. Заодно исправлен существовавший build blocker
-`--no-default-features`: `v` parser обращался к отключённому `string_props`.
-Unicode-off variant теперь отвергает property escapes, как требует его прежний
-контракт; обычный compiler всегда включает Unicode и не теряет грамматику.
+`otter-regex` has a default-on `runtime` feature. The workspace compiler keeps
+`unicode` without the matcher; VM explicitly enables `runtime`. Native matching
+and the standard CLI retain their functionality. ICU casemap, memchr, smallvec,
+and assembler dependencies belong to runtime; Unicode property tables remain
+with the parser. The compiler-only normal/build graph shrank from **97 to 86
+packages**, removing dynasm/dynasmrt, their support dependencies, ICU casemap/data,
+and libc/memmap2. These libraries remain in the full CLI.
 
-Измерения `/tmp/otter-regex-boundary/measure.py`: отдельные before/after copies,
-три чередующиеся пары пустых targets, pinned beta, dev, offline/locked,
-`cargo check -p otter-compiler --timings`; registry/page cache тёплый.
+Parser-only builds use the same internal AST. Only its payload types have a
+justified conditional `dead_code` allowance: validation does not read matcher
+operands; runtime is still checked without that allowance. Lowering methods and
+the ASCII bitmap do not compile without `runtime`. An existing
+`--no-default-features` build blocker was also fixed: the `v` parser referenced
+disabled `string_props`. The Unicode-off variant now rejects property escapes,
+as its previous contract requires; the ordinary compiler always enables Unicode
+and loses no grammar.
 
-| Pair | Before, с | After, с |
+Measurements in `/tmp/otter-regex-boundary/measure.py` used separate before/after
+copies, three alternating pairs of empty targets, pinned beta, dev,
+offline/locked `cargo check -p otter-compiler --timings`, and warm registry/page
+caches.
+
+| Pair | Before, seconds | After, seconds |
 |---|---:|---:|
 | 0 | 58.18 | 24.10 |
 | 1 | 36.08 | 21.08 |
 | 2 | 15.42 | 14.70 |
 
-Первые пары пересекались с другими сборками. Большой разброс не позволяет честно
-объявить процент ускорения. Доказаны меньший dependency graph и отсутствие matcher
-construction при validation; эти значения не являются full CLI clean-build timing.
-Снимок after для измерений сделан до исправления Unicode-off конфигурации;
-измеренная Unicode-on compiler конфигурация функционально та же.
+The first pairs overlapped other builds. The large spread prevents an honest
+percentage speedup claim. The smaller dependency graph and absence of matcher
+construction during validation are established; these values are not full CLI
+clean-build timings. The measured after snapshot predates the Unicode-off
+configuration fix; the measured Unicode-on compiler configuration is functionally
+unchanged.
 
-В full `scripts/gate.sh` добавлена отдельная проверка compiler/parser-only:
-workspace all-features не может проверить эту границу из-за feature unification.
-Default matcher tests прошли на ARM64 и как исполняемые x86_64 macOS binaries
-(47 unit, 49 matching, 1 validation); x86 — не только cross-check. Compiler —
-145 tests, parser-only Unicode — 13 unit + 1 validation. Minimal без Unicode
-также проверен отдельно. Strict workspace Clippy, compiler-only Clippy и
-parser-only Clippy проходят; default CLI и Node/Web build scripts собираются.
+The full `scripts/gate.sh` now checks compiler/parser-only separately: workspace
+all-features cannot check that boundary because of feature unification. Default
+matcher tests passed on ARM64 and as executable x86_64 macOS binaries (47 unit,
+49 matching, 1 validation); x86 was not merely cross-checked. Compiler passed
+145 tests; parser-only Unicode passed 13 unit + 1 validation. Minimal builds
+without Unicode were also checked separately. Strict workspace, compiler-only,
+and parser-only Clippy passed; default CLI and Node/Web build scripts built.
 
-Test262 `language/literals/regexp`, 4 workers, прежний timeout 10 s: **242 pass,
-4 timeout до и после**, совпадают все 246 path → status. Четыре timeout —
-`S7.8.5_A1.1_T2`, `A1.4_T2`, `A2.1_T2`, `A2.4_T2`: длинные переборы code units
-с eval. Они не объявлены passed; миллисекунды срабатывания timeout не сравниваются.
-Before runner собран из изолированного снимка непосредственно перед этим шагом,
-не из старого OXC 0.154. Reports: `test262-before.json`, `test262-final.json`,
-`test262-comparison.json` в `/tmp/otter-regex-boundary`.
+Test262 `language/literals/regexp`, four workers, unchanged 10 s timeout:
+**242 pass / 4 timeout before and after**, with all 246 path → status mappings
+matching. The four timeouts were `S7.8.5_A1.1_T2`, `A1.4_T2`, `A2.1_T2`, and
+`A2.4_T2`: long code-unit enumeration loops using eval. They are not counted as
+passes; elapsed milliseconds at timeout are not compared. The before runner was
+built from an isolated snapshot immediately before this step, not the old
+OXC 0.154 tree. Reports are `test262-before.json`, `test262-final.json`, and
+`test262-comparison.json` under `/tmp/otter-regex-boundary`.
 
-## Следующий шаг: зависимости декларативных расширений
+## Subsequent step: declarative extension dependencies
 
-Без прямого `otter-gc` пример расширения не собирался: `couch!` и `holt!`
-выдавали E0433 из generated code. Это воспроизведено до исправления после
-удаления только dependency из manifest (`missing-dependency-before.log`).
+Without a direct `otter-gc` dependency, the extension example failed to build:
+`couch!` and `holt!` produced E0433 in generated code. This was reproduced before
+the fix by removing only the manifest dependency (`missing-dependency-before.log`).
 
-`holt!`, `couch!` и inheritance resolvers `js_class` теперь получают `GcHeap` и
-`RootScope` через существующий `otter_vm::__macro_support`; runtime уже отдаёт
-этот контракт binding crates. Добавлены ровно два re-export, не весь GC module.
-Это те же типы того же владельца: нет wrapper, conversion, нового trait или
-runtime dispatch. Root slots, их время жизни, порядок аллокаций и barriers не
-менялись. `__macro_support` остаётся скрытым контрактом generated code, не API
-для handwritten extensions. Явные GC-derives `Pelt`/`Groom` сохраняют свою
-обоснованную зависимость от GC.
+`holt!`, `couch!`, and `js_class` inheritance resolvers now obtain `GcHeap` and
+`RootScope` through the existing `otter_vm::__macro_support`; runtime already
+exposes this contract to binding crates. Exactly two re-exports were added, not
+the whole GC module. These are the same types with the same owner: no wrapper,
+conversion, new trait, or runtime dispatch. Root slots, lifetimes, allocation
+order, and barriers were unchanged. `__macro_support` remains a hidden generated
+code contract, not a handwritten extension API. Explicit `Pelt`/`Groom` GC derives
+retain their justified GC dependency.
 
-Удалены прямые зависимости `otter-web → otter-gc` и `extension-template → otter-gc`;
-normal dependencies второго crate — только runtime/macros; VM/GC нет даже в dev deps.
-Шаблон собирается с `#![forbid(unsafe_code)]`: handwritten binding code не должен
-использовать unsafe; внутренние root operations остаются ответственностью engine.
-Существующие тесты template проверяют class, namespace, async и hosted module;
-в full gate добавлен их запуск. Web `File extends Blob` проверяет native inheritance
-через ту же границу. Обновлены оба руководства для bindings/embedding.
+Removed direct `otter-web → otter-gc` and `extension-template → otter-gc` edges.
+The latter's normal dependencies are only runtime/macros; VM/GC are absent even
+from its dev dependencies. The template builds with `#![forbid(unsafe_code)]`:
+handwritten bindings must not use unsafe; internal root operations remain the
+engine's responsibility. Existing template tests check classes, namespaces,
+async bindings, and hosted modules; their execution was added to the full gate.
+Web `File extends Blob` checks native inheritance through the same boundary.
+Both binding/embedding guides were updated.
 
-Это устранение скрытого требования к consumer manifest, не ускорение сборки:
-GC остаётся транзитивной зависимостью runtime. Новых tests/crates нет; регрессия
-проверяется существующим реальным consumer. Журналы: `/tmp/otter-macro-boundary/`.
+This removes a hidden consumer-manifest requirement, not build time: GC remains
+a transitive runtime dependency. No new tests/crates were added; an existing real
+consumer checks the regression. Logs: `/tmp/otter-macro-boundary/`.
 
-Проверки этого шага: macros 14, extension-template 2, Web 72 passed / 1 ignored;
-GC stress 1–16 — по 10 существующих проверок на stride (160 passed): template,
-couch, holt и три Web-сценария, включая native inheritance и async Blob reads.
-Fetch-тестам понадобились loopback sockets: sandbox EPERM отделён от результатов
-движка, повтор с разрешёнными локальными sockets прошёл. Default CLI, strict
-workspace Clippy, formatting и shell syntax gate проверены. Полный closing gate
-не запускался; bytecode/Value layout, GC barriers и JIT ABI не менялись.
+Checks for this step: macros 14, extension-template 2, Web 72 passed / 1 ignored.
+GC stress 1–16 ran ten existing checks per stride (160 passed): template, couch,
+holt, and three Web scenarios, including native inheritance and async Blob reads.
+Fetch tests required loopback sockets: sandbox EPERM was separated from engine
+results, and the rerun with local sockets allowed passed. Default CLI, strict
+workspace Clippy, formatting, and gate shell syntax were checked. The full closing
+gate was not run; bytecode/Value layout, GC barriers, and JIT ABI were unchanged.
 
-## Граница динамической загрузки модулей
+## Dynamic module-loading boundary
 
-В `module_ops.rs` подтверждены две ошибки:
+Two bugs were confirmed in `module_ops.rs`:
 
-- `run_import_namespace_dynamic_operands` использовал lossy `coerce_to_string`;
-  `evaluate_import_call_options` делал то же для `type`. Запрос `./\ud800.js`
-  действительно загружал существующий `./�.js`. Подмена происходила до lookup
-  в `module_resolution_target` и передачи запроса `DynamicImportLoader::schedule`.
-- Проверка типа/поддержки attribute шла внутри перечисления свойств. Например,
-  `{ type: 42, get later() { throw marker; } }` отвергалась с `TypeError`,
-  не вызывая getter. [EvaluateImportCall](https://tc39.es/ecma262/#sec-evaluate-import-call)
-  сначала завершает `EnumerableOwnProperties`, затем проверяет attributes.
+- `run_import_namespace_dynamic_operands` used lossy `coerce_to_string`;
+  `evaluate_import_call_options` did the same for `type`. Requesting `./\ud800.js`
+  actually loaded existing `./�.js`. Substitution happened before lookup in
+  `module_resolution_target` and scheduling through `DynamicImportLoader::schedule`.
+- Attribute type/support validation happened while enumerating properties.
+  For example, `{ type: 42, get later() { throw marker; } }` was rejected with
+  `TypeError` without invoking the getter.
+  [EvaluateImportCall](https://tc39.es/ecma262/#sec-evaluate-import-call) completes
+  `EnumerableOwnProperties` before validating attributes.
 
-VM теперь использует точный `ToString`, сохраняет результат checked UTF-8
-конвертации в Rust-owned памяти и откладывает отказ до чтения options. Все
-attribute values сначала читаются в handle scope; следующий getter или Proxy
-trap может собирать heap. Ошибки проходят через существующий единый обработчик
-`CommittedValueError` → rejected Promise: удалены вложенный `Result<Result<…>>`
-и дублирующая ветка создания Promise. Production-файл стал на 8 строк короче.
-Новых crates, зависимостей, public API, dispatch layers и изменений GC/JIT ABI нет.
-Сбор enumerable values добавляет временный список handles на холодном пути
-`import(..., options)`; это требование observable порядка, не оптимизация скорости.
+VM now uses exact `ToString`, retains the checked UTF-8 conversion result in
+Rust-owned memory, and delays rejection until options are read. All attribute
+values are first read in a handle scope: a subsequent getter or Proxy trap can
+collect the heap. Errors go through the existing shared `CommittedValueError` →
+rejected Promise handler. Nested `Result<Result<…>>` and a duplicate Promise
+creation branch were removed. The production file became eight lines shorter.
+No crates, dependencies, public APIs, dispatch layers, or GC/JIT ABI changes were
+added. Collecting enumerable values adds a temporary handle list on the cold
+`import(..., options)` path; this implements observable ordering, not a speedup.
 
-`module_request_identity.rs` проверяет prelinked и on-demand загрузку, high/low
-lone surrogates, настоящий U+FFFD, emoji, повторный namespace cache hit, точное
-число coercion calls, dynamic literal, JSON attribute через collecting Proxy,
-приоритет thrown object и фильтрацию symbol/non-enumerable keys. Оба новых теста
-сначала упали на исходной реализации; затем прошли. Static-request проверки из
-`oxc_string_values.rs` сохранены. Запрет lone surrogates относится к UTF-8 host
-request API Otter, не к JS-строкам вообще. `import.meta.resolve` в этом шаге не менялся.
+`module_request_identity.rs` checks prelinked and on-demand loading, high/low lone
+surrogates, actual U+FFFD, emoji, repeated namespace cache hits, exact coercion-call
+counts, dynamic literals, JSON attributes through a collecting Proxy, thrown-object
+precedence, and symbol/non-enumerable filtering. Both new tests failed on the
+original implementation and then passed. Static-request checks in
+`oxc_string_values.rs` remain. Lone surrogates are rejected by Otter's UTF-8 host
+request API, not by JS strings generally. `import.meta.resolve` was unchanged
+in this step.
 
-| Проверка | До | После |
+| Check | Before | After |
 |---|---|---|
-| Две новые runtime-регрессии | 2 failed | 2 passed |
+| Two new runtime regressions | 2 failed | 2 passed |
 | Test262 `language/expressions/dynamic-import` | 724 pass, 217 skip | 724 pass, 217 skip |
-| Точные Test262 path → outcome | 941 строки | Все совпали |
-| GC stress 1–16: identity, OXC strings, module error builders | Не запускался | 144 passed |
+| Exact Test262 path → outcome | 941 rows | All matched |
+| GC stress 1–16: identity, OXC strings, module error builders | Not run | 144 passed |
 
-Условия Test262 одинаковы: macOS ARM64, pinned beta-2026-10-18, dev profile,
-production-tiered, 4 workers, timeout 10 s, один прогон каждого состояния.
-Skip policy не менялась; 217 skipped не считаются проверенными. Reports содержат
-SHA-256 runner, revision корпуса и semantic config. Это проверка корректности,
-не сравнение производительности. Build timings здесь не повторялись: граф
-зависимостей не изменён, ускорение не заявляется.
+Test262 conditions matched: macOS ARM64, pinned beta-2026-10-18, dev profile,
+production-tiered, four workers, 10 s timeout, one run per state. Skip policy was
+unchanged; 217 skips are not validated behavior. Reports include runner SHA-256,
+corpus revision, and semantic config. This checks correctness, not performance.
+Build timings were not repeated: the dependency graph was unchanged and no build
+speedup is claimed.
 
-Проверки: VM unit **1305 passed**; семь focused runtime suites **28 passed**;
-dynamic-import capability и Web module suites **45 passed** (loopback sockets
-разрешены отдельно); default CLI и Test262 runner собраны; workspace Clippy
-`--all-targets --all-features -- -D warnings`, formatting и `git diff --check`
-прошли. Linker сообщил о размере debug `__eh_frame`, Cargo — о future-incompat
-в `proc-macro-error2`; они не замаскированы как ошибки этого изменения.
+Checks: VM unit **1305 passed**; seven focused runtime suites **28 passed**;
+dynamic-import capability and Web module suites **45 passed** (loopback sockets
+allowed separately); default CLI and Test262 runner built; workspace Clippy
+`--all-targets --all-features -- -D warnings`, formatting, and `git diff --check`
+passed. The linker reported a large debug `__eh_frame`, and Cargo reported
+future incompatibility in `proc-macro-error2`; these were not presented as errors
+introduced by this change.
 
 `jit_module_ops::synchronous_module_ops_match_interpreter_with_observable_effects`
-падает на `reentrant > 0` **до и после**: semantic output совпадает, fixture не
-входит в требуемый переход. Before воспроизведён в изолированном
-`/tmp/otter-regex-boundary/source-before` с собственным target; test и исходный
-`module_ops.rs` byte-identical, что проверено `cmp`. Assertion не удалён и не
-ослаблен. Полный closing gate и runtime на других архитектурах не запускались;
-этот шаг нельзя считать полностью зелёным workspace gate.
+failed on `reentrant > 0` **before and after**: semantic output matched, but the
+fixture did not enter the required transition. The before failure was reproduced
+in isolated `/tmp/otter-regex-boundary/source-before` with its own target;
+`cmp` verified the test and original `module_ops.rs` were byte-identical.
+The assertion was neither removed nor weakened. The full closing gate and runtime
+on other architectures were not run; this step was not a fully passing workspace
+gate.
 
-Журналы, исходный `module_ops.rs`, environment, Test262 reports/comparison и
-строковые результаты stress сохранены в `/tmp/otter-module-boundary/`.
-Основные команды (target вне пользовательского cache):
+Logs, original `module_ops.rs`, environment, Test262 reports/comparison, and per-run
+stress results are under `/tmp/otter-module-boundary/`. Main commands, with a target
+outside user caches:
 
 ```sh
 export CARGO_TARGET_DIR=/tmp/otter-architecture-review/target-migration
@@ -411,104 +441,231 @@ $CARGO_TARGET_DIR/debug/otter-test262 run --filter language/expressions/dynamic-
   --jobs 4 --timeout 10000 --output /tmp/otter-module-boundary/test262-after.json
 ```
 
-## Восстановленная проверка native module reads
+## Restored native module-read proof
 
-Причина падения `jit_module_ops` установлена: `hot(80)` не оплачивает стоимость
-компиляции по текущей `TierWorkModel`. В исходном запуске Template было **0
-compile attempts, 0 generations, 0 JIT events**. При `hot(1000)` появилась одна
-Template OSR generation именно `hot`, после чего module transitions исполнялись.
-Production policy и код VM/JIT не менялись; это дефект устаревшего fixture,
-а не обнаруженная ошибка backend.
+The `jit_module_ops` failure was explained: `hot(80)` does not pay the compilation
+cost under the current `TierWorkModel`. The original Template run had **0 compile
+attempts, 0 generations, and 0 JIT events**. With `hot(1000)`, one Template OSR
+generation for `hot` appeared and module transitions executed. Production policy
+and VM/JIT code were unchanged; this was a stale fixture, not a backend bug.
 
-Тест теперь проверяет больше, чем положительный общий счётчик:
+The test now proves more than a positive aggregate counter:
 
-- После нормального прогрева находит installed/current/linked Template generation
-  по `function_id`, полученному из реального source trace.
-- После полного GC изменяет live export через функцию другого модуля.
-- Повторный вызов читает новое значение и даёт тот же результат, что interpreter.
-- В измеряемом вызове нет ни одного interpreted opcode `hot`; shared reentrant
-  counter растёт, а исходный `code_object_id` остаётся installed/current/linked.
-- Interpreter oracle действительно исполняет `LoadImportBinding`: tracer не
-  может молча выключиться и дать ложное доказательство native execution.
+- After normal warmup, it finds the installed/current/linked Template generation
+  using `function_id` from an actual source trace.
+- After full GC, it mutates the live export through a function in another module.
+- The repeated call reads the new value and matches the interpreter result.
+- The measured call has no interpreted `hot` opcode; the shared reentrant counter
+  grows and the original `code_object_id` remains installed/current/linked.
+- The interpreter oracle actually executes `LoadImportBinding`: the tracer cannot
+  silently switch off and provide false evidence of native execution.
 
-Native proof относится к повторным binding reads. Одноразовые namespace imports,
-star re-export, deferred evaluation и `import.meta.resolve` по-прежнему проверены
-на observable семантику, но их native execution этот fixture не доказывает.
-Удалён отдельный console-capture harness: сравнение идёт по owned completion.
-Это не сокращение общего LOC: assertions точного исполнения увеличили тест;
-новых tests, crates и production abstractions нет.
+Native proof covers repeated binding reads. One-time namespace imports, star
+re-exports, deferred evaluation, and `import.meta.resolve` retain observable
+semantic checks, but this fixture does not prove their native execution.
+A separate console-capture harness was removed; comparison uses owned completion.
+This does not reduce total LOC: exact-execution assertions made the test larger.
+No new tests, crates, or production abstractions were introduced.
 
-Результат: исходный тест failed → passed; GC stress **1–16 passed**; четыре
-module suites **12 passed**; `scripts/gate.sh --quick all` passed; workspace Clippy
-`--all-targets --all-features -- -D warnings`, formatting, `bash -n` и diff check
-прошли. В full gate включён отдельный запуск `jit_module_ops`, `module_request_identity`
-и `gc_module_error_builders` (**8 passed** той же командой).
+Results: the original test changed from failed to passed; GC stress **1–16 passed**;
+four module suites **12 passed**; `scripts/gate.sh --quick all` passed; workspace
+Clippy `--all-targets --all-features -- -D warnings`, formatting, `bash -n`, and
+diff checks passed. The full gate now separately runs `jit_module_ops`,
+`module_request_identity`, and `gc_module_error_builders` (**8 passed** with that
+same command).
 
-Проверено на macOS ARM64, прежний pinned toolchain и dev profile. Target —
-`/tmp/otter-architecture-review/target-migration`, журналы и исходный fixture —
-`/tmp/otter-jit-module-review/`. Сборка и runtime не ускорялись и не измерялись:
-изменены только тест и gate. Full closing gate, другие платформы и Test262
-повторно не запускались. Ранее найденное падение `jit_module_ops` закрыто;
-это само по себе не означает, что весь workspace gate зелёный.
+Checked on macOS ARM64 with the existing pinned toolchain and dev profile.
+Target: `/tmp/otter-architecture-review/target-migration`; logs and original fixture:
+`/tmp/otter-jit-module-review/`. Build/runtime performance was neither changed nor
+measured: only the test and gate changed. Full closing gate, other platforms, and
+Test262 were not rerun. The previously found `jit_module_ops` failure is closed;
+this does not establish a passing full workspace gate.
 
-## Поддержка static import attributes и владелец ошибок загрузки
+## Static import attributes and loading-error ownership
 
-`module_attribute_type` раньше искал первый `type` и игнорировал остальные
-ключи. Static import с `extra` действительно выполнял зависимость и entry.
-Теперь общий helper compiler/loader проверяет все ключи до сокращения AST
-до `(specifier, attr_type)`. Диагностика указывает диапазон неподдерживаемого
-ключа. Пустой clause, обычный import, `type` и его escaped spelling сохранены.
-Новых зависимостей, DTO, форматов и public API нет.
+`module_attribute_type` previously found the first `type` and ignored other keys.
+A static import with `extra` actually executed both dependency and entry. The
+shared compiler/loader helper now validates every key before reducing the AST to
+`(specifier, attr_type)`. Diagnostics point to the unsupported key's range.
+Empty clauses, ordinary imports, `type`, and its escaped spelling are preserved.
+No dependencies, DTOs, formats, or public APIs were added.
 
-Сохранено различие из [InnerModuleLoading](https://tc39.es/ecma262/#sec-InnerModuleLoading):
-неподдерживаемый ключ static request даёт `SyntaxError` при загрузке. Options
-самого `import()` по-прежнему дают `TypeError` после чтения всех getters.
-Загрузка через `import()` модуля с неверным static request отвергает Promise
-с `SyntaxError`. Это одна политика поддерживаемых ключей, не один класс ошибок.
+The distinction from
+[InnerModuleLoading](https://tc39.es/ecma262/#sec-InnerModuleLoading) remains:
+an unsupported static-request key produces `SyntaxError` during loading. Options
+of `import()` itself still produce `TypeError` after reading every getter.
+Loading a module with an invalid static request through `import()` rejects the
+Promise with `SyntaxError`. This is one supported-key policy, not one error class.
 
-Обнаружена связанная ошибка `handle::discover_remote_requests`: advisory prefetch
-немедленно возвращал parse/request diagnostic из literal dynamic target,
-не позволяя JS поймать её. Такие diagnostics теперь оставлены основному
-`ModuleGraphBuilder`, который уже различает обязательные и optional dynamic
-узлы. I/O, resource и cancellation errors этим изменением не подавляются.
-Изменения только на frontend/загрузочной границе; GC barriers и JIT ABI не тронуты.
+A related bug was found in `handle::discover_remote_requests`: advisory prefetch
+immediately returned a parse/request diagnostic from a literal dynamic target,
+preventing JS from catching it. These diagnostics now remain the responsibility
+of the existing `ModuleGraphBuilder`, which distinguishes required and optional
+dynamic nodes. I/O, resource, and cancellation errors are not suppressed.
+Changes are confined to the frontend/loading boundary; GC barriers and JIT ABI
+are unchanged.
 
-Проверки через public compiler entry points покрывают приём поддерживаемых
-clause и точный span ошибки. Runtime проверяет 32 static комбинации (включая
-re-export, defer, отсутствующую цель, неизвестный ключ до/после `type`), отсутствие
-выполнения отвергнутого графа, literal/on-demand import и оба класса ошибок.
-Async fixture проверяет финальный JS marker через отдельный host call, а не
-только успешный возврат `run_module`. Усиленные регрессии падают на исходном
-helper/handle и проходят после исправления. Существующий build fingerprint
-охватывает `otter-syntax/src`, поэтому старые compiled-cache entries не
-переиспользуются; версия внутреннего формата не добавлялась.
+Public compiler entry-point checks cover supported clauses and exact error spans.
+Runtime checks cover 32 static combinations, including re-exports, defer, missing
+targets, and unknown keys before/after `type`; no execution of rejected graphs;
+literal/on-demand imports; and both error classes. The async fixture checks the
+final JS marker through a separate host call, not merely successful `run_module`
+return. Strengthened regressions fail on the original helper/handle and pass
+after the fix. The existing build fingerprint covers `otter-syntax/src`, so old
+compiled-cache entries are not reused; no internal format version was added.
 
-| Проверка | До | После |
+| Check | Before | After |
 |---|---|---|
 | Test262 `import-attributes` | 83 pass, 13 skip | 83 pass, 13 skip |
 | Test262 `language/expressions/dynamic-import` | 724 pass, 217 skip | 724 pass, 217 skip |
-| Точные path → outcome обоих наборов | 972 уникальных пути | Все совпали |
-| Новые static/async регрессии | Failed | Passed |
+| Exact path → outcome across both subsets | 972 unique paths | All matched |
+| New static/async regressions | Failed | Passed |
 
-Test262: один прогон каждой конфигурации, macOS ARM64, dev profile,
-production-tiered, 4 workers, timeout 10 s, прежняя skip policy. Наборы
-пересекаются; их totals нельзя складывать. Compiler **146**, syntax **11**,
-focused runtime/module suites **69 passed**; GC stress 1–16 — **192 passed**.
-Default CLI/Test262 build, workspace Clippy all-targets/all-features,
-formatting и diff check прошли. Loopback sockets для loader tests разрешены
-отдельно. Журналы и comparison JSON: `/tmp/otter-import-attributes/`.
+Test262 used one run per configuration on macOS ARM64, dev profile,
+production-tiered, four workers, 10 s timeout, and the unchanged skip policy.
+The subsets overlap; their totals must not be added. Compiler **146**, syntax
+**11**, focused runtime/module suites **69 passed**; GC stress 1–16 **192 passed**.
+Default CLI/Test262 build, workspace Clippy all-targets/all-features, formatting,
+and diff checks passed. Loopback sockets were allowed separately for loader tests.
+Logs and comparison JSON: `/tmp/otter-import-attributes/`.
 
-Граф зависимостей и горячие пути не изменены: ускорение сборки/VM не заявляется,
-build timings не повторялись. Полный workspace/GC closing gate и runtime на
-других платформах не запускались. Известные предупреждения debug linker и
-future-incompat `proc-macro-error2` сохраняются.
+The dependency graph and hot paths are unchanged: no build/VM speedup is claimed,
+and build timings were not repeated. Full workspace/GC closing gate and runtime
+on other platforms were not run. Existing debug-linker and proc-macro-error2
+future-incompatibility warnings remain.
 
-## Подтверждённые следующие задачи
+## Phantom: parse goals and recovered ASTs
 
-1. **P1: согласовать parse goals/scanner diagnostics.** Phantom/asm используют
-   Parser напрямую; extract_specifiers посещает AST с parser errors.
-   Приёмка: тесты malformed JS/TS и корректный контракт частичного результата.
-2. **P1: повторить build measurements на свободном host.** Не менее трёх
-   чередующихся before/after clean builds, отдельный linking measurement,
-   восстановительный build между incremental triggers. Не обещать −50% LOC
-   без перечня реально устраняемых обязанностей и сохранённых проверок.
+This continuation uses macOS ARM64 and the existing `beta-2026-10-18` toolchain.
+The local checkout actually started at `7b8f80bda`, not `d3337f755`. At the user's
+separate request, all 28 local commits were rebased onto fetched `origin/main`
+(`d3337f755`); the current HEAD is `ebb80d228`. Three native-stub inventory
+conflicts were resolved by moving additions/removal into the authoritative table.
+All 141 descriptors, eight ABI/effect fields, diagnostic symbols, and dense ids
+were checked against the previous branch. Backup:
+`backup/pre-scanner-rebase-20261112`; the stash was retained. Working files were
+restored and verified with SHA-256. The pre-existing unrelated changes in this
+checkout are `docs/site/public/conformance/data.json` and `.github/banner.png`;
+they remain byte-identical. `vendor/test262`, `.claude/`, and `tests/test262/`
+were not touched. The scanner patch was verified before committing; no push/PR
+was made.
+Searches used the available `fff` service. The review is written in English,
+including the translated historical sections above.
+
+Actual callers and consequences:
+
+- `scan_project` calls `extract_specifiers`; its only production consumer is CLI
+  `otter doctor`. The scanner reads sources, compares specifiers with the manifest,
+  and checks whether package.json exists in node_modules. It neither installs
+  packages nor resolves a module graph nor executes JS. A false finding makes
+  doctor unhealthy and changes its exit code.
+- asm.js `translate` receives function source through the link/native hook, wraps
+  it as an expression, and parses with the CommonJS goal. It checks diagnostics
+  **before** visiting the AST; rejection leaves ordinary JS execution intact.
+  No defect requiring a move to the runtime frontend or a contract change was
+  established for this direct OXC use.
+- Phantom violated its documented promise to skip unparseable files: OXC can
+  return a nonempty AST together with recoverable diagnostics, and the visitor
+  walked it unconditionally. No caller relies on this as a partial-result contract.
+
+Public `scan_project` reproduction: a separate valid `import 'real'` file plus
+one containing `import 'ghost'; const uninitialized;` (JS),
+`import 'ghost'; throw\n0;` (TS), or `import 'ghost'; /(/;` (JS). All three
+previously produced `[ghost, real]`; after the fix they produce `[real]`.
+The original 20 Phantom tests passed on the updated base; the new regression
+failed before the production fix.
+
+The fix belongs in `otter-pm-phantom/src/extract.rs`. The visitor runs only after
+a diagnostic-free parse; RegExp parsing is explicitly enabled, as in the runtime
+frontend. Module is tried first, then CommonJS, which accepts Script syntax and
+top-level `return` and `new.target`. A CommonJS fallback containing module syntax
+is rejected: OXC accepts TS module declarations even under that goal, which would
+otherwise hide a Module error caused by top-level return. The shared
+`allow_return_outside_function` override for Module was removed. No APIs,
+dependencies, traits, crates, or parser wrappers were added. A second parse can
+occur only on the cold analysis path for source rejected by the Module parser;
+no speedup is claimed.
+
+Partial results remain a project-level policy: an unparseable file is skipped
+entirely while other files continue to be scanned. Computed/type-only loads and
+specifiers unrepresentable in UTF-8 are still omitted individually. High/low lone
+surrogates, actual U+FFFD, and a surrogate pair are checked; no string substitution
+is introduced. Occurrence ordering, guarded imports, and `scanned_files` as the
+count of files read, including skipped files, are preserved. This advisory pass
+does not select a loader goal from extension/package.json or replace compiler
+semantic checks. The scanner patch does not change runtime loading, error classes,
+observable effect order, or Value/GC/JIT contracts.
+
+Checks for this continuation:
+
+- Phantom **23**, syntax **11**, compiler **146**, VM **1305**, JIT **349** passed
+  (`--lib --all-features --no-fail-fast`). The goal matrix covers a Script using
+  `await.ready`, CommonJS return/new.target, Module top-level await, and TSX.
+  The project regression also rejects JS/TS Modules with top-level return.
+- Test262 `language/module-code`: **595 pass / 4 skip** before and after;
+  `language/statements/return`: **16 pass** before and after. All **615 exact
+  path → outcome** pairs, including skip reasons, match. Corpus:
+  `be13516fb6441b950ba8a3df97eb34062c186972`, production-tiered, four workers,
+  10 s timeout. Phantom is not a runner dependency; actual runner identity matches
+  across both series and the final standalone runner build. This checks
+  preservation of runtime semantics, not Phantom
+  directly; the `scan_project` regression reproduces its defect.
+- Default CLI/Test262 build, standalone Phantom Clippy
+  `--all-targets --all-features -- -D warnings`, formatting, and diff checks passed.
+  A CLI smoke check with `otter --json doctor --root <temp-project>` read seven
+  files, reported only `[real, script]`, and returned the expected exit 1 for those
+  two real findings; five malformed files added no findings. The standalone
+  scanner declares no Cargo features and is checked separately from workspace
+  feature unification. Existing debug-linker `__eh_frame` and proc-macro-error2
+  future-incompatibility warnings remain.
+- `OTTER_GC_STRESS=1 bash scripts/gate.sh --quick all` passed: GC, remembered
+  arrays, both moving-GC constructor regressions, Math guards, explicit native
+  calls, and named-property tests. This is focused regression coverage after the
+  rebase, not the full optimized GC corpus or closing gate.
+- Workspace Clippy `--all-targets --all-features -- -D warnings` stopped on **12
+  pre-existing lint errors**: `double_must_use` in `abstract_ops.rs:250` and 11
+  `needless_borrow` cases in `array_prototype.rs:5028–5396`. Both files are
+  byte-identical to current HEAD and do not depend on Phantom. These are blockers
+  in the updated base, not scanner-patch errors. Lints were not suppressed and
+  VM code was not changed to address them.
+
+All commands use the separate `/private/tmp/otter-scanner-target`; Cargo metadata
+confirms that target_directory. `scripts/gate.sh --quick` does not override it:
+child Cargo commands inherit `CARGO_TARGET_DIR`. User caches and the toolchain
+were neither deleted nor upgraded; missing OXC 0.158 packages were fetched strictly
+from the existing Cargo.lock. Logs and canonical Test262 reports:
+`/private/tmp/otter-scanner-*.log` / `*.json`. Every before/after path/outcome pair
+is retained in `/private/tmp/otter-scanner-comparison.json`.
+
+Main validation commands for this continuation:
+
+```sh
+export CARGO_TARGET_DIR=/private/tmp/otter-scanner-target
+cargo test --locked --offline -p otter-pm-phantom -p otter-syntax -p otter-compiler \
+  -p otter-vm -p otter-jit --lib --all-features --no-fail-fast
+cargo clippy --locked --offline -p otter-pm-phantom --all-targets --all-features -- -D warnings
+# Currently blocked by the 12 existing VM lint errors listed above.
+cargo clippy --locked --offline --workspace --all-targets --all-features -- -D warnings
+cargo build --locked --offline -p otter-cli
+cargo build --locked --offline -p otter-test262
+OTTER_GC_STRESS=1 bash scripts/gate.sh --quick all
+cargo fmt --all -- --check
+$CARGO_TARGET_DIR/debug/otter-test262 run --filter language/module-code \
+  --jobs 4 --timeout 10000 --output /private/tmp/otter-scanner-module-after.json
+$CARGO_TARGET_DIR/debug/otter-test262 run --filter language/statements/return \
+  --jobs 4 --timeout 10000 --output /private/tmp/otter-scanner-return-after.json
+```
+
+The full closing gate, full checked GC corpus at strides 1–16, and other platforms
+were not run in this continuation. Historical ES_CONFORMANCE.md's 99.98% is not
+current verification; this is not a claim that the whole workspace passes.
+
+## Confirmed next tasks
+
+1. **P1: close current workspace-gate blockers.** Address the 12 existing VM lint
+   errors after integrating local performance commits, then run the full closing
+   gate.
+2. **P1: repeat build measurements on an idle host.** At least three alternating
+   before/after clean-build pairs, a separate linking measurement, and a restorative
+   build between incremental triggers. Do not promise a 50% LOC reduction without
+   identifying the responsibilities actually removed and the checks preserved.

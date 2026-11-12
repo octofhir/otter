@@ -7,9 +7,9 @@
 //! anything the project changed. This crate finds those imports while they
 //! still work.
 //!
-//! Detection parses the same way the engine loads code, so an import that is
-//! erased at runtime — a type-only import, a computed specifier — is never
-//! reported, and an import a `try` block already handles is reported as
+//! Detection inspects an OXC AST without loading or resolving dependencies.
+//! Sources with parser diagnostics are skipped. Type-only imports and computed
+//! specifiers are not reported; a load inside a `try` block is reported as
 //! guarded rather than required.
 //!
 //! # Contents
@@ -84,7 +84,7 @@ pub struct UndeclaredDependency {
 pub struct ProjectScan {
     /// Packages imported but not declared, in name order.
     pub undeclared: Vec<UndeclaredDependency>,
-    /// Number of source files parsed.
+    /// Number of source files read, including those skipped for parser diagnostics.
     pub scanned_files: usize,
 }
 
@@ -342,5 +342,31 @@ mod tests {
                 .undeclared
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn parser_recovery_does_not_report_dependencies_from_malformed_sources() {
+        let mut findings = Vec::new();
+        for (extension, source) in [
+            ("js", "import 'ghost'; const uninitialized;"),
+            ("ts", "import 'ghost'; throw\n0;"),
+            ("js", "import 'ghost'; /(/;"),
+            ("js", "import 'ghost'; return;"),
+            ("ts", "import 'ghost'; return;"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(&tmp.path().join(PACKAGE_JSON), r#"{"name":"app"}"#);
+            write(&tmp.path().join(format!("bad.{extension}")), source);
+            write(&tmp.path().join("valid.mjs"), "import 'real';");
+            let scan = scan_project(tmp.path()).await.unwrap();
+            assert_eq!(scan.scanned_files, 2);
+            findings.push(
+                scan.undeclared
+                    .into_iter()
+                    .map(|dep| dep.package)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(findings, vec![vec!["real"]; 5]);
     }
 }

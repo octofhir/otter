@@ -660,11 +660,25 @@ The full closing gate, full checked GC corpus at strides 1–16, and other platf
 were not run in this continuation. Historical ES_CONFORMANCE.md's 99.98% is not
 current verification; this is not a claim that the whole workspace passes.
 
+## VM lint blockers closed
+
+Following authorization to commit verified slices, the Phantom fix and English
+review were committed as `17ce5cf3`. The 12 VM lint errors listed above were then
+fixed without suppressions: `StrictMatcher::scan` relies on `Result`'s existing
+must-use contract, and the array callback driver passes its already-borrowed
+execution context directly at the 11 affected call sites. Root ownership,
+allocation order, callback ordering, and runtime ABI are unchanged.
+
+Workspace Clippy `--locked --offline --workspace --all-targets --all-features --
+-D warnings` now passes, as do formatting and diff checks. Validation reused the
+dedicated `/private/tmp/otter-scanner-target`; the full closing gate remains
+outstanding. No build or execution speedup is claimed for lint-only changes.
+
 ## Confirmed next tasks
 
-1. **P1: close current workspace-gate blockers.** Address the 12 existing VM lint
-   errors after integrating local performance commits, then run the full closing
-   gate.
+1. **P1: finish the current workspace closing gate.** The 12 VM lint blockers are
+   closed. Full-gate tooling must also use Cargo's actual executable paths rather
+   than assuming `target/release` when `CARGO_TARGET_DIR` is configured.
 2. **P1: repeat build measurements on an idle host.** At least three alternating
    before/after clean-build pairs, a separate linking measurement, and a restorative
    build between incremental triggers. Do not promise a 50% LOC reduction without

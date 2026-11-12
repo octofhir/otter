@@ -1,10 +1,10 @@
 //! Specifier extraction from one source file.
 //!
-//! Extraction runs on the same parser the engine loads code with, so what is
-//! reported is what would actually be imported — not what a text search
-//! guessed at. Type-only syntax is erased before it is ever recorded, and an
-//! import that a `try` block already accounts for is marked guarded rather
-//! than reported as a hard requirement.
+//! This advisory pass uses OXC's AST rather than text matching. It accepts
+//! Script, CommonJS and Module syntax. It does not choose a loader goal from
+//! package metadata or perform the compiler's semantic checks. Type-only imports
+//! are omitted, and a load inside a `try` block is marked guarded rather than
+//! required.
 //!
 //! # Contents
 //! - [`Occurrence`] — one specifier as it appears in a file.
@@ -19,6 +19,8 @@
 //!   that could be checked against a manifest.
 //! - A file that fails to parse yields no occurrences rather than an error:
 //!   this is a diagnostic pass, and it must not become the thing that fails.
+//!   A recovered AST with diagnostics is also rejected in its entirety.
+//! - Specifiers containing unpaired surrogates are omitted, never replaced.
 //!
 //! # See also
 //! - [`crate::specifier`] for what a recorded specifier is then classified as.
@@ -38,22 +40,39 @@ pub struct Occurrence {
     pub guarded: bool,
 }
 
-/// Parse `source` and collect every literal module specifier it loads.
+/// Collect literal loads from a source that parses without diagnostics.
+///
+/// Try Module syntax, then CommonJS (which also accepts ordinary Scripts).
+/// Only CommonJS permits top-level `return` and `new.target`; a CommonJS
+/// fallback cannot accept module declarations. Sources with parser diagnostics
+/// yield no occurrences, including recovered ASTs. This is advisory analysis,
+/// not loader or compiler validation.
 #[must_use]
 pub fn extract_specifiers(source: &str, kind: SourceKind) -> Vec<Occurrence> {
-    let allocator = Allocator::default();
-    let parsed = Parser::new(&allocator, source, kind.to_oxc())
-        .with_options(ParseOptions {
-            allow_return_outside_function: true,
-            ..ParseOptions::default()
-        })
-        .parse();
-    let mut visitor = SpecifierVisitor {
-        occurrences: Vec::new(),
-        try_depth: 0,
-    };
-    visitor.visit_program(&parsed.program);
-    visitor.occurrences
+    let module = kind.to_oxc();
+    for source_type in [module, module.with_commonjs(true)] {
+        let allocator = Allocator::default();
+        let parsed = Parser::new(&allocator, source, source_type)
+            .with_options(ParseOptions {
+                parse_regular_expression: true,
+                ..ParseOptions::default()
+            })
+            .parse();
+        // OXC permits TS module declarations even under a Script/CommonJS goal.
+        // Do not let that fallback hide a Module-goal error (e.g. top-level return).
+        if !parsed.diagnostics.is_empty()
+            || (source_type.is_commonjs() && parsed.module_record.has_module_syntax)
+        {
+            continue;
+        }
+        let mut visitor = SpecifierVisitor {
+            occurrences: Vec::new(),
+            try_depth: 0,
+        };
+        visitor.visit_program(&parsed.program);
+        return visitor.occurrences;
+    }
+    Vec::new()
 }
 
 struct SpecifierVisitor {
@@ -234,5 +253,49 @@ mod tests {
     #[test]
     fn a_file_that_does_not_parse_yields_nothing() {
         assert!(specifiers("import from from from", SourceKind::JavaScript).is_empty());
+    }
+
+    #[test]
+    fn script_and_module_syntax_keep_their_dependencies() {
+        for (kind, source, expected) in [
+            (
+                SourceKind::JavaScript,
+                "var await = require('script'); await.ready; return import('commonjs');",
+                vec!["script", "commonjs"],
+            ),
+            (
+                SourceKind::TypeScript,
+                "var await: number = 0; return require('commonjs');",
+                vec!["commonjs"],
+            ),
+            (
+                SourceKind::JavaScript,
+                "if (new.target) require('commonjs');",
+                vec!["commonjs"],
+            ),
+            (
+                SourceKind::JavaScript,
+                "await import('async-module'); export * from 'reexport';",
+                vec!["async-module", "reexport"],
+            ),
+            (
+                SourceKind::TypeScriptJsx,
+                "import type { T } from 'types'; const view = <div/>; import('tsx');",
+                vec!["tsx"],
+            ),
+        ] {
+            assert_eq!(specifiers(source, kind), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn module_text_is_never_lossily_replaced() {
+        assert_eq!(
+            specifiers(
+                r"require('bad\ud800'); import('bad\udfff'); require('real\ufffd'); import('pair\ud83d\udc19');",
+                SourceKind::JavaScript,
+            ),
+            ["real�", "pair🐙"]
+        );
     }
 }

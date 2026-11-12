@@ -13,6 +13,8 @@
 //! and returns the completed first object. Successful execution reads both
 //! distinct members before returning the first, keeping its tagged projection
 //! live through the current optimizer. Observers retain owned scalar data.
+//! LOS pressure is established before aging the young input: those pressure
+//! allocations may collect and must not promote the input before the probe.
 //!
 //! # See also
 //! - `graph::allocation_groups` forms groups before register allocation.
@@ -325,9 +327,9 @@ fn assert_group(
             r["logicalPc"] == 3
                 && r["operation"]
                     .as_str()
-                    .is_some_and(|s| s.contains("StrictEqual { negate: false }"))
+                    .is_some_and(|s| s.contains("StrictEqual { negate: false, same_value: false }"))
         })
-        .expect("own emitted successful-source identity comparison");
+        .unwrap_or_else(|| panic!("own emitted successful-source identity comparison\n{text}"));
     assert_eq!(comparison["bytePc"], comparison_byte_pc);
     assert!(
         comparison["startOffset"].as_u64().unwrap() < comparison["endOffset"].as_u64().unwrap()
@@ -336,7 +338,7 @@ fn assert_group(
     let projection_id = projection["operationIndex"].as_u64().unwrap();
     let comparison_id = comparison["operationIndex"].as_u64().unwrap();
     let identity_ir = format!(
-        "v{comparison_id} = StrictEqual {{ negate: false }} [{group_id}, {projection_id}] Tagged"
+        "v{comparison_id} = StrictEqual {{ negate: false, same_value: false }} [{group_id}, {projection_id}] Tagged"
     );
     assert!(
         text.lines().any(|line| line.trim() == identity_ir),
@@ -716,27 +718,6 @@ fn current_native_group_collector_failure_resumes_first_source_and_retains_its_c
     // input is then freshly allocated and survives one real collecting cycle.
     vm.force_gc().expect("settle warm heap");
     vm.force_gc().expect("settle old sweep");
-    let fresh =
-        NativeCtx::with_host_context(&mut vm, NativeCallInfo::default_call(), None, |ctx| {
-            ctx.scope(|mut scope| {
-                let child = scope.object()?;
-                Ok::<Value, NativeError>(scope.finish(child))
-            })
-        })
-        .expect("handle-scoped live input");
-    let mut child = fresh.as_object().unwrap();
-    let young = child.offset();
-    let mut roots = RootScope::new(vm.gc_heap_mut());
-    // SAFETY: this engine fixture's compressed typed slot stays stationary
-    // until the registered scope drops; contributors do not use this API.
-    unsafe {
-        roots.add_raw_slot(std::ptr::addr_of_mut!(child).cast());
-    }
-    vm.force_gc()
-        .expect("actual first survival moves the young input");
-    assert_ne!(child.offset(), young);
-    let aged = child.offset();
-    assert!(page_state(aged).2 > otter_gc::page::PAGE_HEADER_SIZE);
     // The heap's handle arena owns all pressure bodies even if a later
     // successful collector becomes reachable; pressure is retained, not RSS.
     // SAFETY: this actual heap and handle stack outlive every local below.
@@ -768,6 +749,30 @@ fn current_native_group_collector_failure_resumes_first_source_and_retains_its_c
             .expect("real residual cage page pressure");
         large.push(pressure_scope.local(value));
     }
+    assert_eq!(otter_gc::cage_stats().unwrap().free_pages, 0);
+    // LOS exhaustion may run real collections. Prepare the young survivor only
+    // after that phase so its nursery identity remains live until the probe.
+    let fresh =
+        NativeCtx::with_host_context(&mut vm, NativeCallInfo::default_call(), None, |ctx| {
+            ctx.scope(|mut scope| {
+                let child = scope.object()?;
+                Ok::<Value, NativeError>(scope.finish(child))
+            })
+        })
+        .expect("handle-scoped live input");
+    let mut child = fresh.as_object().unwrap();
+    let young = child.offset();
+    let mut roots = RootScope::new(vm.gc_heap_mut());
+    // SAFETY: this engine fixture's compressed typed slot stays stationary
+    // until the registered scope drops; contributors do not use this API.
+    unsafe {
+        roots.add_raw_slot(std::ptr::addr_of_mut!(child).cast());
+    }
+    vm.force_gc()
+        .expect("actual first survival moves the young input");
+    assert_ne!(child.offset(), young);
+    let aged = child.offset();
+    assert!(page_state(aged).2 > otter_gc::page::PAGE_HEADER_SIZE);
     assert_eq!(otter_gc::cage_stats().unwrap().free_pages, 0);
     let no_gc = vm.gc_heap_mut().always_allocate_scope();
     let mut last_page = fill_page(&mut vm, aged, 0);

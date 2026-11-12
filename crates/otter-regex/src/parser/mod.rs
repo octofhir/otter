@@ -15,7 +15,7 @@
 //! # Invariants
 //! - The parser never recurses deeper than [`MAX_NESTING_DEPTH`] frames.
 //! - Capture-group ids are assigned in source order, 1-based.
-//! - Counted quantifiers above [`MAX_REPEAT`] saturate rather than expand, so
+//! - Counted quantifiers above `MAX_REPEAT` saturate rather than expand, so
 //!   lowering output stays bounded while §22.2.1's unbounded DecimalDigits is
 //!   still accepted.
 //!
@@ -23,8 +23,8 @@
 //! Inline modifier groups `(?ims-ims:...)` (§22.2.1 RegularExpressionModifiers)
 //! scope the `i`/`m`/`s` flags lexically to the group body; the effective flags
 //! are stamped onto each `Char` / `Class` / `BackRef` / anchor node so the
-//! matcher applies them per node. Still unsupported (raise a clear
-//! [`RegexError`]): `\q{...}` and `v`-flag set operations.
+//! matcher applies them per node. `v`-flag sets support intersection, subtraction
+//! and `\q{...}` strings; Unicode property escapes require the `unicode` feature.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-patterns> (§22.2.1)
@@ -46,6 +46,7 @@ pub(crate) const MAX_NESTING_DEPTH: usize = 1000;
 
 /// Maximum counted-quantifier expansion the lowering accepts, bounding how far
 /// `{n,m}` can inflate the instruction vector.
+#[cfg(feature = "runtime")]
 pub(crate) const MAX_REPEAT: u32 = 100_000;
 
 /// Compare two normalized decimal-digit strings.
@@ -72,6 +73,13 @@ fn decimal_digits_to_u32(digits: &[u8]) -> u32 {
 
 /// The result of a successful parse: the AST plus capture-group bookkeeping the
 /// lowering and executor need.
+#[cfg_attr(
+    not(feature = "runtime"),
+    allow(
+        dead_code,
+        reason = "validation discards parsed output; runtime lowering reads it"
+    )
+)]
 #[derive(Debug)]
 pub(crate) struct Parsed {
     /// The root pattern node.
@@ -939,6 +947,7 @@ impl<'a> Parser<'a> {
     /// A negated string property (`\P{Basic_Emoji}`) is a syntax error.
     fn parse_property_set_v(&mut self, negate: bool) -> Result<ClassSet, RegexError> {
         let (name, value) = self.read_property_name_body()?;
+        #[cfg(feature = "unicode")]
         if value.is_none() && crate::unicode::string_props::is_string_property(&name) {
             if negate {
                 return Err(self.err("a negated property may not contain strings"));
@@ -1740,6 +1749,7 @@ mod tests {
             .expect("deep-nesting parse completes");
     }
 
+    #[cfg(feature = "unicode")]
     #[test]
     fn property_escapes_parse_in_unicode_mode() {
         let u = Flags {

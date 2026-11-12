@@ -51,7 +51,7 @@ fn the_completion_survives_the_microtask_checkpoint() {
         .eval_value(
             SourceInput::from_javascript(
                 "const result = { marker: 4242 };
-                 queueMicrotask(() => { const churn = []; for (let i = 0; i < 20000; i++) { churn.push({ i }); } });
+                 Promise.resolve().then(() => { const churn = []; for (let i = 0; i < 20000; i++) { churn.push({ i }); } });
                  result",
             ),
             "<test>",

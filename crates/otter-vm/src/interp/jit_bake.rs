@@ -1733,7 +1733,12 @@ impl Baker<'_> {
         complete: bool,
     ) -> Option<()> {
         let owner = context.for_function(fid).ok()?;
-        let cells = self.env.shared.literal_cells.read_briefly().or_else(|| self.env.contend())?;
+        let cells = self
+            .env
+            .shared
+            .literal_cells
+            .read_briefly()
+            .or_else(|| self.env.contend())?;
         for instruction in &view.instructions {
             let op = instruction.op(&view.code_block);
             if !matches!(op, Op::LoadString | Op::LoadBigInt) {
@@ -2094,7 +2099,8 @@ impl Baker<'_> {
                                 &self.env.heap,
                             )
                         else {
-                            view.native_calls.insert(call_byte_pc, jit::JitNativeCall::Native);
+                            view.native_calls
+                                .insert(call_byte_pc, jit::JitNativeCall::Native);
                             continue;
                         };
                         view.native_calls.insert(

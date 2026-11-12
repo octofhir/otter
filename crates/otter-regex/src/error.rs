@@ -3,8 +3,8 @@
 //! # Contents
 //! - [`RegexError`] — the pattern could not be compiled (syntax / early error /
 //!   recursion-limit). The host maps this to a JS `SyntaxError`.
-//! - [`ExecError`] — a regex search could not complete under an
-//!   [`crate::ExecConfig`] constraint (the ReDoS step budget).
+//! - `ExecError` — a regex search could not complete under an
+//!   `ExecConfig` constraint (the ReDoS step budget).
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-patterns-static-semantics-early-errors>
@@ -57,17 +57,19 @@ impl fmt::Display for RegexError {
 
 impl std::error::Error for RegexError {}
 
-/// A regex search could not complete under an [`crate::ExecConfig`] constraint.
+/// A regex search could not complete under an `ExecConfig` constraint.
+#[cfg(feature = "runtime")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExecError {
-    /// The [`crate::ExecConfig`] step budget was exhausted before the engine
+    /// The `ExecConfig` step budget was exhausted before the engine
     /// could decide whether a match exists. Hosts must retain this as an
     /// explicit resource-exhaustion result rather than converting it into a
     /// semantic no-match.
     StepLimitExceeded,
 }
 
+#[cfg(feature = "runtime")]
 impl fmt::Display for ExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -78,4 +80,5 @@ impl fmt::Display for ExecError {
     }
 }
 
+#[cfg(feature = "runtime")]
 impl std::error::Error for ExecError {}

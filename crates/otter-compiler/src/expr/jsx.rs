@@ -184,7 +184,11 @@ fn compile_jsx_props(
                         value
                     }
                     Some(JSXAttributeValue::StringLiteral(lit)) => {
-                        load_string(cx, lit.value.as_str(), (lit.span.start, lit.span.end))
+                        crate::expr::literal::compile_string_literal(
+                            cx,
+                            lit,
+                            (lit.span.start, lit.span.end),
+                        )?
                     }
                     Some(JSXAttributeValue::ExpressionContainer(container)) => {
                         compile_jsx_expression_container(cx, container)?

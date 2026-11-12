@@ -315,7 +315,7 @@ fn caller_snapshot_survives_forced_gc_then_nested_target_prewarm() {
             .expect("caller prewarm");
         let mut caller = context.jit_compile_snapshot(0).expect("caller snapshot");
         super::Baker::new(
-            &crate::interp::jit_bake_env::BakeEnv::capture(&interpreter),
+            &crate::interp::jit_bake_env::BakeEnv::capture(interpreter),
             None,
         )
         .bake_literal_cells(&mut caller, &context, 0, true)
@@ -334,7 +334,7 @@ fn caller_snapshot_survives_forced_gc_then_nested_target_prewarm() {
             .expect("nested target prewarm after moving GC");
         let mut nested = context.jit_compile_snapshot(1).expect("nested snapshot");
         super::Baker::new(
-            &crate::interp::jit_bake_env::BakeEnv::capture(&interpreter),
+            &crate::interp::jit_bake_env::BakeEnv::capture(interpreter),
             None,
         )
         .bake_literal_cells(&mut nested, &context, 1, true)

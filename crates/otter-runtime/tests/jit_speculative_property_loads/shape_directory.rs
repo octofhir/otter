@@ -1,20 +1,20 @@
-//! Normal-policy proof of complete shape lookup and its exact recovery edge.
+//! Normal-policy proof of shared property lookup and accessor fallback.
 //!
 //! # Contents
 //! - Megamorphic own reads enter an installed Graph generation, then an
-//!   accessor mutation retrains each source get without replay.
+//!   accessor mutation completes each source get without replay.
 //!
 //! # Invariants
 //! - Artifact capture alone does not prove execution: isolated entry probes
 //!   must retain the exact generation without interpreter/Template dispatch.
-//! - Every accessor read executes once across the typed miss and recovery.
+//! - Effectful cached loads stay distinct; every accessor read executes once.
 //!
 //! # See also
 //! - `crate::compare_with_entry_probes` owns the common execution proof.
 use super::*;
 
 #[test]
-fn complete_shape_directory_enters_native_code_and_recovers_each_get_for_accessors() {
+fn shared_property_loads_enter_native_code_and_call_each_accessor_once() {
     const SETUP: &str = r#"
 const directoryObjects = [];
 for (let index = 0; index < 18; index++) {
@@ -68,18 +68,13 @@ String(directorySum) + '|' + directoryGets;
         .1;
     let ir = &compiled.optimized_ir[&("directoryRead".to_owned(), generation)];
     assert_eq!(
-        ir.matches("LoadShapedProperty").count(),
-        1,
-        "repeated data read must be commoned: {ir}"
+        ir.matches("LoadPropertyCached").count(),
+        2,
+        "cached loads can invoke getters and must not be commoned: {ir}"
     );
-    let exits = compiled.optimizing_exits("directoryRead");
-    let misses = exits
-        .iter()
-        .filter(|(_, reason)| *reason == ExitReason::OwnDataMiss)
-        .count();
     assert_eq!(
-        misses, 2,
-        "one miss per original get after the first becomes effectful: {exits:?}"
+        compiled.entry_probes.first(),
+        compiled.entry_probes.last(),
+        "accessor fallback must retain the generation proved before mutation"
     );
-    compiled.assert_recompiled_after_last_exit("directoryRead");
 }

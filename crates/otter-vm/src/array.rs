@@ -19,6 +19,8 @@
 //! - Large sparse indices live in `sparse_elements` so Array-index
 //!   semantics do not force host-sized dense allocations.
 //! - Missing-index reads return `undefined`.
+//! - Plain and caller-rooted stores share one implementation; pending values
+//!   stay traced through backing-store allocation.
 //! - Element growth allocates a rooted replacement slab, copies the live
 //!   prefix semantically, then republishes its base, length, and kind.
 //! - Only indexed mutation invalidates captured JSON element bytes; named bags
@@ -1403,7 +1405,7 @@ pub fn set(
     idx: usize,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    set_index_value(arr, heap, idx, value, true)
+    set_index_value(arr, heap, idx, value, true, &mut |_| {})
 }
 
 /// Define an indexed data property after descriptor validation has
@@ -1414,7 +1416,7 @@ pub(crate) fn define_index_value(
     idx: usize,
     value: Value,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    set_index_value(arr, heap, idx, value, false)
+    set_index_value(arr, heap, idx, value, false, &mut |_| {})
 }
 
 fn set_index_value(
@@ -1423,6 +1425,7 @@ fn set_index_value(
     idx: usize,
     value: Value,
     enforce_writable: bool,
+    external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
     // Definitions have already validated attributes; assignments consult the
     // numeric indexed descriptor without allocating a property-name string.
@@ -1435,6 +1438,7 @@ fn set_index_value(
     let target_len = idx.saturating_add(1);
     if should_store_sparse(arr, heap, idx) {
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
             value.trace_value_slots(visitor);
         };
         ensure_exotic(&mut arr, heap, &mut roots)?;
@@ -1455,6 +1459,7 @@ fn set_index_value(
     let preferred_kind = dense_kind_for_value(value);
     {
         let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
+            external_visit(visitor);
             value.trace_value_slots(visitor);
         };
         reserve_dense_capacity(&mut arr, heap, target_len, preferred_kind, &mut roots)?;
@@ -1478,76 +1483,15 @@ fn set_index_value(
     Ok(())
 }
 
-/// Write an indexed element while exposing caller-owned roots during any
-/// dense-storage reservation.
-///
-/// This mirrors [`set`] for VM stack-owned mutation sites. Sparse writes do
-/// not reserve dense backing storage and therefore keep the ordinary path; low
-/// dense writes trace the receiver handle plus pending value before a possible
-/// reservation-triggered emergency collection.
+/// Write an indexed element, preserving caller roots during sparse or dense growth.
 pub(crate) fn set_with_roots(
-    mut arr: JsArray,
+    arr: JsArray,
     heap: &mut otter_gc::GcHeap,
     idx: usize,
     value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
-    let key = idx as u32;
-    if !can_write_index_property(arr, heap, key) {
-        return Ok(());
-    }
-    if !has_own_element(arr, heap, idx) && !is_extensible(arr, heap) {
-        return Ok(());
-    }
-    let target_len = idx.saturating_add(1);
-    if should_store_sparse(arr, heap, idx) {
-        let mut roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            value.trace_value_slots(visitor);
-        };
-        ensure_exotic(&mut arr, heap, &mut roots)?;
-        heap.with_payload(arr, |body| {
-            let sparse = body
-                .exotic_mut()
-                .sparse_elements
-                .get_or_insert_with(HashMap::new);
-            sparse.insert(idx, value);
-            body.set_length(body.length().max(target_len));
-            body.mark_dirty();
-        });
-        record_exotic_array_write(heap, arr, &value);
-        return Ok(());
-    }
-    {
-        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            value.trace_value_slots(visitor);
-        };
-        reserve_dense_capacity(
-            &mut arr,
-            heap,
-            target_len,
-            dense_kind_for_value(value),
-            &mut reserve_roots,
-        )?;
-    }
-    heap.with_payload(arr, |body| {
-        if idx < body.dense_len() {
-            body.write_dense_value(idx, value);
-            body.set_length(body.length().max(target_len));
-            body.mark_dirty();
-            return;
-        }
-        body.refresh_element_cache();
-        while body.dense_len() < idx {
-            body.push_dense(Value::hole());
-        }
-        body.push_dense(value);
-        body.set_length(body.length().max(target_len));
-        body.mark_dirty();
-    });
-    record_array_write(heap, arr, &value);
-    Ok(())
+    set_index_value(arr, heap, idx, value, true, external_visit)
 }
 
 /// Return whether a dense bulk fill can bypass generic `[[Set]]`.
@@ -1645,37 +1589,18 @@ pub(crate) fn fill_dense_range_with_roots(
 /// Returns [`otter_gc::OutOfMemory`] if growing dense storage would
 /// exceed the configured heap cap.
 pub fn push(
-    mut arr: JsArray,
+    arr: JsArray,
     heap: &mut otter_gc::GcHeap,
     value: Value,
 ) -> Result<usize, otter_gc::OutOfMemory> {
-    let barrier_value = value;
-    let target_len = len(arr, heap).saturating_add(1);
-    reserve_dense_capacity(
-        &mut arr,
-        heap,
-        target_len,
-        dense_kind_for_value(value),
-        &mut |_| {},
-    )?;
-    let new_len = heap.with_payload(arr, |body| {
-        while body.dense_len() + 1 < target_len {
-            body.push_dense(Value::hole());
-        }
-        body.push_dense(value);
-        body.set_length(target_len);
-        body.mark_dirty();
-        body.length()
-    });
-    record_array_write(heap, arr, &barrier_value);
-    Ok(new_len)
+    push_with_roots(arr, heap, value, &mut |_| {})
 }
 
 /// Push to the tail while exposing caller-owned roots during any
 /// off-slot dense-storage reservation.
 ///
-/// This mirrors [`push`] but is reserved for VM stack-owned mutation
-/// sites. The pending value and the receiver handle are traced along
+/// Shared implementation of [`push`] and VM stack-owned mutation sites.
+/// The pending value and the receiver handle are traced along
 /// with the caller-provided roots if reservation-triggered emergency
 /// collection runs before the dense vector grows.
 pub(crate) fn push_with_roots(
@@ -2039,7 +1964,11 @@ fn trim_dense_head(arr: JsArray, heap: &mut otter_gc::GcHeap) -> Option<Value> {
         body.set_length(len - 1);
         body.refresh_element_cache();
     });
-    Some(if head.is_hole() { Value::undefined() } else { head })
+    Some(if head.is_hole() {
+        Value::undefined()
+    } else {
+        head
+    })
 }
 
 /// Insert `value` at the head of a fully dense array, sliding the rest up.
@@ -2336,7 +2265,7 @@ pub(crate) fn create_plain_dense_element(
     {
         return Ok(false);
     }
-    set_index_value(arr, heap, idx, value, false)?;
+    set_index_value(arr, heap, idx, value, false, &mut |_| {})?;
     Ok(true)
 }
 

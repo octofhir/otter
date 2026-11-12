@@ -4,13 +4,13 @@
 //! Parses the vendored UCD `emoji-sequences.txt` and
 //! `emoji-zwj-sequences.txt` (UTS#51) into per-property tables — a set of
 //! single-code-point ranges and a set of multi-code-point string
-//! sequences — and emits them as a generated Rust module. The runtime
+//! sequences — and emits them as a generated Rust module. The shared parser
 //! (`unicode::string_props`) turns these into the `ClassSet` a
 //! `\p{Basic_Emoji}` / `\p{RGI_Emoji…}` operand contributes.
 //!
 //! Groups every BMP code unit by its non-unicode `i` canonical form and
 //! emits the groups of two or more units (`casefold::canonical_groups`), so
-//! lowering closes an `i` class under case equivalence without evaluating
+//! runtime lowering closes an `i` class under case equivalence without evaluating
 //! the case mapping 65 536 times per class.
 //!
 //! Regenerating only happens when the data files change.
@@ -119,6 +119,10 @@ fn main() {
 
     let out = Path::new(&std::env::var("OUT_DIR").unwrap()).join("emoji_data.rs");
     std::fs::write(&out, code).unwrap();
+
+    if std::env::var_os("CARGO_FEATURE_RUNTIME").is_none() {
+        return;
+    }
 
     let mut groups: std::collections::BTreeMap<u32, Vec<u32>> = Default::default();
     for unit in 0..=0xFFFF {

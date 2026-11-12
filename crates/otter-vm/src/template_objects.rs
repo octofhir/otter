@@ -5,6 +5,7 @@
 //! - The ordinary expando descriptor for `.raw` and shared Array integrity.
 //!
 //! # Invariants
+//! Cooked strings retain exact UTF-16 units, including unpaired surrogates.
 //! Every string and array remains rooted across later allocations. The source
 //! function owns both the template site and realm; disposal has no ambient
 //! fallback. `.raw` is non-enumerable, non-writable and non-configurable, and
@@ -34,7 +35,7 @@ impl Interpreter {
                     .cooked
                     .iter()
                     .map(|entry| match entry {
-                        Some(text) => vm.scoped_string(scope, text),
+                        Some(units) => vm.scoped_utf16_string(scope, units),
                         None => Ok(vm.scoped_value(scope, Value::undefined())),
                     })
                     .collect::<Result<Vec<_>, VmError>>()?;

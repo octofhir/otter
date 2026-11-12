@@ -931,7 +931,8 @@ impl PropertyIcSlot {
             shape_id: AtomicU64::new(0),
             word: AtomicU64::new(0),
         }));
-        self.site_cache.store(Box::into_raw(cache), Ordering::Relaxed);
+        self.site_cache
+            .store(Box::into_raw(cache), Ordering::Relaxed);
     }
 
     /// Start rewriting the entries: the version turns odd.

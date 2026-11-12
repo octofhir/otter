@@ -353,8 +353,9 @@ pub(crate) struct ModuleMetadataParts {
 pub(crate) fn collect_module_metadata(
     program: &Program<'_>,
     host: &ModuleHostInfo,
-) -> ModuleMetadataParts {
+) -> Result<ModuleMetadataParts, CompileError> {
     let mut visitor = ModuleMetadataVisitor {
+        error: None,
         resolved_imports: &host.resolved_imports,
         imports: Vec::new(),
         exports: Vec::new(),
@@ -365,6 +366,9 @@ pub(crate) fn collect_module_metadata(
     for stmt in &program.body {
         visitor.visit_statement(stmt);
     }
+    if let Some(error) = visitor.error {
+        return Err(error.into());
+    }
     let live_binding_slots = visitor
         .live_binding_names
         .into_iter()
@@ -374,12 +378,12 @@ pub(crate) fn collect_module_metadata(
             slot: slot as u32,
         })
         .collect();
-    ModuleMetadataParts {
+    Ok(ModuleMetadataParts {
         imports: visitor.imports,
         exports: visitor.exports,
         live_binding_slots,
         named_imports: visitor.named_imports,
-    }
+    })
 }
 
 fn compiled_metadata_materialized_bytes(
@@ -485,6 +489,7 @@ fn try_clone_metadata_string(
 }
 
 struct ModuleMetadataVisitor<'a> {
+    error: Option<otter_syntax::SyntaxError>,
     resolved_imports: &'a HashMap<ImportRequest, String>,
     imports: Vec<CompiledImport>,
     exports: Vec<CompiledExport>,
@@ -527,8 +532,16 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
         if decl.import_kind.is_type() {
             return;
         }
-        let specifier = decl.source.value.as_str();
-        let attr_type = crate::import_attribute_type(decl.with_clause.as_deref());
+        let (specifier, attr_type) =
+            match otter_syntax::module_literal_text(&decl.source).and_then(|text| {
+                crate::module_attribute_type(decl.with_clause.as_deref()).map(|attr| (text, attr))
+            }) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            };
         self.record_import(
             ImportRequest::new(specifier, attr_type.clone()),
             CompiledImportKind::Static,
@@ -588,10 +601,16 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
         if decl.export_kind.is_type() {
             return;
         }
-        let from = ImportRequest::new(
-            decl.source.value.as_str(),
-            crate::import_attribute_type(decl.with_clause.as_deref()),
-        );
+        let from = match otter_syntax::module_literal_text(&decl.source).and_then(|text| {
+            crate::module_attribute_type(decl.with_clause.as_deref())
+                .map(|attr| ImportRequest::new(text, attr))
+        }) {
+            Ok(request) => request,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
         self.record_import(from.clone(), CompiledImportKind::ReExport);
         for spec in &decl.specifiers {
             let exported = module_export_name_to_str(&spec.exported);
@@ -605,10 +624,16 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
         if decl.export_kind.is_type() {
             return;
         }
-        let source = ImportRequest::new(
-            decl.source.value.as_str(),
-            crate::import_attribute_type(decl.with_clause.as_deref()),
-        );
+        let source = match otter_syntax::module_literal_text(&decl.source).and_then(|text| {
+            crate::module_attribute_type(decl.with_clause.as_deref())
+                .map(|attr| ImportRequest::new(text, attr))
+        }) {
+            Ok(request) => request,
+            Err(error) => {
+                self.error = Some(error);
+                return;
+            }
+        };
         self.record_import(source.clone(), CompiledImportKind::ReExport);
         let exported = decl
             .exported
@@ -636,9 +661,11 @@ impl<'a> Visit<'a> for ModuleMetadataVisitor<'_> {
     }
 
     fn visit_import_expression(&mut self, imp: &oxc_ast::ast::ImportExpression<'a>) {
-        if let Expression::StringLiteral(lit) = &imp.source {
+        if let Expression::StringLiteral(lit) = &imp.source
+            && let Some(text) = lit.value.as_str()
+        {
             self.record_import(
-                ImportRequest::plain(lit.value.as_str()),
+                ImportRequest::plain(text),
                 CompiledImportKind::DynamicLiteral,
             );
         }

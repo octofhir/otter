@@ -4,12 +4,12 @@
 //! under the permissive Unicode license) — we do **not** vendor any external
 //! engine's generated table. Code-point properties (General_Category, Script,
 //! Script_Extensions, binary properties) come from `icu_properties`; `v`-flag
-//! *string* properties (`\p{Basic_Emoji}`) come from [`string_props`].
+//! *string* properties (`\p{Basic_Emoji}`) come from `string_props`.
 //!
 //! # Contents
 //! - [`resolve_property`] — map a `\p{...}` name (and optional value) to a
 //!   code-point set.
-//! - [`string_props`] — `v`-flag string-property sets.
+//! - `string_props` — `v`-flag string-property sets.
 //!
 //! # Invariants
 //! - An unknown or malformed property name is a compile-time error

@@ -110,6 +110,10 @@
 //!      `bootstrap::define_global_value`,
 //!   5. calls `post_install(heap, global, ctor)?` when supplied.
 //!
+//! # Invariants
+//! - Engine types resolve through the one hidden macro-support contract.
+//! - Constructor, prototype and global roots remain live across allocation.
+//!
 //! # Out of scope
 //!
 //! Cross-class fixups that depend on the per-realm
@@ -952,7 +956,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             };
             quote! {
                 fn install_well_knowns(
-                    heap: &mut ::otter_gc::GcHeap,
+                    heap: &mut ::otter_vm::__macro_support::GcHeap,
                     global: ::otter_vm::__macro_support::JsObject,
                     well_known: &::otter_vm::__macro_support::symbol::WellKnownSymbols,
                 ) -> ::core::result::Result<(), ::otter_vm::__macro_support::JsSurfaceError> {
@@ -1076,11 +1080,11 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             #js_glue_const
 
             fn install(
-                heap: &mut ::otter_gc::GcHeap,
+                heap: &mut ::otter_vm::__macro_support::GcHeap,
                 global: ::otter_vm::__macro_support::JsObject,
             ) -> ::core::result::Result<(), ::otter_vm::__macro_support::JsSurfaceError> {
                 let mut global_root = ::otter_vm::__macro_support::Value::object(global);
-                let mut global_scope = ::otter_gc::RootScope::new(heap);
+                let mut global_scope = ::otter_vm::__macro_support::RootScope::new(heap);
                 // SAFETY: `global_root` was declared before the scope and both
                 // remain live until the generated installer returns.
                 unsafe {
@@ -1118,7 +1122,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                 // below, so the collector keeps it current, and each raw-handle
                 // use re-resolves through it rather than reading a stale offset.
                 let mut ctor_value = ::otter_vm::__macro_support::Value::native_function(ctor);
-                let mut ctor_scope = ::otter_gc::RootScope::new(heap);
+                let mut ctor_scope = ::otter_vm::__macro_support::RootScope::new(heap);
                 // SAFETY: `ctor_value` was declared before the scope. This is
                 // the canonical constructor slot for the complete install;
                 // hidden allocations inside property definitions rewrite it.
@@ -1218,7 +1222,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
                     let global = global_root.as_object().expect("couch!: global for prototype parent");
                     #prototype_parent_link
                     let mut prototype_value = ::otter_vm::__macro_support::Value::object(prototype);
-                    let mut prototype_scope = ::otter_gc::RootScope::new(heap);
+                    let mut prototype_scope = ::otter_vm::__macro_support::RootScope::new(heap);
                     // SAFETY: `prototype_value` was declared before the scope
                     // and stays live through every generated prototype write.
                     unsafe {

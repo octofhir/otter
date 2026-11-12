@@ -1,69 +1,29 @@
-//! Literal decoding and key-formatting helpers shared by expression lowering.
+//! Literal interning and key-formatting helpers shared by expression lowering.
 //!
 //! # Contents
-//! - UTF-16 string decoding
+//! - UTF-16 string interning
 //! - lone-surrogate key detection
 //! - numeric literal property-key formatting
 //!
 //! # Invariants
-//! - Decoding is lossless for every oxc lone-surrogate encoding.
+//! - OXC strings retain their exact UTF-16 code units.
 //!
 //! # See also
 //! - `module_state` and `expr`
 
-/// Decode oxc's lossy lone-surrogate encoding back into raw WTF-16
-/// code units. When `StringLiteral::lone_surrogates` is set, oxc
-/// stores each lone surrogate as `\u{FFFD}XXXX` (four lowercase hex
-/// digits) and the literal U+FFFD as `\u{FFFD}fffd`. This decoder
-/// reverses both encodings so the runtime sees the source-fidelity
-/// code units expected by §6.1.4
-/// [`The String Type`](https://tc39.es/ecma262/#sec-ecmascript-language-types-string-type).
-pub(crate) fn decode_lone_surrogate_string(value: &str) -> Vec<u16> {
-    let mut out: Vec<u16> = Vec::with_capacity(value.len());
-    let mut iter = value.chars().peekable();
-    while let Some(c) = iter.next() {
-        if c == '\u{FFFD}' {
-            // Followed by four lowercase hex digits encoding a u16.
-            let mut hex = [0u8; 4];
-            let mut count = 0;
-            for slot in &mut hex {
-                match iter.peek() {
-                    Some(&h) if h.is_ascii_hexdigit() => {
-                        *slot = h as u8;
-                        iter.next();
-                        count += 1;
-                    }
-                    _ => break,
-                }
-            }
-            if count == 4 {
-                let s = std::str::from_utf8(&hex).unwrap();
-                let unit = u16::from_str_radix(s, 16).unwrap();
-                out.push(unit);
-                continue;
-            }
-            // Malformed (shouldn't happen if `lone_surrogates`
-            // signal is honoured) — fall back to literal U+FFFD.
-            out.push(0xFFFD);
-            for h in &hex[..count] {
-                out.push(*h as u16);
-            }
-        } else {
-            let mut buf = [0u16; 2];
-            for u in c.encode_utf16(&mut buf).iter() {
-                out.push(*u);
-            }
-        }
+/// Intern an OXC JavaScript string without replacing unpaired surrogates.
+pub(crate) fn intern_js_string(cx: &mut crate::Compiler, value: oxc_str::JSStr<'_>) -> u32 {
+    match value.as_str() {
+        Some(text) => cx.intern_string_constant(text),
+        None => cx.intern_utf16_string_constant(value.encode_utf16().collect()),
     }
-    out
 }
 
-/// Whether `key` is a string literal holding an unpaired surrogate. Its
-/// oxc text is a lossy stand-in, not its code units, so no static name
+/// Whether `key` is a string literal holding an unpaired surrogate. No UTF-8 static name
 /// spells it: such a key lowers like a computed key, whose literal decodes
 /// to the exact code units.
 pub(crate) fn is_lone_surrogate_key(key: &oxc_ast::ast::PropertyKey<'_>) -> bool {
-    matches!(key, oxc_ast::ast::PropertyKey::StringLiteral(lit) if lit.lone_surrogates)
+    matches!(key, oxc_ast::ast::PropertyKey::StringLiteral(lit) if lit.value.has_lone_surrogate())
 }
 
 /// The settled property-key spelling of a `NumericLiteral` per

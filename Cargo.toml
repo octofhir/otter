@@ -39,14 +39,14 @@ license = "MIT"
 
 [workspace.dependencies]
 rustc-hash      = "2.1"
-oxc_allocator   = "0.154"
-oxc_span        = "0.154"
-oxc_syntax      = "0.154"
-oxc_ast         = "0.154"
-oxc_parser      = "0.154"
-oxc_ast_visit   = "0.154"
-oxc_diagnostics = "0.154"
-oxc_str         = "0.154"
+oxc_allocator   = "0.158"
+oxc_span        = "0.158"
+oxc_syntax      = "0.158"
+oxc_ast         = "0.158"
+oxc_parser      = "0.158"
+oxc_ast_visit   = "0.158"
+oxc_diagnostics = "0.158"
+oxc_str         = "0.158"
 oxc_resolver    = "11.23"
 
 # Errors and serialization.
@@ -139,7 +139,7 @@ otter-syntax    = { path = "crates/otter-syntax" }
 otter-compiler  = { path = "crates/otter-compiler" }
 otter-gc        = { path = "crates/otter-gc" }
 otter-jit       = { path = "crates/otter-jit" }
-otter-regex     = { path = "crates/otter-regex" }
+otter-regex     = { path = "crates/otter-regex", default-features = false, features = ["unicode"] }
 otter-resource  = { path = "crates/otter-resource" }
 otter-http-client = { path = "crates/otter-http-client" }
 otter-xml       = { path = "crates/otter-xml" }

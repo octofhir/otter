@@ -89,6 +89,8 @@ fn young_slab_relocation_refreshes_old_owner_cache_and_traces_children() {
 fn remembered_appends_scan_linear_slots_through_growth() {
     const COUNT: usize = 1024;
     let mut heap = GcHeap::new().expect("heap");
+    // Growth must trace the pending child before it is installed in the slab.
+    heap.set_gc_stress(1, false);
     // SAFETY: heap outlives the scope and its handles.
     let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
     let array = scope.local(array::alloc_array_old_for_fixture(&mut heap).expect("array"));

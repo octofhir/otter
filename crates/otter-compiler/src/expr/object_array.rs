@@ -138,11 +138,7 @@ fn boilerplate_elements(
                 bits: lit.value.to_bits(),
             },
             Expression::StringLiteral(lit) => BoilerplateElement::String {
-                utf16: if lit.lone_surrogates {
-                    crate::synthetic::decode_lone_surrogate_string(&lit.value)
-                } else {
-                    lit.value.encode_utf16().collect()
-                },
+                utf16: lit.value.encode_utf16().collect(),
             },
             Expression::BooleanLiteral(lit) => BoilerplateElement::Boolean { value: lit.value },
             Expression::NullLiteral(_) => BoilerplateElement::Null,
@@ -245,7 +241,11 @@ pub(crate) fn compile_object_literal(
                         oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
                             id.name.as_str().to_string()
                         }
-                        oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+                        oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit
+                            .value
+                            .as_str()
+                            .expect("surrogate key uses computed lowering")
+                            .to_owned(),
                         oxc_ast::ast::PropertyKey::BigIntLiteral(lit) => {
                             match crate::expr::literal::bigint_literal_property_name(lit) {
                                 Some(name) => name,
@@ -645,11 +645,11 @@ fn compile_static_object_literal(
         }
         let key = match &p.key {
             oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str(),
-            oxc_ast::ast::PropertyKey::StringLiteral(lit) if !lit.lone_surrogates => {
-                lit.value.as_str()
+            oxc_ast::ast::PropertyKey::StringLiteral(lit) if !lit.value.has_lone_surrogate() => {
+                lit.value.as_str().expect("surrogate key excluded")
             }
-            // Lone surrogates travel through the lossy oxc spelling; keep
-            // them on the general path, which decodes them.
+            // Lone surrogates have no UTF-8 static name; keep their exact
+            // UTF-16 units on the general computed-key path.
             _ => return Ok(None),
         };
         if key == "__proto__"

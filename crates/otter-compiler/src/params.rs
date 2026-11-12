@@ -97,15 +97,16 @@ fn direct_eval_var_declares(default_expr: &Expression<'_>, formal_name: &str) ->
     let Expression::StringLiteral(source) = arg.to_expression() else {
         return false;
     };
-    with_program(
-        source.value.as_str(),
-        SyntaxSourceKind::JavaScript,
-        |program| {
-            let mut var_names = Vec::new();
-            hoist_var_names(&program.body, &mut var_names);
-            var_names.iter().any(|name| name == formal_name)
-        },
-    )
+    let Some(source) = source.value.as_str() else {
+        // This is only a static shortcut. Runtime eval receives the exact
+        // UTF-16 string and enforces declaration conflicts itself.
+        return false;
+    };
+    with_program(source, SyntaxSourceKind::JavaScript, |program| {
+        let mut var_names = Vec::new();
+        hoist_var_names(&program.body, &mut var_names);
+        var_names.iter().any(|name| name == formal_name)
+    })
     .unwrap_or(false)
 }
 

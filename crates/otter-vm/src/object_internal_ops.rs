@@ -323,8 +323,8 @@ impl Interpreter {
         // A canonical integer key's name is its decimal spelling: the
         // isolate's integer-key cache answers its atom without formatting.
         if let Some(index) = key.as_i32().filter(|index| *index >= 0) {
-            let atom = crate::isolate_names::IsolateNames::of_mut(&mut self.gc_heap)
-                .index_atom(index)?;
+            let atom =
+                crate::isolate_names::IsolateNames::of_mut(&mut self.gc_heap).index_atom(index)?;
             let name = crate::isolate_names::names(&self.gc_heap)
                 .spelling(atom)?
                 .clone();

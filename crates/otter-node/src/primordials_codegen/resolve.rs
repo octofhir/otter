@@ -65,7 +65,17 @@ impl Facts {
                         PropertyKey::StaticIdentifier(key) if !property.computed => {
                             key.name.to_string()
                         }
-                        PropertyKey::StringLiteral(key) => key.value.to_string(),
+                        PropertyKey::StringLiteral(key) => key
+                            .value
+                            .as_str()
+                            .ok_or_else(|| {
+                                reject(
+                                    "bootstrap",
+                                    key.span,
+                                    "holder key contains an unpaired surrogate",
+                                )
+                            })?
+                            .to_owned(),
                         _ => {
                             return Err(reject(
                                 "bootstrap",

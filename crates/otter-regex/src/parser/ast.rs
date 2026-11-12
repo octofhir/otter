@@ -33,6 +33,13 @@ pub(crate) struct Quantifier {
 }
 
 /// A zero-width assertion.
+#[cfg_attr(
+    not(feature = "runtime"),
+    allow(
+        dead_code,
+        reason = "one AST serves validation and runtime lowering; validation does not read matcher operands"
+    )
+)]
 #[derive(Debug, Clone)]
 pub(crate) enum Assertion {
     /// `^` — start of input, or of a line when `m` is in effect at this
@@ -59,6 +66,13 @@ pub(crate) enum Assertion {
 }
 
 /// The flavour of a parenthesised group.
+#[cfg_attr(
+    not(feature = "runtime"),
+    allow(
+        dead_code,
+        reason = "one AST serves validation and runtime lowering; validation does not read matcher operands"
+    )
+)]
 #[derive(Debug, Clone)]
 pub(crate) enum GroupKind {
     /// `(...)` — a capturing group with its 1-based id and optional name.
@@ -83,6 +97,13 @@ pub(crate) enum GroupKind {
 }
 
 /// A pattern AST node.
+#[cfg_attr(
+    not(feature = "runtime"),
+    allow(
+        dead_code,
+        reason = "one AST serves validation and runtime lowering; validation does not read matcher operands"
+    )
+)]
 #[derive(Debug, Clone)]
 pub(crate) enum Node {
     /// Matches the empty string.

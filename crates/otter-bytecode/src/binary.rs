@@ -487,7 +487,10 @@ impl Writer {
             if self.has_failed() {
                 break;
             }
-            self.optional_string(cooked.as_ref());
+            self.bool(cooked.is_some());
+            if let Some(units) = cooked {
+                self.utf16(units);
+            }
         }
         self.seq(&site.raw, |writer, raw| writer.string(raw));
     }
@@ -978,7 +981,11 @@ impl<'a> Reader<'a> {
         let cooked_count = self.count(1)?;
         let mut cooked = self.vec_with_exact_capacity(cooked_count)?;
         for _ in 0..cooked_count {
-            cooked.push(self.optional_string()?);
+            cooked.push(if self.bool()? {
+                Some(self.utf16()?)
+            } else {
+                None
+            });
         }
         let raw = self.seq(Self::string)?;
         Some(TemplateSite { cooked, raw })
@@ -1494,7 +1501,7 @@ mod tests {
         BytecodeModule {
             module: "file:///entry.ts".to_string(),
             template_sites: vec![TemplateSite {
-                cooked: vec![Some("a".to_string()), None],
+                cooked: vec![Some(vec![0x61, 0xd800, 0xfffd, 0xdc00]), None],
                 raw: vec!["a".to_string(), "\\u{}".to_string()],
             }],
             source_kind: SourceKind::TypeScript,

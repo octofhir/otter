@@ -34,12 +34,7 @@ pub(crate) fn intern_template_quasi(
     cx: &mut Compiler,
     quasi: &oxc_ast::ast::TemplateElement<'_>,
 ) -> u32 {
-    let cooked = quasi.value.cooked.as_deref().unwrap_or("");
-    if quasi.lone_surrogates {
-        cx.intern_utf16_string_constant(decode_lone_surrogate_string(cooked))
-    } else {
-        cx.intern_string_constant(cooked)
-    }
+    intern_js_string(cx, quasi.value.cooked.unwrap_or(oxc_str::JSStr::empty()))
 }
 
 pub(crate) fn compile_template_literal(
@@ -90,7 +85,7 @@ pub(crate) fn compile_template_literal(
         acc = dst;
         // Append the next cooked quasi.
         let next_quasi = &t.quasis[i + 1];
-        let cooked = next_quasi.value.cooked.as_deref().unwrap_or("");
+        let cooked = next_quasi.value.cooked.unwrap_or(oxc_str::JSStr::empty());
         if !cooked.is_empty() {
             let quasi_reg = cx.alloc_scratch();
             let const_idx = intern_template_quasi(cx, next_quasi);
@@ -201,7 +196,7 @@ pub(crate) fn compile_tagged_template(
             .quasi
             .quasis
             .iter()
-            .map(|q| q.value.cooked.as_ref().map(|c| c.to_string()))
+            .map(|q| q.value.cooked.map(|c| c.encode_utf16().collect()))
             .collect(),
         raw: t
             .quasi

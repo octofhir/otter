@@ -10,7 +10,7 @@
 //!
 //! # Invariants
 //! - The inventory is dense and unique; descriptor `id == index + 1`.
-//!   Symbol lookup compares the canonical descriptor ids; gaps fail compilation.
+//!   Descriptors, names and inventory come from one table; gaps fail compilation.
 //! - Leaf stubs cannot allocate, trigger GC, reenter JS, or name a safepoint.
 //! - Allocating and reentrant stubs require a precise safepoint at every call.
 //! - Throwing behavior and result-status encoding are explicit descriptor data.
@@ -429,2184 +429,982 @@ impl RuntimeStubAllocContext {
     }
 }
 
-/// Leaf compiled-loop backedge poll; reports interrupt/budget stops through
-/// its status word.
-pub const STUB_JIT_BACKEDGE_POLL: RuntimeStubDescriptor = descriptor(
-    1,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::Poll1,
-    1,
-    RuntimeStubEffects::leaf(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-/// Leaf `Map.prototype.get` probe.
-pub const STUB_COLLECTION_MAP_GET_LEAF: RuntimeStubDescriptor = descriptor(
-    2,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Leaf `Map.prototype.has` probe.
-pub const STUB_COLLECTION_MAP_HAS_LEAF: RuntimeStubDescriptor = descriptor(
-    3,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Leaf `Set.prototype.has` probe.
-pub const STUB_COLLECTION_SET_HAS_LEAF: RuntimeStubDescriptor = descriptor(
-    4,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Allocating `Map.prototype.set` mutation.
-pub const STUB_COLLECTION_MAP_SET_ALLOC: RuntimeStubDescriptor = descriptor(
-    5,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(true, true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Allocating `Set.prototype.add` mutation.
-pub const STUB_COLLECTION_SET_ADD_ALLOC: RuntimeStubDescriptor = descriptor(
-    6,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(true, true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Allocating `Map.prototype.get` lookup.
-pub const STUB_COLLECTION_MAP_GET_ALLOC: RuntimeStubDescriptor = descriptor(
-    7,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Allocating `Map.prototype.has` lookup.
-pub const STUB_COLLECTION_MAP_HAS_ALLOC: RuntimeStubDescriptor = descriptor(
-    8,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Allocating `Set.prototype.has` lookup.
-pub const STUB_COLLECTION_SET_HAS_ALLOC: RuntimeStubDescriptor = descriptor(
-    9,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Allocating `Map.prototype.delete` mutation.
-pub const STUB_COLLECTION_MAP_DELETE_ALLOC: RuntimeStubDescriptor = descriptor(
-    10,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(true, true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Allocating `Set.prototype.delete` mutation.
-pub const STUB_COLLECTION_SET_DELETE_ALLOC: RuntimeStubDescriptor = descriptor(
-    11,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(true, true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Allocating primitive string-concat operation.
-pub const STUB_STRING_CONCAT_ALLOC: RuntimeStubDescriptor = descriptor(
-    12,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Generic `+` slow path; operand coercion may re-enter JS.
-pub const STUB_JIT_ADD: RuntimeStubDescriptor = descriptor(
-    13,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Computed element read over boxed value operands.
-///
-/// `ToPropertyKey`, proxies, accessors, and prototype lookup may all re-enter
-/// JavaScript. The fixed entry completes the operation or returns a pure
-/// exception value; it never asks generated code to replay the access.
-pub const STUB_JIT_LOAD_ELEMENT: RuntimeStubDescriptor = descriptor(
-    14,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ReentrantValue2,
-    2,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-/// Computed element write over boxed value operands.
-///
-/// The store may mutate arbitrary GC-managed state and invoke proxy traps,
-/// setters, or property-key coercion hooks. Once entered it either completes
-/// exactly once or returns a pure exception value.
-pub const STUB_JIT_STORE_ELEMENT: RuntimeStubDescriptor = descriptor(
-    15,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ReentrantValue3,
-    3,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-/// Descriptor-driven define; descriptor reads may re-enter JS.
-pub const STUB_JIT_DEFINE_OWN_PROPERTY: RuntimeStubDescriptor = descriptor(
-    16,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-/// Named-property read over one boxed receiver and the site's native IC slot.
-///
-/// Accessors, proxies, and exotic receivers may re-enter JavaScript. The site
-/// identity bound in the slot selects `LoadProperty`; success returns its value
-/// and may install a handler in the slot, while failure returns one pure
-/// exception value without replay.
-pub const STUB_JIT_LOAD_PROPERTY: RuntimeStubDescriptor = descriptor(
-    17,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ReentrantNamedLoad,
-    1,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-/// Named-property write over boxed receiver/value operands and the site's
-/// native IC slot.
-///
-/// Shape transitions may allocate and setters or proxy traps may re-enter
-/// JavaScript. Entry commits the complete store exactly once or returns one
-/// pure exception value; it never asks generated code to replay the operation.
-pub const STUB_JIT_STORE_PROPERTY: RuntimeStubDescriptor = descriptor(
-    18,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ReentrantNamedStore,
-    2,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-/// Plain data-property define.
-pub const STUB_JIT_DEFINE_DATA_PROPERTY: RuntimeStubDescriptor = descriptor(
-    19,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::allocating(true, true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-/// Capture-free function allocation. The published semantic source owns the
-/// function constant; the three boxed operands are `undefined`. The entry
-/// returns a fresh fully initialized closure or a pre-effect Probe refusal.
-pub const STUB_JIT_MAKE_FN: RuntimeStubDescriptor = descriptor(
-    20,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(false, false),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Closure allocation from `(context, lexical this, lexical new.target)`.
-/// The published innermost source owns the function constant. No operand is
-/// an interpreter register index and no physical-frame binding is consulted.
-pub const STUB_JIT_MAKE_CLOSURE: RuntimeStubDescriptor = descriptor(
-    21,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(false, false),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Ordinary object allocation from an empty boxed-value span. The native
-/// frame publishes roots; success returns the object without a destination.
-pub const STUB_JIT_NEW_OBJECT: RuntimeStubDescriptor = descriptor(
-    22,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::ReentrantValueSpan,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::allocating(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-/// Array literal allocation from boxed values, copied before collection.
-/// The span preserves holes and never denotes interpreter register indices.
-pub const STUB_JIT_NEW_ARRAY: RuntimeStubDescriptor = descriptor(
-    23,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::ReentrantValueSpan,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::allocating(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-/// Static-key object literal allocation (`Op::NewObjectLiteral`) from boxed
-/// values copied before collection; the published instruction names the keys.
-pub const STUB_JIT_NEW_OBJECT_LITERAL: RuntimeStubDescriptor = descriptor(
-    81,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::ReentrantValueSpan,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::allocating(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-/// `CreateContext` allocation: `(parent, function id, scope index)` as boxed
-/// words (the ids as int32 values). Fully initializes the context — scope
-/// identity, parent, and every slot as the hole or `undefined` per its scope
-/// descriptor — before returning it; the parent rides as a rooted stub
-/// argument. Heap refusal is reported through the status pair; the entry
-/// never raises a JavaScript exception.
-pub const STUB_CREATE_CONTEXT_ALLOC: RuntimeStubDescriptor = descriptor(
-    24,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(false, false),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Generational and insertion write barrier for one pointer store.
-///
-/// Generated code runs both halves inline and reaches this only when a marking
-/// cycle is in progress or the store really creates an unrecorded old->young
-/// edge. It therefore takes the parent's header address and the stored value
-/// directly: no register window, no published frame, no reentry.
-pub const STUB_WRITE_BARRIER: RuntimeStubDescriptor = descriptor(
-    25,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::MutatingLeafValue2,
-    2,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// `CopyContext` allocation (§14.7.4.4 CreatePerIterationEnvironment):
-/// `(source, _, _)` as boxed words. Returns a context with the source's scope
-/// identity, parent, and slot values; the source rides as a rooted stub
-/// argument and is re-read after the allocation. Heap refusal is reported
-/// through the status pair.
-pub const STUB_COPY_CONTEXT_ALLOC: RuntimeStubDescriptor = descriptor(
-    26,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(false, false),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Leaf §7.2.15 IsStrictlyEqual probe over two raw operand words: never
-/// throws, never allocates; a null heap reports a miss so probe harnesses
-/// without a live isolate fall back to normal dispatch.
-pub const STUB_STRICT_EQ_LEAF: RuntimeStubDescriptor = descriptor(
-    27,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Completes one full loose-equality opcode in the VM; object-to-primitive
-/// coercion may re-enter JS.
-pub const STUB_JIT_LOOSE_EQ: RuntimeStubDescriptor = descriptor(
-    28,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-/// Materializes a regex literal from the constant pool; allocates the
-/// RegExp body and may compile the pattern.
-pub const STUB_JIT_LOAD_REGEXP: RuntimeStubDescriptor = descriptor(
-    31,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::allocating(true, true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-/// Leaf §7.1.2 ToBoolean probe over one raw operand word (the second
-/// argument is ignored): never throws, never allocates; total for every
-/// value including heap cells, so it never misses on a live isolate.
-pub const STUB_TO_BOOLEAN_LEAF: RuntimeStubDescriptor = descriptor(
-    29,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Leaf `typeof x === kind` test over one raw operand word and an
-/// `Op::TestTypeOf` immediate: never throws, never allocates; total for
-/// every value, so it never misses on a live isolate.
-pub const STUB_TYPEOF_TEST_LEAF: RuntimeStubDescriptor = descriptor(
-    82,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Leaf numeric remainder over two raw operand words already known to be
-/// numbers: full f64 remainder semantics (sign of the dividend, NaN for a
-/// zero divisor), boxed without allocation.
-pub const STUB_NUMBER_REM_LEAF: RuntimeStubDescriptor = descriptor(
-    30,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `String.prototype.charCodeAt` over a string receiver and an integral
-/// index: walks the body to one code unit, boxed without allocation. Misses
-/// (non-string receiver, non-integral or out-of-range index) report
-/// `SideExit` in the shared native pair so the caller falls back to the
-/// general method path.
-pub const STUB_STRING_CHAR_CODE_AT_LEAF: RuntimeStubDescriptor = descriptor(
-    52,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `String.prototype.codePointAt` over a string receiver and an integral
-/// index. Misses on a non-string receiver, a non-integral or out-of-range
-/// index, so the general path owns coercion and the `undefined` result.
-pub const STUB_STRING_CODE_POINT_AT_LEAF: RuntimeStubDescriptor = descriptor(
-    53,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `String.prototype.indexOf` over two string operands, searching from
-/// index zero. Misses when either operand is not a string.
-pub const STUB_STRING_INDEX_OF_LEAF: RuntimeStubDescriptor = descriptor(
-    54,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `String.prototype.includes` over two string operands, searching from
-/// index zero. Misses when either operand is not a string.
-pub const STUB_STRING_INCLUDES_LEAF: RuntimeStubDescriptor = descriptor(
-    55,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `String.prototype.startsWith` over two string operands, anchored at
-/// index zero. Misses when either operand is not a string.
-pub const STUB_STRING_STARTS_WITH_LEAF: RuntimeStubDescriptor = descriptor(
-    56,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `String.prototype.endsWith` over two string operands, anchored at the
-/// receiver's end. Misses when either operand is not a string.
-pub const STUB_STRING_ENDS_WITH_LEAF: RuntimeStubDescriptor = descriptor(
-    57,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Completes one coercive `ToPrimitive` or `ToNumeric` opcode; user conversion
-/// hooks may allocate, throw, and re-enter arbitrary JS.
-pub const STUB_JIT_COERCE_UNARY: RuntimeStubDescriptor = descriptor(
-    32,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Completes one numeric, bitwise, update, or relational opcode in the VM.
-/// The shared family is conservatively reentrant because `Increment` may run
-/// user conversion hooks and BigInt results may allocate.
-pub const STUB_JIT_NUMERIC_OP: RuntimeStubDescriptor = descriptor(
-    33,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Completes structured exception-region state changes, abrupt unwinds, and
-/// TDZ `ReferenceError` materialization.
-pub const STUB_JIT_EXCEPTION_OP: RuntimeStubDescriptor = descriptor(
-    34,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::ExceptionTransition,
-);
-
-/// Completes iterator stepping, iterator close, and closer-registry state
-/// through the VM's full iterator semantics.
-pub const STUB_JIT_ITERATOR_OP: RuntimeStubDescriptor = descriptor(
-    35,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Completes `Function.prototype.bind` — accessor `name`/`length` getters and
-/// bound-function allocation — through the VM's full bind semantics.
-pub const STUB_JIT_BIND_FUNCTION: RuntimeStubDescriptor = descriptor(
-    36,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Complete the explicit object operation from two boxed values and its
-/// checked scalar operation word. Published source/root records retain GC
-/// and reconstruction ownership; Proxy traps, coercions and `@@hasInstance`
-/// commit exactly once.
-pub const STUB_JIT_OBJECT_PROTOCOL_VALUE: RuntimeStubDescriptor = descriptor(
-    37,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ContextWords,
-    3,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-
-/// Completes `delete` (`DeleteProperty`, `DeleteElement`, `DeleteDynamic`) —
-/// including the Proxy `deleteProperty` trap and unqualified delete — through
-/// the VM's delete drivers and fast paths.
-pub const STUB_JIT_DELETE_OP: RuntimeStubDescriptor = descriptor(
-    38,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Complete the exact published scalar value operation from two boxed values.
-/// Function/PC identity selects the typed coercion/query or derived-`this`
-/// bind; a result register is committed by generated code only after the
-/// returned `Ok(value)`.
-pub const STUB_JIT_SCALAR_VALUE: RuntimeStubDescriptor = descriptor(
-    39,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::CommittedValue2,
-    2,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-
-/// Completes `super` property reads and writes (`LoadSuperProperty`,
-/// `LoadSuperElement`, `SetSuperProperty`, `SetSuperElement`) — including home-
-/// prototype accessor getters/setters — through the VM's super helpers.
-pub const STUB_JIT_SUPER_OP: RuntimeStubDescriptor = descriptor(
-    40,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Completes private-member access (`PrivateGet`, `PrivateSet`,
-/// `PrivateBrandCheck`) — including private accessor getters/setters — through
-/// the VM's private-element helpers.
-pub const STUB_JIT_PRIVATE_OP: RuntimeStubDescriptor = descriptor(
-    41,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Completes static value loads (`SymbolLoad`, `TemporalLoad`,
-/// `GetStringIndex`) through the VM's load helpers.
-pub const STUB_JIT_VALUE_LOAD_OP: RuntimeStubDescriptor = descriptor(
-    42,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Completes allocating construction opcodes (`CollectRest`, `ArrayPush`) through the VM's construction helpers.
-pub const STUB_JIT_CONSTRUCT_OP: RuntimeStubDescriptor = descriptor(
-    43,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Completes structural object opcodes (`ForInKeys`, `CopyDataProperties`)
-/// through the VM's structural helpers.
-pub const STUB_JIT_STRUCTURAL_OP: RuntimeStubDescriptor = descriptor(
-    44,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Completes class-construction opcodes (`ClassCheck`, `SetFunctionName`)
-/// through the VM's class helpers.
-pub const STUB_JIT_CLASS_OP: RuntimeStubDescriptor = descriptor(
-    45,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Completes static intrinsic-call opcodes (`ArrayBufferCall`,
-/// `SharedArrayBufferCall`, `BigIntCall`, `DataViewCall`) through the VM's
-/// static-call helpers, rebuilding their method-id operand layout.
-pub const STUB_JIT_STATIC_CALL_OP: RuntimeStubDescriptor = descriptor(
-    46,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Completes class creation, dynamic source evaluation, private-name/template
-/// materialization, eval identity, and full `ToNumber` coercion through shared
-/// VM helpers.
-pub const STUB_JIT_CLASS_VALUE_OP: RuntimeStubDescriptor = descriptor(
-    47,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Completes synchronous static-module namespace/binding operations,
-/// star re-export, module-record marking, and `import.meta.resolve` through
-/// shared VM helpers. Promise-producing module operations remain side exits.
-pub const STUB_JIT_MODULE_OP: RuntimeStubDescriptor = descriptor(
-    48,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Normalize one parked runtime error at the compiled frame's canonical final
-/// abrupt-completion boundary. Catchable failures become pure exception values; a
-/// materialized local handler produces an exact-PC Bail; structural failures
-/// remain parked and produce Fatal. This boundary is never called between two
-/// compiled frames.
-pub const STUB_JIT_FINISH_ERROR: RuntimeStubDescriptor = descriptor(
-    49,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Compiled,
-);
-
-/// Rebuild every interpreter frame a deopt exit owes, from deopt metadata.
-///
-/// A generated exit site selects a code-owned recipe and calls this with the
-/// baked [`crate::deopt::DeoptRuntime`], the frame's canonical slot base, its
-/// register window and the register dump its shared handler saved (null when
-/// the recipe names no register). Physical recipes read homes, constants or
-/// dumped registers; the entry accepts context, exit index, recipe address,
-/// canonical slot base, destination window and register dump.
-/// The stub reconstitutes every slot of every owed frame from that recipe.
-///
-/// An exit owing only the compiled function's own frame writes it into the
-/// published window and reports a bail. An exit owing a chain of spliced
-/// frames restores the physical outer frame and prepares owned descendant
-/// inputs, then switches the physical frame to interpreter ownership, dropping
-/// its machine-root publication. Its generated entry resumes that chain only
-/// after Rust preparation returns and reports the outermost completion.
-pub const STUB_JIT_DEOPT_WRITEBACK: RuntimeStubDescriptor = descriptor(
-    50,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Compiled,
-);
-
-/// Generated deopt continuation over the context's published callee.
-///
-/// One typed side-exit word selects the exact resume PC. Rust preparation
-/// returns before assembly resumes JavaScript on the same Frame. Sources,
-/// generations and constructor mode come from the published chain and recipes.
-pub const STUB_JIT_DEOPT_CALL: RuntimeStubDescriptor = descriptor(
-    51,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ContextWords,
-    1,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-
-/// Leaf dense-array `Array.prototype.pop` mutation.
-///
-/// Truncating the dense buffer drops a reference and rewrites the cached
-/// length pair; neither allocates. The entry re-checks the dense
-/// preconditions the inline guard cannot see (writable `length`, a present
-/// own last element, no accessor override in range) and reports a miss when
-/// they fail, so the call site falls through to ordinary dispatch.
-pub const STUB_ARRAY_POP_LEAF: RuntimeStubDescriptor = descriptor(
-    58,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::MutatingLeafValue2,
-    2,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Leaf dense-array `Array.prototype.push` mutation.
-///
-/// Appends into the dense buffer's existing capacity and never grows it, so
-/// it neither allocates nor collects. `push` creates a new index, which the
-/// spec resolves through the prototype chain: the caller must prove the
-/// array-index accessor protector intact before the call (see
-/// [`crate::runtime_stubs::LeafEntryShape::array_index_protector`]). The entry
-/// re-checks the dense preconditions and misses on a full buffer.
-pub const STUB_ARRAY_PUSH_LEAF: RuntimeStubDescriptor = descriptor(
-    59,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::MutatingLeafValue2,
-    2,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf dense-array `Array.prototype.shift` mutation.
-///
-/// Sliding the element buffer down drops one reference and rewrites the cached
-/// length pair without allocating. Like the `pop` entry it re-checks the dense
-/// preconditions and misses instead of falling back internally.
-pub const STUB_ARRAY_SHIFT_LEAF: RuntimeStubDescriptor = descriptor(
-    60,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::MutatingLeafValue2,
-    2,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-/// Allocating dense-array `Array.prototype.unshift` mutation.
-///
-/// Inserting at the head may grow the dense buffer, so the site publishes a
-/// precise safepoint exactly like the `push` entry.
-pub const STUB_ARRAY_UNSHIFT_ALLOC: RuntimeStubDescriptor = descriptor(
-    61,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf in-place `Map.prototype.set` over a key the map already holds.
-///
-/// Overwriting an existing entry rewrites one slot and runs its write
-/// barrier; nothing allocates, so the site owes no safepoint and no rooting
-/// packet. A key the map does not hold appends and may grow the table, so the
-/// entry misses and the allocating sibling completes the call.
-pub const STUB_COLLECTION_MAP_SET_MUTATING: RuntimeStubDescriptor = descriptor(
-    67,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::MutatingLeafValue3,
-    3,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Pure unboxed Number remainder for typed numeric machine code.
-pub const STUB_NUMBER_REM_F64_LEAF: RuntimeStubDescriptor = descriptor(
-    68,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::Float64Leaf2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::Float64,
-    NativeResultDomain::None,
-);
-
-/// Pure unboxed ECMAScript Number exponentiation for typed numeric machine code.
-pub const STUB_NUMBER_POW_F64_LEAF: RuntimeStubDescriptor = descriptor(
-    69,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::Float64Leaf2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::Float64,
-    NativeResultDomain::None,
-);
-
-/// Pure ECMAScript ToInt32 conversion for typed numeric machine code.
-pub const STUB_NUMBER_TO_INT32_F64_LEAF: RuntimeStubDescriptor = descriptor(
-    70,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::Float64ToWordLeaf1,
-    1,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::ValueWord,
-    NativeResultDomain::None,
-);
-
-/// Bind the published record's receiver before its body runs: convert a
-/// sloppy receiver, or create a base constructor's receiver
-/// (`OrdinaryCreateFromConstructor` over the record's `new.target`).
-pub const STUB_JIT_PREPARE_ACTIVATION: RuntimeStubDescriptor = descriptor(
-    71,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ExecutionEntry0,
-    0,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Execution,
-);
-
-/// Derived-constructor completion of a non-object `result` against the
-/// published record's `this` binding.
-pub const STUB_JIT_DERIVED_CONSTRUCT_RESULT: RuntimeStubDescriptor = descriptor(
-    72,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ContextWords,
-    1,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-
-/// Read the live superclass constructor from an exact class wrapper.
-pub const STUB_JIT_CLASS_SUPER_CONSTRUCTOR: RuntimeStubDescriptor = descriptor(
-    73,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::Variadic,
-    1,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::ValueWord,
-    NativeResultDomain::None,
-);
-
-/// Ask the cold optimizing policy to promote the function of the published
-/// record, whose canonical source-work target was reached before this entry.
-/// Compilation runs no JavaScript; the record keeps its generation.
-pub const STUB_JIT_PROMOTE_ENTERED: RuntimeStubDescriptor = descriptor(
-    74,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ExecutionEntry0,
-    0,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Execution,
-);
-
-/// Leaf `Math.abs`.
-///
-/// A numeric builtin reached through a declared entry rather than a
-/// per-builtin machine-code body. Adding a sibling is a declaration plus its
-/// entry; it costs no generated code.
-pub const STUB_MATH_ABS_LEAF: RuntimeStubDescriptor = descriptor(
-    62,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.floor`.
-pub const STUB_MATH_FLOOR_LEAF: RuntimeStubDescriptor = descriptor(
-    63,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.sqrt`.
-pub const STUB_MATH_SQRT_LEAF: RuntimeStubDescriptor = descriptor(
-    64,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.max` over exactly two arguments.
-///
-/// The variadic and zero/one-argument forms keep the ordinary call path; the
-/// declared arity is what makes a site eligible for this entry.
-pub const STUB_MATH_MAX_LEAF: RuntimeStubDescriptor = descriptor(
-    65,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.min` over exactly two arguments.
-pub const STUB_MATH_MIN_LEAF: RuntimeStubDescriptor = descriptor(
-    66,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.sin`.
-pub const STUB_MATH_SIN_LEAF: RuntimeStubDescriptor = descriptor(
-    102,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.cos`.
-pub const STUB_MATH_COS_LEAF: RuntimeStubDescriptor = descriptor(
-    103,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.tan`.
-pub const STUB_MATH_TAN_LEAF: RuntimeStubDescriptor = descriptor(
-    104,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.atan`.
-pub const STUB_MATH_ATAN_LEAF: RuntimeStubDescriptor = descriptor(
-    105,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.exp`.
-pub const STUB_MATH_EXP_LEAF: RuntimeStubDescriptor = descriptor(
-    106,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.log`.
-pub const STUB_MATH_LOG_LEAF: RuntimeStubDescriptor = descriptor(
-    107,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.ceil`.
-pub const STUB_MATH_CEIL_LEAF: RuntimeStubDescriptor = descriptor(
-    108,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.round`.
-pub const STUB_MATH_ROUND_LEAF: RuntimeStubDescriptor = descriptor(
-    109,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.trunc`.
-pub const STUB_MATH_TRUNC_LEAF: RuntimeStubDescriptor = descriptor(
-    110,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.atan2` over exactly two arguments.
-pub const STUB_MATH_ATAN2_LEAF: RuntimeStubDescriptor = descriptor(
-    111,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `Math.pow` over exactly two arguments.
-pub const STUB_MATH_POW_LEAF: RuntimeStubDescriptor = descriptor(
-    112,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Leaf `parseInt(value)` for one exact int32-tagged argument.
-///
-/// Other argument representations and all non-one-argument JavaScript call
-/// shapes retain the canonical coercing parser before any observable effect.
-pub const STUB_PARSE_INT_I32_LEAF: RuntimeStubDescriptor = descriptor(
-    75,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Allocating `Array(length)` specialization for one exact nonnegative int32.
-///
-/// Invalid tags and negative lengths miss before allocation so the generated
-/// caller can resume the canonical constructor at its exact pre-operation
-/// frame. Heap refusal is reported separately through the status pair; this
-/// entry never constructs or parks a JavaScript exception.
-pub const STUB_ARRAY_CONSTRUCT_ALLOC: RuntimeStubDescriptor = descriptor(
-    76,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(false, false),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Build the activation's `arguments` object into one destination register.
-/// A stack-owned frame supplies the actual arguments its generated caller
-/// published after the register window; a materialized activation supplies
-/// them from its cold record. Allocating, never reentrant.
-pub const STUB_JIT_COLLECT_ARGUMENTS: RuntimeStubDescriptor = descriptor(
-    80,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::allocating(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
-
-/// Complete the exact published schema-owned binding operation from two boxed
-/// values. Function/PC identity selects the semantic family and operand roles
-/// through `otter_bytecode::opcode_schema::BindingSemantics`; a result
-/// register is committed by generated code only after the returned `Ok`.
-pub const STUB_JIT_BINDING_VALUE: RuntimeStubDescriptor = descriptor(
-    78,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::CommittedValue2,
-    2,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-
-/// Complete the exact published schema-owned global declaration or
-/// initialization from two boxed values. Declarations remain a separate
-/// semantic family even though they share the committed physical ABI.
-pub const STUB_JIT_GLOBAL_DECLARATION_VALUE: RuntimeStubDescriptor = descriptor(
-    79,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::CommittedValue2,
-    2,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-
-/// Route one pure exception value into the current activation.
-///
-/// A handled materialized throw publishes the catch/finally PC and reports a
-/// same-frame side exit. An unhandled or stack-owned throw returns the same
-/// exception payload with `Throw`; it is never staged between compiled frames.
-pub const STUB_JIT_ROUTE_THROW: RuntimeStubDescriptor = descriptor(
-    77,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::RouteThrow1,
-    1,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Compiled,
-);
-
-/// Enter the common call trampoline for the request the generated caller
-/// wrote into its context: callee, receiver, `new.target`, flags and the actual
-/// span. The trampoline classifies the callee, owns the callee activation and
-/// returns its completion.
-pub const STUB_JIT_CALL: RuntimeStubDescriptor = descriptor(
-    83,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ExecutionEntry0,
-    0,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Execution,
-);
-
-/// Stage a compiler-created dense spread array's elements as the actual span
-/// of the context's pending call request. Reads only; the span stays valid
-/// until the trampoline copies it.
-pub const STUB_JIT_STAGE_SPREAD: RuntimeStubDescriptor = descriptor(
-    84,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ContextWords,
-    1,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-
-/// Stage the complete pending call request of a forwarding site from one
-/// boxed-value span: the resolved `apply` value, the callee, the receiver and
-/// the current argument-binding values. The intrinsic `apply` forwards the
-/// activation's actual arguments; any other method receives the arguments
-/// object. No JavaScript runs except materialization accessors.
-pub const STUB_JIT_STAGE_FORWARD: RuntimeStubDescriptor = descriptor(
-    85,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ReentrantValueSpan,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-
-/// Resolve the callable of the exact published `CallMethodValue` from its
-/// receiver span, through the shared method caches, and record call feedback.
-/// The generated caller then enters the call trampoline with that callable.
-pub const STUB_JIT_RESOLVE_METHOD: RuntimeStubDescriptor = descriptor(
-    86,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ReentrantValueSpan,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-
-/// Generic entry of the JavaScript call ABI: classify any callee through the
-/// call trampoline and complete the call. Also the entry of every
-/// interpreter destination.
-pub const STUB_JIT_CALL_GENERIC: RuntimeStubDescriptor = descriptor(
-    87,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::JsCall,
-    4,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Execution,
-);
-
-/// Park the stack-overflow `RangeError` for a call entry that found no room
-/// for its frame, before publishing anything.
-pub const STUB_JIT_CALL_OVERFLOW: RuntimeStubDescriptor = descriptor(
-    88,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ExecutionEntry0,
-    0,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Execution,
-);
-
-/// Stage a §15.10.3 tail call from one boxed-value span — the callee, then
-/// its actual arguments — as the context's pending request. The staging
-/// activation then retires its record and returns `Continue`; its caller
-/// enters the request in its place. Reads only.
-pub const STUB_JIT_STAGE_TAIL_CALL: RuntimeStubDescriptor = descriptor(
-    89,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ReentrantValueSpan,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
-
-/// Barrier for one tagged element store generated code wrote into an
-/// ordinary array's slab: `(element base, index, value)`. Reached only for a
-/// heap-cell value while marking or when the value is young; marks the slot
-/// dirty and remembers the slab.
-pub const STUB_ELEMENT_WRITE_BARRIER: RuntimeStubDescriptor = descriptor(
-    90,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::MutatingLeafValue3,
-    3,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
-
-/// Human-readable symbol for a runtime-stub id in the current contract.
-#[must_use]
-pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
-    match id {
-        id if id == STUB_JIT_BACKEDGE_POLL.id => "jit_backedge_poll",
-        id if id == STUB_COLLECTION_MAP_GET_LEAF.id => "collection_map_get_leaf",
-        id if id == STUB_COLLECTION_MAP_HAS_LEAF.id => "collection_map_has_leaf",
-        id if id == STUB_COLLECTION_SET_HAS_LEAF.id => "collection_set_has_leaf",
-        id if id == STUB_COLLECTION_MAP_SET_ALLOC.id => "collection_map_set_alloc",
-        id if id == STUB_COLLECTION_SET_ADD_ALLOC.id => "collection_set_add_alloc",
-        id if id == STUB_COLLECTION_MAP_GET_ALLOC.id => "collection_map_get_alloc",
-        id if id == STUB_COLLECTION_MAP_HAS_ALLOC.id => "collection_map_has_alloc",
-        id if id == STUB_COLLECTION_SET_HAS_ALLOC.id => "collection_set_has_alloc",
-        id if id == STUB_COLLECTION_MAP_DELETE_ALLOC.id => "collection_map_delete_alloc",
-        id if id == STUB_COLLECTION_SET_DELETE_ALLOC.id => "collection_set_delete_alloc",
-        id if id == STUB_STRING_CONCAT_ALLOC.id => "string_concat_alloc",
-        id if id == STUB_JIT_ADD.id => "jit_add",
-        id if id == STUB_JIT_LOAD_ELEMENT.id => "jit_load_element",
-        id if id == STUB_JIT_STORE_ELEMENT.id => "jit_store_element",
-        id if id == STUB_JIT_DEFINE_OWN_PROPERTY.id => "jit_define_own_property",
-        id if id == STUB_JIT_LOAD_PROPERTY.id => "jit_load_property_value",
-        id if id == STUB_JIT_STORE_PROPERTY.id => "jit_store_property_value",
-        id if id == STUB_JIT_DEFINE_DATA_PROPERTY.id => "jit_define_data_property",
-        id if id == STUB_JIT_MAKE_FN.id => "make_function_alloc",
-        id if id == STUB_JIT_MAKE_CLOSURE.id => "make_closure_alloc",
-        id if id == STUB_JIT_NEW_OBJECT.id => "jit_new_object",
-        id if id == STUB_JIT_NEW_ARRAY.id => "jit_new_array",
-        id if id == STUB_CREATE_CONTEXT_ALLOC.id => "create_context_alloc",
-        id if id == STUB_WRITE_BARRIER.id => "write_barrier",
-        id if id == STUB_COPY_CONTEXT_ALLOC.id => "copy_context_alloc",
-        id if id == STUB_STRICT_EQ_LEAF.id => "strict_eq_leaf",
-        id if id == STUB_JIT_LOOSE_EQ.id => "jit_loose_eq",
-        id if id == STUB_TO_BOOLEAN_LEAF.id => "to_boolean_leaf",
-        id if id == STUB_NUMBER_REM_LEAF.id => "number_rem_leaf",
-        id if id == STUB_JIT_LOAD_REGEXP.id => "jit_load_regexp",
-        id if id == STUB_JIT_COERCE_UNARY.id => "jit_coerce_unary",
-        id if id == STUB_JIT_NUMERIC_OP.id => "jit_numeric_op",
-        id if id == STUB_JIT_EXCEPTION_OP.id => "jit_exception_op",
-        id if id == STUB_JIT_ITERATOR_OP.id => "jit_iterator_op",
-        id if id == STUB_JIT_BIND_FUNCTION.id => "jit_bind_function",
-        id if id == STUB_JIT_OBJECT_PROTOCOL_VALUE.id => "jit_object_protocol_value",
-        id if id == STUB_JIT_DELETE_OP.id => "jit_delete_op",
-        id if id == STUB_JIT_SCALAR_VALUE.id => "jit_scalar_value",
-        id if id == STUB_JIT_SUPER_OP.id => "jit_super_op",
-        id if id == STUB_JIT_PRIVATE_OP.id => "jit_private_op",
-        id if id == STUB_JIT_VALUE_LOAD_OP.id => "jit_value_load_op",
-        id if id == STUB_JIT_CONSTRUCT_OP.id => "jit_construct_op",
-        id if id == STUB_JIT_STRUCTURAL_OP.id => "jit_structural_op",
-        id if id == STUB_JIT_CLASS_OP.id => "jit_class_op",
-        id if id == STUB_JIT_STATIC_CALL_OP.id => "jit_static_call_op",
-        id if id == STUB_JIT_CLASS_VALUE_OP.id => "jit_class_value_op",
-        id if id == STUB_JIT_MODULE_OP.id => "jit_module_op",
-        id if id == STUB_JIT_FINISH_ERROR.id => "jit_finish_error",
-        id if id == STUB_JIT_DEOPT_WRITEBACK.id => "jit_deopt_rebuild_frames",
-        id if id == STUB_JIT_DEOPT_CALL.id => "jit_deopt_call",
-        id if id == STUB_STRING_CHAR_CODE_AT_LEAF.id => "string_char_code_at_leaf",
-        id if id == STUB_STRING_CODE_POINT_AT_LEAF.id => "string_code_point_at_leaf",
-        id if id == STUB_STRING_INDEX_OF_LEAF.id => "string_index_of_leaf",
-        id if id == STUB_STRING_INCLUDES_LEAF.id => "string_includes_leaf",
-        id if id == STUB_STRING_STARTS_WITH_LEAF.id => "string_starts_with_leaf",
-        id if id == STUB_STRING_ENDS_WITH_LEAF.id => "string_ends_with_leaf",
-        id if id == STUB_ARRAY_POP_LEAF.id => "array_pop_leaf",
-        id if id == STUB_ARRAY_PUSH_LEAF.id => "array_push_leaf",
-        id if id == STUB_ARRAY_SHIFT_LEAF.id => "array_shift_leaf",
-        id if id == STUB_ARRAY_UNSHIFT_ALLOC.id => "array_unshift_alloc",
-        id if id == STUB_MATH_ABS_LEAF.id => "math_abs_leaf",
-        id if id == STUB_MATH_FLOOR_LEAF.id => "math_floor_leaf",
-        id if id == STUB_MATH_SQRT_LEAF.id => "math_sqrt_leaf",
-        id if id == STUB_MATH_MAX_LEAF.id => "math_max_leaf",
-        id if id == STUB_MATH_MIN_LEAF.id => "math_min_leaf",
-        id if id == STUB_COLLECTION_MAP_SET_MUTATING.id => "collection_map_set_mutating",
-        id if id == STUB_NUMBER_REM_F64_LEAF.id => "number_rem_f64_leaf",
-        id if id == STUB_NUMBER_POW_F64_LEAF.id => "number_pow_f64_leaf",
-        id if id == STUB_NUMBER_TO_INT32_F64_LEAF.id => "number_to_int32_f64_leaf",
-        id if id == STUB_JIT_PREPARE_ACTIVATION.id => "jit_prepare_activation",
-        id if id == STUB_JIT_DERIVED_CONSTRUCT_RESULT.id => "jit_derived_construct_result",
-        id if id == STUB_JIT_CLASS_SUPER_CONSTRUCTOR.id => "jit_class_super_constructor",
-        id if id == STUB_JIT_PROMOTE_ENTERED.id => "jit_promote_entered",
-        id if id == STUB_PARSE_INT_I32_LEAF.id => "parse_int_i32_leaf",
-        id if id == STUB_ARRAY_CONSTRUCT_ALLOC.id => "array_construct_alloc",
-        id if id == STUB_JIT_ROUTE_THROW.id => "jit_route_throw",
-        id if id == STUB_JIT_BINDING_VALUE.id => "jit_binding_value",
-        id if id == STUB_JIT_GLOBAL_DECLARATION_VALUE.id => "jit_global_declaration_value",
-        id if id == STUB_JIT_COLLECT_ARGUMENTS.id => "jit_collect_arguments",
-        id if id == STUB_JIT_NEW_OBJECT_LITERAL.id => "jit_new_object_literal",
-        id if id == STUB_TYPEOF_TEST_LEAF.id => "typeof_test_leaf",
-        id if id == STUB_JIT_CALL.id => "jit_call",
-        id if id == STUB_JIT_STAGE_SPREAD.id => "jit_stage_spread",
-        id if id == STUB_JIT_STAGE_FORWARD.id => "jit_stage_forward",
-        id if id == STUB_JIT_RESOLVE_METHOD.id => "jit_resolve_method",
-        id if id == STUB_JIT_CALL_GENERIC.id => "jit_call_generic",
-        id if id == STUB_JIT_CALL_OVERFLOW.id => "jit_call_overflow",
-        id if id == STUB_JIT_STAGE_TAIL_CALL.id => "jit_stage_tail_call",
-        id if id == STUB_ELEMENT_WRITE_BARRIER.id => "element_write_barrier",
-        id if id == STUB_JIT_CONSTRUCTOR_TERMINAL.id => "jit_constructor_terminal",
-        id if id == STUB_ALLOC_GROUP_ENSURE.id => "alloc_group_ensure",
-        id if id == STUB_PRIMITIVE_STRING_ORDER.id => "primitive_string_order",
-        id if id == STUB_JIT_CALL_NATIVE.id => "jit_call_native",
-        id if id == STUB_CONSTRUCTOR_RECEIVER_PROBE.id => "constructor_receiver_probe",
-        id if id == STUB_CONSTRUCTOR_RECEIVER_COMMIT.id => "constructor_receiver_commit",
-        id if id == STUB_BIGINT_BINARY_ALLOC.id => "bigint_binary_alloc",
-        id if id == STUB_INSTANCEOF_LEAF.id => "instanceof_leaf",
-        id if id == STUB_STRING_KEY_ATOM_LEAF.id => "string_key_atom_leaf",
-        id if id == STUB_KEYED_NAMED_LOAD_LEAF.id => "keyed_named_load_leaf",
-        id if id == STUB_ARRAY_PUSH_ALLOC.id => "array_push_alloc",
-        id if id == STUB_MATH_SIN_LEAF.id => "math_sin_leaf",
-        id if id == STUB_MATH_COS_LEAF.id => "math_cos_leaf",
-        id if id == STUB_MATH_TAN_LEAF.id => "math_tan_leaf",
-        id if id == STUB_MATH_ATAN_LEAF.id => "math_atan_leaf",
-        id if id == STUB_MATH_EXP_LEAF.id => "math_exp_leaf",
-        id if id == STUB_MATH_LOG_LEAF.id => "math_log_leaf",
-        id if id == STUB_MATH_CEIL_LEAF.id => "math_ceil_leaf",
-        id if id == STUB_MATH_ROUND_LEAF.id => "math_round_leaf",
-        id if id == STUB_MATH_TRUNC_LEAF.id => "math_trunc_leaf",
-        id if id == STUB_MATH_ATAN2_LEAF.id => "math_atan2_leaf",
-        id if id == STUB_MATH_POW_LEAF.id => "math_pow_leaf",
-        id if id == STUB_FIELD_TYPE_OBSERVE.id => "field_type_observe",
-        id if id == STUB_SHAPE_LEFT.id => "shape_left",
-        id if id == STUB_JIT_REGEXP_EXEC.id => "jit_regexp_exec",
-        id if id == STUB_JIT_REGEXP_TEST.id => "jit_regexp_test",
-        id if id == STUB_CONTEXT_SLOT_WRITTEN.id => "context_slot_written",
-        id if id == STUB_MATH_F64_LEAF.id => "math_f64_leaf",
-        id if id == STUB_JIT_STRING_METHOD.id => "jit_string_method",
-        id if id == STUB_NUMBER_IS_NAN_LEAF.id => "number_is_nan_leaf",
-        id if id == STUB_NUMBER_IS_FINITE_LEAF.id => "number_is_finite_leaf",
-        id if id == STUB_NUMBER_IS_INTEGER_LEAF.id => "number_is_integer_leaf",
-        id if id == STUB_NUMBER_IS_SAFE_INTEGER_LEAF.id => "number_is_safe_integer_leaf",
-        id if id == STUB_ARRAY_IS_ARRAY_LEAF.id => "array_is_array_leaf",
-        id if id == STUB_OBJECT_GET_PROTOTYPE_OF_LEAF.id => "object_get_prototype_of_leaf",
-        id if id == STUB_NUMBER_CALL_LEAF.id => "number_call_leaf",
-        id if id == STUB_REST_ARRAY_ALLOC.id => "rest_array_alloc",
-        id if id == STUB_JIT_RECORD_CALL_TARGET.id => "jit_record_call_target",
-        id if id == STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT.id => "jit_new_null_prototype_object",
-        id if id == STUB_NUMBER_TO_STRING_ALLOC.id => "number_to_string_alloc",
-        id if id == STUB_REGEXP_EXEC_LEAF.id => "regexp_exec_leaf",
-        id if id == STUB_REGEXP_TEST_LEAF.id => "regexp_test_leaf",
-        id if id == STUB_JIT_REGEXP_LITERAL.id => "jit_regexp_literal",
-        id if id == STUB_JIT_STATIC_NATIVE_CALL.id => "jit_static_native_call",
-        id if id == STUB_OBJECT_IS_LEAF.id => "object_is_leaf",
-        id if id == STUB_STRING_CHAR_AT_LEAF.id => "string_char_at_leaf",
-        id if id == STUB_STRING_FROM_CHAR_CODE_LEAF.id => "string_from_char_code_leaf",
-        id if id == STUB_ARRAY_INDEX_OF_LEAF.id => "array_index_of_leaf",
-        id if id == STUB_ARRAY_INCLUDES_LEAF.id => "array_includes_leaf",
-
-        _ => "unknown_runtime_stub",
-    }
+// One row owns the exported descriptor, diagnostic name, and inventory slot.
+// All ABI/effect fields remain explicit; no family defaults are inferred.
+macro_rules! runtime_stubs {
+    ($( $(#[$doc:meta])* $name:ident = $id:literal => $symbol:literal,
+        $class:ident, $signature:ident, $argc:expr, $effects:expr,
+        $exception:ident, $abi:ident, $domain:ident; )*) => {
+        $(
+            $(#[$doc])*
+            pub const $name: RuntimeStubDescriptor = descriptor(
+                $id, RuntimeStubClass::$class, RuntimeStubSignature::$signature,
+                $argc, $effects, RuntimeStubException::$exception,
+                RuntimeStubResultAbi::$abi, NativeResultDomain::$domain,
+            );
+        )*
+
+        /// Dense inventory of every current machine-callable runtime-stub contract.
+        pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[$($name),*];
+
+        /// Human-readable symbol for a runtime-stub id in the current contract.
+        #[must_use]
+        pub const fn runtime_stub_name(id: super::RuntimeStubId) -> &'static str {
+            match id {
+                $($id => $symbol,)*
+                _ => "unknown_runtime_stub",
+            }
+        }
+    };
 }
 
-/// Terminal construction sampling/transfer over the canonical frame roots.
-/// `(jit_ctx, pair_ptr)` copies and returns the sole parked compiled pair;
-/// no allocation, JavaScript, shape preparation or status reconstruction.
-pub const STUB_JIT_CONSTRUCTOR_TERMINAL: RuntimeStubDescriptor = descriptor(
-    91,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::ContextWords,
-    1,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Compiled,
-);
+runtime_stubs! {
+    /// Leaf compiled-loop backedge poll; reports interrupt/budget stops through
+    /// its status word.
+    STUB_JIT_BACKEDGE_POLL = 1 => "jit_backedge_poll",
+        LeafNoAlloc, Poll1, 1, RuntimeStubEffects::leaf(true, false),
+        Status, StatusWord, None;
 
-/// Ensure bytes for a fixed allocation group in the canonical LAB.
-/// The boxed int32 byte count and two undefined padding operands accompany the
-/// actual current safepoint. Success carries undefined; Miss/OOM restore homes
-/// and resume the first original allocation. No source effect or OOM latch is
-/// committed by this speculative reservation boundary.
-pub const STUB_ALLOC_GROUP_ENSURE: RuntimeStubDescriptor = descriptor(
-    92,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(false, false),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Leaf `Map.prototype.get` probe.
+    STUB_COLLECTION_MAP_GET_LEAF = 2 => "collection_map_get_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
 
-/// Pure ordering of Number/String primitive operands. Two Strings compare
-/// UTF-16 units; a mixed pair uses canonical StringNumericLiteral conversion.
-/// Success carries -1/0/1 or 2 (unordered NaN). Other types miss before effects.
-pub const STUB_PRIMITIVE_STRING_ORDER: RuntimeStubDescriptor = descriptor(
-    93,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Leaf `Map.prototype.has` probe.
+    STUB_COLLECTION_MAP_HAS_LEAF = 3 => "collection_map_has_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
 
-/// Private JS entry for a proved NativeFunction kind. The canonical pending
-/// request and Host Native kernel own actual roots, live policy and completion.
-pub const STUB_JIT_CALL_NATIVE: RuntimeStubDescriptor = descriptor(
-    94,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::JsCall,
-    4,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Execution,
-);
+    /// Leaf `Set.prototype.has` probe.
+    STUB_COLLECTION_SET_HAS_LEAF = 4 => "collection_set_has_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
 
-/// Pure actual-new.target family admission: `(heap, new.target, boxed baseFID)`.
-/// Success is a boxed int32 layout offset; unsupported/unprepared owners Miss.
-pub const STUB_CONSTRUCTOR_RECEIVER_PROBE: RuntimeStubDescriptor = descriptor(
-    95,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Allocating `Map.prototype.set` mutation.
+    STUB_COLLECTION_MAP_SET_ALLOC = 5 => "collection_map_set_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, true),
+        Status, NativePair, Probe;
 
-/// Complete source feedback after a generated receiver/ticket is published.
-/// `(jit_ctx, receiver)` is the existing two-word ContextWords physical ABI.
-/// Only Success/Fatal can leave this noalloc committed extent.
-pub const STUB_CONSTRUCTOR_RECEIVER_COMMIT: RuntimeStubDescriptor = descriptor(
-    96,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::ContextWords,
-    1,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
+    /// Allocating `Set.prototype.add` mutation.
+    STUB_COLLECTION_SET_ADD_ALLOC = 6 => "collection_set_add_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, true),
+        Status, NativePair, Probe;
 
-/// Allocating BigInt binary operator over two BigInt operands and an
-/// operator code; every other input and every operator failure misses.
-pub const STUB_BIGINT_BINARY_ALLOC: RuntimeStubDescriptor = descriptor(
-    97,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Allocating `Map.prototype.get` lookup.
+    STUB_COLLECTION_MAP_GET_ALLOC = 7 => "collection_map_get_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Probe;
 
-/// Leaf §13.10.2 InstanceofOperator for a native-function target, over two
-/// raw operand words. Answers only what needs no JavaScript: a target whose
-/// `@@hasInstance` is `%Function.prototype%`'s immutable one and whose own
-/// `prototype` is an object, against a primitive or an ordinary object
-/// whose chain holds only ordinary objects. Everything else misses.
-pub const STUB_INSTANCEOF_LEAF: RuntimeStubDescriptor = descriptor(
-    98,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Allocating `Map.prototype.has` lookup.
+    STUB_COLLECTION_MAP_HAS_ALLOC = 8 => "collection_map_has_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Probe;
 
-/// Leaf `TryInternalizeString` for a keyed access: the interned atom of a
-/// flat string key's content, read through the name interner the heap owns
-/// (the second argument is ignored). Never allocates; a rope, a lone
-/// surrogate or content no property key ever named misses.
-pub const STUB_STRING_KEY_ATOM_LEAF: RuntimeStubDescriptor = descriptor(
-    99,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Allocating `Set.prototype.has` lookup.
+    STUB_COLLECTION_SET_HAS_ALLOC = 9 => "collection_set_has_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Probe;
 
-/// Leaf keyed `[[Get]]` of an interned string key on a dictionary-mode
-/// object that own data answers along its prototype chain: `(heap, receiver,
-/// key)`, the key carrying its recorded atom. Never allocates; a shaped
-/// receiver, an accessor, an opaque object or an unrecorded key misses.
-pub const STUB_KEYED_NAMED_LOAD_LEAF: RuntimeStubDescriptor = descriptor(
-    100,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Allocating `Map.prototype.delete` mutation.
+    STUB_COLLECTION_MAP_DELETE_ALLOC = 10 => "collection_map_delete_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, true),
+        Status, NativePair, Probe;
 
-/// Allocating dense-array `Array.prototype.push`: the entry a guarded push
-/// site calls when the in-place leaf found the dense storage full, so the
-/// growth publishes a precise safepoint.
-pub const STUB_ARRAY_PUSH_ALLOC: RuntimeStubDescriptor = descriptor(
-    101,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Allocating `Set.prototype.delete` mutation.
+    STUB_COLLECTION_SET_DELETE_ALLOC = 11 => "collection_set_delete_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, true),
+        Status, NativePair, Probe;
 
-/// Widen one defining shape's field-value word: `(heap_mut, owner_offset,
-/// boxed_rhs)`. The owner is a rooted, non-moving defining shape. Only scalar
-/// metadata is changed, so no traced pointer store or barrier is required.
-pub const STUB_FIELD_TYPE_OBSERVE: RuntimeStubDescriptor = descriptor(
-    113,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::MutatingLeafValue2,
-    2,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Allocating primitive string-concat operation.
+    STUB_STRING_CONCAT_ALLOC = 12 => "string_concat_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Probe;
 
-/// An object left a watched shape: `(heap_mut, shape_header_address,
-/// unused)` clears the shape's stable byte and fires its stability
-/// subscribers. Only scalar metadata and code flags change.
-pub const STUB_SHAPE_LEFT: RuntimeStubDescriptor = descriptor(
-    114,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::MutatingLeafValue2,
-    2,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Generic `+` slow path; operand coercion may re-enter JS.
+    STUB_JIT_ADD = 13 => "jit_add",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
 
-/// `%RegExp.prototype.exec%` of the realm's original method on `(receiver,
-/// argument)`, whose identity generated code proved: the method's complete
-/// semantics without a native call frame. The `lastIndex` coercion may run
-/// JavaScript; once entered it completes or returns a pure exception value.
-pub const STUB_JIT_REGEXP_EXEC: RuntimeStubDescriptor = descriptor(
-    115,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::CommittedValue2,
-    2,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
+    /// Computed element read over boxed value operands.
+    ///
+    /// `ToPropertyKey`, proxies, accessors, and prototype lookup may all re-enter
+    /// JavaScript. The fixed entry completes the operation or returns a pure
+    /// exception value; it never asks generated code to replay the access.
+    STUB_JIT_LOAD_ELEMENT = 14 => "jit_load_element",
+        Reentrant, ReentrantValue2, 2, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
 
-/// `%RegExp.prototype.test%` counterpart of [`STUB_JIT_REGEXP_EXEC`].
-pub const STUB_JIT_REGEXP_TEST: RuntimeStubDescriptor = descriptor(
-    116,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::CommittedValue2,
-    2,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
+    /// Computed element write over boxed value operands.
+    ///
+    /// The store may mutate arbitrary GC-managed state and invoke proxy traps,
+    /// setters, or property-key coercion hooks. Once entered it either completes
+    /// exactly once or returns a pure exception value.
+    STUB_JIT_STORE_ELEMENT = 15 => "jit_store_element",
+        Reentrant, ReentrantValue3, 3, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
 
-/// A store wrote a watched context slot: `(heap_mut, watch_word, slot)`
-/// fires the slot's subscribers and marks it volatile. Only code flags and
-/// watch metadata change.
-pub const STUB_CONTEXT_SLOT_WRITTEN: RuntimeStubDescriptor = descriptor(
-    117,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::MutatingLeafValue2,
-    2,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Descriptor-driven define; descriptor reads may re-enter JS.
+    STUB_JIT_DEFINE_OWN_PROPERTY = 16 => "jit_define_own_property",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
 
-/// Pure unboxed `Math` method arithmetic for typed numeric machine code.
-pub const STUB_MATH_F64_LEAF: RuntimeStubDescriptor = descriptor(
-    118,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::Float64MathLeaf3,
-    3,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::Float64,
-    NativeResultDomain::None,
-);
+    /// Named-property read over one boxed receiver and the site's native IC slot.
+    ///
+    /// Accessors, proxies, and exotic receivers may re-enter JavaScript. The site
+    /// identity bound in the slot selects `LoadProperty`; success returns its value
+    /// and may install a handler in the slot, while failure returns one pure
+    /// exception value without replay.
+    STUB_JIT_LOAD_PROPERTY = 17 => "jit_load_property_value",
+        Reentrant, ReentrantNamedLoad, 1, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
 
-/// The realm's original `String.prototype` regexp-facing method selected by
-/// the intrinsic kind payload `(receiver, argument0, argument1, kind)`,
-/// whose identity generated code proved: the method's complete semantics
-/// without a native call frame. Coercions and a non-pristine RegExp argument
-/// may run JavaScript; once entered it completes or returns a pure
-/// exception value.
-pub const STUB_JIT_STRING_METHOD: RuntimeStubDescriptor = descriptor(
-    119,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ContextWords,
-    4,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
+    /// Named-property write over boxed receiver/value operands and the site's
+    /// native IC slot.
+    ///
+    /// Shape transitions may allocate and setters or proxy traps may re-enter
+    /// JavaScript. Entry commits the complete store exactly once or returns one
+    /// pure exception value; it never asks generated code to replay the operation.
+    STUB_JIT_STORE_PROPERTY = 18 => "jit_store_property_value",
+        Reentrant, ReentrantNamedStore, 2, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
 
-/// Leaf `Number.isNaN`: no coercion, every argument answers.
-pub const STUB_NUMBER_IS_NAN_LEAF: RuntimeStubDescriptor = descriptor(
-    120,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Plain data-property define.
+    STUB_JIT_DEFINE_DATA_PROPERTY = 19 => "jit_define_data_property",
+        Alloc, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::allocating(true, true),
+        Status, StatusWord, None;
 
-/// Leaf `Number.isFinite`: no coercion, every argument answers.
-pub const STUB_NUMBER_IS_FINITE_LEAF: RuntimeStubDescriptor = descriptor(
-    121,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Capture-free function allocation. The published semantic source owns the
+    /// function constant; the three boxed operands are `undefined`. The entry
+    /// returns a fresh fully initialized closure or a pre-effect Probe refusal.
+    STUB_JIT_MAKE_FN = 20 => "make_function_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(false, false),
+        Never, NativePair, Probe;
 
-/// Leaf `Number.isInteger`: no coercion, every argument answers.
-pub const STUB_NUMBER_IS_INTEGER_LEAF: RuntimeStubDescriptor = descriptor(
-    122,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Closure allocation from `(context, lexical this, lexical new.target)`.
+    /// The published innermost source owns the function constant. No operand is
+    /// an interpreter register index and no physical-frame binding is consulted.
+    STUB_JIT_MAKE_CLOSURE = 21 => "make_closure_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(false, false),
+        Never, NativePair, Probe;
 
-/// Leaf `Number.isSafeInteger`: no coercion, every argument answers.
-pub const STUB_NUMBER_IS_SAFE_INTEGER_LEAF: RuntimeStubDescriptor = descriptor(
-    123,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Ordinary object allocation from an empty boxed-value span. The native
+    /// frame publishes roots; success returns the object without a destination.
+    STUB_JIT_NEW_OBJECT = 22 => "jit_new_object",
+        Alloc, ReentrantValueSpan, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Committed;
 
-/// Leaf `Array.isArray`; a Proxy misses.
-pub const STUB_ARRAY_IS_ARRAY_LEAF: RuntimeStubDescriptor = descriptor(
-    124,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Array literal allocation from boxed values, copied before collection.
+    /// The span preserves holes and never denotes interpreter register indices.
+    STUB_JIT_NEW_ARRAY = 23 => "jit_new_array",
+        Alloc, ReentrantValueSpan, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Committed;
 
-/// Leaf `Object.getPrototypeOf` of an ordinary object; anything else misses.
-pub const STUB_OBJECT_GET_PROTOTYPE_OF_LEAF: RuntimeStubDescriptor = descriptor(
-    125,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// `CreateContext` allocation: `(parent, function id, scope index)` as boxed
+    /// words (the ids as int32 values). Fully initializes the context — scope
+    /// identity, parent, and every slot as the hole or `undefined` per its scope
+    /// descriptor — before returning it; the parent rides as a rooted stub
+    /// argument. Heap refusal is reported through the status pair; the entry
+    /// never raises a JavaScript exception.
+    STUB_CREATE_CONTEXT_ALLOC = 24 => "create_context_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(false, false),
+        Never, NativePair, Probe;
 
-/// Leaf `Number(value)` call of a non-string primitive; anything else misses.
-pub const STUB_NUMBER_CALL_LEAF: RuntimeStubDescriptor = descriptor(
-    126,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Generational and insertion write barrier for one pointer store.
+    ///
+    /// Generated code runs both halves inline and reaches this only when a marking
+    /// cycle is in progress or the store really creates an unrecorded old->young
+    /// edge. It therefore takes the parent's header address and the stored value
+    /// directly: no register window, no published frame, no reentry.
+    STUB_WRITE_BARRIER = 25 => "write_barrier",
+        LeafNoAlloc, MutatingLeafValue2, 2, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Probe;
 
-/// Allocating rest parameter: an Array of the current frame's actual
-/// arguments from the int32 formal count on. A malformed count misses before
-/// allocation; heap refusal is reported through the status pair.
-pub const STUB_REST_ARRAY_ALLOC: RuntimeStubDescriptor = descriptor(
-    127,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(false, false),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// `CopyContext` allocation (§14.7.4.4 CreatePerIterationEnvironment):
+    /// `(source, _, _)` as boxed words. Returns a context with the source's scope
+    /// identity, parent, and slot values; the source rides as a rooted stub
+    /// argument and is re-read after the allocation. Heap refusal is reported
+    /// through the status pair.
+    STUB_COPY_CONTEXT_ALLOC = 26 => "copy_context_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(false, false),
+        Never, NativePair, Probe;
 
-/// Record the callable a baseline call site called while its feedback was
-/// empty: the site's execution count word, the boxed callee and its receiver
-/// (`undefined` for a plain call; a method call's receiver names the function
-/// a `%Function.prototype.call%` method calls). It neither
-/// allocates nor runs JavaScript, and always reports success; it is entered
-/// through the ordinary runtime transition.
-pub const STUB_JIT_RECORD_CALL_TARGET: RuntimeStubDescriptor = descriptor(
-    128,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::Variadic,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::StatusWord,
-    NativeResultDomain::None,
-);
+    /// Leaf §7.2.15 IsStrictlyEqual probe over two raw operand words: never
+    /// throws, never allocates; a null heap reports a miss so probe harnesses
+    /// without a live isolate fall back to normal dispatch.
+    STUB_STRICT_EQ_LEAF = 27 => "strict_eq_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
 
-/// Allocation of an object whose `[[Prototype]]` is `null` (an object
-/// literal opening with `__proto__: null`) from an empty boxed-value span.
-/// The native frame publishes roots; success returns the object.
-pub const STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT: RuntimeStubDescriptor = descriptor(
-    129,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::ReentrantValueSpan,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::allocating(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
+    /// Completes one full loose-equality opcode in the VM; object-to-primitive
+    /// coercion may re-enter JS.
+    STUB_JIT_LOOSE_EQ = 28 => "jit_loose_eq",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
 
-/// Allocating `ToString` of a Number: its cached decimal string, converted
-/// and cached on a miss.
-pub const STUB_NUMBER_TO_STRING_ALLOC: RuntimeStubDescriptor = descriptor(
-    130,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::AllocValue3,
-    3,
-    RuntimeStubEffects::allocating(true, false),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Leaf §7.1.2 ToBoolean probe over one raw operand word (the second
+    /// argument is ignored): never throws, never allocates; total for every
+    /// value including heap cells, so it never misses on a live isolate.
+    STUB_TO_BOOLEAN_LEAF = 29 => "to_boolean_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
 
-/// `receiver.exec(subject)` of the realm's original RegExp method, its
-/// identity proved by generated code, run in the isolate without a frame:
-/// `(vm_thread, receiver, subject)`. Success carries the method's result
-/// (the match array carved from the ready nursery buffer, or `null`); a miss
-/// precedes every effect and leaves the call to [`STUB_JIT_REGEXP_EXEC`].
-pub const STUB_REGEXP_EXEC_LEAF: RuntimeStubDescriptor = descriptor(
-    131,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::IsolateLeafValue2,
-    2,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Leaf numeric remainder over two raw operand words already known to be
+    /// numbers: full f64 remainder semantics (sign of the dividend, NaN for a
+    /// zero divisor), boxed without allocation.
+    STUB_NUMBER_REM_LEAF = 30 => "number_rem_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
 
-/// `%RegExp.prototype.test%` counterpart of [`STUB_REGEXP_EXEC_LEAF`]: the
-/// receiver's protocol must be the built-in one, since `test` reads `exec`.
-pub const STUB_REGEXP_TEST_LEAF: RuntimeStubDescriptor = descriptor(
-    132,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::IsolateLeafValue2,
-    2,
-    RuntimeStubEffects::leaf(false, true),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Materializes a regex literal from the constant pool; allocates the
+    /// RegExp body and may compile the pattern.
+    STUB_JIT_LOAD_REGEXP = 31 => "jit_load_regexp",
+        Alloc, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::allocating(true, true),
+        Status, StatusWord, None;
 
-/// The RegExp of the regex literal at constant-pool index `value0` of the
-/// chunk owning function `value1`: `(jit_ctx, constant, function) -> value`,
-/// the miss of a generated literal birth.
-pub const STUB_JIT_REGEXP_LITERAL: RuntimeStubDescriptor = descriptor(
-    133,
-    RuntimeStubClass::Alloc,
-    RuntimeStubSignature::CommittedValue2,
-    2,
-    RuntimeStubEffects::allocating(true, true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
+    /// Completes one coercive `ToPrimitive` or `ToNumeric` opcode; user conversion
+    /// hooks may allocate, throw, and re-enter arbitrary JS.
+    STUB_JIT_COERCE_UNARY = 32 => "jit_coerce_unary",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
 
-/// A call of the static native body of the callee in `values[0]` with the
-/// receiver in `values[1]` and the rest as arguments, run without the native
-/// call trampoline's frame: `(jit_ctx, values, count) -> value`. Generated
-/// code proved the callee a native function of the static entry kind; its
-/// body may run JavaScript.
-pub const STUB_JIT_STATIC_NATIVE_CALL: RuntimeStubDescriptor = descriptor(
-    134,
-    RuntimeStubClass::Reentrant,
-    RuntimeStubSignature::ReentrantValueSpan,
-    VARIADIC_STUB_ARGUMENTS,
-    RuntimeStubEffects::reentrant(true),
-    RuntimeStubException::Status,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Committed,
-);
+    /// Completes one numeric, bitwise, update, or relational opcode in the VM.
+    /// The shared family is conservatively reentrant because `Increment` may run
+    /// user conversion hooks and BigInt results may allocate.
+    STUB_JIT_NUMERIC_OP = 33 => "jit_numeric_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
 
-/// Leaf `Object.is`: §7.2.11 SameValue, every argument pair answers.
-pub const STUB_OBJECT_IS_LEAF: RuntimeStubDescriptor = descriptor(
-    135,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Completes structured exception-region state changes, abrupt unwinds, and
+    /// TDZ `ReferenceError` materialization.
+    STUB_JIT_EXCEPTION_OP = 34 => "jit_exception_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, ExceptionTransition;
 
-/// Leaf `String.prototype.charAt` at an int32 index: a one-unit Latin-1 or
-/// empty result is the heap's shared string; any other unit misses.
-pub const STUB_STRING_CHAR_AT_LEAF: RuntimeStubDescriptor = descriptor(
-    136,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Completes iterator stepping, iterator close, and closer-registry state
+    /// through the VM's full iterator semantics.
+    STUB_JIT_ITERATOR_OP = 35 => "jit_iterator_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
 
-/// Leaf `String.fromCharCode` of one int32 code whose unit is Latin-1: the
-/// heap's shared one-unit string; any other code misses.
-pub const STUB_STRING_FROM_CHAR_CODE_LEAF: RuntimeStubDescriptor = descriptor(
-    137,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Completes `Function.prototype.bind` — accessor `name`/`length` getters and
+    /// bound-function allocation — through the VM's full bind semantics.
+    STUB_JIT_BIND_FUNCTION = 36 => "jit_bind_function",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
 
-/// Leaf `Array.prototype.indexOf` of one value over a hole-free plain dense
-/// array; anything else misses.
-pub const STUB_ARRAY_INDEX_OF_LEAF: RuntimeStubDescriptor = descriptor(
-    138,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Complete the explicit object operation from two boxed values and its
+    /// checked scalar operation word. Published source/root records retain GC
+    /// and reconstruction ownership; Proxy traps, coercions and `@@hasInstance`
+    /// commit exactly once.
+    STUB_JIT_OBJECT_PROTOCOL_VALUE = 37 => "jit_object_protocol_value",
+        Reentrant, ContextWords, 3, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
 
-/// Leaf `Array.prototype.includes` of one value over a hole-free plain dense
-/// array; anything else misses.
-pub const STUB_ARRAY_INCLUDES_LEAF: RuntimeStubDescriptor = descriptor(
-    139,
-    RuntimeStubClass::LeafNoAlloc,
-    RuntimeStubSignature::LeafValue2,
-    2,
-    RuntimeStubEffects::none(),
-    RuntimeStubException::Never,
-    RuntimeStubResultAbi::NativePair,
-    NativeResultDomain::Probe,
-);
+    /// Completes `delete` (`DeleteProperty`, `DeleteElement`, `DeleteDynamic`) —
+    /// including the Proxy `deleteProperty` trap and unqualified delete — through
+    /// the VM's delete drivers and fast paths.
+    STUB_JIT_DELETE_OP = 38 => "jit_delete_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
 
-/// Dense inventory of every current machine-callable runtime-stub contract.
-pub const RUNTIME_STUB_DESCRIPTORS: &[RuntimeStubDescriptor] = &[
-    STUB_JIT_BACKEDGE_POLL,
-    STUB_COLLECTION_MAP_GET_LEAF,
-    STUB_COLLECTION_MAP_HAS_LEAF,
-    STUB_COLLECTION_SET_HAS_LEAF,
-    STUB_COLLECTION_MAP_SET_ALLOC,
-    STUB_COLLECTION_SET_ADD_ALLOC,
-    STUB_COLLECTION_MAP_GET_ALLOC,
-    STUB_COLLECTION_MAP_HAS_ALLOC,
-    STUB_COLLECTION_SET_HAS_ALLOC,
-    STUB_COLLECTION_MAP_DELETE_ALLOC,
-    STUB_COLLECTION_SET_DELETE_ALLOC,
-    STUB_STRING_CONCAT_ALLOC,
-    STUB_JIT_ADD,
-    STUB_JIT_LOAD_ELEMENT,
-    STUB_JIT_STORE_ELEMENT,
-    STUB_JIT_DEFINE_OWN_PROPERTY,
-    STUB_JIT_LOAD_PROPERTY,
-    STUB_JIT_STORE_PROPERTY,
-    STUB_JIT_DEFINE_DATA_PROPERTY,
-    STUB_JIT_MAKE_FN,
-    STUB_JIT_MAKE_CLOSURE,
-    STUB_JIT_NEW_OBJECT,
-    STUB_JIT_NEW_ARRAY,
-    STUB_CREATE_CONTEXT_ALLOC,
-    STUB_WRITE_BARRIER,
-    STUB_COPY_CONTEXT_ALLOC,
-    STUB_STRICT_EQ_LEAF,
-    STUB_JIT_LOOSE_EQ,
-    STUB_TO_BOOLEAN_LEAF,
-    STUB_NUMBER_REM_LEAF,
-    STUB_JIT_LOAD_REGEXP,
-    STUB_JIT_COERCE_UNARY,
-    STUB_JIT_NUMERIC_OP,
-    STUB_JIT_EXCEPTION_OP,
-    STUB_JIT_ITERATOR_OP,
-    STUB_JIT_BIND_FUNCTION,
-    STUB_JIT_OBJECT_PROTOCOL_VALUE,
-    STUB_JIT_DELETE_OP,
-    STUB_JIT_SCALAR_VALUE,
-    STUB_JIT_SUPER_OP,
-    STUB_JIT_PRIVATE_OP,
-    STUB_JIT_VALUE_LOAD_OP,
-    STUB_JIT_CONSTRUCT_OP,
-    STUB_JIT_STRUCTURAL_OP,
-    STUB_JIT_CLASS_OP,
-    STUB_JIT_STATIC_CALL_OP,
-    STUB_JIT_CLASS_VALUE_OP,
-    STUB_JIT_MODULE_OP,
-    STUB_JIT_FINISH_ERROR,
-    STUB_JIT_DEOPT_WRITEBACK,
-    STUB_JIT_DEOPT_CALL,
-    STUB_STRING_CHAR_CODE_AT_LEAF,
-    STUB_STRING_CODE_POINT_AT_LEAF,
-    STUB_STRING_INDEX_OF_LEAF,
-    STUB_STRING_INCLUDES_LEAF,
-    STUB_STRING_STARTS_WITH_LEAF,
-    STUB_STRING_ENDS_WITH_LEAF,
-    STUB_ARRAY_POP_LEAF,
-    STUB_ARRAY_PUSH_LEAF,
-    STUB_ARRAY_SHIFT_LEAF,
-    STUB_ARRAY_UNSHIFT_ALLOC,
-    STUB_MATH_ABS_LEAF,
-    STUB_MATH_FLOOR_LEAF,
-    STUB_MATH_SQRT_LEAF,
-    STUB_MATH_MAX_LEAF,
-    STUB_MATH_MIN_LEAF,
-    STUB_COLLECTION_MAP_SET_MUTATING,
-    STUB_NUMBER_REM_F64_LEAF,
-    STUB_NUMBER_POW_F64_LEAF,
-    STUB_NUMBER_TO_INT32_F64_LEAF,
-    STUB_JIT_PREPARE_ACTIVATION,
-    STUB_JIT_DERIVED_CONSTRUCT_RESULT,
-    STUB_JIT_CLASS_SUPER_CONSTRUCTOR,
-    STUB_JIT_PROMOTE_ENTERED,
-    STUB_PARSE_INT_I32_LEAF,
-    STUB_ARRAY_CONSTRUCT_ALLOC,
-    STUB_JIT_ROUTE_THROW,
-    STUB_JIT_BINDING_VALUE,
-    STUB_JIT_GLOBAL_DECLARATION_VALUE,
-    STUB_JIT_COLLECT_ARGUMENTS,
-    STUB_JIT_NEW_OBJECT_LITERAL,
-    STUB_TYPEOF_TEST_LEAF,
-    STUB_JIT_CALL,
-    STUB_JIT_STAGE_SPREAD,
-    STUB_JIT_STAGE_FORWARD,
-    STUB_JIT_RESOLVE_METHOD,
-    STUB_JIT_CALL_GENERIC,
-    STUB_JIT_CALL_OVERFLOW,
-    STUB_JIT_STAGE_TAIL_CALL,
-    STUB_ELEMENT_WRITE_BARRIER,
-    STUB_JIT_CONSTRUCTOR_TERMINAL,
-    STUB_ALLOC_GROUP_ENSURE,
-    STUB_PRIMITIVE_STRING_ORDER,
-    STUB_JIT_CALL_NATIVE,
-    STUB_CONSTRUCTOR_RECEIVER_PROBE,
-    STUB_CONSTRUCTOR_RECEIVER_COMMIT,
-    STUB_BIGINT_BINARY_ALLOC,
-    STUB_INSTANCEOF_LEAF,
-    STUB_STRING_KEY_ATOM_LEAF,
-    STUB_KEYED_NAMED_LOAD_LEAF,
-    STUB_ARRAY_PUSH_ALLOC,
-    STUB_MATH_SIN_LEAF,
-    STUB_MATH_COS_LEAF,
-    STUB_MATH_TAN_LEAF,
-    STUB_MATH_ATAN_LEAF,
-    STUB_MATH_EXP_LEAF,
-    STUB_MATH_LOG_LEAF,
-    STUB_MATH_CEIL_LEAF,
-    STUB_MATH_ROUND_LEAF,
-    STUB_MATH_TRUNC_LEAF,
-    STUB_MATH_ATAN2_LEAF,
-    STUB_MATH_POW_LEAF,
-    STUB_FIELD_TYPE_OBSERVE,
-    STUB_SHAPE_LEFT,
-    STUB_JIT_REGEXP_EXEC,
-    STUB_JIT_REGEXP_TEST,
-    STUB_CONTEXT_SLOT_WRITTEN,
-    STUB_MATH_F64_LEAF,
-    STUB_JIT_STRING_METHOD,
-    STUB_NUMBER_IS_NAN_LEAF,
-    STUB_NUMBER_IS_FINITE_LEAF,
-    STUB_NUMBER_IS_INTEGER_LEAF,
-    STUB_NUMBER_IS_SAFE_INTEGER_LEAF,
-    STUB_ARRAY_IS_ARRAY_LEAF,
-    STUB_OBJECT_GET_PROTOTYPE_OF_LEAF,
-    STUB_NUMBER_CALL_LEAF,
-    STUB_REST_ARRAY_ALLOC,
-    STUB_JIT_RECORD_CALL_TARGET,
-    STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT,
-    STUB_NUMBER_TO_STRING_ALLOC,
-    STUB_REGEXP_EXEC_LEAF,
-    STUB_REGEXP_TEST_LEAF,
-    STUB_JIT_REGEXP_LITERAL,
-    STUB_JIT_STATIC_NATIVE_CALL,
-    STUB_OBJECT_IS_LEAF,
-    STUB_STRING_CHAR_AT_LEAF,
-    STUB_STRING_FROM_CHAR_CODE_LEAF,
-    STUB_ARRAY_INDEX_OF_LEAF,
-    STUB_ARRAY_INCLUDES_LEAF,
-];
+    /// Complete the exact published scalar value operation from two boxed values.
+    /// Function/PC identity selects the typed coercion/query or derived-`this`
+    /// bind; a result register is committed by generated code only after the
+    /// returned `Ok(value)`.
+    STUB_JIT_SCALAR_VALUE = 39 => "jit_scalar_value",
+        Reentrant, CommittedValue2, 2, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// Completes `super` property reads and writes (`LoadSuperProperty`,
+    /// `LoadSuperElement`, `SetSuperProperty`, `SetSuperElement`) — including home-
+    /// prototype accessor getters/setters — through the VM's super helpers.
+    STUB_JIT_SUPER_OP = 40 => "jit_super_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
+
+    /// Completes private-member access (`PrivateGet`, `PrivateSet`,
+    /// `PrivateBrandCheck`) — including private accessor getters/setters — through
+    /// the VM's private-element helpers.
+    STUB_JIT_PRIVATE_OP = 41 => "jit_private_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
+
+    /// Completes static value loads (`SymbolLoad`, `TemporalLoad`,
+    /// `GetStringIndex`) through the VM's load helpers.
+    STUB_JIT_VALUE_LOAD_OP = 42 => "jit_value_load_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
+
+    /// Completes allocating construction opcodes (`CollectRest`, `ArrayPush`) through the VM's construction helpers.
+    STUB_JIT_CONSTRUCT_OP = 43 => "jit_construct_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
+
+    /// Completes structural object opcodes (`ForInKeys`, `CopyDataProperties`)
+    /// through the VM's structural helpers.
+    STUB_JIT_STRUCTURAL_OP = 44 => "jit_structural_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
+
+    /// Completes class-construction opcodes (`ClassCheck`, `SetFunctionName`)
+    /// through the VM's class helpers.
+    STUB_JIT_CLASS_OP = 45 => "jit_class_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
+
+    /// Completes static intrinsic-call opcodes (`ArrayBufferCall`,
+    /// `SharedArrayBufferCall`, `BigIntCall`, `DataViewCall`) through the VM's
+    /// static-call helpers, rebuilding their method-id operand layout.
+    STUB_JIT_STATIC_CALL_OP = 46 => "jit_static_call_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
+
+    /// Completes class creation, dynamic source evaluation, private-name/template
+    /// materialization, eval identity, and full `ToNumber` coercion through shared
+    /// VM helpers.
+    STUB_JIT_CLASS_VALUE_OP = 47 => "jit_class_value_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
+
+    /// Completes synchronous static-module namespace/binding operations,
+    /// star re-export, module-record marking, and `import.meta.resolve` through
+    /// shared VM helpers. Promise-producing module operations remain side exits.
+    STUB_JIT_MODULE_OP = 48 => "jit_module_op",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
+
+    /// Normalize one parked runtime error at the compiled frame's canonical final
+    /// abrupt-completion boundary. Catchable failures become pure exception values; a
+    /// materialized local handler produces an exact-PC Bail; structural failures
+    /// remain parked and produce Fatal. This boundary is never called between two
+    /// compiled frames.
+    STUB_JIT_FINISH_ERROR = 49 => "jit_finish_error",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Compiled;
+
+    /// Rebuild every interpreter frame a deopt exit owes, from deopt metadata.
+    ///
+    /// A generated exit site selects a code-owned recipe and calls this with the
+    /// baked [`crate::deopt::DeoptRuntime`], the frame's canonical slot base, its
+    /// register window and the register dump its shared handler saved (null when
+    /// the recipe names no register). Physical recipes read homes, constants or
+    /// dumped registers; the entry accepts context, exit index, recipe address,
+    /// canonical slot base, destination window and register dump.
+    /// The stub reconstitutes every slot of every owed frame from that recipe.
+    ///
+    /// An exit owing only the compiled function's own frame writes it into the
+    /// published window and reports a bail. An exit owing a chain of spliced
+    /// frames restores the physical outer frame and prepares owned descendant
+    /// inputs, then switches the physical frame to interpreter ownership, dropping
+    /// its machine-root publication. Its generated entry resumes that chain only
+    /// after Rust preparation returns and reports the outermost completion.
+    STUB_JIT_DEOPT_WRITEBACK = 50 => "jit_deopt_rebuild_frames",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Compiled;
+
+    /// Generated deopt continuation over the context's published callee.
+    ///
+    /// One typed side-exit word selects the exact resume PC. Rust preparation
+    /// returns before assembly resumes JavaScript on the same Frame. Sources,
+    /// generations and constructor mode come from the published chain and recipes.
+    STUB_JIT_DEOPT_CALL = 51 => "jit_deopt_call",
+        Reentrant, ContextWords, 1, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// Leaf `String.prototype.charCodeAt` over a string receiver and an integral
+    /// index: walks the body to one code unit, boxed without allocation. Misses
+    /// (non-string receiver, non-integral or out-of-range index) report
+    /// `SideExit` in the shared native pair so the caller falls back to the
+    /// general method path.
+    STUB_STRING_CHAR_CODE_AT_LEAF = 52 => "string_char_code_at_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `String.prototype.codePointAt` over a string receiver and an integral
+    /// index. Misses on a non-string receiver, a non-integral or out-of-range
+    /// index, so the general path owns coercion and the `undefined` result.
+    STUB_STRING_CODE_POINT_AT_LEAF = 53 => "string_code_point_at_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `String.prototype.indexOf` over two string operands, searching from
+    /// index zero. Misses when either operand is not a string.
+    STUB_STRING_INDEX_OF_LEAF = 54 => "string_index_of_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `String.prototype.includes` over two string operands, searching from
+    /// index zero. Misses when either operand is not a string.
+    STUB_STRING_INCLUDES_LEAF = 55 => "string_includes_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `String.prototype.startsWith` over two string operands, anchored at
+    /// index zero. Misses when either operand is not a string.
+    STUB_STRING_STARTS_WITH_LEAF = 56 => "string_starts_with_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `String.prototype.endsWith` over two string operands, anchored at the
+    /// receiver's end. Misses when either operand is not a string.
+    STUB_STRING_ENDS_WITH_LEAF = 57 => "string_ends_with_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf dense-array `Array.prototype.pop` mutation.
+    ///
+    /// Truncating the dense buffer drops a reference and rewrites the cached
+    /// length pair; neither allocates. The entry re-checks the dense
+    /// preconditions the inline guard cannot see (writable `length`, a present
+    /// own last element, no accessor override in range) and reports a miss when
+    /// they fail, so the call site falls through to ordinary dispatch.
+    STUB_ARRAY_POP_LEAF = 58 => "array_pop_leaf",
+        LeafNoAlloc, MutatingLeafValue2, 2, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Probe;
+
+    /// Leaf dense-array `Array.prototype.push` mutation.
+    ///
+    /// Appends into the dense buffer's existing capacity and never grows it, so
+    /// it neither allocates nor collects. `push` creates a new index, which the
+    /// spec resolves through the prototype chain: the caller must prove the
+    /// array-index accessor protector intact before the call (see
+    /// [`crate::runtime_stubs::LeafEntryShape::array_index_protector`]). The entry
+    /// re-checks the dense preconditions and misses on a full buffer.
+    STUB_ARRAY_PUSH_LEAF = 59 => "array_push_leaf",
+        LeafNoAlloc, MutatingLeafValue2, 2, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Probe;
+
+    /// Leaf dense-array `Array.prototype.shift` mutation.
+    ///
+    /// Sliding the element buffer down drops one reference and rewrites the cached
+    /// length pair without allocating. Like the `pop` entry it re-checks the dense
+    /// preconditions and misses instead of falling back internally.
+    STUB_ARRAY_SHIFT_LEAF = 60 => "array_shift_leaf",
+        LeafNoAlloc, MutatingLeafValue2, 2, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Probe;
+
+    /// Allocating dense-array `Array.prototype.unshift` mutation.
+    ///
+    /// Inserting at the head may grow the dense buffer, so the site publishes a
+    /// precise safepoint exactly like the `push` entry.
+    STUB_ARRAY_UNSHIFT_ALLOC = 61 => "array_unshift_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(false, true),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.abs`.
+    ///
+    /// A numeric builtin reached through a declared entry rather than a
+    /// per-builtin machine-code body. Adding a sibling is a declaration plus its
+    /// entry; it costs no generated code.
+    STUB_MATH_ABS_LEAF = 62 => "math_abs_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.floor`.
+    STUB_MATH_FLOOR_LEAF = 63 => "math_floor_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.sqrt`.
+    STUB_MATH_SQRT_LEAF = 64 => "math_sqrt_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.max` over exactly two arguments.
+    ///
+    /// The variadic and zero/one-argument forms keep the ordinary call path; the
+    /// declared arity is what makes a site eligible for this entry.
+    STUB_MATH_MAX_LEAF = 65 => "math_max_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.min` over exactly two arguments.
+    STUB_MATH_MIN_LEAF = 66 => "math_min_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf in-place `Map.prototype.set` over a key the map already holds.
+    ///
+    /// Overwriting an existing entry rewrites one slot and runs its write
+    /// barrier; nothing allocates, so the site owes no safepoint and no rooting
+    /// packet. A key the map does not hold appends and may grow the table, so the
+    /// entry misses and the allocating sibling completes the call.
+    STUB_COLLECTION_MAP_SET_MUTATING = 67 => "collection_map_set_mutating",
+        LeafNoAlloc, MutatingLeafValue3, 3, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Probe;
+
+    /// Pure unboxed Number remainder for typed numeric machine code.
+    STUB_NUMBER_REM_F64_LEAF = 68 => "number_rem_f64_leaf",
+        LeafNoAlloc, Float64Leaf2, 2, RuntimeStubEffects::none(),
+        Never, Float64, None;
+
+    /// Pure unboxed ECMAScript Number exponentiation for typed numeric machine code.
+    STUB_NUMBER_POW_F64_LEAF = 69 => "number_pow_f64_leaf",
+        LeafNoAlloc, Float64Leaf2, 2, RuntimeStubEffects::none(),
+        Never, Float64, None;
+
+    /// Pure ECMAScript ToInt32 conversion for typed numeric machine code.
+    STUB_NUMBER_TO_INT32_F64_LEAF = 70 => "number_to_int32_f64_leaf",
+        LeafNoAlloc, Float64ToWordLeaf1, 1, RuntimeStubEffects::none(),
+        Never, ValueWord, None;
+
+    /// Bind the published record's receiver before its body runs: convert a
+    /// sloppy receiver, or create a base constructor's receiver
+    /// (`OrdinaryCreateFromConstructor` over the record's `new.target`).
+    STUB_JIT_PREPARE_ACTIVATION = 71 => "jit_prepare_activation",
+        Reentrant, ExecutionEntry0, 0, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Execution;
+
+    /// Derived-constructor completion of a non-object `result` against the
+    /// published record's `this` binding.
+    STUB_JIT_DERIVED_CONSTRUCT_RESULT = 72 => "jit_derived_construct_result",
+        Reentrant, ContextWords, 1, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// Read the live superclass constructor from an exact class wrapper.
+    STUB_JIT_CLASS_SUPER_CONSTRUCTOR = 73 => "jit_class_super_constructor",
+        LeafNoAlloc, Variadic, 1, RuntimeStubEffects::none(),
+        Never, ValueWord, None;
+
+    /// Ask the cold optimizing policy to promote the function of the published
+    /// record, whose canonical source-work target was reached before this entry.
+    /// Compilation runs no JavaScript; the record keeps its generation.
+    STUB_JIT_PROMOTE_ENTERED = 74 => "jit_promote_entered",
+        Reentrant, ExecutionEntry0, 0, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Execution;
+
+    /// Leaf `parseInt(value)` for one exact int32-tagged argument.
+    ///
+    /// Other argument representations and all non-one-argument JavaScript call
+    /// shapes retain the canonical coercing parser before any observable effect.
+    STUB_PARSE_INT_I32_LEAF = 75 => "parse_int_i32_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Allocating `Array(length)` specialization for one exact nonnegative int32.
+    ///
+    /// Invalid tags and negative lengths miss before allocation so the generated
+    /// caller can resume the canonical constructor at its exact pre-operation
+    /// frame. Heap refusal is reported separately through the status pair; this
+    /// entry never constructs or parks a JavaScript exception.
+    STUB_ARRAY_CONSTRUCT_ALLOC = 76 => "array_construct_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(false, false),
+        Never, NativePair, Probe;
+
+    /// Route one pure exception value into the current activation.
+    ///
+    /// A handled materialized throw publishes the catch/finally PC and reports a
+    /// same-frame side exit. An unhandled or stack-owned throw returns the same
+    /// exception payload with `Throw`; it is never staged between compiled frames.
+    STUB_JIT_ROUTE_THROW = 77 => "jit_route_throw",
+        Reentrant, RouteThrow1, 1, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Compiled;
+
+    /// Complete the exact published schema-owned binding operation from two boxed
+    /// values. Function/PC identity selects the semantic family and operand roles
+    /// through `otter_bytecode::opcode_schema::BindingSemantics`; a result
+    /// register is committed by generated code only after the returned `Ok`.
+    STUB_JIT_BINDING_VALUE = 78 => "jit_binding_value",
+        Reentrant, CommittedValue2, 2, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// Complete the exact published schema-owned global declaration or
+    /// initialization from two boxed values. Declarations remain a separate
+    /// semantic family even though they share the committed physical ABI.
+    STUB_JIT_GLOBAL_DECLARATION_VALUE = 79 => "jit_global_declaration_value",
+        Reentrant, CommittedValue2, 2, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// Build the activation's `arguments` object into one destination register.
+    /// A stack-owned frame supplies the actual arguments its generated caller
+    /// published after the register window; a materialized activation supplies
+    /// them from its cold record. Allocating, never reentrant.
+    STUB_JIT_COLLECT_ARGUMENTS = 80 => "jit_collect_arguments",
+        Alloc, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::allocating(true, false),
+        Status, StatusWord, None;
+
+    /// Static-key object literal allocation (`Op::NewObjectLiteral`) from boxed
+    /// values copied before collection; the published instruction names the keys.
+    STUB_JIT_NEW_OBJECT_LITERAL = 81 => "jit_new_object_literal",
+        Alloc, ReentrantValueSpan, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Committed;
+
+    /// Leaf `typeof x === kind` test over one raw operand word and an
+    /// `Op::TestTypeOf` immediate: never throws, never allocates; total for
+    /// every value, so it never misses on a live isolate.
+    STUB_TYPEOF_TEST_LEAF = 82 => "typeof_test_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Enter the common call trampoline for the request the generated caller
+    /// wrote into its context: callee, receiver, `new.target`, flags and the actual
+    /// span. The trampoline classifies the callee, owns the callee activation and
+    /// returns its completion.
+    STUB_JIT_CALL = 83 => "jit_call",
+        Reentrant, ExecutionEntry0, 0, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Execution;
+
+    /// Stage a compiler-created dense spread array's elements as the actual span
+    /// of the context's pending call request. Reads only; the span stays valid
+    /// until the trampoline copies it.
+    STUB_JIT_STAGE_SPREAD = 84 => "jit_stage_spread",
+        Reentrant, ContextWords, 1, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// Stage the complete pending call request of a forwarding site from one
+    /// boxed-value span: the resolved `apply` value, the callee, the receiver and
+    /// the current argument-binding values. The intrinsic `apply` forwards the
+    /// activation's actual arguments; any other method receives the arguments
+    /// object. No JavaScript runs except materialization accessors.
+    STUB_JIT_STAGE_FORWARD = 85 => "jit_stage_forward",
+        Reentrant, ReentrantValueSpan, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// Resolve the callable of the exact published `CallMethodValue` from its
+    /// receiver span, through the shared method caches, and record call feedback.
+    /// The generated caller then enters the call trampoline with that callable.
+    STUB_JIT_RESOLVE_METHOD = 86 => "jit_resolve_method",
+        Reentrant, ReentrantValueSpan, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// Generic entry of the JavaScript call ABI: classify any callee through the
+    /// call trampoline and complete the call. Also the entry of every
+    /// interpreter destination.
+    STUB_JIT_CALL_GENERIC = 87 => "jit_call_generic",
+        Reentrant, JsCall, 4, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Execution;
+
+    /// Park the stack-overflow `RangeError` for a call entry that found no room
+    /// for its frame, before publishing anything.
+    STUB_JIT_CALL_OVERFLOW = 88 => "jit_call_overflow",
+        Reentrant, ExecutionEntry0, 0, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Execution;
+
+    /// Stage a §15.10.3 tail call from one boxed-value span — the callee, then
+    /// its actual arguments — as the context's pending request. The staging
+    /// activation then retires its record and returns `Continue`; its caller
+    /// enters the request in its place. Reads only.
+    STUB_JIT_STAGE_TAIL_CALL = 89 => "jit_stage_tail_call",
+        Reentrant, ReentrantValueSpan, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// Barrier for one tagged element store generated code wrote into an
+    /// ordinary array's slab: `(element base, index, value)`. Reached only for a
+    /// heap-cell value while marking or when the value is young; marks the slot
+    /// dirty and remembers the slab.
+    STUB_ELEMENT_WRITE_BARRIER = 90 => "element_write_barrier",
+        LeafNoAlloc, MutatingLeafValue3, 3, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Probe;
+
+    /// Terminal construction sampling/transfer over the canonical frame roots.
+    /// `(jit_ctx, pair_ptr)` copies and returns the sole parked compiled pair;
+    /// no allocation, JavaScript, shape preparation or status reconstruction.
+    STUB_JIT_CONSTRUCTOR_TERMINAL = 91 => "jit_constructor_terminal",
+        LeafNoAlloc, ContextWords, 1, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Compiled;
+
+    /// Ensure bytes for a fixed allocation group in the canonical LAB.
+    /// The boxed int32 byte count and two undefined padding operands accompany the
+    /// actual current safepoint. Success carries undefined; Miss/OOM restore homes
+    /// and resume the first original allocation. No source effect or OOM latch is
+    /// committed by this speculative reservation boundary.
+    STUB_ALLOC_GROUP_ENSURE = 92 => "alloc_group_ensure",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(false, false),
+        Never, NativePair, Probe;
+
+    /// Pure ordering of Number/String primitive operands. Two Strings compare
+    /// UTF-16 units; a mixed pair uses canonical StringNumericLiteral conversion.
+    /// Success carries -1/0/1 or 2 (unordered NaN). Other types miss before effects.
+    STUB_PRIMITIVE_STRING_ORDER = 93 => "primitive_string_order",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Private JS entry for a proved NativeFunction kind. The canonical pending
+    /// request and Host Native kernel own actual roots, live policy and completion.
+    STUB_JIT_CALL_NATIVE = 94 => "jit_call_native",
+        Reentrant, JsCall, 4, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Execution;
+
+    /// Pure actual-new.target family admission: `(heap, new.target, boxed baseFID)`.
+    /// Success is a boxed int32 layout offset; unsupported/unprepared owners Miss.
+    STUB_CONSTRUCTOR_RECEIVER_PROBE = 95 => "constructor_receiver_probe",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Complete source feedback after a generated receiver/ticket is published.
+    /// `(jit_ctx, receiver)` is the existing two-word ContextWords physical ABI.
+    /// Only Success/Fatal can leave this noalloc committed extent.
+    STUB_CONSTRUCTOR_RECEIVER_COMMIT = 96 => "constructor_receiver_commit",
+        LeafNoAlloc, ContextWords, 1, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Committed;
+
+    /// Allocating BigInt binary operator over two BigInt operands and an
+    /// operator code; every other input and every operator failure misses.
+    STUB_BIGINT_BINARY_ALLOC = 97 => "bigint_binary_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Probe;
+
+    /// Leaf §13.10.2 InstanceofOperator for a native-function target, over two
+    /// raw operand words. Answers only what needs no JavaScript: a target whose
+    /// `@@hasInstance` is `%Function.prototype%`'s immutable one and whose own
+    /// `prototype` is an object, against a primitive or an ordinary object
+    /// whose chain holds only ordinary objects. Everything else misses.
+    STUB_INSTANCEOF_LEAF = 98 => "instanceof_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `TryInternalizeString` for a keyed access: the interned atom of a
+    /// flat string key's content, read through the name interner the heap owns
+    /// (the second argument is ignored). Never allocates; a rope, a lone
+    /// surrogate or content no property key ever named misses.
+    STUB_STRING_KEY_ATOM_LEAF = 99 => "string_key_atom_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf keyed `[[Get]]` of an interned string key on a dictionary-mode
+    /// object that own data answers along its prototype chain: `(heap, receiver,
+    /// key)`, the key carrying its recorded atom. Never allocates; a shaped
+    /// receiver, an accessor, an opaque object or an unrecorded key misses.
+    STUB_KEYED_NAMED_LOAD_LEAF = 100 => "keyed_named_load_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Allocating dense-array `Array.prototype.push`: the entry a guarded push
+    /// site calls when the in-place leaf found the dense storage full, so the
+    /// growth publishes a precise safepoint.
+    STUB_ARRAY_PUSH_ALLOC = 101 => "array_push_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(false, true),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.sin`.
+    STUB_MATH_SIN_LEAF = 102 => "math_sin_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.cos`.
+    STUB_MATH_COS_LEAF = 103 => "math_cos_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.tan`.
+    STUB_MATH_TAN_LEAF = 104 => "math_tan_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.atan`.
+    STUB_MATH_ATAN_LEAF = 105 => "math_atan_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.exp`.
+    STUB_MATH_EXP_LEAF = 106 => "math_exp_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.log`.
+    STUB_MATH_LOG_LEAF = 107 => "math_log_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.ceil`.
+    STUB_MATH_CEIL_LEAF = 108 => "math_ceil_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.round`.
+    STUB_MATH_ROUND_LEAF = 109 => "math_round_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.trunc`.
+    STUB_MATH_TRUNC_LEAF = 110 => "math_trunc_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.atan2` over exactly two arguments.
+    STUB_MATH_ATAN2_LEAF = 111 => "math_atan2_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Math.pow` over exactly two arguments.
+    STUB_MATH_POW_LEAF = 112 => "math_pow_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Widen one defining shape's field-value word: `(heap_mut, owner_offset,
+    /// boxed_rhs)`. The owner is a rooted, non-moving defining shape. Only scalar
+    /// metadata is changed, so no traced pointer store or barrier is required.
+    STUB_FIELD_TYPE_OBSERVE = 113 => "field_type_observe",
+        LeafNoAlloc, MutatingLeafValue2, 2, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Probe;
+
+    /// An object left a watched shape: `(heap_mut, shape_header_address,
+    /// unused)` clears the shape's stable byte and fires its stability
+    /// subscribers. Only scalar metadata and code flags change.
+    STUB_SHAPE_LEFT = 114 => "shape_left",
+        LeafNoAlloc, MutatingLeafValue2, 2, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Probe;
+
+    /// `%RegExp.prototype.exec%` of the realm's original method on `(receiver,
+    /// argument)`, whose identity generated code proved: the method's complete
+    /// semantics without a native call frame. The `lastIndex` coercion may run
+    /// JavaScript; once entered it completes or returns a pure exception value.
+    STUB_JIT_REGEXP_EXEC = 115 => "jit_regexp_exec",
+        Reentrant, CommittedValue2, 2, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// `%RegExp.prototype.test%` counterpart of [`STUB_JIT_REGEXP_EXEC`].
+    STUB_JIT_REGEXP_TEST = 116 => "jit_regexp_test",
+        Reentrant, CommittedValue2, 2, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// A store wrote a watched context slot: `(heap_mut, watch_word, slot)`
+    /// fires the slot's subscribers and marks it volatile. Only code flags and
+    /// watch metadata change.
+    STUB_CONTEXT_SLOT_WRITTEN = 117 => "context_slot_written",
+        LeafNoAlloc, MutatingLeafValue2, 2, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Probe;
+
+    /// Pure unboxed `Math` method arithmetic for typed numeric machine code.
+    STUB_MATH_F64_LEAF = 118 => "math_f64_leaf",
+        LeafNoAlloc, Float64MathLeaf3, 3, RuntimeStubEffects::none(),
+        Never, Float64, None;
+
+    /// The realm's original `String.prototype` regexp-facing method selected by
+    /// the intrinsic kind payload `(receiver, argument0, argument1, kind)`,
+    /// whose identity generated code proved: the method's complete semantics
+    /// without a native call frame. Coercions and a non-pristine RegExp argument
+    /// may run JavaScript; once entered it completes or returns a pure
+    /// exception value.
+    STUB_JIT_STRING_METHOD = 119 => "jit_string_method",
+        Reentrant, ContextWords, 4, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// Leaf `Number.isNaN`: no coercion, every argument answers.
+    STUB_NUMBER_IS_NAN_LEAF = 120 => "number_is_nan_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Number.isFinite`: no coercion, every argument answers.
+    STUB_NUMBER_IS_FINITE_LEAF = 121 => "number_is_finite_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Number.isInteger`: no coercion, every argument answers.
+    STUB_NUMBER_IS_INTEGER_LEAF = 122 => "number_is_integer_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Number.isSafeInteger`: no coercion, every argument answers.
+    STUB_NUMBER_IS_SAFE_INTEGER_LEAF = 123 => "number_is_safe_integer_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Array.isArray`; a Proxy misses.
+    STUB_ARRAY_IS_ARRAY_LEAF = 124 => "array_is_array_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Object.getPrototypeOf` of an ordinary object; anything else misses.
+    STUB_OBJECT_GET_PROTOTYPE_OF_LEAF = 125 => "object_get_prototype_of_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Number(value)` call of a non-string primitive; anything else misses.
+    STUB_NUMBER_CALL_LEAF = 126 => "number_call_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Allocating rest parameter: an Array of the current frame's actual
+    /// arguments from the int32 formal count on. A malformed count misses before
+    /// allocation; heap refusal is reported through the status pair.
+    STUB_REST_ARRAY_ALLOC = 127 => "rest_array_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(false, false),
+        Never, NativePair, Probe;
+
+    /// Record the callable a baseline call site called while its feedback was
+    /// empty: the site's execution count word, the boxed callee and its receiver
+    /// (`undefined` for a plain call; a method call's receiver names the function
+    /// a `%Function.prototype.call%` method calls). It neither
+    /// allocates nor runs JavaScript, and always reports success; it is entered
+    /// through the ordinary runtime transition.
+    STUB_JIT_RECORD_CALL_TARGET = 128 => "jit_record_call_target",
+        Reentrant, Variadic, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, StatusWord, None;
+
+    /// Allocation of an object whose `[[Prototype]]` is `null` (an object
+    /// literal opening with `__proto__: null`) from an empty boxed-value span.
+    /// The native frame publishes roots; success returns the object.
+    STUB_JIT_NEW_NULL_PROTOTYPE_OBJECT = 129 => "jit_new_null_prototype_object",
+        Alloc, ReentrantValueSpan, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Committed;
+
+    /// Allocating `ToString` of a Number: its cached decimal string, converted
+    /// and cached on a miss.
+    STUB_NUMBER_TO_STRING_ALLOC = 130 => "number_to_string_alloc",
+        Alloc, AllocValue3, 3, RuntimeStubEffects::allocating(true, false),
+        Status, NativePair, Probe;
+
+    /// `receiver.exec(subject)` of the realm's original RegExp method, its
+    /// identity proved by generated code, run in the isolate without a frame:
+    /// `(vm_thread, receiver, subject)`. Success carries the method's result
+    /// (the match array carved from the ready nursery buffer, or `null`); a miss
+    /// precedes every effect and leaves the call to [`STUB_JIT_REGEXP_EXEC`].
+    STUB_REGEXP_EXEC_LEAF = 131 => "regexp_exec_leaf",
+        LeafNoAlloc, IsolateLeafValue2, 2, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Probe;
+
+    /// `%RegExp.prototype.test%` counterpart of [`STUB_REGEXP_EXEC_LEAF`]: the
+    /// receiver's protocol must be the built-in one, since `test` reads `exec`.
+    STUB_REGEXP_TEST_LEAF = 132 => "regexp_test_leaf",
+        LeafNoAlloc, IsolateLeafValue2, 2, RuntimeStubEffects::leaf(false, true),
+        Never, NativePair, Probe;
+
+    /// The RegExp of the regex literal at constant-pool index `value0` of the
+    /// chunk owning function `value1`: `(jit_ctx, constant, function) -> value`,
+    /// the miss of a generated literal birth.
+    STUB_JIT_REGEXP_LITERAL = 133 => "jit_regexp_literal",
+        Alloc, CommittedValue2, 2, RuntimeStubEffects::allocating(true, true),
+        Status, NativePair, Committed;
+
+    /// A call of the static native body of the callee in `values[0]` with the
+    /// receiver in `values[1]` and the rest as arguments, run without the native
+    /// call trampoline's frame: `(jit_ctx, values, count) -> value`. Generated
+    /// code proved the callee a native function of the static entry kind; its
+    /// body may run JavaScript.
+    STUB_JIT_STATIC_NATIVE_CALL = 134 => "jit_static_native_call",
+        Reentrant, ReentrantValueSpan, VARIADIC_STUB_ARGUMENTS, RuntimeStubEffects::reentrant(true),
+        Status, NativePair, Committed;
+
+    /// Leaf `Object.is`: §7.2.11 SameValue, every argument pair answers.
+    STUB_OBJECT_IS_LEAF = 135 => "object_is_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `String.prototype.charAt` at an int32 index: a one-unit Latin-1 or
+    /// empty result is the heap's shared string; any other unit misses.
+    STUB_STRING_CHAR_AT_LEAF = 136 => "string_char_at_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `String.fromCharCode` of one int32 code whose unit is Latin-1: the
+    /// heap's shared one-unit string; any other code misses.
+    STUB_STRING_FROM_CHAR_CODE_LEAF = 137 => "string_from_char_code_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Array.prototype.indexOf` of one value over a hole-free plain dense
+    /// array; anything else misses.
+    STUB_ARRAY_INDEX_OF_LEAF = 138 => "array_index_of_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+
+    /// Leaf `Array.prototype.includes` of one value over a hole-free plain dense
+    /// array; anything else misses.
+    STUB_ARRAY_INCLUDES_LEAF = 139 => "array_includes_leaf",
+        LeafNoAlloc, LeafValue2, 2, RuntimeStubEffects::none(),
+        Never, NativePair, Probe;
+}
 
 // Descriptor ids are the sole slot authority for bindings and symbol lookup.
 // Reject inventory gaps when compiling, before an isolate can install entries.

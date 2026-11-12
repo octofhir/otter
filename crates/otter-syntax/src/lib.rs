@@ -1,15 +1,16 @@
 //! OXC-only frontend for the new Otter engine.
 //!
 //! All JavaScript and TypeScript parsing in the active engine goes through
-//! OXC. This crate is the only place in `crates/*` that
-//! depends on `oxc_parser` directly: every other crate consumes the
-//! parsed AST through this surface.
+//! OXC. This crate owns runtime parse goals and parse-once callbacks.
+//! Diagnostic scanning and the asm.js translator also use OXC directly
+//! with their own parse options.
 //!
 //! # Contents
 //! - [`SourceKind`] — JavaScript / TypeScript / JSX flavor selector.
 //! - [`detect_source_kind`] — decide kind from file extension.
 //! - [`with_program`] — parse once and consume the AST inside a callback.
 //! - [`with_program_timing`] — the opt-in parse timing surface.
+//! - [`module_literal_text`] / [`module_attribute_type`] — checked host module text.
 //! - [`SyntaxError`] — concrete error returned when OXC reports
 //!   parser diagnostics.
 //!
@@ -27,6 +28,8 @@
 //! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
 
 mod diagnostic;
+mod module_text;
+pub use module_text::{module_attribute_type, module_literal_text};
 
 use std::path::Path;
 use std::time::{Duration, Instant};

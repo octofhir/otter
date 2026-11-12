@@ -1507,7 +1507,7 @@ impl<'a> Visit<'a> for DotArgumentsFinder {
     ) {
         if matches!(
             &it.expression,
-            oxc_ast::ast::Expression::StringLiteral(key) if key.value.as_str() == "arguments"
+            oxc_ast::ast::Expression::StringLiteral(key) if key.value == "arguments"
         ) {
             self.found = true;
             return;

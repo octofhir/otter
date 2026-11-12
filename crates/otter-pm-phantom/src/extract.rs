@@ -62,7 +62,10 @@ struct SpecifierVisitor {
 }
 
 impl SpecifierVisitor {
-    fn record(&mut self, specifier: &str) {
+    fn record(&mut self, specifier: Option<&str>) {
+        let Some(specifier) = specifier else {
+            return;
+        };
         if specifier.is_empty() {
             return;
         }

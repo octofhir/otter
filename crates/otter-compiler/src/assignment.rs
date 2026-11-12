@@ -1220,7 +1220,11 @@ pub(crate) fn assign_object_pattern(
                 } else {
                     let key_str = match &p.name {
                         PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
-                        PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+                        PropertyKey::StringLiteral(lit) => lit
+                            .value
+                            .as_str()
+                            .expect("surrogate key uses computed lowering")
+                            .to_owned(),
                         // A numeric key with no settled integer spelling
                         // is rejected here rather than mis-stringified;
                         // `is_static_property_key` keeps such a pattern

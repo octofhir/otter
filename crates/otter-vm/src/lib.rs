@@ -41,6 +41,9 @@ extern crate self as otter_vm;
 /// the downstream crate. It is not a stable embedding API.
 #[doc(hidden)]
 pub mod __macro_support {
+    // Installer signatures and root scopes are engine plumbing, not extension APIs.
+    pub use otter_gc::{GcHeap, RootScope};
+
     pub use crate::bootstrap::BootstrapFeatures;
     pub use crate::intrinsic_install::BuiltinIntrinsic;
     pub use crate::symbol;

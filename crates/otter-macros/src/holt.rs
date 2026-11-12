@@ -15,8 +15,8 @@
 //! # Invariants
 //! - Method names are unique per `holt!`; duplicates surface as a
 //!   compile error pointing at the offending literal.
-//! - Generated code references `::otter_vm::__macro_support::*` and
-//!   `::otter_gc::GcHeap` only; nothing from `otter-macros`.
+//! - Engine types resolve only through `::otter_vm::__macro_support`;
+//!   downstream binding crates need no direct GC dependency.
 //! - Output type idents:
 //!   - `spec`: derived as `<NAME>_SPEC` (name uppercased + `_SPEC`)
 //!     unless the caller passes `spec = OVERRIDE_IDENT,`.
@@ -548,7 +548,7 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
     let install_well_knowns_fn = match &string_tag {
         Some(tag) => quote! {
             fn install_well_knowns(
-                heap: &mut ::otter_gc::GcHeap,
+                heap: &mut ::otter_vm::__macro_support::GcHeap,
                 global: ::otter_vm::__macro_support::JsObject,
                 well_known: &::otter_vm::__macro_support::symbol::WellKnownSymbols,
             ) -> ::core::result::Result<(), ::otter_vm::__macro_support::JsSurfaceError> {
@@ -603,11 +603,11 @@ pub(crate) fn expand(input: TokenStream) -> TokenStream {
             #install_well_knowns_fn
 
             fn install(
-                heap: &mut ::otter_gc::GcHeap,
+                heap: &mut ::otter_vm::__macro_support::GcHeap,
                 global: ::otter_vm::__macro_support::JsObject,
             ) -> ::core::result::Result<(), ::otter_vm::__macro_support::JsSurfaceError> {
                 let mut global_root = ::otter_vm::__macro_support::Value::object(global);
-                let mut global_scope = ::otter_gc::RootScope::new(heap);
+                let mut global_scope = ::otter_vm::__macro_support::RootScope::new(heap);
                 // SAFETY: the actual global slot stays stationary through this install.
                 unsafe {
                     ::otter_vm::__macro_support::rooting::RootScopeExt::add_value(

@@ -62,7 +62,7 @@ impl<'a> Visit<'a> for Reserved {
     }
     fn visit_string_literal(&mut self, it: &oxc_ast::ast::StringLiteral<'a>) {
         if it.value.starts_with("__rfWarm") {
-            self.names.push(it.value.to_string());
+            self.names.push(it.value.display().to_string());
         }
     }
 }

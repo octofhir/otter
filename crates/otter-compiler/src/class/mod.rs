@@ -643,7 +643,9 @@ fn compile_class_strict(
                 oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
                     Some(id.name.as_str().to_string())
                 }
-                oxc_ast::ast::PropertyKey::StringLiteral(lit) => Some(lit.value.to_string()),
+                oxc_ast::ast::PropertyKey::StringLiteral(lit) => {
+                    lit.value.as_str().map(str::to_owned)
+                }
                 oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
                     Some(number_literal_property_name(lit.value))
                 }
@@ -937,7 +939,9 @@ fn compile_class_strict(
                         }
                         // Only the literal spells a lone surrogate's code
                         // units; the key stays unnamed at compile time.
-                        oxc_ast::ast::PropertyKey::StringLiteral(lit) if lit.lone_surrogates => {
+                        oxc_ast::ast::PropertyKey::StringLiteral(lit)
+                            if lit.value.has_lone_surrogate() =>
+                        {
                             crate::expr::literal::compile_string_literal(cx, lit, pspan)?
                         }
                         _ => {
@@ -945,9 +949,11 @@ fn compile_class_strict(
                                 oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
                                     id.name.as_str().to_string()
                                 }
-                                oxc_ast::ast::PropertyKey::StringLiteral(lit) => {
-                                    lit.value.to_string()
-                                }
+                                oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit
+                                    .value
+                                    .as_str()
+                                    .expect("surrogate key uses computed lowering")
+                                    .to_owned(),
                                 oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
                                     number_literal_property_name(lit.value)
                                 }

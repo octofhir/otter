@@ -262,7 +262,9 @@ fn emit_instance_field_inits_inner(
                 oxc_ast::ast::PropertyKey::StaticIdentifier(id) => {
                     Some(id.name.as_str().to_string())
                 }
-                oxc_ast::ast::PropertyKey::StringLiteral(lit) => Some(lit.value.to_string()),
+                oxc_ast::ast::PropertyKey::StringLiteral(lit) => {
+                    lit.value.as_str().map(str::to_owned)
+                }
                 oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
                     Some(crate::class::number_literal_property_name(lit.value))
                 }
@@ -298,7 +300,7 @@ fn emit_instance_field_inits_inner(
             let binding = crate::class::field_key_binding_name(idx);
             Some(load_synthetic_capture(cx, &binding, pspan)?)
         } else if let oxc_ast::ast::PropertyKey::StringLiteral(lit) = &p.key
-            && lit.lone_surrogates
+            && lit.value.has_lone_surrogate()
         {
             // Only the literal spells a lone surrogate's code units.
             Some(crate::expr::literal::compile_string_literal(
@@ -331,7 +333,11 @@ fn emit_instance_field_inits_inner(
         }
         let key_str = match &p.key {
             oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.as_str().to_string(),
-            oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit.value.to_string(),
+            oxc_ast::ast::PropertyKey::StringLiteral(lit) => lit
+                .value
+                .as_str()
+                .expect("surrogate key uses computed lowering")
+                .to_owned(),
             oxc_ast::ast::PropertyKey::NumericLiteral(lit) => {
                 crate::class::number_literal_property_name(lit.value)
             }

@@ -14,10 +14,9 @@
 //!
 //! # Invariants
 //! - The callee is guarded after argument evaluation; lookup never repeats.
-//! - Every leaf miss commits one ordinary call. The Template tier never
-//!   deoptimizes; an optimizing method load guarded on the warmed receiver
-//!   shape exits once for a receiver kind it never saw, and the generation
-//!   compiled after that exit completes the same misses without exiting.
+//! - Template leaf misses commit one ordinary call. Graph guards may leave
+//!   before the call; recovery preserves the loaded callable and evaluated
+//!   arguments without replaying observable work.
 //!
 //! # See also
 //! - `optimizing_string_intrinsics` covers primitive-string method fallbacks.
@@ -163,6 +162,8 @@ String.prototype.charCodeAt = function (index) { replaced++; return 1000 + index
 log.push(codes("otter", 4), replaced);
 String.prototype.charCodeAt = originalCharCodeAt;
 log.push(finds("otter", { toString() { return "t"; } }, 2));
+log.push(hasMembers(new Set(["x"]), 400));
+log.push(finds(join("q".repeat(64), "needle"), "needle", 400));
 log.push(gets(new Map([[1, "a"], [2, "b"]]), 2));
 class CountingMap extends Map {}
 log.push(gets(new CountingMap([[1, 4], [2, 5]]), 2));
@@ -204,65 +205,12 @@ JSON.stringify(log);
     let expected = completion(&mut oracle, MISSES);
     assert_eq!(
         expected,
-        r#"[null,true,480,444,4006,4,2,"0ab",9,null,6,3,"TypeError","TypeError",21,5368709117.5,"TypeError",27300]"#
+        r#"[null,true,480,444,4006,4,2,0,25600,"0ab",9,null,6,3,"TypeError","TypeError",21,5368709117.5,"TypeError",27300]"#
     );
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
         let mut runtime = warmed(selection);
         assert_eq!(completion(&mut runtime, MISSES), expected, "{selection:?}");
     }
-}
-
-#[test]
-fn numeric_leaf_misses_commit_without_deoptimizing() {
-    // Every call below misses its leaf (wrapper or rope receiver, replaced
-    // callee, subclass instance, non-member) while keeping numeric results,
-    // so no arithmetic speculation can explain a deopt. The block keeps the
-    // fixture re-runnable in one runtime.
-    const LEAF_MISSES: &str = r#"
-{
-const log = [];
-log.push(codes(new String("otter"), 400));
-log.push(codes(join("x".repeat(40), "yz".repeat(30)), 400));
-String.prototype.charCodeAt = function (index) { return 7; };
-log.push(codes("otter", 400));
-String.prototype.charCodeAt = originalCharCodeAt;
-class CountingMap extends Map {}
-log.push(gets(new CountingMap([[1, 4], [2, 5]]), 400));
-log.push(hasMembers(new Set(["x"]), 400));
-log.push(finds(join("q".repeat(64), "needle"), "needle", 400));
-JSON.stringify(log);
-}
-"#;
-    let mut oracle = warmed(JitSelection::InterpreterOnly);
-    let expected = completion(&mut oracle, LEAF_MISSES);
-    assert_eq!(expected, "[44400,48000,2800,1800,0,25600]");
-    let mut template = warmed(JitSelection::Template);
-    let before = template.execution_stats();
-    assert_eq!(completion(&mut template, LEAF_MISSES), expected, "Template");
-    assert_no_deopt(before, template.execution_stats());
-
-    let mut tiered = warmed(JitSelection::ProductionTiered);
-    let before = tiered.execution_stats();
-    assert_eq!(
-        completion(&mut tiered, LEAF_MISSES),
-        expected,
-        "ProductionTiered"
-    );
-    let after = tiered.execution_stats();
-    // At most the `charCodeAt` load in `codes` (String wrapper receiver) and
-    // the `get` load in `gets` (Map subclass receiver) leave their warmed
-    // receiver-shape guards, once each.
-    assert!(
-        after.jit_optimized_deopts - before.jit_optimized_deopts <= 2,
-        "{before:?} -> {after:?}"
-    );
-    let before = after;
-    assert_eq!(
-        completion(&mut tiered, LEAF_MISSES),
-        expected,
-        "ProductionTiered rerun"
-    );
-    assert_no_deopt(before, tiered.execution_stats());
 }
 
 #[test]

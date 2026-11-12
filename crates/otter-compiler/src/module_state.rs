@@ -8,7 +8,8 @@
 //! - module source-kind helpers
 //!
 //! # Invariants
-//! - Host-provided resolved imports are trusted by lowering.
+//! - Host-provided resolved imports are trusted by lowering; static attribute
+//!   keys are validated before AST requests become `(specifier, attr_type)`.
 //! - The constant pool is append-only. Interning returns the lowest index whose
 //!   entry equals the candidate, exactly as a scan of the pool would; the
 //!   content index only shortens the search.
@@ -48,19 +49,6 @@ impl ImportRequest {
     pub fn plain(specifier: impl Into<String>) -> Self {
         Self::new(specifier, None)
     }
-}
-
-/// The `type` attribute of a `with { … }` clause, when it has one.
-pub(crate) fn import_attribute_type(
-    clause: Option<&oxc_ast::ast::WithClause<'_>>,
-) -> Option<String> {
-    clause?.with_entries.iter().find_map(|entry| {
-        let key = match &entry.key {
-            oxc_ast::ast::ImportAttributeKey::Identifier(id) => id.name.as_str(),
-            oxc_ast::ast::ImportAttributeKey::StringLiteral(lit) => lit.value.as_str(),
-        };
-        (key == "type").then(|| entry.value.value.as_str().to_string())
-    })
 }
 
 /// One pre-resolved import-record binding: maps an importer-side
@@ -351,6 +339,77 @@ pub(crate) fn module_export_name_to_str(name: &oxc_ast::ast::ModuleExportName<'_
     match name {
         oxc_ast::ast::ModuleExportName::IdentifierName(id) => id.name.as_str().to_string(),
         oxc_ast::ast::ModuleExportName::IdentifierReference(id) => id.name.as_str().to_string(),
-        oxc_ast::ast::ModuleExportName::StringLiteral(lit) => lit.value.as_str().to_string(),
+        oxc_ast::ast::ModuleExportName::StringLiteral(lit) => lit
+            .value
+            .as_str()
+            .expect("OXC rejects ill-formed module export names")
+            .to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_entry_points_validate_attributes_before_erasing_keys() {
+        let host = ModuleHostInfo {
+            module_url: "file:///main.js".to_string(),
+            resolved_imports: [
+                (ImportRequest::plain("./dep"), "file:///dep.js".to_string()),
+                (
+                    ImportRequest::new("./dep", Some("json".to_string())),
+                    "file:///dep.json".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        for clause in [
+            "",
+            " with {}",
+            " with { type: 'json' }",
+            " with { 't\\u0079pe': 'json' }",
+            " with { extra: 'x' }",
+            " with { type: 'json', extra: 'x' }",
+            " with { extra: 'x', type: 'json' }",
+        ] {
+            let source = format!("import value from './dep'{clause}; export default value;");
+            otter_syntax::with_program(&source, SyntaxSourceKind::JavaScript, |program| {
+                let results = [
+                    compile_module_program(
+                        program,
+                        SyntaxSourceKind::JavaScript,
+                        &host,
+                        CompileOptions::default(),
+                    )
+                    .map(|_| ()),
+                    compile_module_program_to_module(
+                        program,
+                        SyntaxSourceKind::JavaScript,
+                        &host,
+                        CompileOptions::default(),
+                    )
+                    .map(|_| ()),
+                ];
+                for result in results {
+                    if let Some(start) = source.find("extra") {
+                        let CompileError::Syntax { diagnostics, .. } = result.unwrap_err() else {
+                            panic!("expected static attribute SyntaxError");
+                        };
+                        assert!(
+                            diagnostics
+                                .iter()
+                                .any(|d| d.message.contains("unsupported import attribute")
+                                    && d.range
+                                        == Some((start as u32, (start + "extra".len()) as u32)))
+                        );
+                    } else {
+                        result.unwrap();
+                    }
+                }
+            })
+            .unwrap();
+        }
     }
 }

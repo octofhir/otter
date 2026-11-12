@@ -410,10 +410,10 @@ pub(crate) fn compile_method_call(
     if let Expression::ComputedMemberExpression(member) = callee {
         let receiver_reg = compile_expr(cx, &member.object, span)?;
         if let Expression::StringLiteral(lit) = unwrap_ts_expr(&member.expression)
-            && !lit.lone_surrogates
+            && let Some(name) = lit.value.as_str()
             && call_arguments_commute_with_method_lookup(cx, &call.arguments)
         {
-            let name_idx = cx.intern_string_constant(lit.value.as_str());
+            let name_idx = cx.intern_string_constant(name);
             let arg_regs = compile_call_args(cx, &call.arguments, span)?;
             check_call_arity(arg_regs.len(), "Op::CallMethodValue", span)?;
             cx.reset_scratch(call_mark);

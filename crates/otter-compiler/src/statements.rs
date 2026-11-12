@@ -936,8 +936,8 @@ fn compile_statement_body(
                 });
             }
             let source = ImportRequest::new(
-                decl.source.value.as_str(),
-                import_attribute_type(decl.with_clause.as_deref()),
+                otter_syntax::module_literal_text(&decl.source)?,
+                module_attribute_type(decl.with_clause.as_deref())?,
             );
             compile_export_specifiers(cx, &decl.specifiers, Some(&source), span)?;
             Ok(None)
@@ -1037,8 +1037,8 @@ fn compile_statement_body(
                 });
             }
             let source = ImportRequest::new(
-                decl.source.value.as_str(),
-                import_attribute_type(decl.with_clause.as_deref()),
+                otter_syntax::module_literal_text(&decl.source)?,
+                module_attribute_type(decl.with_clause.as_deref())?,
             );
             let record = cx
                 .module_state

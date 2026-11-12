@@ -21,6 +21,8 @@
 //! - Script and module commands carry opaque realm ids; async settlement and
 //!   disposal are routed on the owning isolate.
 //! - Command replies carry only owned public data.
+//! - Remote discovery is advisory: source parse/request diagnostics belong to
+//!   canonical graph preparation, which preserves dynamic-import rejection timing.
 //! - Process lifecycle listeners run inside the current diagnostics batch
 //!   through rooted, observable native calls. They create no synthetic Script
 //!   chunk and never begin a public top-level capture.
@@ -641,7 +643,15 @@ fn discover_remote_requests(
         if !visited.insert(source.url.clone()) {
             continue;
         }
-        for request in crate::module_graph::scan_module_requests(source.text, source.kind)? {
+        let requests = match crate::module_graph::scan_module_requests(source.text, source.kind) {
+            Ok(requests) => requests,
+            // Graph preparation owns syntax/request failures and knows whether
+            // this source is a required module or an optional import() target.
+            // Rejecting here would turn a catchable import() into an entry error.
+            Err(crate::module_graph::GraphError::Parse { .. }) => continue,
+            Err(error) => return Err(error),
+        };
+        for request in requests {
             let target = loader.resolve(&request.specifier, Some(&source.url))?;
             if crate::module_loader::is_http_url(&target) {
                 remote.push((target, request.data));

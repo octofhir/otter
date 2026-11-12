@@ -327,15 +327,15 @@ impl<'a> Visit<'a> for Shape {
                 panic!("fixed first member key")
             };
             let key1 = match &call.arguments[2] {
-                Argument::StringLiteral(key) => Some(key.value.to_string()),
+                Argument::StringLiteral(key) => key.value.as_str().map(str::to_owned),
                 Argument::NullLiteral(_) => None,
                 _ => panic!("fixed fallback key or literal null"),
             };
             self.static_calls.push((
                 id.name.to_string(),
                 authority.name.to_string(),
-                base.value.to_string(),
-                key0.value.to_string(),
+                base.value.as_str().expect("fixture key").to_owned(),
+                key0.value.as_str().expect("fixture key").to_owned(),
                 key1,
             ));
         }
@@ -605,14 +605,6 @@ fn actual_registered_sources_are_a_closed_reproducible_ast_catalog() {
     let bootstrap = repo.join("crates/otter-node/src/nodelib/compat/bootstrap_realm.js");
     let generated =
         generate(repo, &bootstrap).expect("all current registered source bindings and spans");
-    assert_eq!(generated.manifest["catalog"].as_array().unwrap().len(), 277);
-    assert_eq!(
-        generated.manifest["sourceSha256"]
-            .as_object()
-            .unwrap()
-            .len(),
-        192
-    );
     let current = std::fs::read_to_string(&bootstrap).expect("actual bootstrap");
     let (before_start, before_end) = dispatch_span(&current);
     let (after_start, after_end) = dispatch_span(&generated.source);

@@ -14,7 +14,9 @@ Procedural-macro expansions resolve backend details through the doc-hidden
 `otter_vm::__macro_support` module (binding crates alias `otter_runtime` as
 `otter_vm`). That path exists only for generated code. Contributor-written code
 uses the `Runtime*` aliases and helpers below; macro implementation details are
-not a second public builder API.
+not a second public builder API. Installer heap and root-scope types also resolve
+through that contract; binding crates do not import `otter-gc`. Low-level GC-body
+derives (`Pelt`/`Groom`) are separate and deliberately require the GC API.
 
 The goal is high-level ergonomics without runtime overhead:
 

@@ -29,8 +29,8 @@ use crate::{
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, aarch64::Assembler, dynasm};
 use otter_vm::{
     JitCompileSnapshot,
-    jit::{JitPropertyActionCache, PropertyLoadAction, PropertyStoreAction},
     jit::slot_word,
+    jit::{JitPropertyActionCache, PropertyLoadAction, PropertyStoreAction},
     value::tag,
 };
 

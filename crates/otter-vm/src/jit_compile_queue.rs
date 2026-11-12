@@ -108,7 +108,7 @@ pub(crate) struct FinishedCompile {
 pub(crate) enum CompileInput {
     /// A snapshot already baked.
     #[cfg(test)]
-    Request(JitCompileRequest),
+    Request(Box<JitCompileRequest>),
     /// A snapshot the compiler thread bakes first.
     Bake(Box<crate::interp::jit_bake::BakeJob>),
 }
@@ -298,7 +298,7 @@ fn compile(job: CompileJob) -> FinishedCompile {
     } else {
         match job.input {
             #[cfg(test)]
-            CompileInput::Request(request) => Some(request),
+            CompileInput::Request(request) => Some(*request),
             CompileInput::Bake(bake) => bake.run(),
         }
     };
@@ -632,7 +632,7 @@ mod tests {
             queue
                 .submit(
                     hook.clone(),
-                    CompileInput::Request(active),
+                    CompileInput::Request(Box::new(active)),
                     1,
                     active_pending
                 )
@@ -643,7 +643,7 @@ mod tests {
             queue
                 .submit(
                     hook.clone(),
-                    CompileInput::Request(queued),
+                    CompileInput::Request(Box::new(queued)),
                     2,
                     queued_pending
                 )

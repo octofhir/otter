@@ -29,6 +29,9 @@
 //! - Dynamic import writes a Promise for catchable failures. Structural/control
 //!   failures and failed exception materialization return their original Result;
 //!   async module reactions never invent an undefined rejection value.
+//! - Dynamic requests use checked UTF-8 before cache lookup or host scheduling;
+//!   lone surrogates never alias replacement characters. Options getters complete
+//!   before host validation; their values remain rooted across subsequent getters.
 //! - `import.meta.resolve` accepts only string specifiers.
 //! - Module init, deferred-namespace accessors, and async continuation jobs
 //!   re-enter above an activation floor on the current rooted runtime turn.
@@ -1388,112 +1391,105 @@ impl Interpreter {
         Ok(())
     }
 
-    /// §13.3.10.1 steps 7-10 — validate the ImportCall options bag and
-    /// extract the one host-supported attribute (`type`). `Ok(Ok(attr))`
-    /// continues the import, `Ok(Err(reason))` rejects the import promise
-    /// with `reason` (IfAbruptRejectPromise), and `Err(_)` propagates a
-    /// fatal VM error.
+    /// Evaluate ImportCall options before validating the host request. All
+    /// enumerable values are read (and rooted) before checking attribute types
+    /// or host support, so a later getter's exception keeps its precedence.
     fn evaluate_import_call_options(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
         options: &Value,
-    ) -> Result<Result<Option<String>, Value>, CommittedValueError> {
+    ) -> Result<Option<String>, CommittedValueError> {
         if options.is_undefined() {
-            return Ok(Ok(None));
+            return Ok(None);
         }
         if !options.is_object_type() {
-            let reason = self
-                .make_type_error_with_stack_roots(stack, "import options must be an object")
-                .map_err(CommittedValueError::Fatal)?;
-            return Ok(Err(reason));
+            return Err(CommittedValueError::JavaScript(
+                self.err_type("import options must be an object".into()),
+            ));
         }
-        let attributes =
-            self.with_handle_scope(|interp, scope| -> Result<_, CommittedValueError> {
-                let options = interp.scoped_value(scope, *options);
-                let with_value = {
-                    let options_now = interp.escape_scoped(options);
-                    interp.get_property_value_for_call(stack, context, options_now, "with")?
-                };
-                if with_value.is_undefined() {
-                    return Ok(Ok(None));
-                }
-                if !with_value.is_object_type() {
-                    let reason = interp
-                        .make_type_error_with_stack_roots(
-                            stack,
-                            "import attributes must be an object",
-                        )
-                        .map_err(CommittedValueError::Fatal)?;
-                    return Ok(Err(reason));
-                }
-                // §7.3.24 EnumerableOwnProperties(key+value): own keys in
-                // [[OwnPropertyKeys]] order, string keys only, each value read
-                // through [[Get]] so getters and Proxy traps fire.
-                let with_handle = interp.scoped_value(scope, with_value);
-                let with_now = interp.escape_scoped(with_handle);
-                let keys = interp.own_property_keys_value(stack, context, &with_now)?;
-                let key_handles: Vec<_> = keys
-                    .into_iter()
-                    .map(|key| interp.scoped_value(scope, key))
-                    .collect();
-                let mut attr_type: Option<String> = None;
-                for key_handle in key_handles {
-                    let key_value = interp.escape_scoped(key_handle);
-                    let Some(key_string) = key_value.as_string(&interp.gc_heap) else {
-                        // Symbol keys are filtered by EnumerableOwnProperties.
-                        continue;
-                    };
-                    let key = key_string.to_key_spelling(&interp.gc_heap);
-                    let with_now = interp.escape_scoped(with_handle);
-                    let descriptor = interp.get_own_property_descriptor_for_value(
-                        stack,
-                        context,
-                        with_now,
-                        Some(&interp.escape_scoped(key_handle)),
-                    )?;
-                    if !descriptor.is_some_and(|descriptor| descriptor.enumerable()) {
-                        continue;
-                    }
-                    let with_now = interp.escape_scoped(with_handle);
-                    let value = interp.get_property_value_for_call(
-                        stack,
-                        context,
-                        with_now,
-                        key.as_str(),
-                    )?;
-                    let Some(value_string) = value.as_string(&interp.gc_heap) else {
-                        let reason = interp
-                            .make_type_error_with_stack_roots(
-                                stack,
-                                &format!("import attribute \"{key}\" value must be a string"),
-                            )
-                            .map_err(CommittedValueError::Fatal)?;
-                        return Ok(Err(reason));
-                    };
-                    if key != "type" {
-                        let reason = interp
-                            .make_type_error_with_stack_roots(
-                                stack,
-                                &format!("unsupported import attribute \"{key}\""),
-                            )
-                            .map_err(CommittedValueError::Fatal)?;
-                        return Ok(Err(reason));
-                    }
-                    attr_type = Some(value_string.to_lossy_string(&interp.gc_heap));
-                }
-                Ok(Ok(attr_type))
-            });
-        match attributes {
-            Ok(result) => Ok(result),
-            Err(error @ CommittedValueError::Fatal(_)) => Err(error),
-            Err(CommittedValueError::JavaScript(error)) => {
-                let reason = self
-                    .vm_error_to_throwable_with_stack_roots(Some(context), stack, &error)
-                    .map_err(CommittedValueError::Fatal)?;
-                Ok(Err(reason))
+        self.with_handle_scope(|interp, scope| {
+            let options = interp.scoped_value(scope, *options);
+            let with_value = interp.get_property_value_for_call(
+                stack,
+                context,
+                interp.escape_scoped(options),
+                "with",
+            )?;
+            if with_value.is_undefined() {
+                return Ok(None);
             }
-        }
+            if !with_value.is_object_type() {
+                return Err(CommittedValueError::JavaScript(
+                    interp.err_type("import attributes must be an object".into()),
+                ));
+            }
+            // EnumerableOwnProperties(key+value): get all enumerable string
+            // values in own-key order before validating any of them.
+            let with_handle = interp.scoped_value(scope, with_value);
+            let keys = interp.own_property_keys_value(stack, context, &with_value)?;
+            let key_handles: Vec<_> = keys
+                .into_iter()
+                .map(|key| interp.scoped_value(scope, key))
+                .collect();
+            let mut entries = Vec::new();
+            for key_handle in key_handles {
+                let key_value = interp.escape_scoped(key_handle);
+                let Some(key_string) = key_value.as_string(&interp.gc_heap) else {
+                    continue;
+                };
+                let key = key_string.to_key_spelling(&interp.gc_heap);
+                let descriptor = interp.get_own_property_descriptor_for_value(
+                    stack,
+                    context,
+                    interp.escape_scoped(with_handle),
+                    Some(&interp.escape_scoped(key_handle)),
+                )?;
+                if !descriptor.is_some_and(|descriptor| descriptor.enumerable()) {
+                    continue;
+                }
+                let value = interp.get_property_value_for_call(
+                    stack,
+                    context,
+                    interp.escape_scoped(with_handle),
+                    &key,
+                )?;
+                entries.push((key, interp.scoped_value(scope, value)));
+            }
+            for (key, value) in &entries {
+                if interp
+                    .escape_scoped(*value)
+                    .as_string(&interp.gc_heap)
+                    .is_none()
+                {
+                    return Err(CommittedValueError::JavaScript(interp.err_type(
+                        format!("import attribute \"{key}\" value must be a string").into(),
+                    )));
+                }
+            }
+            let mut attr_type = None;
+            for (key, value) in entries {
+                if key != "type" {
+                    return Err(CommittedValueError::JavaScript(interp.err_type(
+                        format!("unsupported import attribute \"{key}\"").into(),
+                    )));
+                }
+                let value = interp
+                    .escape_scoped(value)
+                    .as_string(&interp.gc_heap)
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+                attr_type = Some(
+                    value
+                        .with_utf16(&interp.gc_heap, String::from_utf16)
+                        .map_err(|_| {
+                            CommittedValueError::JavaScript(interp.err_type(
+                                "module request text contains an unpaired surrogate".into(),
+                            ))
+                        })?,
+                );
+            }
+            Ok(attr_type)
+        })
     }
 
     pub(crate) fn run_import_namespace_dynamic_operands(
@@ -1535,28 +1531,24 @@ impl Interpreter {
         // A lazily compiled body runs in a chunk of its own; the module's
         // import table and initializers live in the chunk that created it.
         let module_context = context.module_owner();
-        let promise = match self.coerce_to_string(stack, context, &spec_value) {
-            Ok(specifier) => {
-                // Re-read the options register after specifier coercion: the
-                // coercion can collect, and registers are the traced home.
-                let options_value = *read_register(&stack[top_idx], options_reg)
-                    .map_err(CommittedValueError::Fatal)?;
-                let attr_type =
-                    match self.evaluate_import_call_options(stack, context, &options_value)? {
-                        Ok(attr_type) => attr_type,
-                        Err(reason) => {
-                            let promise = promise_dispatch::PromiseBuilder::with_context(Some(
-                                import_context.clone(),
-                            ))
-                            .rejected_stack_rooted(self, stack, reason, &mut [], &mut [])
-                            .map_err(|error| CommittedValueError::JavaScript(error.into()))?;
-                            let frame = &mut stack[top_idx];
-                            write_register(frame, dst, Value::promise(promise))
-                                .map_err(CommittedValueError::Fatal)?;
-                            frame.advance_pc().map_err(CommittedValueError::Fatal)?;
-                            return Ok(());
-                        }
-                    };
+        let request = (|| {
+            let specifier =
+                crate::coerce::to_js_string_or_throw(self, stack, context, &spec_value)?;
+            // Own the conversion result before options getters can collect.
+            // Delay host rejection until after their observable evaluation.
+            let specifier = specifier.with_utf16(&self.gc_heap, String::from_utf16);
+            let options =
+                *read_register(&stack[top_idx], options_reg).map_err(CommittedValueError::Fatal)?;
+            let attr_type = self.evaluate_import_call_options(stack, context, &options)?;
+            let specifier = specifier.map_err(|_| {
+                CommittedValueError::JavaScript(
+                    self.err_type("module request text contains an unpaired surrogate".into()),
+                )
+            })?;
+            Ok((specifier, attr_type))
+        })();
+        let promise = match request {
+            Ok((specifier, attr_type)) => {
                 if let Some(target) = module_context.module_resolution_target(
                     referrer.as_str(),
                     &specifier,

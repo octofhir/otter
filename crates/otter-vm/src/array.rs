@@ -23,6 +23,8 @@
 //!   stay traced through backing-store allocation.
 //! - Element growth allocates a rooted replacement slab, copies the live
 //!   prefix semantically, then republishes its base, length, and kind.
+//! - Bulk fill proves a writable live length when extending it; writes within
+//!   the existing length remain admissible with a read-only length descriptor.
 //! - Only indexed mutation invalidates captured JSON element bytes; named bags
 //!   cannot alias an index, and the semantic JSON owner resolves toJSON first.
 //! - Non-index string and symbol properties live in one managed ordinary
@@ -1580,7 +1582,8 @@ pub(crate) fn set_with_roots(
 /// Callers must still prove the prototype chain has no indexed
 /// properties in the target range. This helper only checks receiver
 /// state that would make direct data writes observably different from
-/// ordinary array assignment.
+/// ordinary array assignment, including whether extending the live length
+/// is allowed. A read-only length still permits writes below that length.
 #[must_use]
 pub(crate) fn can_fast_fill_dense_range(
     arr: JsArray,
@@ -1594,6 +1597,13 @@ pub(crate) fn can_fast_fill_dense_range(
     const MAX_DENSE_INDEX: usize = 1 << 20;
     heap.read_payload(arr, |body| {
         if !body.extensible() || body.prototype_override().is_some() || end > MAX_DENSE_INDEX {
+            return false;
+        }
+        if end > body.length()
+            && body
+                .exotic()
+                .is_some_and(|exotic| exotic.length_nonwritable)
+        {
             return false;
         }
         if start.saturating_sub(body.dense_len()) > 1024 {

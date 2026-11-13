@@ -1757,3 +1757,72 @@ This slice fixes preparation/root ownership, without claiming complete large
 fill/reverse conformance or a speed gain. The full closing gate and full
 checked GC corpus remain open. The persistent Cargo target and unrelated user
 files are preserved.
+
+## Prove writable length before a growing dense fill
+
+After the preparation fix, a separate public repro still exposes an invalid
+bulk hit: a fill-bound `valueOf` shrinks a three-element array to length one
+and makes length non-writable. Direct fill grows it back to three without
+throwing. Calling the same builtin through an empty-handler Proxy correctly
+commits index zero and throws at index one. The new runtime target fails
+before the guard correction; the direct CLI result is `[false,3,9,9]` in
+all three execution policies, versus the generic control's `[true,1,9,null]`.
+
+This contract follows the standard's ordered throwing
+[fill Set operations](https://tc39.es/ecma262/multipage/indexed-collections.html#sec-array.prototype.fill)
+and [Array index definition rule](https://tc39.es/ecma262/multipage/ordinary-and-exotic-objects-behaviours.html#sec-array-exotic-objects-defineownproperty-p-desc):
+extending a non-writable length must fail. Earlier valid indexed writes remain
+committed. Installed Node v24.16.0 / V8 13.6.233.17-node.49 reproduces the bad
+plain-array result too; its generic Proxy path agrees with the standard. The
+plain V8 fast path is therefore not treated as the oracle for these cases.
+Both observations and exact executable versions are retained.
+
+The existing `array::can_fast_fill_dense_range` is the shared receiver-state
+admission owner used by bulk mutation, callback outputs and native leaf
+consumers. It now declines a range whose end exceeds live length when the
+sidecar marks length non-writable. Writes inside current length, including
+holes, retain admission. Prototype, extensibility, density, accessor and indexed
+descriptor checks remain intact. A declined fill uses its already-computed
+bounds and ordinary Set path; coercions are not replayed and no eager error
+replaces the valid prefix. There is no new allocation, dynamic dispatch,
+carrier, dependency or ABI change in the guard.
+
+The shared regression covers shrink-and-lock in start and end conversion,
+zero/one-element retained prefixes, direct and Proxy receivers, exact live
+length/descriptor preservation, legal in-length writes on dense and holey
+read-only-length arrays, and the existing non-writable-element prefix case.
+The standalone public result becomes `[true,1,9,null]` in every execution
+policy. The pre-change CLI/runner and hashes are preserved in
+`/private/tmp/otter-fill-length-before-tools`.
+
+The affected runtime matrix passes **24/24 per architecture**, including the
+new target, preparation/GC, join/flatten/callback, canonical map, exotic Array
+and exact known-native/shared-routine proofs. All **1307 VM** and **350 JIT unit
+tests** pass; the actual collecting preparation proof also passes separately
+on x86_64. Strict workspace all-target/all-feature Clippy, formatting/diff
+checks, VM/runtime no-default-feature checks and CLI/Test262/difftest builds
+pass. The existing quick GC family passes at stride 1 using the same Cargo
+target. The differential runner passes the new guard, preparation and shared
+spare-push corpora in interpreter, Template, production and GC stride 16 modes,
+with zero timeouts. Native admission and GC assertions are unchanged.
+
+Exact Test262 fill/reverse coverage remains **40/40** relative to the previous
+slice, with unchanged paths/outcomes, corpus, target and semantic configuration.
+Reports are retained under `/private/tmp/otter-fill-length-*`:
+`public-{before,after}.json`, `proxy-before.json`, `before.log`, `after.log`,
+`{host,x86}.log`, `units.log`, `rooting-x86.log`, `clippy.log`, `features.log`,
+`build.jsonl`, `test262-comparison.json`, `reference.json`, `difftest.json` and
+`quick-gc.log`. The reference report records the installed V8 failure rather
+than presenting it as a passing cross-engine gate.
+
+The new guard corpus also passes the existing process-isolated GC driver
+**48/48**, at strides 1–16 across interpreter, Template and production modes.
+`/private/tmp/otter-fill-length-gc/results.json` reports `status: passed` and
+zero failures; its executable/source hashes match the final build and corpus,
+and `runs.jsonl` retains every observation. Final source/executable identities
+and validation results are recorded in
+`/private/tmp/otter-fill-length-{inputs,validation}.json`.
+
+The full closing gate, full checked GC corpus and outstanding large-range
+mutation/materialization policies remain open. No speed improvement is claimed;
+the persistent Cargo cache and unrelated user files remain preserved.

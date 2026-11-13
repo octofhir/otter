@@ -10,6 +10,7 @@
 
 use super::super::*;
 use crate::HandleScope;
+use crate::page::{CELL_SIZE, align_up};
 use crate::pretenuring::PretenureDecision;
 use crate::test_support::{OpaqueLeaf, OpaquePair};
 

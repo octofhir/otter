@@ -16,6 +16,8 @@
 
 use super::*;
 use crate::FullGcGoal;
+use crate::compressed::cage_base;
+use crate::observation::{GcPauseKind, GcPauseTrigger};
 use crate::page::PAGE_SIZE;
 use crate::test_support::OpaqueLeaf;
 use crate::trace::{SlotVisitor, Traceable};

@@ -18,6 +18,8 @@
 
 use super::*;
 use crate::HandleScope;
+use crate::external::ExternalMemory;
+use crate::page::{CELL_SIZE, align_up};
 use crate::test_support::{OpaqueLeaf, OpaquePair};
 
 struct Backing {

@@ -707,6 +707,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::LogicalNot,
         Kind::TestTypeOf { test: 0 },
         Kind::CheckNumber,
+        Kind::CheckString,
         Kind::CheckNotNullish { mask: 1 },
         Kind::CheckFieldTypes(Default::default()),
         Kind::CheckShapes {
@@ -992,6 +993,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::LogicalNot
         | K::TestTypeOf { .. }
         | K::CheckNumber
+        | K::CheckString
         | K::CheckNotNullish { .. }
         | K::CheckFieldTypes(_)
         | K::CheckShapes { .. }

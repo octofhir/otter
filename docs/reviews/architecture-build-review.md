@@ -924,9 +924,10 @@ scope and validation rather than an incidental broad rewrite.
 
 ## Confirmed next tasks
 
-1. **P0: fix premature string coercion in optimized Add.** Use the preserved
-   reduced reproduction and native artifacts; require current operand proof
-   before conversion and retain native admission, effect order and moving roots.
+1. **P1: finish validation of guarded optimized Add.** The correction and native
+   proofs are recorded below. Complete cold full-suite and after-change Test262
+   validation once disk cleanup is complete; classify the broader observed test
+   failures against baseline without weakening their assertions.
 2. **P1: diagnose the GC-stress watchdog failures.** Keep exact failed paths and
    limits. Re-run the full closing gate after correcting the causes, then the
    separate full checked GC corpus at strides 1–16. Do not turn timeouts into
@@ -942,3 +943,79 @@ scope and validation rather than an incidental broad rewrite.
    before/after clean-build pairs, a separate linking measurement, and a restorative
    build between incremental triggers. Do not promise a 50% LOC reduction without
    identifying the responsibilities actually removed and the checks preserved.
+
+## Optimizing Add: guard current String operands before conversion
+
+Starting from `2e10b49f2`, the new public runtime regression failed before the
+production change: after `labelAfterConcat(1, "!")`, the later numeric loop
+returned `[800020000,["2!",3.5,8],"string",false]` under production tiering.
+Interpreter and Template returned the expected `"number",true`. The failure
+reproduces with synchronous compilation and normal tier admission.
+
+The graph builder now inserts `CheckString` on the unknown counterpart before
+emitting `NumberToString` for a proved numeric Add operand. String-only historical
+feedback still selects the specialization but does not establish that proof.
+When both operands are already proved numeric, or neither receives the early
+conversion, their existing PrimitiveAdd paths remain intact. The number-string
+cache fast path is retained.
+
+The guard has one tagged input, an eager source state and no allocation, runtime
+call or safepoint. Both AArch64 and x86-64 check cell/null bits before reading the
+immutable String type tag. A miss resumes the original Add before conversion.
+Its value-only effect, redundancy and loop-motion contracts follow the existing
+scalar guards. No Value layout, barrier, safepoint format, deopt ABI, runtime-stub
+inventory, dependency or contributor API changed.
+
+Completed checks before the requested Cargo cleanup:
+
+- Both public runtime regressions pass under interpreter, Template and
+  production policies. They cover numeric addition after concat feedback,
+  boolean/null/undefined/double inputs, BigInt/Symbol TypeErrors, ordered and
+  throwing `Symbol.toPrimitive`, exact thrown identity and lone UTF-16 units.
+  The main regression also requires actual optimizing entries.
+- The graph regression checks both operand orders, a current String guard before
+  cached conversion, the original eager source state and native PrimitiveAdd.
+  All **350 JIT unit tests** pass.
+- All **three native primitive-string integration tests** pass on macOS ARM64
+  and on x86-64 under Rosetta. The new proof performs **64 measured native probes
+  per architecture** (two operand orders, cache hit/miss, strides 1–16). Exact
+  installed generations, emitted guard/conversion source PCs, no interpreter
+  replay, real minor collection/slot updates, moved inputs, exact UTF-16 results
+  and subsequent full-GC survival are asserted. A numeric pair produces one
+  exact-generation TypeMismatch at the original Add, no allocating probe, one
+  interpreter Add and result 42. Existing native/GC assertions are unchanged.
+- A release CLI with its own startup image reproduces the old production failure
+  **3/3** and the corrected numeric result **3/3**; interpreter/Template agree.
+  `/private/tmp/otter-add-feedback-release-comparison.json` retains every outcome.
+- Strict workspace all-target/all-feature Clippy passed with the production and
+  native-test changes. The later public coercion test compiled and passed;
+  a final cold all-target Clippy repeat remains pending. Formatting and diff
+  checks pass. Test262 addition baseline is **48/48 passed** with exact rows in
+  `/private/tmp/otter-add-feedback-test262-before.json`; after-change comparison
+  remains pending rather than being inferred from the regressions.
+
+Primary logs: `/private/tmp/otter-add-feedback-{before,after,runtime,builder,native,jit-unit,clippy}.log`
+and `/private/tmp/otter-add-feedback-x86-native.log`. The executed x86-64 test
+binary and checksum are retained at `/private/tmp/otter-add-feedback-x86-native-test`.
+
+The broader VM/runtime/JIT test attempt did not complete: parallel linking ran
+out of disk space. A serial follow-up completed ten two-target batches before
+the user's cleanup request interrupted it. It observed failures in browser event
+and timer tests (`queueMicrotask` unavailable), captured eval chunk accounting
+(`1` rather than `2` evictions), and exact Known-linkage checks in
+`jit_actual_only_calls`. These failures are retained and not all baseline-classified;
+none of those tests or assertions was edited. Full results and individual logs
+are under `/private/tmp/otter-add-feedback-core-batches/`. A later cold full test
+and checked build were explicitly stopped for disk cleanup. Neither invocation
+counts as a passing gate. The earlier complete differential gate remains failed.
+
+The user explicitly requested Cargo and broader disk cleanup. All active task
+builds were stopped. `cargo clean` removed the temporary engine targets and the
+verified Cargo targets of `fml-rs` and `ccda-fhir`; sources, corpora and reports
+were preserved. Local Docker cleanup removed dangling images and unused build
+cache only: all 10 containers and 64 volumes remained. Available space reached
+**57 GiB**. Heavy builds remain stopped. A future run should use one temporary
+target with both dev/test debug information disabled and assertions enabled,
+rather than recreating several debug-info-heavy target trees. Baseline binaries
+and hashes survive separately in `/private/tmp/otter-retained-baseline-binaries/`;
+the former baseline build cache and finished cross target were removed.

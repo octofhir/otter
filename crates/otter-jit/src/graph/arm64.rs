@@ -1869,6 +1869,16 @@ impl<'a> Codegen<'a> {
                 self.load_immediate(16, NUMBER_TAG);
                 dynasm!(self.ops ; .arch aarch64 ; tst X(a), x16 ; b.eq =>exit);
             }
+            Kind::CheckString => {
+                let value = Self::gp(input(0));
+                let exit = self.eager_exit(node, DeoptReason::WrongType);
+                let type_tag = self.view_of(node).string_layout.string_type_tag;
+                self.emit_cell_receiver(value, exit);
+                dynasm!(self.ops ; .arch aarch64
+                    ; ldrb w16, [X(value)]
+                    ; cmp w16, u32::from(type_tag)
+                    ; b.ne =>exit);
+            }
             // A writable site's shapes come from store handlers, which no
             // prototype shape receives; a shape's state never changes, and
             // this code keeps its shapes alive, so an exact match proves the

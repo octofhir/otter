@@ -29,6 +29,8 @@
 //!   slab growth, length coercions, and reentrant setters.
 //! - Species-created arrays and their receivers stay in the interpreter handle
 //!   arena across every allocating property operation.
+//! - Fill and reverse root receivers and pending operands before length/index
+//!   coercion and re-read them after reentrant operations.
 //! - Join snapshots only primitive dense elements; reentrant coercions keep
 //!   indexed reads live and release their scoped roots on every error.
 //! - String conversion roots its receiver across `join` and tag getters;
@@ -47,6 +49,7 @@
 
 mod flatten;
 mod join;
+mod mutate;
 mod push;
 
 #[cfg(test)]
@@ -54,6 +57,9 @@ mod species_rooting_tests;
 
 #[cfg(test)]
 mod join_rooting_tests;
+
+#[cfg(test)]
+mod mutate_tests;
 
 use crate::ValueWindow;
 use crate::native_abi::CommittedValueError;
@@ -1480,174 +1486,6 @@ impl Interpreter {
         })();
         self.pop_iteration_anchors_to(o_anchor);
         result
-    }
-
-    /// §23.1.3.27 live `Array.prototype.reverse`.
-    pub(crate) fn array_reverse(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        receiver: Value,
-        roots: &mut [&mut [Value]],
-    ) -> Result<Value, CommittedValueError> {
-        let o = if receiver.is_object_type() {
-            receiver
-        } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(CommittedValueError::JavaScript)?
-        };
-        let len = length_of_array_like(self, stack, context, &o)?;
-        if len < 2 {
-            return Ok(o);
-        }
-        let bounded_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
-        // Every `[[Get]]`/`[[Set]]` can allocate (an accessor, or copying shared
-        // literal storage out), so the receiver and the two moved values stay
-        // in handles across them.
-        self.with_handle_scope(|interp, scope| {
-            let o_root = interp.scoped_value(scope, o);
-            for lower in 0..(bounded_len / 2) {
-                interp.with_handle_scope(|interp, step| {
-                    let upper = len - lower - 1;
-                    let lower_key = lower.to_string();
-                    let upper_key = format_index_key(upper as f64);
-                    let o = interp.escape_scoped(o_root);
-                    let lower_exists =
-                        interp.array_method_has_property(stack, context, o, &lower_key)?;
-                    let lower_value = if lower_exists {
-                        let o = interp.escape_scoped(o_root);
-                        let value =
-                            interp.array_method_get_property(stack, context, o, &lower_key)?;
-                        Some(interp.scoped_value(step, value))
-                    } else {
-                        None
-                    };
-                    let o = interp.escape_scoped(o_root);
-                    let upper_exists =
-                        interp.array_method_has_property(stack, context, o, &upper_key)?;
-                    let upper_value = if upper_exists {
-                        let o = interp.escape_scoped(o_root);
-                        let value =
-                            interp.array_method_get_property(stack, context, o, &upper_key)?;
-                        Some(interp.scoped_value(step, value))
-                    } else {
-                        None
-                    };
-                    match (lower_value, upper_value) {
-                        (Some(l), Some(u)) => {
-                            let (o, u_value) =
-                                (interp.escape_scoped(o_root), interp.escape_scoped(u));
-                            interp.array_set_property_throwing(
-                                stack, context, o, &lower_key, u_value,
-                            )?;
-                            let (o, l_value) =
-                                (interp.escape_scoped(o_root), interp.escape_scoped(l));
-                            interp.array_set_property_throwing(
-                                stack, context, o, &upper_key, l_value,
-                            )?;
-                        }
-                        (Some(l), None) => {
-                            let o = interp.escape_scoped(o_root);
-                            interp.array_delete_property_throwing(stack, context, o, &lower_key)?;
-                            let (o, l_value) =
-                                (interp.escape_scoped(o_root), interp.escape_scoped(l));
-                            interp.array_set_property_throwing(
-                                stack, context, o, &upper_key, l_value,
-                            )?;
-                        }
-                        (None, Some(u)) => {
-                            let (o, u_value) =
-                                (interp.escape_scoped(o_root), interp.escape_scoped(u));
-                            interp.array_set_property_throwing(
-                                stack, context, o, &lower_key, u_value,
-                            )?;
-                            let o = interp.escape_scoped(o_root);
-                            interp.array_delete_property_throwing(stack, context, o, &upper_key)?;
-                        }
-                        (None, None) => {}
-                    }
-                    Ok::<(), CommittedValueError>(())
-                })?;
-            }
-            Ok(interp.escape_scoped(o_root))
-        })
-    }
-
-    /// §23.1.3.7 live `Array.prototype.fill`.
-    pub(crate) fn array_fill(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        receiver: Value,
-        value: Value,
-        args: ValueWindow<'_>,
-        roots: &mut [&mut [Value]],
-    ) -> Result<Value, CommittedValueError> {
-        let o = if receiver.is_object_type() {
-            receiver
-        } else {
-            self.box_sloppy_this_primitive_runtime_rooted(receiver, roots)
-                .map_err(CommittedValueError::JavaScript)?
-        };
-        let len = length_of_array_like(self, stack, context, &o)?;
-        let start = self.array_relative_index(stack, context, args.get(1), 0.0, len)?;
-        let end = self.array_relative_index(stack, context, args.get(2), len as f64, len)?;
-        let bounded_end = end.min(start.saturating_add(MAX_ARRAY_LIKE_PROBE_LEN));
-        // Filling can allocate (growth, copying shared literal storage out, an
-        // accessor), so the receiver and the value live in handles.
-        self.with_handle_scope(|interp, scope| {
-            let o_root = interp.scoped_value(scope, o);
-            let value_root = interp.scoped_value(scope, value);
-            if let Some(arr) = o.as_array()
-                && crate::array::can_fast_fill_dense_range(
-                    arr,
-                    interp.gc_heap(),
-                    start,
-                    bounded_end,
-                )
-                && !interp
-                    .array_prototype_chain_has_indexed_property(start, bounded_end)
-                    .map_err(CommittedValueError::JavaScript)?
-            {
-                let arr = interp
-                    .escape_scoped(o_root)
-                    .as_array()
-                    .expect("rooted fill receiver");
-                let value = interp.escape_scoped(value_root);
-                let mut external_visit = |visit: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
-                    for root in roots.iter_mut() {
-                        for value in root.iter_mut() {
-                            value.trace_value_slot_mut(visit);
-                        }
-                    }
-                };
-                crate::array::fill_dense_range_with_roots(
-                    arr,
-                    interp.gc_heap_mut(),
-                    start,
-                    bounded_end,
-                    value,
-                    &mut external_visit,
-                )
-                .map_err(|_| interp.err_range(("Invalid array length".to_string()).into()))
-                .map_err(CommittedValueError::JavaScript)?;
-                return Ok(interp.escape_scoped(o_root));
-            }
-            for k in start..bounded_end {
-                let (o, value) = (
-                    interp.escape_scoped(o_root),
-                    interp.escape_scoped(value_root),
-                );
-                interp.array_set_property_throwing(
-                    stack,
-                    context,
-                    o,
-                    &format_index_key(k as f64),
-                    value,
-                )?;
-            }
-            Ok(interp.escape_scoped(o_root))
-        })
     }
 
     fn array_prototype_chain_has_indexed_property(

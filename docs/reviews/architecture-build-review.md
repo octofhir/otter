@@ -1684,3 +1684,76 @@ This slice does not claim complete large-length join conformance or a speed
 improvement. The full closing gate and full checked GC corpus remain open.
 The persistent `/private/tmp/otter-engine-target` and unrelated user files are
 preserved. The retained target occupies **9.0 GiB** at closure.
+
+## Root fill and reverse before reentrant preparation
+
+At `a4b3c05ad`, forced collection in a public receiver's `length` getter
+reproduces a preparation-time use-after-move. With
+`const o = {get length(){gc(); return 0;}}`, `Array.prototype.reverse.call(o)`
+returns a different identity. A two-element reverse, generic fill with a
+collecting length getter, and dense fill with a collecting start coercion all
+abort on the forwarded-cell diagnostic. These isolated CLI probes use
+`--interpreter --expose-gc`; their complete stderr and exits are preserved.
+
+The drivers opened their receiver handles after reading length. Fill also
+carried its pending value and bound inputs through length/start/end coercion
+before creating handles. The native argument window can keep the objects alive
+and move them correctly while these detached Rust copies remain stale. The
+short reverse return bypassed even the later receiver handle.
+
+`array_prototype/mutate.rs` now owns the two existing drivers. Reverse opens
+its receiver handle before ToObject and LengthOfArrayLike and resolves that
+handle on the short return. Fill roots receiver, payload and optional start/end
+operands before any reentrant preparation. Each coercion reads its input from
+the current slot; in particular, end is resolved after start completes. The
+boxed receiver replaces the receiver slot, and dense admission reads the
+current array after all preparation. Existing per-pair reverse handles, dense
+fill admission, prototype proof, reservation/writes, error disposition and
+mutation bounds remain intact. No Value layout, barrier, safepoint, deopt ABI,
+invalidation, native admission threshold, dependency or crate changes.
+
+The focused VM proof exercises the actual native builtins for seven cases:
+empty/pair reverse; empty fill; collecting length getter, length-number, start
+and end coercion. Source and payload are freshly young before entry. Exactly
+one selected child callback performs full collection, both offsets change,
+result/source/payload aliases remain exact, and only the caller's returned
+Local is retained. The start/end cases also prove ordinary dense admission
+before the call. Callback bodies contain no assertions. This proof passes on
+ARM64 and x86_64 under Rosetta.
+
+The shared corpus covers preparation order, captured length after shrink,
+pending operands, empty-range coercion, UTF-16 payloads, collecting indexed
+operations, all four reverse presence branches, holes, Proxy traps without
+enumeration/preliminary prototype traversal, and exact abrupt fill values/order.
+It passes on Node v24.16.0. All four forced-GC public reproducers return true
+after the change in interpreter, Template and production policies (**12/12**).
+
+The affected runtime matrix passes **18/18 per architecture**. All **1307 VM**
+and **350 JIT unit tests** pass; neighboring exact native-generation, no-fallback,
+real-OOM and GC assertions are unchanged. Strict workspace all-target/all-feature
+Clippy, formatting/diff checks, VM/runtime no-default-feature checks and
+CLI/Test262/difftest builds pass. The existing quick GC family passes at stride
+1 and honors the explicit persistent target. Exact Test262 coverage remains
+**22/22 fill + 18/18 reverse**, with identical paths/outcomes, pinned corpus,
+target, assertions and semantic configuration before/after.
+
+Reports live under `/private/tmp/otter-mutate-*`: `public-before.json`,
+`public-after.json`, `rooting.log`, `rooting-x86.log`, `{host,x86}.log`,
+`units.log`, `clippy.log`, `features.log`, `build-final.jsonl`,
+`test262-comparison.json`, `reference.json` and `quick-gc.log`. Verified
+pre-change CLI/runner executables remain in `otter-mutate-before-tools`.
+
+The new mutation corpus passes the existing process-isolated GC driver
+**48/48** at strides 1–16 across interpreter, Template and production modes.
+`/private/tmp/otter-mutate-gc/results.json` reports `status: passed`, with
+unchanged binary/source hashes and a complete `runs.jsonl` journal. The
+standalone differential runner passes the mutation, join and flatten corpora
+in interpreter, Template, production and GC stride 16 modes, with zero timeouts.
+Final identities and commands/results are collected in
+`/private/tmp/otter-mutate-{inputs,validation}.json`.
+
+Full-range mutation clamps and loop-control admission remain separate work.
+This slice fixes preparation/root ownership, without claiming complete large
+fill/reverse conformance or a speed gain. The full closing gate and full
+checked GC corpus remain open. The persistent Cargo target and unrelated user
+files are preserved.

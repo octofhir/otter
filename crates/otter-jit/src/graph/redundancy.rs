@@ -99,6 +99,7 @@ fn origin_free(kind: &Kind) -> bool {
             | Kind::BooleanToInt32
             | Kind::CheckBounds
             | Kind::CheckNumber
+            | Kind::CheckString
             | Kind::CheckNotHole
             | Kind::LoadReceiverShape
             | Kind::CheckShapes { .. }

@@ -240,6 +240,7 @@ fn proves_inputs(kind: &Kind) -> bool {
         | Kind::CheckHoleyElementPresent(_)
         | Kind::CheckBounds
         | Kind::CheckNumber
+        | Kind::CheckString
         | Kind::CheckNotNullish { .. }
         | Kind::CheckNotHole
         | Kind::CheckedNumberToInt32
@@ -338,6 +339,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::LogicalNot
         | Kind::TestTypeOf { .. }
         | Kind::CheckNumber
+        | Kind::CheckString
         | Kind::CheckNotNullish { .. }
         | Kind::CheckBounds
         | Kind::CheckNative(..)

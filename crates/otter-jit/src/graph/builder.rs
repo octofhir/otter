@@ -64,6 +64,8 @@
 //! - A held method or a source with one closure context may fold watched
 //!   context slots. Source and slot dependencies guard the respective facts;
 //!   each slot store notifies its context's watch.
+//! - Concat feedback does not prove current string operands. A speculative
+//!   Number-to-String conversion first guards the other Add operand as String.
 //!
 //! # See also
 //! - [`super::bytecode`] — blocks, loops and liveness.
@@ -2786,9 +2788,15 @@ impl<'a> Builder<'a> {
             return;
         }
         if op == Op::Add && feedback.is_primitive_string_concat_only() {
-            // A side proved a Number joins as its cached decimal string, so
-            // the concatenation itself sees two strings.
+            // A proved Number can use its cached decimal string only while
+            // the other operand is a String. Feedback describes past pairs;
+            // an unknown current operand can also be numeric (including an
+            // inlined conditional whose representation is resolved later).
             let numbers = [self.is_number(lhs), self.is_number(rhs)];
+            if numbers[0] != numbers[1] {
+                let string = self.tagged(if numbers[0] { rhs } else { lhs });
+                self.add(Kind::CheckString, &[string], Repr::None);
+            }
             let mut operands = [lhs, rhs];
             for (operand, number) in operands.iter_mut().zip(numbers) {
                 let tagged = self.tagged(*operand);

@@ -1,7 +1,7 @@
 //! x86-64 Graph guards over current object, indexed and callable layouts.
 //!
 //! # Contents
-//! - Shape, body, bounds, hole and detach-protector checks.
+//! - Primitive String, shape, body, bounds, hole and detach-protector checks.
 //! - Native/function identity, intrinsic-prototype method and
 //!   Function.prototype.call proofs.
 //! - Shared ordinary-receiver and exact body-word checks.
@@ -45,6 +45,14 @@ impl Codegen<'_> {
                 let exit = self.eager_exit(node, DeoptReason::WrongType);
                 self.load_immediate(10, tag::NUMBER_TAG);
                 dynasm!(self.ops ; .arch x64 ; test Rq(input(0)), r10 ; jz =>exit);
+            }
+            Kind::CheckString => {
+                let exit = self.eager_exit(node, DeoptReason::WrongType);
+                let type_tag = self.view_of(node).string_layout.string_type_tag;
+                self.emit_cell_guard(input(0), exit);
+                dynasm!(self.ops ; .arch x64
+                    ; cmp BYTE [Rq(input(0))], type_tag as i8
+                    ; jne =>exit);
             }
             // A writable site's shapes come from store handlers, which no
             // prototype shape receives; a shape's state never changes, and

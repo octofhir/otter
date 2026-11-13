@@ -124,7 +124,8 @@ fn may_leave_at_header(kind: &Kind, header: &LoopHeader) -> bool {
         Kind::CheckedNumberToInt32
         | Kind::CheckedTaggedToFloat64
         | Kind::CheckedFloat64ToInt32
-        | Kind::CheckNumber => return header.speculate,
+        | Kind::CheckNumber
+        | Kind::CheckString => return header.speculate,
         Kind::CheckedTaggedToIndex | Kind::CheckedFloat64ToIndex => {
             if !header.speculate {
                 return false;

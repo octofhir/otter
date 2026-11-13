@@ -522,6 +522,9 @@ pub(crate) enum Kind {
     // ---- Checks ----
     /// Eager deopt unless input0 is a Number.
     CheckNumber,
+    /// Eager deopt unless input0 is a primitive String. In particular, string
+    /// feedback alone cannot justify converting the other operand of Add.
+    CheckString,
     /// Eager deopt if input0 is one of the nullish categories in `mask`.
     CheckNotNullish {
         mask: u8,
@@ -1160,6 +1163,7 @@ impl Kind {
             | Self::CheckedTaggedToIndex
             | Self::CheckedFloat64ToIndex
             | Self::CheckNumber
+            | Self::CheckString
             | Self::IsArray
             | Self::CheckNotNullish { .. }
             | Self::CheckShapes { .. }
@@ -1886,7 +1890,7 @@ impl Kind {
                 fixed_gp_clobbers: SmallVec::new(),
             },
             Self::ToBoolean | Self::LogicalNot => simple(1, ResultPolicy::Register),
-            Self::CheckNumber => simple(1, ResultPolicy::None),
+            Self::CheckNumber | Self::CheckString => simple(1, ResultPolicy::None),
             Self::CheckNotNullish { .. } => simple(1, ResultPolicy::None),
             Self::CheckShapes { .. } | Self::CheckElements { .. } => simple(1, ResultPolicy::None),
             Self::StoreOwnField { owners, .. } => Constraints {

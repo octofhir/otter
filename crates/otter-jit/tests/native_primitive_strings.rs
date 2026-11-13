@@ -4,6 +4,7 @@
 //! - Production-policy native concat fits, collecting probes and mixed Numbers.
 //! - Exact UTF-16 flat/rope/slice ordering and unordered numeric comparisons.
 //! - Own generation artifacts, managed accounting and complete source traces.
+//! - Guarded number conversion with retained native generations under stress.
 //!
 //! # Invariants
 //! All retained inputs use collector-rewritten handles. The measured concat
@@ -36,6 +37,9 @@ use otter_vm::{
 use serde_json::Value as Json;
 use smallvec::smallvec;
 use std::sync::{Arc, Mutex};
+
+#[path = "native_primitive_strings/concat_feedback.rs"]
+mod concat_feedback;
 
 const OPERATIONS: [Op; 6] = [
     Op::LessThan,

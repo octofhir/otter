@@ -7,9 +7,10 @@
 //!
 //! # Why this is cheap here
 //!
-//! Every GC pointer is a 32-bit cage offset ([`crate::compressed`]), not
-//! an address, so a restored page needs no address translation. What it
-//! does need is *relocation*: the cage hands out pages from a free list
+//! GC handles use 32-bit cage offsets ([`crate::compressed`]). Tagged words
+//! may also retain the capture process's cage prefix; their mutable tracers
+//! rebase that prefix under the image's exclusive relocation scope. Pages
+//! also need *relocation*: the cage hands out pages from a free list
 //! and cannot promise the same offsets twice, and a second isolate in the
 //! same process could not have them anyway. Relocation is therefore a
 //! uniform per-page delta added to every pointer slot, and the trace
@@ -38,6 +39,9 @@
 //!   pointing outside the image is an error, not a silently kept stale
 //!   offset. The collector's weak registries are not part of the image: the
 //!   VM registers each restored weak body again.
+//! - The capture cage base is carried in the one current image format.
+//!   Full-address rebasing accepts only that prefix, only during the trace
+//!   walks. Ordinary GC and mutator pointer validation stay unchanged.
 //! - Restored pages are old-generation and unmarked. The image carries no
 //!   mark state; a restore starts a fresh collection cycle.
 //! - An image never crosses an executable or type-layout boundary. It
@@ -184,6 +188,8 @@ struct PageImage {
 /// A captured old generation.
 #[derive(Clone)]
 pub struct HeapImage {
+    /// Cage base whose full-width addresses the captured bodies contain.
+    source_cage_base: u64,
     pages: Vec<PageImage>,
     /// Live objects captured, for diagnostics and for sizing a restore.
     object_count: u64,
@@ -218,6 +224,7 @@ impl HeapImage {
 
     /// Append the image's pages and counts to `out`.
     pub fn encode(&self, out: &mut crate::image_codec::ImageWriter) {
+        out.u64(self.source_cage_base);
         out.u64(self.object_count);
         out.u64(self.live_bytes);
         out.len(self.pages.len());
@@ -235,6 +242,10 @@ impl HeapImage {
     /// The bytes must be an image this same executable encoded: restoring
     /// them trusts every page byte as a body this build laid out.
     pub unsafe fn decode(input: &mut crate::image_codec::ImageReader<'_>) -> Option<Self> {
+        let source_cage_base = input.u64()?;
+        if source_cage_base == 0 || source_cage_base & u64::from(u32::MAX) != 0 {
+            return None;
+        }
         let object_count = input.u64()?;
         let live_bytes = input.u64()?;
         let page_count = input.len()?;
@@ -253,6 +264,7 @@ impl HeapImage {
             });
         }
         Some(Self {
+            source_cage_base,
             pages,
             object_count,
             live_bytes,
@@ -358,6 +370,7 @@ impl GcHeap {
         }
         pages.sort_by_key(|p| p.cage_offset);
         Ok(HeapImage {
+            source_cage_base: crate::cage_base() as u64,
             pages,
             object_count: census.old.object_count,
             live_bytes: census.old.live_bytes,
@@ -502,6 +515,7 @@ impl GcHeap {
         // verbatim. Done before the pages are adopted so a failure
         // leaves the heap untouched and the pages simply drop back to
         // the cage.
+        let cage_scope = crate::image_cage::ImageCageScope::enter(image.source_cage_base);
         let mut failure: Option<ImageError> = None;
         // Per type tag: the restored bodies and their bytes, for the heap's
         // statistics, which count allocations and would otherwise miss them.
@@ -577,6 +591,8 @@ impl GcHeap {
                 });
             }
         }
+
+        drop(cage_scope);
 
         // 4) Adopt the pages and account for what they hold.
         for (_, page) in placed {

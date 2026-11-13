@@ -43,6 +43,8 @@
 //!   by value and apply the appropriate NaN and signed-zero rules.
 //! - Cell addresses retain the cage prefix in bits 32..48 and have zero high
 //!   16 bits. Moving GC updates their low 32-bit compressed offset in place.
+//!   Image restoration first rebases full mutable words under the captured
+//!   cage's authenticated, exclusive relocation scope.
 //! - Heap family discrimination uses [`otter_gc::header::GcHeader::type_tag`].
 //!   Number and immediate tags distinguish values without reading a header.
 //!
@@ -2040,9 +2042,14 @@ impl Value {
         }
     }
 
-    /// Visit this value as an explicitly mutable root slot.
+    /// Visit this value as an explicitly mutable root slot. Copied image words
+    /// first rebase their authenticated capture-process cage prefix; ordinary
+    /// tracing still rejects a foreign prefix under the existing assertion.
     pub(crate) fn trace_value_slot_mut(&mut self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
         if is_cell_bits(self.0) {
+            if self.0 >> 32 != (otter_gc::cage_base() as u64) >> 32 {
+                self.0 = otter_gc::raw::rebase_image_address(self.0);
+            }
             debug_assert_eq!(
                 self.0 >> 32,
                 (otter_gc::cage_base() as u64) >> 32,
@@ -2537,6 +2544,18 @@ mod tests {
         let v = Value::function_id(0);
         assert_eq!(v.as_closure(&heap), None);
         assert!(v.is_callable());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "non-cage high word")]
+    fn ordinary_mutable_tracing_still_rejects_a_foreign_cage_prefix() {
+        let _heap = otter_gc::GcHeap::new().expect("heap");
+        let mut value = Value(
+            (otter_gc::cage_base() as u64 + (1 << 32)) | 0x4_0040,
+            std::marker::PhantomData,
+        );
+        value.trace_value_slot_mut(&mut |_| panic!("foreign slot reached the visitor"));
     }
 
     #[test]

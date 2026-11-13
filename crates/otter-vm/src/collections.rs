@@ -27,6 +27,8 @@
 //!   after that reservation returns.
 //! - `JsWeakMap` / `JsWeakSet` reject values that cannot be held weakly with
 //!   [`CollectionError::NonObjectKey`].
+//! - WeakMap ephemeron values expose mutable slots, including the full cage
+//!   address word that image relocation must rebase before page relocation.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-map-objects>
@@ -1376,7 +1378,7 @@ fn weak_map_ephemeron_walk(
         if let WeakCollectionKey::Object(raw) = key {
             let key_slot = raw as *mut RawGc;
             let mut visit_value_slots =
-                |slot_visitor: &mut SlotVisitor<'_>| value.trace_value_slots(slot_visitor);
+                |slot_visitor: &mut SlotVisitor<'_>| value.trace_value_slot_mut(slot_visitor);
             visitor(key_slot, &mut visit_value_slots);
         }
     }

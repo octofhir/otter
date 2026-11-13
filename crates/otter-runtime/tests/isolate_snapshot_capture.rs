@@ -15,17 +15,23 @@ use otter_modules::OtterModulesBuilderExt;
 use otter_node::NodeApiBuilderExt;
 use otter_web::WebApiBuilderExt;
 
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[path = "isolate_snapshot_capture/startup_image_process.rs"]
+mod startup_image_process;
+
 fn build_runtime(builder: otter_runtime::RuntimeBuilder) -> Box<otter_runtime::Runtime> {
     Box::new(builder.build().expect("runtime build"))
 }
 
 fn full_surface_runtime() -> Box<otter_runtime::Runtime> {
-    build_runtime(
-        otter_runtime::Runtime::builder()
-            .with_node_apis()
-            .with_otter_modules()
-            .with_web_apis(),
-    )
+    build_runtime(full_surface_builder())
+}
+
+fn full_surface_builder() -> otter_runtime::RuntimeBuilder {
+    otter_runtime::Runtime::builder()
+        .with_node_apis()
+        .with_otter_modules()
+        .with_web_apis()
 }
 
 fn restore_runtime(snapshot: &otter_runtime::RuntimeSnapshot) -> Box<otter_runtime::Runtime> {

@@ -10,7 +10,6 @@ A targeted pass does not establish a green workspace or market leadership.
 |---|---|---|
 | P0 | **Finish the closing gate.** `scripts/gate.sh`, runtime integration tests. The last complete differential gate failed; subsequent slices passed focused matrices only. | Reclassify failures on current HEAD against a comparable baseline, fix their causes, and complete the unchanged gate. Preserve native admission, exact generations, no replay/fallback, real OOM and moving-GC assertions. |
 | P0 | **Diagnose GC-stress watchdog failures.** `scripts/dev/gc-stress.py`, `otter-difftest`, GC/VM. Existing full reports contain timed-out candidate processes. | Preserve exact paths, watchdogs and outcomes; attribute startup, verification and mutator cost separately. Complete the full checked-profile corpus at strides 1–16 with `status: passed`. No filtered corpus or timeout-as-agreement verdict. |
-| P0 | **Reproduce and isolate startup-image failures.** `isolate_snapshot_capture`, startup-image restore. An older restored release executable crashed before source; current shipped-image coverage is incomplete. | Compare raw/restored launches from the same current binary/profile, including fresh processes, restored allocation pressure and weak/bootstrap bodies. Classify the old crash separately from current failures. |
 | P1 | **Separate Array semantics from materialization limits.** `array_prototype.rs`, `array_prototype/{mutate,join}.rs`; inspect remaining `MAX_ARRAY_LIKE_PROBE_LEN` uses individually. Fill still truncates its span; join retains a length ceiling and eager length-sized scratch vectors. | Concrete public regressions for each driver; complete live ordered property attempts, bounded scratch/root retention, cancellation and explicit allocation/output limits. Preserve UTF-16, species and observable error order. |
 | P1 | **Account for dense bulk native work.** `array_fill` and existing bulk helpers. Generic-loop checks alone do not control admitted dense fill. | Reject/Yield/interrupt proofs on the actual admitted path, correct committed-prefix policy, and comparable hot-path measurements. Keep reservation, descriptor/prototype proofs and barriers intact. |
 | P1 | **Resolve remaining broad-suite failures.** Runtime GC/JIT, snapshot, compile-fail and audit fixtures. Older baseline reports contain failures outside the repaired global-binding/known-native targets. | Reproduce current failures first; distinguish engine bugs, stale contracts and environment restrictions. Fix owners and fixtures together without weakening safety or native-execution proofs. |
@@ -18,7 +17,7 @@ A targeted pass does not establish a green workspace or market leadership.
 
 Start broad-suite reclassification with `gc_atomics_wait_async_result`,
 `code_chunk_eviction`, `jit_actual_only_calls`, `jit_canonical_homes_gc`,
-`jit_stack_owned_array_construct`, snapshot restore, runtime `compile_fail`,
+`jit_stack_owned_array_construct`, runtime `compile_fail`,
 `dependency_graph`, `step_trace_golden` and `tokio_spawn_audit`. These are leads
 from prior failures, not a claim that every named target currently fails.
 The retained baseline identities are in

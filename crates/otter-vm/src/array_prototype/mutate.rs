@@ -12,7 +12,9 @@
 //! - Fill captures length once and coerces start before end, including empty
 //!   ranges. The pending end is never cached across start coercion.
 //! - Reverse retains both fetched values across subsequent getters and writes.
-//! - Existing mutation bounds, dense guards, allocator and barriers are intact.
+//! - Reverse walks every pair in the captured length, with a native work and
+//!   cancellation checkpoint before each pair, including two absent indices.
+//! - Fill's existing materialization bounds, dense guards and barriers remain.
 //!
 //! # See also
 //! - `super::Interpreter::array_prototype_chain_has_indexed_property` owns fill's chain proof.
@@ -46,8 +48,10 @@ impl Interpreter {
             if len < 2 {
                 return Ok(interp.escape_scoped(o_root));
             }
-            let bounded_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
-            for lower in 0..(bounded_len / 2) {
+            for lower in 0..(len / 2) {
+                interp
+                    .charge_native_loop_iteration()
+                    .map_err(CommittedValueError::Fatal)?;
                 interp.with_handle_scope(|interp, step| {
                     let upper = len - lower - 1;
                     let lower_key = lower.to_string();

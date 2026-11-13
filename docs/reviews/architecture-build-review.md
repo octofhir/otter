@@ -1826,3 +1826,77 @@ and validation results are recorded in
 The full closing gate, full checked GC corpus and outstanding large-range
 mutation/materialization policies remain open. No speed improvement is claimed;
 the persistent Cargo cache and unrelated user files remain preserved.
+
+## Complete and control every reverse pair
+
+At `4024f6ef6`, `Array.prototype.reverse` independently truncates its loop to
+half of `min(length, 2^25)`. A generic receiver of length `2^25 + 2` with a
+throwing getter at index `2^24` returns normally instead of reaching that final
+pair. The isolated pre-change CLI returns `[false,33554434]`; installed Node
+returns `[true,33554434]` for the same exact thrown-identity probe. The
+[standard reverse algorithm](https://tc39.es/ecma262/multipage/indexed-collections.html#sec-array.prototype.reverse)
+visits all pairs up to `floor(captured length / 2)`. This is an observable
+property-order defect, not a dense allocation limit.
+
+The same native loop has no work or cancellation checkpoint. A 20,000-length
+ordinary hole receiver completes with only 62 reported work units under a
+1,000-unit rejecting budget. New public-runtime budget, yield and cancellation
+tests all fail before the fix. The cancellation safety sentinel independently
+bounds a broken implementation at a third native HasProperty callback; it
+reports an invalid operand instead of the expected interruption.
+
+The reverse driver now owns the full captured pair range and calls the
+existing native iteration checkpoint before every pair. Rejection and
+interruption retain fatal disposition; yielding rotates the owning work slice
+without returning to the JavaScript job queue. Both-absent pairs still consume
+work. There is no preliminary enumeration, eager scan, new allocation,
+dynamic dispatch, or alternate receiver implementation. Existing ToObject and
+length preparation, per-pair scoped roots and Has/Get/Set/Delete order remain
+unchanged. Fill's separate materialization bound and admission are unchanged.
+
+The runtime regression deliberately traverses the former ceiling rather than
+using an early-throw large-length case as proof of complete range coverage.
+Other cases cover ordinary and Array holes under a rejecting budget, fatal
+completion bypassing source catches, runtime reuse after GC, exact native
+HasProperty cancellation between pairs, and yielding without early microtask
+delivery. The shared small corpus covers odd/even/short lengths, holes,
+UTF-16 payload identity, a maximum-safe length with live length mutation,
+ordered Proxy operations, exact thrown identity and no enumeration/prototype
+prewalk. It passes on installed Node; the existing preparation corpus retains
+all four reverse presence branches and moving-GC proofs.
+
+The final affected runtime matrix passes **29/29 on ARM64** and **29/29 on
+x86_64 under Rosetta**, including all five new tests and the complete range in
+every execution policy. The standalone public CLI range probe now returns
+`[true,33554434]` in interpreter, Template and production modes. All **1307 VM**
+and **350 JIT unit tests** pass; the actual moving preparation/root-extent proof
+also passes separately on x86_64. Existing native-generation, no-fallback,
+real-OOM and GC assertions are unchanged. Strict workspace all-target/all-feature
+Clippy, VM/runtime no-default-feature checks, formatting/diff checks and the
+CLI/Test262/difftest build pass. The existing quick GC family passes at stride
+1 and inherits the explicit persistent `CARGO_TARGET_DIR`.
+
+Test262 reverse coverage remains **18/18**, with identical exact paths and
+outcomes before/after and matching corpus, target, assertions and semantic
+configuration. The standalone differential runner passes the new reverse,
+preparation and fill-length-guard corpora across interpreter, Template,
+production and GC stride 16, with zero timeouts. Pre-change CLI/runner binaries
+and hashes remain in `/private/tmp/otter-reverse-control-before-tools`.
+
+Reports are retained under `/private/tmp/otter-reverse-control-*`, including
+`commands.json`, `tests-{before,after}.log`, `range-{before,after}.json`,
+`reference.json`, `{host,x86}.log`, `units.log`, `clippy.stderr.log`,
+`features.stderr.log`, `build.jsonl`, `rooting-x86.log`,
+`test262-comparison.json`, `difftest.json`, `quick-gc.log` and `fmt.log`.
+
+The new reverse corpus passes the existing process-isolated GC driver
+**48/48** at strides 1–16 across all three execution policies.
+`/private/tmp/otter-reverse-control-gc/results.json` reports `status: passed`
+with zero failures, unchanged source/executable hashes and a complete
+`runs.jsonl` journal. Final source/executable identities and results are
+recorded in `/private/tmp/otter-reverse-control-{inputs,validation}.json`.
+
+This closes reverse's range/control limitation. Fill and join materialization
+bounds, the full closing gate and the full checked GC corpus remain separate
+work. No speed improvement is claimed. The persistent Cargo target and
+unrelated user files remain preserved; dependencies and toolchain are unchanged.

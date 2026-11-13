@@ -929,8 +929,9 @@ scope and validation rather than an incidental broad rewrite.
    now pass, as recorded below. Classify and correct the broader test failures
    against baseline without weakening their assertions; a successful targeted
    subset does not close this task.
-   The baseline `jit_global_access` stack-overflow abort deserves priority over
-   fixture cleanup; preserve its exact native/GC assertions while diagnosing it.
+   The `jit_global_access` abort was traced to its fixture stack footprint and
+   repaired below. Its four exposed guard/call/foreign-realm proof failures still
+   need diagnosis with the exact native/GC assertions preserved.
 2. **P1: diagnose the GC-stress watchdog failures.** Keep exact failed paths and
    limits. Re-run the full closing gate after correcting the causes, then the
    separate full checked GC corpus at strides 1–16. Do not turn timeouts into
@@ -1168,3 +1169,49 @@ their SHA-256 manifest survive at
 in all three policies after relocation. Test reports and baseline evidence are
 preserved outside the cleaned target. No dependency/toolchain update, unrelated
 cache cleanup or performance claim accompanies this change.
+
+## Restore the global-binding native proof on the default test stack
+
+At `5207e788e`, the exact dictionary/epoch/descriptor regression again aborts
+with SIGABRT. LLDB stops in the stack probe of
+`Interpreter::with_string_heap_cap`, through the first `Harness::new` and
+`RuntimeBuilder::build`, before JavaScript runs. This is fixture stack pressure,
+not demonstrated JavaScript recursion or a native binding fallback failure.
+The test's ARM64 unoptimized prologue reserves 735712 bytes, including saved
+registers: eight by-value harness locals retain large runtime/oracle pairs and
+leave too little stack for normal construction. The simplified public CLI
+getter probe passes under interpreter, Template and production policies.
+
+An investigative 8-MiB-stack run proceeds to another stale fixture assumption:
+the emitted `write_barrier` has descriptor id 25, while the fixture expects 26
+(currently `copy_context_alloc`). The committed correction does not enlarge
+the test stack. Each independent scenario constructs and drops its pair inside
+a scoped helper, retaining a fresh epoch/layout for every miss. The test's own
+measured ARM64 frame is now 96 bytes. The barrier check uses the canonical
+`STUB_WRITE_BARRIER.id`, keeps its exact name and call-count checks, and also
+requires the mutating two-value leaf signature. Every original source program,
+expected result, cold-transition count, exact-generation, no-deopt/no-replay and
+GC assertion remains in place. No runtime allocation, VM layout or ABI changes.
+
+The previously aborting regression passes **10/10** standalone repetitions on
+the default Rust test stack, with all eight scenarios and nine probes each.
+The full target now completes **4 passed /
+4 failed**, rather than aborting the process. Passing coverage includes lexical
+cells, own loop OSR and the existing exact moving-child checks at strides 1–16.
+The still-failing tests are intentionally not relaxed:
+
+- `heap_only_frozen_ordinary_globals_decline_current_native_strict_and_sloppy_stores`
+  rejects a dictionary discriminator in its ordinary-guard region.
+- `frozen_dictionary_globals_decline_current_native_strict_and_sloppy_stores`
+  and `sealed_dictionary_globals_retire_descriptor_guards_and_keep_writable_stores`
+  do not find the expected private-JS observer edge.
+- `foreign_realms::foreign_callable_binding_misses_keep_defining_realm_and_moving_actuals`
+  observes interpreter dispatch of the foreign body during its native probe.
+
+Strict workspace all-target/all-feature Clippy passes. Formatting/diff checks
+pass; the focused native target was run on macOS ARM64 with assertions enabled,
+both dev/test debug information disabled, and no `RUST_MIN_STACK` override. This
+is restored test coverage, not an engine stack-safety or performance claim, nor
+a passing full gate. Primary evidence is retained at
+`/private/tmp/otter-binding-{before,after-fixture,suite,clippy}.log` and
+`/private/tmp/otter-binding-{before-backtrace,before-disassembly,after-disassembly}.txt`.

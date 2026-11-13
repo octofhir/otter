@@ -16,6 +16,8 @@
 //! - Read hits have no calls; a store hit owns only the canonical NoGC barrier.
 //!   Each cold region owns one committed binding call.
 //! - Observable getters, setters and argument evaluation execute exactly once.
+//! - Independent dictionary misses drop their runtime/oracle pair before the
+//!   next case; the default Rust test stack must reach all native assertions.
 //! - Collecting callbacks retain only scoped handles and owned motion records;
 //!   all fixture assertions run after returning from the native callback.
 //!
@@ -157,7 +159,11 @@ fn assert_binding_regions(bundle: &JitArtifactBundle, hit: bool, lexical: bool) 
         assert_eq!(hit_calls.len(), usize::from(barrier));
         if barrier {
             assert_eq!(hit_calls[0]["target"]["name"], "write_barrier");
-            assert_eq!(hit_calls[0]["target"]["id"], 26);
+            assert_eq!(
+                hit_calls[0]["target"]["id"].as_u64(),
+                Some(u64::from(otter_vm::native_abi::STUB_WRITE_BARRIER.id))
+            );
+            assert_eq!(hit_calls[0]["target"]["signature"], "mutatingLeafValue2");
         }
         assert!(
             matches!(
@@ -1161,73 +1167,83 @@ for (let warm = 0; warm < 5000; warm++) {
     ];
     // Each miss starts with the original epoch and descriptor layout, so an
     // earlier epoch failure cannot hide the dictionary or descriptor guard.
-    let fresh = || {
-        let harness = Harness::new(setup, &names, false, None);
+    // Keep each pair in the callee's frame instead of returning eight large
+    // Harness values into this test's frame in an unoptimized build.
+    fn with_fresh(setup: &str, names: &[&'static str], check: impl FnOnce(&mut Harness)) {
+        let mut harness = Harness::new(setup, names, false, None);
         for proof in harness.proofs.values() {
             assert_binding_regions(&proof.bundle, true, false);
         }
         assert_strict_global_store_operations(&harness.proofs["writeDictionaryBinding"].bundle);
-        harness
-    };
-    let mut harness = fresh();
-    assert_eq!(harness.probe("JSON.stringify([readEpochBinding(), writeDictionaryBinding(9), readDictionaryBinding()]);", "[3,9,9]", &["readEpochBinding", "writeDictionaryBinding", "readDictionaryBinding"]), 0);
-    assert_eq!(
-        harness.probe(
-            "globalThis.dictionaryBinding = 13; readDictionaryBinding();",
-            "13",
-            &["readDictionaryBinding"]
-        ),
-        0,
-        "same-slot value replacement stays a live native hit"
-    );
-    let mut harness = fresh();
-    assert_eq!(
-        harness.probe(
-            "let epochBinding = 29; readEpochBinding();",
-            "29",
-            &["readEpochBinding"]
-        ),
-        1
-    );
-    let mut harness = fresh();
-    assert_eq!(
-        harness.probe(
-            "let unrelatedLexical = 31; readEpochBinding() + unrelatedLexical;",
-            "34",
-            &["readEpochBinding"]
-        ),
-        0,
-        "a lexical that shadows no global property keeps the read native"
-    );
-    let mut harness = fresh();
-    assert_eq!(
-        harness.probe(
-            "globalThis.bindingAddedAfterCompile = 1; readDictionaryBinding();",
-            "5",
-            &["readDictionaryBinding"]
-        ),
-        0,
-        "appending an unrelated key preserves the watched slot layout"
-    );
-    let mut harness = fresh();
-    assert_eq!(
-        harness.probe(
-            "delete globalThis.dictionaryBinding; globalThis.dictionaryBinding = 5; readDictionaryBinding();",
-            "5",
-            &["readDictionaryBinding"]
-        ),
-        1,
-        "removing the watched slot changes its guarded dictionary layout"
-    );
-    let mut harness = fresh();
-    assert_eq!(harness.probe("Object.defineProperty(globalThis, 'dictionaryBinding', {get() { descriptorGetterCalls++; return 41; }, configurable: true}); JSON.stringify([readDictionaryBinding(), descriptorGetterCalls]);", "[41,1]", &["readDictionaryBinding"]), 1);
-    let mut harness = fresh();
-    // Strict assignment snapshots existence before the RHS, then performs
-    // the checked store. The changed layout makes both exact operations cold;
-    // argument evaluation and the throwing store still happen once.
-    assert_eq!(harness.probe("{ let effects = 0; let kind = ''; Object.defineProperty(globalThis, 'dictionaryBinding', {value: 43, writable: false, configurable: true}); try { writeDictionaryBinding(++effects); } catch (error) { kind = error.name; } JSON.stringify([kind, effects, dictionaryBinding]); }", "[\"TypeError\",1,43]", &["writeDictionaryBinding"]), 2);
-    let mut harness = fresh();
-    assert_eq!(harness.probe("Object.defineProperty(globalThis, 'dictionaryBinding', {get() { return descriptorStored; }, set(value) { descriptorSetterCalls++; descriptorStored = value; }, configurable: true}); JSON.stringify([writeDictionaryBinding(47), descriptorSetterCalls, descriptorStored]);", "[47,1,47]", &["writeDictionaryBinding"]), 2);
+        check(&mut harness);
+    }
+    with_fresh(setup, &names, |harness| {
+        assert_eq!(harness.probe("JSON.stringify([readEpochBinding(), writeDictionaryBinding(9), readDictionaryBinding()]);", "[3,9,9]", &["readEpochBinding", "writeDictionaryBinding", "readDictionaryBinding"]), 0);
+        assert_eq!(
+            harness.probe(
+                "globalThis.dictionaryBinding = 13; readDictionaryBinding();",
+                "13",
+                &["readDictionaryBinding"]
+            ),
+            0,
+            "same-slot value replacement stays a live native hit"
+        );
+    });
+    with_fresh(setup, &names, |harness| {
+        assert_eq!(
+            harness.probe(
+                "let epochBinding = 29; readEpochBinding();",
+                "29",
+                &["readEpochBinding"]
+            ),
+            1
+        );
+    });
+    with_fresh(setup, &names, |harness| {
+        assert_eq!(
+            harness.probe(
+                "let unrelatedLexical = 31; readEpochBinding() + unrelatedLexical;",
+                "34",
+                &["readEpochBinding"]
+            ),
+            0,
+            "a lexical that shadows no global property keeps the read native"
+        );
+    });
+    with_fresh(setup, &names, |harness| {
+        assert_eq!(
+            harness.probe(
+                "globalThis.bindingAddedAfterCompile = 1; readDictionaryBinding();",
+                "5",
+                &["readDictionaryBinding"]
+            ),
+            0,
+            "appending an unrelated key preserves the watched slot layout"
+        );
+    });
+    with_fresh(setup, &names, |harness| {
+        assert_eq!(
+            harness.probe(
+                "delete globalThis.dictionaryBinding; globalThis.dictionaryBinding = 5; readDictionaryBinding();",
+                "5",
+                &["readDictionaryBinding"]
+            ),
+            1,
+            "removing the watched slot changes its guarded dictionary layout"
+        );
+    });
+    with_fresh(setup, &names, |harness| {
+        assert_eq!(harness.probe("Object.defineProperty(globalThis, 'dictionaryBinding', {get() { descriptorGetterCalls++; return 41; }, configurable: true}); JSON.stringify([readDictionaryBinding(), descriptorGetterCalls]);", "[41,1]", &["readDictionaryBinding"]), 1);
+    });
+    with_fresh(setup, &names, |harness| {
+        // Strict assignment snapshots existence before the RHS, then performs
+        // the checked store. The changed layout makes both exact operations cold;
+        // argument evaluation and the throwing store still happen once.
+        assert_eq!(harness.probe("{ let effects = 0; let kind = ''; Object.defineProperty(globalThis, 'dictionaryBinding', {value: 43, writable: false, configurable: true}); try { writeDictionaryBinding(++effects); } catch (error) { kind = error.name; } JSON.stringify([kind, effects, dictionaryBinding]); }", "[\"TypeError\",1,43]", &["writeDictionaryBinding"]), 2);
+    });
+    with_fresh(setup, &names, |harness| {
+        assert_eq!(harness.probe("Object.defineProperty(globalThis, 'dictionaryBinding', {get() { return descriptorStored; }, set(value) { descriptorSetterCalls++; descriptorStored = value; }, configurable: true}); JSON.stringify([writeDictionaryBinding(47), descriptorSetterCalls, descriptorStored]);", "[47,1,47]", &["writeDictionaryBinding"]), 2);
+    });
 }
 
 #[test]

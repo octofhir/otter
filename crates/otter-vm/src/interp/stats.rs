@@ -15,7 +15,7 @@
 //!
 //! # See also
 //! - [`crate::work_budget`] owns the unified counter and enforcement policy.
-//! - [`crate::array_prototype`] checkpoints full FindViaPredicate walks.
+//! - [`crate::array_prototype`] checkpoints complete generic callback walks.
 #![allow(unused_imports)]
 use crate::work_budget::WorkBudgetCheckpoint;
 use crate::*;

@@ -36,8 +36,8 @@
 //!   anchor indices.
 //! - FindViaPredicate reads every visited index with Get, without HasProperty;
 //!   callback methods that skip absent indices retain HasProperty before Get.
-//! - FindViaPredicate walks its full snapshotted length lazily, with a work and
-//!   cancellation checkpoint before each indexed Get, including native callbacks.
+//! - The generic callback driver walks its full snapshotted length lazily, with
+//!   a work/cancellation checkpoint before each index attempt, including holes.
 //! - Pathological array-like lengths are guarded before any dense
 //!   materialisation.
 
@@ -64,17 +64,9 @@ use crate::{
     ActivationStack, ExecutionContext, Interpreter, NativeCall, NativeCtx, NativeError, VmError,
 };
 
-/// Defensive upper bound on the materialised length of an
-/// array-like Object receiver before we'd refuse to expand a
-/// snapshot. Spec ToLength clamps to 2^53-1; test262 patterns
-/// (`{length: 2**32 - 1}`, `new Array(2**32)`) deliberately
-/// exercise pathological lengths to stress generic-array methods.
-/// These methods visit only **present** indexed own properties (see
-/// HasProperty short-circuit in §22.1.3 generic algorithms) and never
-/// materialise the absent slots, so the cap only matters when a caller passes
-/// in a genuinely-large-but-dense object — at that point an OOM
-/// `RangeError` from the allocator is the spec-compliant outcome
-/// and we never reach a 4 GB pre-allocated `Vec`.
+/// Bound retained by materialization and probe paths in other Array drivers.
+/// The generic callback driver does not use this bound: every index in its
+/// snapshotted ToLength range owns an observable HasProperty/Get attempt.
 const MAX_ARRAY_LIKE_PROBE_LEN: usize = 1 << 25;
 const MAX_SPARSE_PREFIX_PROBE_LEN: usize = 1024;
 const MAX_SAFE_ARRAY_LENGTH: usize = 9_007_199_254_740_991;
@@ -4949,26 +4941,6 @@ pub(crate) const BUILTIN_TAG_RESULTS: [(&str, &str); 10] = [
     ("RegExp", "[object RegExp]"),
 ];
 
-/// Index visit order of a callback method: a lazy ladder up or down, or a
-/// listed sparse set for non-Find callback methods.
-enum CallbackIndices {
-    Up(std::ops::Range<usize>),
-    Down(std::iter::Rev<std::ops::Range<usize>>),
-    Listed(std::vec::IntoIter<usize>),
-}
-
-impl Iterator for CallbackIndices {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<usize> {
-        match self {
-            Self::Up(indices) => indices.next(),
-            Self::Down(indices) => indices.next(),
-            Self::Listed(indices) => indices.next(),
-        }
-    }
-}
-
 /// Dispatches callback-based `Array.prototype` NativeCtx methods.
 fn array_callback_native_dispatch(
     kind: ArrayCallbackKind,
@@ -5129,46 +5101,6 @@ fn array_callback_native_dispatch(
         let string_data = receiver
             .as_object()
             .and_then(|o| crate::object::string_data(o, interp.gc_heap()));
-        // FindViaPredicate needs every index, even an absent one, and may stop
-        // immediately. A lazy range neither allocates a length-sized vector
-        // nor enumerates the receiver before its first Get. Other callback
-        // methods retain their existing large-length sparse approximation.
-        let index_iter = if visit_all || len <= MAX_ARRAY_LIKE_PROBE_LEN {
-            if reverse {
-                CallbackIndices::Down((0..len).rev())
-            } else {
-                CallbackIndices::Up(0..len)
-            }
-        } else {
-            let mut indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-            let mut current = receiver;
-            let mut hops = 0usize;
-            loop {
-                collect_own_indices_below(interp, &current, len, &mut indices);
-                if hops >= object::PROTO_CHAIN_HARD_CAP {
-                    break;
-                }
-                let proto_result = interp.get_prototype_for_op(&current);
-                let proto = proto_result.map_err(|err| {
-                    crate::native_function::vm_to_native_error(
-                        interp,
-                        err,
-                        "Array.prototype callback",
-                    )
-                })?;
-                if proto.is_null() || !proto.is_object_type() {
-                    break;
-                }
-                current = proto;
-                hops += 1;
-            }
-            let mut v: Vec<usize> = indices.into_iter().collect();
-            if reverse {
-                v.reverse();
-            }
-            CallbackIndices::Listed(v.into_iter())
-        };
-
         let mut acc = Value::undefined();
         let mut found_idx: Option<usize> = None;
         let mut found_val = Value::undefined();
@@ -5207,16 +5139,18 @@ fn array_callback_native_dispatch(
         // on every `?` error — without threading a manual cleanup through
         // each fallible step (mirrors `flatMap`'s capture-then-pop above).
         let walk: Result<(), NativeError> = (|| {
-            for idx in index_iter {
-                if visit_all {
-                    interp.charge_native_loop_iteration().map_err(|error| {
-                        crate::native_function::vm_to_native_error(
-                            interp,
-                            error,
-                            "Array.prototype callback",
-                        )
-                    })?;
-                }
+            // HasProperty is observable even for a hole, and callbacks can
+            // add or delete later indices. Walk the captured range lazily;
+            // neither key enumeration nor a present-index snapshot is valid.
+            for offset in 0..len {
+                let idx = if reverse { len - 1 - offset } else { offset };
+                interp.charge_native_loop_iteration().map_err(|error| {
+                    crate::native_function::vm_to_native_error(
+                        interp,
+                        error,
+                        "Array.prototype callback",
+                    )
+                })?;
                 let receiver = interp.iteration_anchor(anchor_base + A_RECEIVER);
                 let string_data = interp
                     .iteration_anchor(anchor_base + A_STRING)

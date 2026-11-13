@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Large forward/reverse ranges, ordered Get, mutation and abrupt completion.
-//! - Bounded work and cancellation with native and admitted JS predicates.
+//! - Bounded Find/reduce work and cancellation with native and admitted JS predicates.
 //!
 //! # Invariants
 //! - A large length cannot introduce enumeration or truncate absent indices.
@@ -154,113 +154,116 @@ fn large_ranges_keep_order_live_get_and_early_completion_in_every_tier() {
 fn large_walks_reject_work_with_native_and_current_compiled_predicates() {
     for selection in SELECTIONS {
         for callback in ["Boolean", PREDICATE] {
-            let mut runtime = Runtime::builder()
-                .jit_selection(selection)
-                .jit_compile_threads(0)
-                .jit_debug(JitDebugRequest::artifacts().with_events(true))
-                .work_budget(WorkBudget {
-                    on_exceeded: WorkBudgetExceededAction::Reject,
-                    max_work_units_per_turn: Some(BUDGET),
-                    ..WorkBudget::default()
-                })
-                .build()
-                .unwrap();
-            let proof = if callback == PREDICATE {
-                warm_predicate(&mut runtime, selection)
-            } else {
-                None
-            };
-            runtime
-                .run_script(
-                    SourceInput::from_javascript(
-                        r#"
+            for method in ["findLast", "reduce", "reduceRight"] {
+                let mut runtime = Runtime::builder()
+                    .jit_selection(selection)
+                    .jit_compile_threads(0)
+                    .jit_debug(JitDebugRequest::artifacts().with_events(true))
+                    .work_budget(WorkBudget {
+                        on_exceeded: WorkBudgetExceededAction::Reject,
+                        max_work_units_per_turn: Some(BUDGET),
+                        ..WorkBudget::default()
+                    })
+                    .build()
+                    .unwrap();
+                let proof = if callback == PREDICATE {
+                    warm_predicate(&mut runtime, selection)
+                } else {
+                    None
+                };
+                runtime
+                    .run_script(
+                        SourceInput::from_javascript(
+                            r#"
 globalThis.findRangeCaught = false; globalThis.findRangeAfter = false;
-const receiver = {length: 2 ** 26};
+const receiver = {length: 2 ** 26, 0: undefined, [2 ** 26 - 1]: undefined};
+Object.defineProperty(receiver, '20000', {get() { throw 'forward safety sentinel'; }});
 Object.defineProperty(receiver, String(2 ** 26 - 20_001), {get() { throw 'safety sentinel'; }});
 "#,
-                    ),
-                    "find-range-input.js",
-                )
-                .unwrap();
-            if callback == PREDICATE {
-                runtime
-                    .eval(SourceInput::from_javascript("findRangeVisits = 0"))
+                        ),
+                        "find-range-input.js",
+                    )
                     .unwrap();
-            }
-            let trace = Arc::new(TraceCounts::default());
-            runtime.set_tracer(Some(Box::new(Trace(trace.clone()))));
-            let source = format!(
-                r#"
-try {{ Array.prototype.findLast.call(receiver, {callback}); }} catch (error) {{ findRangeCaught = true; }}
+                if callback == PREDICATE {
+                    runtime
+                        .eval(SourceInput::from_javascript("findRangeVisits = 0"))
+                        .unwrap();
+                }
+                let trace = Arc::new(TraceCounts::default());
+                runtime.set_tracer(Some(Box::new(Trace(trace.clone()))));
+                let source = format!(
+                    r#"
+try {{ Array.prototype.{method}.call(receiver, {callback}, 0); }} catch (error) {{ findRangeCaught = true; }}
 findRangeAfter = true;
 "#
-            );
-            let error = runtime
-                .run_script(SourceInput::from_javascript(source), "find-range-budget.js")
-                .expect_err("a large walk must exhaust its configured budget");
-            match error {
-                OtterError::Runtime { diagnostic } => {
-                    assert_eq!(diagnostic.code, "BUDGET_EXCEEDED")
+                );
+                let error = runtime
+                    .run_script(SourceInput::from_javascript(source), "find-range-budget.js")
+                    .expect_err("a large walk must exhaust its configured budget");
+                match error {
+                    OtterError::Runtime { diagnostic } => {
+                        assert_eq!(diagnostic.code, "BUDGET_EXCEEDED")
+                    }
+                    other => panic!("{selection:?} {method} {callback}: {other:?}"),
                 }
-                other => panic!("{selection:?} {callback}: {other:?}"),
-            }
-            assert_eq!(runtime.work_budget_stats().budget_rejections, 1);
-            let report = runtime.take_jit_debug_report().unwrap();
-            assert!(!report.truncated());
-            assert_eq!(report.dropped_events(), 0);
-            assert!(
-                !report.events().iter().any(|event| matches!(
-                    event,
-                    JitDebugEvent::Bail { .. }
-                        | JitDebugEvent::EnteredGenerationDeopt { .. }
-                        | JitDebugEvent::InlineDeoptFrame { .. }
-                )),
-                "the predicate must not deopt: {:?}",
-                report.events()
-            );
-            if callback == PREDICATE && selection == JitSelection::InterpreterOnly {
+                assert_eq!(runtime.work_budget_stats().budget_rejections, 1);
+                let report = runtime.take_jit_debug_report().unwrap();
+                assert!(!report.truncated());
+                assert_eq!(report.dropped_events(), 0);
                 assert!(
-                    trace.predicate_steps.load(Ordering::Relaxed) > 0,
-                    "the oracle validates the callback's tracer identity"
+                    !report.events().iter().any(|event| matches!(
+                        event,
+                        JitDebugEvent::Bail { .. }
+                            | JitDebugEvent::EnteredGenerationDeopt { .. }
+                            | JitDebugEvent::InlineDeoptFrame { .. }
+                    )),
+                    "the predicate must not deopt: {:?}",
+                    report.events()
                 );
-            }
-            if let Some(proof) = proof {
-                assert_predicate(&runtime, &proof, BUDGET);
-                assert!(trace.steps.load(Ordering::Relaxed) > 0);
-                assert_eq!(
-                    trace.predicate_steps.load(Ordering::Relaxed),
-                    0,
-                    "the subject must not fall back to interpreter execution"
-                );
-                let visits = runtime
-                    .eval(SourceInput::from_javascript("findRangeVisits"))
-                    .unwrap()
-                    .completion_string()
-                    .parse::<u64>()
-                    .unwrap();
-                assert!(
-                    visits > 0 && visits <= BUDGET,
-                    "bounded native predicate effects: {visits}"
-                );
-                // Graph omits generated-entry counters. Its exact retained
-                // generation, observable effects, no interpreter steps and no
-                // deopt events jointly prove this actual native execution.
-                if proof.tier == NativeFrameKind::Baseline {
-                    let after = runtime
-                        .jit_code_generation_snapshot()
-                        .into_iter()
-                        .find(|g| g.code_object_id == proof.code_object_id)
+                if callback == PREDICATE && selection == JitSelection::InterpreterOnly {
+                    assert!(
+                        trace.predicate_steps.load(Ordering::Relaxed) > 0,
+                        "the oracle validates the callback's tracer identity"
+                    );
+                }
+                if let Some(proof) = proof {
+                    assert_predicate(&runtime, &proof, BUDGET);
+                    assert!(trace.steps.load(Ordering::Relaxed) > 0);
+                    assert_eq!(
+                        trace.predicate_steps.load(Ordering::Relaxed),
+                        0,
+                        "the subject must not fall back to interpreter execution"
+                    );
+                    let visits = runtime
+                        .eval(SourceInput::from_javascript("findRangeVisits"))
+                        .unwrap()
+                        .completion_string()
+                        .parse::<u64>()
                         .unwrap();
-                    assert_eq!(after.generated_entries - proof.generated_entries, visits);
+                    assert!(
+                        visits > 0 && visits <= BUDGET,
+                        "bounded native predicate effects: {visits}"
+                    );
+                    // Graph omits generated-entry counters. Its exact retained
+                    // generation, observable effects, no interpreter steps and no
+                    // deopt events jointly prove this actual native execution.
+                    if proof.tier == NativeFrameKind::Baseline {
+                        let after = runtime
+                            .jit_code_generation_snapshot()
+                            .into_iter()
+                            .find(|g| g.code_object_id == proof.code_object_id)
+                            .unwrap();
+                        assert_eq!(after.generated_entries - proof.generated_entries, visits);
+                    }
                 }
+                runtime.force_gc().unwrap();
+                let result = runtime
+                    .eval(SourceInput::from_javascript(
+                        "JSON.stringify([findRangeCaught, findRangeAfter])",
+                    ))
+                    .unwrap();
+                assert_eq!(result.completion_string(), "[false,false]");
             }
-            runtime.force_gc().unwrap();
-            let result = runtime
-                .eval(SourceInput::from_javascript(
-                    "JSON.stringify([findRangeCaught, findRangeAfter])",
-                ))
-                .unwrap();
-            assert_eq!(result.completion_string(), "[false,false]");
         }
     }
 }

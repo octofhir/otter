@@ -50,10 +50,13 @@ Runtime turns are budgetable. A CPU-heavy script, promise reaction storm,
 or long host callback chain must be able to yield or fail according to the
 resource policy described in [Runtime Principles](/otter/engine/runtime-principles/).
 
-Generic Array `find`, `findIndex`, `findLast` and `findLastIndex` walks visit
-their full snapshotted length lazily. Each index attempt charges native-loop
-work and checks cancellation before its indexed Get, including walks whose
-predicate is native or compiled JavaScript. Rejecting budgets stop the turn;
+The generic Array callback driver for `find`, `findIndex`, `findLast`,
+`findLastIndex`, `some`, `every`, `forEach`, `map`, `filter`, `reduce` and
+`reduceRight` visits its full snapshotted length lazily. Each index attempt,
+including a hole, charges native-loop work and checks cancellation before its
+HasProperty/Get operations. Find methods use Get alone; the others skip absent
+properties after HasProperty. Native and compiled JavaScript callbacks retain
+the same driver control. Rejecting budgets stop the turn;
 cooperative yields resume the same walk without draining its pending microtasks.
 This also permits early matches on very large array-like objects without
 enumerating their keys or prototypes first.

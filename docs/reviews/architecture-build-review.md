@@ -939,11 +939,11 @@ validation rather than an incidental broad rewrite.
    under the same release profile before attributing the failure to image or
    debug-information settings. Current shipped-image conformance is not inferred
    from the raw baseline comparison.
-4. **P1: audit the remaining large callback ranges.** FindViaPredicate is corrected
-   below. Other callback methods still approximate large ranges with present-index
-   enumeration, and `flatMap` clamps its input range. Correct them with their own
-   property-order, interruption and budget proofs; preserve Find's full ordered
-   Get-without-HasProperty behavior.
+4. **P1: audit the other bounded Array drivers.** The generic callback range
+   correction is recorded below. `flatMap` still clamps its input range, and
+   other uses of `MAX_ARRAY_LIKE_PROBE_LEN` need their own property-order,
+   materialization and interruption audit. Preserve the generic callback driver's
+   complete ordered HasProperty/Get and Find's Get-without-HasProperty behavior.
 5. **P1: repeat build measurements on an idle host.** At least three alternating
    before/after clean-build pairs, a separate linking measurement, and a restorative
    build between incremental triggers. Do not promise a 50% LOC reduction without
@@ -1368,3 +1368,74 @@ Cleaning only this task's temporary Cargo target removed **4.9 GiB** and left
 **50 GiB** available. Reports and verified executables remain; the default
 repository target was not created and unrelated working-tree hashes match.
 The full closing gate and full checked GC corpus remain outstanding.
+
+## Complete generic Array callback ranges and control hole attempts
+
+At `f5ba3f495`, public CLI probes reproduce erroneous preliminary prototype
+traversal for `some`, `every`, `forEach`, `map`, `filter`, `reduce` and
+`reduceRight` at length `2**26`. A Proxy whose first element already satisfies
+`some` throws `TypeError` instead of returning true. The new public runtime
+target fails all three tests before the change: ordered live property access,
+work rejection over holes and cancellation. A plain large object also returns
+normally without exhausting its enforcing budget, because the old sparse
+approximation never attempts its absent indices.
+
+The existing callback driver now walks its captured range lazily in the
+specified direction at every length. The present-index BTreeSet/Vec snapshot
+and its custom iterator are removed. HasProperty remains live before Get for
+methods that skip holes; Find still performs Get without HasProperty. Their
+bounded property-protocol owner and rooted receiver/callback/accumulator/output
+anchors remain unchanged. Every attempted index now enters the existing
+native iteration checkpoint, including a hole that invokes no JS callback.
+Species creation, length capture, callback validation, early completion and
+error ordering retain their existing owners. Matched numeric callback fast
+paths retain their admission and behavior. `flatMap` remains a separate,
+unfixed bounded driver; this is not a claim that every Array range is corrected.
+
+The shared corpus covers all seven methods at `2**26` and
+`Number.MAX_SAFE_INTEGER`: exact HasProperty/Get order, skipped holes, live
+deletion/addition after length mutation, forward/reverse reducers, callback
+receiver/arguments/accumulator, custom species and exact result writes,
+early/abrupt completion, lone UTF-16 units and allocating callbacks. Ordinary
+object cases also prove that additions beyond the initial index set are seen.
+Public budget tests prepare their input in a separate turn and then require an
+uncatchable resource rejection while visiting holes. Cancellation must stop
+before a second observable HasProperty entry; every regression has a bounded
+safety failure independent of the budget/interrupt it is testing.
+
+The existing exact-generation predicate proof now also covers `reduce` and
+`reduceRight`. Each earns normal Template/Graph admission, runs a present first
+element and must stop in its subsequent hole range without deopt, interpreter
+fallback or replacement generation. The callback's effects and tracer identity
+still independently prove actual native execution. No GC layout, barrier,
+safepoint, deopt ABI, invalidation rule, dependency or admission threshold changes.
+
+The ARM64 affected runtime matrix passes **33/33**; all **1305 VM** and
+**350 JIT unit tests** pass. The two large-range targets pass **7/7** on x86_64
+under Rosetta. Test262 covers **1605 exact paths** across the seven methods:
+**1601 passed / 4 skipped** before and after, with no changed path/outcome,
+semantic configuration, corpus commit or target. The newly reproduced cases
+are coverage beyond that existing subset, not a claimed aggregate pass-rate gain.
+Reports and inputs are retained under `/private/tmp/otter-callback-range-*`;
+the exact comparison is `otter-callback-range-test262-comparison.json`.
+
+The shared new corpus passes the existing process-isolated GC driver **48/48**
+at strides 1–16 in interpreter, Template and production modes. Its final
+`status: passed`, exact binary/source hashes and commands are retained in
+`/private/tmp/otter-callback-range-gc/results.json`. The standalone difftest
+also passes both this corpus and `array_find_large_range` under normal policies
+and GC stride 16, comparing complete output/diagnostics with zero timeouts.
+That report is `/private/tmp/otter-callback-range-difftest.json`. The frozen-source
+CLI comparison records three failures before and three passes after in
+`/private/tmp/otter-callback-range-cli-comparison.json`. Strict workspace
+all-target/all-feature Clippy, formatting/diff checks and VM/runtime
+no-default-feature builds pass. The existing quick GC family also passes at
+stride 1 and inherits this same explicit Cargo target. Final commands and
+report paths are collected in `/private/tmp/otter-callback-range-validation.json`.
+
+The working Cargo cache is intentionally retained at
+`/private/tmp/otter-engine-target` for subsequent iterations. Commands use
+`CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`, and both
+`CARGO_PROFILE_DEV_DEBUG=0` / `CARGO_PROFILE_TEST_DEBUG=0`, retaining assertions.
+User caches and unrelated working-tree files are preserved. The full closing
+gate and full checked GC corpus remain open.

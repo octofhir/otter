@@ -11,7 +11,6 @@ A targeted pass does not establish a green workspace or market leadership.
 | P0 | **Finish the closing gate.** `scripts/gate.sh`, runtime integration tests. The last complete differential gate failed; subsequent slices passed focused matrices only. | Reclassify failures on current HEAD against a comparable baseline, fix their causes, and complete the unchanged gate. Preserve native admission, exact generations, no replay/fallback, real OOM and moving-GC assertions. |
 | P0 | **Diagnose GC-stress watchdog failures.** `scripts/dev/gc-stress.py`, `otter-difftest`, GC/VM. Existing full reports contain timed-out candidate processes. | Preserve exact paths, watchdogs and outcomes; attribute startup, verification and mutator cost separately. Complete the full checked-profile corpus at strides 1–16 with `status: passed`. No filtered corpus or timeout-as-agreement verdict. |
 | P0 | **Reproduce and isolate startup-image failures.** `isolate_snapshot_capture`, startup-image restore. An older restored release executable crashed before source; current shipped-image coverage is incomplete. | Compare raw/restored launches from the same current binary/profile, including fresh processes, restored allocation pressure and weak/bootstrap bodies. Classify the old crash separately from current failures. |
-| P1 | **Control generic fill work.** `array_prototype/mutate.rs::array_fill`. Its generic Set loop has no native iteration checkpoint. | Public Reject/Yield/cancellation regressions, committed-prefix effects, fatal error disposition, runtime reuse, and unchanged coercion/Set order. |
 | P1 | **Separate Array semantics from materialization limits.** `array_prototype.rs`, `array_prototype/{mutate,join}.rs`; inspect remaining `MAX_ARRAY_LIKE_PROBE_LEN` uses individually. Fill still truncates its span; join retains a length ceiling and eager length-sized scratch vectors. | Concrete public regressions for each driver; complete live ordered property attempts, bounded scratch/root retention, cancellation and explicit allocation/output limits. Preserve UTF-16, species and observable error order. |
 | P1 | **Account for dense bulk native work.** `array_fill` and existing bulk helpers. Generic-loop checks alone do not control admitted dense fill. | Reject/Yield/interrupt proofs on the actual admitted path, correct committed-prefix policy, and comparable hot-path measurements. Keep reservation, descriptor/prototype proofs and barriers intact. |
 | P1 | **Resolve remaining broad-suite failures.** Runtime GC/JIT, snapshot, compile-fail and audit fixtures. Older baseline reports contain failures outside the repaired global-binding/known-native targets. | Reproduce current failures first; distinguish engine bugs, stale contracts and environment restrictions. Fix owners and fixtures together without weakening safety or native-execution proofs. |
@@ -48,19 +47,3 @@ in `/private/tmp/otter-engine-full-difftest{,-failures}.json`.
 | Startup and loading | Measure raw and startup-image processes, parse/compile/module loading and fresh/reused runtime cases separately. A cache hit or parser microbenchmark is not a whole-engine win. |
 | Build and footprint | Repeat at least three alternating comparable clean-build pairs, measure linking separately, and restore between incremental edit triggers. Measure retained shared-routine metadata and diagnostics footprint. Remove dependency edges only when their functionality has another current owner or no caller. No build speedup is established by the old busy-host samples. |
 | Regression policy | Keep raw observations, binary/source identities, commands, limits and variance. Set workload-specific budgets from a reproducible baseline; retain per-workload regressions rather than hiding them in one aggregate score. |
-
-## Working and closing rules
-
-- Use one persistent separate `CARGO_TARGET_DIR`; verify scripts use Cargo's
-  reported executable. Keep caches unless the user requests cleanup. Do not
-  change dependencies/toolchain to make a measurement look better.
-- For each coherent engine slice: reproduce before, fix the owning contract,
-  run formatting, strict Clippy, affected tests and feature builds, exact
-  Test262 comparisons where applicable, and existing differential/stress checks.
-  Run the full closing gate and full checked GC corpus before broad readiness
-  claims. Track incomplete gates explicitly.
-- Keep Value layout, barriers, safepoints, private ABI and invalidation changes
-  separately justified and verified. No duplicate runtime stacks, cosmetic
-  compatibility layers, or extra hot-path allocation/dispatch for build time.
-- Use local commits for verified slices; preserve unrelated files. No push/PR
-  without a separate request. All repository text stays in English.

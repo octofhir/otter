@@ -1,14 +1,27 @@
-//! Standard Web-platform function globals: `atob`, `btoa`, `queueMicrotask`,
+//! Standard Web-platform function globals: `atob`, `btoa`,
 //! `structuredClone`, `fetch`, plus the JS-implemented class globals in
 //! the static bootstrap bundle (Event/EventTarget/DOMException/TextEncoder/Decoder/
 //! AbortController/AbortSignal/MessageEvent/…).
 //!
 //! These belong to the Web platform (not Node), so they live here and are
 //! installed for every runtime that enables Web APIs. `atob`/`btoa`,
-//! `queueMicrotask`, `navigator`, the native in-realm `structuredClone`
+//! `navigator`, the native in-realm `structuredClone`
 //! plus Streams compression codec, and the native CSPRNG/digest backing
 //! for `crypto` (see [`crate::crypto`]) are implemented. `fetch()` is a JS
 //! shim over the private `__nativeFetch` transport (see [`crate::fetch_ext`]).
+//! `queueMicrotask` is installed by core VM bootstrap and retains its identity
+//! when Web APIs are enabled.
+//!
+//! # Contents
+//! - Native Web globals and the private transport/codec helpers used by JS shims.
+//! - Per-run Web services and eager rejection reporting.
+//!
+//! # Invariants
+//! - Core scheduling globals keep the callable installed by VM bootstrap.
+//! - Native globals enter through the runtime extension installer boundary.
+//!
+//! # See also
+//! - [`web_globals_installer`] registers the opt-in Web surface.
 
 use otter_runtime::ValueWindow;
 use otter_runtime::{
@@ -27,7 +40,6 @@ pub fn web_globals_installer() -> RuntimeExtensionInstaller {
 fn install(runtime: &mut RuntimeExtensionContext<'_>) -> Result<(), OtterError> {
     runtime.install_native_global("atob", 1, atob)?;
     runtime.install_native_global("btoa", 1, btoa)?;
-    runtime.install_native_global("queueMicrotask", 1, queue_microtask)?;
     runtime.install_native_global("structuredClone", 1, structured_clone)?;
     // `fetch()` itself is the JS shim in `web_fetch.js`; it normalizes its
     // arguments and calls this private native transport member, which the shim
@@ -237,16 +249,6 @@ fn atob(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeE
         }
     }
     runtime_string_value(ctx, &out)
-}
-
-/// `queueMicrotask(callback)` — HTML §8.7. Direct bare-identifier calls
-/// compile to the VM microtask opcode; this native body serves indirect
-/// calls (an aliased or reflected `queueMicrotask`) by enqueueing on the
-/// same per-isolate queue. Throws `TypeError` for non-callable arguments.
-fn queue_microtask(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    let callback = args.first().copied().unwrap_or_else(Value::undefined);
-    ctx.queue_microtask(callback, [])?;
-    Ok(Value::undefined())
 }
 
 fn structured_clone(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {

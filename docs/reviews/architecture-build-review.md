@@ -924,10 +924,13 @@ scope and validation rather than an incidental broad rewrite.
 
 ## Confirmed next tasks
 
-1. **P1: finish validation of guarded optimized Add.** The correction and native
-   proofs are recorded below. Complete cold full-suite and after-change Test262
-   validation once disk cleanup is complete; classify the broader observed test
-   failures against baseline without weakening their assertions.
+1. **P1: resolve cold full-suite failures and finish the closing gate.** Guarded
+   Add's exact after-change Test262 comparison and final strict Clippy repeat
+   now pass, as recorded below. Classify and correct the broader test failures
+   against baseline without weakening their assertions; a successful targeted
+   subset does not close this task.
+   The baseline `jit_global_access` stack-overflow abort deserves priority over
+   fixture cleanup; preserve its exact native/GC assertions while diagnosing it.
 2. **P1: diagnose the GC-stress watchdog failures.** Keep exact failed paths and
    limits. Re-run the full closing gate after correcting the causes, then the
    separate full checked GC corpus at strides 1–16. Do not turn timeouts into
@@ -1014,8 +1017,154 @@ builds were stopped. `cargo clean` removed the temporary engine targets and the
 verified Cargo targets of `fml-rs` and `ccda-fhir`; sources, corpora and reports
 were preserved. Local Docker cleanup removed dangling images and unused build
 cache only: all 10 containers and 64 volumes remained. Available space reached
-**57 GiB**. Heavy builds remain stopped. A future run should use one temporary
-target with both dev/test debug information disabled and assertions enabled,
+**57 GiB**. Heavy builds were stopped at that checkpoint. Subsequent work uses
+one temporary target with both dev/test debug information disabled and assertions enabled,
 rather than recreating several debug-info-heavy target trees. Baseline binaries
 and hashes survive separately in `/private/tmp/otter-retained-baseline-binaries/`;
 the former baseline build cache and finished cross target were removed.
+
+## Core microtask global: one bootstrap owner
+
+At `f0c88e886`, default `Runtime::builder().build()` exposed no
+`queueMicrotask`. The Web installer owned its only callable even though the VM
+already owned callback admission, roots, realm/context capture and FIFO draining.
+This broke the public runtime boundary without a Web extension: browser event
+turn and embedder timer tests failed with `ReferenceError`. The new public
+regressions also failed before the production change, including the check that
+Web installation preserves the core callable's identity.
+
+The VM now installs one CORE `queueMicrotask` through the existing static
+MethodSpec/ObjectBuilder/bootstrap flow. Its native body delegates to the same
+`NativeCtx::queue_microtask`; the Web installer no longer replaces it. There is
+no new queue, runtime interface, dependency, dynamic dispatch, manual rooting,
+Value representation or compiled-code ABI. The obsolete comment claiming that
+direct calls use a dedicated microtask opcode was removed: current direct and
+indirect calls resolve the ordinary callable.
+
+The shared `core_microtask_queue.js` fixture and public runtime tests check the
+descriptor/name/arity/non-constructor contract, synchronous callable validation
+without coercion, ignored extra arguments, undefined callback receiver, aliases,
+`.call`, Proxy and bound callbacks, nested jobs and FIFO agreement with Promise
+reactions. Allocations before the checkpoint retain queued callbacks and their
+receivers through stress collections. Web installation is separately required
+to preserve exact function identity. Existing event-turn, embedder timer and
+all ten microtask-ordering tests pass. No existing assertion was weakened.
+
+The bootstrap measurement changed from 146 to 147 reported native functions,
+3448 to 3451 allocations and 367152 to 367416 bytes. The existing allocation
+and byte caps remain unchanged; only the expected native-function inventory
+increased by one. All four bootstrap tests pass. Core availability is documented
+in the event-loop and type-package docs; the existing `@types/node` dependency
+already supplies the signature, so no duplicate TypeScript declaration was added.
+
+Validation at this checkpoint uses the locked offline dependency graph and one
+`/private/tmp/otter-engine-compact-target`, with dev/test debug information and
+incremental compilation disabled while assertions remain enabled:
+
+- Default-feature CLI, Test262 and difftest builds pass. Strict workspace
+  all-target/all-feature Clippy passes with `-D warnings`; formatting and diff
+  checks pass.
+- Guarded Add follow-up: both public runtime regressions pass again. Test262
+  addition remains **48/48** with the same exact paths and outcomes, corpus
+  commit, semantic configuration and target. The comparison is retained in
+  `/private/tmp/otter-continuation-addition-comparison.json`; runner executable
+  hashes are recorded separately rather than required to match across builds.
+- The Promise `prototype/then` subset passes **75/75**. This is an after-change
+  observation, not a fabricated before/after comparison or a whole-suite claim.
+- `gc-stress.py` passes **48/48** process observations: interpreter, Template and
+  production policies at every stride 1–16, with GC verification enabled. Its
+  final `status: passed`, exact executable/source hashes, commands, console and
+  completion comparisons are retained in
+  `/private/tmp/otter-core-microtask-gc-final/results.json`. This focused debug
+  build run does not replace the outstanding full checked-profile GC corpus.
+- VM/runtime checks without default features pass. The exact default-global
+  snapshot was updated by adding only `queueMicrotask w.c function`; all three
+  snapshot tests and both final public queue regressions pass. Strict Clippy
+  passes again after that fixture update.
+- All **48 Web integration tests** pass, including indirect microtask callers,
+  rejection notifications, the common-API ledger and WebAssembly interactions.
+  `/private/tmp/otter-core-queue-web-tests.log` retains the full observation.
+
+Primary logs: `/private/tmp/otter-core-queue-{before,after}.log`,
+`/private/tmp/otter-core-queue-bootstrap-{before,after}.log`,
+`/private/tmp/otter-continuation-{baseline-tests,core-full,clippy,tools-build}.log`.
+The broader test run and process-isolated GC/differential checks are tracked
+separately below; targeted successes do not make the full closing gate green.
+
+### Completed broad checks and remaining failures
+
+The cold `cargo test --locked --offline --all-features --no-fail-fast
+-p otter-vm -p otter-runtime -p otter-jit` invocation completed, including docs.
+All **1305 VM unit tests**, **350 JIT unit tests**, the native primitive-string
+integration proofs and all four VM compile-fail groups pass. The in-process
+Template/interpreter comparison passes over all **201 corpus programs**, including
+the new queue fixture. Its unoptimized run took 830.76 seconds; this is a single
+validation observation, not a build or execution speedup measurement.
+
+The broad invocation reports **44 failed targets**, including the default-global
+inventory expectation that was then corrected by one row and retested
+successfully. No second full passing invocation is claimed. Browser event,
+embedder timer, microtask ordering and both Add regressions pass in this broad
+run. Full native-admission, exact-generation, GC and no-replay assertions remain
+intact in the other tests, including the ones that fail.
+
+Two redirect tests fail to bind local sockets inside the sandbox and both pass
+outside it. IPC also initially fails with `Operation not permitted`; its
+unsandboxed repeat exposes a separate charge assertion (`6` rather than `3`).
+The exact outputs are retained in
+`/private/tmp/otter-continuation-unsandboxed-permissions.json`. A retained old raw
+CLI and the current interpreter both return `false` in the `arguments.callee.caller`
+case whose fixture expects `true`; that independent comparison is retained at
+`/private/tmp/otter-continuation-caller-baseline.json`.
+
+A supplementary unoptimized process differential invocation with
+`--gc-strides 0` was interrupted after 19 progress records when fixed 20-second
+caps produced timeouts. It produced no completed JSON gate report and supplies
+no passing-gate claim. Its partial paths and status remain in
+`/private/tmp/otter-continuation-difftest-no-forced-gc{.log,-status.json}`. It does
+not replace the previous optimized full differential failure report or the
+focused passing queue stress matrix.
+
+The remaining **43 targets** were then executed against `f0c88e886` production
+sources in the same target, locked graph, feature set and debug/assertion
+profiles. The three changed production files were saved, compared with the
+commit, substituted for the run and restored byte-for-byte afterward; the new
+`globals` module is not declared by that baseline. No other source, fixture or
+user file was replaced. **40 targets fail on baseline**, including the same
+`global_epoch_dictionary_and_descriptor_misses_preserve_current_native_body`
+stack-overflow thread and SIGABRT in `jit_global_access`. The other failures
+include native-admission/GC proofs, captured eval eviction, snapshot ownership,
+runtime trybuild diagnostics and its missing `ValueWindow` import, dependency
+boundary checks and trace/audit fixtures. Their assertions remain unchanged.
+
+The baseline's runtime unit, redirect and dynamic HTTP module targets pass
+outside the sandbox. The restored patch passes those targets under the same
+permissions, together with all affected queue/timer/snapshot/Add tests:
+**333 passed, 0 failed, 1 pre-existing ignored**. The exact compared target/test
+identities and outcomes, including the abort, are retained in
+`/private/tmp/otter-queue-baseline-audit/comparison.json`; there are no remaining
+outcome differences among the originally differing identities after the
+equivalent-permission repeats. This compares statuses, not process-local native
+addresses or complete artifact bytes.
+
+IPC and compile-cache assertions also pass **10/10 standalone repetitions each**
+on both baseline and restored source. Their earlier failures are not declared
+fixed: notably the first unsandboxed IPC repeat really observed the doubled
+charge. Scheduling/environment sensitivity still needs a separate diagnosis.
+The baseline command, source hashes, exact restoration and full log are recorded
+in `/private/tmp/otter-queue-baseline-audit/{audit.json,otter-runtime.log}`;
+the restored checks are in `/private/tmp/otter-core-queue-restored-final.log`.
+The previous failed full optimized differential gate and the outstanding full
+checked GC matrix remain open. The workspace is not declared green.
+
+Final restored-source workspace Clippy and formatting checks pass again. All
+seven tested source/fixture hashes and both unrelated user-file hashes match
+their saved values. After all test/compiler processes stopped, `cargo clean`
+removed **36.5 GiB** from this task's temporary target; free space is **52 GiB**
+at the closing observation. Neither the temporary nor default repository target
+remains. The three exact CLI/Test262/difftest executables (317 MiB total) and
+their SHA-256 manifest survive at
+`/private/tmp/otter-core-queue-retained-tools/`; the CLI passes the queue fixture
+in all three policies after relocation. Test reports and baseline evidence are
+preserved outside the cleaned target. No dependency/toolchain update, unrelated
+cache cleanup or performance claim accompanies this change.

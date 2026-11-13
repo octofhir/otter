@@ -34,3 +34,8 @@ Types are automatically available when you install this package. For best result
 - **serve.d.ts** - HTTP server APIs (`Otter.serve()`)
 
 Web APIs (fetch, URL, TextEncoder, etc.) and Node.js APIs (fs, path, etc.) come from `@types/node`.
+
+Core scheduling globals such as `queueMicrotask` are available without enabling
+Web or Node APIs on a runtime. Their TypeScript signatures are also supplied by
+`@types/node`; the type dependency does not determine which runtime extensions
+are installed.

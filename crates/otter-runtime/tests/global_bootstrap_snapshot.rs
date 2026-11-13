@@ -129,6 +129,7 @@ isNaN w.c function
 parseFloat w.c function
 parseInt w.c function
 process w.c object
+queueMicrotask w.c function
 setImmediate w.c function
 setInterval w.c function
 setTimeout w.c function

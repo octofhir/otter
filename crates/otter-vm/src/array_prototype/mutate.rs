@@ -14,8 +14,9 @@
 //! - Reverse retains both fetched values across subsequent getters and writes.
 //! - Reverse walks every pair in the captured length, with a native work and
 //!   cancellation checkpoint before each pair, including two absent indices.
-//! - Generic fill checks native work and cancellation before every Set attempt.
-//! - Fill's existing materialization bounds, dense guards and barriers remain.
+//! - Fill walks the full captured range. Enforcing budgets checkpoint every
+//!   Set attempt; observing bulk paths charge the actual span before effects.
+//! - Dense admission, rooted reservation and write barriers remain required.
 //!
 //! # See also
 //! - `super::Interpreter::array_prototype_chain_has_indexed_property` owns fill's chain proof.
@@ -24,7 +25,7 @@
 use crate::native_abi::CommittedValueError;
 use crate::{ActivationStack, ExecutionContext, Interpreter, Value, ValueWindow};
 
-use super::{MAX_ARRAY_LIKE_PROBE_LEN, format_index_key, length_of_array_like};
+use super::{format_index_key, length_of_array_like};
 
 impl Interpreter {
     /// §23.1.3.27 live `Array.prototype.reverse`.
@@ -151,19 +152,27 @@ impl Interpreter {
             let end_value = end_root.map(|root| interp.escape_scoped(root));
             let end =
                 interp.array_relative_index(stack, context, end_value.as_ref(), len as f64, len)?;
-            let bounded_end = end.min(start.saturating_add(MAX_ARRAY_LIKE_PROBE_LEN));
+            if start >= end {
+                return Ok(interp.escape_scoped(o_root));
+            }
             let o = interp.escape_scoped(o_root);
-            if let Some(arr) = o.as_array()
-                && crate::array::can_fast_fill_dense_range(
-                    arr,
-                    interp.gc_heap(),
-                    start,
-                    bounded_end,
-                )
+            let value = interp.escape_scoped(value_root);
+            if interp
+                .try_fill_numeric_typed_array(o, value, start, end)
+                .map_err(CommittedValueError::Fatal)?
+            {
+                return Ok(interp.escape_scoped(o_root));
+            }
+            if !interp.work_budget().enforces_on_exceedance()
+                && let Some(arr) = o.as_array()
+                && crate::array::can_fast_fill_dense_range(arr, interp.gc_heap(), start, end)
                 && !interp
-                    .array_prototype_chain_has_indexed_property(start, bounded_end)
+                    .array_prototype_chain_has_indexed_property(start, end)
                     .map_err(CommittedValueError::JavaScript)?
             {
+                interp
+                    .charge_native_loop_work((end - start) as u64)
+                    .map_err(CommittedValueError::Fatal)?;
                 let arr = interp
                     .escape_scoped(o_root)
                     .as_array()
@@ -180,7 +189,7 @@ impl Interpreter {
                     arr,
                     interp.gc_heap_mut(),
                     start,
-                    bounded_end,
+                    end,
                     value,
                     &mut external_visit,
                 )
@@ -188,7 +197,7 @@ impl Interpreter {
                 .map_err(CommittedValueError::JavaScript)?;
                 return Ok(interp.escape_scoped(o_root));
             }
-            for k in start..bounded_end {
+            for k in start..end {
                 interp
                     .charge_native_loop_iteration()
                     .map_err(CommittedValueError::Fatal)?;

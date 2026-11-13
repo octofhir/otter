@@ -213,10 +213,18 @@ impl Interpreter {
     /// so its owning native loop must remain cancellable on its own.
     #[inline]
     pub(crate) fn charge_native_loop_iteration(&mut self) -> Result<(), VmError> {
+        self.charge_native_loop_work(1)
+    }
+
+    /// Account for a non-reentrant native batch before its effects. Owners
+    /// must bound batches for cancellation and use per-operation checkpoints
+    /// when enforcing budgets require a precise committed prefix.
+    #[inline]
+    pub(crate) fn charge_native_loop_work(&mut self, units: u64) -> Result<(), VmError> {
         if self.interrupt.is_set() {
             return Err(VmError::Interrupted);
         }
-        self.work_budget_stats.record_work(1);
+        self.work_budget_stats.record_work(units);
         self.enforce_work_budget_checkpoint()
     }
 

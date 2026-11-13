@@ -304,11 +304,22 @@ fn bundle_relocation_target_kinds(bundle: &JitArtifactBundle) -> BTreeSet<String
 }
 
 fn relocation_target_kinds(batch: &JitArtifactBatch) -> BTreeSet<String> {
-    batch
+    let mut kinds: BTreeSet<_> = batch
         .bundles()
         .iter()
         .flat_map(bundle_relocation_target_kinds)
-        .collect()
+        .collect();
+    for bundle in batch.bundles() {
+        if let Some(file) = bundle.file(JitArtifactFileName::Routines) {
+            let document: serde_json::Value = serde_json::from_slice(file.contents()).unwrap();
+            for object in document["objects"].as_array().unwrap() {
+                for relocation in object["relocations"]["relocations"].as_array().unwrap() {
+                    kinds.insert(relocation["target"]["kind"].as_str().unwrap().to_owned());
+                }
+            }
+        }
+    }
+    kinds
 }
 
 #[test]

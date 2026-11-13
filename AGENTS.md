@@ -430,8 +430,16 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     a cross-process no-clobber primitive.
   - Each compile directory contains exact runtime-local `code.bin`,
     portable semantic `code-normalized.bin`, typed `relocations.json`,
-    annotated ARM64 `asm.txt`, `bytecode.txt`, tier input, `code-map.json`,
+    annotated target `asm.txt`, `bytecode.txt`, tier input, `code-map.json`,
     `safepoints.json`, and optimizer `deopt.json` when applicable.
+  - A function that references shared native code also includes `routines.json`.
+    It snapshots each referenced placed object once, with its runtime address
+    range, named entry offsets, exact `code`, portable `normalizedCode`, and
+    symbolic `relocations`. These offsets belong to the routine object, not
+    `code.bin`. Join the caller's `routine` relocation to its named entry;
+    source and GC records remain with the caller. Routine owners retain compact
+    relocation records from placement so later captures never re-emit code.
+    Disabled capture does not copy routine bytes or build artifact text.
   - Named property probes in Template and Graph use the VM's one shared
     property action table (`propertyActionCacheTable` relocation). Each
     receiver shape and atom key retains independent load and store facts,

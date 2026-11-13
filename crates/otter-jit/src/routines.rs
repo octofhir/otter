@@ -28,6 +28,9 @@
 //!   routine as well.
 //! - Every code object that calls a routine retains its set, so routines
 //!   outlive every caller.
+//! - Placed routines retain their symbolic address records. Exact bytes and
+//!   normalized artifact text are copied/rendered only on explicit capture;
+//!   capturing a later caller never re-emits an already placed routine.
 //!
 //! # See also
 //! - `crate::template::arm64::shared_property` and its x86-64 counterpart
@@ -80,6 +83,22 @@ pub(crate) enum Routine {
 }
 
 impl Routine {
+    pub(crate) const ALL: [Self; 13] = [
+        Self::Load,
+        Self::Store,
+        Self::Method,
+        Self::Concat,
+        Self::KeyedLoad,
+        Self::KeyedStore,
+        Self::ProbeLoad,
+        Self::ProbeStore,
+        Self::ProbeKeyedLoad,
+        Self::Truthy,
+        Self::StoreTail,
+        Self::FieldObserve,
+        Self::Instanceof,
+    ];
+
     /// Stable name for artifacts.
     pub(crate) const fn name(self) -> &'static str {
         match self {
@@ -100,7 +119,7 @@ impl Routine {
     }
 
     /// The code object holding this routine, with which it is emitted.
-    const fn object(self) -> RoutineObject {
+    pub(crate) const fn object(self) -> RoutineObject {
         match self {
             Self::Load | Self::ProbeLoad => RoutineObject::Load,
             Self::Store | Self::ProbeStore => RoutineObject::Store,
@@ -116,7 +135,7 @@ impl Routine {
     }
 
     /// Whether this is the second entry of its object.
-    const fn second(self) -> bool {
+    pub(crate) const fn second(self) -> bool {
         matches!(
             self,
             Self::ProbeLoad | Self::ProbeStore | Self::ProbeKeyedLoad
@@ -156,7 +175,7 @@ impl RoutineObject {
     ];
 
     /// Stable name for profilers.
-    const fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::Load => "routine:load",
             Self::Store => "routine:store",
@@ -182,10 +201,11 @@ pub(crate) struct RoutineOffsets {
 
 /// One placed routine object.
 #[derive(Debug)]
-struct RoutineCode {
-    code: CompiledCode,
-    entry: u64,
-    second: u64,
+pub(crate) struct RoutineCode {
+    pub(crate) code: CompiledCode,
+    pub(crate) entry: u64,
+    pub(crate) second: u64,
+    pub(crate) relocations: crate::artifact::relocation::RelocationCapture,
 }
 
 /// The routines of one isolate, each emitted on first use.
@@ -195,6 +215,14 @@ pub(crate) struct Routines {
 }
 
 impl Routines {
+    /// Borrow placed owners for artifact capture without copying code.
+    pub(crate) fn code_objects(&self) -> impl Iterator<Item = (RoutineObject, &RoutineCode)> {
+        RoutineObject::ALL.into_iter().filter_map(|object| {
+            let code = self.objects[object as usize].get()?.as_ref().ok()?;
+            Some((object, code))
+        })
+    }
+
     /// `(address, length, name)` of every placed routine object.
     pub(crate) fn symbols(&self) -> Vec<(u64, usize, &'static str)> {
         RoutineObject::ALL
@@ -358,7 +386,7 @@ fn place(
     transitions: &crate::entry::TransitionTable,
     memory: &Arc<CodeMemory>,
 ) -> Result<RoutineCode, Unsupported> {
-    let (buffer, offsets) = emit(object, view, transitions)?;
+    let (buffer, offsets, relocations) = emit(object, view, transitions)?;
     let code = CompiledCode::new(memory, buffer, dynasmrt::AssemblyOffset(offsets.entry))?;
     // SAFETY: both offsets are assembler offsets inside `code`.
     let (entry, second) = unsafe { (code.entry_ptr(), code.ptr_at(offsets.second)) };
@@ -366,6 +394,7 @@ fn place(
         entry: entry as u64,
         second: second as u64,
         code,
+        relocations,
     })
 }
 
@@ -374,11 +403,18 @@ fn emit(
     object: RoutineObject,
     view: &JitCompileSnapshot,
     transitions: &crate::entry::TransitionTable,
-) -> Result<(dynasmrt::ExecutableBuffer, RoutineOffsets), Unsupported> {
+) -> Result<
+    (
+        dynasmrt::ExecutableBuffer,
+        RoutineOffsets,
+        crate::artifact::relocation::RelocationCapture,
+    ),
+    Unsupported,
+> {
     let mut ops = dynasmrt::aarch64::Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
     let mut relocations =
-        crate::artifact::relocation::RelocationCapture::new(false).with_literal_pool();
+        crate::artifact::relocation::RelocationCapture::new(true).with_literal_pool();
     let offsets = match object {
         RoutineObject::Truthy => {
             crate::graph::arm64::truthy::emit_routine(&mut ops, &mut relocations, view)
@@ -398,7 +434,7 @@ fn emit(
         ),
     };
     relocations.emit_literal_pool(&mut ops);
-    Ok((crate::entry::finalize_assembler(ops)?, offsets))
+    Ok((crate::entry::finalize_assembler(ops)?, offsets, relocations))
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -406,10 +442,17 @@ fn emit(
     object: RoutineObject,
     view: &JitCompileSnapshot,
     transitions: &crate::entry::TransitionTable,
-) -> Result<(dynasmrt::ExecutableBuffer, RoutineOffsets), Unsupported> {
+) -> Result<
+    (
+        dynasmrt::ExecutableBuffer,
+        RoutineOffsets,
+        crate::artifact::relocation::RelocationCapture,
+    ),
+    Unsupported,
+> {
     let mut ops = dynasmrt::x64::Assembler::new()
         .map_err(|_| Unsupported::Backend(crate::BackendFailure::AssemblerAllocation))?;
-    let mut relocations = crate::artifact::relocation::RelocationCapture::new(false);
+    let mut relocations = crate::artifact::relocation::RelocationCapture::new(true);
     let offsets = match object {
         RoutineObject::Truthy => {
             crate::graph::x86_64::truthy::emit_routine(&mut ops, &mut relocations, view)
@@ -428,7 +471,7 @@ fn emit(
             object,
         ),
     };
-    Ok((crate::entry::finalize_assembler(ops)?, offsets))
+    Ok((crate::entry::finalize_assembler(ops)?, offsets, relocations))
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
@@ -436,7 +479,14 @@ fn emit(
     _object: RoutineObject,
     _view: &JitCompileSnapshot,
     _transitions: &crate::entry::TransitionTable,
-) -> Result<(dynasmrt::ExecutableBuffer, RoutineOffsets), Unsupported> {
+) -> Result<
+    (
+        dynasmrt::ExecutableBuffer,
+        RoutineOffsets,
+        crate::artifact::relocation::RelocationCapture,
+    ),
+    Unsupported,
+> {
     Err(Unsupported::OperandShape(
         "no routine backend on this target",
     ))

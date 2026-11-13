@@ -133,6 +133,10 @@ fn assert_generic_edge(bundle: &JitArtifactBundle) {
     let links = json(bundle, JitArtifactFileName::Relocations);
     let code = bundle.file(JitArtifactFileName::Code).unwrap().contents();
     let sites = return_sites::assert_sites(bundle);
+    #[cfg(target_arch = "aarch64")]
+    let call: &[u8] = &[0x00, 0x02, 0x3f, 0xd6];
+    #[cfg(target_arch = "x86_64")]
+    let call: &[u8] = &[0x41, 0xff, 0xd3];
     let links: Vec<_> = links["relocations"]
         .as_array()
         .unwrap()
@@ -140,14 +144,14 @@ fn assert_generic_edge(bundle: &JitArtifactBundle) {
         .filter(|link| {
             link["target"]["kind"] == "runtimeStub"
                 && link["target"]["id"].as_u64() == Some(u64::from(abi::STUB_JIT_CALL_GENERIC.id))
+                && sites["returnSites"].as_array().unwrap().iter().any(|site| {
+                    site["nativeReturnOffset"].as_u64()
+                        == Some(link["endOffset"].as_u64().unwrap() + call.len() as u64)
+                })
         })
         .collect();
     assert_eq!(links.len(), 1, "actual committed Generic miss edge");
     let end = links[0]["endOffset"].as_u64().unwrap() as usize;
-    #[cfg(target_arch = "aarch64")]
-    let call: &[u8] = &[0x00, 0x02, 0x3f, 0xd6];
-    #[cfg(target_arch = "x86_64")]
-    let call: &[u8] = &[0x41, 0xff, 0xd3];
     assert_eq!(code.get(end..end + call.len()), Some(call));
     assert_eq!(
         sites["returnSites"]

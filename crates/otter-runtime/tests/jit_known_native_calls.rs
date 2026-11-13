@@ -56,7 +56,9 @@ function knownNativeConstruct(ctor, value) {
 function knownNativeThrow(fn) { const result = fn(); return result; }
 function knownNativeReplacement(a, b, c) { return 2000 + arguments.length; }
 "#;
-const WARM: &str = "knownNativeZero(nativeKindA); knownNativeOne(nativeKindA,nativeWarmA); knownNativeOdd(nativeKindA,nativeWarmA,nativeWarmB,nativeWarmA); knownNativeConstruct(Array,nativeWarmA); knownNativeThrow(nativeKindA);";
+// Boolean construction uses the Native entry, without a specialized intrinsic
+// construction form. The probe supplies Array to that same kind-only plan.
+const WARM: &str = "knownNativeZero(nativeKindA); knownNativeOne(nativeKindA,nativeWarmA); knownNativeOdd(nativeKindA,nativeWarmA,nativeWarmB,nativeWarmA); knownNativeConstruct(Boolean,nativeWarmA); knownNativeThrow(nativeKindA);";
 const NAMES: [&str; 5] = [
     "knownNativeZero",
     "knownNativeOne",
@@ -266,6 +268,7 @@ impl Fixture {
                 generation.tier == tier
                     && generation.lifecycle == CodeLifetimeState::Installed
                     && generation.linked
+                    && generation.current_entry
                     && self
                         .artifacts
                         .get(&generation.code_object_id)
@@ -280,6 +283,10 @@ impl Fixture {
         found.into_iter().next()
     }
     fn admit(&mut self) {
+        // Settle the return-array sites before selecting a generation that
+        // must survive the measured collection without placement deopts.
+        self.runtime.force_gc().unwrap();
+        self.setup(&WARM.repeat(16));
         for batch in 0..=128 {
             if NAMES.iter().all(|name| self.current(name).is_some()) {
                 return;
@@ -315,6 +322,15 @@ fn assert_native_edge(bundle: &JitArtifactBundle) {
         .filter(|link| {
             link["target"]["kind"] == "runtimeStub"
                 && link["target"]["id"].as_u64() == Some(u64::from(abi::STUB_JIT_CALL_NATIVE.id))
+                && map["regions"].as_array().unwrap().iter().any(|region| {
+                    region["kind"] == "instruction"
+                        && region["functionId"].as_u64()
+                            == Some(u64::from(bundle.manifest().function_id()))
+                        && region["startOffset"].as_u64().unwrap()
+                            <= link["startOffset"].as_u64().unwrap()
+                        && link["endOffset"].as_u64().unwrap()
+                            <= region["endOffset"].as_u64().unwrap()
+                })
         })
         .collect();
     assert_eq!(

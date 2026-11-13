@@ -132,21 +132,73 @@ fn assert_get_entry(bundle: &JitArtifactBundle, own: &JitCodeGenerationSnapshot)
     let end = region["endOffset"].as_u64().unwrap();
     assert!(start < end);
     let relocations = json(bundle, JitArtifactFileName::Relocations);
-    // A Template body shares one out-of-line property probe per code object;
-    // the source instruction branches to it, and the probe owns the committed
-    // C entry. An optimizing body emits the edge inside the instruction.
-    let shared = map["regions"]
+    let parent_code = bundle.file(JitArtifactFileName::Code).unwrap().contents();
+    // Template and Generic sites call the retained shared load object. A
+    // specialized Graph load owns its committed C miss in this instruction.
+    let shared: Vec<_> = relocations["relocations"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|region| region["kind"] == "sharedPropertyProbes")
-        .map(|region| {
-            (
-                region["startOffset"].as_u64().unwrap(),
-                region["endOffset"].as_u64().unwrap(),
-            )
-        });
-    let (start, end) = shared.unwrap_or((start, end));
+        .filter(|link| {
+            link["target"]["kind"] == "routine"
+                && link["target"]["routine"] == "load"
+                && start <= link["startOffset"].as_u64().unwrap()
+                && link["endOffset"].as_u64().unwrap() <= end
+        })
+        .collect();
+    assert!(shared.len() <= 1, "one own shared load transfer");
+    let (code, relocations, start, end) = if let Some(link) = shared.first() {
+        let transfer = link["endOffset"].as_u64().unwrap() as usize;
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            parent_code.get(transfer..transfer + 4),
+            Some([0x00, 0x02, 0x3f, 0xd6].as_slice())
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            parent_code.get(transfer..transfer + 3),
+            Some([0x41, 0xff, 0xd3].as_slice())
+        );
+        let routines = json(bundle, JitArtifactFileName::Routines);
+        assert_eq!(routines["exactCodeIsRuntimeLocal"], true);
+        let owners: Vec<_> = routines["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|object| {
+                object["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["name"] == "load")
+            })
+            .collect();
+        assert_eq!(owners.len(), 1, "one retained physical load owner");
+        let owner = owners[0];
+        let code: Vec<u8> = owner["code"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| u8::try_from(value.as_u64().unwrap()).unwrap())
+            .collect();
+        let entries = owner["entries"].as_array().unwrap();
+        let start = entries
+            .iter()
+            .find(|entry| entry["name"] == "load")
+            .unwrap()["offset"]
+            .as_u64()
+            .unwrap();
+        let end = entries
+            .iter()
+            .filter_map(|entry| entry["offset"].as_u64())
+            .filter(|&offset| offset > start)
+            .min()
+            .unwrap_or(code.len() as u64);
+        assert!(start < end && end <= code.len() as u64);
+        (code, owner["relocations"].clone(), start, end)
+    } else {
+        (parent_code.to_vec(), relocations, start, end)
+    };
     let links: Vec<_> = relocations["relocations"]
         .as_array()
         .unwrap()
@@ -155,6 +207,7 @@ fn assert_get_entry(bundle: &JitArtifactBundle, own: &JitCodeGenerationSnapshot)
             link["target"]["kind"] == "runtimeStub"
                 && link["target"]["id"].as_u64() == Some(u64::from(abi::STUB_JIT_LOAD_PROPERTY.id))
                 && link["target"]["name"] == abi::runtime_stub_name(abi::STUB_JIT_LOAD_PROPERTY.id)
+                && link["target"]["signature"] == "reentrantNamedLoad"
                 && link["startOffset"]
                     .as_u64()
                     .is_some_and(|offset| start <= offset && offset < end)
@@ -162,7 +215,6 @@ fn assert_get_entry(bundle: &JitArtifactBundle, own: &JitCodeGenerationSnapshot)
         .collect();
     assert_eq!(links.len(), 1, "one source-owned committed Get edge");
     let link_end = links[0]["endOffset"].as_u64().unwrap() as usize;
-    let code = bundle.file(JitArtifactFileName::Code).unwrap().contents();
     #[cfg(target_arch = "aarch64")]
     assert_eq!(
         code.get(link_end..link_end + 4),
@@ -190,6 +242,10 @@ fn assert_get_entry(bundle: &JitArtifactBundle, own: &JitCodeGenerationSnapshot)
         }
     }
     let roots = json(bundle, JitArtifactFileName::Safepoints);
+    assert!(
+        roots["returnSites"].as_array().unwrap().is_empty(),
+        "a C Get owns no synthetic JS return site"
+    );
     let records: Vec<_> = roots["records"]
         .as_array()
         .unwrap()

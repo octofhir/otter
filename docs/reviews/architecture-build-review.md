@@ -1439,3 +1439,76 @@ The working Cargo cache is intentionally retained at
 `CARGO_PROFILE_DEV_DEBUG=0` / `CARGO_PROFILE_TEST_DEBUG=0`, retaining assertions.
 User caches and unrelated working-tree files are preserved. The full closing
 gate and full checked GC corpus remain open.
+
+## Capture actual shared JIT routine owners and restore native proofs
+
+The fresh `jit_known_native_calls` baseline fails all three tests. Two ARM64
+assertions count a literal-pool address word as another call; the same symbol
+has one load instruction and one data relocation. Constructor warmup with
+`Array` also admits intrinsic allocation rather than the Native entry the
+fixture is intended to exercise. The return-array placement decision can then
+retire the measured body at its first collection. These are fixture assumptions,
+not evidence that the native entry or placement policy is broken.
+
+The committed Get proof exposes a separate production diagnostics gap. Its
+source operation now transfers to an isolate-shared load routine in another
+physical mapping. Function-only artifacts contain the transfer symbol but omit
+that mapping's code and relocations. Searching an obsolete embedded-probe region
+cannot prove its actual canonical C miss. A public CLI capture at `f58d7402e`
+reproduces the missing shared bytes without requiring a runtime semantic error.
+
+Placed routine owners now retain their symbolic relocation records from the
+original emission. Explicit artifact capture borrows those actual owners and
+adds `routines.json` only when the function references shared code. Each
+referenced physical object occurs once, with all its entry aliases, local
+offsets, runtime address range, exact bytes, portable normalized bytes and the
+ordinary validated relocation document. Unrelated cached objects are excluded;
+missing required owners fail the capture invariant. Source and GC records stay
+with the calling function. No routine is re-emitted for diagnostics, and shared
+C misses acquire no synthetic JavaScript return sites.
+
+The native fixtures now distinguish instruction relocations from pool data and
+still require the exact stub id/signature, machine CALL, source region and root
+record. Boolean construction earns the existing Native plan before the Array
+probe; a preparation collection and normal warmup settle allocation placement
+before admission. Current-entry checks are strengthened. Exact installed
+generation, actual native execution, young motion, real OOM, no replay, no deopt
+and no interpreter fallback assertions remain mandatory. No admission threshold,
+GC layout, barrier, safepoint, deopt ABI or invalidation policy changes.
+
+The affected runtime matrix passes **21/21 on ARM64** and **20/20 on x86_64 under
+Rosetta**: artifacts, global accesses, all three known-native cases and two new
+shared-owner tests. The new tests retain the same physical mapping through GC
+and later captures, exclude a genuinely populated unrelated store routine,
+validate owned payloads after runtime destruction, and compare portable identity
+between distinct simultaneously live mappings on both targets. All **1305 VM**
+and **350 JIT unit tests** pass, including the updated explicit manifest inventory.
+Strict workspace all-target/all-feature Clippy, formatting/diff checks,
+VM/runtime no-default-feature checks and CLI/Test262/difftest builds pass.
+
+Public CLI comparison preserves the exact source and function's normalized
+machine code before/after, while the new shared payload closes the missing-code
+gap. Shared normalized code and symbolic records also match across independent
+CLI processes. Exact Test262 `built-ins/Reflect/get/` coverage remains **11/11**,
+with identical paths/outcomes, corpus, target and semantic configuration.
+Existing differential corpora pass **5/5** in interpreter, Template, production
+and GC stride 16 modes, including megamorphic loads, nested property reentry,
+Proxy receiver roots and both large Array-range corpora; no process times out.
+
+The original baseline is `/private/tmp/otter-known-native-before.log`.
+Final evidence lives under `/private/tmp/otter-routine-capture-*`:
+`{host,x86}-complete.log`,
+`units-final.log`, `clippy-final.log`, `features.log`, `build.jsonl`,
+`cli-comparison.json`, `test262-comparison.json`, both differential JSON reports,
+and the final input/validation manifests. The pre-change CLI/runner binaries
+are retained with hashes in `otter-routine-capture-before-tools/manifest.json`.
+
+This adds cold relocation metadata once per placed shared object, including
+when artifact capture is disabled. Disabled capture still copies no routine
+bytes, normalizes no code and builds no artifact JSON. No execution-time or
+compile-time speed improvement is claimed; metadata footprint is not benchmarked.
+The current artifact contract is updated in place, without a compatibility
+format, extra crate or dependency. The persistent Cargo target is kept at
+`/private/tmp/otter-engine-target`; unrelated files and user caches are preserved.
+The full closing gate, full checked GC corpus and remaining bounded Array
+drivers (including `flatMap`) are still outstanding.

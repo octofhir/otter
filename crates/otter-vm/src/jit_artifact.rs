@@ -16,11 +16,12 @@
 //!   selected by its host.
 //! - Every bundle owns all strings and bytes. It contains no live GC handles,
 //!   pointer-typed values, isolate borrows, sinks, locks, or registries.
-//!   Opt-in code maps may encode a process-local executable address range as
+//!   Opt-in code maps and routine captures may encode executable address ranges as
 //!   text for profiler joins; it is diagnostic data, never a callable pointer.
 //! - Exact [`JitArtifactFileName::Code`] bytes are runtime-local. Portable
 //!   comparisons use the required normalized and relocation files. The
 //!   normalized stream is semantic data and is never executable.
+//!   Shared routines carry their own exact/normalized bytes and local offsets.
 //! - This module performs no I/O. The outer host owns atomic persistence and
 //!   write failures.
 //!
@@ -38,7 +39,7 @@ pub const JIT_ARTIFACT_BUNDLE_LIMIT: usize = 4_096;
 /// Maximum owned payload bytes retained by one top-level capture.
 pub const JIT_ARTIFACT_BYTE_LIMIT: usize = 2 * 1024 * 1024 * 1024;
 
-const ALL_PAYLOAD_FILES: [JitArtifactFileName; 10] = [
+const ALL_PAYLOAD_FILES: [JitArtifactFileName; 11] = [
     JitArtifactFileName::Bytecode,
     JitArtifactFileName::TemplatePlan,
     JitArtifactFileName::OptimizedIr,
@@ -49,6 +50,7 @@ const ALL_PAYLOAD_FILES: [JitArtifactFileName; 10] = [
     JitArtifactFileName::Relocations,
     JitArtifactFileName::Deopt,
     JitArtifactFileName::Safepoints,
+    JitArtifactFileName::Routines,
 ];
 
 /// Owned source identity copied only when artifact capture is enabled.
@@ -83,6 +85,8 @@ pub enum JitArtifactFileName {
     Deopt,
     /// Moving-GC safepoint metadata.
     Safepoints,
+    /// Referenced shared machine-code objects with exact bytes and relocations.
+    Routines,
 }
 
 impl JitArtifactFileName {
@@ -100,6 +104,7 @@ impl JitArtifactFileName {
             Self::Relocations => "relocations.json",
             Self::Deopt => "deopt.json",
             Self::Safepoints => "safepoints.json",
+            Self::Routines => "routines.json",
         }
     }
 }
@@ -642,7 +647,8 @@ mod tests {
                 "filesAbsent": [
                     "optimized-ir.txt",
                     "asm.txt",
-                    "deopt.json"
+                    "deopt.json",
+                    "routines.json"
                 ]
             })
         );

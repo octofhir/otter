@@ -13,6 +13,8 @@
 //! - Fixtures earn native admission through normal source execution.
 //! - Each measured call enters its exact installed generation; an interpreter
 //!   trace, side exit, recompilation, or another function's bundle cannot pass.
+//! - Ordinary globals earn migration through named-method feedback; observer
+//!   calls use the proved Native kind's private-JS entry.
 //! - Read hits have no calls; a store hit owns only the canonical NoGC barrier.
 //!   Each cold region owns one committed binding call.
 //! - Observable getters, setters and argument evaluation execute exactly once.
@@ -688,6 +690,7 @@ impl Harness {
                                     && generation.tier == frame_kind
                                     && generation.lifecycle == CodeLifetimeState::Installed
                                     && generation.linked
+                                    && generation.current_entry
                             })
                             .map(|generation| Proof {
                                 bundle: bundle.clone(),
@@ -777,7 +780,11 @@ impl Harness {
                 .iter()
                 .find(|generation| generation.code_object_id == proof.generation.code_object_id)
                 .unwrap();
-            assert!(generation.linked && generation.lifecycle == CodeLifetimeState::Installed);
+            assert!(
+                generation.current_entry
+                    && generation.linked
+                    && generation.lifecycle == CodeLifetimeState::Installed
+            );
             if proof.generation.tier == NativeFrameKind::Baseline {
                 assert_eq!(
                     generation.generated_entries,
@@ -835,6 +842,7 @@ impl Harness {
                             && generation.tier == proof.generation.tier
                             && generation.lifecycle == CodeLifetimeState::Installed
                             && generation.linked
+                            && generation.current_entry
                     })
                     .collect::<Vec<_>>();
                 assert_eq!(
@@ -845,6 +853,10 @@ impl Harness {
                 assert_eq!(
                     current[0].code_object_id,
                     proof.bundle.manifest().code_object_id()
+                );
+                assert!(
+                    current[0].active_count > 0,
+                    "own native observer activation"
                 );
                 assert_eq!(
                     current[0].generated_deopts,
@@ -882,9 +894,9 @@ for (let warm = 0; warm < 5000; warm++) {
 
 const ORDINARY_INTEGRITY_SETUP: &str = r#"
 globalThis.integrityBinding = 5;
-// A normal named-property read migrates this small actual global. No delete,
-// padding, prototype publication or descriptor override precedes admission.
-globalThis.integrityBinding;
+// Named-method feedback migrates this actual global before store admission.
+// No delete, padding, prototype publication or descriptor override is needed.
+globalThis.integrityObserve();
 function strictIntegrityStore(value, observe) {
   'use strict';
   observe();
@@ -969,8 +981,8 @@ fn assert_integrity_observer_call(bundle: &JitArtifactBundle) {
         .filter(|relocation| {
             relocation["target"]["kind"] == "runtimeStub"
                 && relocation["target"]["id"].as_u64()
-                    == Some(u64::from(otter_vm::native_abi::STUB_JIT_CALL_GENERIC.id))
-                && relocation["target"]["name"] == "jit_call_generic"
+                    == Some(u64::from(otter_vm::native_abi::STUB_JIT_CALL_NATIVE.id))
+                && relocation["target"]["name"] == "jit_call_native"
                 && relocation["target"]["signature"] == "jsCall"
                 && relocation["startOffset"].as_u64().unwrap()
                     >= call["startOffset"].as_u64().unwrap()

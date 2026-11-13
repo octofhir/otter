@@ -929,8 +929,8 @@ validation rather than an incidental broad rewrite.
    against baseline without weakening their assertions; a successful targeted
    subset does not close this task.
    The `jit_global_access` abort was traced to its fixture stack footprint and
-   repaired below. Its four exposed guard/call/foreign-realm proof failures still
-   need diagnosis with the exact native/GC assertions preserved.
+   repaired below. Its four exposed guard/call/foreign-realm proof failures are
+   diagnosed and repaired in the final section with native/GC assertions preserved.
 2. **P1: diagnose the GC-stress watchdog failures.** Keep exact failed paths and
    limits. Re-run the full closing gate after correcting the causes, then the
    separate full checked GC corpus at strides 1–16. Do not turn timeouts into
@@ -1298,5 +1298,73 @@ user caches and unrelated working-tree files were preserved.
 
 This focused matrix does not replace the outstanding full checked GC corpus or
 the failed full closing gate. The four exposed global-binding proof failures
-from the preceding section and the other baseline failures remain open. Other
+were still open at this checkpoint; their later repair is recorded below. Other
 callback methods' large-range approximations are deliberately not claimed fixed.
+
+## Complete the current-generation global-binding regression proof
+
+At `b22f55c4b`, a fresh compact debug build reproduces **4 passed / 4 failed**
+in `jit_global_access`. Additional failure diagnostics identify the foreign
+exit as `AllocationSiteDecided` with `Recompile` in the optimizing tier, at
+the return-array allocation after the first measured collection. Its result
+already agrees with the interpreter. The correction preserves this legitimate
+placement policy and prepares the fixture before selecting its measured code.
+
+Three independent fixture assumptions had drifted from their runtime owners:
+
+- A cold named read no longer migrates an ordinary dictionary receiver:
+  `make_prototypes_fast` intentionally prepares its prototypes. The ordinary
+  global setup now makes a no-argument named call to its existing observer,
+  earning migration through normal method feedback before either writer is
+  admitted. It still performs no deletion, padding, prototype publication or
+  descriptor override. Exact ordinary guard emission remains mandatory.
+- The known native observer enters the canonical `STUB_JIT_CALL_NATIVE`, rather
+  than the generic classifier. The assertion now requires that exact id/name,
+  the private-JS signature, its own source operation and the actual machine
+  call. It still requires exactly one observer edge, with no extra cold calls.
+- The foreign return-array placement was undecided at admission. A preparation
+  collection and another ordinary source warmup settle it. Artifacts from both
+  warmup turns are joined to the one current installed body; an older linked
+  generation or another function's bundle cannot satisfy the proof.
+
+The measured foreign source, fresh young argument, strict existence snapshot,
+source-realm values, real moving collection and exact generation before/after
+remain unchanged. Its probe still forbids interpreter subject steps, deopt,
+compilation, inlining and replay. The parent harness also now requires
+`current_entry` at admission and every probe, and an active own native frame at
+the actual observer. No production source, placement/invalidation policy,
+admission threshold, ABI, GC assertion or test-stack setting changes.
+
+The target passes **8/8** on macOS ARM64 and x86_64 under Rosetta, including its
+existing exact young-child matrix at strides 1–16. The adjacent four public
+large-Find regressions also pass on ARM64. Each architecture passes **10/10**
+standalone repetitions of the whole eight-test target on the default test
+stack, with normal tier policy and assertions enabled. Test262 global-code
+remains **195/195**, with identical exact paths/outcomes and semantic
+configuration. These are repeated runs of the same retained runtime binary;
+this fixture-only change makes no conformance or engine-performance claim.
+Strict workspace all-target/all-feature Clippy, formatting/diff checks and
+VM/runtime no-default-feature builds pass, using one separate Cargo target
+with dev/test debug information disabled and assertions enabled.
+Broader validation still observes three failures in the unchanged
+`jit_known_native_calls` target. On ARM64, two
+Native-entry count assertions see two edges instead of one, and `mixed_get`
+finds no expected committed Get edge. These match the prior ARM64 baseline
+audit at `/private/tmp/otter-queue-baseline-audit/otter-runtime.log`. On x86_64,
+the first two cases stop at the constructor's generated-JS return-site
+assertion; `mixed_get` has the same missing-Get-edge assertion. Their source
+hashes match HEAD and none of these neighboring assertions is relaxed.
+
+Primary reports are retained at
+`/private/tmp/otter-global-proof-{before,host-final,x86-final}.log`; the final source
+hashes and unchanged neighboring fixture hashes are in
+`/private/tmp/otter-global-proof-inputs.json`. Per-repeat observations and exact
+Test262 identities are in `/private/tmp/otter-global-proof-repeat-{arm,x86}.json`
+and `/private/tmp/otter-global-proof-test262-comparison.json`; both verified
+test executables survive under `/private/tmp/otter-global-proof-retained-tests`.
+Commands and both passing/failing target outcomes are summarized separately in
+`/private/tmp/otter-global-proof-validation.json`.
+Cleaning only this task's temporary Cargo target removed **4.9 GiB** and left
+**50 GiB** available. Reports and verified executables remain; the default
+repository target was not created and unrelated working-tree hashes match.
+The full closing gate and full checked GC corpus remain outstanding.

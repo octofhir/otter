@@ -32,6 +32,7 @@
 //! - [`frame_roots`] — active interpreter frame-stack root registry.
 //! - [`finalize`] — raw weak-reference and finalization bookkeeping.
 //! - [`image_codec`] — byte writer/reader of the startup image.
+//! - `image_cage` — exclusive capture-cage rebasing during image relocation.
 //! - [`oom`] — `OutOfMemory` error.
 //! - [`os_memory`] — resident set and host free memory from the OS.
 //! - [`stats`] — per-heap counters and per-type rows.
@@ -90,6 +91,7 @@ pub mod header;
 pub mod heap;
 pub mod heap_image;
 pub mod host_refs;
+mod image_cage;
 pub mod image_codec;
 pub mod isolate_data;
 pub mod lab;
@@ -152,6 +154,7 @@ pub use trace::{SafeFinalize, SafeTraceable, Traceable};
 pub mod raw {
     pub use crate::compressed::RawGc;
     pub use crate::heap::RootSlotVisitor;
+    pub use crate::image_cage::rebase_image_address;
     pub use crate::trace::{SlotVisitor, TraceFn, TraceTable};
 }
 

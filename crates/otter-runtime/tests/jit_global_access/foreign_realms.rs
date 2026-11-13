@@ -10,6 +10,8 @@
 //! admission without policy changes. The foreign body may not bake the caller's
 //! globals or splice into it; its committed reads and writes retain the defining
 //! realm. Callback records own text/scalars and are asserted after the ABI returns.
+//! Allocation placement settles before the measured generation is selected;
+//! its actual moving-GC probe must retain that generation without any deopt.
 //!
 //! # See also
 //! - otter_vm::global_ops owns the source-aware committed semantics.
@@ -164,15 +166,17 @@ fn installer(exchange: Arc<Exchange>) -> RuntimeExtensionInstaller {
 
 fn native_proof(
     runtime: &Runtime,
-    warm: &otter_runtime::ExecutionResult,
+    warm: &[&otter_runtime::ExecutionResult],
     tier: NativeFrameKind,
 ) -> Proof {
-    let artifacts = warm.jit_artifacts().unwrap();
-    assert!(!artifacts.truncated());
     let generations = runtime.jit_code_generation_snapshot();
-    let proofs: Vec<_> = artifacts
-        .bundles()
+    let proofs: Vec<_> = warm
         .iter()
+        .flat_map(|result| {
+            let artifacts = result.jit_artifacts().unwrap();
+            assert!(!artifacts.truncated());
+            artifacts.bundles()
+        })
         .filter(|bundle| {
             bundle.manifest().module() == FOREIGN
                 && bundle.manifest().function_name() == "realmForeign"
@@ -237,6 +241,19 @@ fn foreign_callable_binding_misses_keep_defining_realm_and_moving_actuals() {
             .unwrap();
         assert_eq!(warm.completion_string(), "8000");
         assert!(exchange.retained.lock().unwrap().is_none());
+        // Settle allocation-site placement before selecting the generation
+        // that must survive the measured collection. A tracked return-array
+        // site legitimately leaves once after its first placement decision.
+        runtime.force_gc().unwrap();
+        let readmit = runtime
+            .run_script(
+                SourceInput::from_javascript(
+                    "for (let warm = 0; warm < 8000; warm++) foreignBundle[0](warmChild, foreignBundle[1], 0); 8000;",
+                ),
+                "foreign-binding-readmit.js",
+            )
+            .unwrap();
+        assert_eq!(readmit.completion_string(), "8000");
         assert!(
             trace
                 .lock()
@@ -248,12 +265,16 @@ fn foreign_callable_binding_misses_keep_defining_realm_and_moving_actuals() {
         );
         let proof = match selection {
             JitSelection::InterpreterOnly => None,
-            JitSelection::Template => {
-                Some(native_proof(&runtime, &warm, NativeFrameKind::Baseline))
-            }
-            JitSelection::ProductionTiered => {
-                Some(native_proof(&runtime, &warm, NativeFrameKind::Optimizing))
-            }
+            JitSelection::Template => Some(native_proof(
+                &runtime,
+                &[&warm, &readmit],
+                NativeFrameKind::Baseline,
+            )),
+            JitSelection::ProductionTiered => Some(native_proof(
+                &runtime,
+                &[&warm, &readmit],
+                NativeFrameKind::Optimizing,
+            )),
         };
         if let Some(proof) = &proof {
             let bundle = &proof.bundle;
@@ -274,10 +295,12 @@ fn foreign_callable_binding_misses_keep_defining_realm_and_moving_actuals() {
                 "a foreign compile never bakes the default realm's same-spelled lexical"
             );
             return_sites::assert_sites(bundle);
-            let events = warm.jit_debug_report().unwrap();
-            assert!(!events.truncated());
-            assert_eq!(events.dropped_events(), 0);
-            assert!(!events.events().iter().any(|event| matches!(event, JitDebugEvent::InlineLowered { callee_function_id, .. } if *callee_function_id == proof.generation.function_id)), "the foreign body has its own activation");
+            for result in [&warm, &readmit] {
+                let events = result.jit_debug_report().unwrap();
+                assert!(!events.truncated());
+                assert_eq!(events.dropped_events(), 0);
+                assert!(!events.events().iter().any(|event| matches!(event, JitDebugEvent::InlineLowered { callee_function_id, .. } if *callee_function_id == proof.generation.function_id)), "the foreign body has its own activation");
+            }
             let map = json(bundle, JitArtifactFileName::CodeMap);
             let regions = map["regions"].as_array().unwrap();
             let bytecode = binding_bytecode(bundle);
@@ -353,8 +376,9 @@ fn foreign_callable_binding_misses_keep_defining_realm_and_moving_actuals() {
         if let Some(proof) = &proof {
             assert!(
                 !trace.functions.iter().any(|name| name == "realmForeign"),
-                "the own foreign body stays native: {:?}",
-                trace.functions
+                "{selection:?}: the own foreign body stays native: {:?}; events: {:?}",
+                trace.functions,
+                result.jit_debug_report().unwrap().events()
             );
             for generations in [&record.before_generations, &record.after_generations] {
                 let own: Vec<_> = generations

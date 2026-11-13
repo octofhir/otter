@@ -31,6 +31,8 @@
 //!   arena across every allocating property operation.
 //! - Fill and reverse root receivers and pending operands before length/index
 //!   coercion and re-read them after reentrant operations.
+//! - Reverse walks the full captured range, charging native work before each
+//!   pair even when both indices are absent.
 //! - Join snapshots only primitive dense elements; reentrant coercions keep
 //!   indexed reads live and release their scoped roots on every error.
 //! - String conversion roots its receiver across `join` and tag getters;

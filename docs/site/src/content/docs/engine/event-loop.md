@@ -54,6 +54,12 @@ Microtask checkpointing is VM work. Promise reactions, `queueMicrotask`,
 and async-function resumes run only after the current JS execution context
 unwinds and before the runtime turn is considered complete.
 
+`queueMicrotask(callback)` is a core global, available on a default `Runtime`
+or `Otter` without enabling Web/Node APIs or installing a timer scheduler.
+Direct, aliased and reflected calls enqueue on the same isolate-owned FIFO as
+Promise reactions. Non-callable callbacks throw synchronously; extra arguments
+are ignored. Enabling Web APIs preserves the existing core function identity.
+
 Tokio-specific state belongs in the runtime's internal event-loop and
 host-service layer. Runtime handles carry owned command payloads and
 settlement messages; timer callbacks re-enter the isolate by opaque timer

@@ -11,9 +11,9 @@
 //!   `<realm-installer>`; a realm verifies and links it, never compiles it
 //!   (unless the embedder configured its own compiler).
 //! - `setImmediate`/`clearImmediate` are real timer globals installed by the
-//!   VM timer family (`otter-vm/src/timers.rs`), not here. Web-platform
-//!   globals (`atob`, `fetch`, `queueMicrotask`, `AbortController`, ...) live
-//!   in `otter-web`.
+//!   VM timer family (`otter-vm/src/timers.rs`), not here. `queueMicrotask`
+//!   belongs to the VM microtask bootstrap. Web-platform globals (`atob`,
+//!   `fetch`, `AbortController`, ...) live in `otter-web`.
 //!
 //! # See also
 //! - `build/builtins.rs` for the producer.

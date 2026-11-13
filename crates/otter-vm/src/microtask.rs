@@ -42,11 +42,15 @@
 //! # Contents
 //! - [`Microtask`] — task record (callee + this + inline args).
 //! - [`MicrotaskQueue`] — sync deque + drain state.
+//! - `globals` — core `queueMicrotask` spec and bootstrap installer.
 //!
 //! # See also
 //! - [Event loop](../../../docs/book/src/engine/event-loop.md)
 
+mod globals;
 mod ownership;
+
+pub(crate) use globals::Intrinsic;
 
 use std::collections::VecDeque;
 

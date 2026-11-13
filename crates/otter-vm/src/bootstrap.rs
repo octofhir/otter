@@ -63,7 +63,7 @@ unsafe fn trace_well_known_symbols(
 pub struct BootstrapFeatures(u32);
 
 impl BootstrapFeatures {
-    /// Core ECMAScript placeholder/builtin globals.
+    /// Core ECMAScript builtins and isolate scheduling globals.
     pub const CORE: Self = Self(0b0001);
     /// Host console surface.
     pub const CONSOLE: Self = Self(0b0010);
@@ -342,6 +342,7 @@ pub static BOOTSTRAP_ENTRIES: &[BootstrapEntry] = &[
     crate::bootstrap_entry!(crate::bootstrap_weak_refs::FinalizationRegistryIntrinsic),
     crate::bootstrap_entry!(crate::intrinsics::iterator::IteratorIntrinsic),
     crate::bootstrap_entry!(crate::console::Intrinsic),
+    crate::bootstrap_entry!(crate::microtask::Intrinsic),
     crate::bootstrap_entry!(crate::timers::Intrinsic),
 ];
 
@@ -584,6 +585,11 @@ fn record_installed_entry(telemetry: &mut BootstrapTelemetry, entry: &BootstrapE
                 .saturating_add(crate::number::prototype::NUMBER_PROTOTYPE_METHODS.len());
         }
         "console" => telemetry.record_namespace(&console::CONSOLE_SPEC),
+        "queueMicrotask" => {
+            telemetry.entries_installed = telemetry.entries_installed.saturating_add(1);
+            telemetry.native_functions_installed =
+                telemetry.native_functions_installed.saturating_add(1);
+        }
         _ => telemetry.record_placeholder(),
     }
 }
@@ -730,9 +736,10 @@ mod tests {
         // +2 for JSON `rawJSON` / `isRawJSON` (json-parse-with-source).
         // +1 for `Math.sumPrecise` (Math.sumPrecise proposal).
         // +1 for `Math.f16round` (Float16Array proposal).
+        // +1 for the core `queueMicrotask` function.
         assert_eq!(
             telemetry.native_functions_installed(),
-            133 + reflect::REFLECT_SPEC.methods.len(),
+            134 + reflect::REFLECT_SPEC.methods.len(),
         );
         assert!(
             telemetry.gc_allocations() <= MAX_DEFAULT_GC_ALLOCATIONS,

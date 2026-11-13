@@ -1,19 +1,35 @@
-//! The snapshot capture side is deterministic: two identically-built
-//! isolates produce the same atom table, the same fixed-root walk
-//! length, and the same global-lexical key set. Offsets are cage
-//! placement and may differ; identity of the *structure* must not.
+//! Public snapshot capture, restore and startup-image contracts.
+//!
+//! # Contents
+//! - Deterministic atoms, fixed roots and global lexical names.
+//! - Donor authority, restored globals, weak bodies and collecting pressure.
+//! - Startup native inventory and bootstrap/restore timing.
+//!
+//! # Invariants
+//! - Construction and restore helpers keep by-value Runtime temporaries out
+//!   of test frames, leaving the default Rust stack and native guard intact.
+//! - Donor lifetimes, full collection and exact observable results stay checked.
+//! - Cage placement may differ; captured structural identity must not.
 
 use otter_modules::OtterModulesBuilderExt;
 use otter_node::NodeApiBuilderExt;
 use otter_web::WebApiBuilderExt;
 
-fn full_surface_runtime() -> otter_runtime::Runtime {
-    otter_runtime::Runtime::builder()
-        .with_node_apis()
-        .with_otter_modules()
-        .with_web_apis()
-        .build()
-        .expect("full-surface runtime")
+fn build_runtime(builder: otter_runtime::RuntimeBuilder) -> Box<otter_runtime::Runtime> {
+    Box::new(builder.build().expect("runtime build"))
+}
+
+fn full_surface_runtime() -> Box<otter_runtime::Runtime> {
+    build_runtime(
+        otter_runtime::Runtime::builder()
+            .with_node_apis()
+            .with_otter_modules()
+            .with_web_apis(),
+    )
+}
+
+fn restore_runtime(snapshot: &otter_runtime::RuntimeSnapshot) -> Box<otter_runtime::Runtime> {
+    Box::new(otter_runtime::Runtime::from_isolate_snapshot(snapshot).expect("runtime restore"))
 }
 
 #[test]
@@ -57,8 +73,7 @@ fn restore_round_trips_in_process() {
         let source = full_surface_runtime();
         source.capture_isolate_snapshot().expect("capture")
     };
-    let mut restored =
-        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
+    let mut restored = restore_runtime(&snapshot);
 
     let before = restored
         .eval(otter_runtime::SourceInput::from_javascript(
@@ -84,18 +99,17 @@ fn restore_round_trips_in_process() {
 #[test]
 fn restore_preserves_donor_authority_and_non_overridden_config() {
     let snapshot = {
-        let donor = otter_runtime::Runtime::builder()
-            .capabilities(otter_runtime::CapabilitySet::allow_all())
-            .max_stack_depth(777)
-            .process_global(false)
-            .worker_global(false)
-            .build()
-            .expect("configured donor");
+        let donor = build_runtime(
+            otter_runtime::Runtime::builder()
+                .capabilities(otter_runtime::CapabilitySet::allow_all())
+                .max_stack_depth(777)
+                .process_global(false)
+                .worker_global(false),
+        );
         donor.capture_isolate_snapshot().expect("capture")
     };
 
-    let restored =
-        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
+    let restored = restore_runtime(&snapshot);
     assert!(restored.capabilities().is_allow_all());
     assert_eq!(restored.max_stack_depth(), 777);
 }
@@ -104,8 +118,7 @@ fn restore_preserves_donor_authority_and_non_overridden_config() {
 fn restored_runtime_evaluates_javascript() {
     let source = full_surface_runtime();
     let snapshot = source.capture_isolate_snapshot().expect("capture");
-    let mut restored =
-        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
+    let mut restored = restore_runtime(&snapshot);
     // Host events (a child's exit, a server's request) run their callbacks
     // against the realm's host-script context before any script of the
     // restored run has executed.
@@ -238,8 +251,7 @@ fn a_full_collection_on_a_restored_isolate_loses_nothing() {
         .map(|row| (row.type_tag, row.object_count))
         .collect();
 
-    let mut restored =
-        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
+    let mut restored = restore_runtime(&snapshot);
     restored.force_gc().expect("restored full GC");
     let after = restored.heap_census();
     let after_by_tag: std::collections::HashMap<u8, u64> = after
@@ -274,8 +286,7 @@ fn in_process_restored_isolate_survives_allocation_pressure() {
         let source = full_surface_runtime();
         source.capture_isolate_snapshot().expect("capture")
     };
-    let mut restored =
-        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
+    let mut restored = restore_runtime(&snapshot);
     assert!(restored.restored_from_snapshot());
 
     let probe = restored
@@ -302,7 +313,7 @@ fn bootstrap_weak_bodies_keep_working_after_restore() {
     // the registry's cells, relocates the weak tables' entries and puts every
     // weak body back in the collector's weak registries.
     let snapshot = {
-        let source = otter_runtime::Runtime::builder()
+        let source = build_runtime(otter_runtime::Runtime::builder()
             .with_node_apis()
             .with_otter_modules()
             .with_web_apis()
@@ -315,14 +326,11 @@ fn bootstrap_weak_bodies_keep_working_after_restore() {
                      for (var i = 0; i < 16; i++) { var k = {k: i}; __wmKeys.push(k); __wm.set(k, {v: i}); } \
                      globalThis.__wmEmpty = new WeakMap();",
                 ))
-            }))
-            .build()
-            .expect("seeded runtime");
+            })));
         source.capture_isolate_snapshot().expect("capture")
     };
 
-    let mut restored =
-        otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("runtime restore");
+    let mut restored = restore_runtime(&snapshot);
     restored.force_gc().expect("full GC over severed registry");
     let probe = restored
         .eval(otter_runtime::SourceInput::from_javascript(
@@ -354,7 +362,7 @@ fn restore_is_cheaper_than_bootstrap() {
 
     let restore_started = Instant::now();
     for _ in 0..ROUNDS {
-        let runtime = otter_runtime::Runtime::from_isolate_snapshot(&snapshot).expect("restore");
+        let runtime = restore_runtime(&snapshot);
         std::hint::black_box(&runtime);
     }
     let restore = restore_started.elapsed() / ROUNDS;
@@ -376,8 +384,6 @@ fn a_startup_image_names_no_closure() {
         assert!(!bytes.is_empty());
     }
     check(&full_surface_runtime());
-    let bare = otter_runtime::Runtime::builder()
-        .build()
-        .expect("bare runtime");
+    let bare = build_runtime(otter_runtime::Runtime::builder());
     check(&bare);
 }

@@ -491,14 +491,30 @@ size, and explicit `filesPresent` / `filesAbsent` inventories.
 | `relocations.json` | Typed runtime-local address sites and their exact `code.bin` ranges, without resolved address values. |
 | `deopt.json` | Optimizer frame reconstruction metadata; omitted for template code. |
 | `safepoints.json` | Tagged frame/register/spill locations known to moving GC. |
+| `routines.json` | Referenced shared native objects, their actual entry offsets, exact/normalized bytes and symbolic relocations. Present only when the function references a routine. |
 
 `code.bin` is intentionally marked runtime-local. It can contain baked process
 addresses and can differ across identical runs because of ASLR. Do not use it
 as a portable golden file.
 
-All native locations are offsets into the matching `code.bin`, never absolute
-executable addresses. A range must satisfy
+Function-native locations are offsets into the matching `code.bin`. A range must satisfy
 `0 <= startOffset <= endOffset <= manifest.codeBytes`.
+
+`routines.json` captures only shared physical objects referenced by this
+function's `routine` relocations. Each object contains its actual
+`runtimeAddressRange`, named `entries` with local offsets, exact `code` bytes,
+portable `normalizedCode`, and the ordinary symbolic relocation document.
+One object can have both `load` and `probeLoad` entries. Join the caller's
+named relocation to the exact entry; routine offsets belong to that object,
+independently of `code.bin`. Source and collector records remain in the caller.
+Shared C misses do not acquire synthetic JavaScript return sites.
+
+Exact routine bytes and address ranges are runtime-local diagnostic data.
+Compare `normalizedCode` for portable code identity. Multiple function bundles
+can snapshot the same mapping; their payload copies are not distinct resident
+code allocations. Routine owners retain their compact address records at first
+placement, so a later capture reads the existing mapping without re-emission.
+Disabled capture does not copy routine bytes, normalize code or build JSON.
 
 `code-map.json` contains typed structural regions and validates every native
 range against the matching code object.

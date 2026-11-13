@@ -10,6 +10,7 @@
 //!   targets, compact scratch layouts and actual callable-entry offsets.
 //! - [`relocation`] — typed address sites and portable semantic code.
 //! - [`assembly`] — deterministic annotated target disassembly.
+//! - [`routines`] — actual referenced shared mappings and their local entries.
 //! - Deterministic bytecode, safepoint, deopt, and bundle renderers.
 //!
 //! # Invariants
@@ -30,6 +31,8 @@
 //!   invariant fails loudly; release builds never silently drop diagnostics.
 //! - Exact executable bytes remain runtime-local and are never retained by the
 //!   installed hot code object through this sidecar.
+//! - Shared routines retain symbolic placement records independently of capture;
+//!   their bytes, normalized streams and JSON are copied only on request.
 //! - Files are returned as owned VM DTOs; this crate performs no filesystem
 //!   I/O.
 //!
@@ -44,6 +47,7 @@ mod assembly;
 mod assembly;
 pub(crate) mod relocation;
 mod return_sites;
+mod routines;
 
 use std::fmt::Write as _;
 
@@ -75,6 +79,25 @@ pub(crate) struct NativeCompileOutput<T> {
     pub(crate) artifact: Option<Box<JitArtifactBundle>>,
     pub(crate) diagnostics: Box<[otter_vm::JitCompilerDiagnostic]>,
     pub(crate) ir_node_count: u64,
+}
+
+/// Runtime-local placement used only by explicitly captured diagnostics.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct RuntimeAddressRange {
+    start: String,
+    end_exclusive: String,
+    entry: String,
+}
+
+impl RuntimeAddressRange {
+    fn new(start: usize, end_exclusive: usize, entry_offset: usize) -> Self {
+        Self {
+            start: format!("0x{start:x}"),
+            end_exclusive: format!("0x{end_exclusive:x}"),
+            entry: format!("0x{:x}", start.saturating_add(entry_offset)),
+        }
+    }
 }
 
 /// Machine-readable compact scratch assignment attached to an inline setup
@@ -416,14 +439,6 @@ impl CodeMapCapture {
     fn render(self, entry_offset: usize, runtime_range: Option<(usize, usize)>) -> String {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
-        struct RuntimeAddressRange {
-            start: String,
-            end_exclusive: String,
-            entry: String,
-        }
-
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
         struct Document {
             entry_offset: u64,
             call_entry_offset: Option<u64>,
@@ -433,12 +448,9 @@ impl CodeMapCapture {
             osr_entries: Vec<OsrCodeEntry>,
         }
 
-        let runtime_address_range =
-            runtime_range.map(|(start, end_exclusive)| RuntimeAddressRange {
-                start: format!("0x{start:x}"),
-                end_exclusive: format!("0x{end_exclusive:x}"),
-                entry: format!("0x{:x}", start.saturating_add(entry_offset)),
-            });
+        let runtime_address_range = runtime_range.map(|(start, end_exclusive)| {
+            RuntimeAddressRange::new(start, end_exclusive, entry_offset)
+        });
         let document = Document {
             entry_offset: entry_offset as u64,
             call_entry_offset: self.call_entry_offset.map(|offset| {
@@ -471,6 +483,7 @@ pub(crate) fn build_bundle(
     return_sites: &[SafepointEntry],
 ) -> Box<JitArtifactBundle> {
     code_map.validate_call_entry(code.len());
+    let routine_artifact = routines::render(code, &relocations);
     let rendered_relocations = relocations
         .render(code.bytes())
         .unwrap_or_else(|error| panic!("compiler built invalid JIT relocations: {error}"));
@@ -525,6 +538,12 @@ pub(crate) fn build_bundle(
         JitArtifactFileName::Assembly,
         rendered_assembly,
     ));
+    if let Some(routines) = routine_artifact {
+        files.push(JitArtifactFile::text(
+            JitArtifactFileName::Routines,
+            routines,
+        ));
+    }
     if let Some(runtime) = deopt_runtime {
         files.push(JitArtifactFile::text(
             JitArtifactFileName::Deopt,

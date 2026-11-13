@@ -299,6 +299,16 @@ pub(crate) struct RelocationCapture {
 }
 
 impl RelocationCapture {
+    /// The named shared entries this code object actually materializes.
+    pub(crate) fn referenced_routines(&self) -> impl Iterator<Item = &'static str> {
+        self.records
+            .iter()
+            .filter_map(|record| match &record.target {
+                RelocationTarget::Routine { routine } => Some(*routine),
+                _ => None,
+            })
+    }
+
     /// Creates capture storage without allocating a record buffer.
     pub(crate) fn new(enabled: bool) -> Self {
         Self {

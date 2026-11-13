@@ -15,6 +15,8 @@
 //!   they are placed.
 //! - Logical instruction bytes and retained placement are distinct: artifacts
 //!   and entry bounds use the former, resource admission the latter.
+//! - Shared routine mappings stay with their retained set; diagnostics borrow
+//!   those same placed owners without generating another copy.
 //!
 //! # See also
 //! - [`crate`] — the JIT tier and its rooting/`unsafe` contract.
@@ -68,6 +70,11 @@ impl CompiledCode {
     /// Keep `routines` alive for as long as this code, which calls them.
     pub(crate) fn retain_routines(&mut self, routines: Option<Arc<crate::routines::Routines>>) {
         self.routines = routines;
+    }
+
+    /// Borrow the actual placed routine owners for opt-in artifact capture.
+    pub(crate) fn routines(&self) -> Option<&crate::routines::Routines> {
+        self.routines.as_deref()
     }
 
     /// Raw pointer to the entry instruction of the compiled code.

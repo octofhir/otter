@@ -1,13 +1,15 @@
-//! Actual collecting preparation of fill and reverse through native builtins.
+//! Array mutation preparation, relocation and numeric bulk admission.
 //!
 //! # Contents
 //! - Length getter/number coercion, start/end and empty-result GC boundaries.
 //! - Current source/result/payload identities and exact scoped-root cleanup.
+//! - Numeric bulk admission accounts for stores and checks cancellation.
 //!
 //! # Invariants
-//! - Fresh source and payload are young before the actual native operation.
-//! - One selected callback forces full GC inside that operation.
-//! - Source and payload move; assertions remain outside the callback.
+//! - Collecting preparation cases start with young source and payload values.
+//! - Their selected callback forces full GC inside the actual native operation;
+//!   source and payload move, with assertions outside the callback.
+//! - Numeric bulk checks prove admission, charged stores and cancellation.
 //!
 //! # See also
 //! - `super::mutate` owns preparation and live mutations.
@@ -17,6 +19,47 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+
+#[test]
+fn numeric_bulk_admission_charges_stores_and_observes_cancellation() {
+    let mut vm = Interpreter::new().unwrap();
+    NativeCtx::with_host_context(
+        &mut vm,
+        crate::NativeCallInfo::default_call(),
+        None,
+        |ctx| {
+            ctx.scope(|mut scope| -> Result<(), NativeError> {
+                let buffer = scope.array_buffer_from_bytes(vec![0; 16])?;
+                let view =
+                    scope.typed_array_view(buffer, crate::binary::TypedArrayKind::Uint16, 2, 5)?;
+                scope.with_turn_parts(|interp, _| {
+                    let raw = interp.escape_scoped(view);
+                    let before = interp.work_budget_stats().work_units_executed;
+                    let cycles = interp.gc_heap().gc_cycle_counts();
+                    assert!(
+                        interp
+                            .try_fill_numeric_typed_array(raw, Value::number_i32(719), 1, 4)
+                            .unwrap()
+                    );
+                    assert_eq!(interp.work_budget_stats().work_units_executed - before, 3);
+                    assert_eq!(interp.gc_heap().gc_cycle_counts(), cycles);
+                    interp.interrupt_handle().interrupt();
+                    assert!(matches!(
+                        interp.try_fill_numeric_typed_array(raw, Value::number_i32(19), 1, 4),
+                        Err(VmError::Interrupted)
+                    ));
+                    interp.interrupt_handle().reset();
+                });
+                assert_eq!(
+                    scope.array_buffer_bytes(buffer).unwrap(),
+                    [0, 0, 0, 0, 207, 2, 207, 2, 207, 2, 0, 0, 0, 0, 0, 0]
+                );
+                Ok(())
+            })
+        },
+    )
+    .unwrap();
+}
 
 #[test]
 fn mutation_preparation_moves_inputs_and_keeps_exact_aliases_and_root_extent() {

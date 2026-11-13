@@ -1635,24 +1635,19 @@ pub(crate) fn fill_dense_range_with_roots(
     heap: &mut otter_gc::GcHeap,
     start: usize,
     end: usize,
-    value: Value,
+    mut value: Value,
     external_visit: &mut RootSlotVisitor<'_>,
 ) -> Result<(), otter_gc::OutOfMemory> {
     if start >= end {
         return Ok(());
     }
     {
+        let kind = dense_kind_for_value(value);
         let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
             external_visit(visitor);
-            value.trace_value_slots(visitor);
+            value.trace_value_slot_mut(visitor);
         };
-        reserve_dense_capacity(
-            &mut arr,
-            heap,
-            end,
-            dense_kind_for_value(value),
-            &mut reserve_roots,
-        )?;
+        reserve_dense_capacity(&mut arr, heap, end, kind, &mut reserve_roots)?;
     }
     heap.with_payload(arr, |body| {
         body.refresh_element_cache();

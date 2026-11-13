@@ -4,6 +4,7 @@
 //! - Linear append scanning with geometric slab growth.
 //! - Roots that evacuate a child before its remembered parent is traced.
 //! - Arbitrary stores, bulk rewrites, truncation, and full marking.
+//! - Pending fill values relocate during actual backing-store reservation.
 //!
 //! # Invariants
 //! - Every test keeps the old array in a handle scope across collections.
@@ -177,4 +178,40 @@ fn remembered_ranges_follow_overwrites_bulk_rewrites_and_truncation() {
     assert_marker(&heap, array::get(array.get(), &heap, 29), 61);
     assert!(array::get(array.get(), &heap, 13).is_undefined());
     assert_eq!(array::len(array.get(), &heap), 32);
+}
+
+#[test]
+fn fill_reservation_updates_the_pending_child_before_bulk_stores() {
+    let mut heap = GcHeap::new().expect("heap");
+    heap.set_gc_stress(0, false);
+    // SAFETY: the heap outlives this scope and both locals.
+    let scope = unsafe { HandleScope::from_ptr(heap.handle_stack_ptr()) };
+    let owner = scope.local(array::alloc_array_old_for_fixture(&mut heap).expect("old array"));
+    let child = scope.local(heap.alloc(Child { marker: 719 }).expect("pending child"));
+    let before = child.get().offset();
+    let cycles = heap.gc_cycle_counts();
+    // The next backing-store allocation, inside the real fill helper, collects.
+    heap.set_gc_stress(1, false);
+    array::fill_dense_range_with_roots(
+        owner.get(),
+        &mut heap,
+        0,
+        128,
+        Value::from_other_gc(child.get().raw()),
+        &mut |_| {},
+    )
+    .expect("collecting fill reservation");
+    assert!(heap.gc_cycle_counts().0 > cycles.0);
+    assert_ne!(
+        child.get().offset(),
+        before,
+        "the pending child actually moved"
+    );
+    for index in 0..128 {
+        let value = array::get(owner.get(), &heap, index);
+        assert_eq!(value.as_raw_gc().unwrap(), child.get().raw());
+        assert_marker(&heap, value, 719);
+    }
+    heap.collect_minor(EmptyRoots).expect("bulk-write barrier");
+    assert_marker(&heap, array::get(owner.get(), &heap, 127), 719);
 }

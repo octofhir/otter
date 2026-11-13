@@ -1601,3 +1601,86 @@ debug/assertion and parallelism settings, occupying **8.4 GiB** at closure.
 Unrelated files and user caches are preserved. The full closing gate and full
 checked GC corpus remain open; the other bounded Array materialization/probe
 drivers are still separate work. No performance improvement is claimed.
+
+## Preserve live join reads across reentrant coercion and close its roots
+
+At `092f9dfe9`, a public two-element example reproduces a common-path semantic
+error in all three execution policies:
+`const a = [{toString(){a[1] = 'after'; return 'first';}}, 'before']; a.join('|')`
+returns `first|before`, while Node returns `first|after`. Join's dense snapshot
+admits object elements before any conversion. An object's ToString can then
+replace, delete or redefine a later element, but the snapshot still supplies
+its old value. A plain dense array's initial data layout proves no indexed
+getter effect; it does not prove that subsequent conversions cannot reenter.
+
+A focused VM regression independently reproduces an abrupt-root ownership
+error: a native indexed getter actually performs full GC and throws its exact
+captured marker. The old join returns with six handles where the enclosing
+scope previously had five, because its manual JSON root pop is skipped by `?`.
+The failing baseline is `otter-join-rooting-before-final.log`; the public shared
+corpus also fails before the production change.
+
+`array_prototype/join.rs` now owns the existing join driver and Latin-1 helper.
+Dense snapshots admit only primitive own data elements. Object and callable
+elements, holes, accessors and proxies use the existing live Get/ToString
+sequence. This retains primitive Latin-1 copying and the existing rooted
+primitive snapshot during allocating number conversions. It does not introduce
+a second property or coercion implementation.
+
+One handle scope owns the receiver and separator before ToObject, the boxed
+receiver during length/separator coercions, and every subsequent receiver read.
+All early returns and errors close that extent. The manual JSON root pair and
+outer raw-value RootScope are removed; existing primitive-vector rooting is
+preserved. Length capture, separator conversion, per-element coercion,
+UTF-16 output and original property/call error dispositions retain their order.
+No Value layout, barrier, safepoint, deopt ABI, invalidation policy, native
+admission threshold, crate or dependency changes.
+
+The shared corpus covers dense replacement, installing a later getter,
+shrinking length, inherited indices after prototype mutation, nested joins,
+ordered Proxy Gets without HasProperty/enumeration, separator effects,
+primitive boxing, exact lone UTF-16 units, Latin-1 and wide primitive cases,
+and abrupt identity/order at length, separator, Get and element conversion.
+It passes on installed Node **v24.16.0**. The focused VM proof checks indexed
+getter and element-coercion failures three times each, with actual full
+collection, fresh young input, changed source offset, exact original thrown
+value and unchanged handle-arena/iteration-anchor extents. Its assertions stay
+outside the native callback, and it passes on both architectures.
+
+The affected runtime matrix passes **17/17 on ARM64 and 17/17 on x86_64 under
+Rosetta**. All **1306 VM** and **350 JIT unit tests** pass. Neighboring exact
+native generation, no-fallback, real OOM and GC assertions remain intact.
+Strict workspace all-target/all-feature Clippy, formatting/diff checks,
+VM/runtime no-default-feature checks and CLI/Test262/difftest builds pass.
+The existing quick GC family passes at stride 1 and honors the same explicit
+Cargo target. The standalone differential runner passes all three selected
+join/callback/flatten corpora under interpreter, Template, production and GC
+stride 16, with zero timeouts.
+
+Test262 `built-ins/Array/prototype/join/` remains **23/23** before/after, with
+identical exact paths/outcomes, corpus, target, assertions and semantic
+configuration. The frozen-source public CLI example returns `first|after` in
+all three execution policies after the fix. The pending-separator primitive
+boxing control also passed on the pre-change binary at stress stride 1; it is
+preservation coverage, not a separately claimed reproduced bug.
+
+Evidence is retained under `/private/tmp/otter-join-*`, including
+`live-{before,after}.json`, `rooting-before-final.log`, `runtime-before.log`,
+`rooting-x86-final.log`, `{host,x86}-final.log`, `units-final.log`,
+`clippy-final.log`, `features-final.log`, `build-final.jsonl`,
+`test262-comparison.json`, `difftest.json`, `reference.json` and `quick-gc.log`.
+Pre-change executables and their hashes remain in `otter-join-before-tools`.
+
+The new join corpus passes the existing process-isolated GC driver **48/48**
+at strides 1–16 in interpreter, Template and production modes.
+`/private/tmp/otter-join-gc/results.json` reports `status: passed`, with
+unchanged executable/source hashes and every observation retained alongside
+`runs.jsonl`. Final source/binary identities and validation commands/results
+are retained in `/private/tmp/otter-join-{inputs,validation}.json`.
+
+The existing join materialization ceiling and scratch/output admission are
+unchanged and still require their own full-range/resource-policy correction.
+This slice does not claim complete large-length join conformance or a speed
+improvement. The full closing gate and full checked GC corpus remain open.
+The persistent `/private/tmp/otter-engine-target` and unrelated user files are
+preserved. The retained target occupies **9.0 GiB** at closure.

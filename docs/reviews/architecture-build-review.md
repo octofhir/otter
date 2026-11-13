@@ -1510,5 +1510,94 @@ compile-time speed improvement is claimed; metadata footprint is not benchmarked
 The current artifact contract is updated in place, without a compatibility
 format, extra crate or dependency. The persistent Cargo target is kept at
 `/private/tmp/otter-engine-target`; unrelated files and user caches are preserved.
-The full closing gate, full checked GC corpus and remaining bounded Array
-drivers (including `flatMap`) are still outstanding.
+The full closing gate and full checked GC corpus remain outstanding. The
+flattening slice below resolves `flat`/`flatMap`; other bounded Array drivers
+still require separate audits.
+
+## Bound native flattening depth and control the complete source range
+
+At `cf3171dd7`, the public CLI aborts with a Rust stack overflow on
+`const a = []; a[0] = a; a.flat(Infinity)`. The isolated process exits by
+SIGABRT even with a two-second runtime timeout. A second public probe places a
+throwing getter at index `2**25` on an object of length `2**25 + 1`.
+`flatMap` returns normally without visiting it, because its caller silently
+clamps the captured range. `flat` and recursive child arrays have the same
+clamp. Existing Test262 coverage nevertheless passes all 44 selected paths.
+
+The shared native walk also bypasses rejecting work budgets over holes. A
+bounded public-runtime regression reaches its independent getter sentinel at
+10000 and executes its source catch/later effects instead of rejecting the
+turn. The existing callback-budget regression reproduces the same failure
+when extended to `flatMap`; the seven previously corrected methods still pass.
+These observations precede the production changes.
+
+`array_prototype/flatten.rs` now owns one iterative FlattenIntoArray driver.
+Its explicit stack preserves depth-first order, captured lengths, live
+HasProperty/Get, top-level-only mapping and CreateDataPropertyOrThrow. The
+three range clamps are removed. Every attempted index, including a nested
+hole, enters the existing native work/cancellation checkpoint before property
+access. Terminal budget/control errors retain the committed fatal domain.
+Length capture, mapper validation, depth coercion and species creation retain
+their existing order and owners.
+
+The target, mapper, callback receiver, current element and source frames use
+scoped GC handles. A frame's source slot is reused at that depth and cleared
+when it completes; root storage grows with peak nesting, not source element
+count. Four frame records fit inline. At most 512 active source frames are
+retained; deeper nonempty input raises a catchable `RangeError`, after its
+nested length read. This deliberate implementation limit bounds native frame
+storage and stops cyclic infinite-depth input without using the Rust stack.
+The safe-integer target-index check and actual property/call error dispositions
+remain intact. No dependency, Value layout, barrier, safepoint, deopt ABI,
+invalidation policy or native admission threshold changes.
+
+The new shared corpus checks exact source/child/species/write order at large
+lengths, holes and live deletion/addition after length mutation, callback
+arguments and `this`, inherited getters, revoked-proxy IsArray behavior,
+one-level mapping, UTF-16 units, deep sibling reuse, abrupt identity and
+allocating target traps. The existing callback corpus now includes `flatMap`.
+Public resource regressions cover top-level/nested holes, rejection bypassing
+source catch handlers, repeated cyclic failure, valid 512-frame input and
+catchable 513-frame exhaustion, plus yield/microtask ordering. The existing
+predicate fixture now also requires normal Template/Graph admission for
+`flatMap`, exact retained generation, actual native effects, no deopt and no
+interpreter fallback; its assertions are preserved.
+
+The affected runtime matrix passes **16/16 on ARM64 and 16/16 on x86_64 under
+Rosetta**. All **1305 VM** and **350 JIT unit tests** pass, including existing
+collecting species-consumer checks. Strict workspace all-target/all-feature
+Clippy, formatting/diff checks, VM/runtime no-default-feature checks and
+CLI/Test262/difftest builds pass. The existing quick GC family passes at stride
+1 and inherits the explicit Cargo target. The standalone differential runner
+passes all three selected corpora in interpreter, Template, production and GC
+stride 16 modes, with zero timeouts. Both changed JS corpora also pass on
+installed Node **v24.16.0**.
+
+Exact Test262 coverage is unchanged: **19/19 `flat`** and **25/25 `flatMap`**,
+with identical per-path outcomes, corpus, target, assertions and semantic
+configuration before/after. The original cyclic CLI probe now produces a
+catchable RangeError in all three execution policies; the full-range probe
+reaches the getter at `2**25`. The long unoptimized range probe is semantic
+evidence only, not a comparable speed measurement.
+
+Reports are retained under `/private/tmp/otter-flatten-*`, including
+`cyclic-{before,after}.json`, `boundary-{before,after}.json`,
+`budget-before.log`, `control-before.log`, `{host-complete,x86-final}.log`,
+`units.log`, `clippy-final.log`, `features.log`, `build-final.jsonl`,
+`test262-comparison.json`, `difftest.json` and `reference.json`. The first
+x86 test attempt exposed an accidental Rust test block embedded in a new JS
+raw-string fixture; the fixture was corrected before both final passing runs.
+Pre-change executables and hashes remain in `otter-flatten-before-tools`.
+
+The new flatten corpus also passes the existing process-isolated GC driver
+**48/48** at strides 1–16 in interpreter, Template and production modes.
+`/private/tmp/otter-flatten-gc/results.json` reports `status: passed`, with
+exact unchanged binary/source hashes and per-run output retained alongside
+`runs.jsonl`. Final inputs and commands/results are collected in
+`/private/tmp/otter-flatten-{inputs,validation}.json`.
+
+The persistent `/private/tmp/otter-engine-target` is retained with the same
+debug/assertion and parallelism settings, occupying **8.4 GiB** at closure.
+Unrelated files and user caches are preserved. The full closing gate and full
+checked GC corpus remain open; the other bounded Array materialization/probe
+drivers are still separate work. No performance improvement is claimed.

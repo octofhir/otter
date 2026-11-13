@@ -14,6 +14,7 @@
 //! - Reverse retains both fetched values across subsequent getters and writes.
 //! - Reverse walks every pair in the captured length, with a native work and
 //!   cancellation checkpoint before each pair, including two absent indices.
+//! - Generic fill checks native work and cancellation before every Set attempt.
 //! - Fill's existing materialization bounds, dense guards and barriers remain.
 //!
 //! # See also
@@ -188,6 +189,9 @@ impl Interpreter {
                 return Ok(interp.escape_scoped(o_root));
             }
             for k in start..bounded_end {
+                interp
+                    .charge_native_loop_iteration()
+                    .map_err(CommittedValueError::Fatal)?;
                 let (o, value) = (
                     interp.escape_scoped(o_root),
                     interp.escape_scoped(value_root),

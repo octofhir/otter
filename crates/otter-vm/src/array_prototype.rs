@@ -36,6 +36,8 @@
 //!   anchor indices.
 //! - FindViaPredicate reads every visited index with Get, without HasProperty;
 //!   callback methods that skip absent indices retain HasProperty before Get.
+//! - FindViaPredicate walks its full snapshotted length lazily, with a work and
+//!   cancellation checkpoint before each indexed Get, including native callbacks.
 //! - Pathological array-like lengths are guarded before any dense
 //!   materialisation.
 
@@ -412,10 +414,13 @@ fn try_dense_array_callback_fast_path(
     callback_fast_path: Option<ArrayCallbackFastPath>,
     args: ValueWindow<'_>,
 ) -> Option<Result<Value, NativeError>> {
+    // Decide admission before copying a dense receiver. Find and other
+    // unmatched callbacks use the live driver, including immediate matches.
+    let callback_fast_path = callback_fast_path?;
     let arr = receiver.as_array()?;
     let values = crate::array::plain_dense_prefix_values(arr, interp.gc_heap(), len)?;
     match callback_fast_path {
-        Some(ArrayCallbackFastPath::MapMulAdd { mul, add }) if kind == ArrayCallbackKind::Map => {
+        ArrayCallbackFastPath::MapMulAdd { mul, add } if kind == ArrayCallbackKind::Map => {
             let target = output_target?;
             let target_arr = target.as_array()?;
             if !crate::array::can_fast_fill_dense_range(target_arr, interp.gc_heap(), 0, len) {
@@ -450,9 +455,7 @@ fn try_dense_array_callback_fast_path(
             });
             Some(result)
         }
-        Some(ArrayCallbackFastPath::FilterRemEqZero { divisor })
-            if kind == ArrayCallbackKind::Filter =>
-        {
+        ArrayCallbackFastPath::FilterRemEqZero { divisor } if kind == ArrayCallbackKind::Filter => {
             let target = output_target?;
             let target_arr = target.as_array()?;
             if !crate::array::can_fast_fill_dense_range(target_arr, interp.gc_heap(), 0, len) {
@@ -490,7 +493,7 @@ fn try_dense_array_callback_fast_path(
             });
             Some(result)
         }
-        Some(ArrayCallbackFastPath::ReduceAdd) if kind.is_reduce() => {
+        ArrayCallbackFastPath::ReduceAdd if kind.is_reduce() => {
             let acc = args.get(1).copied().and_then(Value::as_f64);
             if kind.reverse() {
                 let mut iter = values.into_iter().rev();
@@ -4946,12 +4949,12 @@ pub(crate) const BUILTIN_TAG_RESULTS: [(&str, &str); 10] = [
     ("RegExp", "[object RegExp]"),
 ];
 
-/// Index visit order of a callback method: a dense ladder up or down, or a
-/// listed sparse set behind an optional dense prefix.
+/// Index visit order of a callback method: a lazy ladder up or down, or a
+/// listed sparse set for non-Find callback methods.
 enum CallbackIndices {
     Up(std::ops::Range<usize>),
     Down(std::iter::Rev<std::ops::Range<usize>>),
-    Listed(std::iter::Chain<std::ops::Range<usize>, std::vec::IntoIter<usize>>),
+    Listed(std::vec::IntoIter<usize>),
 }
 
 impl Iterator for CallbackIndices {
@@ -5126,23 +5129,16 @@ fn array_callback_native_dispatch(
         let string_data = receiver
             .as_object()
             .and_then(|o| crate::object::string_data(o, interp.gc_heap()));
-        // Index visit order. A bounded `0..len` ladder is spec-exact for any
-        // receiver (dense array, Function, object with getters, mutation
-        // mid-walk). A pathological `length` (> MAX_ARRAY_LIKE_PROBE_LEN)
-        // falls back to the sparse present-index set across the prototype
-        // chain so the walk never runs billions of `HasProperty` probes.
-        let index_iter = if len <= MAX_ARRAY_LIKE_PROBE_LEN {
+        // FindViaPredicate needs every index, even an absent one, and may stop
+        // immediately. A lazy range neither allocates a length-sized vector
+        // nor enumerates the receiver before its first Get. Other callback
+        // methods retain their existing large-length sparse approximation.
+        let index_iter = if visit_all || len <= MAX_ARRAY_LIKE_PROBE_LEN {
             if reverse {
                 CallbackIndices::Down((0..len).rev())
             } else {
                 CallbackIndices::Up(0..len)
             }
-        } else if visit_all && reverse {
-            // `findLast` / `findLastIndex` must visit absent indices too.
-            // For pathological array-like lengths we cannot probe the whole
-            // range, but the spec-observable first reverse callback is the
-            // clamped final index.
-            CallbackIndices::Listed((0..0).chain(vec![len.saturating_sub(1)]))
         } else {
             let mut indices: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
             let mut current = receiver;
@@ -5170,17 +5166,7 @@ fn array_callback_native_dispatch(
             if reverse {
                 v.reverse();
             }
-            if visit_all {
-                // `find` / `findIndex` must also visit absent indices, and
-                // the observable prefix of that walk is a dense `0..`
-                // ladder. Probing the whole pathological range is not
-                // possible, so the dense prefix runs first and the
-                // present-index set covers what lies beyond it.
-                v.retain(|index| *index >= MAX_ARRAY_LIKE_PROBE_LEN);
-                CallbackIndices::Listed((0..MAX_ARRAY_LIKE_PROBE_LEN).chain(v))
-            } else {
-                CallbackIndices::Listed((0..0).chain(v))
-            }
+            CallbackIndices::Listed(v.into_iter())
         };
 
         let mut acc = Value::undefined();
@@ -5222,6 +5208,15 @@ fn array_callback_native_dispatch(
         // each fallible step (mirrors `flatMap`'s capture-then-pop above).
         let walk: Result<(), NativeError> = (|| {
             for idx in index_iter {
+                if visit_all {
+                    interp.charge_native_loop_iteration().map_err(|error| {
+                        crate::native_function::vm_to_native_error(
+                            interp,
+                            error,
+                            "Array.prototype callback",
+                        )
+                    })?;
+                }
                 let receiver = interp.iteration_anchor(anchor_base + A_RECEIVER);
                 let string_data = interp
                     .iteration_anchor(anchor_base + A_STRING)

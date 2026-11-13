@@ -888,11 +888,12 @@ syntax, strict workspace all-target/all-feature Clippy and the runner's three
 existing rejection/agreement tests pass. Artifacts:
 `/private/tmp/otter-difftest-observability-{pass,timeout}.{json,stderr}`.
 
-## Large FindViaPredicate ranges: separate confirmed defect
+## Large FindViaPredicate ranges: pre-fix reproduction
 
 Read-only follow-up probes found that the callback driver's pathological-length
-approximation also changes `find*` semantics. This remains outside the committed
-Get/HasProperty correction and has not been fixed or added to the running gate.
+approximation also changes `find*` semantics. These observations predate the
+full-range correction and validation recorded below; the earlier Get/HasProperty
+correction alone did not fix them.
 
 With `length: 2 ** 26`, a Proxy containing index `0: 'first'` and a predicate that
 immediately returns true should let `find` return `'first'` and `findIndex` return
@@ -912,15 +913,13 @@ The source and exact observations are retained at
 `/private/tmp/otter-find-large-{actual,reference}.txt`, and
 `/private/tmp/otter-find-large-observations.json`. The last report checks
 interpreter, Template and production policies against the same debug executable.
-These are public CLI reproductions, not new passing regressions.
+These original artifacts retain the public CLI failures; the passing shared
+regression below covers these conditions.
 
-The intended owner remains the existing callback driver: lazy ordered ranges
-can preserve early termination without allocating an index vector or walking
-prototypes. Before removing the approximation, verify interruption and work
-budget enforcement for repeated callbacks, including native and compiled
-predicates. A huge range must remain cancellable; silently skipping indices is
-not a substitute. The other callback methods' sparse approximation needs its own
-scope and validation rather than an incidental broad rewrite.
+The correction below keeps the existing callback driver and verifies native and
+compiled predicate cancellation/budgets before accepting its complete lazy range.
+The other callback methods' sparse approximation still needs its own scope and
+validation rather than an incidental broad rewrite.
 
 ## Confirmed next tasks
 
@@ -940,9 +939,11 @@ scope and validation rather than an incidental broad rewrite.
    under the same release profile before attributing the failure to image or
    debug-information settings. Current shipped-image conformance is not inferred
    from the raw baseline comparison.
-4. **P1: correct large FindViaPredicate ranges.** Retain exact forward/reverse
-   indexed Get order and early termination, with interruption/budget proof and
-   public regressions. Preserve the already-fixed Get-without-HasProperty rule.
+4. **P1: audit the remaining large callback ranges.** FindViaPredicate is corrected
+   below. Other callback methods still approximate large ranges with present-index
+   enumeration, and `flatMap` clamps its input range. Correct them with their own
+   property-order, interruption and budget proofs; preserve Find's full ordered
+   Get-without-HasProperty behavior.
 5. **P1: repeat build measurements on an idle host.** At least three alternating
    before/after clean-build pairs, a separate linking measurement, and a restorative
    build between incremental triggers. Do not promise a 50% LOC reduction without
@@ -1215,3 +1216,87 @@ is restored test coverage, not an engine stack-safety or performance claim, nor
 a passing full gate. Primary evidence is retained at
 `/private/tmp/otter-binding-{before,after-fixture,suite,clippy}.log` and
 `/private/tmp/otter-binding-{before-backtrace,before-disassembly,after-disassembly}.txt`.
+
+## Complete lazy FindViaPredicate ranges with bounded native work
+
+Starting from `389af315e`, the new public runtime regressions reproduce the
+large-range semantic and work-budget failures. The shared program also fails
+through the retained CLI in interpreter, Template and production modes. Forward
+Proxy searches perform an unwanted preliminary prototype walk; reverse searches
+silently stop after their first absent index. A rejecting work budget never
+crosses its limit when the reverse walk returns this incorrect early result.
+The existing ten work-budget configuration tests pass before the change.
+
+The callback driver now selects a full lazy ascending/descending range for all
+four `find*` methods, independently of length. It needs no length-sized vector,
+key enumeration or preliminary prototype traversal. The unreachable Find
+prefix/singleton approximations are removed; the sparse iterator for other callback methods
+retains its existing behavior. Length remains snapshotted once, indexed values
+are read live with Get, absent indices are visited, and callbacks can terminate
+immediately. The clamped `Number.MAX_VALUE` first-match regressions remain intact.
+Dense callback admission also rejects an unmatched callback before cloning the
+receiver's values, so a dense Find immediate match stays lazy as well. Existing
+matched numeric Map/Filter/Reduce fast paths retain their guards and behavior.
+
+Each Find index attempt now enters a small VM-owned native iteration checkpoint
+before Get. It observes the interrupt flag even under an observing budget,
+charges one unit of real loop work without incrementing native-call counts, and
+uses the existing Reject/Yield policy owner. This keeps a straight-line native
+or generated predicate from bypassing loop control. The enclosing driver still
+releases its existing iteration anchors on every error. There is no new public
+runtime interface, dependency, trait, GC/root layout, safepoint, deopt ABI or
+invalidation policy; the default checkpoint introduces no allocation or dynamic dispatch.
+Configured work limits can now reject a long Find walk according to its actual
+index work rather than a truncated approximation.
+
+The shared `array_find_large_range.js` covers both directions at `2**26` and
+`Number.MAX_SAFE_INTEGER`, absent indices, exact callback receiver/arguments,
+single length capture, mutation of length and the next element, forbidden
+HasProperty/key/prototype traps, exact abrupt-Get identity, length-error priority,
+lone UTF-16 units and moving Array/Proxy receivers across allocating callbacks.
+The public runtime tests also exercise rejecting budgets, cooperative yields,
+FIFO microtask timing, cancellation and runtime/GC reuse after abrupt termination.
+Independent indexed getter sentinels bound broken budget/cancellation tests.
+
+Native predicate admission uses normal source warmup and exact captured code
+objects. Template entry counts agree with actual predicate effects; the Graph
+backend has no entry counter, so its proof uses the selected installed generation,
+observable effect count, independently validated interpreter tracer identity and
+absence of deopt events. Both policies retain their generation, linkage and
+private-JS entry with zero active frames after the error; no interpreter subject
+execution can satisfy the native budget test. This does not add counters to the
+engine or force native admission.
+
+Current validation retains exact commands/reports outside the one temporary
+`/private/tmp/otter-binding-target`. Default CLI/Test262 builds pass; Test262
+`built-ins/Array/prototype/find` remains **94/94**, with identical path/outcome
+rows, corpus commit, semantic configuration and target in
+`/private/tmp/otter-find-range-test262-comparison.json`. The exact-source CLI
+comparison records three failing before policies and three passing after
+policies at `/private/tmp/otter-find-range-cli-comparison.json`.
+
+All **1305 VM** and **350 JIT unit tests** pass. The four new public tests pass
+on macOS ARM64 and x86_64 under Rosetta, with explicit Template/Graph admission
+and no test-stack override. The ARM64 affected runtime matrix passes **20/20**,
+including existing max-index, property protocol, work-budget and timeout tests.
+Strict workspace all-target/all-feature Clippy, formatting/diff checks, default
+CLI/Test262 builds and VM/runtime no-default-feature builds pass. These checks
+use assertions with dev/test debug information disabled. The quick GC family
+passes at stress stride 1 and inherits the explicit Cargo target; it creates no default
+repository target. The shared large-range program passes the existing
+process-isolated GC driver **48/48** at strides 1–16 in all three policies, with
+GC verification and exact console/completion agreement. Its final
+`status: passed`, executable/source hashes and per-run commands are retained at
+`/private/tmp/otter-find-range-gc-final/results.json`. The final source hashes,
+commands and report paths are retained in
+`/private/tmp/otter-find-range-{final-inputs,validation}.json`; verified CLI,
+Test262 and ARM64/x86_64 regression executables are retained under
+`/private/tmp/otter-find-range-retained-tools` independently of the Cargo target.
+After validation, cleaning only that temporary target removed **7.2 GiB** and
+left **51 GiB** available. The repository's default target was not created;
+user caches and unrelated working-tree files were preserved.
+
+This focused matrix does not replace the outstanding full checked GC corpus or
+the failed full closing gate. The four exposed global-binding proof failures
+from the preceding section and the other baseline failures remain open. Other
+callback methods' large-range approximations are deliberately not claimed fixed.

@@ -25,7 +25,7 @@ use otter_runtime::{
     WorkBudgetExceededAction,
 };
 
-const METHODS: [&str; 7] = [
+const METHODS: [&str; 8] = [
     "some",
     "every",
     "forEach",
@@ -33,6 +33,7 @@ const METHODS: [&str; 7] = [
     "filter",
     "reduce",
     "reduceRight",
+    "flatMap",
 ];
 const SELECTIONS: [JitSelection; 3] = [
     JitSelection::InterpreterOnly,

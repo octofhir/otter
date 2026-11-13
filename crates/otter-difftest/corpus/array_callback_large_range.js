@@ -3,7 +3,7 @@
 function checkCallbackRange(condition, message) {
     if (!condition) throw new Error(message);
 }
-const callbackRangeMethods = ["some", "every", "forEach", "map", "filter", "reduce", "reduceRight"];
+const callbackRangeMethods = ["some", "every", "forEach", "map", "filter", "reduce", "reduceRight", "flatMap"];
 for (const length of [2 ** 26, Number.MAX_SAFE_INTEGER]) {
     for (const name of callbackRangeMethods) {
         const reverse = name === "reduceRight";
@@ -81,17 +81,17 @@ for (const length of [2 ** 26, Number.MAX_SAFE_INTEGER]) {
         checkCallbackRange(early ? caught === undefined && answer === (name === "some") : caught === marker,
             "exact early or abrupt completion: " + name);
         const expected = ["length"];
-        if (name === "map" || name === "filter")
+        if (name === "map" || name === "filter" || name === "flatMap")
             expected.push("constructor", "species", "create:" + (name === "map" ? length : 0));
         expected.push("has:" + hole, "has:" + first, "get:" + first, "callback:" + first);
-        if (name === "map" || name === "filter") expected.push("define:" + (name === "map" ? first : 0));
+        if (name === "map" || name === "filter" || name === "flatMap") expected.push("define:" + (name === "map" ? first : 0));
         expected.push("has:" + gap, "has:" + next, "get:" + next, "callback:" + next);
-        if (name === "map" || name === "filter") expected.push("define:" + (name === "map" ? next : 1));
+        if (name === "map" || name === "filter" || name === "flatMap") expected.push("define:" + (name === "map" ? next : 1));
         if (!early) expected.push("has:" + stop);
         checkCallbackRange(events.join("|") === expected.join("|"), "exact observable order: " + name);
         checkCallbackRange(calls === 2 && value.text.charCodeAt(0) === 0xd800
             && value.text.charCodeAt(5) === 0xdc00, "callback count and UTF-16 payload");
-        checkCallbackRange(writes.length === (name === "map" || name === "filter" ? 2 : 0),
+        checkCallbackRange(writes.length === (name === "map" || name === "filter" || name === "flatMap" ? 2 : 0),
             "species effects occur exactly once per present element");
     }
 }

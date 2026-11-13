@@ -61,6 +61,13 @@ cooperative yields resume the same walk without draining its pending microtasks.
 This also permits early matches on very large array-like objects without
 enumerating their keys or prototypes first.
 
+The shared `flat`/`flatMap` flattening driver applies the same checkpoint to
+every top-level and nested index attempt, including holes. It walks full
+captured lengths in depth-first order and retains sources, target and mapper
+in scoped GC handles. Nesting uses an explicit stack with at most 512 active
+source frames; exceeding that bound throws a catchable `RangeError` instead of
+exhausting the host stack. Source nesting never introduces Rust recursion.
+
 Microtask checkpointing is VM work. Promise reactions, `queueMicrotask`,
 and async-function resumes run only after the current JS execution context
 unwinds and before the runtime turn is considered complete.

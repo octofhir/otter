@@ -38,9 +38,12 @@
 //!   callback methods that skip absent indices retain HasProperty before Get.
 //! - The generic callback driver walks its full snapshotted length lazily, with
 //!   a work/cancellation checkpoint before each index attempt, including holes.
+//! - Flattening uses a bounded explicit stack with scoped roots; source nesting
+//!   cannot exhaust the Rust stack, and every attempted index charges work.
 //! - Pathological array-like lengths are guarded before any dense
 //!   materialisation.
 
+mod flatten;
 mod push;
 
 #[cfg(test)]
@@ -65,8 +68,8 @@ use crate::{
 };
 
 /// Bound retained by materialization and probe paths in other Array drivers.
-/// The generic callback driver does not use this bound: every index in its
-/// snapshotted ToLength range owns an observable HasProperty/Get attempt.
+/// Generic callback and flattening drivers do not use this bound: every index
+/// in their captured ToLength ranges owns an observable HasProperty/Get attempt.
 const MAX_ARRAY_LIKE_PROBE_LEN: usize = 1 << 25;
 const MAX_SPARSE_PREFIX_PROBE_LEN: usize = 1024;
 const MAX_SAFE_ARRAY_LENGTH: usize = 9_007_199_254_740_991;
@@ -1712,8 +1715,7 @@ impl Interpreter {
             };
             let o = interp.scoped_value(scope, o);
             let source = interp.escape_scoped(o);
-            let source_len = length_of_array_like(interp, stack, context, &source)?
-                .min(MAX_ARRAY_LIKE_PROBE_LEN);
+            let source_len = length_of_array_like(interp, stack, context, &source)?;
             let current_depth = interp.escape_scoped(depth_arg);
             let depth = if current_depth.is_undefined() {
                 1
@@ -1746,128 +1748,6 @@ impl Interpreter {
             )?;
             Ok(interp.escape_scoped(target))
         })
-    }
-
-    /// §23.1.3.13.1 FlattenIntoArray. Recurses into nested arrays while
-    /// `depth > 0`, applying `mapper` (the `flatMap` callback) only at
-    /// the top level. Reads each source index through the observable
-    /// `HasProperty` / `Get`, recurses on `IsArray` elements, and
-    /// installs leaves via `CreateDataPropertyOrThrow`. Returns the next
-    /// free target index.
-    ///
-    /// # See also
-    /// - <https://tc39.es/ecma262/#sec-flattenintoarray>
-    pub(crate) fn flatten_into_array(
-        &mut self,
-        stack: &mut ActivationStack,
-        context: &ExecutionContext,
-        target: Value,
-        source: Value,
-        source_len: usize,
-        start: usize,
-        depth: i64,
-        mapper: Option<(Value, Value)>,
-    ) -> Result<usize, CommittedValueError> {
-        // 2^53 - 1: a CreateDataPropertyOrThrow target index past the
-        // safe-integer limit is a §23.1.3.13.1 step 4.c.ii TypeError.
-        const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
-        // Every iteration runs observable operations (HasProperty / Get /
-        // the mapper / CreateDataPropertyOrThrow) that can allocate or run
-        // user code, so the target, source, mapper pair, and current element
-        // all ride anchor slots and are re-read before each use.
-        let target_slot = self.push_iteration_anchor(target) - 1;
-        let base = target_slot;
-        let source_slot = self.push_iteration_anchor(source) - 1;
-        let mapper_slots = mapper.map(|(mapper_fn, map_this)| {
-            (
-                self.push_iteration_anchor(mapper_fn) - 1,
-                self.push_iteration_anchor(map_this) - 1,
-            )
-        });
-        let outcome = (|this: &mut Self| -> Result<usize, CommittedValueError> {
-            let mut target_index = start;
-            for source_index in 0..source_len {
-                let key = format_index_key(source_index as f64);
-                let source = this.iteration_anchor(source_slot);
-                if !this.array_method_has_property(stack, context, source, &key)? {
-                    continue;
-                }
-                let source = this.iteration_anchor(source_slot);
-                let element = this.array_method_get_property(stack, context, source, &key)?;
-                let element_slot = this.push_iteration_anchor(element) - 1;
-                let step = (|this: &mut Self| -> Result<(), CommittedValueError> {
-                    if let Some((mapper_fn_slot, map_this_slot)) = mapper_slots {
-                        let mapper_fn = this.iteration_anchor(mapper_fn_slot);
-                        let map_this = this.iteration_anchor(map_this_slot);
-                        let element = this.iteration_anchor(element_slot);
-                        let source = this.iteration_anchor(source_slot);
-                        let cb_args: SmallVec<[Value; 8]> = smallvec::smallvec![
-                            element,
-                            Value::number_f64(source_index as f64),
-                            source,
-                        ];
-                        let mapped = this
-                            .run_callable_sync_rooted(
-                                stack,
-                                Some(context),
-                                &mapper_fn,
-                                map_this,
-                                cb_args,
-                            )
-                            .map_err(CommittedValueError::completed_call)?;
-                        this.set_iteration_anchor(element_slot, mapped);
-                    }
-                    let element = this.iteration_anchor(element_slot);
-                    if depth > 0
-                        && this
-                            .is_array(&element)
-                            .map_err(CommittedValueError::JavaScript)?
-                    {
-                        let element = this.iteration_anchor(element_slot);
-                        let element_len = length_of_array_like(this, stack, context, &element)?
-                            .min(MAX_ARRAY_LIKE_PROBE_LEN);
-                        let target = this.iteration_anchor(target_slot);
-                        let element = this.iteration_anchor(element_slot);
-                        target_index = this.flatten_into_array(
-                            stack,
-                            context,
-                            target,
-                            element,
-                            element_len,
-                            target_index,
-                            depth - 1,
-                            None,
-                        )?;
-                    } else {
-                        if target_index as f64 >= MAX_SAFE_INTEGER {
-                            return Err(CommittedValueError::JavaScript(
-                                this.err_type(
-                                    ("flatten target index exceeds maximum safe integer"
-                                        .to_string())
-                                    .into(),
-                                ),
-                            ));
-                        }
-                        let target = this.iteration_anchor(target_slot);
-                        let element = this.iteration_anchor(element_slot);
-                        this.create_data_property_or_throw(
-                            stack,
-                            context,
-                            target,
-                            &format_index_key(target_index as f64),
-                            element,
-                        )?;
-                        target_index += 1;
-                    }
-                    Ok(())
-                })(this);
-                this.pop_iteration_anchors_to(element_slot);
-                step?;
-            }
-            Ok(target_index)
-        })(self);
-        self.pop_iteration_anchors_to(base);
-        outcome
     }
 
     /// §23.1.3.6 / §23.1.3.20 / §23.1.3.32 live Array iterator creation.
@@ -5046,18 +4926,17 @@ fn array_callback_native_dispatch(
         // §23.1.3.12 `flatMap` is FlattenIntoArray(A, O, len, 0, 1, mapper,
         // T): each callback result that IsArray is spliced one level deep
         // through the observable HasProperty / Get / CreateDataProperty
-        // protocol — not the raw element snapshot the generic loop uses.
+        // protocol through the same scoped driver as `flat`.
         if kind == ArrayCallbackKind::FlatMap {
             let target = output_target.expect("flatMap output target created above");
             let anchor_base = interp.push_iteration_anchor(target) - 1;
             interp.push_iteration_anchor(receiver);
-            let probe_len = len.min(MAX_ARRAY_LIKE_PROBE_LEN);
             let result = interp.flatten_into_array(
                 stack,
                 context,
                 target,
                 receiver,
-                probe_len,
+                len,
                 0,
                 1,
                 Some((callback, this_arg)),

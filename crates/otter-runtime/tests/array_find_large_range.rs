@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Large forward/reverse ranges, ordered Get, mutation and abrupt completion.
-//! - Bounded Find/reduce work and cancellation with native and admitted JS predicates.
+//! - Bounded Find/reduce/flatMap work with native and admitted JS predicates.
 //!
 //! # Invariants
 //! - A large length cannot introduce enumeration or truncate absent indices.
@@ -154,7 +154,7 @@ fn large_ranges_keep_order_live_get_and_early_completion_in_every_tier() {
 fn large_walks_reject_work_with_native_and_current_compiled_predicates() {
     for selection in SELECTIONS {
         for callback in ["Boolean", PREDICATE] {
-            for method in ["findLast", "reduce", "reduceRight"] {
+            for method in ["findLast", "reduce", "reduceRight", "flatMap"] {
                 let mut runtime = Runtime::builder()
                     .jit_selection(selection)
                     .jit_compile_threads(0)

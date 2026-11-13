@@ -7,7 +7,7 @@
 //!
 //! # Invariants
 //! - `LengthOfArrayLike` clamps to `2**53 - 1`, but the generic
-//!   callback driver must not materialize or probe that full range.
+//!   driver traverses lazily: a first-match predicate reads only the final index.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-array.prototype.findlast>

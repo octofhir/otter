@@ -16,8 +16,8 @@
 //!
 //! # Invariants
 //! - Budget DTOs are owned, copyable data; no VM handles cross the boundary.
-//! - Bytecode, generated backedges, native calls, GC, RegExp, and microtasks
-//!   debit one monotonic work-unit counter.
+//! - Bytecode, generated backedges, native calls/iterations, GC, RegExp, and
+//!   microtasks debit one monotonic work-unit counter.
 //! - [`WorkBudgetExceededAction::Observe`] records an exceedance,
 //!   [`WorkBudgetExceededAction::Reject`] returns a structural error, and
 //!   [`WorkBudgetExceededAction::Yield`] rotates the owning isolate's work
@@ -43,8 +43,8 @@ use std::time::Duration;
 ///
 /// Interpreter dispatch checks enforcing budgets before every instruction.
 /// Native JIT loops decrement an inline fuel counter and re-enter the same
-/// checkpoint in bounded batches. Microtasks, native calls, RegExp, and GC all
-/// debit that same work counter.
+/// checkpoint in bounded batches. Microtasks, native calls/iterations, RegExp,
+/// and GC all debit that same work counter.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkBudget {
     /// Outcome policy when a configured limit is crossed.

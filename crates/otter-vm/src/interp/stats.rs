@@ -2,14 +2,20 @@
 //!
 //! # Contents
 //! Work-slice begin/finish/checkpoint, bytecode/native/construct
-//! call tallies, JIT stub and fast-path hit counters, microtask drain
-//! stats, and property-IC capacity management.
+//! call tallies, native iteration checkpoints, JIT stub and fast-path hit
+//! counters, microtask drain stats, and property-IC capacity management.
 //!
 //! # Invariants
 //! - Every enforcing checkpoint either continues, rejects, or rotates exactly
 //!   one isolate-owned work slice.
 //! - A cooperative yield never exposes a JavaScript completion and never lets
 //!   a later macrotask overtake the current turn.
+//! - Native iteration checkpoints observe interruption even with an observing
+//!   budget and charge actual loop work without inventing native calls.
+//!
+//! # See also
+//! - [`crate::work_budget`] owns the unified counter and enforcement policy.
+//! - [`crate::array_prototype`] checkpoints full FindViaPredicate walks.
 #![allow(unused_imports)]
 use crate::work_budget::WorkBudgetCheckpoint;
 use crate::*;
@@ -199,6 +205,18 @@ impl Interpreter {
 
     pub(crate) fn record_runtime_native_call(&mut self) -> Result<(), VmError> {
         self.work_budget_stats.record_native_call();
+        self.enforce_work_budget_checkpoint()
+    }
+
+    /// Charge one native iteration before its observable work. A straight-line
+    /// compiled or native callback need not encounter a bytecode/backedge poll,
+    /// so its owning native loop must remain cancellable on its own.
+    #[inline]
+    pub(crate) fn charge_native_loop_iteration(&mut self) -> Result<(), VmError> {
+        if self.interrupt.is_set() {
+            return Err(VmError::Interrupted);
+        }
+        self.work_budget_stats.record_work(1);
         self.enforce_work_budget_checkpoint()
     }
 

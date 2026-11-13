@@ -50,6 +50,14 @@ Runtime turns are budgetable. A CPU-heavy script, promise reaction storm,
 or long host callback chain must be able to yield or fail according to the
 resource policy described in [Runtime Principles](/otter/engine/runtime-principles/).
 
+Generic Array `find`, `findIndex`, `findLast` and `findLastIndex` walks visit
+their full snapshotted length lazily. Each index attempt charges native-loop
+work and checks cancellation before its indexed Get, including walks whose
+predicate is native or compiled JavaScript. Rejecting budgets stop the turn;
+cooperative yields resume the same walk without draining its pending microtasks.
+This also permits early matches on very large array-like objects without
+enumerating their keys or prototypes first.
+
 Microtask checkpointing is VM work. Promise reactions, `queueMicrotask`,
 and async-function resumes run only after the current JS execution context
 unwinds and before the runtime turn is considered complete.

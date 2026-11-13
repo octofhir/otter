@@ -13,7 +13,10 @@
 //! - `super::GcHeap::ensure_machine_allocation_with_roots`.
 
 use super::*;
+use crate::observation::{GcPauseKind, GcPauseOutcome, GcPauseTrigger};
+use crate::page::{CELL_SIZE, align_up};
 use crate::test_support::OpaqueLeaf;
+use std::sync::atomic::Ordering;
 
 #[test]
 fn ensure_charges_one_window_and_repeated_fit_never_advances_or_accounts() {

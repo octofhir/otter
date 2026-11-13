@@ -35,8 +35,9 @@
 
 use std::time::Instant;
 
+use super::GcHeap;
 use super::sweep::{self, OldSweep, SweepTotals};
-use super::{FullGcGoal, GcHeap};
+use crate::collection_goal::FullGcGoal;
 use crate::header::GcHeader;
 
 /// Old pages from which a throughput collection sweeps them behind its

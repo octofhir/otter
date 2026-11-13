@@ -15,6 +15,7 @@
 
 use super::*;
 use crate::HandleScope;
+use crate::page::{CELL_SIZE, align_up};
 use crate::test_support::{OpaqueLeaf, OpaquePair};
 
 #[test]

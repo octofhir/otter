@@ -16,7 +16,10 @@
 
 use super::*;
 use crate::FullGcGoal;
+use crate::compressed::cage_base;
 use crate::header::{FREE_TAG, HEADER_SIZE};
+use crate::observation::{GcPauseKind, GcPauseTrigger};
+use crate::page::{CELL_SIZE, PAGE_HEADER_SIZE, align_up};
 use crate::page::{PAGE_SIZE, Page};
 use crate::test_support::{OpaqueLeaf, OpaquePair};
 use crate::trace::{SlotVisitor, Traceable};

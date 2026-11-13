@@ -16,6 +16,7 @@
 
 use super::*;
 use crate::HandleScope;
+use crate::page::{CELL_SIZE, align_up};
 use crate::test_support::{OpaqueLeaf, OpaquePair};
 
 fn cell_bytes<T>() -> u64 {

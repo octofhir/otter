@@ -1755,7 +1755,7 @@ impl Baker<'_> {
             view.literal_cells.insert(
                 instruction.byte_pc,
                 jit::JitLiteralCell {
-                    cell_addr: std::ptr::from_ref::<Value>(cell.as_ref()) as usize,
+                    cell_addr: std::ptr::from_ref::<Value>(cell) as usize,
                 },
             );
         }

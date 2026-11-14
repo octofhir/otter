@@ -15,6 +15,8 @@ use otter_bytecode::{
     Constant, Function, Instruction, Op, Operand, SourceKind as BcSourceKind, SpanEntry,
 };
 
+mod literal_roots;
+
 fn spans_for(code: &[Instruction]) -> Vec<SpanEntry> {
     code.iter()
         .map(|i| SpanEntry {

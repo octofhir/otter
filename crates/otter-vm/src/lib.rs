@@ -103,6 +103,7 @@ pub mod date;
 mod element_feedback;
 mod eval_env;
 mod literal_allocation;
+mod literal_cells;
 mod native_stack_snapshot;
 mod stack_snapshot;
 // `date` is a directory module — see `date/mod.rs`.
@@ -1544,7 +1545,7 @@ impl Interpreter {
 
     /// Root-tracing view of the literal cells.
     pub(crate) fn literal_cells_for_trace(&self) -> impl Iterator<Item = &Value> {
-        self.literal_cells().values().map(Box::as_ref)
+        self.literal_cells().values()
     }
 
     pub(crate) fn array_boilerplates_for_trace(
@@ -1572,7 +1573,7 @@ impl Interpreter {
     fn literal_cell_addr_for_test(&self, context: &ExecutionContext, idx: u32) -> Option<usize> {
         self.literal_cells()
             .get(&context.constant_cache_key(idx))
-            .map(|cell| std::ptr::from_ref::<Value>(cell.as_ref()) as usize)
+            .map(|cell| std::ptr::from_ref::<Value>(cell) as usize)
     }
 
     /// Trace every live scope-handle slot as a GC root. Called from the runtime
@@ -1591,7 +1592,7 @@ impl Interpreter {
             if !value.is_string() {
                 return Err(VmError::InvalidOperand);
             }
-            return Ok(**value);
+            return Ok(*value);
         }
         let units = context
             .string_constant_units(idx)
@@ -1606,8 +1607,7 @@ impl Interpreter {
                 .with_payload(string.handle(), |body| body.set_cached_atom(atom));
         }
         let value = Value::string(string);
-        let replaced = self.literal_cells_mut().insert(key, Box::new(value));
-        debug_assert!(replaced.is_none(), "literals canonicalize once");
+        self.literal_cells_mut().insert(key, value);
         Ok(value)
     }
 
@@ -1679,6 +1679,10 @@ impl Interpreter {
 }
 
 impl otter_gc::ExtraRootSource for Interpreter {
+    fn prepare_collection(&self, _heap: &otter_gc::GcHeap) {
+        self.literal_cells().prepare_collection(&self.mutator);
+    }
+
     fn process_weak(&self, resolve: &mut dyn FnMut(RawGc) -> Option<RawGc>) {
         self.jit_code_registry.process_weak(resolve);
         self.jit_compile_queue.process_weak(resolve);

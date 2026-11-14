@@ -22,8 +22,8 @@
 //!   microtask queue, dynamic-import registry, module error
 //!   cache, symbol registry, error-class registry,
 //!   function-user-prop bag.
-//! - A scavenge ([`otter_gc::RootSet::Young`]) skips only tables whose
-//!   slots name hidden classes, which are always old-space cells. The
+//! - A scavenge ([`otter_gc::RootSet::Young`]) skips hidden-class tables and
+//!   immutable literal cells proven old before collection. The
 //!   canonical key strings are the heap's own roots
 //!   ([`crate::isolate_names`]).
 //!
@@ -70,9 +70,8 @@ impl<'a> RuntimeState<'a> {
     /// - function-user-prop bag;
     /// - pending generator / uncaught throw side-channels.
     ///
-    /// For [`RootSet::Young`] the tables that name only hidden classes are
-    /// skipped: they are allocated in old space, which a scavenge neither
-    /// moves nor frees.
+    /// For [`RootSet::Young`], hidden-class tables and promoted immutable
+    /// literal cells are skipped: a scavenge neither moves nor frees old cells.
     pub fn trace_roots(&self, roots: RootSet, visitor: &mut GcRootVisitor<'_>) {
         let interp = self.interp;
         // 1) Shared globalThis.
@@ -106,9 +105,7 @@ impl<'a> RuntimeState<'a> {
         // String and BigInt literals materialized from bytecode constant pools.
         // Immutable primitives can be reused across executions, but the cached
         // handles must move with the heap.
-        for value in interp.literal_cells_for_trace() {
-            value.trace_value_slots(visitor);
-        }
+        interp.trace_literal_cells(roots, visitor);
         // Cached small-integer decimal strings (`SmallStrings`-style). Immutable
         // shared handles that must move with the heap.
         for value in interp.small_int_strings_for_trace() {

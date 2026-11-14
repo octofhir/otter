@@ -17,9 +17,7 @@
 //! - [`crate::mutator_owned`] — the ownership protocol.
 
 use crate::mutator_owned::{MutatorOwned, MutatorWrite};
-use crate::{
-    Interpreter, Value, constructor_fast_path, handles, interp, jit, native_abi, object, regexp,
-};
+use crate::{Interpreter, constructor_fast_path, handles, interp, jit, native_abi, object, regexp};
 
 /// The isolate tables a compilation reads.
 #[derive(Default)]
@@ -33,7 +31,7 @@ pub(crate) struct CompileShared {
     /// the shared address-stable box. The isolate's root walk traces the
     /// values, so a moving collection rewrites them in place without
     /// invalidating relocations.
-    pub(crate) literal_cells: MutatorOwned<rustc_hash::FxHashMap<(usize, u32), Box<Value>>>,
+    pub(crate) literal_cells: MutatorOwned<crate::literal_cells::LiteralCells>,
     /// Regex literal sites resolved once, keyed like the literal cells:
     /// the program cell (old, rooted here) and the flags every evaluation of
     /// the site births a young RegExp from.
@@ -127,6 +125,8 @@ impl CompileShared {
 // holds the isolate's heap-read right, which excludes collection; the values
 // it reads may be stale and every fact it bakes from them is re-verified on
 // the isolate thread before code depending on it is published.
+// LiteralCells keeps a private RefCell frontier in addition to its map: shared
+// frontier access requires the mutator token, which compiler threads never own.
 unsafe impl Send for CompileShared {}
 // SAFETY: as above.
 unsafe impl Sync for CompileShared {}
@@ -152,7 +152,7 @@ macro_rules! shared_tables {
 }
 
 shared_tables! {
-    literal_cells, literal_cells_mut: rustc_hash::FxHashMap<(usize, u32), Box<Value>>;
+    literal_cells, literal_cells_mut: crate::literal_cells::LiteralCells;
     regexp_literals, regexp_literals_mut: rustc_hash::FxHashMap<(usize, u32), regexp::RegExpLiteralSite>;
     array_boilerplates, array_boilerplates_mut: rustc_hash::FxHashMap<(usize, u32), crate::array::elements::ElementSlabHandle>;
     object_literal_layouts, object_literal_layouts_mut: rustc_hash::FxHashMap<(u32, u32), handles::ObjectLayout>;

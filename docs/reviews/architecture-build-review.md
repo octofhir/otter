@@ -11,7 +11,7 @@ A targeted pass does not establish a green workspace or market leadership.
 | P0 | **Finish the closing gate.** `scripts/gate.sh`, runtime integration tests. The last complete differential gate failed; subsequent slices passed focused matrices only. | Reclassify failures on current HEAD against a comparable baseline, fix their causes, and complete the unchanged gate. Preserve native admission, exact generations, no replay/fallback, real OOM and moving-GC assertions. |
 | P0 | **Diagnose GC-stress watchdog failures.** `scripts/dev/gc-stress.py`, `otter-difftest`, GC/VM. Existing full reports contain timed-out candidate processes. | Preserve exact paths, watchdogs and outcomes; attribute startup, verification and mutator cost separately. Complete the full checked-profile corpus at strides 1–16 with `status: passed`. No filtered corpus or timeout-as-agreement verdict. |
 | P1 | **Separate remaining Array semantics from materialization limits.** `array_prototype.rs`, `array_prototype/join.rs`; inspect remaining `MAX_ARRAY_LIKE_PROBE_LEN` uses individually. Join retains a length ceiling and eager length-sized scratch vectors. | Concrete public regressions for each driver; complete live ordered property attempts, bounded scratch/root retention, cancellation and explicit allocation/output limits. Preserve UTF-16, species and observable error order. |
-| P1 | **Audit remaining typed-array native work and live bounds.** Start with `binary/typed_array_prototype.rs::{impl_reverse,impl_set}` and search loops. | Reproduce each issue through the public runtime before changing its owner. Verify Reject/Yield/interrupt and committed prefixes; preserve raw NaN bits, BigInt roots and shared-storage semantics. Reuse the common view validator where the algorithm requires it; do not merge different preparation contracts. |
+| P1 | **Audit remaining typed-array native work and live bounds.** Start with `binary/typed_array_prototype.rs::impl_set` and search loops. | Reproduce each issue through the public runtime before changing its owner. Verify Reject/Yield/interrupt and committed prefixes; preserve raw NaN bits, BigInt roots and shared-storage semantics. Reuse the common view validator where the algorithm requires it; do not merge different preparation contracts. |
 | P1 | **Resolve remaining broad-suite failures.** Runtime GC/JIT, snapshot, compile-fail and audit fixtures. Older baseline reports contain failures outside the repaired global-binding/known-native targets. | Reproduce current failures first; distinguish engine bugs, stale contracts and environment restrictions. Fix owners and fixtures together without weakening safety or native-execution proofs. |
 | P1 | **Diagnose flaky accounting observations.** `ipc` incoming-charge lifetime and compile-cache pruning. Both failed previously and also passed repeated standalone runs. | Controlled scheduling/lifetime reproductions, exact resource ownership assertions and repeated isolated/concurrent checks. Passing retries alone do not close the task. |
 
@@ -30,6 +30,12 @@ and `coerced-values-start-detached.js`. Exact-path repeated baseline and
 candidate captures are under
 `benchmarks/results/typed-array-copy-within-2026-11-14/`. Attribute constructor,
 preparation and operation costs separately without relaxing the watchdog.
+An isolated checked-profile probe of the same 80 constructor/factory combinations,
+without calling `copyWithin`, spent about 92 ms in constructors and 2.7 s in
+factory preparation. Investigate array-like indexed stores and the JavaScript
+byte-copy loops used to prepare resizable buffers. This is a lead, not a complete
+attribution of the debug-runner timeouts. Probe sources, hashes and individual
+observations are under `benchmarks/results/typed-array-reverse-2026-11-14/`.
 
 ## Establish current compatibility evidence
 

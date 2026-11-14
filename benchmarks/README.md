@@ -83,6 +83,7 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `array-fill-numeric.js` | Borrowed Array fill over a fixed Uint8Array beyond the former span ceiling | `33554447` |
 | `typed-array-fill.js` | Native Uint8Array fill with alternating values and endpoint validation | `8388625` |
 | `typed-array-copy-within.js` | Two overlapping 8 MiB byte moves with changing boundary checks | `8388622` |
+| `typed-array-reverse.js` | Two complete 8 MiB reversals with boundary validation | `8388622` |
 | `numeric-leaf.js` | Repeated calls into a straight-line eight-operation Number leaf | `-700000` |
 | `math-intrinsics.js` | Guarded `Math.abs` / `max` / `min` methods with Int32 operands | `2200000` |
 | `math-explicit-calls.js` | Separate method lookup and Int32 argument evaluation through `CallWithThis` | `2200000` |

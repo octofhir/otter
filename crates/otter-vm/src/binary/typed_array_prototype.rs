@@ -14,7 +14,7 @@
 //!
 //! # Contents
 //! - Native dispatch and live typed-array value/buffer operations.
-//! - `fill` and `copy_within` own their distinct preparation and controlled stores.
+//! - `fill`, `copy_within` and `reverse` own distinct preparation and controlled stores.
 //!
 //! # Invariants
 //! - A view is a young cell that a scavenge moves, and a BigInt element
@@ -28,6 +28,7 @@
 
 mod copy_within;
 mod fill;
+mod reverse;
 
 use crate::ValueWindow;
 use crate::string::JsString;
@@ -275,31 +276,6 @@ fn impl_at(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Nati
     receiver(ctx)?
         .get(ctx.heap_mut(), resolved as usize)
         .map_err(native_oom)
-}
-
-fn impl_reverse(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    let t = receiver(ctx)?;
-    validate_typed_array(&t, ctx.heap())?;
-    let len = t.length(ctx.heap_mut());
-    if len > 1 {
-        // Reversing moves whole elements, so it swaps their bytes: no
-        // element is decoded, and no BigInt is allocated.
-        let bpe = t.kind().bytes_per_element();
-        let start = t.byte_offset(ctx.heap());
-        let buffer = t.buffer(ctx.heap());
-        buffer.with_bytes_mut(ctx.heap_mut(), |bytes| {
-            if let Some(view) = bytes.get_mut(start..start + len * bpe) {
-                let (mut i, mut j) = (0usize, len - 1);
-                while i < j {
-                    let (head, tail) = view.split_at_mut(j * bpe);
-                    head[i * bpe..(i + 1) * bpe].swap_with_slice(&mut tail[..bpe]);
-                    i += 1;
-                    j -= 1;
-                }
-            }
-        });
-    }
-    Ok(Value::typed_array(t))
 }
 
 fn impl_index_of(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
@@ -1040,7 +1016,7 @@ pub fn method_impl(name: &str) -> Option<TypedArrayNativeFn> {
         "at" => impl_at,
         "fill" => fill::run,
         "copyWithin" => copy_within::run,
-        "reverse" => impl_reverse,
+        "reverse" => reverse::run,
         "indexOf" => impl_index_of,
         "lastIndexOf" => impl_last_index_of,
         "includes" => impl_includes,

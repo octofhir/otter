@@ -4,6 +4,7 @@
 All engines and resource measurements are mocked; these tests run no benchmarks.
 """
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+import hashlib
 import importlib.util
 import io
 import json
@@ -23,6 +24,59 @@ COUNTERS = """        0.13 real         0.10 user         0.01 sys
 
 
 class FixedWorkTests(unittest.TestCase):
+    def write_anchors(self, root):
+        manifest = root / FW.ANCHOR_MANIFEST
+        manifest.parent.mkdir(parents=True)
+        entries = []
+        for anchor in FW.ANCHORS:
+            source = manifest.parent / (anchor + ".js")
+            source.write_bytes(b"// Preserve CRLF and exact source bytes.\r\nprint(33)\r\n")
+            entries.append({"anchor": anchor, "source": source.name,
+                            "originalPath": "missing-history/" + source.name,
+                            "sha256": FW.digest(source)})
+        manifest.write_text(json.dumps(entries))
+        return manifest
+
+    def test_committed_manifest_preserves_all_seven_exact_sources(self):
+        manifest = FW.ROOT / FW.ANCHOR_MANIFEST
+        entries = json.loads(manifest.read_bytes())
+        before = {entry["anchor"]: (manifest.parent / entry["source"]).read_bytes()
+                  for entry in entries}
+        workloads, provenance = FW.load_workloads()
+        self.assertEqual(set(workloads), set(FW.ANCHORS))
+        self.assertEqual(len(workloads), 7)
+        self.assertEqual(provenance["sha256"], FW.digest(manifest))
+        for anchor, workload in workloads.items():
+            source = FW.ROOT / workload["path"]
+            self.assertEqual(source.parent, manifest.parent)
+            self.assertEqual(source.read_bytes(), before[anchor])
+            self.assertEqual(workload["sha256"], hashlib.sha256(before[anchor]).hexdigest())
+
+    def test_manifest_requires_exact_cases_and_local_pinned_sources(self):
+        for defect in ("duplicate", "missing", "unhashable", "traversal", "symlink", "hash"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as scratch:
+                root = Path(scratch)
+                manifest = self.write_anchors(root)
+                entries = json.loads(manifest.read_text())
+                if defect == "duplicate":
+                    entries[-1] = entries[0]
+                elif defect == "missing":
+                    entries.pop()
+                elif defect == "unhashable":
+                    entries[0]["anchor"] = []
+                elif defect == "traversal":
+                    entries[0]["source"] = "../ts.js"
+                elif defect == "symlink":
+                    source = manifest.parent / entries[0]["source"]
+                    outside = root / "outside.js"
+                    source.rename(outside)
+                    source.symlink_to(outside)
+                else:
+                    entries[0]["sha256"] = "0" * 64
+                manifest.write_text(json.dumps(entries))
+                with patch.object(FW, "ROOT", root), self.assertRaises(ValueError):
+                    FW.load_workloads()
+
     def sample(self, **changes):
         sample = dict(exit=0, timedOut=False, launchToExitSeconds=0.13, **FW.parse_counters(COUNTERS))
         sample.update(changes)
@@ -133,9 +187,14 @@ class FixedWorkTests(unittest.TestCase):
         self.assertEqual(sample["exit"], 0)
 
     def run_main(self, scratch, *, missing=False, mismatch=False, changed_tree=False,
-                 reference=False, missing_reference_path=False):
+                 reference=False, missing_reference_path=False, anchor_defect=None,
+                 changed_manifest=False, all_workloads=False):
         root = Path(scratch)
-        (root / "fib.js").write_text("print(33)")
+        manifest = self.write_anchors(root)
+        if anchor_defect == "missing":
+            (manifest.parent / "ts.js").unlink()
+        elif anchor_defect == "corrupt":
+            (manifest.parent / "ts.js").write_bytes(b"print(34)\n")
         executables = {}
         selected = ["otter", "otter-reference", "node", "bun"] if reference else ["otter", "node", "bun"]
         for engine in selected:
@@ -153,18 +212,21 @@ class FixedWorkTests(unittest.TestCase):
             output = b"different\n" if mismatch and engine == "bun" else b"33\n"
             prefix.with_suffix(".stdout").write_bytes(output)
             prefix.with_suffix(".time").write_text(COUNTERS)
+            if changed_manifest and len(calls) == 1:
+                manifest.write_bytes(manifest.read_bytes() + b"\n")
             return dict(command=command, stdoutFile=prefix.with_suffix(".stdout").name,
                         **self.sample(instructions=occurrences[engine] * 10))
 
         provenance = {"treeSha256": "before", "dirty": True, "head": "test-head"}
         output = root / "out"
         argv = ["fixed-work.py", str(output), "--otter", executables["otter"],
-                "--engines", *selected, "--workloads", "fib"]
+                "--engines", *selected]
+        if not all_workloads:
+            argv.extend(["--workloads", "fib"])
         if reference and not missing_reference_path:
             argv.extend(["--reference-otter", executables["otter-reference"]])
         with ExitStack() as stack:
             stack.enter_context(patch.object(FW, "ROOT", root))
-            stack.enter_context(patch.object(FW, "WORKLOADS", {"fib": "fib.js"}))
             stack.enter_context(patch.object(FW, "source_provenance", side_effect=[
                 provenance, dict(provenance, treeSha256="after" if changed_tree else "before")]))
             stack.enter_context(patch.object(FW.shutil, "which", side_effect=lambda engine:
@@ -196,6 +258,34 @@ class FixedWorkTests(unittest.TestCase):
         self.assertFalse(metadata["baselineEligible"])
         self.assertIsNone(metadata["executables"]["otter"]["sourceRevision"])
         self.assertIn("eval", rows[2]["command"][2])
+        self.assertTrue(rows[0]["command"][-1].endswith("benchmarks/fixtures/fixed-work/fib.js"))
+        self.assertEqual(metadata["anchorManifest"]["path"], str(FW.ANCHOR_MANIFEST))
+
+    def test_default_workload_selection_retains_all_seven_cases(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            result, rows, metadata, calls = self.run_main(scratch, all_workloads=True)
+        self.assertEqual(result, 0)
+        self.assertEqual(len(rows), 21)
+        self.assertEqual(set(metadata["scripts"]), set(FW.ANCHORS))
+        self.assertEqual(len(calls), 7 * 3 * 6)
+        self.assertTrue(all(row["scoreable"] for row in rows))
+
+    def test_invalid_unselected_anchor_prevents_any_measurement(self):
+        for defect in ("missing", "corrupt"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as scratch:
+                result, rows, metadata, calls = self.run_main(scratch, anchor_defect=defect)
+            self.assertEqual(result, 1)
+            self.assertEqual(calls, [])
+            self.assertTrue(any("anchor manifest" in failure for failure in metadata["failures"]))
+            self.assertTrue(all(not row["scoreable"] for row in rows))
+
+    def test_manifest_change_invalidates_all_rows_even_with_stable_tree_metadata(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            result, rows, metadata, calls = self.run_main(scratch, changed_manifest=True)
+        self.assertEqual(result, 1)
+        self.assertEqual(len(calls), 18)
+        self.assertIn("anchor manifest changed during measurement", metadata["failures"])
+        self.assertTrue(all(not row["scoreable"] for row in rows))
 
     def test_missing_engine_fails_before_measurement(self):
         with tempfile.TemporaryDirectory() as scratch:

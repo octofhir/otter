@@ -14,7 +14,7 @@
 //!
 //! # Contents
 //! - Native dispatch and live typed-array value/buffer operations.
-//! - `fill` owns ordered preparation and controlled, cancellable stores.
+//! - `fill` and `copy_within` own their distinct preparation and controlled stores.
 //!
 //! # Invariants
 //! - A view is a young cell that a scavenge moves, and a BigInt element
@@ -26,6 +26,7 @@
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarrayprototype%25-object>
 
+mod copy_within;
 mod fill;
 
 use crate::ValueWindow;
@@ -274,47 +275,6 @@ fn impl_at(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Nati
     receiver(ctx)?
         .get(ctx.heap_mut(), resolved as usize)
         .map_err(native_oom)
-}
-
-fn impl_copy_within(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    let name = "TypedArray.prototype.copyWithin";
-    let t = receiver(ctx)?;
-    validate_typed_array(&t, ctx.heap())?;
-    let len = t.length(ctx.heap_mut()) as i64;
-    let target = to_integer_or_infinity_arg(ctx, args.first(), 0, name)?;
-    let start = to_integer_or_infinity_arg(ctx, args.get(1), 0, name)?;
-    let end = to_integer_or_infinity_arg(ctx, args.get(2), len, name)?;
-    let to = clamp_relative_index(target, len);
-    let from = clamp_relative_index(start, len);
-    let final_end = clamp_relative_index(end, len);
-    let mut count = (final_end - from).min(len - to).max(0) as usize;
-    let t = receiver(ctx)?;
-    if count == 0 {
-        return Ok(Value::typed_array(t));
-    }
-    if t.buffer(ctx.heap()).is_detached(ctx.heap())
-        || (!t.is_length_tracking(ctx.heap()) && t.is_out_of_bounds(ctx.heap()))
-    {
-        return Err(type_error("typedarray is detached or out of bounds"));
-    }
-    let live_len = t.length(ctx.heap()) as i64;
-    count = count
-        .min((live_len - from).max(0) as usize)
-        .min((live_len - to).max(0) as usize);
-    if count == 0 {
-        return Ok(Value::typed_array(t));
-    }
-    // Memmove by raw bytes through the backing buffer to handle
-    // overlap correctly.
-    let bpe = t.kind().bytes_per_element();
-    let src_off = t.byte_offset(ctx.heap()) + from as usize * bpe;
-    let dst_off = t.byte_offset(ctx.heap()) + to as usize * bpe;
-    let byte_count = count * bpe;
-    let buffer = t.buffer(ctx.heap());
-    buffer.with_bytes_mut(ctx.heap_mut(), |buf| {
-        buf.copy_within(src_off..src_off + byte_count, dst_off);
-    });
-    Ok(Value::typed_array(t))
 }
 
 fn impl_reverse(ctx: &mut NativeCtx<'_>, _args: ValueWindow<'_>) -> Result<Value, NativeError> {
@@ -1079,7 +1039,7 @@ pub fn method_impl(name: &str) -> Option<TypedArrayNativeFn> {
     Some(match name {
         "at" => impl_at,
         "fill" => fill::run,
-        "copyWithin" => impl_copy_within,
+        "copyWithin" => copy_within::run,
         "reverse" => impl_reverse,
         "indexOf" => impl_index_of,
         "lastIndexOf" => impl_last_index_of,

@@ -12,7 +12,7 @@
 //! - The collecting allocation is the tested generated callee's Array construction;
 //!   no separate force-GC operation substitutes for it.
 //! - A private host-buffer unit fit cannot satisfy the runtime LAB-hit assertion.
-//! - Cold argument forwarding keeps the callee's actual frame without an
+//! - The caller owns a finally continuation, retaining the callee without an
 //!   arguments-object allocation that could promote the receiver before phase 0.
 //!
 //! # See also
@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const MODULE: &str = "jit-native-receiver-own-generation.js";
 const PROBE: &str = r#"
 const receiverProbeChild = {marker: 7};
+stackArrayPrepareFit();
 const receiverOne = buildReceiverWithArray(ReceiverCtor, receiverProbeChild, receiverObserve);
 const receiverTwo = buildReceiverWithArray(ReceiverCtor, receiverProbeChild, receiverObserve);
 JSON.stringify([receiverOne.child === receiverProbeChild, receiverOne.marker, receiverOne.array.length,
@@ -53,7 +54,12 @@ function receiverFactory() {
 }
 const ReceiverCtor = receiverFactory();
 const receiverWarmChild = {marker: 7};
-function buildReceiverWithArray(Ctor, child, observe) { return new Ctor(child, observe); }
+function buildReceiverWithArray(Ctor, child, observe) {
+  let result;
+  try { result = new Ctor(child, observe); }
+  finally { if (result !== undefined && result.child !== child) throw "receiver continuation"; }
+  return result;
+}
 for (let warm = 0; warm < 20000; warm++) {
   buildReceiverWithArray(ReceiverCtor, receiverWarmChild, receiverObserve);
 }
@@ -72,6 +78,7 @@ fn assert_native_probe(
     generations: &[JitCodeGenerationSnapshot],
     probe: &otter_runtime::ExecutionResult,
     delta: CounterDelta,
+    typed_allocations: u64,
 ) {
     assert_eq!(
         probe.completion_string(),
@@ -107,8 +114,8 @@ fn assert_native_probe(
     assert_eq!(delta.code_generations, 0);
     assert_eq!(delta.optimized_osr_entries, 0);
     assert_eq!(
-        delta.alloc_value_stub_ok, 2,
-        "one Array construction per native callee"
+        delta.alloc_value_stub_ok, typed_allocations,
+        "each Array construction uses its proven LAB fit or collecting typed Probe"
     );
     assert_eq!(delta.alloc_value_stub_miss, 0);
     assert_eq!(delta.alloc_value_stub_out_of_memory, 0);
@@ -126,6 +133,7 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
         RuntimeExtensionInstaller::new(move |realm| {
             let recording = recording.clone();
             let observations = observations.clone();
+            realm.install_native_global_call("stackArrayPrepareFit", 0, fit_preparation_call())?;
             realm.install_native_global_call(
                 "receiverStress",
                 1,
@@ -197,7 +205,6 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
         })
     };
     let mut runtime = Runtime::builder()
-        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .extension_installer(installer)
@@ -316,6 +323,7 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
         &generations,
         &probe,
         CounterDelta::between(before, after),
+        if original_stride == 0 { 0 } else { 2 },
     );
     // The probe constructs two receivers, and each construct executes the
     // caller's receiver plan. A fit carves the receiver and counts nothing.
@@ -386,6 +394,7 @@ fn own_generated_receiver_fits_and_collecting_array_construct_keep_exact_roots()
         &generations,
         &probe,
         CounterDelta::between(before, after),
+        2,
     );
     let observations = observations.lock().unwrap();
     assert_eq!(observations.len(), 4);

@@ -15,13 +15,17 @@
 //! - Successful callee-entry cases allocate before any effectful body work.
 //!   The invalid-length callee records one preceding effect to detect replay.
 //! - Every probe enters that callee through generated stack-owned linkage.
-//!   An arguments identity check or cold forwarding branch retains its
-//!   argument-frame ownership, proven by the exact current bytecode artifact.
+//!   An arguments identity check or a caller finally continuation retains own
+//!   activation ownership, proven by exact current bytecode and native artifacts.
 //! - A successful allocation returns once; pre-effect misses deopt exactly once.
+//! - LAB publication branches over the typed helper in each exact allocation
+//!   region. Fit probes require no helper; collecting probes retain real GC.
+//! - An interpreted zero-argument control admits LAB headroom immediately before
+//!   fit probes; it never changes an enabled external stress policy.
 //! - Completed calls unlink their native roots and leave the caller reusable.
 //! - Template generations count their entries and returns; graph generations
 //!   count only their exits. Graph execution requires exact current call
-//!   artifacts, absent subject interpreter dispatch, typed allocation hits,
+//!   artifacts, absent subject interpreter dispatch, exact allocation paths,
 //!   and unchanged installed generations.
 //!
 //! # See also
@@ -43,6 +47,11 @@ use otter_vm::{
     JitCodeGenerationSnapshot,
     native_abi::{CodeLifetimeState, ExitAction, ExitReason, NativeFrameKind},
 };
+
+#[path = "jit_stack_owned_array_construct/allocation_fit.rs"]
+mod allocation_fit;
+
+use allocation_fit::{assert_array_length_lab_publication, fit_preparation_call};
 
 #[path = "jit_stack_owned_array_construct/receiver.rs"]
 mod receiver;
@@ -67,11 +76,17 @@ function arrayLengthAtEntry(length) {
 }
 
 function callArrayZero(fn) {
-  return fn();
+  let result;
+  try { result = fn(); }
+  finally { if (result !== undefined && result !== 0) throw "zero continuation"; }
+  return result;
 }
 
 function callArrayLength(fn, length) {
-  return fn(length);
+  let result;
+  try { result = fn(length); }
+  finally { if (result !== undefined && result !== length) throw "length continuation"; }
+  return result;
 }
 
 for (let warm = 0; warm < 5000; warm++) {
@@ -83,6 +98,7 @@ for (let warm = 0; warm < 5000; warm++) {
 "#;
 
 const NORMAL_PROBE: &str = r#"
+stackArrayPrepareFit();
 JSON.stringify([
   callArrayZero(arrayZeroAtEntry),
   callArrayLength(arrayLengthAtEntry, 4),
@@ -126,6 +142,7 @@ const INVALID_LENGTH_PROBE: &str = r#"
     message = error.message;
   }
   const attemptsAfterThrow = globalThis.__stackArrayLengthEffects[0];
+  stackArrayPrepareFit();
   const recoveredLength = callInvalidArrayLength(
     invalidArrayLength,
     3,
@@ -161,15 +178,22 @@ function gcArrayLengthAtEntry(marker, length) {
 }
 
 function gcCallArrayZero(fn, marker) {
-  return fn(marker);
+  let result;
+  try { result = fn(marker); }
+  finally { if (result !== undefined && result !== 0) throw "zero continuation"; }
+  return result;
 }
 
 function gcCallArrayLength(fn, marker, length) {
-  return fn(marker, length);
+  let result;
+  try { result = fn(marker, length); }
+  finally { if (result !== undefined && result !== length) throw "length continuation"; }
+  return result;
 }
 
 globalThis.__stackArrayWarmMarker = { value: 0 };
 for (let warm = 0; warm < 5000; warm++) {
+  __stackArrayWarmMarker.value = warm & 31;
   gcArrayZeroAtEntry(__stackArrayWarmMarker);
   gcArrayLengthAtEntry(__stackArrayWarmMarker, 4);
   gcCallArrayZero(gcArrayZeroAtEntry, __stackArrayWarmMarker);
@@ -298,7 +322,9 @@ function TinyConstructCost() {
 function makeTinyConstructCost() {
   return new TinyConstructCost();
 }
+"#;
 
+const TINY_CONSTRUCT_COST_WARM: &str = r#"
 for (let warm = 0; warm < 5000; warm++) {
   makeTinyConstructCost();
 }
@@ -363,16 +389,17 @@ impl CounterDelta {
 
 fn runtime() -> Runtime {
     Runtime::builder()
-        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
+        .extension_installer(otter_runtime::RuntimeExtensionInstaller::new(|realm| {
+            realm.install_native_global_call("stackArrayPrepareFit", 0, fit_preparation_call())
+        }))
         .build()
         .expect("stack-owned Array construction runtime")
 }
 
 fn interpreter_runtime() -> Runtime {
     Runtime::builder()
-        .jit_compile_threads(0)
         .jit_selection(JitSelection::InterpreterOnly)
         .build()
         .expect("interpreter-only constructor transition runtime")
@@ -438,6 +465,7 @@ fn has_current_graph(generation: &JitCodeGenerationSnapshot, fid: u32) -> bool {
         && generation.tier == NativeFrameKind::Optimizing
         && generation.lifecycle == CodeLifetimeState::Installed
         && generation.linked
+        && generation.current_entry
 }
 
 fn current_graph(runtime: &Runtime, fid: u32) -> JitCodeGenerationSnapshot {
@@ -482,11 +510,13 @@ fn admit_graph_entries(
     const PAIRS_PER_BATCH: usize = 16;
     for batch in 0..=BATCHES {
         let generations = runtime.jit_code_generation_snapshot();
-        if names.iter().all(|(_, fid)| {
-            generations
-                .iter()
-                .any(|generation| has_current_graph(generation, *fid))
-        }) {
+        if runtime.jit_code_residency().pending_compilations == 0
+            && names.iter().all(|(_, fid)| {
+                generations
+                    .iter()
+                    .any(|generation| has_current_graph(generation, *fid))
+            })
+        {
             assert!(!artifacts.truncated(), "complete own-entry artifacts");
             return artifacts;
         }
@@ -542,7 +572,7 @@ fn assert_argument_frame_opcode(bundle: &JitArtifactBundle, opcode: &str) {
             .filter(|line| line.split_whitespace().nth(2) == Some(opcode))
             .count(),
         1,
-        "the exact callee keeps its actual-argument frame through {opcode}: {bytecode}"
+        "the exact callee preserves its argument operation {opcode}: {bytecode}"
     );
 }
 
@@ -580,6 +610,9 @@ fn assert_array_allocation_nodes(bundle: &JitArtifactBundle, empty: usize, lengt
                 region["startOffset"].as_u64().unwrap() < region["endOffset"].as_u64().unwrap(),
                 "the allocation owns emitted instructions: {region}"
             );
+            if kind == "NewArrayWithLength" {
+                assert_array_length_lab_publication(bundle, region);
+            }
         }
     }
 }
@@ -1008,6 +1041,20 @@ fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
         let bundle = current_graph_entry(&artifacts, callee);
         assert_argument_frame_opcode(bundle, "CallForwardArguments");
         assert_array_allocation_nodes(bundle, empty, length);
+        let ir = std::str::from_utf8(
+            bundle
+                .file(JitArtifactFileName::OptimizedIr)
+                .unwrap()
+                .contents(),
+        )
+        .unwrap();
+        assert_eq!(
+            ir.lines()
+                .filter(|line| line.contains(" = NativeNewContext("))
+                .count(),
+            length,
+            "only the length callee needs a context for its forwarded formal: {ir}"
+        );
     }
     assert_array_construct_at_entry(&artifacts, MODULE, "arrayZeroAtEntry");
     assert_array_construct_at_entry(&artifacts, MODULE, "arrayLengthAtEntry");
@@ -1050,8 +1097,8 @@ fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
             .iter()
             .filter(|(fid, _, _, op)| trace.names[fid] == "<main>" && *op == Op::Call)
             .count(),
-        4,
-        "the interpreted probe independently dispatches all four wrapper calls"
+        5,
+        "the interpreted probe dispatches one fit control and all four independent wrapper calls"
     );
     for generation in &generations {
         assert!(
@@ -1088,8 +1135,9 @@ fn zero_and_int32_length_constructs_stay_in_stack_owned_generated_callees() {
     assert_eq!(delta.code_generations, 0, "{delta:?}");
     assert_eq!(delta.optimized_osr_entries, 0, "{delta:?}");
     assert_eq!(
-        delta.alloc_value_stub_ok, 2,
-        "only the two length allocations use the typed allocation Probe: {delta:?}"
+        delta.alloc_value_stub_ok,
+        if gc_stress_stride() == 0 { 0 } else { 4 },
+        "each length call allocates its proven context and Array through LAB fits or collecting typed Probes: {delta:?}"
     );
     assert_eq!(delta.alloc_value_stub_miss, 0, "{delta:?}");
     assert_eq!(delta.alloc_value_stub_out_of_memory, 0, "{delta:?}");
@@ -1102,12 +1150,24 @@ fn invalid_length_throws_once_reuses_graph_caller_and_reconciles_generated_deopt
     let mut runtime = runtime();
     let trace = Arc::new(Mutex::new(ArrayProbeTrace::default()));
     runtime.set_tracer(Some(Box::new(ArrayProbeTracer(trace.clone()))));
-    let setup = runtime
+    let mut setup = runtime
         .run_script(SourceInput::from_javascript(INVALID_LENGTH_SETUP), MODULE)
         .expect("Graph-only Array construction setup");
     let names = traced_function_names(
         &trace.lock().unwrap(),
         &["callInvalidArrayLength", "invalidArrayLength"],
+    );
+    let artifacts = admit_graph_entries(
+        &mut runtime,
+        setup.take_jit_artifacts().unwrap(),
+        &names,
+        "callInvalidArrayLength(invalidArrayLength, 4, __stackArrayLengthEffects);\n",
+        "jit-invalid-array-admission",
+    );
+    run(
+        &mut runtime,
+        "__stackArrayLengthEffects[0] = 0;",
+        "jit-invalid-array-reset.js",
     );
     let caller_fid = names[0].1;
     let callee_fid = names[1].1;
@@ -1115,7 +1175,7 @@ fn invalid_length_throws_once_reuses_graph_caller_and_reconciles_generated_deopt
     let callee = current_graph(&runtime, callee_fid);
     assert_eq!(callee.generated_entries, 0);
     assert_eq!(callee.generated_deopts, 0);
-    let artifacts = setup.jit_artifacts().unwrap();
+    let artifacts = &artifacts;
     assert!(!artifacts.truncated());
     assert_current_graph_call(artifacts, &caller, &callee);
     let callee_bundle = current_graph_entry(artifacts, &callee);
@@ -1216,7 +1276,10 @@ fn invalid_length_throws_once_reuses_graph_caller_and_reconciles_generated_deopt
     assert_eq!(delta.code_generations, 0);
     assert_eq!(delta.optimized_osr_entries, 0);
     assert_eq!(delta.to_rust_call_transitions, 0);
-    assert_eq!(delta.alloc_value_stub_ok, 1);
+    assert_eq!(
+        delta.alloc_value_stub_ok,
+        u64::from(gc_stress_stride() != 0)
+    );
     assert_eq!(delta.alloc_value_stub_miss, 1);
     assert_eq!(delta.alloc_value_stub_out_of_memory, 0);
     assert_eq!(delta.alloc_value_stub_other, 0);
@@ -1301,22 +1364,35 @@ fn ordinary_constructor_transition_cannot_append_to_a_non_extensible_receiver() 
     );
 
     let mut runtime = runtime();
-    let setup = runtime
+    let trace = Arc::new(Mutex::new(ArrayProbeTrace::default()));
+    runtime.set_tracer(Some(Box::new(ArrayProbeTracer(trace.clone()))));
+    let mut setup = runtime
         .run_script(
             SourceInput::from_javascript(NON_EXTENSIBLE_CONSTRUCTOR_SETUP),
             MODULE,
         )
         .expect("non-extensible ordinary constructor setup");
-    let artifacts = setup
-        .jit_artifacts()
-        .expect("non-extensible ordinary constructor artifacts");
+    let names = traced_function_names(
+        &trace.lock().unwrap(),
+        &[
+            "constructNonExtensibleOrdinary",
+            "NonExtensibleOrdinaryField",
+        ],
+    );
+    let artifacts = admit_graph_entries(
+        &mut runtime,
+        setup.take_jit_artifacts().unwrap(),
+        &names,
+        "constructNonExtensibleOrdinary(NonExtensibleOrdinaryField, lockOrdinaryReceiver);\n",
+        "jit-non-extensible-constructor-admission",
+    );
     assert_direct_edge(
-        artifacts,
+        &artifacts,
         MODULE,
         "constructNonExtensibleOrdinary",
         "NonExtensibleOrdinaryField",
     );
-    assert_graph_constructor_fields(artifacts, MODULE, "NonExtensibleOrdinaryField", 1);
+    assert_graph_constructor_fields(&artifacts, MODULE, "NonExtensibleOrdinaryField", 1);
     drop(setup);
 
     let completion = run(&mut runtime, NON_EXTENSIBLE_CONSTRUCTOR_PROBE, PROBE_MODULE);
@@ -1327,22 +1403,32 @@ fn ordinary_constructor_transition_cannot_append_to_a_non_extensible_receiver() 
 fn wide_ordinary_constructor_transitions_preserve_the_reserved_slab() {
     const MODULE: &str = "jit-wide-ordinary-constructor-fields.js";
     let mut runtime = runtime();
-    let setup = runtime
+    let trace = Arc::new(Mutex::new(ArrayProbeTrace::default()));
+    runtime.set_tracer(Some(Box::new(ArrayProbeTracer(trace.clone()))));
+    let mut setup = runtime
         .run_script(
             SourceInput::from_javascript(WIDE_ORDINARY_CONSTRUCTOR_SETUP),
             MODULE,
         )
         .expect("wide ordinary constructor setup");
-    let artifacts = setup
-        .jit_artifacts()
-        .expect("wide ordinary constructor artifacts");
+    let names = traced_function_names(
+        &trace.lock().unwrap(),
+        &["constructWideOrdinary", "WideOrdinaryFields"],
+    );
+    let artifacts = admit_graph_entries(
+        &mut runtime,
+        setup.take_jit_artifacts().unwrap(),
+        &names,
+        "constructWideOrdinary(WideOrdinaryFields, 4);\n",
+        "jit-wide-constructor-admission",
+    );
     assert_direct_edge(
-        artifacts,
+        &artifacts,
         MODULE,
         "constructWideOrdinary",
         "WideOrdinaryFields",
     );
-    assert_graph_constructor_fields(artifacts, MODULE, "WideOrdinaryFields", 4);
+    assert_graph_constructor_fields(&artifacts, MODULE, "WideOrdinaryFields", 4);
     drop(setup);
 
     let before = runtime.execution_stats();
@@ -1378,15 +1464,83 @@ JSON.stringify([value.a, value.b, value.c, value.d, Object.keys(value).join(",")
 fn tiny_base_constructor_uses_only_template_or_the_graph_optimizer() {
     const MODULE: &str = "jit-tiny-construct-cost-model.js";
     let mut runtime = runtime();
-    let setup = runtime
+    let mut setup = runtime
         .run_script(
             SourceInput::from_javascript(TINY_CONSTRUCT_COST_SETUP),
             MODULE,
         )
         .expect("tiny constructor cost-model setup");
-    let artifacts = setup
-        .jit_artifacts()
+    let mut artifacts = setup
+        .take_jit_artifacts()
         .expect("tiny constructor cost-model artifacts");
+    // Observe the baseline before the hot loop can admit Graph first. Pending
+    // jobs receive ordinary constant turns, which poll ACKs without allocating
+    // another receiver or earning more optimizing work for the tiny wrapper.
+    let mut own_calls = 0;
+    for batch in 0..4096 {
+        if runtime.jit_code_residency().pending_compilations == 0
+            && artifacts.bundles().iter().any(|bundle| {
+                let manifest = bundle.manifest();
+                manifest.module() == MODULE
+                    && manifest.function_name() == "makeTinyConstructCost"
+                    && manifest.entry() == JitDebugTarget::Entry
+                    && manifest.tier() == JitDebugTier::Template
+            })
+        {
+            break;
+        }
+        let source = if runtime.jit_code_residency().pending_compilations == 0 {
+            if own_calls == 128 {
+                break;
+            }
+            own_calls += 1;
+            "makeTinyConstructCost();"
+        } else {
+            "0;"
+        };
+        let mut admission = runtime
+            .run_script(
+                SourceInput::from_javascript(source),
+                &format!("jit-tiny-construct-admission-{batch}.js"),
+            )
+            .expect("bounded ordinary tiny constructor admission");
+        artifacts = artifacts.merged(admission.take_jit_artifacts().unwrap());
+        std::thread::yield_now();
+    }
+    assert!(!artifacts.truncated());
+    assert_eq!(runtime.jit_code_residency().pending_compilations, 0);
+    let baseline = artifacts
+        .bundles()
+        .iter()
+        .find(|bundle| {
+            let manifest = bundle.manifest();
+            manifest.module() == MODULE
+                && manifest.function_name() == "makeTinyConstructCost"
+                && manifest.entry() == JitDebugTarget::Entry
+                && manifest.tier() == JitDebugTier::Template
+        })
+        .expect("ordinary entry admission must install the tiny Template baseline");
+    assert!(
+        runtime
+            .jit_code_generation_snapshot()
+            .iter()
+            .any(|generation| {
+                generation.code_object_id == baseline.manifest().code_object_id()
+                    && generation.tier == NativeFrameKind::Baseline
+                    && generation.lifecycle == CodeLifetimeState::Installed
+                    && generation.linked
+                    && generation.current_entry
+            })
+    );
+    let mut warmed = runtime
+        .run_script(
+            SourceInput::from_javascript(TINY_CONSTRUCT_COST_WARM),
+            "jit-tiny-construct-cost-warm.js",
+        )
+        .expect("the complete original tiny constructor warm loop");
+    artifacts = artifacts.merged(warmed.take_jit_artifacts().unwrap());
+    assert!(!artifacts.truncated());
+    drop(warmed);
     let caller_bundles = artifacts
         .bundles()
         .iter()
@@ -1401,7 +1555,12 @@ fn tiny_base_constructor_uses_only_template_or_the_graph_optimizer() {
         caller_bundles
             .iter()
             .any(|bundle| bundle.manifest().tier() == JitDebugTier::Template),
-        "tiny constructor caller must retain a Template baseline"
+        "tiny constructor caller must retain a Template baseline; observed={:?}; generations={:?}",
+        caller_bundles
+            .iter()
+            .map(|bundle| (bundle.manifest().tier(), bundle.manifest().code_object_id()))
+            .collect::<Vec<_>>(),
+        runtime.jit_code_generation_snapshot()
     );
     assert!(
         caller_bundles.iter().all(|bundle| {
@@ -1509,17 +1668,25 @@ checksum;
     // says nothing about the Array construction edges this test covers. Once the
     // probe loop enters OSR code, its callers and their Array construction callees
     // run in their own graph generations, which count no entries. The two
-    // length allocations per iteration use the typed Probe; the two empty
-    // Arrays use the emitted LAB/empty boundary proved above.
+    // length allocations per iteration use the LAB path proved above until
+    // a refill needs the typed Probe. Stress retires the LAB, requiring both
+    // length allocations to cross the collecting boundary on every iteration.
     assert_eq!(
         delta.generated_template_entries, delta.generated_template_returns,
         "{delta:?}"
     );
     assert_no_exits_except_checksum_overflow(&result, delta);
-    assert!(
-        delta.alloc_value_stub_ok >= u64::from(iterations) * 2,
-        "both Array results must remain rooted across a second allocation: {delta:?}"
-    );
+    if gc_stress_stride() == 0 {
+        assert!(
+            delta.alloc_value_stub_ok > 0 && delta.alloc_value_stub_ok < u64::from(iterations) * 2,
+            "the proven LAB paths fit and also reach their rooted refill boundary: {delta:?}"
+        );
+    } else {
+        assert!(
+            delta.alloc_value_stub_ok >= u64::from(iterations) * 2,
+            "both length allocations collect with the earlier result rooted: {delta:?}"
+        );
+    }
     assert!(
         delta.minor_gc_cycles > 0,
         "Array construction must collect while stack-owned values are live: {delta:?}"
@@ -1533,6 +1700,7 @@ checksum;
         &mut runtime,
         r#"
 const marker = { value: 9 };
+stackArrayPrepareFit();
 JSON.stringify([
   gcCallArrayZero(gcArrayZeroAtEntry, marker),
   gcCallArrayLength(gcArrayLengthAtEntry, marker, 4),
@@ -1549,7 +1717,11 @@ JSON.stringify([
     );
     assert_no_exits(reuse_delta);
     assert_eq!(reuse_delta.code_generations, 0, "{reuse_delta:?}");
-    assert!(reuse_delta.alloc_value_stub_ok >= 2, "{reuse_delta:?}");
+    if gc_stress_stride() == 0 {
+        assert_eq!(reuse_delta.alloc_value_stub_ok, 0, "{reuse_delta:?}");
+    } else {
+        assert!(reuse_delta.alloc_value_stub_ok >= 2, "{reuse_delta:?}");
+    }
     for generation in &generations {
         let after = current_graph(&runtime, generation.function_id);
         assert_eq!(after.code_object_id, generation.code_object_id);

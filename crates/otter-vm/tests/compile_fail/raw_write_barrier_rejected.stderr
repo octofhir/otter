@@ -4,7 +4,7 @@ error[E0624]: method `write_barrier_raw` is private
 9 |     heap.write_barrier_raw(parent, slot, child);
   |          ^^^^^^^^^^^^^^^^^ private method
   |
- ::: $WORKSPACE/crates/otter-gc/src/heap.rs
+ ::: $WORKSPACE/crates/otter-gc/src/heap/mutation.rs
   |
   |     pub(crate) fn write_barrier_raw<T: ?Sized>(&mut self, parent: Gc<T>, child: RawGc) {
   |     ---------------------------------------------------------------------------------- private method defined here

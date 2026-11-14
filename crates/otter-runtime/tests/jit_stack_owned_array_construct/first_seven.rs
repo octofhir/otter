@@ -11,6 +11,8 @@
 //! - Native execution requires exact call artifacts, complete trace exclusion,
 //!   canonical-receiver and plan-miss counters and unchanged installed
 //!   generations.
+//! - Stress probes arm collection at every allocation after admission, so two
+//!   native receiver allocations cannot miss a larger external stride's phase.
 
 use super::*;
 use otter_runtime::ValueWindow;
@@ -46,6 +48,7 @@ for (let warm = 0; warm < 20000; warm++) {
 }
 "#;
 const PROBE: &str = r#"
+stackArrayPrepareFit();
 const layoutFutureA = layoutBuild(LayoutTarget, 42, layoutObserve);
 const layoutFutureB = layoutBuild(LayoutTarget, 57, layoutObserve);
 JSON.stringify([layoutFutureA.value, layoutFutureA.next, layoutFutureB.value, layoutFutureB.next,
@@ -77,6 +80,19 @@ fn retained_first_seven_cells_keep_geometry_while_current_native_calls_use_final
         RuntimeExtensionInstaller::new(move |realm| {
             let recording = recording.clone();
             let observations = observations.clone();
+            realm.install_native_global_call("stackArrayPrepareFit", 0, fit_preparation_call())?;
+            realm.install_native_global_call(
+                "layoutArmCollection",
+                0,
+                RuntimeNativeCall::Dynamic(Arc::new(
+                    |ctx: &mut RuntimeNativeCtx<'_>,
+                     _args: ValueWindow<'_>,
+                     _state: ValueWindow<'_>| {
+                        ctx.interp_mut().gc_heap_mut().set_gc_stress(1, true);
+                        Ok(RuntimeValue::undefined())
+                    },
+                )),
+            )?;
             realm.install_native_global_call(
                 "layoutObserve",
                 1,
@@ -112,7 +128,6 @@ fn retained_first_seven_cells_keep_geometry_while_current_native_calls_use_final
         })
     };
     let mut runtime = Runtime::builder()
-        .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .extension_installer(installer)
@@ -177,6 +192,17 @@ fn retained_first_seven_cells_keep_geometry_while_current_native_calls_use_final
         vec![Ok(cell_bytes(64)); 7],
         "finalization/full GC cannot shrink or repoint retained first-seven cells"
     );
+    if gc_stress_stride() != 0 {
+        // Retiring the LAB preserves the external stress mode's canonical
+        // receiver path. A stride of one makes the measured allocation collect
+        // regardless of the incoming stride's counter phase; the hook itself
+        // does not collect. The isolated heap keeps this stronger stress mode.
+        run(
+            &mut runtime,
+            "layoutArmCollection();",
+            "jit-constructor-finalized-arm.js",
+        );
+    }
     observations.lock().unwrap().clear();
     trace.lock().unwrap().recording = true;
     let before = runtime.execution_stats();

@@ -818,6 +818,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
             pc: 0,
             plan: crate::call_linkage::CallPlan::Generic,
             construct: true,
+            tail: false,
             receiver: false,
             receiver_object: false,
             allocation: Some(plan),

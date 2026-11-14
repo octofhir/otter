@@ -55,6 +55,7 @@ mod native_leaf;
 mod nullish;
 mod properties;
 mod scalar;
+mod tail_call;
 pub(crate) mod truthy;
 
 type Deferred<'a> = Box<dyn FnOnce(&mut Codegen<'a>) + 'a>;
@@ -563,7 +564,11 @@ impl<'a> Codegen<'a> {
                 receiver,
                 receiver_object,
                 allocation,
+                tail,
             } => {
+                if *tail {
+                    self.emit_tail_call(node, *plan)?;
+                }
                 self.emit_call_js(
                     node,
                     *pc,

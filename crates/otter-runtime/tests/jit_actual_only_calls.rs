@@ -12,6 +12,9 @@
 //! - Ordinary source work admits every subject; tests never force a tier or budget.
 //! - Exact current artifacts prove Known edges, and complete isolated traces
 //!   exclude interpreted subject execution during the measured calls.
+//! - Observable arguments identity preserves own activations where arity alone
+//!   can be spliced. Forwarding keeps its actuals elided and owns a finally
+//!   continuation instead, which verifies its modified mapped formal.
 //! - Probe generations remain installed and linked with no compile, OSR or exit.
 //! - A handle scope roots exact fresh children across a real full collection.
 //!
@@ -45,8 +48,12 @@ mod moving_children;
 #[path = "support/return_sites.rs"]
 mod return_sites;
 
+#[path = "jit_actual_only_calls/tail_deopt.rs"]
+mod tail_deopt;
+
 const DEFINITIONS: &str = r#"
 function actualEcho(a, b, c) {
+  if (a === -1 && arguments === a) throw "distinct arguments identity";
   return [arguments.length, a, b, c, arguments[0], arguments[3]];
 }
 function actualMapped(a, b, c) {
@@ -54,6 +61,7 @@ function actualMapped(a, b, c) {
   return [arguments.length, arguments[0], arguments[1], c];
 }
 function actualDefaults(a = {marker: 41}, b = 2, ...rest) {
+  if (arguments === a) throw "distinct arguments identity";
   return [arguments.length, a.marker, b, rest];
 }
 function actualZero() {
@@ -82,7 +90,11 @@ function actualDefaultsMany(a) {
 }
 function actualForward(a, b, c) {
   a = 9;
-  const result = actualEcho.apply(undefined, arguments); return result;
+  try {
+    const result = actualEcho.apply(undefined, arguments); return result;
+  } finally {
+    if (a !== 9) throw "mapped formal survives forwarding";
+  }
 }
 function actualForwardBridge(a) {
   if (arguments.length !== 1) throw "forward bridge";
@@ -90,16 +102,19 @@ function actualForwardBridge(a) {
 }
 function actualTail(a, b, c) {
   "use strict";
+  if (arguments === a) throw "distinct arguments identity";
   if (arguments.length !== 1) throw "tail arguments";
   return actualEcho(a);
 }
 function actualTailZero() {
   "use strict";
+  if (arguments === undefined) throw "distinct arguments identity";
   if (arguments.length !== 0) throw "zero tail arguments";
   return actualEcho();
 }
 function actualTailGrow() {
   "use strict";
+  if (arguments === undefined) throw "distinct arguments identity";
   if (arguments.length !== 0) throw "growing tail arguments";
   return actualEcho(1, 2, 3, 4, 5);
 }
@@ -116,9 +131,11 @@ function actualTailGrowBridge() {
   const result = actualTailGrow(); return result;
 }
 function ActualUnderConstructor(value, missing) {
+  if (arguments === value) throw "distinct arguments identity";
   this.value = value; this.missing = missing;
 }
 function ActualCollectConstructor(value, missing) {
+  if (arguments === value) throw "distinct arguments identity";
   if (arguments.length !== 1) throw "constructor arguments";
   this.value = value;
   const child = actualRenewChild(value);
@@ -169,18 +186,29 @@ function actualDefaultCollectBridge() {
   const result = actualDefaultCollect(); return result;
 }
 function actualTailCollectTarget(payload, missing) {
+  if (arguments === payload) throw "distinct arguments identity";
   const child = actualRenewChild(payload);
   actualCollect(child);
   return [child.marker, missing, child === payload.child];
 }
 function actualTailCollect(payload) {
   "use strict";
+  if (arguments === payload) throw "distinct arguments identity";
   return actualTailCollectTarget(payload);
 }
 function actualTailCollectBridge(payload) {
   const result = actualTailCollect(payload); return result;
 }
+function actualTailGrowCollect(payload) {
+  "use strict";
+  if (arguments === payload) throw "distinct arguments identity";
+  return actualTailCollectTarget(payload, undefined, 1, 2, 3);
+}
+function actualTailGrowCollectBridge(payload) {
+  const result = actualTailGrowCollect(payload); return result;
+}
 function actualThrowCollect(payload) {
+  if (arguments === payload) throw "distinct arguments identity";
   const child = actualRenewChild(payload);
   actualCollect(child);
   throw child;
@@ -197,6 +225,7 @@ actualForwardBridge(5); actualTailBridge(5); actualTailZeroBridge(); actualTailG
 actualConstruct({marker:42}); actualConstructCollect({marker:42}); actualBoundConstruct({marker:42});
 actualBoundCall(8); actualBoundConstructCollect(); actualDefaultCollectBridge();
 actualTailCollectBridge({marker:51});
+actualTailGrowCollectBridge({marker:53});
 try { actualThrowCollectBridge({marker:52}); } catch (error) { if (error.marker !== 52) throw error; }
 "#;
 
@@ -247,7 +276,6 @@ impl Fixture {
         let collections = Arc::new(AtomicUsize::new(0));
         let observations = Arc::new(Mutex::new(Vec::new()));
         let mut runtime = Runtime::builder()
-            .jit_compile_threads(0)
             .jit_selection(selection)
             .jit_debug(JitDebugRequest::artifacts().with_events(true))
             .extension_installer(RuntimeExtensionInstaller::new({
@@ -374,6 +402,7 @@ impl Fixture {
             .filter(|generation| {
                 generation.lifecycle == CodeLifetimeState::Installed
                     && generation.linked
+                    && generation.current_entry
                     && self
                         .artifacts
                         .get(&generation.code_object_id)
@@ -389,16 +418,18 @@ impl Fixture {
 
     fn admit(&mut self, names: &[&str]) {
         for batch in 0..=128 {
-            if names.iter().all(|name| {
-                self.current(name).is_some_and(|generation| {
-                    generation.tier
-                        == match self.selection {
-                            JitSelection::ProductionTiered => NativeFrameKind::Optimizing,
-                            JitSelection::Template => NativeFrameKind::Baseline,
-                            JitSelection::InterpreterOnly => unreachable!("native fixture"),
-                        }
+            if self.runtime.jit_code_residency().pending_compilations == 0
+                && names.iter().all(|name| {
+                    self.current(name).is_some_and(|generation| {
+                        generation.tier
+                            == match self.selection {
+                                JitSelection::ProductionTiered => NativeFrameKind::Optimizing,
+                                JitSelection::Template => NativeFrameKind::Baseline,
+                                JitSelection::InterpreterOnly => unreachable!("native fixture"),
+                            }
+                    })
                 })
-            }) {
+            {
                 return;
             }
             if batch == 128 {
@@ -443,6 +474,97 @@ impl Fixture {
             bundle.manifest().function_name()
         );
         return_sites::assert_known(bundle, callee.function_id);
+    }
+
+    fn tail_edge(&self, caller: &str, callee: &str) {
+        self.edge(caller, callee);
+        let caller = self.current(caller).unwrap();
+        let callee = self.current(callee).unwrap();
+        let bundle = &self.artifacts[&caller.code_object_id];
+        let json = |name| {
+            serde_json::from_slice::<serde_json::Value>(bundle.file(name).unwrap().contents())
+                .unwrap()
+        };
+        let relocations = json(JitArtifactFileName::Relocations);
+        let sites = json(JitArtifactFileName::Safepoints);
+        let code = bundle.file(JitArtifactFileName::Code).unwrap().contents();
+        let mut transfers = 0;
+        for relocation in relocations["relocations"].as_array().unwrap() {
+            if relocation["target"]["kind"] != "functionEntryCell"
+                || relocation["target"]["functionId"] != callee.function_id
+            {
+                continue;
+            }
+            let end = relocation["endOffset"].as_u64().unwrap() as usize;
+            #[cfg(target_arch = "aarch64")]
+            let branch_end = {
+                let Some(words) = code.get(end..end + 24) else {
+                    continue;
+                };
+                let words: Vec<_> = words
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .copied()
+                    .map(u32::from_le_bytes)
+                    .collect();
+                if words[0] != 0xf940_0108 || words[1] != 0xf940_0110 || words[5] != 0xd61f_0200 {
+                    continue;
+                }
+                end + 24
+            };
+            #[cfg(target_arch = "x86_64")]
+            let branch_end = {
+                use yaxpeax_arch::LengthedInstruction;
+                use yaxpeax_x86::amd64::{InstDecoder, Opcode, Operand, RegSpec};
+                if code.get(end..end + 6) != Some(&[0x4d, 0x8b, 0x0b, 0x49, 0x8b, 0x01]) {
+                    continue;
+                }
+                let decoder = InstDecoder::default();
+                let mut cursor = end;
+                let mut branch_end = None;
+                for _ in 0..6 {
+                    let instruction = decoder.decode_slice(&code[cursor..]).unwrap();
+                    cursor += instruction.len().to_const() as usize;
+                    assert_ne!(instruction.opcode(), Opcode::CALL);
+                    if instruction.opcode() == Opcode::JMP {
+                        assert_eq!(
+                            instruction.operand(0),
+                            Operand::Register {
+                                reg: RegSpec::rax()
+                            }
+                        );
+                        branch_end = Some(cursor);
+                        break;
+                    }
+                }
+                branch_end.expect("Known tail ends in JMP rax")
+            };
+            assert!(
+                !sites["returnSites"].as_array().unwrap().iter().any(|site| {
+                    site["nativeReturnOffset"]
+                        .as_u64()
+                        .is_some_and(|offset| offset > end as u64 && offset <= branch_end as u64)
+                }),
+                "a tail branch has no return association"
+            );
+            transfers += 1;
+        }
+        assert_eq!(transfers, 1, "one exact Known tail transfer");
+        if self.selection == JitSelection::ProductionTiered {
+            let ir = std::str::from_utf8(
+                bundle
+                    .file(JitArtifactFileName::OptimizedIr)
+                    .unwrap()
+                    .contents(),
+            )
+            .unwrap();
+            assert!(
+                ir.lines()
+                    .any(|line| line.contains("CallJs") && line.contains("tail: true")),
+                "{ir}"
+            );
+        }
     }
 
     fn assert_collections(&self, expected: usize, caller: &[(&str, &str)]) {
@@ -516,6 +638,33 @@ impl Fixture {
         }
         let result = self.run(source, "actual-only-probe.js");
         self.trace.lock().unwrap().recording = false;
+        if let Some(root) = std::env::var_os("OTTER_ACTUAL_PROOF_ARTIFACTS") {
+            let directory = std::path::PathBuf::from(root).join(format!(
+                "{}-{:?}-{:?}",
+                std::thread::current().name().unwrap(),
+                self.selection,
+                self.realm
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("events.json"),
+                serde_json::to_vec_pretty(result.jit_debug_report().unwrap()).unwrap(),
+            )
+            .unwrap();
+            for generation in &before {
+                let bundle = &self.artifacts[&generation.code_object_id];
+                let directory = directory.join(bundle.manifest().function_name());
+                std::fs::create_dir_all(&directory).unwrap();
+                std::fs::write(
+                    directory.join("manifest.json"),
+                    serde_json::to_vec_pretty(bundle.manifest()).unwrap(),
+                )
+                .unwrap();
+                for file in bundle.files() {
+                    std::fs::write(directory.join(file.name().as_str()), file.contents()).unwrap();
+                }
+            }
+        }
         assert_eq!(result.completion_string(), expected);
         let events = result.jit_debug_report().unwrap();
         assert!(!events.truncated());
@@ -552,6 +701,10 @@ impl Fixture {
                 "same current {name}"
             );
             assert_eq!(current.generated_deopts, previous.generated_deopts);
+            assert_eq!(
+                current.active_count, 0,
+                "retired calls release their leases"
+            );
             assert!(
                 !trace
                     .ticks
@@ -731,21 +884,25 @@ fn proper_tail_and_throwing_children_keep_their_exact_suspended_sources_through_
             "actualTailCollectTarget",
             "actualTailCollect",
             "actualTailCollectBridge",
+            "actualTailGrowCollect",
+            "actualTailGrowCollectBridge",
             "actualThrowCollect",
             "actualThrowCollectBridge",
         ];
         let mut fixture = Fixture::new(selection);
         fixture.admit(&names);
         fixture.edge("actualTailCollectBridge", "actualTailCollect");
-        fixture.edge("actualTailCollect", "actualTailCollectTarget");
+        fixture.tail_edge("actualTailCollect", "actualTailCollectTarget");
+        fixture.edge("actualTailGrowCollectBridge", "actualTailGrowCollect");
+        fixture.tail_edge("actualTailGrowCollect", "actualTailCollectTarget");
         fixture.edge("actualThrowCollectBridge", "actualThrowCollect");
         fixture.collect.store(true, Ordering::Relaxed);
         let before = fixture.runtime.execution_stats();
-        fixture.probe("const tailResult=actualTailCollectBridge({marker:51});const throwPayload={marker:52};let throwResult;try{actualThrowCollectBridge(throwPayload);}catch(error){throwResult=[error.marker,error===throwPayload.child];}JSON.stringify([tailResult,throwResult]);",
-            &names, "[[51,null,true],[52,true]]");
-        assert_eq!(fixture.collections.load(Ordering::Relaxed), 2);
+        fixture.probe("const tailResult=actualTailCollectBridge({marker:51});const grownResult=actualTailGrowCollectBridge({marker:53});const throwPayload={marker:52};let throwResult;try{actualThrowCollectBridge(throwPayload);}catch(error){throwResult=[error.marker,error===throwPayload.child];}JSON.stringify([tailResult,grownResult,throwResult]);",
+            &names, "[[51,null,true],[53,null,true],[52,true]]");
+        assert_eq!(fixture.collections.load(Ordering::Relaxed), 3);
         fixture.assert_collections(
-            2,
+            3,
             &[
                 (
                     "actualTailCollectBridge",
@@ -755,12 +912,16 @@ fn proper_tail_and_throwing_children_keep_their_exact_suspended_sources_through_
                     "actualThrowCollectBridge",
                     "const result = actualThrowCollect(payload); return result;",
                 ),
+                (
+                    "actualTailGrowCollectBridge",
+                    "const result = actualTailGrowCollect(payload); return result;",
+                ),
             ],
         );
         let observations = fixture.observations.lock().unwrap();
-        let tail = observations
+        let tails = observations
             .iter()
-            .find(|observation| {
+            .filter(|observation| {
                 let (_, source, _) = observation.as_ref().unwrap();
                 let frames: serde_json::Value = serde_json::from_str(source).unwrap();
                 frames
@@ -769,17 +930,21 @@ fn proper_tail_and_throwing_children_keep_their_exact_suspended_sources_through_
                     .iter()
                     .any(|frame| frame["functionName"] == "actualTailCollectTarget")
             })
-            .unwrap();
-        let (_, source, _) = tail.as_ref().unwrap();
-        let frames: serde_json::Value = serde_json::from_str(source).unwrap();
-        assert!(
-            !frames
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|frame| frame["functionName"] == "actualTailCollect"),
-            "the proper tail removed its physical caller; the collecting target inherited only the bridge return"
-        );
-        assert!(fixture.runtime.execution_stats().gc_cycles >= before.gc_cycles + 2);
+            .collect::<Vec<_>>();
+        assert_eq!(tails.len(), 2, "both fitting and grown tails collect");
+        for tail in tails {
+            let (_, source, _) = tail.as_ref().unwrap();
+            let frames: serde_json::Value = serde_json::from_str(source).unwrap();
+            assert!(
+                !frames
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|frame| frame["functionName"] == "actualTailCollect"
+                        || frame["functionName"] == "actualTailGrowCollect"),
+                "the proper tail removed its physical caller; the collecting target inherited only the bridge return"
+            );
+        }
+        assert!(fixture.runtime.execution_stats().gc_cycles >= before.gc_cycles + 3);
     }
 }

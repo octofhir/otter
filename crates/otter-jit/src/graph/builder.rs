@@ -4044,12 +4044,11 @@ impl<'a> Builder<'a> {
     /// `construct`. A site that never ran leaves to collect its target; a
     /// site with one proven target enters it directly.
     /// §15.10.3 `return f(args…)` from a strict tail position, to a site's
-    /// one bytecode target: an ordinary call and return, which the callee
-    /// can then be inlined into, while the native stack keeps
-    /// [`super::ir::TAIL_CALL_STACK_RESERVE`] free. Past it the guard resumes the
-    /// baseline operation, which replaces the frame, so an unbounded chain
-    /// of tail calls still runs in bounded stack. Any other site keeps the
-    /// baseline operation.
+    /// one bytecode target: an own activation transfers its physical frame,
+    /// while an inlined source must retain its outer continuation. The latter
+    /// uses an ordinary call while [`super::ir::TAIL_CALL_STACK_RESERVE`] stays
+    /// free, then reconstructs the source tail instruction. Any other site
+    /// keeps the baseline operation.
     fn visit_tail_call(&mut self, instruction: &Instruction) {
         let monomorphic = self
             .view
@@ -4062,7 +4061,7 @@ impl<'a> Builder<'a> {
         if !monomorphic || self.exited_for(ExitReason::UnsupportedOperation) {
             return self.generic(instruction);
         }
-        self.add(Kind::CheckStackHeadroom, &[], Repr::None);
+        let headroom = self.add(Kind::CheckStackHeadroom, &[], Repr::None);
         let mut call = instruction.clone();
         call.op = Op::Call;
         call.writes = smallvec::smallvec![destination];
@@ -4074,6 +4073,17 @@ impl<'a> Builder<'a> {
             return;
         }
         let value = self.read(destination);
+        if matches!(self.graph.node(value).kind, Kind::CallJs { tail: true, .. }) {
+            // Only an emitted physical transfer replaces this frame. A splice
+            // can retain ordinary calls and still needs the bounded-stack guard.
+            let block = self.graph.node(headroom).block.unwrap();
+            self.graph.blocks[block.0 as usize]
+                .body
+                .retain(|node| *node != headroom);
+            let removed = self.graph.node_mut(headroom);
+            removed.block = None;
+            removed.eager = None;
+        }
         if self.inline.is_some() {
             return self.inline_return(value);
         }
@@ -4220,6 +4230,7 @@ impl<'a> Builder<'a> {
                 pc: self.pc,
                 plan: crate::call_linkage::CallPlan::for_site(self.view, instruction.byte_pc, plan),
                 construct,
+                tail: self.tail_call.is_some() && self.inline.is_none(),
                 receiver: false,
                 receiver_object: false,
                 allocation,
@@ -4330,6 +4341,7 @@ impl<'a> Builder<'a> {
                 pc: self.pc,
                 plan: crate::call_linkage::CallPlan::for_site(self.view, instruction.byte_pc, plan),
                 construct: false,
+                tail: false,
                 receiver: true,
                 receiver_object,
                 allocation: None,

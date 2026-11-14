@@ -16,19 +16,26 @@ A targeted pass does not establish a green workspace or market leadership.
 | P1 | **Diagnose flaky accounting observations.** `ipc` incoming-charge lifetime and compile-cache pruning. Both failed previously and also passed repeated standalone runs. | Controlled scheduling/lifetime reproductions, exact resource ownership assertions and repeated isolated/concurrent checks. Passing retries alone do not close the task. |
 
 Continue broad-suite reclassification with `code_chunk_eviction`,
-`jit_actual_only_calls`, `jit_stack_owned_array_construct`,
-`jit_empty_allocations`, runtime `compile_fail`,
+`jit_stack_owned_array_construct`,
+`jit_empty_allocations`, `jit_generic_call_transition`, runtime `compile_fail`,
 `dependency_graph`, `step_trace_golden` and `tokio_spawn_audit`. These are leads
 from prior failures, not a claim that every named target currently fails.
-Comparable baseline/candidate runs retain four exact Known-linkage failures,
-four stack-owned Array failures and five literal-artifact failures. Retain exact
-generation, activation, suspended-source and native-lowering proofs while
-determining whether lowering or fixtures own each mismatch. Raw reclassification,
-native artifacts and the bounded validation matrix are under
+Four stack-owned Array failures, five literal-artifact failures and two generic-call
+counter assertions remain open. The two generic-call failures reproduce on the
+same final fixtures with both parent and candidate codegen.
+One Array probe warms only a constant field before changing its feedback; classify
+that dependency exit separately from activation ownership. Retain exact generation,
+activation, suspended-source and native-lowering proofs when repairing fixtures.
+Current native-tail evidence and remaining failure observations are under
+`benchmarks/results/generated-array-deopts-2026-11-14/validation.json`.
+The preceding allocation-generation validation matrix is under
 `benchmarks/results/generated-call-ownership-2026-11-14/validation.json`.
 That matrix retains a 120-second checked interpreter timeout for
 `array_literal_boilerplate` at GC stride 1; its remaining cases are unobserved.
-Attribute verification and mutator costs before rerunning the full corpus.
+The exact-generation `jit_actual_only_calls` integration stress also retains a
+120-second stride-1 timeout in its proper-tail/throwing GC case; its phase is not
+attributed. Its unstressed checked run still performs explicit moving/full GC.
+Attribute verification and mutator costs before rerunning these matrices.
 Code-eviction runs have both passed and failed their hot-source reclamation
 assertions; separate compiler-job leases and acknowledgement timing from leaked
 ownership. Passing retries do not close that investigation; retained observations

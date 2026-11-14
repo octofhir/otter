@@ -3030,6 +3030,9 @@ pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
 /// or page-rounding overhead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitCodeResidency {
+    /// Queued, active, or finished compilations not yet acknowledged by the
+    /// isolate. Their roots/source leases are retained independently of code.
+    pub pending_compilations: usize,
     /// Installed optimizing-tier entry bodies.
     pub installed_optimized_bodies: u64,
     /// Canonical Template bodies eligible for ordinary function entry.

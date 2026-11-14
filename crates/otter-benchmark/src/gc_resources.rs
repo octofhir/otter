@@ -11,6 +11,8 @@
 //!   retained as explicit coverage gaps.
 //! - No formatting, RSS inspection or quantile sorting runs inside collection.
 //! - Reserved off-slot bytes are not added to reconciled live GC-cell bytes.
+//! - Minor/Full summaries describe only those synchronous services. A Full
+//!   duration excludes a preceding MarkStart and concurrent marking work.
 //! - These service intervals are not a whole-mutator-blocked comparison to Bun.
 //!
 //! # See also
@@ -146,7 +148,8 @@ pub fn trace_document(
                     let kind_matches = match record.kind {
                         GcPauseKind::Minor => full == 0 && minor == 1,
                         GcPauseKind::Full => full >= 1 && minor >= 1,
-                        GcPauseKind::MarkStart => full == 0 && minor == 0,
+                        // Starting concurrent marking first evacuates the nursery.
+                        GcPauseKind::MarkStart => full == 0 && minor == 1,
                         _ => true,
                     };
                     if !kind_matches {
@@ -222,7 +225,7 @@ pub fn trace_document(
             "boundary": "complete synchronous collection service including trigger accounting",
             "clock": "monotonic; capture-local origin",
             "eventUnits": "microseconds; exact nanoseconds preserved in args",
-            "nestedMinorPolicy": "included in outer full service",
+            "nestedMinorPolicy": "included in outer Full or MarkStart service",
             "quantileMethod": "nearest rank, ceil(p*n)-1, one capture, no pooling",
             "droppedRecords": capture.dropped_records,
             "incomplete": capture.incomplete,

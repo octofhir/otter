@@ -257,3 +257,111 @@ fn incomplete_failed_and_dropped_records_remain_visible_and_unscoreable() {
     );
     assert!(trace["metadata"]["descriptiveSummaries"][0]["p50Ns"].is_null());
 }
+
+#[test]
+fn mark_start_covers_its_minor_without_merging_the_later_full_pause() {
+    let start = GcPauseRecord {
+        kind: GcPauseKind::MarkStart,
+        trigger: GcPauseTrigger::GrowthBudget,
+        full_cycles_before: 4,
+        full_cycles_after: 4,
+        minor_cycles_before: 10,
+        minor_cycles_after: 11,
+        ..record(1, 1_200)
+    };
+    let full = GcPauseRecord {
+        kind: GcPauseKind::Full,
+        trigger: GcPauseTrigger::GrowthBudget,
+        full_cycles_before: 4,
+        full_cycles_after: 5,
+        minor_cycles_before: 11,
+        minor_cycles_after: 12,
+        ..record(2, 3_000)
+    };
+    let trace = trace_document(
+        &capture(vec![start, full]),
+        1,
+        &counters(4, 10),
+        &counters(5, 12),
+    );
+    assert_eq!(trace["metadata"]["coverageComplete"], true);
+    assert_eq!(trace["metadata"]["containsSplitPhases"], false);
+    assert_eq!(trace["metadata"]["coverageGaps"], json!([]));
+    assert_eq!(
+        trace["metadata"]["counterCoverage"]["recordedFullCycles"],
+        1
+    );
+    assert_eq!(
+        trace["metadata"]["counterCoverage"]["recordedMinorCyclesIncludingNested"],
+        2
+    );
+    let events = trace["traceEvents"].as_array().unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "each synchronous service keeps its own interval"
+    );
+    assert_eq!(events[0]["name"], "MarkStart");
+    assert_eq!(events[0]["args"]["durationNs"], 1_200);
+    assert_eq!(events[1]["name"], "Full");
+    assert_eq!(events[1]["args"]["startNs"], full.start_ns);
+    assert_eq!(events[1]["args"]["durationNs"], 3_000);
+    let summaries = trace["metadata"]["descriptiveSummaries"]
+        .as_array()
+        .unwrap();
+    let full_summary = summaries.iter().find(|row| row["kind"] == "Full").unwrap();
+    assert_eq!(full_summary["count"], 1);
+    assert_eq!(full_summary["p50Ns"], 3_000);
+    assert_eq!(full_summary["maxNs"], 3_000);
+    let minor_summary = summaries.iter().find(|row| row["kind"] == "Minor").unwrap();
+    assert_eq!(
+        minor_summary["count"], 0,
+        "nested minors have no separate pause"
+    );
+    assert!(minor_summary["p50Ns"].is_null());
+    assert_eq!(trace["metadata"]["tailCoverageComplete"], false);
+}
+
+#[test]
+fn mark_start_rejects_impossible_cycles_and_noncompleted_outcomes() {
+    for (full, minor, outcome) in [
+        (0, 0, GcPauseOutcome::Completed),
+        (1, 1, GcPauseOutcome::Completed),
+        (0, 2, GcPauseOutcome::Completed),
+        (0, 1, GcPauseOutcome::CompletedAllocationRefused),
+        (0, 0, GcPauseOutcome::CollectionFailed),
+    ] {
+        let start = GcPauseRecord {
+            kind: GcPauseKind::MarkStart,
+            trigger: GcPauseTrigger::GrowthBudget,
+            full_cycles_before: 4,
+            full_cycles_after: 4 + full,
+            minor_cycles_before: 10,
+            minor_cycles_after: 10 + minor,
+            outcome,
+            ..record(1, 1_200)
+        };
+        let trace = trace_document(
+            &capture(vec![start]),
+            1,
+            &counters(4, 10),
+            &counters(4 + full, 10 + minor),
+        );
+        assert_eq!(trace["metadata"]["coverageComplete"], false, "{start:?}");
+        assert!(
+            !trace["metadata"]["coverageGaps"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(trace["traceEvents"].as_array().unwrap().len(), 1);
+        assert_eq!(trace["traceEvents"][0]["args"]["durationNs"], 1_200);
+        for summary in trace["metadata"]["descriptiveSummaries"]
+            .as_array()
+            .unwrap()
+        {
+            assert_eq!(summary["tailSummaryAvailable"], false);
+            assert!(summary["p50Ns"].is_null());
+        }
+    }
+}

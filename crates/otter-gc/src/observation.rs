@@ -31,7 +31,9 @@ pub enum GcPauseKind {
     Minor,
     /// One outer full service, including nested copying collections.
     Full,
-    /// The pause that begins a concurrent marking cycle: the root scan.
+    /// The synchronous pause that begins a concurrent marking cycle: one
+    /// preparatory minor collection followed by shading roots. Background
+    /// marking and the later Full service are outside this interval.
     MarkStart,
     /// A standalone initial/final mark or additional marking operation.
     SplitMark,
@@ -92,7 +94,7 @@ pub struct GcPauseRecord {
     pub full_cycles_after: u64,
     /// Minor-cycle counter immediately before the outer service.
     pub minor_cycles_before: u64,
-    /// Minor-cycle counter afterward, including full service's nested minors.
+    /// Minor-cycle counter afterward, including nested Full/MarkStart minors.
     pub minor_cycles_after: u64,
     /// Heap occupancy when the service began.
     pub before: HeapOccupancy,

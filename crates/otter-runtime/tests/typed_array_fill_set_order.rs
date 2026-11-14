@@ -2,6 +2,7 @@
 //!
 //! # Contents
 //! - `fill` snapshots length before value/start/end coercion.
+//! - A tracking view is revalidated when bound coercion shrinks past its offset.
 //! - `set` checks source length against the initial target length.
 //!
 //! # Invariants
@@ -12,7 +13,7 @@
 //! - <https://tc39.es/ecma262/#sec-%typedarray%.prototype.fill>
 //! - <https://tc39.es/ecma262/#sec-%typedarray%.prototype.set>
 
-use otter_runtime::{Runtime, SourceInput};
+use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 fn run(source: &str) -> String {
     let mut rt = Runtime::builder().build().expect("runtime");
@@ -35,6 +36,25 @@ fn fill_uses_initial_length_when_value_coercion_grows_buffer() {
         Array.from(ta).join(",");
         "#);
     assert_eq!(completion, "123,0,0,0");
+}
+
+#[test]
+fn fill_revalidates_tracking_views_after_shrink_even_for_empty_ranges() {
+    for selection in [
+        JitSelection::InterpreterOnly,
+        JitSelection::Template,
+        JitSelection::ProductionTiered,
+    ] {
+        let mut runtime = Runtime::builder().jit_selection(selection).build().unwrap();
+        let result = runtime.run_script(SourceInput::from_javascript(
+            "{ const buffer = new ArrayBuffer(4, {maxByteLength: 8}); const view = new Uint8Array(buffer, 2); let result; try { view.fill(7, {valueOf(){buffer.resize(1); return 0;}}); result = 'returned'; } catch(error) { result = error.name; } JSON.stringify([result, view.length]); }"
+        ), "typed-fill-tracking-shrink.js").unwrap();
+        assert_eq!(
+            result.completion_string(),
+            "[\"TypeError\",0]",
+            "{selection:?}"
+        );
+    }
 }
 
 #[test]

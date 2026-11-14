@@ -158,7 +158,7 @@ impl Interpreter {
             let o = interp.escape_scoped(o_root);
             let value = interp.escape_scoped(value_root);
             if interp
-                .try_fill_numeric_typed_array(o, value, start, end)
+                .try_fill_typed_array(o, value, start, end)
                 .map_err(CommittedValueError::Fatal)?
             {
                 return Ok(interp.escape_scoped(o_root));

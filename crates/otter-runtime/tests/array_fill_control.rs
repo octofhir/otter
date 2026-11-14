@@ -1,9 +1,9 @@
-//! Array fill range, numeric bulk stores and work control at the runtime boundary.
+//! Array and TypedArray fill protocols, bulk stores and runtime work control.
 //!
 //! # Contents
 //! - Shared live Set/coercion protocol and exact abrupt completion.
 //! - Full-range numeric stores and guarded bulk admission.
-//! - Reject, yield and cancellation checks for generic and ordinary dense inputs.
+//! - Reject, yield and cancellation checks for generic, dense and typed inputs.
 //!
 //! # Invariants
 //! - Every generic Set attempt consumes work before its observable operation.
@@ -60,6 +60,26 @@ fn borrowed_numeric_fill_keeps_conversions_ranges_and_live_buffer_state() {
         assert_eq!(
             result.completion_string(),
             "ok:fill-numeric",
+            "{selection:?}"
+        );
+    }
+}
+
+#[test]
+fn native_typed_fill_keeps_value_order_encodings_and_live_buffer_validation() {
+    for selection in SELECTIONS {
+        let mut runtime = Runtime::builder().jit_selection(selection).build().unwrap();
+        let result = runtime
+            .run_script(
+                SourceInput::from_javascript(include_str!(
+                    "../../otter-difftest/corpus/typed_array_fill_control.js"
+                )),
+                "typed-fill-control.js",
+            )
+            .unwrap();
+        assert_eq!(
+            result.completion_string(),
+            "ok:typed-fill-control",
             "{selection:?}"
         );
     }
@@ -144,10 +164,32 @@ fn stores_reject_work_and_preserve_only_the_committed_prefix() {
 #[test]
 fn yielding_fill_keeps_the_turn_and_microtask_order() {
     for selection in SELECTIONS {
-        for (input, value) in [
-            ("{length: 5000}", "{marker: 719}"),
-            ("new Array(5000)", "{marker: 719}"),
-            ("new Uint8Array(5000)", "19"),
+        for (input, value, fill) in [
+            (
+                "{length: 5000}",
+                "{marker: 719}",
+                "Array.prototype.fill.call(fillYieldInput, fillYieldValue)",
+            ),
+            (
+                "new Array(5000)",
+                "{marker: 719}",
+                "Array.prototype.fill.call(fillYieldInput, fillYieldValue)",
+            ),
+            (
+                "new Uint8Array(5000)",
+                "19",
+                "Array.prototype.fill.call(fillYieldInput, fillYieldValue)",
+            ),
+            (
+                "new Uint8Array(5000)",
+                "19",
+                "fillYieldInput.fill(fillYieldValue)",
+            ),
+            (
+                "new BigInt64Array(5000)",
+                "719n",
+                "fillYieldInput.fill(fillYieldValue)",
+            ),
         ] {
             let mut runtime = Runtime::builder()
                 .jit_selection(selection)
@@ -162,9 +204,9 @@ fn yielding_fill_keeps_the_turn_and_microtask_order() {
             "globalThis.fillYieldInput = {input}; globalThis.fillYieldValue = {value}; globalThis.fillYieldLog = [];"
         )), "fill-yield-input.js").unwrap();
             let before = runtime.work_budget_stats().forced_yields;
-            let result = runtime.run_script(SourceInput::from_javascript(
-            "queueMicrotask(() => fillYieldLog.push('microtask')); const result = Array.prototype.fill.call(fillYieldInput, fillYieldValue); fillYieldLog.push(result[0] === fillYieldValue, result[4999] === fillYieldValue, 'after'); result === fillYieldInput;"
-        ), "fill-yield.js").unwrap();
+            let result = runtime.run_script(SourceInput::from_javascript(format!(
+            "queueMicrotask(() => fillYieldLog.push('microtask')); const result = {fill}; fillYieldLog.push(result[0] === fillYieldValue, result[4999] === fillYieldValue, 'after'); result === fillYieldInput;"
+        )), "fill-yield.js").unwrap();
             assert_eq!(result.completion_string(), "true");
             assert!(runtime.work_budget_stats().forced_yields >= before + 30);
             assert_eq!(runtime.work_budget_stats().budget_rejections, 0);
@@ -182,33 +224,115 @@ fn yielding_fill_keeps_the_turn_and_microtask_order() {
 #[test]
 fn numeric_typed_stores_reject_at_the_committed_prefix() {
     for selection in SELECTIONS {
-        let mut runtime = Runtime::builder()
-            .jit_selection(selection)
-            .work_budget(WorkBudget {
-                on_exceeded: WorkBudgetExceededAction::Reject,
-                max_work_units_per_turn: Some(1_000),
-                ..WorkBudget::default()
-            })
-            .build()
-            .unwrap();
-        runtime.run_script(SourceInput::from_javascript(
+        for fill in [
+            "Array.prototype.fill.call(fillNumbers, 19)",
+            "fillNumbers.fill(19)",
+        ] {
+            let mut runtime = Runtime::builder()
+                .jit_selection(selection)
+                .work_budget(WorkBudget {
+                    on_exceeded: WorkBudgetExceededAction::Reject,
+                    max_work_units_per_turn: Some(1_000),
+                    ..WorkBudget::default()
+                })
+                .build()
+                .unwrap();
+            runtime.run_script(SourceInput::from_javascript(
             "globalThis.fillNumbers = new Uint8Array(20000); globalThis.fillNumbersCaught = false; globalThis.fillNumbersAfter = false;"
         ), "fill-numbers-input.js").unwrap();
-        let error = runtime.run_script(SourceInput::from_javascript(
-            "try { Array.prototype.fill.call(fillNumbers, 19); } catch (error) { fillNumbersCaught = true; } fillNumbersAfter = true;"
-        ), "fill-numbers-budget.js").expect_err("borrowed numeric fill must remain controlled");
-        assert!(
-            matches!(error, OtterError::Runtime { diagnostic } if diagnostic.code == "BUDGET_EXCEEDED")
-        );
-        runtime.force_gc().unwrap();
-        let result = runtime.eval(SourceInput::from_javascript(
+            let error = runtime.run_script(SourceInput::from_javascript(format!(
+            "try {{ {fill}; }} catch (error) {{ fillNumbersCaught = true; }} fillNumbersAfter = true;"
+        )), "fill-numbers-budget.js").expect_err("numeric fill must remain controlled");
+            assert!(
+                matches!(error, OtterError::Runtime { diagnostic } if diagnostic.code == "BUDGET_EXCEEDED")
+            );
+            runtime.force_gc().unwrap();
+            let result = runtime.eval(SourceInput::from_javascript(
             "{ const prefix = fillNumbers.indexOf(0); JSON.stringify([prefix > 0 && prefix <= 1000, fillNumbers[prefix - 1] === 19, fillNumbers[1000], fillNumbers[19999], fillNumbersCaught, fillNumbersAfter]); }"
         )).unwrap();
-        assert_eq!(
-            result.completion_string(),
-            "[true,true,0,0,false,false]",
-            "{selection:?}"
-        );
+            assert_eq!(
+                result.completion_string(),
+                "[true,true,0,0,false,false]",
+                "{selection:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_fill_rejects_bigint_shared_and_resizable_stores_after_one_value_conversion() {
+    for selection in SELECTIONS {
+        for (input, value, zero) in [
+            ("new BigInt64Array(20000)", "-719n", "0n"),
+            ("new BigUint64Array(20000)", "719n", "0n"),
+            ("new Uint8Array(new SharedArrayBuffer(20000))", "19", "0"),
+            (
+                "new Uint8Array(new ArrayBuffer(20000, {maxByteLength: 40000}))",
+                "19",
+                "0",
+            ),
+        ] {
+            let mut runtime = Runtime::builder()
+                .jit_selection(selection)
+                .work_budget(WorkBudget {
+                    on_exceeded: WorkBudgetExceededAction::Reject,
+                    max_work_units_per_turn: Some(1000),
+                    ..WorkBudget::default()
+                })
+                .build()
+                .unwrap();
+            runtime.run_script(SourceInput::from_javascript(format!(
+                "globalThis.nativeFillInput = {input}; globalThis.nativeFillCalls = 0; globalThis.nativeFillCaught = false; globalThis.nativeFillAfter = false;"
+            )), "native-fill-input.js").unwrap();
+            let error = runtime.run_script(SourceInput::from_javascript(format!(
+                "try {{ nativeFillInput.fill({{valueOf(){{++nativeFillCalls; return {value};}}}}); }} catch(error) {{ nativeFillCaught = true; }} nativeFillAfter = true;"
+            )), "native-fill-budget.js").expect_err("typed stores must debit the enforcing budget");
+            assert!(
+                matches!(error, OtterError::Runtime { diagnostic } if diagnostic.code == "BUDGET_EXCEEDED")
+            );
+            assert_eq!(runtime.work_budget_stats().budget_rejections, 1);
+            // Inspect the committed state without imposing another small work
+            // slice on BigInt reads, which themselves allocate.
+            runtime.set_work_budget(WorkBudget::default());
+            runtime.force_gc().unwrap();
+            let result = runtime.eval(SourceInput::from_javascript(format!(
+                "{{ const prefix = nativeFillInput.indexOf({zero}); JSON.stringify([prefix > 0 && prefix <= 1000, nativeFillInput[0] === {value}, nativeFillInput[prefix - 1] === {value}, nativeFillInput[1000] === {zero}, nativeFillInput[19999] === {zero}, nativeFillCalls, nativeFillCaught, nativeFillAfter]); }}"
+            ))).unwrap();
+            assert_eq!(
+                result.completion_string(),
+                "[true,true,true,true,true,1,false,false]",
+                "{selection:?}: {input}"
+            );
+        }
+    }
+}
+
+#[test]
+fn typed_fill_observing_budget_accounts_for_bulk_and_fallback_work() {
+    for selection in SELECTIONS {
+        for (input, value) in [
+            ("new Uint8Array(20000)", "19"),
+            ("new BigInt64Array(20000)", "-719n"),
+            ("new Uint8Array(new SharedArrayBuffer(20000))", "19"),
+            (
+                "new Uint8Array(new ArrayBuffer(20000, {maxByteLength: 40000}))",
+                "19",
+            ),
+        ] {
+            let mut runtime = Runtime::builder().jit_selection(selection).build().unwrap();
+            runtime
+                .run_script(
+                    SourceInput::from_javascript(format!("globalThis.nativeFillInput = {input};")),
+                    "native-fill-observe-input.js",
+                )
+                .unwrap();
+            let before = runtime.work_budget_stats().work_units_executed;
+            let result = runtime.run_script(SourceInput::from_javascript(format!(
+                "nativeFillInput.fill({value}); nativeFillInput[0] === {value} && nativeFillInput[19999] === {value};"
+            )), "native-fill-observe.js").unwrap();
+            assert_eq!(result.completion_string(), "true", "{selection:?}: {input}");
+            assert!(runtime.work_budget_stats().work_units_executed - before >= 20000);
+        }
     }
 }
 

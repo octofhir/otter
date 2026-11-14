@@ -1,5 +1,4 @@
-//! Binary-data values: `ArrayBuffer`, `DataView`, and the eleven
-//! `TypedArray` constructors.
+//! Binary-data values: `ArrayBuffer`, `DataView`, and `TypedArray` constructors.
 //!
 //! Foundation surface implements ECMA-262 §25.1 / §25.3 / §23.2 in
 //! full: every constructor overload, every prototype method, and
@@ -7,7 +6,7 @@
 //! `WebAssembly.Memory` integration is out of scope for the runtime
 //! slice; this module is the language-level surface.
 //!
-//! # Layout
+//! # Contents
 //! - [`array_buffer`] — `JsArrayBuffer` value type.
 //! - [`data_view`] — `JsDataView` value type.
 //! - [`typed_array`] — `JsTypedArray` value type and
@@ -16,6 +15,12 @@
 //!   `Op::DataViewCall`, `Op::TypedArrayCall`.
 //! - [`array_buffer_prototype`] / [`data_view_prototype`] /
 //!   [`typed_array_prototype`] — prototype native method helpers.
+//! - `typed_array_fill` — shared scalar encoding and guarded fill byte batches.
+//!
+//! # Invariants
+//! - Array and TypedArray fill keep their distinct coercion/validation protocols.
+//! - Shared fill stores admit only matching primitives in fixed local buffers;
+//!   no buffer borrow crosses a native work checkpoint.
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-arraybuffer-objects>
@@ -29,6 +34,7 @@ pub mod data_view;
 pub mod data_view_prototype;
 pub mod dispatch;
 pub mod typed_array;
+mod typed_array_fill;
 pub mod typed_array_prototype;
 
 pub use array_buffer::{

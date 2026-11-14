@@ -1,6 +1,6 @@
 //! `%TypedArray%.prototype.<name>` per ECMA-262 §23.2.3.
 //!
-//! All eleven concrete `TypedArray` constructors share one prototype
+//! The concrete `TypedArray` constructors share one prototype
 //! at the spec level; the runtime models that with one bootstrap
 //! native surface whose impls read the receiver's
 //! [`crate::binary::TypedArrayKind`] off the value to pick
@@ -10,7 +10,11 @@
 //! `some`, `find*`, `reduce*`, `sort` with comparator) live in the
 //! interpreter's `typed_array_callback_dispatch` because they need
 //! access to the engine to drive synchronous callbacks. This module
-//! covers the pure-functional surface.
+//! covers the remaining native method surface, including ordered fill stores.
+//!
+//! # Contents
+//! - Native dispatch and live typed-array value/buffer operations.
+//! - `fill` owns ordered preparation and controlled, cancellable stores.
 //!
 //! # Invariants
 //! - A view is a young cell that a scavenge moves, and a BigInt element
@@ -21,6 +25,8 @@
 //!
 //! # See also
 //! - <https://tc39.es/ecma262/#sec-properties-of-the-%25typedarrayprototype%25-object>
+
+mod fill;
 
 use crate::ValueWindow;
 use crate::string::JsString;
@@ -268,38 +274,6 @@ fn impl_at(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, Nati
     receiver(ctx)?
         .get(ctx.heap_mut(), resolved as usize)
         .map_err(native_oom)
-}
-
-fn impl_fill(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
-    let name = "TypedArray.prototype.fill";
-    let t = receiver(ctx)?;
-    validate_typed_array(&t, ctx.heap())?;
-    let len = t.length(ctx.heap_mut()) as i64;
-    let raw_value = args.first().cloned().unwrap_or(Value::undefined());
-    let value = ta_coerce_value(ctx, t.kind(), &raw_value)?;
-    with_anchors(ctx, |ctx, base| {
-        // A BigInt fill value must survive the index coercions below.
-        ctx.cx.interp.push_iteration_anchor(value);
-        let start = to_integer_or_infinity_arg(ctx, args.get(1), 0, name)?;
-        let end = to_integer_or_infinity_arg(ctx, args.get(2), len, name)?;
-        let s = clamp_relative_index(start, len) as usize;
-        let e = clamp_relative_index(end, len) as usize;
-        // §23.2.3.9 steps 13-16: the buffer witness is re-taken after every
-        // coercion and validated unconditionally, so an empty fill range
-        // still reports a buffer that a `valueOf` hook detached or shrank.
-        let t = receiver(ctx)?;
-        if t.buffer(ctx.heap()).is_detached(ctx.heap())
-            || (!t.is_length_tracking(ctx.heap()) && t.is_out_of_bounds(ctx.heap()))
-        {
-            return Err(type_error("typedarray is detached or out of bounds"));
-        }
-        let e = e.min(t.length(ctx.heap_mut()));
-        let value = ctx.cx.interp.iteration_anchor(base);
-        for i in s..e {
-            t.set(ctx.heap_mut(), i, &value);
-        }
-        Ok(Value::typed_array(t))
-    })
 }
 
 fn impl_copy_within(ctx: &mut NativeCtx<'_>, args: ValueWindow<'_>) -> Result<Value, NativeError> {
@@ -1104,7 +1078,7 @@ type TypedArrayNativeFn = fn(&mut NativeCtx<'_>, ValueWindow<'_>) -> Result<Valu
 pub fn method_impl(name: &str) -> Option<TypedArrayNativeFn> {
     Some(match name {
         "at" => impl_at,
-        "fill" => impl_fill,
+        "fill" => fill::run,
         "copyWithin" => impl_copy_within,
         "reverse" => impl_reverse,
         "indexOf" => impl_index_of,

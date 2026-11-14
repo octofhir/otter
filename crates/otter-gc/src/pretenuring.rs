@@ -18,7 +18,9 @@
 //!   site once the nursery already reached its maximum size; below that the
 //!   site waits as `MaybeTenure`. Lower survival never tenures.
 //! - `Tenure` and `DontTenure` are final, and only they have bit 1 set:
-//!   tracking code tests that bit alone to leave a decided site.
+//!   new allocations use that bit to stop tracking. Already installed young
+//!   code may keep tagging births after `DontTenure`: digestion ignores final
+//!   records and resets their counters, and evacuation still clears each tag.
 //!
 //! # See also
 //! - [`crate::scavenger`] counts found cells and clears their site tags.
@@ -380,6 +382,30 @@ impl AllocationSites {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_tracking_births_cannot_reconsider_a_final_young_decision() {
+        let mut sites = AllocationSites::default();
+        let site = sites.register();
+        for _ in 0..MINIMUM_CREATED {
+            sites.record_created(site);
+        }
+        assert_eq!(sites.digest(true), 1);
+        assert_eq!(sites.decision(site), PretenureDecision::DontTenure);
+        // Installed tracking generations still tag and count their young
+        // births. Even total survival at maximum nursery size cannot change
+        // the final placement, and each scavenge releases both counters.
+        for _ in 0..3 {
+            for _ in 0..MINIMUM_CREATED {
+                sites.record_created(site);
+                sites.record_found(site);
+            }
+            assert_eq!(sites.digest(true), 0);
+            assert_eq!(sites.decision(site), PretenureDecision::DontTenure);
+            assert_eq!(sites.record(site).created, 0);
+            assert_eq!(sites.record(site).found, 0);
+        }
+    }
 
     #[test]
     fn records_stay_at_stable_addresses_across_growth() {

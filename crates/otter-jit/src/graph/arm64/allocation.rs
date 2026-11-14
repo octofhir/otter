@@ -11,7 +11,8 @@
 //! Literal geometry comes from that same source; each field's observation
 //! record comes from the node, selected before any collecting clobber.
 //! The allocation site's compiled placement selects the buffer and header; a
-//! tracking site leaves before effects once decided and counts each birth.
+//! tracking site leaves before effects only when placement becomes old. A final
+//! young decision keeps the same tagged births; GC ignores their final counters.
 //!
 //! # See also
 //! `crate::arm64::allocation` owns the one LAB probe/init/publish implementation.
@@ -23,7 +24,7 @@ use crate::arm64::allocation::{
 };
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::jit::{
-    JIT_SITE_CREATED_OFFSET, JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET, JitSiteMode,
+    JIT_SITE_CREATED_OFFSET, JIT_SITE_DECISION_OFFSET, JIT_SITE_TENURE, JitSiteMode,
 };
 
 impl Codegen<'_> {
@@ -101,12 +102,14 @@ impl Codegen<'_> {
             _ => unreachable!("literal allocation kind"),
         };
         if fits && site.mode == JitSiteMode::Track {
-            // A decided site leaves before any effect and recompiles.
+            // Only a change of placement needs reconstruction and recompilation.
+            // DontTenure still accepts this young header and its site tag; final
+            // records ignore survival feedback and reset counters every scavenge.
             let exit = self.eager_exit(node, DeoptReason::AllocationSiteDecided);
             self.load_immediate(16, site.record);
             dynasm!(self.ops ; .arch aarch64
                 ; ldrb w17, [x16, JIT_SITE_DECISION_OFFSET]
-                ; tbnz w17, JIT_SITE_DECIDED_BIT.trailing_zeros(), =>exit);
+                ; cmp w17, u32::from(JIT_SITE_TENURE) ; b.eq =>exit);
         }
         let stub = match kind {
             Kind::NewObjectLiteral { fields } => {

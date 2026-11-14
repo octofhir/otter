@@ -5,6 +5,7 @@
 //! - Dense encoding limit and incremental construction above that limit.
 //! - Optimizing-tier allocation with unrelated live values and mixed tagged
 //!   elements.
+//! - Allocation-site decisions across exact generated entries and moving GC.
 //!
 //! # Invariants
 //! - Compiled results match the interpreter and allocation does not turn a
@@ -12,6 +13,10 @@
 //! - Artifacts must prove both literal boundaries use the fixed value ABI.
 
 use otter_runtime::{JitArtifactFileName, JitDebugRequest, JitSelection, Runtime, SourceInput};
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[path = "jit_literal_allocation/site_decisions.rs"]
+mod site_decisions;
 
 #[test]
 fn optimizing_literal_allocation_keeps_live_roots_and_preserves_holes() {

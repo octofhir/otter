@@ -3,7 +3,8 @@
 
 Keep commands, raw outputs, counters and executable/source hashes. Explicit
 warmup processes are excluded from aggregates. Validate stdout across engines
-and repetitions. Run on an idle machine without compilation or profiling.
+and repetitions. Load the seven immutable sources from the committed anchor
+manifest. Run on an idle machine without compilation or profiling.
 """
 import argparse
 import hashlib
@@ -21,21 +22,40 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
-WORKLOADS = {
-    "ts": "benchmarks/results/slice11/ts-fixed.js",
-    "zlib": "benchmarks/results/slice11/zlib-fixed.js",
-    "crypto": "benchmarks/results/slice11/crypto-fixed.js",
-    "fib": "benchmarks/results/calls/fib.js",
-    "mega_method": "benchmarks/results/calls/mega_method.js",
-    "ast_ctor": "benchmarks/results/calls/ast_ctor.js",
-    "earley-boyer": "benchmarks/results/octane_fixed/earley-boyer-x1.js",
-}
+ANCHORS = ("ts", "zlib", "crypto", "fib", "mega_method", "ast_ctor", "earley-boyer")
+ANCHOR_MANIFEST = Path("benchmarks/fixtures/fixed-work/anchors.json")
 COUNTER_METRICS = ("real_seconds", "user_seconds", "sys_seconds", "instructions", "rss_bytes")
 METRICS = COUNTER_METRICS + ("launchToExitSeconds",)
 
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def load_workloads():
+    """Resolve all seven pinned sources from their one committed manifest."""
+    manifest = ROOT / ANCHOR_MANIFEST
+    manifest_bytes = manifest.read_bytes()
+    entries = json.loads(manifest_bytes)
+    if (not isinstance(entries, list) or len(entries) != len(ANCHORS)
+            or any(not isinstance(entry, dict) or not isinstance(entry.get("anchor"), str)
+                   for entry in entries)
+            or {entry.get("anchor") for entry in entries} != set(ANCHORS)):
+        raise ValueError("anchor manifest must contain exactly the seven fixed-work cases")
+    workloads = {}
+    for entry in entries:
+        source = entry.get("source")
+        if not isinstance(source, str) or Path(source).name != source:
+            raise ValueError("anchor source must be a direct child filename")
+        path = manifest.parent / source
+        if not path.is_file() or path.resolve().parent != manifest.parent.resolve():
+            raise ValueError("anchor source must be an existing direct child: " + source)
+        actual = digest(path)
+        if actual != entry.get("sha256"):
+            raise ValueError("anchor source hash mismatch: " + entry["anchor"])
+        workloads[entry["anchor"]] = {"path": str(path.relative_to(ROOT)), "sha256": actual}
+    return workloads, {"path": str(ANCHOR_MANIFEST),
+                       "sha256": hashlib.sha256(manifest_bytes).hexdigest()}
 
 
 def write_json(path, value):
@@ -215,7 +235,7 @@ def main():
                         help="Preserved reference executable; select otter-reference in --engines")
     parser.add_argument("--engines", nargs="+", choices=["otter", "otter-reference", "node", "bun"],
                         default=["otter", "node", "bun"])
-    parser.add_argument("--workloads", nargs="+", choices=list(WORKLOADS), default=list(WORKLOADS))
+    parser.add_argument("--workloads", nargs="+", choices=ANCHORS, default=list(ANCHORS))
     parser.add_argument("--runs", type=positive_int, default=5,
                         help="Measured fresh-process samples per workload/engine (default: 5)")
     parser.add_argument("--warmup", type=nonnegative_int, default=1,
@@ -231,8 +251,7 @@ def main():
                "otter-reference": str(args.reference_otter.resolve()) if args.reference_otter else None,
                "node": shutil.which("node"), "bun": shutil.which("bun")}
     rows = [{"workload": workload, "engine": engine,
-             "command": build_command(engine, engines[engine], ROOT / WORKLOADS[workload])
-             if engines[engine] else None,
+             "command": None,
              "samples": [], "warmup_samples": [], "failures": []}
             for workload in args.workloads for engine in args.engines]
     by_key = {(row["workload"], row["engine"]): row for row in rows}
@@ -252,6 +271,18 @@ def main():
                 "bunLoader": "indirect eval of exact source bytes; wrapper cost included",
                 "executables": {}, "scripts": {}, "failures": [], "status": "incomplete",
                 "scoreable": False, "baselineEligible": False}
+    try:
+        workloads, metadata["anchorManifest"] = load_workloads()
+        metadata["scripts"] = {name: workloads[name] for name in args.workloads}
+        for row in rows:
+            executable = engines[row["engine"]]
+            if executable:
+                row["command"] = build_command(row["engine"], executable,
+                                               ROOT / workloads[row["workload"]]["path"])
+    except (OSError, ValueError) as error:
+        metadata["failures"].append(f"anchor manifest: {error}")
+        for row in rows:
+            row["failures"].append(f"unavailable pinned workload: {error}")
     try:
         metadata["uptime"] = subprocess.check_output(["uptime"], text=True).strip()
     except (OSError, subprocess.CalledProcessError) as error:
@@ -274,14 +305,6 @@ def main():
             for row in rows:
                 if row["engine"] == engine:
                     row["failures"].append(f"unavailable engine: {error}")
-    for workload in args.workloads:
-        try:
-            metadata["scripts"][workload] = {"path": WORKLOADS[workload], "sha256": digest(ROOT / WORKLOADS[workload])}
-        except OSError as error:
-            metadata["failures"].append(f"{workload}: {error}")
-            for row in rows:
-                if row["workload"] == workload:
-                    row["failures"].append(f"unavailable workload: {error}")
     if sys.platform != "darwin":
         metadata["failures"].append("macOS time -l counters require Darwin")
     if metadata["stress"] not in (None, "0") or metadata["gcVerify"] not in (None, "0"):
@@ -339,6 +362,8 @@ def main():
         for workload, source in metadata["scripts"].items():
             if digest(ROOT / source["path"]) != source["sha256"]:
                 metadata["failures"].append(f"{workload} source changed during measurement")
+        if digest(ROOT / ANCHOR_MANIFEST) != metadata["anchorManifest"]["sha256"]:
+            metadata["failures"].append("anchor manifest changed during measurement")
     except OSError as error:
         metadata["failures"].append(f"provenance recheck failed: {error}")
     if metadata["failures"]:

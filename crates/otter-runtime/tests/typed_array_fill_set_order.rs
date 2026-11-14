@@ -17,6 +17,7 @@
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
 mod copy_within;
+mod reverse;
 
 fn run(source: &str) -> String {
     let mut rt = Runtime::builder().build().expect("runtime");

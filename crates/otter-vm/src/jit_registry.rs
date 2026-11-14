@@ -60,6 +60,9 @@
 //!   and its stable cell selects the interpreter until retraining completes.
 //! - Invalidating a generation unlinks its entry cell before executable
 //!   retirement. The cell address remains valid and is never reused.
+//! - Source reclamation preserves generations independent of candidate source
+//!   and of source-owning heap graphs. Source bodies, actual splices and
+//!   speculative heap owners retire before the full-GC liveness census.
 //!
 //! # See also
 //! - [`crate::native_abi::CodeRegistryView`] — the published lookup surface.
@@ -73,6 +76,10 @@ use crate::native_abi::{
     SafepointId, SafepointRecord,
 };
 use std::sync::Arc;
+
+#[cfg(test)]
+#[path = "jit_registry/reclamation_tests.rs"]
+mod reclamation_tests;
 
 /// Admission failure at the canonical code-object installation boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -819,9 +826,8 @@ impl JitCodeRegistry {
         self.invalidate_code_objects(seeds)
     }
 
-    /// Unlink every installed generation. Chunk reclamation uses this
-    /// conservative boundary because an installed caller may have inlined a
-    /// function from the retiring chunk even when its own id lies elsewhere.
+    /// Unlink every installed generation.
+    #[cfg(test)]
     pub(crate) fn invalidate_all(&mut self) -> Vec<u32> {
         let seeds = self
             .codes
@@ -882,19 +888,43 @@ impl JitCodeRegistry {
         self.invalidate_code_objects(seeds)
     }
 
-    /// Empty every callee identity cell of a registered code object that
-    /// holds a value `release` names. Returns whether any was emptied.
-    pub(crate) fn release_callee_identities(
-        &self,
-        release: &mut dyn FnMut(crate::Value) -> bool,
-    ) -> bool {
-        let mut released = false;
-        for registered in self.codes.values() {
-            for root in &*registered.roots {
-                released |= root.release_callee_if(release);
-            }
+    /// Release speculative source owners before a chunk liveness census.
+    /// Ordinary generated callers use permanent function cells and survive if
+    /// their own source, splices and retained roots are independent. Roots with
+    /// arbitrary heap graphs remain conservative: a captured object or shape
+    /// prototype can reach a candidate closure without directly naming it.
+    pub(crate) fn invalidate_for_code_reclamation(
+        &mut self,
+        candidates: &[crate::code_space::ChunkEvictionCandidate],
+    ) -> Vec<u32> {
+        if candidates.is_empty() {
+            return Vec::new();
         }
-        released
+        let contains = |id| {
+            candidates
+                .iter()
+                .any(|candidate| (candidate.function_base..candidate.function_end()).contains(&id))
+        };
+        let seeds = self
+            .codes
+            .iter()
+            .filter_map(|(&id, registered)| {
+                (registered.state == CodeLifetimeState::Installed
+                    && (contains(registered.code.metadata().code_block_id)
+                        || registered
+                            .code
+                            .spliced_functions()
+                            .iter()
+                            .copied()
+                            .any(contains)
+                        || registered
+                            .roots
+                            .iter()
+                            .any(crate::jit_roots::CompilationRoot::may_retain_source)))
+                .then_some(id)
+            })
+            .collect::<Vec<_>>();
+        self.invalidate_code_objects(seeds)
     }
 
     /// Visit every hidden class a registered (not yet retired) code object

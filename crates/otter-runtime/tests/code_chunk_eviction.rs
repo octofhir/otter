@@ -4,7 +4,8 @@
 //!
 //! - Dead, live, and mixed eval-chunk liveness cases.
 //! - Exact payload-byte release and the separate aggregate source ledger.
-//! - Source context optimization roots release before the actual dead-code census.
+//! - Speculative source owners release before the actual dead-code census.
+//! - Active compiler leases postpone eviction until their terminal acknowledgement.
 //! - Bounded repeated-eval pressure and interpreter/JIT agreement.
 //!
 //! # Invariants
@@ -19,7 +20,10 @@
 //! - `otter_vm::code_space`
 //! - `otter_vm::code_liveness`
 
-use otter_runtime::{JitSelection, ResourceAccount, ResourceClass, Runtime, SourceInput};
+use otter_runtime::{
+    JitDebugRequest, JitSelection, ResourceAccount, ResourceClass, Runtime, SourceInput,
+};
+use otter_vm::native_abi::{CodeLifetimeState, NativeFrameKind};
 
 fn source_module_bytes(account: &ResourceAccount) -> u64 {
     account
@@ -33,6 +37,31 @@ fn generated_code_bytes(account: &ResourceAccount) -> u64 {
         .snapshot()
         .get(ResourceClass::GeneratedCodeBytes)
         .current()
+}
+
+fn reclaim_after_compiler_ack(runtime: &mut Runtime) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        runtime
+            .reclaim_dynamic_code()
+            .expect("reclaim dynamic source");
+        let residency = runtime.jit_code_residency();
+        // Once all reclaimable payload is gone, no pending job can block this
+        // reclamation result. The zero-pressure fast return need not consume
+        // further ACKs; waiting for queue-wide quiescence would not progress.
+        if residency.pending_compilations == 0 || runtime.code_eviction_stats().retained_bytes == 0
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "compiler cancellation did not acknowledge: {residency:?}; {:?}",
+            runtime.code_eviction_stats()
+        );
+        // A running compiler owns its immutable source until terminal ACK.
+        // Retry that boundary without adding source or retraining a function.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
 }
 
 #[test]
@@ -206,35 +235,116 @@ fn interpreter_and_jit_agree_after_hot_eval_code_is_evicted() {
     let mut completions = Vec::new();
     for selection in [
         JitSelection::InterpreterOnly,
+        JitSelection::Template,
         JitSelection::ProductionTiered,
     ] {
         let account = ResourceAccount::default();
         let mut runtime = Runtime::builder()
             .resource_account(account.clone())
             .jit_selection(selection)
+            .jit_debug(JitDebugRequest::artifacts())
             .build()
             .expect("runtime");
-        runtime.set_code_eviction_high_water_bytes(0);
-        runtime
-            .run_script(
-                SourceInput::from_javascript(
-                    "eval(`(function hot(n) {\
+        let mut hot_codes = std::collections::BTreeSet::new();
+        let mut hot_generation = None;
+        // The source stays semantically live while ordinary calls earn an exact
+        // current native entry. A fast loop alone can finish before its worker
+        // publishes code, especially in checked/release builds.
+        for batch in 0..=256 {
+            let pending = runtime.jit_code_residency().pending_compilations != 0;
+            let source = if batch == 0 {
+                "globalThis.__hotChunk = eval(`(function hot(n) {\
                        let sum = 0;\
                        for (let i = 0; i < n; i++) sum += i;\
                        return sum;\
-                     })(2000)`);",
-                ),
-                "<hot-dead-eval>",
+                     })`); __hotChunk(2000);"
+            } else if pending {
+                "0;"
+            } else {
+                "__hotChunk(2000);"
+            };
+            let result = runtime
+                .run_script(SourceInput::from_javascript(source), "<hot-eval-admission>")
+                .expect("run or acknowledge hot eval");
+            assert_eq!(
+                result.completion_string(),
+                if batch != 0 && pending {
+                    "0"
+                } else {
+                    "1999000"
+                }
+            );
+            let artifacts = result.jit_artifacts().unwrap();
+            assert!(!artifacts.truncated());
+            for bundle in artifacts.bundles() {
+                if bundle.manifest().function_name() == "hot" {
+                    hot_codes.insert(bundle.manifest().code_object_id());
+                }
+            }
+            if selection == JitSelection::InterpreterOnly {
+                break;
+            }
+            let tier = if selection == JitSelection::Template {
+                NativeFrameKind::Baseline
+            } else {
+                NativeFrameKind::Optimizing
+            };
+            hot_generation = runtime
+                .jit_code_generation_snapshot()
+                .into_iter()
+                .find(|code| {
+                    hot_codes.contains(&code.code_object_id)
+                        && code.lifecycle == CodeLifetimeState::Installed
+                        && code.linked
+                        && code.current_entry
+                        && code.call_entry_offset.is_some()
+                        && code.tier == tier
+                });
+            if hot_generation.is_some() && runtime.jit_code_residency().pending_compilations == 0 {
+                break;
+            }
+            assert!(
+                batch < 256,
+                "{selection:?}: exact hot native admission; {:?}",
+                runtime.jit_code_generation_snapshot()
+            );
+            std::thread::yield_now();
+        }
+        runtime
+            .run_script(
+                SourceInput::from_javascript("globalThis.__hotChunk = undefined;"),
+                "<drop-hot-eval>",
             )
-            .expect("run hot eval");
+            .expect("drop the semantic source owner");
+        assert_eq!(runtime.jit_code_residency().pending_compilations, 0);
         let generated_before = generated_code_bytes(&account);
         let source_before = source_module_bytes(&account);
+        let payload_before = runtime.code_eviction_stats().retained_bytes;
+        let evicted_before = runtime.code_eviction_stats().evicted_bytes;
 
-        runtime.reclaim_dynamic_code().expect("reclaim hot eval");
-        assert!(source_module_bytes(&account) < source_before);
-        if selection == JitSelection::ProductionTiered {
+        runtime.set_code_eviction_high_water_bytes(0);
+        reclaim_after_compiler_ack(&mut runtime);
+        assert_eq!(runtime.code_eviction_stats().retained_bytes, 0);
+        assert_eq!(
+            runtime.code_eviction_stats().evicted_bytes - evicted_before,
+            payload_before
+        );
+        assert!(
+            source_module_bytes(&account) < source_before,
+            "{selection:?}: {:?}; residency: {:?}",
+            runtime.code_eviction_stats(),
+            runtime.jit_code_residency()
+        );
+        if let Some(hot) = hot_generation {
             assert!(generated_before > 0, "hot eval must install generated code");
             assert!(generated_code_bytes(&account) < generated_before);
+            let retired = runtime
+                .jit_code_generation_snapshot()
+                .into_iter()
+                .find(|code| code.code_object_id == hot.code_object_id)
+                .unwrap();
+            assert_eq!(retired.lifecycle, CodeLifetimeState::Retired);
+            assert_eq!(retired.active_count, 0);
         }
         let result = runtime
             .run_script(
@@ -246,7 +356,7 @@ fn interpreter_and_jit_agree_after_hot_eval_code_is_evicted() {
             .expect("execute after eviction");
         completions.push(result.completion_string().to_string());
     }
-    assert_eq!(completions, ["42", "42"]);
+    assert_eq!(completions, ["42", "42", "42"]);
 }
 
 #[test]
@@ -292,10 +402,16 @@ fn captured_eval_contexts_do_not_keep_dead_source_chunks_alive() {
                 "<drop-context>",
             )
             .unwrap();
-        runtime.reclaim_dynamic_code().unwrap();
+        reclaim_after_compiler_ack(&mut runtime);
         // The eval's chunk and the body chunk `readEvalContext` compiled on
         // its first call.
-        assert_eq!(runtime.code_eviction_stats().evicted_chunks, 2);
+        assert_eq!(
+            runtime.code_eviction_stats().evicted_chunks,
+            2,
+            "{selection:?}: {:?}; residency: {:?}",
+            runtime.code_eviction_stats(),
+            runtime.jit_code_residency()
+        );
         assert_eq!(runtime.code_eviction_stats().retained_bytes, 0);
     }
 }
@@ -342,3 +458,11 @@ fn live_code_past_the_mark_is_not_censused_on_every_turn() {
         .expect("a turn after growth");
     assert_eq!(runtime.code_eviction_stats().evicted_chunks, 64);
 }
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[path = "code_chunk_eviction/native_retention.rs"]
+mod native_retention;
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[path = "code_chunk_eviction/compiled_constants.rs"]
+mod compiled_constants;

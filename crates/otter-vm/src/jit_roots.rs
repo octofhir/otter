@@ -25,6 +25,8 @@
 //!   or clear a dead entry before its offset can name another allocation.
 //! - A held identity is an embedded constant, not a writable cache: the same
 //!   carrier traces that value strongly for the generation's lifetime.
+//! - Source reclamation retires generations with roots that may transitively
+//!   own source ids before its census. It never empties an embedded constant.
 //! - The VM also empties an `instanceof` cache before a closure that ever
 //!   filled one changes its `prototype`, own properties or `[[Prototype]]`
 //!   (see `Interpreter::retire_instanceof_proofs_for`).
@@ -113,18 +115,6 @@ impl CalleeIdentityCell {
     /// The value a strong cell holds, as the collector last rewrote it.
     pub(crate) fn held(&self) -> crate::Value {
         crate::Value::from_bits(self.value.load(Ordering::Relaxed))
-    }
-
-    /// Empty the cell when it holds a value `release` names. A call through
-    /// an empty cell misses and takes the full proof, as for any other
-    /// callee.
-    fn release_if(&self, release: &mut dyn FnMut(crate::Value) -> bool) -> bool {
-        let bits = self.value.load(Ordering::Relaxed);
-        if bits == Self::EMPTY || !release(crate::Value::from_bits(bits)) {
-            return false;
-        }
-        self.value.store(Self::EMPTY, Ordering::Relaxed);
-        true
     }
 
     fn trace(&self, visitor: &mut otter_gc::raw::SlotVisitor<'_>) {
@@ -254,11 +244,18 @@ impl CompilationRoot {
         }
     }
 
-    /// Empty a callee identity cell holding a value `release` names.
-    pub(crate) fn release_callee_if(&self, release: &mut dyn FnMut(crate::Value) -> bool) -> bool {
+    /// Whether retaining this proof may keep JavaScript source alive, directly
+    /// or through an arbitrary heap graph. Reclamation cannot treat those
+    /// speculative owners as evidence of application liveness.
+    pub(crate) fn may_retain_source(&self) -> bool {
         match self {
-            Self::CalleeIdentity(cell) => cell.release_if(release),
-            Self::Shape(_) | Self::Family(_) | Self::Prototype(_) | Self::Instanceof(_) => false,
+            Self::Shape(_) | Self::Family(_) => true,
+            Self::CalleeIdentity(cell) if cell.strong => {
+                let value = cell.held();
+                value.is_function_id()
+                    || (value.is_cell() && !value.is_string() && !value.is_big_int())
+            }
+            Self::CalleeIdentity(_) | Self::Prototype(_) | Self::Instanceof(_) => false,
         }
     }
 
@@ -329,6 +326,63 @@ mod tests {
             )
             .expect("context"),
         )
+    }
+
+    #[test]
+    fn source_reclamation_distinguishes_strong_graphs_from_weak_and_primitive_roots() {
+        let held =
+            |value| CompilationRoot::CalleeIdentity(Arc::new(CalleeIdentityCell::holding(value)));
+        assert!(held(crate::Value::function(7)).may_retain_source());
+        assert!(!held(crate::Value::number_i32(7)).may_retain_source());
+
+        let mut vm = crate::Interpreter::new().expect("root-classification interpreter");
+        vm.with_handle_scope(|vm, scope| {
+            let string = vm
+                .scoped_string(scope, "immutable compiled string constant")
+                .unwrap();
+            let bigint = vm.scoped_bigint_i128(scope, i128::MAX).unwrap();
+            for value in [vm.escape_scoped(string), vm.escape_scoped(bigint)] {
+                assert!(value.is_cell(), "exercise allocated primitive values");
+                assert!(!held(value).may_retain_source());
+            }
+
+            let object = vm.scoped_object_bare(scope).unwrap();
+            assert!(held(vm.escape_scoped(object)).may_retain_source());
+            let value = context(&mut vm.gc_heap);
+            let context = vm.scoped_value(scope, value);
+            assert!(held(vm.escape_scoped(context)).may_retain_source());
+
+            let cache = Arc::new(CalleeIdentityCell::new());
+            cache
+                .value
+                .store(vm.escape_scoped(context).to_bits(), Ordering::Relaxed);
+            assert!(!CompilationRoot::CalleeIdentity(cache).may_retain_source());
+            let pair = Arc::new(InstanceofCell::new());
+            pair.target
+                .store(crate::Value::function(7).to_bits(), Ordering::Relaxed);
+            pair.prototype
+                .store(vm.escape_scoped(object).to_bits(), Ordering::Relaxed);
+            assert!(!CompilationRoot::Instanceof(pair).may_retain_source());
+
+            let (validity, _) = vm
+                .prove_chain(crate::Interpreter::object_prototype_object_opt)
+                .expect("ordinary prototype proof");
+            assert!(!CompilationRoot::Prototype(validity).may_retain_source());
+            let shape =
+                crate::object::shape(vm.escape_scoped(object).as_object().unwrap(), &vm.gc_heap);
+            assert!(!shape.is_null());
+            assert!(CompilationRoot::Shape(shape).may_retain_source());
+            let family = vm
+                .constructor_layout_for_receiver(
+                    7,
+                    crate::Value::function(7),
+                    vm.escape_scoped(object),
+                    |_, _| 0,
+                )
+                .unwrap();
+            assert!(!family.is_null());
+            assert!(CompilationRoot::Family(family).may_retain_source());
+        });
     }
 
     #[test]

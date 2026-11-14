@@ -15,11 +15,19 @@ A targeted pass does not establish a green workspace or market leadership.
 | P1 | **Resolve remaining broad-suite failures.** Runtime GC/JIT, snapshot, compile-fail and audit fixtures. Older baseline reports contain failures outside the repaired global-binding/known-native targets. | Reproduce current failures first; distinguish engine bugs, stale contracts and environment restrictions. Fix owners and fixtures together without weakening safety or native-execution proofs. |
 | P1 | **Diagnose flaky accounting observations.** `ipc` incoming-charge lifetime and compile-cache pruning. Both failed previously and also passed repeated standalone runs. | Controlled scheduling/lifetime reproductions, exact resource ownership assertions and repeated isolated/concurrent checks. Passing retries alone do not close the task. |
 
-Start broad-suite reclassification with `gc_atomics_wait_async_result`,
-`code_chunk_eviction`, `jit_actual_only_calls`, `jit_canonical_homes_gc`,
+Continue broad-suite reclassification with `code_chunk_eviction`,
+`jit_actual_only_calls`, `jit_canonical_homes_gc`,
 `jit_stack_owned_array_construct`, runtime `compile_fail`,
 `dependency_graph`, `step_trace_golden` and `tokio_spawn_audit`. These are leads
 from prior failures, not a claim that every named target currently fails.
+The current `jit_actual_only_calls` baseline has four failures in exact Known
+linkage admission assertions; retain those generation and suspended-source proofs
+while determining whether lowering or the fixtures own the mismatch. Raw current
+reclassification is under `benchmarks/results/atomic-wait-driver-2026-11-14/`;
+the pre-change runs are under `benchmarks/results/eval-code-liveness-2026-11-14/`.
+Code-eviction runs have both passed and failed their hot-source reclamation
+assertions; separate compiler-job leases and acknowledgement timing from leaked
+ownership. Passing retries do not close that investigation.
 The retained baseline identities are in
 `/private/tmp/otter-queue-baseline-audit/comparison.json`; raw gate failures are
 in `/private/tmp/otter-engine-full-difftest{,-failures}.json`.

@@ -1347,6 +1347,8 @@ impl Interpreter {
 
 #[cfg(test)]
 mod tests {
+    mod compile_reclamation;
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};

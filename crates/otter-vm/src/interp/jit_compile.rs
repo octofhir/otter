@@ -27,10 +27,12 @@
 //! Compile requests use the function's defining context, even when a later
 //! script triggered invalidation or reentry. Compiled code is published only
 //! after the registry accepts its metadata and exact isolate-epoch dependency
-//! snapshot. An optimizing snapshot owns its roots and defining source chunks
-//! until terminal compiler acknowledgement; cancelled, replaced-source or
-//! retraining results cannot be published. Caller compilation never
-//! recursively compiles its generated-call targets.
+//! snapshot. Both tiers retain their roots and defining source chunks until
+//! terminal compiler acknowledgement; cancelled, replaced-source or retraining
+//! results cannot be published. The shared acknowledgement owner re-arms
+//! deferred source reclamation after releasing those leases, without collecting
+//! inside acknowledgement. Caller compilation never recursively compiles its
+//! generated-call targets.
 //!
 //! # See also
 //! - `jit_bake` — what a compilation reads and how it names it.
@@ -475,6 +477,7 @@ impl Interpreter {
         self.retire_fired_jit_code();
         if self.jit_compile_queue.has_finished() {
             for (pending, finished) in self.jit_compile_queue.take_finished() {
+                let retry_code_reclamation = pending.retry_code_reclamation;
                 match pending.tier {
                     jit_debug::JitDebugTier::Template => {
                         let _ = self.finish_template_compile(pending, finished);
@@ -482,6 +485,12 @@ impl Interpreter {
                     _ => {
                         let _ = self.finish_optimized_compile(pending, finished);
                     }
+                }
+                if retry_code_reclamation {
+                    // Both tiers release their source leases before re-arming
+                    // the next top-level pressure check. ACK itself never
+                    // collects or recursively evicts source.
+                    self.code_eviction_trigger_bytes = self.code_eviction_high_water_bytes;
                 }
             }
         }
@@ -505,7 +514,6 @@ impl Interpreter {
             function,
             products,
             cancellation,
-            retry_code_reclamation,
             feedback_epoch,
             queued_ns,
             perf_name,
@@ -522,11 +530,6 @@ impl Interpreter {
         // No source leases and no cancellation: the bake yielded to a
         // collection (or declined) before it could finish.
         let yielded = sources.is_none() && !cancellation.is_cancelled();
-        if retry_code_reclamation {
-            // Release the leases below before the next top-level pressure
-            // check. ACK itself never collects or recursively evicts source.
-            self.code_eviction_trigger_bytes = self.code_eviction_high_water_bytes;
-        }
         let spliced = match &finished.status {
             Ok(jit::JitCompileStatus::Compiled { code, .. }) => code.spliced_functions(),
             _ => &[],

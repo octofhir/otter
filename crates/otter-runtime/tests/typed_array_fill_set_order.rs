@@ -4,6 +4,7 @@
 //! - `fill` snapshots length before value/start/end coercion.
 //! - A tracking view is revalidated when bound coercion shrinks past its offset.
 //! - `set` checks source length against the initial target length.
+//! - `copy_within` checks live bounds and controlled byte-copy completion.
 //!
 //! # Invariants
 //! - Resizable buffers may change during user coercion without changing
@@ -14,6 +15,8 @@
 //! - <https://tc39.es/ecma262/#sec-%typedarray%.prototype.set>
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
+
+mod copy_within;
 
 fn run(source: &str) -> String {
     let mut rt = Runtime::builder().build().expect("runtime");

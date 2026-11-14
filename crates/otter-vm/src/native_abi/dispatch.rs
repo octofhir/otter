@@ -64,7 +64,7 @@ pub enum ExitReason {
     DependencyChanged = 13,
     /// A pre-effect constructor receiver allocation probe missed.
     ReceiverAllocationMiss = 14,
-    /// A literal allocation site the generation tracked has decided its
+    /// A literal allocation site the generation tracked now requires old
     /// placement. The exit recompiles with the decision; it is not a failed
     /// speculation.
     AllocationSiteDecided = 15,

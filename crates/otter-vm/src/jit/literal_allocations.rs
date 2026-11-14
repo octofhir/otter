@@ -20,7 +20,9 @@
 //! and padding are never serialized across this boundary.
 //! A tracking site's young header carries its id and the code counts each
 //! birth in the site's address-stable record; a tenured site's header is old.
-//! Generated tracking code must leave once the record's decision is final.
+//! Generated tracking code must leave before allocating when the record decides
+//! to tenure. A final young decision accepts existing tracking code: its tags
+//! remain valid and GC resets, but no longer evaluates, its survival counters.
 //! A boilerplate slab is old, immutable and retained by the isolate's
 //! boilerplate cache for as long as its chunk is linked, so generated code may
 //! bake its compressed offset; its shell reports no writable capacity.

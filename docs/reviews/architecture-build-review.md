@@ -16,18 +16,24 @@ A targeted pass does not establish a green workspace or market leadership.
 | P1 | **Diagnose flaky accounting observations.** `ipc` incoming-charge lifetime and compile-cache pruning. Both failed previously and also passed repeated standalone runs. | Controlled scheduling/lifetime reproductions, exact resource ownership assertions and repeated isolated/concurrent checks. Passing retries alone do not close the task. |
 
 Continue broad-suite reclassification with `code_chunk_eviction`,
-`jit_actual_only_calls`, `jit_canonical_homes_gc`,
-`jit_stack_owned_array_construct`, runtime `compile_fail`,
+`jit_actual_only_calls`, `jit_stack_owned_array_construct`,
+`jit_empty_allocations`, runtime `compile_fail`,
 `dependency_graph`, `step_trace_golden` and `tokio_spawn_audit`. These are leads
 from prior failures, not a claim that every named target currently fails.
-The current `jit_actual_only_calls` baseline has four failures in exact Known
-linkage admission assertions; retain those generation and suspended-source proofs
-while determining whether lowering or the fixtures own the mismatch. Raw current
-reclassification is under `benchmarks/results/atomic-wait-driver-2026-11-14/`;
-the pre-change runs are under `benchmarks/results/eval-code-liveness-2026-11-14/`.
+Comparable baseline/candidate runs retain four exact Known-linkage failures,
+four stack-owned Array failures and five literal-artifact failures. Retain exact
+generation, activation, suspended-source and native-lowering proofs while
+determining whether lowering or fixtures own each mismatch. Raw reclassification,
+native artifacts and the bounded validation matrix are under
+`benchmarks/results/generated-call-ownership-2026-11-14/validation.json`.
+That matrix retains a 120-second checked interpreter timeout for
+`array_literal_boilerplate` at GC stride 1; its remaining cases are unobserved.
+Attribute verification and mutator costs before rerunning the full corpus.
 Code-eviction runs have both passed and failed their hot-source reclamation
 assertions; separate compiler-job leases and acknowledgement timing from leaked
-ownership. Passing retries do not close that investigation.
+ownership. Passing retries do not close that investigation; retained observations
+are under `benchmarks/results/atomic-wait-driver-2026-11-14/` and
+`benchmarks/results/eval-code-liveness-2026-11-14/`.
 The retained baseline identities are in
 `/private/tmp/otter-queue-baseline-audit/comparison.json`; raw gate failures are
 in `/private/tmp/otter-engine-full-difftest{,-failures}.json`.

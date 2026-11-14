@@ -10,7 +10,8 @@
 //! - Plans and realms come from the node's actual outer or inlined source;
 //!   each field's observation record comes from the node itself.
 //! - The allocation site's compiled placement selects buffer and header; a
-//!   tracking site leaves before effects once decided and counts each birth.
+//!   tracking site leaves before effects only when placement becomes old. Final
+//!   young decisions keep tagged births; GC ignores their final counters.
 //! - Fit initialization precedes publication and cannot collect.
 //! - Misses use the same canonical VM allocator and root contract as ARM.
 //!
@@ -24,7 +25,7 @@ use crate::x86_64::allocation::{
     emit_array_literal, emit_boilerplate_array, emit_empty_literal, emit_object_literal,
 };
 use otter_vm::jit::{
-    JIT_SITE_CREATED_OFFSET, JIT_SITE_DECIDED_BIT, JIT_SITE_DECISION_OFFSET, JitSiteMode,
+    JIT_SITE_CREATED_OFFSET, JIT_SITE_DECISION_OFFSET, JIT_SITE_TENURE, JitSiteMode,
 };
 
 impl Codegen<'_> {
@@ -182,12 +183,13 @@ impl Codegen<'_> {
             _ => unreachable!("literal allocation kind"),
         };
         if fits && site.mode == JitSiteMode::Track {
-            // A decided site leaves before any effect and recompiles.
+            // Only a change of placement needs reconstruction and recompilation.
+            // Final young records safely ignore further tagged survival feedback.
             let exit = self.eager_exit(node, DeoptReason::AllocationSiteDecided);
             self.load_immediate(10, site.record);
             dynasm!(self.ops ; .arch x64
-                ; test BYTE [r10 + JIT_SITE_DECISION_OFFSET as i32], JIT_SITE_DECIDED_BIT as i8
-                ; jnz =>exit);
+                ; cmp BYTE [r10 + JIT_SITE_DECISION_OFFSET as i32], JIT_SITE_TENURE as i8
+                ; je =>exit);
         }
         let stub = match kind {
             Kind::NewObjectLiteral { fields } => {

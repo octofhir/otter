@@ -204,10 +204,13 @@ the runtime integration-test dependency graph.
 service and exports Chrome Trace Event JSON after capture. It loads the unchanged
 classic init source once and invokes the same rooted JavaScript callable for
 warm and captured work, with an exact finite numeric checksum. Retention and
-release scripts require paired expected completions; the trace path must be fresh. Full service includes nested minor service and its
-trigger accounting; overflow, incomplete capture, split phases and collector
-failure remain explicit failures. Quantiles use nearest rank on individual
-records; missing classes have null values rather than zero pauses.
+release scripts require paired expected completions; the trace path must be fresh.
+Full service includes its own nested minor service and trigger accounting.
+MarkStart contains one preparatory minor collection and root shading; subsequent
+concurrent work and the later Full service are separate. Cycle reconciliation
+includes nested minors in both outer kinds. Overflow, incomplete capture, split
+phases and collector failure remain explicit failures. Quantiles use nearest rank
+on individual records; missing classes have null values rather than zero pauses.
 
 Baseline, retained and released snapshots follow separate successful forced
 full collections outside natural capture. RSS, reconciled live GC-cell bytes,

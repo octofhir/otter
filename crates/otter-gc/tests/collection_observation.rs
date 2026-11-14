@@ -80,7 +80,7 @@ fn natural_major_pressure_includes_nested_minor_and_accounting_in_one_event() {
     let mut heap = heap();
     heap.set_initial_old_generation_size(8 * 1024 * 1024);
     heap.start_gc_pause_capture(32).expect("capture");
-    let before = heap.gc_stats().gc_cycles;
+    let before = heap.gc_stats().clone();
     // Each dead tenured large cell consumes an actual old large page. This
     // crosses the configured initial old-generation limit; there is no manual
     // collection or stress tick.
@@ -94,25 +94,55 @@ fn natural_major_pressure_includes_nested_minor_and_accounting_in_one_event() {
         )
         .expect("dead large traffic");
     }
-    let after = heap.gc_stats().gc_cycles;
+    let after = heap.gc_stats().clone();
     let capture = heap.take_gc_pause_capture().expect("take");
-    assert!(after > before, "actual page pressure must run major GC");
+    assert!(
+        after.gc_cycles > before.gc_cycles,
+        "actual page pressure must run major GC"
+    );
     assert!(!capture.incomplete && !capture.contains_split_phases);
     assert_eq!(capture.dropped_records, 0);
-    // A concurrent cycle's start is its own event; each full one finishes a
-    // cycle.
-    let full: Vec<_> = capture
-        .records
-        .into_iter()
-        .filter(|event| event.kind != GcPauseKind::MarkStart)
-        .collect();
-    assert_eq!(full.len() as u64, after - before);
-    for event in full {
-        assert_eq!(event.kind, GcPauseKind::Full);
+    let mut full_cycles = before.gc_cycles;
+    let mut minor_cycles = before.minor_gc_cycles;
+    let mut mark_starts = 0;
+    let mut full_services = 0;
+    for (index, event) in capture.records.iter().enumerate() {
+        assert_eq!(event.sequence, index as u64 + 1);
         assert_eq!(event.trigger, GcPauseTrigger::GrowthBudget);
         assert_eq!(event.outcome, GcPauseOutcome::Completed);
-        assert_eq!(event.full_cycles_after, event.full_cycles_before + 1);
-        assert!(event.minor_cycles_after > event.minor_cycles_before);
+        assert_eq!(event.full_cycles_before, full_cycles);
+        assert_eq!(event.minor_cycles_before, minor_cycles);
+        match event.kind {
+            GcPauseKind::MarkStart => {
+                mark_starts += 1;
+                assert_eq!(event.full_cycles_after, full_cycles);
+                assert_eq!(event.minor_cycles_after, minor_cycles + 1);
+            }
+            GcPauseKind::Full => {
+                full_services += 1;
+                assert_eq!(event.full_cycles_after, full_cycles + 1);
+                assert!(event.minor_cycles_after > minor_cycles);
+            }
+            kind => panic!("unexpected old-allocation pressure service: {kind:?}"),
+        }
+        full_cycles = event.full_cycles_after;
+        minor_cycles = event.minor_cycles_after;
+    }
+    assert_eq!(full_services, after.gc_cycles - before.gc_cycles);
+    assert_eq!(full_cycles, after.gc_cycles);
+    assert_eq!(minor_cycles, after.minor_gc_cycles);
+    println!(
+        "natural-major markStarts={mark_starts} fullServices={full_services} minorCycles={}",
+        after.minor_gc_cycles - before.minor_gc_cycles,
+    );
+    // A single-worker host legitimately uses only synchronous Full service.
+    // On a multi-worker host, this natural-pressure fixture must also observe
+    // the initial root pause, including its preparatory nested minor.
+    if std::thread::available_parallelism().is_ok_and(|workers| workers.get() > 1) {
+        assert!(
+            mark_starts > 0,
+            "natural pressure must start a concurrent cycle"
+        );
     }
 }
 

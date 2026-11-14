@@ -10,8 +10,11 @@ records and is reserved before JavaScript runs. Disabled capture reads no
 observation clock. Collection never grows the record buffer or formats output.
 
 A service interval includes collector setup, root processing, collection,
-cleanup and the trigger's GC accounting tail. A full interval includes its
-nested minor collection. Trigger metadata comes from the entry owner:
+cleanup and the trigger's GC accounting tail. A Full interval includes its own
+nested minor collection. MarkStart contains one preparatory minor collection
+and root shading before concurrent marking begins. That background work and the
+later Full service are separate; a Full duration never includes the preceding
+MarkStart. Trigger metadata comes from the entry owner:
 explicit, stress, nursery capacity, heap cap, growth budget or code reclamation.
 The records also preserve full/minor cycle counters before and after service.
 Completed collection followed by an allocation refusal is distinct from a
@@ -80,8 +83,9 @@ every captured raw interval, exact nanoseconds and cycle metadata before a
 measured checksum, coverage or retention failure can terminate the probe.
 Sequence must be exact, intervals ordered/nonoverlapping, counters nonregressing
 and continuous. Summed completed full and all minor deltas, including nested
-minors in each outer full record, must match the runtime's exact before/after
-GC counters. Dropped/incomplete/split/failed service remains unscoreable.
+minors in both Full and MarkStart outer records, must match the runtime's exact
+before/after GC counters. Successful MarkStart advances the minor counter once
+and does not advance the full counter. Dropped/incomplete/split/failed service remains unscoreable.
 Unavailable or invalid tail summaries have null quantiles/max and explicit
 gaps. An absent class is never assigned a zero percentile or manufactured work.
 `status: passed` validates execution and capture coverage; availability of both

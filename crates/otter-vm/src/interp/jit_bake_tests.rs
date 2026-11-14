@@ -242,10 +242,9 @@ fn prewarm_publishes_one_shared_stable_cell_for_all_literal_sites() {
     // No production path inserts a cell before successful allocation. If
     // corrupt state nevertheless exposes a hole, preparation and baking
     // both decline instead of publishing that state to generated code.
-    **interpreter
+    interpreter
         .literal_cells_mut()
-        .get_mut(&context.constant_cache_key(0))
-        .expect("prepared cell") = Value::hole();
+        .clear_value_for_test(&context.constant_cache_key(0));
     assert!(interpreter.prewarm_literal_cells(&context, 0).is_none());
     let mut invalid = context
         .jit_compile_snapshot(0)

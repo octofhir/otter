@@ -12,9 +12,16 @@
 //! - Speculative checks run before effects and a miss remains reusable.
 //! - Literal relocations name traced cells, never moving string handles.
 
+#[cfg(target_arch = "aarch64")]
 use otter_runtime::{JitSelection, Runtime, SourceInput};
 
-const STRING_MATRIX: &str = r#"
+#[path = "optimizing_string_intrinsics/literal_frontier.rs"]
+mod literal_frontier;
+
+#[path = "optimizing_string_intrinsics/matrix_admission.rs"]
+mod matrix_admission;
+
+const STRING_WARMUP: &str = r#"
 function codeAt(text, index) {
   return text.charCodeAt(index | 0);
 }
@@ -33,6 +40,9 @@ for (let warm = 0; warm < 4010; warm++) {
   findLiteral("alpha");
 }
 
+"#;
+
+const STRING_MATRIX: &str = r#"
 const sequentialLatin1 = "abcdefghijklmnopqrstuvwxyz0123456789";
 const sequentialWide = "αβγδεζηθικλμνξοπρστυφχψω";
 function join(left, right) { return left + right; }
@@ -89,38 +99,14 @@ JSON.stringify([
 ]);
 "#;
 
-fn run(selection: JitSelection) -> (String, u64) {
-    let mut runtime = Runtime::builder()
-        .jit_compile_threads(0)
-        .jit_selection(selection)
-        .build()
-        .expect("string intrinsic runtime");
-    let completion = runtime
-        .run_script(
-            SourceInput::from_javascript(STRING_MATRIX),
-            "optimizing-string-intrinsics.js",
-        )
-        .expect("string intrinsic matrix")
-        .completion_string()
-        .to_owned();
-    (completion, runtime.execution_stats().jit_optimized_entries)
-}
-
 #[test]
 fn optimizing_string_intrinsics_match_oracle_and_preserve_fallbacks() {
-    let (oracle, _) = run(JitSelection::InterpreterOnly);
-    // Only the AArch64 optimizing tier enters these callers.
-    let (compiled, _optimized_entries) = run(JitSelection::ProductionTiered);
-
+    let oracle = matrix_admission::run_oracle(STRING_WARMUP, STRING_MATRIX);
+    let compiled = matrix_admission::run_native(STRING_WARMUP, STRING_MATRIX);
     assert_eq!(compiled, oracle);
     assert_eq!(
         oracle,
         r#"[[98,937,122,957,true,true,101,103,1,1,25,12,-1,2,25,3,23,300,-1,1],702,901,97,1,2]"#
-    );
-    #[cfg(target_arch = "aarch64")]
-    assert!(
-        _optimized_entries > 0,
-        "fixture must enter optimized string callers before replacement"
     );
 }
 

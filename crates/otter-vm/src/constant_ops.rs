@@ -41,7 +41,7 @@ impl Interpreter {
             if !value.is_big_int() {
                 return Err(VmError::InvalidOperand);
             }
-            return Ok(**value);
+            return Ok(*value);
         }
         let decimal = context
             .bigint_decimal_constant(idx)
@@ -50,8 +50,7 @@ impl Interpreter {
             .ok_or(VmError::InvalidOperand)?
             .map_err(crate::oom_to_vm)?;
         let value = Value::big_int(value);
-        let replaced = self.literal_cells_mut().insert(key, Box::new(value));
-        debug_assert!(replaced.is_none(), "literals canonicalize once");
+        self.literal_cells_mut().insert(key, value);
         Ok(value)
     }
 }

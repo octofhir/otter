@@ -185,8 +185,7 @@ impl Interpreter {
             .collect();
         self.template_objects
             .retain(|(function_base, _), _| !bases.contains(function_base));
-        self.literal_cells_mut()
-            .retain(|(identity, _), _| !identities.contains(identity));
+        self.literal_cells_mut().remove_sources(&identities);
         self.array_boilerplates_mut()
             .retain(|(identity, _), _| !identities.contains(identity));
         self.regexp_literals_mut()
@@ -1346,9 +1345,9 @@ mod tests {
                 .template_objects
                 .insert((context.function_base(), 0), Value::boolean(false));
             vm.literal_cells_mut()
-                .insert(context.constant_cache_key(0), Box::new(Value::undefined()));
+                .insert(context.constant_cache_key(0), Value::undefined());
             vm.literal_cells_mut()
-                .insert(context.constant_cache_key(1), Box::new(Value::undefined()));
+                .insert(context.constant_cache_key(1), Value::undefined());
             vm.ensure_method_feedback_context(context);
             for (site, address) in context.feedback_slot_addresses() {
                 assert!(address.is_method());

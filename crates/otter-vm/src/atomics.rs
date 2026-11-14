@@ -16,6 +16,7 @@
 //! - per-method native handlers using [`NativeCtx`] for spec-faithful
 //!   coercion of `index` and `value` arguments.
 //! - `call()` opcode entry for the verified AtomicsCall fast path.
+//! - Poll-driven wait settlement and live queue inspection for direct embeddings.
 //!
 //! # Invariants
 //! - `Uint8ClampedArray`, `Float32Array`, `Float64Array` are never
@@ -689,6 +690,13 @@ pub(crate) struct PendingAtomicWait {
 }
 
 impl crate::Interpreter {
+    /// Whether this isolate still owns poll-driven waitAsync waiters.
+    /// Reactions drained after a poll may have registered new waiters.
+    #[must_use]
+    pub fn has_pending_atomic_waits(&self) -> bool {
+        !self.pending_atomic_waits.is_empty()
+    }
+
     /// Settle this isolate's poll-driven waitAsync waiters: a slot the
     /// notify side claimed resolves "ok", an expired deadline resolves
     /// "timed-out". Returns `(settled, still_pending)`.

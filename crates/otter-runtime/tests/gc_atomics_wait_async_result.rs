@@ -3,6 +3,7 @@
 //! # Contents
 //! - Synchronous `not-equal` and zero-timeout result records.
 //! - Promise-valued finite-timeout and registered-waiter result records.
+//! - Explicit host polling before observing suspended script results.
 //!
 //! # Invariants
 //! - The result receiver, label, and optional Promise remain rooted across
@@ -11,8 +12,14 @@
 //!   ordinary writable, enumerable, configurable data descriptors.
 //! - Synchronous results expose a string while asynchronous results expose a
 //!   Promise that retains its exact label across moving collections.
+//! - Direct-runtime scripts do not synchronously wait for parked atomic promises.
+//! - Timeout and notification waiters use distinct words, independent of timing.
+//! - Warmup retains all 64 calls under stress; a bounded host slice may yield.
 
 use otter_runtime::{JitSelection, Runtime, SourceInput};
+use std::time::Duration;
+
+mod atomic_wait_driver;
 
 struct RunResult {
     completion: String,
@@ -28,18 +35,70 @@ fn run(selection: JitSelection, warm_source: &str, final_source: &str, name: &st
     let warm_name = format!("{name}-warm");
     runtime
         .run_script(
-            SourceInput::from_javascript(warm_source.to_string()).with_top_level_await(),
+            SourceInput::from_javascript(format!(
+                "{warm_source}\nglobalThis.__waitAsyncWarmDone=true;"
+            ))
+            .with_top_level_await(),
             &warm_name,
         )
         .expect("Atomics.waitAsync warmup");
+    let mut completed = 0;
+    for _ in 0..64 {
+        let done = runtime
+            .drive_pending_atomic_waits(Duration::from_secs(2))
+            .expect("drive warmup waiters");
+        let current: u32 = runtime
+            .eval(SourceInput::from_javascript(
+                "globalThis.__waitAsyncCompleted;",
+            ))
+            .unwrap()
+            .completion_string()
+            .parse()
+            .unwrap();
+        assert!(
+            current > completed,
+            "warmup made no progress after {completed} calls"
+        );
+        completed = current;
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        completed, 64,
+        "every warmup call must finish before measuring compilation"
+    );
+    assert_eq!(
+        runtime
+            .eval(SourceInput::from_javascript(
+                "globalThis.__waitAsyncWarmDone;"
+            ))
+            .unwrap()
+            .completion_string(),
+        "true"
+    );
     let warm_stats = runtime.execution_stats();
     let final_name = format!("{name}-final");
-    let completion = runtime
+    runtime
         .run_script(
             SourceInput::from_javascript(final_source.to_string()).with_top_level_await(),
             &final_name,
         )
-        .expect("Atomics.waitAsync final probe")
+        .expect("Atomics.waitAsync final probe");
+    runtime
+        .force_gc()
+        .expect("collect suspended result records");
+    assert!(
+        runtime
+            .drive_pending_atomic_waits(Duration::from_secs(2))
+            .expect("drive final waiters"),
+        "final result must settle"
+    );
+    let completion = runtime
+        .eval(SourceInput::from_javascript(
+            "globalThis.__waitAsyncCompletion;",
+        ))
+        .unwrap()
         .completion_string()
         .to_owned();
     RunResult {
@@ -79,13 +138,14 @@ fn assert_interpreter_and_template(
 fn wait_async_result_records_survive_each_allocation_and_shape_write() {
     assert_interpreter_and_template(
         r#"
-        const view = new Int32Array(new SharedArrayBuffer(4));
+        const view = new Int32Array(new SharedArrayBuffer(8));
         Atomics.store(view, 0, 17);
+        Atomics.store(view, 1, 17);
 
         globalThis.__waitAsyncResultProbe = function probe(seed, stress) {
             const notEqual = Atomics.waitAsync(view, 0, 18, Infinity);
             const zeroTimeout = Atomics.waitAsync(view, 0, 17, 0);
-            const finiteTimeout = Atomics.waitAsync(view, 0, 17, 1);
+            const finiteTimeout = Atomics.waitAsync(view, 1, 17, 1);
             const finitePromise = finiteTimeout.value;
             const registered = Atomics.waitAsync(view, 0, 17, Infinity);
             const registeredPromise = registered.value;
@@ -190,15 +250,17 @@ fn wait_async_result_records_survive_each_allocation_and_shape_write() {
             ];
         };
 
+        globalThis.__waitAsyncCompleted = 0;
         for (let i = 0; i < 64; i++) {
             const warm = __waitAsyncResultProbe(i, false);
             await Promise.all([warm[5], warm[6]]);
+            __waitAsyncCompleted = i + 1;
         }
         "#,
         r#"
         const result = __waitAsyncResultProbe(73, true);
         const labels = await Promise.all([result[5], result[6]]);
-        [
+        globalThis.__waitAsyncCompletion = [
             result[0],
             result[1],
             result[2],

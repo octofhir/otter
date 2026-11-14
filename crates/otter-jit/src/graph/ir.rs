@@ -799,6 +799,9 @@ pub(crate) enum Kind {
         pc: u32,
         plan: crate::call_linkage::CallPlan,
         construct: bool,
+        /// A strict tail call owned by this physical activation. Called frames
+        /// transfer their actual span; constructors still complete ordinarily.
+        tail: bool,
         /// Input1 is the receiver; otherwise the receiver is `undefined`.
         receiver: bool,
         /// The receiver is proved an Object: the callee is entered past a
@@ -1458,7 +1461,15 @@ impl Kind {
             Self::PrimitiveAdd => &[abi::STUB_STRING_CONCAT_ALLOC, abi::STUB_WRITE_BARRIER],
             Self::NumberToString => &[abi::STUB_NUMBER_TO_STRING_ALLOC],
             Self::BigIntBinary(_) => &[abi::STUB_BIGINT_BINARY_ALLOC],
-            Self::CallJs { .. } | Self::CallForward { .. } | Self::CallApplyArray { .. } => &[
+            Self::CallJs { tail: true, .. } => &[
+                abi::STUB_JIT_CALL,
+                abi::STUB_JIT_CALL_GENERIC,
+                abi::STUB_JIT_CALL_NATIVE,
+                abi::STUB_JIT_STAGE_TAIL_CALL,
+            ],
+            Self::CallJs { tail: false, .. }
+            | Self::CallForward { .. }
+            | Self::CallApplyArray { .. } => &[
                 abi::STUB_JIT_CALL,
                 abi::STUB_JIT_CALL_GENERIC,
                 abi::STUB_JIT_CALL_NATIVE,

@@ -369,6 +369,12 @@ impl Drop for OptimizingCompileQueue {
 }
 
 impl OptimizingCompileQueue {
+    /// Jobs whose roots and source leases have not been acknowledged by the
+    /// isolate, including worker results awaiting its next collection poll.
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
     /// Compile on up to `threads` compiler threads; zero compiles on the
     /// requesting thread. A pool already started keeps its threads.
     pub(crate) fn set_threads(&mut self, threads: usize) {
@@ -654,6 +660,7 @@ mod tests {
         drop(contexts);
         assert!(space.eviction_candidates().is_empty());
         queue.invalidate(&[queued_id]);
+        assert_eq!(queue.pending_count(), 2, "a queued ACK still owns its job");
         assert!(
             queue.is_pending(queued_id),
             "pending survives until terminal ACK consumption"
@@ -663,6 +670,11 @@ mod tests {
         assert!(queue.pending[&2].retry_code_reclamation);
         assert!(!queue.pending[&1].retry_code_reclamation);
         let finished = queue.take_finished();
+        assert_eq!(
+            queue.pending_count(),
+            1,
+            "the active compiler still owns its job"
+        );
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0].0.function_id, queued_id);
         assert!(!finished[0].1.entered_hook);

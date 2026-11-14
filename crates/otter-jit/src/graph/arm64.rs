@@ -106,6 +106,7 @@ mod keyed_store;
 mod native_leaf;
 mod nullish;
 mod own_fields;
+mod tail_call;
 pub(crate) mod truthy;
 
 const NUMBER_TAG: u64 = tag::NUMBER_TAG;
@@ -2526,7 +2527,11 @@ impl<'a> Codegen<'a> {
                 receiver,
                 receiver_object,
                 allocation,
+                tail,
             } => {
+                if *tail {
+                    self.emit_tail_call(node, *plan)?;
+                }
                 let (pc, plan, construct, receiver, receiver_object, allocation) = (
                     *pc,
                     *plan,

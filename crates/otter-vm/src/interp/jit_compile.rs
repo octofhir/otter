@@ -118,6 +118,7 @@ impl Interpreter {
             record(code);
         }
         jit::JitCodeResidency {
+            pending_compilations: self.jit_compile_queue.pending_count(),
             installed_optimized_bodies: self.jit_optimized_code.values().flatten().count() as u64,
             installed_entry_bodies: self
                 .jit_code

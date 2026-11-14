@@ -825,7 +825,7 @@ pub(crate) fn emit_exits(
 /// interpreter, which performs the replacement itself, and so does a
 /// pending interrupt, since an unbounded tail-call chain has no back-edge
 /// to poll at. A constructing record calls ordinarily and completes on the
-/// return that follows. Clobbers `rax` and `r11`.
+/// return that follows. Clobbers `r10` and `r11`.
 pub(crate) fn emit_tail_admission(
     ops: &mut Assembler,
     leave: DynamicLabel,
@@ -838,23 +838,23 @@ pub(crate) fn emit_tail_admission(
         ; je =>leave
         ; test r11b, 1
         ; jnz =>ordinary
-        ; mov rax, [r15 + THREAD_OFFSET as i32]
-        ; mov rax, [rax + VM_THREAD_INTERRUPT_CELL_OFFSET as i32]
-        ; cmp BYTE [rax], 0
+        ; mov r10, [r15 + THREAD_OFFSET as i32]
+        ; mov r10, [r10 + VM_THREAD_INTERRUPT_CELL_OFFSET as i32]
+        ; cmp BYTE [r10], 0
         ; jne =>leave
     );
 }
 
 /// Branch to `outgrown` unless a tail callee's span of `words` (an even
-/// count) fits this record's aligned actual span. Clobbers `rax`.
+/// count) fits this record's aligned actual span. Clobbers `r10`.
 pub(crate) fn emit_tail_span_check(ops: &mut Assembler, words: u32, outgrown: DynamicLabel) {
     if words == 0 {
         return;
     }
     dynasm!(ops
         ; .arch x64
-        ; mov eax, [r14 + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
-        ; cmp eax, (words - 1) as i32
+        ; mov r10d, [r14 + abi::NATIVE_FRAME_ARGUMENT_COUNT_OFFSET as i32]
+        ; cmp r10d, (words - 1) as i32
         ; jb =>outgrown
     );
 }

@@ -81,6 +81,7 @@ print output, access the filesystem, install packages, or depend on host APIs.
 | `boxed-double-property.js` | Repeated double-valued object property loads | `4000000` |
 | `dense-array.js` | Repeated dense indexed array loads | `5234688` |
 | `array-fill-numeric.js` | Borrowed Array fill over a fixed Uint8Array beyond the former span ceiling | `33554447` |
+| `typed-array-fill.js` | Native Uint8Array fill with alternating values and endpoint validation | `8388625` |
 | `numeric-leaf.js` | Repeated calls into a straight-line eight-operation Number leaf | `-700000` |
 | `math-intrinsics.js` | Guarded `Math.abs` / `max` / `min` methods with Int32 operands | `2200000` |
 | `math-explicit-calls.js` | Separate method lookup and Int32 argument evaluation through `CallWithThis` | `2200000` |

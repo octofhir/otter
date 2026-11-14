@@ -49,7 +49,6 @@
 //! - Pathological array-like lengths are guarded before any dense
 //!   materialisation.
 
-mod fill_numeric;
 mod flatten;
 mod join;
 mod mutate;

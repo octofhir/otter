@@ -38,14 +38,14 @@ fn numeric_bulk_admission_charges_stores_and_observes_cancellation() {
                     let cycles = interp.gc_heap().gc_cycle_counts();
                     assert!(
                         interp
-                            .try_fill_numeric_typed_array(raw, Value::number_i32(719), 1, 4)
+                            .try_fill_typed_array(raw, Value::number_i32(719), 1, 4)
                             .unwrap()
                     );
                     assert_eq!(interp.work_budget_stats().work_units_executed - before, 3);
                     assert_eq!(interp.gc_heap().gc_cycle_counts(), cycles);
                     interp.interrupt_handle().interrupt();
                     assert!(matches!(
-                        interp.try_fill_numeric_typed_array(raw, Value::number_i32(19), 1, 4),
+                        interp.try_fill_typed_array(raw, Value::number_i32(19), 1, 4),
                         Err(VmError::Interrupted)
                     ));
                     interp.interrupt_handle().reset();

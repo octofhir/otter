@@ -15,8 +15,9 @@
 //! downstream settlement.
 //! Linked bytecode chunks retain the scalar identity of their creation realm;
 //! no moving-GC handle is stored in function metadata.
-//! Source-context optimization roots of candidates are released before the
-//! collection, so they cannot turn a dead chunk into a live census result.
+//! Candidate source bodies, actual splices and generations with potentially
+//! source-owning heap roots retire before collection. Independent generations
+//! remain installed; weak observations cannot keep a dead chunk alive.
 //! Pending compiler jobs are cancelled before candidate selection. Their source
 //! leases survive until terminal acknowledgement, so an active worker can
 //! postpone reclamation but cannot read a detached chunk or publish orphan code.
@@ -109,33 +110,15 @@ impl Interpreter {
 
         self.code_eviction_stats.census_passes =
             self.code_eviction_stats.census_passes.saturating_add(1);
-        let mut released_contexts = false;
         let candidates = self.code_space.eviction_candidates();
-        for candidate in &candidates {
-            released_contexts |= self
-                .jit_code_registry
-                .closure_contexts
-                .release_range(candidate.function_base, candidate.function_end());
-        }
-        // A call site's cached callee is a cache, not an owner: a cell
-        // holding a function of a candidate chunk would keep that chunk.
-        let heap = &self.gc_heap;
-        self.jit_code_registry
-            .release_callee_identities(&mut |value| {
-                value.as_closure(heap).is_some_and(|closure| {
-                    let id = closure.function_id();
-                    candidates.iter().any(|candidate| {
-                        (candidate.function_base..candidate.function_end()).contains(&id)
-                    })
-                })
-            });
-        if released_contexts {
-            self.retire_jit_for_code_eviction();
-        }
+        self.retire_jit_for_code_eviction(&candidates);
         self.force_gc_with_trigger(otter_gc::GcPauseTrigger::CodeReclamation)?;
         let candidates = self.code_space.eviction_candidates();
+        // A worker may have acknowledged cancellation during collection,
+        // making another leased source eligible after the first pass. Retire
+        // the whole set once, rather than rescanning generations per chunk.
+        self.retire_jit_for_code_eviction(&candidates);
         let liveness = crate::code_liveness::census_candidate_ids(self, candidates.clone());
-        let mut retired_jit = released_contexts;
         let mut evicted = Vec::new();
         for candidate in candidates {
             if retained <= target_bytes {
@@ -145,10 +128,6 @@ impl Interpreter {
                 self.code_eviction_stats.live_id_skips =
                     self.code_eviction_stats.live_id_skips.saturating_add(1);
                 continue;
-            }
-            if !retired_jit {
-                self.retire_jit_for_code_eviction();
-                retired_jit = true;
             }
             if let crate::code_space::ChunkEvictionResult::Evicted { retained_bytes } =
                 self.code_space.evict_candidate(candidate)
@@ -174,20 +153,20 @@ impl Interpreter {
         Ok(())
     }
 
-    fn retire_jit_for_code_eviction(&mut self) {
-        self.jit_compile_queue.cancel_all();
-        let invalidated = self.jit_code_registry.invalidate_all().len() as u64;
+    fn retire_jit_for_code_eviction(
+        &mut self,
+        candidates: &[crate::code_space::ChunkEvictionCandidate],
+    ) {
+        let affected = self
+            .jit_code_registry
+            .invalidate_for_code_reclamation(candidates);
         self.jit_runtime_stats.caller_invalidations = self
             .jit_runtime_stats
             .caller_invalidations
-            .saturating_add(invalidated);
-        self.jit_code.clear();
-        self.jit_optimized_code.clear();
-        self.jit_code_cache = None;
-        self.jit_optimized_code_cache = None;
-        self.jit_template_osr_fids.clear();
-        self.jit_entry_osr_only.clear();
-        self.jit_template_compiling.clear();
+            .saturating_add(affected.len() as u64);
+        self.discard_invalidated_jit_state(&affected);
+        // Invalid roots remain strong until physical retirement. Drop map and
+        // cache owners first, while no native activation can borrow the code.
         self.retire_unreferenced_jit_code();
     }
 

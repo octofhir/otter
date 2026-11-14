@@ -11,7 +11,8 @@
 //!   own code, not by the record's placeholder.
 //! - A source progresses from unseen to one context to permanently unavailable.
 //! - A second context releases the first and fires every subscribed generation.
-//!   Code reclamation also releases candidate sources before its full census.
+//!   Reclamation retires source-owning generations before its full census;
+//!   unowned observations then expire through ordinary weak processing.
 //! - Native allocation accepts an identical context or a many cell; every
 //!   other birth misses before effects into the common VM construction owner.
 //! - Cells survive generated code, but their observed contexts are weak.
@@ -184,22 +185,6 @@ impl ClosureContexts {
             fact.subscribers
                 .retain(|candidate| !Arc::ptr_eq(candidate, flag));
         }
-    }
-
-    /// Drop optimization-owned roots before a candidate chunk's GC census.
-    pub(crate) fn release_range(&mut self, start: u32, end: u32) -> bool {
-        let mut released = false;
-        for (&function_id, fact) in &mut self.facts {
-            if function_id >= start
-                && function_id < end
-                && let Some(fact) = fact
-                && fact.single().is_some()
-            {
-                fact.invalidate();
-                released = true;
-            }
-        }
-        released
     }
 
     /// Keep a fact only while a non-speculative owner keeps its context alive.

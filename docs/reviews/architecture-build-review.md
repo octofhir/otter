@@ -15,18 +15,18 @@ A targeted pass does not establish a green workspace or market leadership.
 | P1 | **Resolve remaining broad-suite failures.** Runtime GC/JIT, snapshot, compile-fail and audit fixtures. Older baseline reports contain failures outside the repaired global-binding/known-native targets. | Reproduce current failures first; distinguish engine bugs, stale contracts and environment restrictions. Fix owners and fixtures together without weakening safety or native-execution proofs. |
 | P1 | **Diagnose flaky accounting observations.** `ipc` incoming-charge lifetime and compile-cache pruning. Both failed previously and also passed repeated standalone runs. | Controlled scheduling/lifetime reproductions, exact resource ownership assertions and repeated isolated/concurrent checks. Passing retries alone do not close the task. |
 
-Continue broad-suite reclassification with `code_chunk_eviction`,
-`jit_stack_owned_array_construct`,
-`jit_empty_allocations`, `jit_generic_call_transition`, runtime `compile_fail`,
+Continue broad-suite reclassification with `jit_empty_allocations`,
+`jit_generic_call_transition`, runtime `compile_fail`,
 `dependency_graph`, `step_trace_golden` and `tokio_spawn_audit`. These are leads
 from prior failures, not a claim that every named target currently fails.
-Four stack-owned Array failures, five literal-artifact failures and two generic-call
-counter assertions remain open. The two generic-call failures reproduce on the
+Five literal-artifact failures and two generic-call counter assertions remain
+open. The two generic-call failures reproduce on the
 same final fixtures with both parent and candidate codegen.
-One Array probe warms only a constant field before changing its feedback; classify
-that dependency exit separately from activation ownership. Retain exact generation,
-activation, suspended-source and native-lowering proofs when repairing fixtures.
-Current native-tail evidence and remaining failure observations are under
+Retain exact generation, activation, suspended-source and native-lowering proofs
+when repairing fixtures. Current stack-owned Array evidence and its baseline
+scope are under
+`benchmarks/results/autonomous-12h-2026-11-15/array-investigation/validation.json`.
+Native-tail evidence and remaining generic-call observations are under
 `benchmarks/results/generated-array-deopts-2026-11-14/validation.json`.
 The preceding allocation-generation validation matrix is under
 `benchmarks/results/generated-call-ownership-2026-11-14/validation.json`.
@@ -36,11 +36,20 @@ The exact-generation `jit_actual_only_calls` integration stress also retains a
 120-second stride-1 timeout in its proper-tail/throwing GC case; its phase is not
 attributed. Its unstressed checked run still performs explicit moving/full GC.
 Attribute verification and mutator costs before rerunning these matrices.
-Code-eviction runs have both passed and failed their hot-source reclamation
-assertions; separate compiler-job leases and acknowledgement timing from leaked
-ownership. Passing retries do not close that investigation; retained observations
-are under `benchmarks/results/atomic-wait-driver-2026-11-14/` and
-`benchmarks/results/eval-code-liveness-2026-11-14/`.
+Source reclamation still conservatively retires generations holding arbitrary
+strong heap graphs or shape/family roots. Any narrower retention policy must
+prove transitive source ownership before retaining those generations. Exact
+native-retention, compiled-constant lifetime and delayed compiler-ACK evidence is
+under `benchmarks/results/autonomous-12h-2026-11-15/eviction-validation.json`
+and `ack-retry-validation.json` in the same directory.
+The current targeted checked GC matrix retains two 120-second stride-1 timeouts
+in `context_eval_injection` (interpreter and Template); all 48 runs of each of
+`native_tail_transfer` and `forward_context_formals` passed. A separate profile
+of the context workload identifies exhaustive verification as its main cost,
+but does not establish the timed-out runs' complete attribution or a comparable
+before/after result. Evidence: `checked-native-gc/results.json` and
+`context-stress-diagnosis/diagnosis.md` in that directory. Keep the full corpus
+and unchanged closing gate open until their complete reports pass.
 The retained baseline identities are in
 `/private/tmp/otter-queue-baseline-audit/comparison.json`; raw gate failures are
 in `/private/tmp/otter-engine-full-difftest{,-failures}.json`.

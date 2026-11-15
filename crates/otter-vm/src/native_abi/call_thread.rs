@@ -4,16 +4,21 @@
 //! - [`JitCtx`] carries isolate services and the currently published frame.
 //! - [`JitEntry`] is the entry signature used by every execution tier.
 //! - Checked runtime-call binding and operation-scoped frame access.
+//! - Tagged slice copies and streamed numeric spread snapshots into the
+//!   activation-owned actual argument buffer.
 //!
 //! # Invariants
 //! The VM owns this machine-visible layout. Interpreter and generated entries
 //! receive the same context; JavaScript state lives in its published frame.
 //! Frame and service pointers remain valid throughout the entry extent. A
 //! runtime operation never retains a slot borrow across allocation or reentry.
+//! Spread staging borrows the heap and mutates the disjoint stack without
+//! collecting; its rooted actual window survives until trampoline consumption.
 //!
 //! # See also
 //! - [`super::Frame`] for activation state and caller links.
 //! - [`super::RuntimeCall`] for the typed semantic boundary.
+//! - `ArrayBody` for borrowed tagged prefixes and numeric value boxing.
 
 use super::{
     ActiveFrameMut, ActiveFrameRef, CallRequest, Frame, NativeResultPair, RuntimeCall, VmThread,
@@ -115,14 +120,31 @@ impl JitCtx {
             .checked_activation()
             .copied()
             .ok_or(VmError::InvalidOperand)?;
-        // SAFETY: the published activation retains its VM for this entry.
+        // SAFETY: the activation was published from distinct VM and stack
+        // borrows. Staging mutates only the stack's Rust-owned argument buffer;
+        // it cannot collect or reenter while the array payload is borrowed.
         let vm = unsafe { activation.vm.as_ref() }.ok_or(VmError::InvalidOperand)?;
         let array = array.as_array().ok_or(VmError::TypeMismatch)?;
-        let elements: smallvec::SmallVec<[Value; 8]> =
-            crate::array::with_elements(array, &vm.gc_heap, |values| {
-                values.iter().copied().collect()
-            });
-        self.stage_call_arguments(elements)
+        let stack = unsafe { activation.stack.as_mut() }.ok_or(VmError::InvalidOperand)?;
+        let (pointer, count) = vm
+            .gc_heap
+            .read_payload(array, |body| {
+                // Tagged storage exposes its complete live prefix once, so
+                // staging need not rediscover the slab and kind per argument.
+                if let Some(values) = body.tagged_dense_values() {
+                    return stack.stage_arguments(values.iter().copied());
+                }
+                // Numeric storage keeps its existing boxing and hole semantics
+                // without a temporary Vec or a borrow across collection.
+                stack.stage_arguments(
+                    (0..body.dense_len())
+                        .map(|index| body.dense_value(index).expect("live dense spread argument")),
+                )
+            })
+            .ok_or(VmError::InvalidOperand)?;
+        self.pending_call.arguments = pointer;
+        self.pending_call.argument_count = count;
+        Ok(())
     }
 
     /// Write a complete ordinary `[[Call]]` request with staged actuals.

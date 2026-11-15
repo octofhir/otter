@@ -768,3 +768,6 @@ fn rust_reentry_preserves_zero_and_explicit_suspended_caller_anchors() {
         assert!(error.is_none());
     }
 }
+
+#[path = "tests/spread_staging.rs"]
+mod spread_staging;

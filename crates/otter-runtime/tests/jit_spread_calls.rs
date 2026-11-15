@@ -264,3 +264,6 @@ fn deep_tail_recursion_preserves_stack_reuse_under_template() {
     assert_eq!(compiled, oracle);
     assert_eq!(compiled, "200000");
 }
+
+#[path = "jit_spread_calls/staging.rs"]
+mod staging;

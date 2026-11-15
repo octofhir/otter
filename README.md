@@ -1,10 +1,13 @@
+<p align="center"><img src=".github/banner.png" alt="octo/otter — A TypeScript runtime on its own bytecode VM" width="100%"></p>
+
+<p align="center"><b>Embeddable TypeScript/JavaScript runtime and CLI powered by a custom bytecode VM.</b></p>
+
 <p align="center">
-  <img src="./otter-logo.png" alt="Otter logo" width="200">
+  <a href="https://github.com/octofhir/otter/actions/workflows/ci.yml"><img src="https://github.com/octofhir/otter/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/otterjs"><img src="https://img.shields.io/crates/v/otterjs.svg" alt="crates.io"></a>
+  <a href="https://github.com/octofhir/otter/tree/main/docs/site/src/content/docs"><img src="https://img.shields.io/badge/docs-read-blue.svg" alt="Documentation"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
-
-# Otter
-
-Embeddable TypeScript/JavaScript runtime and CLI powered by a custom bytecode VM.
 
 ## Overview
 

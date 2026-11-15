@@ -12,6 +12,7 @@
 //!   completion used after guarded native element misses.
 //! - Cached eligibility for present own dense slots with source-realm prototypes.
 //! - Allocation-free ordinary tail appends with one length/kind publication.
+//! - Plain dense bulk appends into rooted, freshly reserved empty storage.
 //! - Borrowed tagged dense prefixes and representation-neutral numeric reads.
 //!
 //! # Invariants
@@ -46,12 +47,14 @@
 //! - <https://tc39.es/ecma262/#sec-array-exotic-objects>
 //! - [GC API](../../../docs/book/src/engine/gc-api.md)
 
+mod dense_append;
 mod dense_guard;
 mod dense_push;
 pub(crate) mod elements;
 mod expando;
 mod indexed_snapshot;
 
+pub(crate) use dense_append::append_plain_dense;
 pub(crate) use dense_guard::element_family as dense_element_family;
 pub(crate) use dense_guard::{DENSE_OWN_GUARD_EXOTIC, DENSE_OWN_GUARD_SHARED};
 pub(crate) use dense_push::try_push_spare;
@@ -2673,65 +2676,6 @@ pub(crate) fn copy_plain_dense(
         }
         true
     })
-}
-
-/// Append `src`'s elements to `dst` when `src` is a plain dense array (no
-/// sidecar, no holes, nothing past its dense prefix): one reservation and no
-/// intermediate list. `Ok(false)` leaves both untouched.
-pub(crate) fn append_plain_dense(
-    mut dst: JsArray,
-    mut src: JsArray,
-    heap: &mut otter_gc::GcHeap,
-    external_visit: &mut RootSlotVisitor<'_>,
-) -> Result<bool, otter_gc::OutOfMemory> {
-    let Some((count, kind)) = heap.read_payload(src, |body| {
-        let count = body.dense_len();
-        let plain = body.exotic.is_null()
-            && body.length() == count
-            && (0..count).all(|index| body.dense_value(index).is_some_and(|v| !v.is_hole()));
-        plain.then(|| (count, body.dense_kind()))
-    }) else {
-        return Ok(false);
-    };
-    let start = len(dst, heap);
-    let target_len = start.saturating_add(count);
-    {
-        let src_slot = std::ptr::addr_of_mut!(src);
-        let mut reserve_roots = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            external_visit(visitor);
-            visitor(src_slot.cast::<RawGc>());
-        };
-        reserve_dense_capacity(&mut dst, heap, target_len, kind, &mut reserve_roots)?;
-    }
-    const CHUNK: usize = 32;
-    let mut copied = 0;
-    while copied < count {
-        let n = (count - copied).min(CHUNK);
-        let mut chunk = [Value::undefined(); CHUNK];
-        heap.read_payload(src, |body| {
-            for (offset, slot) in chunk[..n].iter_mut().enumerate() {
-                *slot = body.dense_value(copied + offset).expect("plain dense slot");
-            }
-        });
-        heap.with_payload(dst, |body| {
-            body.refresh_element_cache();
-            while body.dense_len() < start {
-                body.push_dense(Value::hole());
-            }
-            for value in &chunk[..n] {
-                body.push_dense(*value);
-            }
-        });
-        for value in &chunk[..n] {
-            record_array_write(heap, dst, value);
-        }
-        copied += n;
-    }
-    heap.with_payload(dst, |body| {
-        body.set_length(target_len);
-        body.mark_dirty();
-    });
-    Ok(true)
 }
 
 /// Write a caller-proven plain dense range with per-element values.

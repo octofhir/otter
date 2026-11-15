@@ -58,6 +58,14 @@ The retained baseline identities are in
 `/private/tmp/otter-queue-baseline-audit/comparison.json`; raw gate failures are
 in `/private/tmp/otter-engine-full-difftest{,-failures}.json`.
 
+The checked `jit_known_native_calls::mixed_get` OOM fixture fails under external
+GC verification/stride16 at `mixed_get.rs:366` (argument evacuation proof), on
+both HEAD24a6bb9c3 production owners and the NativeCallInfo root-cell candidate.
+Default checked execution passes. Preserve the assertion and investigate marker
+age and collection timing; this is not a closed stress gate. Exact captures:
+`copy-context-provenance/prehook-validation/native-call-info-execution/` under
+`benchmarks/results/autonomous-12h-2026-11-15/`.
+
 The current TypedArray `copyWithin` subset retains 10-second timeouts in
 `coerced-values-end-detached-prototype.js`, `coerced-values-end-detached.js`
 and `coerced-values-start-detached.js`. Exact-path repeated baseline and

@@ -411,16 +411,8 @@ impl PromiseBuilder {
         value_roots: &mut [&mut Value],
         slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
-        let this_value = *ctx.this_value();
-        let new_target = ctx.new_target().cloned();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            crate::runtime_cx::visit_native_value_roots(
-                visitor,
-                &this_value,
-                new_target.as_ref(),
-                value_roots,
-                slice_roots,
-            );
+            crate::runtime_cx::visit_native_value_roots(visitor, value_roots, slice_roots);
         };
         JsPromiseHandle::pending_with_roots(ctx.heap_mut(), &mut external_visit)
     }
@@ -812,16 +804,8 @@ where
         ) -> Result<Value, NativeError>
         + 'static,
 {
-    let this_value = *ctx.this_value();
-    let new_target = ctx.new_target().cloned();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        crate::runtime_cx::visit_native_value_roots(
-            visitor,
-            &this_value,
-            new_target.as_ref(),
-            value_roots,
-            slice_roots,
-        );
+        crate::runtime_cx::visit_native_value_roots(visitor, value_roots, slice_roots);
     };
     let value = local_native_value_with_length(
         ctx.heap_mut(),

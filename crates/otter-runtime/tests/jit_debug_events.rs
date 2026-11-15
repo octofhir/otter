@@ -203,10 +203,12 @@ fn template_osr_emits_ordered_compile_events() {
 
 #[test]
 fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
+    let artifact_directory =
+        std::env::var_os("OTTER_STATIC_NATIVE_ARTIFACTS").map(std::path::PathBuf::from);
     let mut runtime = Runtime::builder()
         .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
-        .jit_debug(JitDebugRequest::events())
+        .jit_debug(JitDebugRequest::artifacts().with_events(true))
         .build()
         .expect("production-tiered runtime with events");
     let result = runtime
@@ -229,6 +231,36 @@ fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
     let report = result
         .jit_debug_report()
         .expect("enabled run owns a report");
+
+    if let Some(directory) = artifact_directory {
+        std::fs::create_dir(&directory).expect("fresh static-native diagnostic directory");
+        std::fs::write(
+            directory.join("events.json"),
+            serde_json::to_vec_pretty(report).expect("owned event report"),
+        )
+        .expect("write event report");
+        std::fs::write(directory.join("completion.txt"), result.completion_string())
+            .expect("write completion");
+        std::fs::write(
+            directory.join("current-generations.txt"),
+            format!("{:#?}", runtime.jit_code_generation_snapshot()),
+        )
+        .expect("write generation snapshot");
+        let artifacts = result.jit_artifacts().expect("requested compile artifacts");
+        for bundle in artifacts.bundles() {
+            let code = directory.join(format!("code-{}", bundle.manifest().code_object_id()));
+            std::fs::create_dir(&code).expect("fresh code bundle directory");
+            std::fs::write(
+                code.join("manifest.json"),
+                serde_json::to_vec_pretty(bundle.manifest()).expect("owned bundle manifest"),
+            )
+            .expect("write bundle manifest");
+            for file in bundle.files() {
+                std::fs::write(code.join(file.name().as_str()), file.contents())
+                    .expect("write owned compile artifact");
+            }
+        }
+    }
 
     assert_eq!(result.completion_string(), "5000");
     let optimizing_compiles = report
@@ -270,18 +302,120 @@ fn extracted_int32_math_call_publishes_one_stable_optimizing_body() {
         "guarded Int32 Math lowering must avoid the warmup leaf bail: {:?}",
         report.events()
     );
-    assert!(
-        report.events().iter().any(|event| matches!(
-            event,
-            JitDebugEvent::StaticNativeCallLowered {
+    assert!(!report.truncated());
+    let (function_id, code_object_id) = report
+        .events()
+        .iter()
+        .find_map(|event| match event {
+            JitDebugEvent::CompileFinished {
+                function_id,
+                tier: JitDebugTier::Optimizing,
+                outcome: JitDebugCompileOutcome::Compiled { code_object_id, .. },
+                ..
+            } => Some((*function_id, *code_object_id)),
+            _ => None,
+        })
+        .expect("the sole optimizing generation");
+    let call_pc = report
+        .events()
+        .iter()
+        .find_map(|event| match event {
+            JitDebugEvent::StaticNativeCallPlan {
+                caller_function_id,
+                instruction_pc,
                 tier: JitDebugTier::Optimizing,
                 target: "math_abs_leaf",
-                outcome: otter_vm::JitStaticNativeCallLoweringOutcome::Generated,
-                ..
-            }
-        )),
-        "the stable body must report generated guarded static-native lowering: {:?}",
-        report.events()
+            } if *caller_function_id == function_id => Some(*instruction_pc),
+            _ => None,
+        })
+        .expect("the extracted Math.abs call plan");
+    assert!(
+        runtime
+            .jit_code_generation_snapshot()
+            .iter()
+            .any(|generation| {
+                generation.function_id == function_id
+                    && generation.code_object_id == code_object_id
+                    && generation.current_entry
+                    && generation.linked
+            })
+    );
+    let artifacts = result
+        .jit_artifacts()
+        .expect("emitted optimizing artifacts");
+    assert!(!artifacts.truncated());
+    let bundle = artifacts
+        .bundles()
+        .iter()
+        .find(|bundle| bundle.manifest().code_object_id() == code_object_id)
+        .expect("the exact compiled generation's artifact");
+    assert_eq!(bundle.manifest().function_id(), function_id);
+    assert_eq!(bundle.manifest().tier(), JitDebugTier::Optimizing);
+    let code_map: serde_json::Value = serde_json::from_slice(
+        bundle
+            .file(otter_runtime::JitArtifactFileName::CodeMap)
+            .expect("emitted code map")
+            .contents(),
+    )
+    .expect("valid code map");
+    let call_regions: Vec<_> = code_map["regions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|region| {
+            region["kind"] == "instruction"
+                && region["functionId"] == function_id
+                && region["logicalPc"] == call_pc
+        })
+        .collect();
+    // The optimizing tier reduces Math.abs to arithmetic after its identity
+    // guard. A leaf-call event would claim a helper that this body does not emit.
+    assert_eq!(call_regions.len(), 2, "{call_regions:?}");
+    let guard = call_regions
+        .iter()
+        .find(|region| {
+            region["operation"]
+                .as_str()
+                .unwrap()
+                .contains(" CheckNative(")
+        })
+        .expect("emitted exact native identity guard");
+    let math = call_regions
+        .iter()
+        .find(|region| {
+            region["operation"]
+                .as_str()
+                .unwrap()
+                .ends_with(" Float64Math(Abs)")
+        })
+        .expect("emitted absolute-value arithmetic without Generic or NativeLeaf");
+    assert_eq!(guard["block"], math["block"]);
+    assert_eq!(guard["bytePc"], math["bytePc"]);
+    for region in [guard, math] {
+        assert!(region["startOffset"].as_u64().unwrap() < region["endOffset"].as_u64().unwrap());
+        assert!(region["endOffset"].as_u64().unwrap() <= bundle.manifest().code_bytes());
+    }
+    assert!(guard["endOffset"].as_u64().unwrap() <= math["startOffset"].as_u64().unwrap());
+    let relocations: serde_json::Value = serde_json::from_slice(
+        bundle
+            .file(otter_runtime::JitArtifactFileName::Relocations)
+            .expect("actual code relocations")
+            .contents(),
+    )
+    .expect("valid relocations");
+    assert!(
+        relocations["relocations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|relocation| {
+                relocation["target"]["name"] != "math_abs_leaf"
+                    && (relocation["target"]["kind"] != "runtimeStub"
+                        || relocation["endOffset"].as_u64().unwrap()
+                            <= guard["startOffset"].as_u64().unwrap()
+                        || relocation["startOffset"].as_u64().unwrap()
+                            >= math["endOffset"].as_u64().unwrap())
+            })
     );
 }
 

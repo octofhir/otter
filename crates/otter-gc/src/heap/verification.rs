@@ -7,6 +7,7 @@
 //! # Invariants
 //! - Verification never bypasses the incoming-owner garbage filter.
 //! - A remembered miss stops before movement in every build profile.
+//! - Both complete body walks run; incoming owners are resolved once per body.
 //!
 //! # See also
 //! - [`super::minor`].
@@ -127,7 +128,7 @@ impl GcHeap {
                             covered.insert(slot as usize);
                         }
                         if (*slot).0 != 0 {
-                            holder.insert((*slot).0, h as usize);
+                            holder.insert((*slot).0, (h as usize - cage_base() as usize) as u32);
                         }
                     });
                 });
@@ -141,21 +142,27 @@ impl GcHeap {
                     if !live(h) {
                         return;
                     }
+                    let offset = (h as usize - cage_base() as usize) as u32;
+                    // The incoming-owner index is immutable throughout this
+                    // walk. Resolve it once per body, including bodies whose
+                    // slots are covered by another trace. Still trace every
+                    // body: out-of-line storage coverage remains exhaustive.
+                    let owner = holder.get(offset);
                     trace_table.trace(h, &mut |slot| {
                         let raw = (*slot).0;
+                        // An unreferenced cell is garbage the next full
+                        // collection reclaims. Filter it before probing slot
+                        // coverage or dereferencing a possibly stale child.
+                        let Some(owner) = owner else {
+                            return;
+                        };
                         if raw == 0 || covered.contains(&(slot as usize)) {
                             return;
                         }
                         let child = cage_base().add(raw as usize) as *const GcHeader;
-                        let offset = (h as usize - cage_base() as usize) as u32;
-                        // An unreferenced cell is garbage the next full
-                        // collection reclaims; no trace reads it.
-                        let Some(&owner) = holder.get(&offset) else {
-                            return;
-                        };
                         if (*child).is_young() && reported < 16 {
                             reported += 1;
-                            let owner = owner as *const GcHeader;
+                            let owner = cage_base().add(owner as usize) as *const GcHeader;
                             eprintln!(
                                 "OTTER_GC_VERIFY: old cell {offset:#x} (tag {:#x}, {} bytes) holds \
                                  young cell {raw:#x} (tag {:#x}) at byte {} that no traced cell \

@@ -5,6 +5,7 @@
 //! - Recording the barrier repairs the edge before actual nursery movement.
 //! - Unreferenced garbage is filtered before its stale child is dereferenced.
 //! - Remembered and young owners cover slots in another old storage cell.
+//! - Unreferenced bodies still receive both complete verification traces.
 //!
 //! # Invariants
 //! - Faults are injected without a safepoint, into test-owned old bodies.
@@ -165,4 +166,46 @@ fn remembered_or_young_owners_cover_shared_old_storage_slots() {
         heap.verify_remembered_complete();
         heap.read_payload(storage, |pair| assert_eq!(pair.first, child.raw()));
     }
+}
+
+struct CountedReference {
+    child: RawGc,
+    traces: usize,
+}
+
+impl Traceable for CountedReference {
+    const TYPE_TAG: u8 = 0xee;
+
+    unsafe fn trace_slots(this: *mut Self, visitor: &mut crate::raw::SlotVisitor<'_>) {
+        // SAFETY: the verifier owns this initialized test body during its pause.
+        unsafe {
+            (*this).traces += 1;
+            visitor(&raw mut (*this).child);
+        }
+    }
+}
+
+#[test]
+fn unreferenced_bodies_still_receive_both_complete_verification_walks() {
+    let mut heap = heap();
+    let garbage = heap
+        .alloc_old(CountedReference {
+            child: RawGc(0),
+            traces: 0,
+        })
+        .unwrap();
+    // SAFETY: test-owned old body, no collection or shared payload borrow.
+    // A missing incoming owner must filter this stale child without skipping
+    // either body trace. No code may dereference the injected offset.
+    unsafe {
+        let body = garbage
+            .as_header_ptr()
+            .cast::<u8>()
+            .add(std::mem::size_of::<GcHeader>())
+            .cast::<CountedReference>();
+        (*body).traces = 0;
+        (*body).child = RawGc((crate::compressed::cage_size() - crate::page::PAGE_SIZE) as u32);
+    }
+    heap.verify_remembered_complete();
+    heap.read_payload(garbage, |body| assert_eq!(body.traces, 2));
 }

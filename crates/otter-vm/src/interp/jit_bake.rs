@@ -42,6 +42,9 @@ use inline_snapshot_budget::InlineSnapshotBudget;
 #[path = "jit_field_types.rs"]
 mod field_types;
 
+#[path = "jit_context_provenance.rs"]
+mod context_provenance;
+
 #[path = "jit_inline_methods.rs"]
 mod inline_methods;
 
@@ -2710,7 +2713,7 @@ impl Baker<'_> {
     /// The slots of `context`'s chain that `code` reads, each now
     /// watched, with the value it holds. A slot qualifies within the
     /// watchable range, never written since an earlier watch, at a
-    /// coordinate the body itself never writes, and holding neither the
+    /// captured coordinate disjoint from explicit context stores, and holding neither the
     /// hole nor `undefined` — a binding still awaiting its initialization,
     /// like one the body assigns, would only fire its watch.
     fn bake_closure_constants(
@@ -2718,47 +2721,11 @@ impl Baker<'_> {
         context: Value,
         code: &crate::executable::CodeBlock,
     ) -> Vec<jit::JitContextConstant> {
-        use otter_bytecode::Op;
         let Some(base) = context.as_context() else {
             return Vec::new();
         };
-        let mut seen: rustc_hash::FxHashSet<(u16, u16)> = code
-            .code
-            .iter()
-            .filter_map(|instruction| {
-                let position = match code.op(instruction) {
-                    Op::StoreContextSlot
-                    | Op::StoreContextSlotChecked
-                    | Op::BindThisContextSlot => 2,
-                    Op::StoreLookupSlot => 3,
-                    _ => return None,
-                };
-                let Some(otter_bytecode::Operand::Imm32(word)) =
-                    code.operand(instruction, position)
-                else {
-                    return None;
-                };
-                otter_bytecode::ContextCoord::from_imm32(word)
-                    .map(|coord| (coord.depth, coord.slot))
-            })
-            .collect();
         let mut constants = Vec::new();
-        for instruction in code.code.iter() {
-            if !matches!(
-                code.op(instruction),
-                Op::LoadContextSlot | Op::LoadContextSlotChecked
-            ) {
-                continue;
-            }
-            let Some(otter_bytecode::Operand::Imm32(word)) = code.operand(instruction, 2) else {
-                continue;
-            };
-            let Some(coord) = otter_bytecode::ContextCoord::from_imm32(word) else {
-                continue;
-            };
-            if !seen.insert((coord.depth, coord.slot)) {
-                continue;
-            }
+        for coord in context_provenance::unwritten_captured_slots(code) {
             let Some(context) = crate::context::walk(&self.env.heap, base, coord.depth) else {
                 continue;
             };

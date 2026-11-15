@@ -51,6 +51,9 @@ mod return_sites;
 #[path = "jit_actual_only_calls/tail_deopt.rs"]
 mod tail_deopt;
 
+#[path = "jit_actual_only_calls/context_provenance.rs"]
+mod context_provenance;
+
 const DEFINITIONS: &str = r#"
 function actualEcho(a, b, c) {
   if (a === -1 && arguments === a) throw "distinct arguments identity";
@@ -271,6 +274,14 @@ impl Fixture {
     }
 
     fn new_in_realm(selection: JitSelection, extra_realm: bool) -> Self {
+        let mut fixture = Self::unwarmed_in_realm(selection, extra_realm);
+        fixture.setup(&format!(
+            "{DEFINITIONS}\nfor(let warm=0;warm<1500;warm++){{{CALLS}}}"
+        ));
+        fixture
+    }
+
+    fn unwarmed_in_realm(selection: JitSelection, extra_realm: bool) -> Self {
         let trace = Arc::new(Mutex::new(Trace::default()));
         let collect = Arc::new(AtomicBool::new(false));
         let collections = Arc::new(AtomicUsize::new(0));
@@ -351,7 +362,7 @@ impl Fixture {
             .unwrap();
         runtime.set_tracer(Some(Box::new(Tracer(trace.clone()))));
         let realm = extra_realm.then(|| runtime.create_realm().unwrap());
-        let mut fixture = Self {
+        Self {
             runtime,
             selection,
             setup_sequence: 0,
@@ -361,11 +372,7 @@ impl Fixture {
             collect,
             collections,
             observations,
-        };
-        fixture.setup(&format!(
-            "{DEFINITIONS}\nfor(let warm=0;warm<1500;warm++){{{CALLS}}}"
-        ));
-        fixture
+        }
     }
 
     fn setup(&mut self, source: &str) {
@@ -384,6 +391,7 @@ impl Fixture {
             self.artifacts
                 .insert(bundle.manifest().code_object_id(), bundle.clone());
         }
+        context_provenance::record_setup(self, &result, &module);
     }
 
     fn run(&mut self, source: &str, module: &str) -> otter_runtime::ExecutionResult {

@@ -10,6 +10,7 @@
 //! - [`ElementSlabBody`] — fixed header followed by element words and,
 //!   for numeric slabs, a hole bitmap.
 //! - Root-aware allocation and raw-handle accessors used by `array`.
+//! - Address-only rebasing after slot visits, including foreign image restore.
 //! - [`alloc_shared_slab`] and [`copy_private_no_collect`] — copy-on-write
 //!   boilerplate storage and its non-collecting copy-out.
 //!
@@ -769,6 +770,20 @@ pub(crate) unsafe fn record_generated_write(
             .cast::<otter_gc::GcHeader>();
         heap.record_write_at(header, child);
     }
+}
+
+/// Rebase an array cache after its slab slot has been visited. Verification
+/// can visit an unreferenced old body whose child is stale, so this must form
+/// neither a payload reference nor a metadata read. Recompute even when the
+/// compressed offset is unchanged: a foreign image can have another cage base.
+#[must_use]
+pub(super) fn traced_data_base(slab: ElementSlabHandle) -> *mut u8 {
+    if slab.is_null() {
+        return std::ptr::null_mut();
+    }
+    slab.as_header_ptr().cast::<u8>().wrapping_add(
+        std::mem::size_of::<otter_gc::GcHeader>() + std::mem::size_of::<ElementSlabBody>(),
+    )
 }
 
 #[must_use]

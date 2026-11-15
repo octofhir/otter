@@ -408,8 +408,9 @@ impl Interpreter {
                 return Ok(OpStep::Leave(DispatchOutcome::Fatal(error)));
             }
         }
-        // Feedback comes from the staged request. `f.call(...)` stages `%Function.prototype.call%` with `f`
-        // as its receiver; the site records the function it runs.
+        // Resolved intrinsic shortcuts record their target before forwarding
+        // to the receiver. This late observation covers requests that still
+        // retain `%Function.prototype.call%` and its callable receiver.
         let function_call_target = jit_installed
             .then(|| {
                 stack

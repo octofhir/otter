@@ -36,6 +36,12 @@ The exact-generation `jit_actual_only_calls` integration stress also retains a
 120-second stride-1 timeout in its proper-tail/throwing GC case; its phase is not
 attributed. Its unstressed checked run still performs explicit moving/full GC.
 Attribute verification and mutator costs before rerunning these matrices.
+Background compile preparation can repeatedly cancel before entering the hook
+under moving-GC stress; the x86 captured-context leaf exhausted its ordinary
+admission budget. Distinguish read-right yield, shared-table contention and
+terminal cancellation before choosing bounded retry ownership. Preserve the
+existing timeout and exact native proof. See the
+[pre-hook cancellation evidence](../../benchmarks/results/autonomous-12h-2026-11-15/copy-context-provenance/closing/x86-leaf-prehook-investigation.json).
 Source reclamation still conservatively retires generations holding arbitrary
 strong heap graphs or shape/family roots. Any narrower retention policy must
 prove transitive source ownership before retaining those generations. Exact

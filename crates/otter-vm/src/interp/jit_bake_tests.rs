@@ -5,6 +5,9 @@ use otter_bytecode::{BytecodeModule, Constant, Function, Instruction, Op, Operan
 
 use crate::{ActivationStack, Interpreter, Value};
 
+#[path = "jit_bake_tests/context_provenance.rs"]
+mod context_provenance;
+
 #[test]
 fn method_feedback_declines_a_wide_dictionary_holder_without_losing_its_data() {
     let mut module = crate::test_support::minimal_bytecode_module("wide-method-holder.js");

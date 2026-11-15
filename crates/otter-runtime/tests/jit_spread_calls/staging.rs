@@ -565,3 +565,6 @@ fn wide_spread_actuals_survive_native_collection_and_throw_once() {
         phase("assertions-done");
     }
 }
+
+#[path = "staging/reserve.rs"]
+mod reserve;

@@ -14,7 +14,8 @@
 //!   byte zero. A RegExp match
 //!   result (`index`, `input`, `groups`) keeps native element access.
 //! - Mutable sidecar exposure invalidates the byte before a write; completed
-//!   mutations and traced relocation recompute it from the current sidecar.
+//!   mutations and restored indexed metadata recompute it from the sidecar.
+//!   Relocation preserves indexed semantics and the published guard byte.
 //! - Holey numeric access still requires no sidecar, because its hole result
 //!   may use the realm prototype protector to answer `undefined`.
 //!

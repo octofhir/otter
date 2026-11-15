@@ -27,6 +27,9 @@
 //!   stay traced through backing-store allocation.
 //! - Element growth allocates a rooted replacement slab, copies the live
 //!   prefix semantically, then republishes its base, length, and kind.
+//! - Tracing refreshes the absolute element base after visiting handles.
+//!   Mutators own scalar capacity, representation and own-slot guards;
+//!   relocation preserves those semantic facts.
 //! - Bulk fill proves a writable live length when extending it; writes within
 //!   the existing length remain admissible with a read-only length descriptor.
 //! - Only indexed mutation invalidates captured JSON element bytes; named bags
@@ -53,6 +56,9 @@ mod dense_push;
 pub(crate) mod elements;
 mod expando;
 mod indexed_snapshot;
+
+#[cfg(test)]
+mod tracing_tests;
 
 pub(crate) use dense_append::append_plain_dense;
 pub(crate) use dense_guard::element_family as dense_element_family;
@@ -151,10 +157,10 @@ impl otter_gc::SafeTraceable for ArrayBody {
     const MAP_WORD: otter_gc::cell_map::MapWord =
         otter_gc::cell_map::MapWord::of_type(ARRAY_BODY_TYPE_TAG);
 
-    /// Visit the slab, sidecar and expando handles separately, then republish
-    /// the element base. The refresh must follow the visits: a restore relocates
-    /// the slab handle here, and the cached absolute pointer has to be
-    /// recomputed from the relocated value.
+    /// Visit the slab, sidecar and expando handles, then republish the absolute
+    /// element base. Movement preserves capacity, kind and indexed semantics;
+    /// their scalar caches are already current and belong to mutation owners.
+    /// Restore rebuilds the own-slot guard after indexed host metadata returns.
     fn trace_slots_safe(&mut self, visitor: &mut SlotVisitor<'_>) {
         if !self.slab.is_null() {
             let p = &mut self.slab as *mut elements::ElementSlabHandle as *mut otter_gc::raw::RawGc;
@@ -167,7 +173,7 @@ impl otter_gc::SafeTraceable for ArrayBody {
         if !self.expando.is_null() {
             visitor(std::ptr::from_mut(&mut self.expando).cast());
         }
-        self.refresh_element_cache();
+        self.elements_ptr.set(elements::traced_data_base(self.slab));
     }
 
     const CONCURRENT_MARKING: bool = true;

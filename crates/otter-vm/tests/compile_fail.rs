@@ -72,3 +72,10 @@ fn compile_fail_snapshot_carrier_boundary() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/compile_fail/isolate_snapshot_raw_field_rejected.rs");
 }
+
+#[test]
+fn compile_fail_native_metadata_borrows() {
+    let t = trybuild::TestCases::new();
+    t.compile_fail("tests/compile_fail/native_receiver_borrow_rejected.rs");
+    t.compile_fail("tests/compile_fail/native_new_target_borrow_rejected.rs");
+}

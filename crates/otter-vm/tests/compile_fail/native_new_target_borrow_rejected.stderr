@@ -1,0 +1,9 @@
+error[E0502]: cannot borrow `*ctx` as mutable because it is also borrowed as immutable
+ --> tests/compile_fail/native_new_target_borrow_rejected.rs:6:13
+  |
+5 |     let value = ctx.new_target().unwrap();
+  |                 --- immutable borrow occurs here
+6 |     let _ = ctx.alloc_object();
+  |             ^^^^^^^^^^^^^^^^^^ mutable borrow occurs here
+7 |     println!("{value:?}");
+  |                ----- immutable borrow later used here

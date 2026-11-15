@@ -488,3 +488,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod interpreted_tests;

@@ -9,6 +9,7 @@
 //! - `CallMethodValue` typed execution-operand decoding.
 //! - Callback-driven Array and TypedArray prototype methods.
 //! - Canonical callable property and accessor lookup before method invocation.
+//! - Resolved intrinsic target feedback before forwarding to a callable receiver.
 //!
 //! # Invariants
 //! - Stack-modifying callback paths run before the dense in-frame match.
@@ -19,6 +20,8 @@
 //! - Generator resumption keeps the completed-body disposition through
 //!   direct method dispatch; local decode/preparation errors still throw.
 //! - Ordinary method lookup still funnels into `Interpreter::invoke`.
+//! - Resolved function intrinsics publish their call target before forwarding
+//!   to the receiver; callee effects and collection cannot precede observation.
 //! - Native and bound callable receivers use ordinary `[[Get]]`; accessors
 //!   receive the original receiver, and their returned callable is used once.
 //! - Composite root scopes forward pre-collection observation flushing before
@@ -1145,6 +1148,7 @@ impl Interpreter {
                     let (recv_value, arg_values) =
                         read_method_call_values(stack, top_idx, operands, argc)
                             .map_err(CommittedValueError::Fatal)?;
+                    self.record_method_native_call(operands, method, recv_value);
                     return self.dispatch_function_method(
                         stack,
                         context,
@@ -1320,6 +1324,7 @@ impl Interpreter {
                 let (recv_value, arg_values) =
                     read_method_call_values(stack, top_idx, operands, argc)
                         .map_err(CommittedValueError::Fatal)?;
+                self.record_method_native_call(operands, method, recv_value);
                 return self.dispatch_function_method(
                     stack,
                     context,

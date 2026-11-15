@@ -20,6 +20,9 @@
 //!   (§27.2.1.5).
 //!
 //! # Invariants
+//! - Out-of-turn rooted allocations retain the interpreter's lazy provider,
+//!   so pending compiler roots published while a pause waits are discovered
+//!   after heap readers leave rather than in an earlier slot snapshot.
 //! - Native `resolve` / `reject` closures retain the promise and their
 //!   shared AlreadyResolved cell in collector-traced captures. They read
 //!   the current promise after every collecting allocation and settle
@@ -325,9 +328,9 @@ impl PromiseBuilder {
         value_roots: &mut [&mut Value],
         slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
-        let roots = interp.collect_runtime_roots();
+        let _runtime_roots_guard = interp.scope_runtime_roots_guard();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
+            visit_pending_roots(visitor, &[], value_roots, slice_roots);
         };
         JsPromiseHandle::pending_with_roots(interp.gc_heap_mut(), &mut external_visit)
     }
@@ -339,9 +342,9 @@ impl PromiseBuilder {
         value_roots: &mut [&mut Value],
         slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
-        let roots = interp.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = interp.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
+            visit_pending_roots(visitor, &roots, value_roots, slice_roots);
         };
         JsPromiseHandle::pending_with_roots(interp.gc_heap_mut(), &mut external_visit)
     }
@@ -354,9 +357,9 @@ impl PromiseBuilder {
         value_roots: &mut [&mut Value],
         slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
-        let roots = interp.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = interp.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
+            visit_pending_roots(visitor, &roots, value_roots, slice_roots);
         };
         JsPromiseHandle::fulfilled_with_roots(interp.gc_heap_mut(), value, &mut external_visit)
     }
@@ -369,9 +372,9 @@ impl PromiseBuilder {
         value_roots: &mut [&mut Value],
         slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
-        let roots = interp.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = interp.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
+            visit_pending_roots(visitor, &roots, value_roots, slice_roots);
         };
         let promise = JsPromiseHandle::rejected_with_roots(
             interp.gc_heap_mut(),
@@ -389,9 +392,9 @@ impl PromiseBuilder {
         value_roots: &mut [&mut Value],
         slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
-        let roots = interp.collect_runtime_roots();
+        let _runtime_roots_guard = interp.scope_runtime_roots_guard();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
+            visit_pending_roots(visitor, &[], value_roots, slice_roots);
         };
         let promise = JsPromiseHandle::rejected_with_roots(
             interp.gc_heap_mut(),
@@ -408,13 +411,11 @@ impl PromiseBuilder {
         value_roots: &mut [&mut Value],
         slice_roots: &mut [&mut [Value]],
     ) -> Result<JsPromiseHandle, otter_gc::OutOfMemory> {
-        let roots = ctx.collect_native_roots();
         let this_value = *ctx.this_value();
         let new_target = ctx.new_target().cloned();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-            crate::runtime_cx::visit_native_roots(
+            crate::runtime_cx::visit_native_value_roots(
                 visitor,
-                &roots,
                 &this_value,
                 new_target.as_ref(),
                 value_roots,
@@ -708,13 +709,15 @@ pub fn pending_runtime_rooted(
     PromiseBuilder::new().pending_runtime_rooted(interp, value_roots, slice_roots)
 }
 
-fn visit_runtime_roots(
+// Runtime roots remain in the lexical provider; this list holds only stable
+// slots from a caller's unregistered stack, followed by its pending values.
+fn visit_pending_roots(
     visitor: &mut dyn FnMut(*mut RawGc),
-    roots: &[*mut RawGc],
+    frame_roots: &[*mut RawGc],
     value_roots: &mut [&mut Value],
     slice_roots: &mut [&mut [Value]],
 ) {
-    for &slot in roots {
+    for &slot in frame_roots {
         visitor(slot);
     }
     for value in value_roots.iter_mut() {
@@ -744,9 +747,9 @@ where
         ) -> Result<Value, NativeError>
         + 'static,
 {
-    let roots = interp.collect_runtime_roots();
+    let _runtime_roots_guard = interp.scope_runtime_roots_guard();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
+        visit_pending_roots(visitor, &[], value_roots, slice_roots);
     };
     let value = local_native_value_with_length(
         interp.gc_heap_mut(),
@@ -777,9 +780,9 @@ where
         ) -> Result<Value, NativeError>
         + 'static,
 {
-    let roots = interp.collect_allocation_roots(stack);
+    let (_allocation_roots_guard, roots) = interp.collect_allocation_roots(stack);
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &roots, value_roots, slice_roots);
+        visit_pending_roots(visitor, &roots, value_roots, slice_roots);
     };
     let value = local_native_value_with_length(
         interp.gc_heap_mut(),
@@ -809,13 +812,11 @@ where
         ) -> Result<Value, NativeError>
         + 'static,
 {
-    let roots = ctx.collect_native_roots();
     let this_value = *ctx.this_value();
     let new_target = ctx.new_target().cloned();
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        crate::runtime_cx::visit_native_roots(
+        crate::runtime_cx::visit_native_value_roots(
             visitor,
-            &roots,
             &this_value,
             new_target.as_ref(),
             value_roots,
@@ -1189,10 +1190,10 @@ fn make_then_finally(
     let exec_for_call = exec.cloned();
     let mut constructor_root = constructor;
     let mut on_finally_root = on_finally;
-    let runtime_roots = interp.collect_runtime_roots();
+    let _runtime_roots_guard = interp.scope_runtime_roots_guard();
     let value_roots: &mut [&mut Value] = &mut [&mut constructor_root, &mut on_finally_root];
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &runtime_roots, value_roots, &mut []);
+        visit_pending_roots(visitor, &[], value_roots, &mut []);
     };
     let value = local_native_value_with_length(
         interp.gc_heap_mut(),
@@ -1241,10 +1242,10 @@ fn make_catch_finally(
     let exec_for_call = exec.cloned();
     let mut constructor_root = constructor;
     let mut on_finally_root = on_finally;
-    let runtime_roots = interp.collect_runtime_roots();
+    let _runtime_roots_guard = interp.scope_runtime_roots_guard();
     let value_roots: &mut [&mut Value] = &mut [&mut constructor_root, &mut on_finally_root];
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &runtime_roots, value_roots, &mut []);
+        visit_pending_roots(visitor, &[], value_roots, &mut []);
     };
     let value = local_native_value_with_length(
         interp.gc_heap_mut(),
@@ -1287,10 +1288,10 @@ fn make_value_thunk(ctx: &mut NativeCtx<'_>, value: Value) -> Result<Value, Nati
     let captures: SmallVec<[Value; 4]> = smallvec![value];
     let mut value_root = value;
     let (interp, _) = ctx.interp_mut_and_context();
-    let runtime_roots = interp.collect_runtime_roots();
+    let _runtime_roots_guard = interp.scope_runtime_roots_guard();
     let value_roots: &mut [&mut Value] = &mut [&mut value_root];
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &runtime_roots, value_roots, &mut []);
+        visit_pending_roots(visitor, &[], value_roots, &mut []);
     };
     let value = local_native_value_with_length(
         interp.gc_heap_mut(),
@@ -1307,10 +1308,10 @@ fn make_thrower(ctx: &mut NativeCtx<'_>, reason: Value) -> Result<Value, NativeE
     let captures: SmallVec<[Value; 4]> = smallvec![reason];
     let mut reason_root = reason;
     let (interp, _) = ctx.interp_mut_and_context();
-    let runtime_roots = interp.collect_runtime_roots();
+    let _runtime_roots_guard = interp.scope_runtime_roots_guard();
     let value_roots: &mut [&mut Value] = &mut [&mut reason_root];
     let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
-        visit_runtime_roots(visitor, &runtime_roots, value_roots, &mut []);
+        visit_pending_roots(visitor, &[], value_roots, &mut []);
     };
     let value = local_native_value_with_length(
         interp.gc_heap_mut(),

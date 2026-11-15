@@ -12,6 +12,8 @@
 //! remain published until the trampoline returns. Host frames keep their
 //! caller's depth and are skipped: they are physical, not logical, activations. Iteration never changes
 //! linkage. Queued input and cold records stay rooted before native entry.
+//! Staged arguments expose interior-mutable slots to the collector; staging
+//! itself never enters the VM or collects while it borrows the span.
 //!
 //! # See also
 //! - [`crate::native_abi::call_trampoline`] for stack storage and dispatch.
@@ -23,6 +25,7 @@ use crate::{
     runtime_cx::RuntimeTurn,
 };
 use otter_gc::raw::RawGc;
+use std::cell::UnsafeCell;
 
 /// First frame at or below `frame` that is a JavaScript activation. Host
 /// frames carry their caller's depth and are not logical activations.
@@ -45,7 +48,9 @@ pub struct ActivationStack {
     request: Option<crate::native_abi::CallRequest>,
     /// Actual arguments of `request`, copied by the trampoline before any
     /// allocation. Cleared by the next execution turn.
-    staged: smallvec::SmallVec<[crate::Value; 8]>,
+    /// A shared root walk may rewrite these words between noncollecting
+    /// staging operations, including when the values live inline.
+    staged: UnsafeCell<smallvec::SmallVec<[crate::Value; 8]>>,
     runtime_root_owner: Option<usize>,
 }
 
@@ -105,7 +110,7 @@ impl ActivationStack {
             context: std::ptr::null_mut(),
             pending: None,
             request: None,
-            staged: smallvec::SmallVec::new(),
+            staged: UnsafeCell::new(smallvec::SmallVec::new()),
             runtime_root_owner: None,
         }
     }
@@ -152,7 +157,8 @@ impl ActivationStack {
 
     /// Queue an ordinary `[[Call]]` (or `[[Construct]]` when `new_target` is
     /// present) for the trampoline to classify. Nothing about the callee is
-    /// inspected here.
+    /// inspected here. `arguments` yields already materialized values without
+    /// entering the VM or collecting while staging borrows the span.
     pub(crate) fn stage_call(
         &mut self,
         callee: crate::Value,
@@ -165,14 +171,16 @@ impl ActivationStack {
             !self.has_pending_call(),
             "one pending call per execution boundary"
         );
-        self.staged.clear();
-        self.staged.extend(arguments);
+        let staged = self.staged.get_mut();
+        staged.clear();
+        staged.extend(arguments);
         self.stage_request(callee, receiver, new_target, return_register);
     }
 
     /// [`Self::stage_call`] whose actual arguments `fill` writes straight
     /// into the staged span, with no intermediate buffer. A failed fill
-    /// stages nothing.
+    /// stages nothing. `fill` only copies already materialized values: it
+    /// must not enter the VM or collect while it borrows the staged span.
     pub(crate) fn stage_call_with<E>(
         &mut self,
         callee: crate::Value,
@@ -185,8 +193,9 @@ impl ActivationStack {
             !self.has_pending_call(),
             "one pending call per execution boundary"
         );
-        self.staged.clear();
-        fill(&mut self.staged)?;
+        let staged = self.staged.get_mut();
+        staged.clear();
+        fill(staged)?;
         self.stage_request(callee, receiver, new_target, return_register);
         Ok(())
     }
@@ -214,6 +223,7 @@ impl ActivationStack {
 
     /// Stage only the actual span of a request a generated caller writes
     /// itself. Returns the span; it stays valid until the next staging.
+    /// `arguments` must not enter the VM or collect while yielding values.
     pub(crate) fn stage_arguments(
         &mut self,
         arguments: impl IntoIterator<Item = crate::Value>,
@@ -222,9 +232,10 @@ impl ActivationStack {
             self.request.is_none(),
             "one pending call per execution boundary"
         );
-        self.staged.clear();
-        self.staged.extend(arguments);
-        Some((self.staged.as_ptr(), u32::try_from(self.staged.len()).ok()?))
+        let staged = self.staged.get_mut();
+        staged.clear();
+        staged.extend(arguments);
+        Some((staged.as_ptr(), u32::try_from(staged.len()).ok()?))
     }
 
     /// The staged classify request, if any.
@@ -236,8 +247,9 @@ impl ActivationStack {
     /// the next staging or [`Self::clear_staged`].
     pub(crate) fn take_request(&mut self) -> Option<crate::native_abi::CallRequest> {
         let mut request = self.request.take()?;
-        request.arguments = self.staged.as_ptr();
-        request.argument_count = u32::try_from(self.staged.len()).ok()?;
+        let staged = self.staged.get_mut();
+        request.arguments = staged.as_ptr();
+        request.argument_count = u32::try_from(staged.len()).ok()?;
         Some(request)
     }
 
@@ -248,12 +260,13 @@ impl ActivationStack {
         let Some(request) = self.request.as_ref() else {
             return false;
         };
-        let Ok(argument_count) = u32::try_from(self.staged.len()) else {
+        let staged = self.staged.get_mut();
+        let Ok(argument_count) = u32::try_from(staged.len()) else {
             return false;
         };
         *slot = *request;
         self.request = None;
-        slot.arguments = self.staged.as_ptr();
+        slot.arguments = staged.as_ptr();
         slot.argument_count = argument_count;
         true
     }
@@ -261,8 +274,9 @@ impl ActivationStack {
     /// Drop a consumed request span so it retains no values.
     #[inline]
     pub(crate) fn clear_staged(&mut self) {
-        if self.request.is_none() && !self.staged.is_empty() {
-            self.staged.clear();
+        let staged = self.staged.get_mut();
+        if self.request.is_none() && !staged.is_empty() {
+            staged.clear();
         }
     }
     pub(crate) fn pending_packet(&self) -> Option<crate::native_abi::CallRequest> {
@@ -457,8 +471,13 @@ impl ActivationStack {
                 );
             }
         }
-        for value in &self.staged {
-            value.trace_value_slots(visitor);
+        // SAFETY: the isolate has one mutator, and collector root walks run
+        // with staging stopped. Staging borrows are noncollecting and cannot
+        // overlap this walk; the span stays stationary until staging resumes.
+        // UnsafeCell permits rewrites through this shared activation owner.
+        let staged = unsafe { &mut *self.staged.get() };
+        for value in staged.iter_mut() {
+            value.trace_value_slot_mut(visitor);
         }
         cold.trace_all(visitor);
     }

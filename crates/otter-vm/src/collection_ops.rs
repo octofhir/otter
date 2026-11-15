@@ -49,7 +49,7 @@ impl Interpreter {
         seed: &Value,
         stack: &ActivationStack,
     ) -> Result<Value, VmError> {
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let seed_entries = if seed_is_present(seed) {
             seed_array(seed, &self.gc_heap)?
         } else {

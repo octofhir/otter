@@ -344,11 +344,12 @@ pub use jit_artifact::{
 };
 pub use jit_cancellation::JitCompileCancellation;
 pub use jit_debug::{
-    JIT_DEBUG_EVENT_LIMIT, JitCompilerDiagnostic, JitDebugCompileOutcome, JitDebugEvent,
-    JitDebugReport, JitDebugRequest, JitDebugTarget, JitDebugTier, JitDirectCallLoweringOutcome,
-    JitDirectCallLoweringRejectionReason, JitDirectCallPlanOutcome, JitDirectCallRejectionReason,
-    JitInlineLoweringOutcome, JitInlineRejectionReason, JitInstallDeclineReason,
-    JitStaticNativeCallLoweringOutcome, JitStaticNativeCallLoweringRejectionReason,
+    JIT_DEBUG_EVENT_LIMIT, JitCompilerDiagnostic, JitDebugBakeYieldPoint, JitDebugCompileOutcome,
+    JitDebugEvent, JitDebugPreHookExit, JitDebugReport, JitDebugRequest, JitDebugTarget,
+    JitDebugTier, JitDirectCallLoweringOutcome, JitDirectCallLoweringRejectionReason,
+    JitDirectCallPlanOutcome, JitDirectCallRejectionReason, JitInlineLoweringOutcome,
+    JitInlineRejectionReason, JitInstallDeclineReason, JitStaticNativeCallLoweringOutcome,
+    JitStaticNativeCallLoweringRejectionReason,
 };
 pub use js_surface::{
     AccessorSpec, Attr, ClassBuilder, ClassSpec, ConstSpec, ConstValue, ConstructorBuilder,

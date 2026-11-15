@@ -487,7 +487,7 @@ impl Interpreter {
             crate::object::inline_capacity_for(argc + 2 + usize::from(iterator.is_some())),
             state,
         )?;
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -783,7 +783,7 @@ impl Interpreter {
                 }),
                 _ => None,
             };
-            let roots = interp.collect_allocation_roots(stack);
+            let (_allocation_roots_guard, roots) = interp.collect_allocation_roots(stack);
             let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                 for &slot in &roots {
                     visitor(slot);
@@ -812,7 +812,7 @@ impl Interpreter {
             return Ok(cell);
         }
         let thrower = self.restricted_throw_type_error()?;
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             for &slot in &roots {
                 visitor(slot);

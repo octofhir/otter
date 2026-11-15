@@ -239,7 +239,7 @@ impl Interpreter {
         let statics = read_register(frame, statics_reg)?
             .as_object()
             .ok_or(VmError::TypeMismatch)?;
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -1722,7 +1722,7 @@ impl Interpreter {
             return Ok(());
         }
         let _runtime_roots_guard = stack.is_none().then(|| self.scope_runtime_roots_guard());
-        let stack_roots = stack
+        let (_allocation_roots_guard, stack_roots) = stack
             .map(|stack| self.collect_allocation_roots(stack))
             .unwrap_or_default();
         let closure_slot: *mut Value = closure;

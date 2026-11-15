@@ -156,6 +156,49 @@ pub enum JitDebugTarget {
     },
 }
 
+/// Existing bake poll that first observed a heap pause's yield request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JitDebugBakeYieldPoint {
+    /// Before preparing a root snapshot in either tier.
+    RootStart,
+    /// Before preparing an optional inline body.
+    InlineEntry,
+}
+
+/// First observed reason preparation stopped before entering the compiler hook.
+///
+/// This is a terminal job disposition, not a retry policy. A contention reason
+/// does not exclude a simultaneous GC request: the baker preserves its existing
+/// short-circuit order and reports the first condition it actually observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum JitDebugPreHookExit {
+    /// The request's monotonic cancellation token was set before hook entry.
+    Cancelled,
+    /// A heap pause asked the compiler's current read guard to yield.
+    ReadRightYield {
+        /// Existing poll that first observed the request.
+        point: JitDebugBakeYieldPoint,
+    },
+    /// A bounded shared-state read could not outlast the mutator's write.
+    SharedStateContended,
+    /// A required body remains an unlinked lazy source record.
+    UnlinkedBody,
+    /// The source owner or root executable body could not be resolved.
+    SourceUnavailable,
+    /// A mandatory literal lacks its matching, prepared traced cell.
+    LiteralCellUnavailable,
+    /// A mandatory literal operand or instruction index is not representable.
+    InvalidLiteralOperands,
+    /// Prepared bodies do not all resolve to their exact retained owners.
+    SourceRetentionFailed,
+}
+
 /// Structured terminal outcome of one prepared compile request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
@@ -686,13 +729,16 @@ pub enum JitDebugEvent {
         tier: JitDebugTier,
         /// Function entry or loop-OSR target.
         target: JitDebugTarget,
-        /// Hook entry on the isolate's monotonic diagnostics clock, or `None`
-        /// when queued cancellation skipped the hook entirely.
+        /// First observed preparation refusal, or `None` if the hook ran.
+        /// An entered hook may still return a cancelled terminal outcome.
+        pre_hook_exit: Option<JitDebugPreHookExit>,
+        /// Worker start on the isolate's monotonic diagnostics clock, or `None`
+        /// when preparation never entered the hook.
         compile_started_ns: Option<u64>,
-        /// Delay between request readiness and hook entry, or terminal queued
-        /// cancellation when the hook was never entered.
+        /// Delay from request readiness to worker start, or terminal queued
+        /// cancellation for a request that was never started.
         queue_delay_ns: u64,
-        /// Monotonic hook wall duration; zero for a skipped hook.
+        /// Worker preparation plus hook wall duration; zero for a skipped hook.
         compile_duration_ns: u64,
         /// Lowered IR operations presented to native emission, or zero when no
         /// code object was produced.
@@ -1055,6 +1101,7 @@ mod tests {
             function_id: 7,
             tier: JitDebugTier::Template,
             target: JitDebugTarget::Entry,
+            pre_hook_exit: None,
             compile_started_ns: Some(10),
             queue_delay_ns: 2,
             compile_duration_ns: 30,
@@ -1104,6 +1151,82 @@ mod tests {
         assert!(!called.get());
         assert_eq!(state.request(), JitDebugRequest::disabled());
         assert!(state.take_report().is_none());
+    }
+
+    #[test]
+    fn pre_hook_dispositions_serialize_without_conflating_entered_cancellation() {
+        for (reason, text) in [
+            (JitDebugPreHookExit::Cancelled, "cancelled"),
+            (
+                JitDebugPreHookExit::ReadRightYield {
+                    point: JitDebugBakeYieldPoint::RootStart,
+                },
+                "readRightYield",
+            ),
+            (
+                JitDebugPreHookExit::SharedStateContended,
+                "sharedStateContended",
+            ),
+            (JitDebugPreHookExit::UnlinkedBody, "unlinkedBody"),
+            (JitDebugPreHookExit::SourceUnavailable, "sourceUnavailable"),
+            (
+                JitDebugPreHookExit::LiteralCellUnavailable,
+                "literalCellUnavailable",
+            ),
+            (
+                JitDebugPreHookExit::InvalidLiteralOperands,
+                "invalidLiteralOperands",
+            ),
+            (
+                JitDebugPreHookExit::SourceRetentionFailed,
+                "sourceRetentionFailed",
+            ),
+        ] {
+            let mut event = sample_event();
+            let JitDebugEvent::CompileFinished {
+                pre_hook_exit,
+                compile_started_ns,
+                compile_duration_ns,
+                outcome,
+                ..
+            } = &mut event
+            else {
+                unreachable!()
+            };
+            *pre_hook_exit = Some(reason);
+            *compile_started_ns = None;
+            *compile_duration_ns = 0;
+            *outcome = JitDebugCompileOutcome::Cancelled;
+            let json = serde_json::to_value(event).unwrap();
+            assert_eq!(json["preHookExit"]["kind"], text);
+            if matches!(reason, JitDebugPreHookExit::ReadRightYield { .. }) {
+                assert_eq!(json["preHookExit"]["point"], "rootStart");
+            } else {
+                assert!(json["preHookExit"].get("point").is_none());
+            }
+            assert!(json["compileStartedNs"].is_null());
+            assert_eq!(json["outcome"]["kind"], "cancelled");
+        }
+        for (point, text) in [
+            (JitDebugBakeYieldPoint::RootStart, "rootStart"),
+            (JitDebugBakeYieldPoint::InlineEntry, "inlineEntry"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(JitDebugPreHookExit::ReadRightYield { point }).unwrap(),
+                serde_json::json!({ "kind": "readRightYield", "point": text })
+            );
+        }
+        let mut event = sample_event();
+        let JitDebugEvent::CompileFinished { outcome, .. } = &mut event else {
+            unreachable!()
+        };
+        *outcome = JitDebugCompileOutcome::Cancelled;
+        let json = serde_json::to_value(event).unwrap();
+        assert!(
+            json["preHookExit"].is_null(),
+            "an entered hook can later cancel"
+        );
+        assert_eq!(json["compileStartedNs"], 10);
     }
 
     #[test]

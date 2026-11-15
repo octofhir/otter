@@ -32,16 +32,14 @@ The preceding allocation-generation validation matrix is under
 `benchmarks/results/generated-call-ownership-2026-11-14/validation.json`.
 That matrix retains a 120-second checked interpreter timeout for
 `array_literal_boilerplate` at GC stride 1; its remaining cases are unobserved.
-The exact-generation `jit_actual_only_calls` integration stress also retains a
-120-second stride-1 timeout in its proper-tail/throwing GC case; its phase is not
-attributed. Its unstressed checked run still performs explicit moving/full GC.
-Attribute verification and mutator costs before rerunning these matrices.
-Background compile preparation can repeatedly cancel before entering the hook
-under moving-GC stress; the x86 captured-context leaf exhausted its ordinary
-admission budget. Distinguish read-right yield, shared-table contention and
-terminal cancellation before choosing bounded retry ownership. Preserve the
-existing timeout and exact native proof. See the
-[pre-hook cancellation evidence](../../benchmarks/results/autonomous-12h-2026-11-15/copy-context-provenance/closing/x86-leaf-prehook-investigation.json).
+The exact-generation `jit_actual_only_calls` stress matrix retains 120-second
+stride-1 timeouts in the checked proper-tail/throwing case and the x86 debug
+copied-context case. The latter reaches exact initial Known linkage, its native
+probe and IdentityGuard, then times out during caller retraining. Attribute
+verification and mutator costs separately; retain the original watchdog,
+background compilation, exact generations, no replay and actual moving/full GC.
+A partial native proof or a passing retry does not close either timeout. See
+[publication and native stress evidence](../../benchmarks/results/autonomous-12h-2026-11-15/copy-context-provenance/publication-validation.json).
 Source reclamation still conservatively retires generations holding arbitrary
 strong heap graphs or shape/family roots. Any narrower retention policy must
 prove transitive source ownership before retaining those generations. Exact

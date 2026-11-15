@@ -7,10 +7,12 @@
 //! # Invariants
 //! - While any reader holds the right, no pause has begun: no cell moves and
 //!   no cell is freed, so every handle a reader follows stays valid.
-//! - A pause first raises the yield request, then waits for the readers to
-//!   leave. Readers poll the request at short intervals and leave promptly,
-//!   abandoning what they read; a reader arriving during a pause waits for
-//!   it to end.
+//! - A pause first raises the yield request, then waits for every read guard
+//!   to leave. Reader owners choose safe checkpoints. Heap references kept
+//!   from completed work must enter collector-traced storage before their
+//!   guard is released; incomplete work may instead be abandoned.
+//! - The collecting root walk begins only after readers are excluded. Readers
+//!   arriving during exclusion wait for the pause to end.
 //! - Pauses nest on the mutator; the right is released when the outermost
 //!   ends.
 //!

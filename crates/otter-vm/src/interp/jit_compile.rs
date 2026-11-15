@@ -207,6 +207,7 @@ impl Interpreter {
         tier: jit_debug::JitDebugTier,
         target: jit_debug::JitDebugTarget,
         code_object_id: u64,
+        pre_hook_exit: Option<jit_debug::JitDebugPreHookExit>,
         compile_started_ns: Option<u64>,
         queue_delay_ns: u64,
         compile_duration_ns: u64,
@@ -250,6 +251,7 @@ impl Interpreter {
             function_id: fid,
             tier,
             target,
+            pre_hook_exit,
             compile_started_ns,
             queue_delay_ns,
             compile_duration_ns,
@@ -424,6 +426,14 @@ impl Interpreter {
             perf_name,
         };
         let job = super::jit_bake::BakeJob {
+            #[cfg(test)]
+            checkpoint: None,
+            #[cfg(test)]
+            before_hook: None,
+            #[cfg(test)]
+            publish_ready: None,
+            #[cfg(test)]
+            before_shape_census: None,
             env,
             context: (*owner).clone(),
             function_id: fid,
@@ -549,7 +559,7 @@ impl Interpreter {
         if cancellation.is_cancelled() {
             finished.status = Ok(jit::JitCompileStatus::Cancelled);
         }
-        if finished.entered_hook {
+        if finished.pre_hook_exit.is_none() {
             self.jit_runtime_stats.compile_attempts =
                 self.jit_runtime_stats.compile_attempts.saturating_add(1);
             // Actual compiler work belongs to a still-current root even when
@@ -573,8 +583,10 @@ impl Interpreter {
             jit_debug::JitDebugTier::Optimizing,
             target,
             code_object_id,
+            finished.pre_hook_exit,
             finished
-                .entered_hook
+                .pre_hook_exit
+                .is_none()
                 .then(|| queued_ns.saturating_add(queue_delay_ns)),
             queue_delay_ns,
             nanos(finished.duration),
@@ -879,6 +891,14 @@ impl Interpreter {
             perf_name,
         };
         let job = super::jit_bake::BakeJob {
+            #[cfg(test)]
+            checkpoint: None,
+            #[cfg(test)]
+            before_hook: None,
+            #[cfg(test)]
+            publish_ready: None,
+            #[cfg(test)]
+            before_shape_census: None,
             env,
             context: (*owner).clone(),
             function_id: fid,
@@ -947,7 +967,7 @@ impl Interpreter {
         // Only compiler work on a still-current body is an attempt: a
         // cancelled or abandoned compilation leaves the function's work
         // budget ready to request it again at once.
-        if finished.entered_hook && !cancelled {
+        if finished.pre_hook_exit.is_none() && !cancelled {
             self.jit_runtime_stats.compile_attempts =
                 self.jit_runtime_stats.compile_attempts.saturating_add(1);
             self.optimizing_tier_policy
@@ -958,8 +978,10 @@ impl Interpreter {
             jit_debug::JitDebugTier::Template,
             target,
             code_object_id,
+            finished.pre_hook_exit,
             finished
-                .entered_hook
+                .pre_hook_exit
+                .is_none()
                 .then(|| queued_ns.saturating_add(queue_delay_ns)),
             queue_delay_ns,
             nanos(finished.duration),

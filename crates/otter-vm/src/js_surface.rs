@@ -20,6 +20,8 @@
 //!   frames, or borrowed contexts.
 //! - Builders are lifetime-bound to a mutable heap borrow and carry
 //!   a raw-pointer marker so they remain `!Send + !Sync`.
+//! - Native-context builders remain inside the context's registered runtime
+//!   turn; they retain owned pending values, never runtime root-slot snapshots.
 //! - Every object store goes through [`crate::object`] descriptor
 //!   APIs so write barriers fire; allocation failures remain typed.
 //! - Realm string tags root their receiver, symbol and string through the
@@ -349,16 +351,14 @@ impl<'rt> ObjectBuilder<'rt> {
     pub fn new_in_ctx<'a>(
         ctx: &'a mut NativeCtx<'_>,
     ) -> Result<ObjectBuilder<'a>, otter_gc::OutOfMemory> {
-        let raw_roots = ctx.collect_native_roots();
+        let object = ctx.alloc_object()?;
         let mut value_roots = vec![*ctx.this_value()];
         if let Some(new_target) = ctx.new_target() {
             value_roots.push(*new_target);
         }
-        let object = ctx.alloc_object()?;
-        Ok(ObjectBuilder::<'a>::from_object_with_raw_and_value_roots(
+        Ok(ObjectBuilder::<'a>::from_object_with_value_roots(
             ctx.heap_mut(),
             object,
-            raw_roots,
             value_roots,
         ))
     }
@@ -370,17 +370,11 @@ impl<'rt> ObjectBuilder<'rt> {
         ctx: &'a mut NativeCtx<'_>,
         object: JsObject,
     ) -> ObjectBuilder<'a> {
-        let raw_roots = ctx.collect_native_roots();
         let mut value_roots = vec![*ctx.this_value()];
         if let Some(new_target) = ctx.new_target() {
             value_roots.push(*new_target);
         }
-        ObjectBuilder::<'a>::from_object_with_raw_and_value_roots(
-            ctx.heap_mut(),
-            object,
-            raw_roots,
-            value_roots,
-        )
+        ObjectBuilder::<'a>::from_object_with_value_roots(ctx.heap_mut(), object, value_roots)
     }
 
     /// Bind a builder to an existing object.
@@ -952,17 +946,16 @@ impl<'rt> NamespaceBuilder<'rt> {
         ctx: &'a mut NativeCtx<'_>,
         spec: &'static NamespaceSpec,
     ) -> Result<NamespaceBuilder<'a>, otter_gc::OutOfMemory> {
-        let raw_roots = ctx.collect_native_roots();
+        let object = ctx.alloc_object()?;
         let mut value_roots = vec![*ctx.this_value()];
         if let Some(new_target) = ctx.new_target() {
             value_roots.push(*new_target);
         }
-        let object = ctx.alloc_object()?;
         Ok(NamespaceBuilder {
             heap: ctx.heap_mut(),
             spec,
             object,
-            raw_roots,
+            raw_roots: Vec::new(),
             value_roots,
             _not_send_sync: PhantomData,
         })

@@ -258,7 +258,7 @@ fn prewarm_publishes_one_shared_stable_cell_for_all_literal_sites() {
             None
         )
         .bake_literal_cells(&mut invalid, &context, 0, true)
-        .is_none()
+        .is_err_and(|reason| reason == crate::JitDebugPreHookExit::LiteralCellUnavailable)
     );
     assert!(invalid.literal_cells.is_empty());
 }

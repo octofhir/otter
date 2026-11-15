@@ -16,11 +16,12 @@
 //!   and grows no isolate cache. Facts a site needs are prepared where they
 //!   arise (first execution, an IC miss, template compilation); a fact that
 //!   does not exist yet drops that one specialization.
-//! - Baking reads the heap only while no collection can run: a compiler
-//!   thread holds the heap read right and yields when a pause asks it to,
-//!   dropping what it baked; on the isolate thread nothing collects while it
-//!   bakes. Every identity it reads stays valid until the roots reach the
-//!   pending compilation, which the collector traces from then on.
+//! - Baking reads the heap only while no collection can run. A compiler
+//!   thread holds the heap read right and observes pending pauses before
+//!   starting root or inline bodies. Completed body passes finish validation
+//!   and publish their roots and exact source leases before releasing that
+//!   same guard; the collector then traces the pending compilation. A prior
+//!   abandonment or shared-state contention never publishes a partial input.
 //! - Captured realm handles are read back from collector-rewritten cells
 //!   when a compiler thread starts baking.
 //! - Requests that must change mutator state (context-slot and dictionary
@@ -58,6 +59,10 @@ use receiver_methods::ConstructReceiver;
 #[cfg(test)]
 #[path = "jit_bake_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "jit_bake_tests/pre_hook.rs"]
+pub(crate) mod pre_hook_tests;
 
 #[cfg(test)]
 #[path = "jit_compile_binding_tests.rs"]
@@ -147,13 +152,15 @@ pub(crate) fn method_holder_layout(
 
 /// One compilation's baking pass over the isolate's feedback and heap.
 pub(crate) struct Baker<'a> {
+    #[cfg(test)]
+    before_shape_census: Option<pre_hook_tests::BeforeShapeCensus>,
     pub(crate) env: &'a super::jit_bake_env::BakeEnv,
     /// The read right a compiler thread bakes under, whose yield requests
     /// the bake honours; none on the isolate thread, which runs no pause
     /// while it bakes.
     right: Option<&'a otter_gc::read_right::HeapReadGuard<'a>>,
-    /// A collection asked this bake to yield: what it baked is dropped.
-    abandoned: bool,
+    /// First observed whole-bake refusal; partial products are never published.
+    abandoned: Option<JitDebugPreHookExit>,
     /// Every allocation the snapshot being baked names.
     roots: Vec<crate::jit_roots::CompilationRoot>,
     /// Mutator-side work the isolate runs before publishing the code.
@@ -172,9 +179,11 @@ impl<'a> Baker<'a> {
         right: Option<&'a otter_gc::read_right::HeapReadGuard<'a>>,
     ) -> Self {
         Self {
+            #[cfg(test)]
+            before_shape_census: None,
             env,
             right,
-            abandoned: false,
+            abandoned: None,
             roots: Vec::new(),
             install: InstallTasks::default(),
             events: Vec::new(),
@@ -200,25 +209,41 @@ impl<'a> Baker<'a> {
         id
     }
 
-    /// Whether a collection asked this bake to yield. Once it did, the bake
-    /// stops preparing bodies and returns nothing: what it read may have
-    /// moved.
-    fn yielded(&mut self) -> bool {
-        if !self.abandoned
-            && (self.env.contended() || self.right.is_some_and(|right| right.yield_requested()))
-        {
-            self.abandoned = true;
+    /// Before starting a body, cooperate with a pending collection. A first
+    /// refusal is sticky: no later body or completion may publish this bake.
+    /// The held read right still excludes movement until the job releases it.
+    fn yielded(&mut self, point: JitDebugBakeYieldPoint) -> bool {
+        if self.abandoned.is_none() {
+            self.abandoned = if self.env.contended() {
+                Some(JitDebugPreHookExit::SharedStateContended)
+            } else if self.right.is_some_and(|right| right.yield_requested()) {
+                Some(JitDebugPreHookExit::ReadRightYield { point })
+            } else {
+                None
+            };
         }
-        self.abandoned
+        self.abandoned.is_some()
+    }
+
+    /// Validate completed work without reopening the decision to start a body.
+    /// A pause requested during that work still waits for the held read right;
+    /// publishing the complete root set before releasing it lets GC trace it.
+    /// Earlier abandonment and incomplete shared-state reads remain terminal.
+    fn validate_completion(&mut self) -> Result<(), JitDebugPreHookExit> {
+        if self.abandoned.is_none() && self.env.contended() {
+            self.abandoned = Some(JitDebugPreHookExit::SharedStateContended);
+        }
+        self.abandoned.map_or(Ok(()), Err)
     }
 
     /// Whether `fid` resolves in `context` to a lazy record whose body the
     /// mutator has not linked yet. Code baked without that body would keep
-    /// the gap for its whole life, so the bake is abandoned and retried as
-    /// after a collection's yield.
+    /// the gap for its whole life, so the bake declines without publishing
+    /// an incomplete snapshot.
     pub(super) fn unlinked_body(&mut self, context: &ExecutionContext, fid: u32) -> bool {
         if context.is_lazy_record(fid) {
-            self.abandoned = true;
+            self.abandoned
+                .get_or_insert(JitDebugPreHookExit::UnlinkedBody);
             return true;
         }
         false
@@ -460,8 +485,13 @@ impl Baker<'_> {
         &mut self,
         context: &ExecutionContext,
         fid: u32,
-    ) -> Option<jit::JitCompileSnapshot> {
-        let mut view = context.jit_compile_snapshot(fid)?;
+    ) -> Result<jit::JitCompileSnapshot, JitDebugPreHookExit> {
+        if self.yielded(JitDebugBakeYieldPoint::RootStart) {
+            return Err(self.abandoned.expect("yield records its first cause"));
+        }
+        let mut view = context
+            .jit_compile_snapshot(fid)
+            .ok_or(JitDebugPreHookExit::SourceUnavailable)?;
         // Realm guards compare the active realm with the function's own.
         view.literal_allocations.realm_id = self.env.function_realm_id(fid);
         Self::bake_typed_array_layout(&mut view);
@@ -478,7 +508,7 @@ impl Baker<'_> {
         Self::bake_context_allocations(&mut view);
         self.bake_closure_allocations(&mut view, context);
         self.bake_field_type_tree(&mut view);
-        Some(view)
+        Ok(view)
     }
 
     /// Bake the optimizing tier's compile input for `fid` and every body it
@@ -488,11 +518,13 @@ impl Baker<'_> {
         context: &ExecutionContext,
         fid: u32,
         dependency_flag: std::sync::Arc<crate::code_dependencies::DependencyFlag>,
-    ) -> Option<jit::JitCompileSnapshot> {
-        if self.yielded() {
-            return None;
+    ) -> Result<jit::JitCompileSnapshot, JitDebugPreHookExit> {
+        if self.yielded(JitDebugBakeYieldPoint::RootStart) {
+            return Err(self.abandoned.expect("yield records its first cause"));
         }
-        let mut snapshot = context.jit_compile_snapshot(fid)?;
+        let mut snapshot = context
+            .jit_compile_snapshot(fid)
+            .ok_or(JitDebugPreHookExit::SourceUnavailable)?;
         snapshot.dependency_flag = dependency_flag;
         self.bake_literal_allocations(&mut snapshot, context, fid)?;
         // The optimizing tier consumes the same baked compile inputs as the
@@ -501,7 +533,7 @@ impl Baker<'_> {
         // there is nothing to inline.
         Self::bake_typed_array_layout(&mut snapshot);
         Self::bake_string_layout(&mut snapshot);
-        self.bake_literal_cells(&mut snapshot, context, fid, false);
+        let _ = self.bake_literal_cells(&mut snapshot, context, fid, false);
         self.bake_global_lexical_loads(&mut snapshot, context, fid);
         self.bake_binding_hit_proofs(&mut snapshot, context, fid);
         self.bake_property_cache_ir(&mut snapshot, context);
@@ -527,9 +559,13 @@ impl Baker<'_> {
         // proven to have one survives calls while the generation's
         // subscription to the shape's stability holds. The rest have been
         // left already, and stay so.
-        if self.yielded() {
-            return None;
+        #[cfg(test)]
+        if let Some(checkpoint) = self.before_shape_census.take() {
+            checkpoint.arrive(self, &snapshot);
         }
+        // Do not extend the held pause for a body already refused by an
+        // earlier inline boundary or an incomplete shared-state read.
+        self.validate_completion()?;
         for root in &self.roots {
             if let crate::jit_roots::CompilationRoot::Shape(shape) = root {
                 if crate::object::shape_body::is_stable(*shape) {
@@ -539,7 +575,8 @@ impl Baker<'_> {
                 }
             }
         }
-        Some(snapshot)
+        self.validate_completion()?;
+        Ok(snapshot)
     }
 
     /// Name `shape` in the code being compiled and return the compressed
@@ -670,7 +707,7 @@ impl Baker<'_> {
         view: &mut jit::JitCompileSnapshot,
         context: &ExecutionContext,
         fid: u32,
-    ) -> Option<()> {
+    ) -> Result<(), JitDebugPreHookExit> {
         let realm_id = self.env.function_realm_id(fid);
         view.literal_allocations.realm_id = realm_id;
         view.literal_allocations.group_allowed = self.env.machine_allocation_allowed;
@@ -681,7 +718,9 @@ impl Baker<'_> {
                     let Some(constant) = instruction.const_index(&view.code_block, 1) else {
                         continue;
                     };
-                    let owner = context.for_function(fid).ok()?;
+                    let owner = context
+                        .for_function(fid)
+                        .map_err(|_| JitDebugPreHookExit::SourceUnavailable)?;
                     let key = owner.constant_cache_key(constant);
                     // The literal's first execution resolves its site.
                     let Some(site) = self.env.regexp_literal(key) else {
@@ -737,11 +776,18 @@ impl Baker<'_> {
                     let site = self
                         .env
                         .registered_jit_allocation_site(view.code_block.allocation_site_at(pc));
-                    view.literal_allocations
-                        .sites
-                        .insert(u32::try_from(pc).ok()?, site);
-                    let count = instruction.const_index(&view.code_block, 1)? as usize;
-                    let first_key = instruction.const_index(&view.code_block, 2)?;
+                    view.literal_allocations.sites.insert(
+                        u32::try_from(pc)
+                            .map_err(|_| JitDebugPreHookExit::InvalidLiteralOperands)?,
+                        site,
+                    );
+                    let count = instruction
+                        .const_index(&view.code_block, 1)
+                        .ok_or(JitDebugPreHookExit::InvalidLiteralOperands)?
+                        as usize;
+                    let first_key = instruction
+                        .const_index(&view.code_block, 2)
+                        .ok_or(JitDebugPreHookExit::InvalidLiteralOperands)?;
                     // The literal's first execution built its layout.
                     let plan = self
                         .env
@@ -752,27 +798,35 @@ impl Baker<'_> {
                             jit::JitObjectLiteralAllocationPlan::new(shape, count)
                         });
                     if let Some(plan) = plan {
-                        view.literal_allocations
-                            .objects
-                            .insert(u32::try_from(pc).ok()?, plan);
+                        view.literal_allocations.objects.insert(
+                            u32::try_from(pc)
+                                .map_err(|_| JitDebugPreHookExit::InvalidLiteralOperands)?,
+                            plan,
+                        );
                     }
                 }
                 Op::NewArrayBoilerplate => {
                     let site = self
                         .env
                         .registered_jit_allocation_site(view.code_block.allocation_site_at(pc));
-                    view.literal_allocations
-                        .sites
-                        .insert(u32::try_from(pc).ok()?, site);
-                    let constant = instruction.const_index(&view.code_block, 1)?;
+                    view.literal_allocations.sites.insert(
+                        u32::try_from(pc)
+                            .map_err(|_| JitDebugPreHookExit::InvalidLiteralOperands)?,
+                        site,
+                    );
+                    let constant = instruction
+                        .const_index(&view.code_block, 1)
+                        .ok_or(JitDebugPreHookExit::InvalidLiteralOperands)?;
                     // The literal's first execution built its shared slab.
                     let slab = context
                         .array_boilerplate_for_function(fid, constant)
                         .and_then(|(key, _)| self.env.array_boilerplate(key));
                     if let Some(plan) = slab.and_then(jit::JitBoilerplateArrayAllocationPlan::new) {
-                        view.literal_allocations
-                            .boilerplates
-                            .insert(u32::try_from(pc).ok()?, plan);
+                        view.literal_allocations.boilerplates.insert(
+                            u32::try_from(pc)
+                                .map_err(|_| JitDebugPreHookExit::InvalidLiteralOperands)?,
+                            plan,
+                        );
                     }
                 }
                 // A `+` that concatenated places its strings at its site.
@@ -783,30 +837,39 @@ impl Baker<'_> {
                     let site = self
                         .env
                         .registered_jit_allocation_site(view.code_block.allocation_site_at(pc));
-                    view.literal_allocations
-                        .sites
-                        .insert(u32::try_from(pc).ok()?, site);
+                    view.literal_allocations.sites.insert(
+                        u32::try_from(pc)
+                            .map_err(|_| JitDebugPreHookExit::InvalidLiteralOperands)?,
+                        site,
+                    );
                 }
                 Op::NewArray => {
-                    let count = instruction.const_index(&view.code_block, 1)? as usize;
+                    let count = instruction
+                        .const_index(&view.code_block, 1)
+                        .ok_or(JitDebugPreHookExit::InvalidLiteralOperands)?
+                        as usize;
                     if count != 0 {
                         let site = self
                             .env
                             .registered_jit_allocation_site(view.code_block.allocation_site_at(pc));
-                        view.literal_allocations
-                            .sites
-                            .insert(u32::try_from(pc).ok()?, site);
+                        view.literal_allocations.sites.insert(
+                            u32::try_from(pc)
+                                .map_err(|_| JitDebugPreHookExit::InvalidLiteralOperands)?,
+                            site,
+                        );
                     }
                     if let Some(plan) = jit::JitArrayLiteralAllocationPlan::new(count) {
-                        view.literal_allocations
-                            .arrays
-                            .insert(u32::try_from(pc).ok()?, plan);
+                        view.literal_allocations.arrays.insert(
+                            u32::try_from(pc)
+                                .map_err(|_| JitDebugPreHookExit::InvalidLiteralOperands)?,
+                            plan,
+                        );
                     }
                 }
                 _ => {}
             }
         }
-        Some(())
+        Ok(())
     }
 
     /// Plan inline context allocation for every scope of this function and
@@ -1734,24 +1797,29 @@ impl Baker<'_> {
         context: &ExecutionContext,
         fid: u32,
         complete: bool,
-    ) -> Option<()> {
-        let owner = context.for_function(fid).ok()?;
+    ) -> Result<(), JitDebugPreHookExit> {
+        let owner = context
+            .for_function(fid)
+            .map_err(|_| JitDebugPreHookExit::SourceUnavailable)?;
         let cells = self
             .env
             .shared
             .literal_cells
             .read_briefly()
-            .or_else(|| self.env.contend())?;
+            .or_else(|| self.env.contend())
+            .ok_or(JitDebugPreHookExit::SharedStateContended)?;
         for instruction in &view.instructions {
             let op = instruction.op(&view.code_block);
             if !matches!(op, Op::LoadString | Op::LoadBigInt) {
                 continue;
             }
-            let constant = instruction.const_index(&view.code_block, 1)?;
+            let constant = instruction
+                .const_index(&view.code_block, 1)
+                .ok_or(JitDebugPreHookExit::InvalidLiteralOperands)?;
             let key = owner.constant_cache_key(constant);
             let Some(cell) = cells.get(&key).filter(|cell| literal_matches(op, cell)) else {
                 if complete {
-                    return None;
+                    return Err(JitDebugPreHookExit::LiteralCellUnavailable);
                 }
                 continue;
             };
@@ -1762,7 +1830,7 @@ impl Baker<'_> {
                 },
             );
         }
-        Some(())
+        Ok(())
     }
 
     /// Bake one spliced body's own compile inputs.
@@ -1786,7 +1854,7 @@ impl Baker<'_> {
         // An inline body shares the physical caller's active-global cells.
         // Source identity alone does not make a foreign realm's globals active.
         // Refuse the optional splice before preparing any ambient proofs.
-        if self.yielded() {
+        if self.yielded(JitDebugBakeYieldPoint::InlineEntry) {
             return None;
         }
         let instructions = context
@@ -1803,7 +1871,8 @@ impl Baker<'_> {
         }
         let result = (|| {
             let mut body = context.jit_compile_snapshot(fid)?;
-            self.bake_literal_allocations(&mut body, context, fid)?;
+            self.bake_literal_allocations(&mut body, context, fid)
+                .ok()?;
             Self::bake_typed_array_layout(&mut body);
             Self::bake_string_layout(&mut body);
             self.bake_literal_cells(
@@ -1811,7 +1880,8 @@ impl Baker<'_> {
                 context,
                 fid,
                 tier == jit_debug::JitDebugTier::Template,
-            )?;
+            )
+            .ok()?;
             self.bake_global_lexical_loads(&mut body, context, fid);
             self.bake_binding_hit_proofs(&mut body, context, fid);
             self.bake_property_cache_ir(&mut body, context);
@@ -2975,6 +3045,14 @@ impl crate::jit_roots::CompileProofs for Baker<'_> {
 /// heap read right: the isolate prepared its facts, captured `env` and
 /// queued this.
 pub(crate) struct BakeJob {
+    #[cfg(test)]
+    pub(crate) checkpoint: Option<pre_hook_tests::Checkpoint>,
+    #[cfg(test)]
+    pub(crate) before_hook: Option<pre_hook_tests::BeforeHook>,
+    #[cfg(test)]
+    pub(crate) publish_ready: Option<pre_hook_tests::PublishReady>,
+    #[cfg(test)]
+    pub(crate) before_shape_census: Option<pre_hook_tests::BeforeShapeCensus>,
     pub(crate) env: super::jit_bake_env::BakeEnv,
     pub(crate) context: ExecutionContext,
     pub(crate) function_id: u32,
@@ -2992,36 +3070,63 @@ pub(crate) struct BakeJob {
 impl BakeJob {
     /// Bake the snapshot and hand back the compile request, leaving the
     /// roots, install tasks, events and source leases in the products before
-    /// the read right is released. `None` when cancelled, when a collection
-    /// made the bake yield, or when the function cannot be compiled.
-    pub(crate) fn run(mut self) -> Option<jit::JitCompileRequest> {
+    /// the read right is released. A refusal names the first observed cause;
+    /// it never carries a partial snapshot or changes the queue's retry policy.
+    pub(crate) fn run(mut self) -> Result<jit::JitCompileRequest, JitDebugPreHookExit> {
         if self.cancellation.is_cancelled() {
-            return None;
+            return Err(JitDebugPreHookExit::Cancelled);
         }
         let right = std::sync::Arc::clone(&self.env.read_right);
         let guard = right.read();
         self.env.refresh();
+        #[cfg(test)]
+        if let Some(checkpoint) = self.checkpoint.take() {
+            checkpoint.arrive(&guard);
+        }
         let mut baker = Baker::new(&self.env, Some(&guard));
+        #[cfg(test)]
+        {
+            baker.before_shape_census = self.before_shape_census.take();
+        }
         let snapshot = match self.tier {
             jit_debug::JitDebugTier::Template => {
                 baker.bake_template(&self.context, self.function_id)
             }
             _ => baker.bake_optimized(&self.context, self.function_id, self.dependency_flag),
         };
-        if let Some(snapshot) = &snapshot {
+        if let Ok(snapshot) = &snapshot {
             let target = self.osr_pc.map_or(jit_debug::JitDebugTarget::Entry, |pc| {
                 jit_debug::JitDebugTarget::Osr { pc }
             });
             baker.record_prepared(&self.context, self.function_id, self.tier, target, snapshot);
         }
-        let abandoned = baker.yielded();
+        #[cfg(test)]
+        if let Some(checkpoint) = self.publish_ready.take() {
+            checkpoint.arrive(
+                &guard,
+                &mut baker,
+                snapshot
+                    .as_ref()
+                    .expect("publication checkpoint follows a completed bake"),
+            );
+        }
+        // Mandatory root errors retain precedence. A completed body cannot
+        // abandon its finished work merely because a pause now waits for this
+        // guard, but an earlier refusal or incomplete shared read still wins.
+        let completion = baker.validate_completion();
         let (roots, install, events) = baker.finish();
-        let snapshot = snapshot.filter(|_| !abandoned)?;
+        let snapshot = snapshot?;
+        completion?;
         let sources =
-            crate::jit_compile_lifetime::CompilationSources::retain(&self.context, &snapshot)?;
+            crate::jit_compile_lifetime::CompilationSources::retain(&self.context, &snapshot)
+                .ok_or(JitDebugPreHookExit::SourceRetentionFailed)?;
         self.products.publish(roots, install, events, sources);
         drop(guard);
-        Some(jit::JitCompileRequest {
+        #[cfg(test)]
+        if let Some(checkpoint) = self.before_hook.take() {
+            checkpoint.arrive();
+        }
+        Ok(jit::JitCompileRequest {
             cancellation: self.cancellation,
             snapshot,
             debug: self.debug,

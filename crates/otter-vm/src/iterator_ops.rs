@@ -3035,7 +3035,7 @@ impl Interpreter {
             let (Some(array), Some(source)) = (array.as_array(), source.as_array()) else {
                 return Err(CommittedValueError::Fatal(VmError::InvalidOperand));
             };
-            let roots = self.collect_allocation_roots(stack);
+            let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
             let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                 for &slot in &roots {
                     visitor(slot);
@@ -3053,7 +3053,7 @@ impl Interpreter {
             .map_err(CommittedValueError::Fatal)?
             .as_array()
             .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
             for &slot in &roots {
                 visitor(slot);

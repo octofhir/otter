@@ -82,7 +82,8 @@ impl RuntimeCall<'_> {
                     .read(statics)?
                     .as_object()
                     .ok_or(VmError::TypeMismatch)?;
-                let roots = vm.collect_allocation_roots(unsafe { self.stack.as_ref() });
+                let (_allocation_roots_guard, roots) =
+                    vm.collect_allocation_roots(unsafe { self.stack.as_ref() });
                 let mut external_visit = |visitor: &mut dyn FnMut(*mut otter_gc::raw::RawGc)| {
                     for &slot in &roots {
                         visitor(slot);

@@ -89,7 +89,7 @@ impl Interpreter {
         {
             return Ok(None);
         }
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut operand_roots = otter_gc::RootScope::new(&mut self.gc_heap);
         // SAFETY: these actual caller-owned slots remain stationary throughout
         // shape preparation and capture, including refused allocating attempts.

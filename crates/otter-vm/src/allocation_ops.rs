@@ -18,9 +18,9 @@
 //!   `literal_allocation`, including native inlined slow transitions.
 //! - Object-with-prototype allocation parks both object and prototype in a
 //!   handle scope before either raw handle is used after a possible scavenge.
-//! - Runtime-rooted helpers install a direct temporary root provider only when
-//!   the caller has not already published one; external visitors trace only
-//!   caller-local values and never allocate a runtime-root snapshot.
+//! - Rooted allocation boundaries retain a direct runtime provider until the
+//!   allocation finishes. Runtime roots are discovered only after compiler
+//!   readers have left; eager fallback vectors contain only stable activation slots.
 //! - Virtual-object dependencies and scalar fields stay in one handle scope
 //!   and are re-read after every allocation, so moving collection cannot stale
 //!   an earlier identity or a later recipe input.
@@ -35,61 +35,30 @@ use crate::{
     ExecutionContext, Frame, Interpreter, IteratorHandle, IteratorState, NativeCall, NativeFastFn,
     NativeFunction, Value, VmError,
     operand_decode::{const_operand, register_operand},
-    read_register, regexp,
-    runtime_state::RuntimeState,
-    write_register,
+    read_register, regexp, write_register,
 };
 use otter_gc::raw::RawGc;
 
 impl Interpreter {
-    pub(crate) fn collect_allocation_roots(&self, stack: &ActivationStack) -> Vec<*mut RawGc> {
-        // Fast path: when the dispatch loop has registered its frame-roots
-        // and extra-roots providers, an allocation-triggered collection walks
-        // both of them *internally* — see `GcHeap::collect_minor_internal`
-        // (`visit_extra_roots_deduped` + `frame_root_providers.trace`) and the
-        // full-GC `mark_phase`. Re-tracing the entire root set here, eagerly,
-        // on *every* allocation (most of which never trigger a collection)
-        // is pure waste — it dominated allocation-heavy workloads (e.g. the
-        // RegExp property-escape harness building 100k-element strings). Hand
-        // the heap an empty external set and let it pull roots lazily, only
-        // when a collection actually fires.
-        if self.gc_heap.has_frame_root_providers() {
-            return Vec::new();
+    pub(crate) fn collect_allocation_roots(
+        &mut self,
+        stack: &ActivationStack,
+    ) -> (Option<otter_gc::ExtraRootsGuard>, Vec<*mut RawGc>) {
+        // The private turn marker proves both this exact stack and its
+        // Interpreter provider remain registered through this allocation.
+        if stack.is_runtime_rooted_by(self) {
+            return (None, Vec::new());
         }
-        // Fallback: no frame-roots provider registered (out-of-band alloc with
-        // no active dispatch loop). The GC cannot reach the live Rust frame
-        // stack on its own, so snapshot the runtime + frame roots here to keep
-        // a collection at this site sound.
+        // Another registered stack is not a proof for this caller. Retain a
+        // lazy runtime provider and capture only this stack's stable slots.
+        // Compiler roots are discovered after the pause excludes readers.
+        let runtime_roots_guard = self.scope_runtime_roots_guard();
         let mut roots = Vec::new();
-        RuntimeState::new(self).trace_roots(otter_gc::RootSet::All, &mut |slot| roots.push(slot));
-        let pool = self.cold_frames();
         for frame in stack.iter() {
             frame.trace_frame_slots(&mut |slot| roots.push(slot));
-            if let Some(idx) = frame.cold {
-                pool.get(idx).trace_cold_slots(&mut |slot| roots.push(slot));
-            }
         }
-        roots
-    }
-
-    pub(crate) fn collect_runtime_roots(&self) -> Vec<*mut RawGc> {
-        // When an extra-roots provider is registered, a collection pulls the
-        // full runtime root set itself (the dispatch loop installs
-        // `ExtraRootSource for Interpreter`, which walks `trace_roots`). Eagerly
-        // snapshotting that whole set here on *every* rooted allocation — most
-        // of which never trigger a collection — is pure waste; it dominated
-        // allocation-heavy native paths such as `RegExp.prototype.exec`'s
-        // per-match result building. Hand back an empty set and let the heap
-        // pull roots lazily, exactly as `collect_allocation_roots` already does.
-        let runtime_roots = otter_gc::ExtraRoots::new(self as &Interpreter);
-        if self.gc_heap.has_extra_root_source(runtime_roots) {
-            return Vec::new();
-        }
-        let mut roots = Vec::new();
-        RuntimeState::new(self).trace_roots(otter_gc::RootSet::All, &mut |slot| roots.push(slot));
-        self.gc_heap
-            .trace_frame_root_providers(&mut |slot| roots.push(slot));
-        roots
+        stack.trace_roots(self.cold_frames(), &mut |slot| roots.push(slot));
+        (runtime_roots_guard, roots)
     }
 
     pub(crate) fn alloc_runtime_rooted_object_with_roots(
@@ -623,7 +592,7 @@ impl Interpreter {
         stack: &ActivationStack,
         pending: &mut [Value],
     ) -> Result<crate::object::JsObject, VmError> {
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let shape_root = self.null_prototype_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -650,7 +619,7 @@ impl Interpreter {
         value_roots: &mut [&mut Value],
         prototype: Value,
     ) -> Result<crate::object::JsObject, VmError> {
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -690,7 +659,7 @@ impl Interpreter {
         value_roots: &mut [&mut Value],
         slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::object::JsObject, VmError> {
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let shape_root = self.null_prototype_root();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -720,8 +689,7 @@ impl Interpreter {
         value_roots: &mut [&mut Value],
         slice_roots: &mut [&mut [Value]],
     ) -> Result<crate::object::JsObject, VmError> {
-        let _runtime_roots_guard = self.scope_runtime_roots_guard();
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -776,7 +744,7 @@ impl Interpreter {
         I: IntoIterator<Item = Value>,
     {
         let mut elements: smallvec::SmallVec<[Value; 8]> = elements.into_iter().collect();
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let prototype = self.current_array_prototype_override();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -814,7 +782,7 @@ impl Interpreter {
         mut source: crate::array::JsArray,
         range: impl FnOnce(usize) -> std::ops::Range<usize>,
     ) -> Option<Result<crate::array::JsArray, VmError>> {
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let prototype = self.current_array_prototype_override();
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -846,7 +814,7 @@ impl Interpreter {
         value_roots: &mut [&mut Value],
         slice_roots: &mut [&mut [Value]],
     ) -> Result<IteratorHandle, VmError> {
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let prototype = self.iterator_prototype_override_for_state(&state);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
@@ -1260,7 +1228,7 @@ impl Interpreter {
         let array = read_register(frame, arr_reg)?
             .as_array()
             .ok_or(VmError::TypeMismatch)?;
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -1281,7 +1249,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
         let target = *read_register(frame, target_reg)?;
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -1308,7 +1276,7 @@ impl Interpreter {
     ) -> Result<(), VmError> {
         let frame = &stack[top_idx];
         let callback = *read_register(frame, callback_reg)?;
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);

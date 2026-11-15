@@ -95,10 +95,27 @@ that fires before the isolate replies may have no partial batch to write.
 
 `compileFinished` reports the terminal compile attempt and retains duration/queue
 delay as diagnostics only. A `cancelled` outcome is distinct from compiler
-unavailability or unsupported input. A queued cancellation has
-`compileStartedNs: null` and zero hook duration because the hook never ran; an
-active cancellation retains its actual entered-hook timing. A successfully
-compiled mapping can still fail
+unavailability or unsupported input. `preHookExit` is null when the compiler
+hook ran. Otherwise its `kind` identifies the first observed refusal: `cancelled`,
+`readRightYield`, `sharedStateContended`, `unlinkedBody`, `sourceUnavailable`,
+`literalCellUnavailable`, `invalidLiteralOperands`, or `sourceRetentionFailed`.
+A `readRightYield` also records the body boundary in `point`: `rootStart`
+(before either tier starts its root body) or `inlineEntry` (before an optional
+inline body). Completed body passes finish the shape census and validate prior
+abandonment and shared-state contention under the held read right. A newly
+requested pause does not discard otherwise complete work: the job publishes
+all roots and exact source leases before releasing that guard, so the waiting
+collector enumerates the pending owner. This does not retry a refused job.
+A shared-state refusal does not rule out a simultaneous GC yield request: the
+baker keeps its existing short-circuit order. Optional inline refusal alone does
+not refuse the enclosing job. This field describes the completed attempt and
+does not prescribe a retry policy.
+
+A skipped hook has `compileStartedNs: null` and zero `compileDurationNs`.
+For entered work, the existing start/queue delay identify worker start before
+baking, and duration includes preparation plus the hook. These are diagnostic
+wall times, not a benchmark. An entered hook may still finish cancelled; its
+`preHookExit` stays null. A successfully compiled mapping can still fail
 canonical publication: `installDeclined` identifies the exact function,
 `codeObjectId`, tier and typed `invalidCode` or `resourceBudget` reason. Resource
 refusals include the full centrally computed `requiredBytes` and current

@@ -149,7 +149,7 @@ impl Interpreter {
         };
         let method =
             method_id::ArrayBufferMethod::from_u32(method_idx).ok_or(VmError::InvalidOperand)?;
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);
@@ -179,7 +179,7 @@ impl Interpreter {
         };
         let method = method_id::SharedArrayBufferMethod::from_u32(method_idx)
             .ok_or(VmError::InvalidOperand)?;
-        let roots = self.collect_allocation_roots(stack);
+        let (_allocation_roots_guard, roots) = self.collect_allocation_roots(stack);
         let mut external_visit = |visitor: &mut dyn FnMut(*mut RawGc)| {
             for &slot in &roots {
                 visitor(slot);

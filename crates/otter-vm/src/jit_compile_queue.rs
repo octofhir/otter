@@ -100,8 +100,8 @@ pub(crate) struct FinishedCompile {
     pub(crate) queue_delay: Duration,
     /// Time the compiler spent on it.
     pub(crate) duration: Duration,
-    /// False when cancellation acknowledged without entering the hook.
-    pub(crate) entered_hook: bool,
+    /// First preparation refusal; `None` exactly when the hook was entered.
+    pub(crate) pre_hook_exit: Option<crate::JitDebugPreHookExit>,
 }
 
 /// What a compiler thread starts a compilation from.
@@ -294,16 +294,25 @@ fn compile(job: CompileJob) -> FinishedCompile {
     let code_object_id = job.code_object_id;
     let cancellation = job.cancellation;
     let request = if cancellation.is_cancelled() {
-        None
+        Err(crate::JitDebugPreHookExit::Cancelled)
     } else {
         match job.input {
             #[cfg(test)]
-            CompileInput::Request(request) => Some(*request),
+            CompileInput::Request(request) => Ok(*request),
             CompileInput::Bake(bake) => bake.run(),
         }
     };
-    let entered_hook = request.is_some() && !cancellation.is_cancelled();
-    let status = if let Some(request) = request.filter(|_| entered_hook) {
+    // Keep an earlier bake refusal if cancellation raced with that refusal.
+    // A successful bake must still recheck the token before entering the hook.
+    let request = request.and_then(|request| {
+        if cancellation.is_cancelled() {
+            Err(crate::JitDebugPreHookExit::Cancelled)
+        } else {
+            Ok(request)
+        }
+    });
+    let pre_hook_exit = request.as_ref().err().copied();
+    let status = if let Ok(request) = request {
         let status = match job.tier {
             crate::jit_debug::JitDebugTier::Template => job.hook.compile_function(request),
             _ => job.hook.compile_optimized_function(request),
@@ -322,12 +331,12 @@ fn compile(job: CompileJob) -> FinishedCompile {
         code_object_id,
         status,
         queue_delay: started.saturating_duration_since(job.queued),
-        duration: if entered_hook {
+        duration: if pre_hook_exit.is_none() {
             started.elapsed()
         } else {
             Duration::ZERO
         },
-        entered_hook,
+        pre_hook_exit,
     }
 }
 
@@ -338,7 +347,7 @@ fn cancel_queued_job(job: CompileJob) -> FinishedCompile {
         status: Ok(JitCompileStatus::Cancelled),
         queue_delay: job.queued.elapsed(),
         duration: Duration::ZERO,
-        entered_hook: false,
+        pre_hook_exit: Some(crate::JitDebugPreHookExit::Cancelled),
     };
     drop(job);
     finished
@@ -677,7 +686,10 @@ mod tests {
         );
         assert_eq!(finished.len(), 1);
         assert_eq!(finished[0].0.function_id, queued_id);
-        assert!(!finished[0].1.entered_hook);
+        assert_eq!(
+            finished[0].1.pre_hook_exit,
+            Some(crate::JitDebugPreHookExit::Cancelled)
+        );
         assert_eq!(finished[0].1.duration, Duration::ZERO);
         assert!(matches!(
             finished[0].1.status,
@@ -698,5 +710,66 @@ mod tests {
             entries.try_recv().is_err(),
             "cancelled FIFO job never enters its hook"
         );
+    }
+
+    #[test]
+    fn active_hook_cancellation_does_not_claim_a_pre_hook_refusal() {
+        let space = Arc::new(CodeSpace::default());
+        let context = space
+            .link_evictable_module(
+                crate::test_support::minimal_bytecode_module("active-cancel.js"),
+                SourceRegistry::default(),
+                &ResourceAccount::default(),
+            )
+            .unwrap();
+        let (active, pending, root) = request(&context, 1);
+        let token = pending.cancellation.clone();
+        let (entered, entries) = mpsc::channel();
+        let hook = Arc::new(CancellingHook {
+            entered,
+            invocations: AtomicUsize::new(0),
+            active_root: root.clone(),
+            acknowledged: AtomicBool::new(false),
+        });
+        let mut queue = OptimizingCompileQueue::default();
+        queue.set_threads(1);
+        assert!(
+            queue
+                .submit(
+                    hook.clone(),
+                    CompileInput::Request(Box::new(active)),
+                    1,
+                    pending
+                )
+                .is_none()
+        );
+        assert_eq!(
+            entries.recv_timeout(Duration::from_secs(5)).unwrap(),
+            context.function_base()
+        );
+        token.cancel();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let finished = loop {
+            let rows = queue.take_finished();
+            if !rows.is_empty() {
+                break rows;
+            }
+            assert!(Instant::now() < deadline, "active cancellation did not ACK");
+            std::thread::yield_now();
+        };
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].1.pre_hook_exit, None);
+        assert!(matches!(
+            finished[0].1.status,
+            Ok(JitCompileStatus::Cancelled)
+        ));
+        assert_eq!(hook.invocations.load(Ordering::Relaxed), 1);
+        assert!(hook.acknowledged.load(Ordering::Relaxed));
+        assert!(
+            root.upgrade().is_some(),
+            "active products outlive hook acknowledgement"
+        );
+        drop(finished);
+        assert!(root.upgrade().is_none());
     }
 }

@@ -115,7 +115,7 @@ impl<'a> RuntimeState<'a> {
         // serializer scratch roots.
         // Every collection that can run while a native call holds handles must
         // trace these, or a parked handle goes stale across a move. The
-        // snapshot path (`collect_runtime_roots`) also reaches here.
+        // registered Interpreter provider reaches this arena lazily.
         interp.handle_arena_trace(visitor);
         // 2b-quinquies) Host-resource persistent roots.
         interp.persistent_roots_for_trace().trace_gc_roots(visitor);

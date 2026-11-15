@@ -65,16 +65,23 @@ const INSTANCE_SOURCE: &str = r#"const provenanceLeaf = provenanceMakeLeaf(3);
 const provenanceMethod = provenanceMakeCaller(provenanceLeaf);
 const provenancePayload = {marker: 2, calls: 0, effects: 0};
 "#;
-const CALLER_WARM: &str = r#"
-for (let warm = 0; warm < 5000; warm++) {
-  if (provenanceMethod(7, provenancePayload) !== 13) throw "warm checksum";
+const CALLER_ADMISSION_CALL: &str =
+    r#"if (provenanceMethod(7, provenancePayload) !== 13) throw "warm checksum";"#;
+
+fn record_phase(phase: &str, setup_sequence: usize, admission: Option<(usize, usize)>) {
+    if std::env::var_os("OTTER_ACTUAL_SETUP_ARTIFACTS").is_some() {
+        // Admission metadata is the already-read (pending, funding_batches)
+        // pair. Logging must not enter the runtime or acknowledge worker jobs.
+        eprintln!(
+            "context-provenance phase={phase} setup_sequence={setup_sequence} admission={admission:?}"
+        );
+    }
 }
-"#;
 
 fn admit(fixture: &mut Fixture, names: &[&str], call: &str) {
     // Source-work admission is independent of GC verification speed. These
-    // bounded ordinary batches fund both the leaf's initial compilation and
-    // the caller's fresh post-deopt window; only worker settling uses a clock.
+    // bounded ordinary batches fund initial leaf/caller compilation and the
+    // caller's fresh post-deopt window; only worker settling uses a clock.
     let mut funding_batches = 0;
     let mut worker_wait = std::time::Duration::ZERO;
     for _ in 0..4096 {
@@ -94,6 +101,11 @@ fn admit(fixture: &mut Fixture, names: &[&str], call: &str) {
                 .collect();
             // Installation can precede the first use of a retrained lookup.
             // Ordinary calls must settle it before the isolated GC probe.
+            record_phase(
+                "admit:stable",
+                fixture.setup_sequence,
+                Some((pending, funding_batches)),
+            );
             fixture.setup(&call.repeat(16));
             if fixture.runtime.jit_code_residency().pending_compilations == 0
                 && names.iter().zip(before).all(|(name, before)| {
@@ -112,6 +124,11 @@ fn admit(fixture: &mut Fixture, names: &[&str], call: &str) {
                 "ordinary admission exhausted {funding_batches} batches: {:?}",
                 fixture.runtime.jit_code_generation_snapshot()
             );
+            record_phase(
+                "admit:fund",
+                fixture.setup_sequence,
+                Some((pending, funding_batches)),
+            );
             fixture.setup(&call.repeat(32));
             funding_batches += 1;
         } else {
@@ -119,6 +136,11 @@ fn admit(fixture: &mut Fixture, names: &[&str], call: &str) {
                 worker_wait < std::time::Duration::from_secs(5),
                 "worker settling exhausted after {funding_batches} batches: {:?}",
                 fixture.runtime.jit_code_generation_snapshot()
+            );
+            record_phase(
+                "admit:worker",
+                fixture.setup_sequence,
+                Some((pending, funding_batches)),
             );
             let started = std::time::Instant::now();
             fixture.setup("0;");
@@ -265,10 +287,13 @@ fn captured_call_linkage_after_identity_retraining_and_gc(caller_source: &str, c
     // Plans retain a capture-time generation stamp while dispatch follows the
     // stable function entry cell. Admit the leaf before compiling its caller so
     // the exact-current stamp assertion is independent of worker completion order.
+    record_phase("leaf-admit:begin", fixture.setup_sequence, None);
     admit(&mut fixture, &NAMES[1..], LEAF_CALL);
+    record_phase("leaf-admit:end", fixture.setup_sequence, None);
     let prepared_leaf = fixture.current(NAMES[1]).unwrap();
-    fixture.setup(CALLER_WARM);
-    admit(&mut fixture, &NAMES, CALL);
+    record_phase("caller-admit:begin", fixture.setup_sequence, None);
+    admit(&mut fixture, &NAMES, CALLER_ADMISSION_CALL);
+    record_phase("caller-admit:end", fixture.setup_sequence, None);
     assert_eq!(
         fixture.current(NAMES[1]).unwrap().code_object_id,
         prepared_leaf.code_object_id

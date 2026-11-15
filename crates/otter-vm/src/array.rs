@@ -12,10 +12,13 @@
 //!   completion used after guarded native element misses.
 //! - Cached eligibility for present own dense slots with source-realm prototypes.
 //! - Allocation-free ordinary tail appends with one length/kind publication.
+//! - Borrowed tagged dense prefixes and representation-neutral numeric reads.
 //!
 //! # Invariants
 //!
 //! - Low, contiguous indices live in one GC-owned element slab.
+//! - Borrowed dense views retain internal holes and end before collection or
+//!   mutation; numeric reads use the existing value-boxing rules.
 //! - Large sparse indices live in `sparse_elements` so Array-index
 //!   semantics do not force host-sized dense allocations.
 //! - Missing-index reads return `undefined`.
@@ -275,6 +278,16 @@ impl ArrayBody {
         let body = elements::body_of(self.slab)?;
         // SAFETY: the array body keeps the slab reachable for this borrow.
         unsafe { (*body).get(index) }
+    }
+
+    /// Borrow the tagged live prefix without boxing numeric storage.
+    /// Internal holes retain their exact tagged representation.
+    #[inline]
+    pub(crate) fn tagged_dense_values(&self) -> Option<&[Value]> {
+        let slab = elements::body_of(self.slab)?;
+        // SAFETY: this body owns the live slab for the payload borrow, which
+        // cannot span collection or heap mutation.
+        unsafe { (*slab).tagged_slice() }.map(|values| &values[..self.dense_len()])
     }
 
     /// Materialize the live dense prefix as tagged values.

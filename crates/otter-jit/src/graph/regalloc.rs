@@ -20,7 +20,8 @@
 //!   no other tagged home is read by the collector there.
 //! - Collecting slow paths preserve only control-flow-live register values
 //!   ([`super::liveness`]), through their canonical homes. A linear interval
-//!   may cover paths that never ran a value's definition.
+//!   may cover paths that never ran a value's definition. Exact queries
+//!   combine local use positions and block live-out sets.
 //! - At a collecting boundary, a tagged home is a root exactly when a value
 //!   assigned to it is live in the CFG or read by the node or its
 //!   reconstruction states, and that value's home is written there: stored at
@@ -58,6 +59,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use super::ir::{BlockId, Constraints, Graph, InputPolicy, Kind, NodeId, Repr, ResultPolicy};
+use super::liveness::{Liveness, NO_POSITION};
 use super::registers::RegisterContract;
 
 /// Where a value lives at one point.
@@ -334,24 +336,14 @@ impl RegisterFile {
     }
 }
 
-/// One value's registers and its use positions.
+/// One value's registers and additional linear lifetime across loops.
 #[derive(Debug, Clone, Copy, Default)]
 struct ValueState {
     gp: u32,
     fp: u32,
-    /// Its sorted, distinct use positions are `positions[first_use..][..use_count]`.
-    first_use: u32,
-    use_count: u32,
     /// The last back edge of a loop the value is defined before and used
     /// in, which keeps it live through every iteration; zero when none.
     loop_end: u32,
-}
-
-impl ValueState {
-    /// Whether anything reads the value.
-    const fn is_used(self) -> bool {
-        self.use_count != 0
-    }
 }
 
 struct Allocator<'g> {
@@ -360,12 +352,8 @@ struct Allocator<'g> {
     /// Every frame state's values, flattened once.
     states: &'g super::ir::StateValues,
     layout: &'g [BlockId],
-    position: Vec<u32>,
-    block_start: Vec<u32>,
     /// Per node, indexed by its id.
     values: Vec<ValueState>,
-    /// Every value's use positions, grouped by value.
-    positions: Vec<u32>,
     gp: RegisterFile,
     fp: RegisterFile,
     out: Allocation,
@@ -374,13 +362,11 @@ struct Allocator<'g> {
     exit_states: Vec<Option<Vec<(NodeId, Location)>>>,
     current: NodeId,
     /// Control-flow liveness, including deopt frame-state uses.
-    liveness: super::liveness::Liveness,
+    liveness: Liveness,
     /// Values a loop's back edge feeds into a header phi, with that phi: the
     /// value prefers the phi's register, so the edge needs no move.
     phi_hints: FxHashMap<NodeId, NodeId>,
 }
-
-const NO_POSITION: u32 = u32::MAX;
 
 /// Values that share one canonical home over the hull of their intervals.
 struct HomeBundle {
@@ -398,15 +384,13 @@ pub(crate) fn allocate(
 ) -> Allocation {
     registers.validate();
     let states = graph.all_state_values();
+    let liveness = Liveness::compute(graph, layout, &states);
     let mut allocator = Allocator {
         states: &states,
         registers,
         graph,
         layout,
-        position: vec![NO_POSITION; graph.nodes.len()],
-        block_start: vec![NO_POSITION; graph.blocks.len()],
         values: vec![ValueState::default(); graph.nodes.len()],
-        positions: Vec::new(),
         gp: RegisterFile::new(registers.general),
         fp: RegisterFile::new(registers.floating),
         out: Allocation {
@@ -416,11 +400,10 @@ pub(crate) fn allocate(
         entry_states: vec![None; graph.blocks.len()],
         exit_states: vec![None; graph.blocks.len()],
         current: NodeId(0),
-        liveness: super::liveness::Liveness::compute_with(graph, layout, &states),
+        liveness,
         phi_hints: FxHashMap::default(),
     };
-    allocator.number();
-    allocator.collect_uses();
+    allocator.prepare_loops();
     allocator.walk();
     let homes = allocator.plan_homes();
     allocator.place_homes(homes);
@@ -475,7 +458,8 @@ impl<'g> Allocator<'g> {
                         continue;
                     }
                     if let Location::TaggedSlot(slot) = home
-                        && (self.liveness.is_live_after(node, value) || reads.contains(&value))
+                        && (self.liveness.is_live_after(block, node, value)
+                            || reads.contains(&value))
                     {
                         rooted.push(slot);
                     }
@@ -491,105 +475,8 @@ impl<'g> Allocator<'g> {
     // Positions and uses
     // ------------------------------------------------------------------
 
-    fn number(&mut self) {
-        let mut next = 1u32;
-        for &block in self.layout {
-            let data = self.graph.block(block);
-            self.block_start[block.0 as usize] = next;
-            for &phi in &data.phis {
-                self.position[phi.0 as usize] = next;
-                // A loop header's last predecessor is its back edge.
-                if data.is_loop
-                    && let Some(&input) = self.graph.node(phi).inputs.last()
-                    && input != phi
-                {
-                    self.phi_hints.entry(input).or_insert(phi);
-                }
-            }
-            next += 1;
-            for &node in &data.body {
-                self.position[node.0 as usize] = next;
-                next += 1;
-            }
-            if let Some(control) = data.control {
-                self.position[control.0 as usize] = next;
-                next += 1;
-            }
-        }
-    }
-
-    fn pos(&self, node: NodeId) -> u32 {
-        self.position[node.0 as usize]
-    }
-
-    fn collect_uses(&mut self) {
+    fn prepare_loops(&mut self) {
         let graph = self.graph;
-        let mut uses: Vec<(u32, u32)> = Vec::new();
-        for &block in self.layout {
-            let data = graph.block(block);
-            for (index, &predecessor) in data.predecessors.iter().enumerate() {
-                let Some(control) = graph.block(predecessor).control else {
-                    continue;
-                };
-                let at = self.pos(control);
-                for &phi in &data.phis {
-                    if let Some(&input) = graph.node(phi).inputs.get(index) {
-                        uses.push((input.0, at));
-                    }
-                }
-            }
-            for &node in data.body.iter().chain(data.control.iter()) {
-                let at = self.pos(node);
-                let data = graph.node(node);
-                for &input in &data.inputs {
-                    uses.push((input.0, at));
-                }
-                for state in data.eager.iter().chain(data.lazy.iter()) {
-                    for &value in self.states.of(*state) {
-                        if value != node {
-                            uses.push((value.0, at));
-                        }
-                    }
-                }
-            }
-        }
-        // Group the positions by value in one flat array, each group sorted
-        // and distinct. Uses arrive in layout order but for phi inputs, read
-        // at a predecessor's end, so a counting placement keeps each group
-        // nearly sorted and only an out-of-order group is sorted.
-        let mut starts = vec![0u32; self.values.len() + 1];
-        for &(value, _) in &uses {
-            starts[value as usize + 1] += 1;
-        }
-        for index in 1..starts.len() {
-            starts[index] += starts[index - 1];
-        }
-        let mut grouped = vec![0u32; uses.len()];
-        let mut fill = starts.clone();
-        for &(value, at) in &uses {
-            grouped[fill[value as usize] as usize] = at;
-            fill[value as usize] += 1;
-        }
-        let mut positions = Vec::with_capacity(uses.len());
-        for value in 0..self.values.len() {
-            let group = &mut grouped[starts[value] as usize..starts[value + 1] as usize];
-            if group.is_empty() {
-                continue;
-            }
-            if !group.is_sorted() {
-                group.sort_unstable();
-            }
-            let first = positions.len();
-            for &at in group.iter() {
-                if positions.len() == first || positions.last() != Some(&at) {
-                    positions.push(at);
-                }
-            }
-            let state = &mut self.values[value];
-            state.first_use = first as u32;
-            state.use_count = (positions.len() - first) as u32;
-        }
-        self.positions = positions;
         // A value used inside a loop but defined before it stays live until
         // every back edge of the loop.
         let mut loops = Vec::new();
@@ -598,7 +485,15 @@ impl<'g> Allocator<'g> {
             if !data.is_loop {
                 continue;
             }
-            let start = self.block_start[block.0 as usize];
+            // A loop header's last predecessor is its back edge.
+            for &phi in &data.phis {
+                if let Some(&input) = graph.node(phi).inputs.last()
+                    && input != phi
+                {
+                    self.phi_hints.entry(input).or_insert(phi);
+                }
+            }
+            let start = self.liveness.positions.block(block).start;
             let end = data
                 .predecessors
                 .iter()
@@ -613,26 +508,27 @@ impl<'g> Allocator<'g> {
         if loops.is_empty() {
             return;
         }
-        let used: Vec<u32> = (0..self.values.len() as u32)
-            .filter(|&value| self.values[value as usize].is_used())
+        let used: Vec<NodeId> = (0..self.values.len() as u32)
+            .map(NodeId)
+            .filter(|&value| self.is_used(value))
             .collect();
         // An extension may make a value used inside an enclosing loop.
         loop {
             let mut changed = false;
             for &(start, end) in &loops {
                 for &value in &used {
-                    let defined = self.position[value as usize];
+                    let defined = self.pos(value);
                     if defined != NO_POSITION && defined >= start {
                         continue;
                     }
-                    let loop_end = self.values[value as usize].loop_end;
-                    let uses = self.uses_of(NodeId(value));
+                    let loop_end = self.values[value.0 as usize].loop_end;
+                    let uses = self.uses_of(value);
                     let first_inside = uses.partition_point(|&at| at < start);
                     let used_inside = uses.get(first_inside).is_some_and(|&at| at <= end)
                         || (start..=end).contains(&loop_end);
                     let last = uses.last().copied().unwrap_or(0).max(loop_end);
                     if used_inside && last < end {
-                        self.values[value as usize].loop_end = end;
+                        self.values[value.0 as usize].loop_end = end;
                         changed = true;
                     }
                 }
@@ -643,10 +539,17 @@ impl<'g> Allocator<'g> {
         }
     }
 
+    fn pos(&self, node: NodeId) -> u32 {
+        self.liveness.positions.node(node)
+    }
+
+    fn is_used(&self, value: NodeId) -> bool {
+        !self.uses_of(value).is_empty()
+    }
+
     /// The sorted, distinct positions that read `value`.
     fn uses_of(&self, value: NodeId) -> &[u32] {
-        let state = self.values[value.0 as usize];
-        &self.positions[state.first_use as usize..][..state.use_count as usize]
+        self.liveness.positions.of(value)
     }
 
     fn last_use(&self, value: NodeId) -> u32 {
@@ -727,8 +630,8 @@ impl<'g> Allocator<'g> {
         let file = self.file(float);
         file.values[register as usize] = Some(value);
         file.occupied |= 1 << register;
+        debug_assert!(self.is_used(value), "a bound value is read");
         let state = &mut self.values[value.0 as usize];
-        debug_assert!(state.is_used(), "a bound value is read");
         if float {
             state.fp |= 1 << register;
         } else {
@@ -927,7 +830,7 @@ impl<'g> Allocator<'g> {
         let graph = self.graph;
         for (layout_index, &block) in self.layout.iter().enumerate() {
             let data = graph.block(block);
-            let start = self.block_start[block.0 as usize];
+            let start = self.liveness.positions.block(block).start;
             if layout_index != 0 {
                 self.restore_entry_state(block, start);
             }
@@ -939,7 +842,7 @@ impl<'g> Allocator<'g> {
             self.fp.blocked = 0;
             for &node in &data.body {
                 self.current = node;
-                self.allocate_node(node);
+                self.allocate_node(node, block);
             }
             if let Some(control) = data.control {
                 self.current = control;
@@ -970,7 +873,7 @@ impl<'g> Allocator<'g> {
 
     fn allocate_phi(&mut self, phi: NodeId, block: BlockId) {
         let float = self.is_float(phi);
-        if !self.values[phi.0 as usize].is_used() {
+        if !self.is_used(phi) {
             // A phi nothing reads.
             self.out.nodes[phi.0 as usize].skipped = true;
             return;
@@ -1140,7 +1043,7 @@ impl<'g> Allocator<'g> {
         inputs
     }
 
-    fn allocate_node(&mut self, node: NodeId) {
+    fn allocate_node(&mut self, node: NodeId, block: BlockId) {
         let graph = self.graph;
         let data = graph.node(node);
         let at = self.pos(node);
@@ -1148,7 +1051,7 @@ impl<'g> Allocator<'g> {
         if data.repr != Repr::None
             && !properties.effectful
             && !properties.eager_deopt
-            && !self.values[node.0 as usize].is_used()
+            && !self.is_used(node)
         {
             self.out.nodes[node.0 as usize].skipped = true;
             return;
@@ -1205,7 +1108,7 @@ impl<'g> Allocator<'g> {
             for float in [false, true] {
                 for register in self.file(float).held() {
                     if let Some(value) = self.file(float).holder(register)
-                        && (self.liveness.is_live_after(node, value)
+                        && (self.liveness.is_live_after(block, node, value)
                             || (calls_out && eager_values.contains(&value)))
                     {
                         let location = Self::register_location(float, register);
@@ -1237,7 +1140,7 @@ impl<'g> Allocator<'g> {
                     .phi_hint(node, float)
                     .unwrap_or_else(|| self.take_register(float)),
             };
-            if self.values[node.0 as usize].is_used() {
+            if self.is_used(node) {
                 self.bind(node, register);
             }
             self.block_register(float, register);
@@ -1339,7 +1242,7 @@ impl<'g> Allocator<'g> {
         for (float, file) in [(false, &self.gp), (true, &self.fp)] {
             for register in file.held() {
                 if let Some(value) = file.holder(register)
-                    && (self.liveness.is_live_after(control, value)
+                    && (self.liveness.is_live_after(block, control, value)
                         || eager_values.contains(&value))
                 {
                     occupied.push((
@@ -1357,7 +1260,8 @@ impl<'g> Allocator<'g> {
                 .snapshot()
                 .into_iter()
                 .filter(|(value, _)| {
-                    self.liveness.is_live_after(control, *value) || eager_values.contains(value)
+                    self.liveness.is_live_after(block, control, *value)
+                        || eager_values.contains(value)
                 })
                 .collect();
             for (value, location) in values {
@@ -1373,7 +1277,7 @@ impl<'g> Allocator<'g> {
         let snapshot = self.snapshot();
         self.release_dead(at);
         for target in targets {
-            let target_start = self.block_start[target.0 as usize];
+            let target_start = self.liveness.positions.block(target).start;
             let live: Vec<(NodeId, Location)> = snapshot
                 .iter()
                 .copied()

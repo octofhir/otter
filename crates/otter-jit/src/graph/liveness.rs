@@ -1,9 +1,9 @@
-//! Control-flow liveness of SSA values at every node, including values read
-//! by eager and lazy deopt frame states.
+//! Control-flow liveness of SSA values at block boundaries.
 //!
 //! # Contents
-//! - [`Liveness`] — backward dataflow over blocks, with phi inputs read on
-//!   their incoming edges and frame states read at their owning nodes.
+//! - [`Liveness`] — backward dataflow over blocks, retaining one live-out
+//!   set per block and answering exact queries using local read positions.
+//! - [`positions`] — the layout and read table also used by the allocator.
 //!
 //! # Invariants
 //! - A value is live after a point only when some path from the point reads
@@ -15,39 +15,56 @@
 //!   frame state's values are read by its node.
 //!
 //! # See also
-//! - [`super::regalloc`] — uses these sets to preserve only registers whose
-//!   values are defined on every path into a collecting slow path.
+//! - [`super::regalloc`] — derives exact liveness at a node to preserve
+//!   registers and identify written roots at collecting boundaries.
 
 use smallvec::SmallVec;
 
 use super::ir::{BlockId, Graph, Kind, NodeId, Repr, StateValues};
+use positions::UsePositions;
 
-/// A node or value outside the sets.
+mod positions;
+pub(super) use positions::NO_POSITION;
+
+/// A block or value outside the sets.
 const NONE: u32 = u32::MAX;
 
-/// SSA values live after each node.
-#[derive(Debug, Default)]
+/// Instruction inputs and reconstruction reads at the instruction. A lazy
+/// state can reference the instruction's own result without reading it here.
+fn node_reads<'g>(
+    graph: &'g Graph,
+    node: NodeId,
+    states: &'g StateValues,
+) -> impl Iterator<Item = NodeId> + 'g {
+    let data = graph.node(node);
+    data.inputs.iter().copied().chain(
+        data.eager
+            .iter()
+            .chain(data.lazy.iter())
+            .flat_map(move |&state| states.of(state).iter().copied())
+            .filter(move |&value| value != node),
+    )
+}
+
+/// Block live-out sets and read positions for exact liveness queries.
+#[derive(Debug)]
 pub(crate) struct Liveness {
+    pub(super) positions: UsePositions,
     /// Dense bit index of block values and rematerializable constants, by
     /// node id; [`NONE`] for a node that defines no tracked value.
     index: Vec<u32>,
-    /// Row of each placed node's live-after set in `sets`, by node id;
-    /// [`NONE`] for a node outside the layout's bodies and controls.
-    rows: Vec<u32>,
+    /// Dense row index by block id; [`NONE`] outside the layout.
+    block_rows: Vec<u32>,
     /// Words of one set.
     words: usize,
-    /// The live-after sets, `words` per row.
-    sets: Vec<u64>,
+    /// One live-out set per block in layout order.
+    live_out: Vec<u64>,
 }
 
 impl Liveness {
-    #[cfg(test)]
-    pub(crate) fn compute(graph: &Graph, layout: &[BlockId]) -> Self {
-        Self::compute_with(graph, layout, &graph.all_state_values())
-    }
-
-    /// [`Self::compute`] over frame-state values already flattened.
-    pub(crate) fn compute_with(graph: &Graph, layout: &[BlockId], states: &StateValues) -> Self {
+    /// Solve liveness using the already flattened frame-state values.
+    pub(crate) fn compute(graph: &Graph, layout: &[BlockId], states: &StateValues) -> Self {
+        let positions = UsePositions::collect(graph, layout, states);
         let mut index = vec![NONE; graph.nodes.len()];
         let mut tracked = 0u32;
         for (node, data) in graph.nodes.iter().enumerate() {
@@ -82,20 +99,6 @@ impl Liveness {
                 set[slot as usize / 64] &= !(1 << (slot % 64));
             }
         };
-        // Everything `node` reads: its inputs and its frame states' values.
-        let read = |set: &mut [u64], node: NodeId| {
-            let data = graph.node(node);
-            for &input in &data.inputs {
-                bit(set, input);
-            }
-            for &state in data.eager.iter().chain(data.lazy.iter()) {
-                for &value in states.of(state) {
-                    if value != node {
-                        bit(set, value);
-                    }
-                }
-            }
-        };
         let successors = |block: BlockId| -> SmallVec<[BlockId; 2]> {
             match graph
                 .block(block)
@@ -109,21 +112,27 @@ impl Liveness {
                 _ => SmallVec::new(),
             }
         };
-        let row_of = |block: BlockId| block.0 as usize * words;
+        let mut block_rows = vec![NONE; graph.blocks.len()];
+        for (row, &block) in layout.iter().enumerate() {
+            block_rows[block.0 as usize] = row as u32;
+        }
+        let row_of = |block: BlockId| block_rows[block.0 as usize];
         // Upward-exposed reads and definitions of each block; phis define
         // at the block's start and read nothing in it.
-        let blocks = graph.blocks.len();
+        let blocks = layout.len();
         let mut generated = vec![0u64; blocks * words];
         let mut killed = vec![0u64; blocks * words];
         for &block in layout {
             let data = graph.block(block);
-            let row = row_of(block);
+            let row = row_of(block) as usize * words;
             let live = &mut generated[row..row + words];
             let kill = &mut killed[row..row + words];
             for &node in data.control.iter().rev().chain(data.body.iter().rev()) {
                 clear(live, node);
                 bit(kill, node);
-                read(live, node);
+                for value in node_reads(graph, node, states) {
+                    bit(live, value);
+                }
             }
             for &phi in &data.phis {
                 clear(live, phi);
@@ -134,8 +143,11 @@ impl Liveness {
             out.fill(0);
             for successor in successors(block) {
                 let row = row_of(successor);
-                for (word, &incoming) in out.iter_mut().zip(&live_in[row..row + words]) {
-                    *word |= incoming;
+                if row != NONE {
+                    let start = row as usize * words;
+                    for (word, &incoming) in out.iter_mut().zip(&live_in[start..start + words]) {
+                        *word |= incoming;
+                    }
                 }
                 let target = graph.block(successor);
                 if let Some(position) = target.predecessors.iter().position(|&p| p == block) {
@@ -153,7 +165,7 @@ impl Liveness {
             let mut changed = false;
             for &block in layout.iter().rev() {
                 live_out_of(block, &live_in, &mut out);
-                let row = row_of(block);
+                let row = row_of(block) as usize * words;
                 for (offset, &outgoing) in out.iter().enumerate() {
                     let next = generated[row + offset] | (outgoing & !killed[row + offset]);
                     if next != live_in[row + offset] {
@@ -166,48 +178,55 @@ impl Liveness {
                 break;
             }
         }
-        // The live-after set at every node, regardless of representation.
-        let mut rows = vec![NONE; graph.nodes.len()];
-        let placed: usize = layout
-            .iter()
-            .map(|&block| {
-                let data = graph.block(block);
-                data.body.len() + usize::from(data.control.is_some())
-            })
-            .sum();
-        let mut sets = vec![0u64; placed * words];
-        let mut next_row = 0u32;
+        // The fixed point no longer needs the locally generated sets.
+        // Reuse their storage for the outgoing edge sets.
+        let mut live_out = generated;
         for &block in layout {
-            let data = graph.block(block);
-            live_out_of(block, &live_in, &mut out);
-            for &node in data.control.iter().rev().chain(data.body.iter().rev()) {
-                let start = next_row as usize * words;
-                sets[start..start + words].copy_from_slice(&out);
-                rows[node.0 as usize] = next_row;
-                next_row += 1;
-                clear(&mut out, node);
-                read(&mut out, node);
-            }
+            let row = row_of(block) as usize * words;
+            live_out_of(block, &live_in, &mut live_out[row..row + words]);
         }
         Self {
+            positions,
             index,
-            rows,
+            block_rows,
             words,
-            sets,
+            live_out,
         }
     }
 
-    /// Whether `value` is live after `node` on some successor path.
-    pub(crate) fn is_live_after(&self, node: NodeId, value: NodeId) -> bool {
-        let (Some(&slot), Some(&row)) = (
-            self.index.get(value.0 as usize),
-            self.rows.get(node.0 as usize),
-        ) else {
-            return false;
-        };
-        if slot == NONE || row == NONE {
+    /// Whether `value` is read after `node` before its next definition, via
+    /// a local read or an outgoing edge of `block`.
+    pub(crate) fn is_live_after(&self, block: BlockId, node: NodeId, value: NodeId) -> bool {
+        let slot = self.index[value.0 as usize];
+        if slot == NONE {
             return false;
         }
-        self.sets[row as usize * self.words + slot as usize / 64] & (1 << (slot % 64)) != 0
+        let at = self.positions.node(node);
+        let end = self.positions.block(block).end;
+        debug_assert!(self.positions.block(block).contains(&at));
+        let definition = self.positions.node(value);
+        let read_end = if at < definition && definition < end {
+            // The later definition kills the value from this point onward.
+            // Any reads by the defining instruction precede its write.
+            definition + 1
+        } else {
+            let row = self.block_rows[block.0 as usize] as usize;
+            let word = row * self.words + slot as usize / 64;
+            if self.live_out[word] & (1 << (slot % 64)) != 0 {
+                return true;
+            }
+            end
+        };
+        if at + 1 == read_end {
+            return false;
+        }
+        let uses = self.positions.of(value);
+        match uses.last() {
+            Some(&last) if last < read_end => last > at,
+            Some(_) => uses
+                .get(uses.partition_point(|&read| read <= at))
+                .is_some_and(|&read| read < read_end),
+            None => false,
+        }
     }
 }

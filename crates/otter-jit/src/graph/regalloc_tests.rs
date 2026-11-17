@@ -1,6 +1,7 @@
 //! Canonical-home and control-flow-liveness regressions.
 //!
 //! # Contents
+//! - Exact liveness from local reads, outgoing phi inputs and block bounds.
 //! - Collecting slow paths, representation separation and interval reuse.
 //! - Path-dead values at an inner-loop entry and constant rematerialization.
 //! - GP and FP exhaustion across collecting operations, calls and backedges.
@@ -47,6 +48,84 @@ fn state(graph: &mut Graph, values: &[NodeId]) -> super::super::ir::FrameStateId
             .collect(),
         caller: None,
     })
+}
+
+#[test]
+fn exact_liveness_respects_local_definitions_frame_reads_and_phi_edges() {
+    let mut graph = Graph::default();
+    let entry = graph.new_block();
+    let left = graph.new_block();
+    let right = graph.new_block();
+    let join = graph.new_block();
+    graph.block_mut(left).predecessors = vec![entry];
+    graph.block_mut(right).predecessors = vec![entry];
+    graph.block_mut(join).predecessors = vec![left, right];
+    let shared = append(
+        &mut graph,
+        entry,
+        Kind::InitialRegister(0),
+        &[],
+        Repr::Tagged,
+    );
+    terminate(
+        &mut graph,
+        entry,
+        Kind::Branch {
+            kind: BranchKind::Truthy,
+            if_true: left,
+            if_false: right,
+        },
+        &[shared],
+    );
+
+    let left_start = append(&mut graph, left, Kind::CheckNotHole, &[shared], Repr::None);
+    let left_input = append(
+        &mut graph,
+        left,
+        Kind::InitialRegister(1),
+        &[],
+        Repr::Tagged,
+    );
+    let eager = state(&mut graph, &[shared]);
+    let guard = append(
+        &mut graph,
+        left,
+        Kind::CheckNotHole,
+        &[left_input],
+        Repr::None,
+    );
+    graph.node_mut(guard).eager = Some(eager);
+    let left_jump = terminate(&mut graph, left, Kind::Jump(join), &[]);
+
+    let right_input = append(&mut graph, right, Kind::LogicalNot, &[shared], Repr::Tagged);
+    let right_jump = terminate(&mut graph, right, Kind::Jump(join), &[]);
+    let phi = graph.add_node(Kind::Phi, &[left_input, right_input], Repr::Tagged);
+    graph.node_mut(phi).block = Some(join);
+    graph.block_mut(join).phis.push(phi);
+    terminate(&mut graph, join, Kind::Return, &[phi]);
+
+    let states = graph.all_state_values();
+    let layout = [entry, left, right, join];
+    let liveness = Liveness::compute(&graph, &layout, &states);
+    let live = |block, node, value| liveness.is_live_after(block, node, value);
+    assert!(
+        live(left, left_start, shared),
+        "the later guard reads its frame"
+    );
+    assert!(
+        !live(left, guard, shared),
+        "the later read is on the other branch"
+    );
+    assert!(
+        !live(left, left_start, left_input),
+        "its definition is still ahead"
+    );
+    assert!(live(left, left_input, left_input));
+    assert!(live(left, left_jump, left_input));
+    assert!(!live(left, left_jump, right_input));
+    assert!(live(right, right_jump, right_input));
+    assert!(!live(right, right_jump, left_input));
+    assert!(!live(right, right_jump, phi), "the join defines the phi");
 }
 
 /// Follow the emitted allocation protocol with distinct symbolic SSA values.
@@ -860,9 +939,11 @@ fn fixed_count_eviction_keeps_an_exit_only_occupant_under_full_pressure() {
             .all(|movement| movement.from != Location::Gp(1)),
         "with no free word, the displaced exit-only occupant lives in its definition home"
     );
-    let liveness = crate::graph::liveness::Liveness::compute(&graph, &[block]);
+    let states = graph.all_state_values();
+    let layout = [block];
+    let liveness = Liveness::compute(&graph, &layout, &states);
     assert!(
-        !liveness.is_live_after(shift, values[1]),
+        !liveness.is_live_after(block, shift, values[1]),
         "the frame state is its final use"
     );
     let mut contents = FxHashMap::default();
@@ -902,9 +983,11 @@ fn division_evicts_both_exit_only_words_before_materializing_a_constant_operand(
         let returned = tagged(&mut graph, block, division);
         terminate(&mut graph, block, Kind::Return, &[returned]);
         let allocation = allocate(&graph, &[block], X86_64);
-        let liveness = crate::graph::liveness::Liveness::compute(&graph, &[block]);
+        let states = graph.all_state_values();
+        let layout = [block];
+        let liveness = Liveness::compute(&graph, &layout, &states);
         for value in [tagged_word, untagged_word] {
-            assert!(!liveness.is_live_after(division, value));
+            assert!(!liveness.is_live_after(block, division, value));
             assert!(allocation.definition_spills.contains(&value));
         }
         assert!(matches!(
@@ -1550,8 +1633,10 @@ fn poll_saves_eager_state_values_that_die_on_the_backedge() {
     let eager = state(&mut graph, &[value]);
     let poll = terminate(&mut graph, header, Kind::JumpLoop(header), &[]);
     graph.node_mut(poll).eager = Some(eager);
-    let liveness = crate::graph::liveness::Liveness::compute(&graph, &[header]);
-    assert!(!liveness.is_live_after(poll, value));
+    let states = graph.all_state_values();
+    let layout = [header];
+    let liveness = Liveness::compute(&graph, &layout, &states);
+    assert!(!liveness.is_live_after(header, poll, value));
     let allocation = allocate(&graph, &[header], AARCH64);
     let register = allocation.node(value).result.expect("value in a register");
     let home = allocation.spill[&value];
@@ -1653,7 +1738,9 @@ fn register_pressure_preserves_distinct_live_homes_across_collection_and_backedg
         let poll = terminate(&mut graph, header, Kind::JumpLoop(header), &[]);
         graph.node_mut(poll).eager = Some(eager);
 
-        let liveness = crate::graph::liveness::Liveness::compute(&graph, &[entry, header]);
+        let states = graph.all_state_values();
+        let layout = [entry, header];
+        let liveness = Liveness::compute(&graph, &layout, &states);
         let allocation = allocate(&graph, &[entry, header], target);
         let homes: FxHashSet<Location> =
             values.iter().map(|value| allocation.spill[value]).collect();
@@ -1686,7 +1773,7 @@ fn register_pressure_preserves_distinct_live_homes_across_collection_and_backedg
             assert!(
                 values
                     .iter()
-                    .all(|&value| liveness.is_live_after(node, value))
+                    .all(|&value| liveness.is_live_after(header, node, value))
             );
             let saved = &allocation.node(node).live_homes;
             assert!(
@@ -1796,7 +1883,7 @@ fn float_pressure_preserves_untagged_homes_through_collection_call_reload_and_ba
         graph.node_mut(poll).eager = Some(eager);
 
         let allocation = allocate(&graph, &[entry, header], target);
-        let liveness = crate::graph::liveness::Liveness::compute(&graph, &[entry, header]);
+        let liveness = Liveness::compute(&graph, &[entry, header], &graph.all_state_values());
         let float_homes: FxHashSet<Location> =
             floats.iter().map(|value| allocation.spill[value]).collect();
         assert_eq!(float_homes.len(), floats.len());
@@ -1833,7 +1920,7 @@ fn float_pressure_preserves_untagged_homes_through_collection_call_reload_and_ba
             assert!(
                 values
                     .iter()
-                    .all(|&value| liveness.is_live_after(node, value))
+                    .all(|&value| liveness.is_live_after(header, node, value))
             );
             assert_eq!(
                 allocation.node(node).eager,

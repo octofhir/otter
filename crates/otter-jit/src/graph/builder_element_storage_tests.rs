@@ -93,11 +93,13 @@ fn bases(built: &Built) -> Vec<NodeId> {
 }
 
 fn assert_no_base_crosses(built: &Built, boundary: NodeId) {
-    let live = Liveness::compute(&built.graph, &built.layout);
+    let graph = &built.graph;
+    let block = graph.node(boundary).block.expect("placed boundary");
+    let live = Liveness::compute(graph, &built.layout, &graph.all_state_values());
     for base in bases(built) {
         assert_eq!(built.graph.node(base).repr, Repr::Word);
         assert!(
-            !live.is_live_after(boundary, base),
+            !live.is_live_after(block, boundary, base),
             "untraced base {base:?} is live across {:?}",
             built.graph.node(boundary).kind
         );
@@ -262,9 +264,12 @@ fn boxed_and_numeric_bases_expire_at_every_collecting_kind() {
             let [before, after] = assert_refreshed_accesses(&built, 0, 2);
             assert_eq!(bases(&built), [before, after]);
             assert_no_base_crosses(&built, boundary);
-            let owner = built.graph.node(before).inputs[0];
+            let graph = &built.graph;
+            let block = graph.node(boundary).block.expect("placed boundary");
+            let owner = graph.node(before).inputs[0];
+            let live = Liveness::compute(graph, &built.layout, &graph.all_state_values());
             assert!(
-                Liveness::compute(&built.graph, &built.layout).is_live_after(boundary, owner),
+                live.is_live_after(block, boundary, owner),
                 "the collector must retain the array owner"
             );
         }

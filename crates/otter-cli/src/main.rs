@@ -841,7 +841,7 @@ struct RunArgs {
     /// Directory for `--cpu-prof` artifacts.
     #[arg(long, default_value = "/tmp/otter-prof", requires = "cpu_prof")]
     cpu_prof_dir: PathBuf,
-    /// Sample every N bytecode dispatch ticks for `--cpu-prof`.
+    /// Minimum wall-clock microseconds between `--cpu-prof` samples.
     #[arg(long, default_value_t = 1000, requires = "cpu_prof")]
     cpu_prof_interval: u64,
     /// Base file name for `--cpu-prof` artifacts.

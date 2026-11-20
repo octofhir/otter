@@ -27,6 +27,64 @@ note: required by a bound in `assert_send`
 3 | fn assert_send<T: Send>() {}
   |                   ^^^^ required by this bound in `assert_send`
 
+error[E0277]: `UnsafeCell<otter_vm::Value>` cannot be shared between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `UnsafeCell<otter_vm::Value>` cannot be shared between threads safely
+  |
+  = help: within `NativeCallInfo`, the trait `Sync` is not implemented for `UnsafeCell<otter_vm::Value>`
+note: required because it appears within the type `gc_trace::RootCell<otter_vm::Value>`
+ --> src/gc_trace.rs
+  |
+  | pub(crate) struct RootCell<T: Copy>(std::cell::UnsafeCell<T>);
+  |                   ^^^^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+  = note: required for `&'static NativeCallInfo` to implement `Send`
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `UnsafeCell<Option<otter_vm::Value>>` cannot be shared between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `UnsafeCell<Option<otter_vm::Value>>` cannot be shared between threads safely
+  |
+  = help: within `NativeCallInfo`, the trait `Sync` is not implemented for `UnsafeCell<Option<otter_vm::Value>>`
+note: required because it appears within the type `gc_trace::RootCell<Option<otter_vm::Value>>`
+ --> src/gc_trace.rs
+  |
+  | pub(crate) struct RootCell<T: Copy>(std::cell::UnsafeCell<T>);
+  |                   ^^^^^^^^
+note: required because it appears within the type `NativeCallInfo`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCallInfo {
+  |            ^^^^^^^^^^^^^^
+  = note: required for `&'static NativeCallInfo` to implement `Send`
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
 error[E0277]: `*mut Frame` cannot be shared between threads safely
  --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
   |
@@ -106,37 +164,6 @@ note: required because it appears within the type `runtime_cx::RuntimeTurn<'stat
   |
   | pub(crate) struct RuntimeTurn<'rt> {
   |                   ^^^^^^^^^^^
-note: required because it appears within the type `NativeCtx<'static>`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCtx<'rt> {
-  |            ^^^^^^^^^
-note: required by a bound in `assert_send`
- --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
-  |
-3 | fn assert_send<T: Send>() {}
-  |                   ^^^^ required by this bound in `assert_send`
-
-error[E0277]: `*const ()` cannot be shared between threads safely
- --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
-  |
-6 |     assert_send::<otter_vm::NativeCtx<'static>>();
-  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const ()` cannot be shared between threads safely
-  |
-  = help: within `NativeCallInfo`, the trait `Sync` is not implemented for `*const ()`
-note: required because it appears within the type `PhantomData<*const ()>`
- --> $RUST/core/src/marker.rs
-note: required because it appears within the type `otter_vm::Value`
- --> src/value/mod.rs
-  |
-  | pub struct Value(u64, std::marker::PhantomData<*const ()>);
-  |            ^^^^^
-note: required because it appears within the type `NativeCallInfo`
- --> src/runtime_cx.rs
-  |
-  | pub struct NativeCallInfo {
-  |            ^^^^^^^^^^^^^^
-  = note: required for `&'static NativeCallInfo` to implement `Send`
 note: required because it appears within the type `NativeCtx<'static>`
  --> src/runtime_cx.rs
   |
@@ -1081,6 +1108,266 @@ note: required because it appears within the type `otter_vm::__macro_support::Gc
   |
   | pub struct GcHeap {
   |            ^^^^^^
+note: required because it appears within the type `otter_vm::Interpreter`
+ --> src/lib.rs
+  |
+  | pub struct Interpreter {
+  |            ^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub(crate) struct RuntimeTurn<'rt> {
+  |                   ^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*const u8` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const u8` cannot be sent between threads safely
+  |
+  = help: within `otter_regex::api::Buffers`, the trait `Send` is not implemented for `*const u8`
+note: required because it appears within the type `otter_regex::exec::native::State`
+ --> $WORKSPACE/crates/otter-regex/src/exec/native/mod.rs
+  |
+  | pub(crate) struct State {
+  |                   ^^^^^
+note: required because it appears within the type `Option<otter_regex::exec::native::State>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `otter_regex::api::Buffers`
+ --> $WORKSPACE/crates/otter-regex/src/api.rs
+  |
+  | struct Buffers {
+  |        ^^^^^^^
+  = note: required for `std::ptr::Unique<otter_regex::api::Buffers>` to implement `Send`
+note: required because it appears within the type `Box<otter_regex::api::Buffers>`
+ --> $RUST/alloc/src/boxed.rs
+note: required because it appears within the type `Option<Box<otter_regex::api::Buffers>>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `otter_regex::api::MatchScratch`
+ --> $WORKSPACE/crates/otter-regex/src/api.rs
+  |
+  | pub struct MatchScratch(Option<Box<Buffers>>);
+  |            ^^^^^^^^^^^^
+  = note: required for `std::cell::Cell<otter_regex::api::MatchScratch>` to implement `Send`
+note: required because it appears within the type `otter_vm::Interpreter`
+ --> src/lib.rs
+  |
+  | pub struct Interpreter {
+  |            ^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub(crate) struct RuntimeTurn<'rt> {
+  |                   ^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*mut u64` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut u64` cannot be sent between threads safely
+  |
+  = help: within `otter_regex::api::Buffers`, the trait `Send` is not implemented for `*mut u64`
+note: required because it appears within the type `otter_regex::exec::native::State`
+ --> $WORKSPACE/crates/otter-regex/src/exec/native/mod.rs
+  |
+  | pub(crate) struct State {
+  |                   ^^^^^
+note: required because it appears within the type `Option<otter_regex::exec::native::State>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `otter_regex::api::Buffers`
+ --> $WORKSPACE/crates/otter-regex/src/api.rs
+  |
+  | struct Buffers {
+  |        ^^^^^^^
+  = note: required for `std::ptr::Unique<otter_regex::api::Buffers>` to implement `Send`
+note: required because it appears within the type `Box<otter_regex::api::Buffers>`
+ --> $RUST/alloc/src/boxed.rs
+note: required because it appears within the type `Option<Box<otter_regex::api::Buffers>>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `otter_regex::api::MatchScratch`
+ --> $WORKSPACE/crates/otter-regex/src/api.rs
+  |
+  | pub struct MatchScratch(Option<Box<Buffers>>);
+  |            ^^^^^^^^^^^^
+  = note: required for `std::cell::Cell<otter_regex::api::MatchScratch>` to implement `Send`
+note: required because it appears within the type `otter_vm::Interpreter`
+ --> src/lib.rs
+  |
+  | pub struct Interpreter {
+  |            ^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub(crate) struct RuntimeTurn<'rt> {
+  |                   ^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*const otter_regex::program::Program` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const otter_regex::program::Program` cannot be sent between threads safely
+  |
+  = help: within `otter_regex::api::Buffers`, the trait `Send` is not implemented for `*const otter_regex::program::Program`
+note: required because it appears within the type `otter_regex::exec::native::State`
+ --> $WORKSPACE/crates/otter-regex/src/exec/native/mod.rs
+  |
+  | pub(crate) struct State {
+  |                   ^^^^^
+note: required because it appears within the type `Option<otter_regex::exec::native::State>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `otter_regex::api::Buffers`
+ --> $WORKSPACE/crates/otter-regex/src/api.rs
+  |
+  | struct Buffers {
+  |        ^^^^^^^
+  = note: required for `std::ptr::Unique<otter_regex::api::Buffers>` to implement `Send`
+note: required because it appears within the type `Box<otter_regex::api::Buffers>`
+ --> $RUST/alloc/src/boxed.rs
+note: required because it appears within the type `Option<Box<otter_regex::api::Buffers>>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `otter_regex::api::MatchScratch`
+ --> $WORKSPACE/crates/otter-regex/src/api.rs
+  |
+  | pub struct MatchScratch(Option<Box<Buffers>>);
+  |            ^^^^^^^^^^^^
+  = note: required for `std::cell::Cell<otter_regex::api::MatchScratch>` to implement `Send`
+note: required because it appears within the type `otter_vm::Interpreter`
+ --> src/lib.rs
+  |
+  | pub struct Interpreter {
+  |            ^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub(crate) struct RuntimeTurn<'rt> {
+  |                   ^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*const otter_regex::exec::native::HighPred` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*const otter_regex::exec::native::HighPred` cannot be sent between threads safely
+  |
+  = help: within `otter_regex::api::Buffers`, the trait `Send` is not implemented for `*const otter_regex::exec::native::HighPred`
+note: required because it appears within the type `otter_regex::exec::native::State`
+ --> $WORKSPACE/crates/otter-regex/src/exec/native/mod.rs
+  |
+  | pub(crate) struct State {
+  |                   ^^^^^
+note: required because it appears within the type `Option<otter_regex::exec::native::State>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `otter_regex::api::Buffers`
+ --> $WORKSPACE/crates/otter-regex/src/api.rs
+  |
+  | struct Buffers {
+  |        ^^^^^^^
+  = note: required for `std::ptr::Unique<otter_regex::api::Buffers>` to implement `Send`
+note: required because it appears within the type `Box<otter_regex::api::Buffers>`
+ --> $RUST/alloc/src/boxed.rs
+note: required because it appears within the type `Option<Box<otter_regex::api::Buffers>>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `otter_regex::api::MatchScratch`
+ --> $WORKSPACE/crates/otter-regex/src/api.rs
+  |
+  | pub struct MatchScratch(Option<Box<Buffers>>);
+  |            ^^^^^^^^^^^^
+  = note: required for `std::cell::Cell<otter_regex::api::MatchScratch>` to implement `Send`
+note: required because it appears within the type `otter_vm::Interpreter`
+ --> src/lib.rs
+  |
+  | pub struct Interpreter {
+  |            ^^^^^^^^^^^
+  = note: required because it appears within the type `&'static mut otter_vm::Interpreter`
+note: required because it appears within the type `runtime_cx::RuntimeTurn<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub(crate) struct RuntimeTurn<'rt> {
+  |                   ^^^^^^^^^^^
+note: required because it appears within the type `NativeCtx<'static>`
+ --> src/runtime_cx.rs
+  |
+  | pub struct NativeCtx<'rt> {
+  |            ^^^^^^^^^
+note: required by a bound in `assert_send`
+ --> tests/compile_fail/native_ctx_is_not_send.rs:3:19
+  |
+3 | fn assert_send<T: Send>() {}
+  |                   ^^^^ required by this bound in `assert_send`
+
+error[E0277]: `*mut Vec<u64>` cannot be sent between threads safely
+ --> tests/compile_fail/native_ctx_is_not_send.rs:6:19
+  |
+6 |     assert_send::<otter_vm::NativeCtx<'static>>();
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `*mut Vec<u64>` cannot be sent between threads safely
+  |
+  = help: within `otter_regex::api::Buffers`, the trait `Send` is not implemented for `*mut Vec<u64>`
+note: required because it appears within the type `otter_regex::exec::native::State`
+ --> $WORKSPACE/crates/otter-regex/src/exec/native/mod.rs
+  |
+  | pub(crate) struct State {
+  |                   ^^^^^
+note: required because it appears within the type `Option<otter_regex::exec::native::State>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `otter_regex::api::Buffers`
+ --> $WORKSPACE/crates/otter-regex/src/api.rs
+  |
+  | struct Buffers {
+  |        ^^^^^^^
+  = note: required for `std::ptr::Unique<otter_regex::api::Buffers>` to implement `Send`
+note: required because it appears within the type `Box<otter_regex::api::Buffers>`
+ --> $RUST/alloc/src/boxed.rs
+note: required because it appears within the type `Option<Box<otter_regex::api::Buffers>>`
+ --> $RUST/core/src/option.rs
+note: required because it appears within the type `otter_regex::api::MatchScratch`
+ --> $WORKSPACE/crates/otter-regex/src/api.rs
+  |
+  | pub struct MatchScratch(Option<Box<Buffers>>);
+  |            ^^^^^^^^^^^^
+  = note: required for `std::cell::Cell<otter_regex::api::MatchScratch>` to implement `Send`
 note: required because it appears within the type `otter_vm::Interpreter`
  --> src/lib.rs
   |

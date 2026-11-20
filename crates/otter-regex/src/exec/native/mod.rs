@@ -10,7 +10,8 @@
 //! - [`NativeTier`] — per-regex search counter and the code per width.
 //! - [`NativeCode`] — the finalized code of one program at one width.
 //! - [`Scratch`] — the backtrack stack, undo log and capture slots it runs on.
-//! - [`Window`] / [`search`] — run one window of candidate starts.
+//! - [`Window`] / [`prepare`] / [`run_window`] / [`search`] — run one window of
+//!   candidate starts, preparing the invariant inputs once per search.
 //! - [`State`] — the block emitted code reads its inputs from.
 //!
 //! # Invariants
@@ -216,6 +217,7 @@ impl core::fmt::Debug for NativeCode {
 
 /// Inputs and outputs of one native search, read and written by emitted code
 /// at the offsets in [`offsets`].
+#[derive(Debug)]
 #[repr(C)]
 pub(crate) struct State {
     text: *const u8,
@@ -304,18 +306,21 @@ pub(crate) enum Outcome {
     StepLimit,
 }
 
-/// Run every candidate start of `window` over `text` until one matches.
-/// `budget` is the number of steps the search may still take and comes back
-/// reduced by the steps taken.
-#[inline(always)]
-pub(crate) fn search<U: Unit>(
+/// Prepare the invariant inputs of a native search over `text`: size the
+/// scratch buffers once and fill every [`State`] field that does not change
+/// between windows. The window fields (`start`, `window_end`, `filter`) and
+/// the per-window `budget`/`next`/`spill_sp` are left for [`run_window`].
+///
+/// The returned state borrows `scratch` through raw pointers; it stays valid
+/// for as long as those buffers live at the same address, which a search's
+/// owned scratch guarantees. Growth helpers refresh the buffer pointers in
+/// place, so a prepared state survives mid-search growth.
+pub(crate) fn prepare<U: Unit>(
     code: &NativeCode,
     program: &Program,
     text: &[U],
-    window: Window,
-    budget: &mut u64,
     scratch: &mut Scratch,
-) -> Outcome {
+) -> State {
     let slots = program.slot_count();
     if scratch.caps.len() < slots {
         scratch.caps.resize(slots, NONE);
@@ -328,36 +333,70 @@ pub(crate) fn search<U: Unit>(
     }
     let stack_base = scratch.stack.as_mut_ptr();
     let stack_words = scratch.stack.len();
-    let mut state = State {
+    State {
         text: text.as_ptr().cast(),
         len: text.len() as u64,
-        start: window.start as u64,
-        window_end: window.end as u64,
-        filter: u64::from(window.filter),
+        start: 0,
+        window_end: 0,
+        filter: 0,
         caps: scratch.caps.as_mut_ptr(),
         stack_base,
         stack_limit: stack_base.wrapping_add(stack_words - FRAME_WORDS),
         log_base: scratch.log.as_mut_ptr(),
         log_cap: (scratch.log.len() * 8) as u64,
-        budget: *budget,
+        budget: 0,
         next: 0,
         spill_sp: 0,
         program,
         preds: code.preds.as_ptr(),
         stack: &raw mut scratch.stack,
         log: &raw mut scratch.log,
-    };
+    }
+}
+
+/// Run one window of candidate starts over a [`prepare`]d state until one
+/// matches. `budget` is the number of steps the search may still take and
+/// comes back reduced by the steps taken.
+#[inline(always)]
+pub(crate) fn run_window(
+    code: &NativeCode,
+    state: &mut State,
+    window: Window,
+    budget: &mut u64,
+) -> Outcome {
+    state.start = window.start as u64;
+    state.window_end = window.end as u64;
+    state.filter = u64::from(window.filter);
+    state.budget = *budget;
+    state.next = 0;
+    state.spill_sp = 0;
     // The entry was emitted for `program` at this width and prepared for
     // this thread when the search began; `code` outlives the call, and
     // every pointer in `state` stays valid for it: the buffers it grows are
     // re-read from `state` after each growth helper returns.
-    let status = (code.entry)(&raw mut state);
+    let status = (code.entry)(state);
     *budget = state.budget;
     match status {
         0 => Outcome::Exhausted(state.next as usize),
         1 => Outcome::Match,
         _ => Outcome::StepLimit,
     }
+}
+
+/// Run every candidate start of `window` over `text` until one matches.
+/// `budget` is the number of steps the search may still take and comes back
+/// reduced by the steps taken.
+#[inline(always)]
+pub(crate) fn search<U: Unit>(
+    code: &NativeCode,
+    program: &Program,
+    text: &[U],
+    window: Window,
+    budget: &mut u64,
+    scratch: &mut Scratch,
+) -> Outcome {
+    let mut state = prepare(code, program, text, scratch);
+    run_window(code, &mut state, window, budget)
 }
 
 /// An identity of the calling thread: its thread-pointer register, which no

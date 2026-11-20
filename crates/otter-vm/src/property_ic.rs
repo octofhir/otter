@@ -1590,6 +1590,22 @@ impl PropertyIcSlot {
         }
         self.begin_write();
         let mut dropped = self.retain(|entry| entry.proof_holds());
+        // A settled own-field overwrite supersedes the append transition that
+        // produced its receiver shape: once a receiver of the target shape
+        // reaches this site, the pre-transition source shape is historical
+        // feedback. At the capacity boundary drop that transition so a store
+        // that starts as a transition and settles into a plain slot write stays
+        // polymorphic instead of going terminally megamorphic.
+        if self.entry_count() == PROFILED_PROPERTY_PIC_CAPACITY
+            && handler.kind == IcHandlerKind::StoreField
+        {
+            let target = handler.receiver_shape.offset();
+            dropped.extend(self.retain(|entry| {
+                !(entry.kind() == IcHandlerKind::StoreTransition
+                    && entry.projection() == handler.projection
+                    && entry.aux().offset() == target)
+            }));
+        }
         let count = self.entry_count();
         if count < PROFILED_PROPERTY_PIC_CAPACITY {
             dropped.push(self.entries[count].write(handler));

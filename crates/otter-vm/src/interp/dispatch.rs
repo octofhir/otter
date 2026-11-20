@@ -821,7 +821,7 @@ impl Interpreter {
             self.enforce_work_budget_checkpoint()?;
         }
         if let Some(mut profiler) = self.cpu_profiler.take() {
-            profiler.maybe_sample(self, run.context);
+            profiler.maybe_sample_dispatch(self, run.context);
             self.cpu_profiler = Some(profiler);
         }
         if self.tracer.is_some() {

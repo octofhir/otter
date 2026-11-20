@@ -128,10 +128,7 @@ cargo test --release -q -p otter-vm --lib code_space
 cargo test --release -q -p otter-vm --test snapshot_boundary
 cargo test --release -q -p otter-jit --test artifact_agreement
 
-step "difftest: interpreter vs tiers vs gc-stress"
-# The full report is megabytes of per-case observations; keep it on disk and
-# surface only the verdict. Any mismatch fails the gate.
-difftest_report=$(mktemp)
+step "difftest: interpreter vs tiers"
 otter_binary=$(cargo build --release -q -p otter-cli --bin otter \
     --message-format=json-render-diagnostics | python3 -c '
 import json, sys
@@ -148,10 +145,16 @@ print(executable)
 # A cargo build links the binary without its startup image; write it back so
 # difftest runs the executable as it ships, restoring instead of bootstrapping.
 "$otter_binary" startup-image "$otter_binary"
-echo "full report: $difftest_report"
-difftest_status=0
-cargo run --release -q -p otter-difftest -- "$@" >"$difftest_report" || difftest_status=$?
-python3 - "$difftest_report" <<'PY'
+
+if [[ "${OTTER_GATE_FULL_DIFFTEST:-0}" == "1" ]]; then
+    # Heavy closing option for GC/codegen/ABI slices: the full corpus across
+    # tiers and GC strides. Hours-long; heavy stride-1 programs can exceed the
+    # per-process timeout even on a clean tree. Not the per-slice default.
+    difftest_report=$(mktemp)
+    echo "full report: $difftest_report"
+    difftest_status=0
+    cargo run --release -q -p otter-difftest -- "$@" >"$difftest_report" || difftest_status=$?
+    python3 - "$difftest_report" <<'PY'
 import json, sys
 
 report = json.load(open(sys.argv[1]))
@@ -163,8 +166,18 @@ if failed:
             print(f"  MISMATCH {case['case']}: {case['mismatch']}")
     sys.exit(1)
 PY
-if (( difftest_status != 0 )); then
-    exit "$difftest_status"
+    if (( difftest_status != 0 )); then
+        exit "$difftest_status"
+    fi
+else
+    # Fast semantic oracle: interpreter vs tiered across the whole corpus, no
+    # GC-stress, one process per mode. Minutes. Any divergence fails the gate.
+    quick_report=$(mktemp)
+    python3 scripts/dev/quick_difftest.py "$otter_binary" "$@" | tee "$quick_report"
+    if grep -q '^DIFF ' "$quick_report"; then
+        echo "quick difftest found tier divergence" >&2
+        exit 1
+    fi
 fi
 
 step "kernel ledger"

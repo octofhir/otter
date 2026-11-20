@@ -10,7 +10,7 @@
 //! - Both owners return the original resource cause through the one runtime mapper.
 //!
 //! # See also
-//! - `crate::evaluate_dynamic_linked_module_on` owns additional-realm evaluation.
+//! - `crate::dynamic_module_evaluation::evaluate_dynamic_linked_module_on` owns additional-realm evaluation.
 //! - `otter_vm::NativeCtx::evaluate_module` transfers its existing owned RunError.
 
 use super::RuntimeRealmId;
@@ -127,9 +127,11 @@ fn completed_dynamic_module_keeps_exact_source_refusal_in_default_and_additional
                 runtime
                     .interp
                     .with_host_realm(realm.realm, |interp| {
-                        Ok(crate::evaluate_dynamic_linked_module_on(
-                            interp, records, config, commonjs, url, linked,
-                        ))
+                        Ok(
+                            crate::dynamic_module_evaluation::evaluate_dynamic_linked_module_on(
+                                interp, records, config, commonjs, url, linked,
+                            ),
+                        )
                     })
                     .expect("real traced realm extent")
             }

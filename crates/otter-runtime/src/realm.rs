@@ -679,8 +679,7 @@ impl crate::Runtime {
     ) -> Result<crate::ExecutionResult, OtterError> {
         self.validate_realm(realm)?;
         self.interp.begin_jit_debug_capture();
-        self.module_graph.last_entry_url = Some(linked.entry_url.clone());
-        self.module_graph.last_module_count = linked.module.module_inits.len();
+        self.module_graph.record_linked(&linked);
         for metadata in &linked.metadata {
             self.source_maps.record_compiled_metadata(metadata);
         }

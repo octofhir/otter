@@ -39,9 +39,15 @@ oxc_diagnostics = { workspace = true }
 mimalloc = { workspace = true }
 
 [dev-dependencies]
+otter-gc = { workspace = true }
+otter-vm = { workspace = true }
 criterion = { workspace = true }
 tempfile = "3"
 
 [[bench]]
 name = "cold_start"
+harness = false
+
+[[bench]]
+name = "startup"
 harness = false

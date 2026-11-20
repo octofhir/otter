@@ -47,10 +47,6 @@ rustix = { workspace = true }
 blake3 = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
-otter-modules = { workspace = true }
-otter-node = { workspace = true }
-otter-web = { workspace = true }
 otter-macros = { workspace = true }
 otter-pm-manifest = { workspace = true }
 tempfile = "3"
@@ -59,7 +55,3 @@ trybuild = "1.0"
 [target.'cfg(target_arch = "x86_64")'.dev-dependencies]
 yaxpeax-arch = { workspace = true }
 yaxpeax-x86 = { workspace = true }
-
-[[bench]]
-name = "startup"
-harness = false

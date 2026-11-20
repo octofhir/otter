@@ -50,7 +50,7 @@ use crate::cursor::{Input, Unit};
 use crate::error::{ExecError, RegexError};
 use crate::exec::ExecConfig;
 use crate::exec::backtrack;
-use crate::exec::native::{self, NativeCode, NativeTier, Outcome, Window};
+use crate::exec::native::{self, NativeCode, NativeTier, Outcome, State, Window};
 use crate::flags::Flags;
 use crate::program::{Program, RequiredLiteral};
 
@@ -177,6 +177,12 @@ struct Buffers {
     literal: [u64; 2],
     /// Which buffer holds the slots of the last match a kept search found.
     last: LastSlots,
+    /// The native matcher's invariant inputs, prepared once on the first native
+    /// window of a search and reused by every later window. Its raw pointers
+    /// borrow the sibling `native` buffers (whose boxed home keeps its address
+    /// for the whole search) plus the regex, code and subject the search
+    /// borrows. A fresh search clears it before its first window.
+    native_state: Option<State>,
 }
 
 /// The execution whose buffer holds the last kept match's slots.
@@ -457,6 +463,8 @@ impl Regex {
         } else {
             Execution::Interpreted
         };
+        let mut scratch = scratch.0.unwrap_or_default();
+        scratch.native_state = None;
         Matches {
             regex: self,
             text,
@@ -465,7 +473,7 @@ impl Regex {
             anchored: false,
             done: false,
             steps_executed: 0,
-            scratch: scratch.0.unwrap_or_default(),
+            scratch,
             execution,
         }
     }
@@ -665,17 +673,32 @@ impl<U: Unit> Matches<'_, '_, U> {
         }
     }
 
+    /// Prepare this search's native matcher inputs once, on its first native
+    /// window; later windows reuse them. The prepared state borrows the boxed
+    /// scratch, which keeps its address for the whole search.
+    #[inline]
+    fn prepared_native(&mut self, code: &NativeCode) {
+        if self.scratch.native_state.is_none() {
+            self.scratch.native_state = Some(native::prepare(
+                code,
+                &self.regex.program,
+                self.text,
+                &mut self.scratch.native,
+            ));
+        }
+    }
+
     /// [`Self::advance_native`] of a search with a single candidate start: a
     /// sticky search tries only where it stands and a start-anchored program
     /// only offset 0, so one window decides it, without the scan state the
     /// general loop keeps.
     #[inline(never)]
     fn advance_native_once(&mut self, code: &NativeCode) -> Option<Result<(), ExecError>> {
-        let program = &self.regex.program;
         let pos = self.next_start;
         let admitted = if self.anchored {
             self.may_start_at(pos)
         } else {
+            let program = &self.regex.program;
             pos == 0
                 && program.prefilter.as_ref().is_none_or(|pf| {
                     pos < self.text.len() && pf.cp_may_start(self.text[pos].into())
@@ -685,6 +708,7 @@ impl<U: Unit> Matches<'_, '_, U> {
         if !admitted {
             return None;
         }
+        self.prepared_native(code);
         let window = Window {
             start: pos,
             end: pos,
@@ -692,13 +716,11 @@ impl<U: Unit> Matches<'_, '_, U> {
         };
         let remaining = self.config.step_limit.saturating_sub(self.steps_executed);
         let mut budget = remaining;
-        let outcome = native::search(
+        let outcome = native::run_window(
             code,
-            program,
-            self.text,
+            self.scratch.native_state.as_mut().unwrap(),
             window,
             &mut budget,
-            &mut self.scratch.native,
         );
         self.steps_executed = self.steps_executed.saturating_add(remaining - budget);
         match outcome {
@@ -726,10 +748,10 @@ impl<U: Unit> Matches<'_, '_, U> {
     /// candidates, and the code runs each window.
     #[inline(never)]
     fn advance_native(&mut self, code: &NativeCode) -> Option<Result<(), ExecError>> {
-        let program = &self.regex.program;
         let len = self.text.len();
         let mut pos = self.next_start;
         loop {
+            let program = &self.regex.program;
             let window = if self.anchored {
                 if !self.may_start_at(pos) {
                     break;
@@ -817,13 +839,12 @@ impl<U: Unit> Matches<'_, '_, U> {
             }
             let remaining = self.config.step_limit.saturating_sub(self.steps_executed);
             let mut budget = remaining;
-            let outcome = native::search(
+            self.prepared_native(code);
+            let outcome = native::run_window(
                 code,
-                program,
-                self.text,
+                self.scratch.native_state.as_mut().unwrap(),
                 window,
                 &mut budget,
-                &mut self.scratch.native,
             );
             self.steps_executed = self.steps_executed.saturating_add(remaining - budget);
             match outcome {

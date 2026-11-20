@@ -13,6 +13,7 @@
 //! - [`OptimizingCompileQueue`] — the isolate's compiler threads, the requests
 //!   they take, the results they hand back, and the isolate-thread record of
 //!   every compilation in flight.
+//! - [`pool`] — worker lifetime and synchronized dispatch.
 //! - [`PendingCompile`] — what the isolate keeps for one request until its
 //!   result is installed or dropped.
 //! - [`FinishedCompile`] — one request's compiler outcome and its timing.
@@ -37,7 +38,9 @@
 //! - With no compiler threads the requesting thread compiles at once and the
 //!   caller installs the result before the request returns.
 //! - Compiler threads start on demand: one more whenever the compilations in
-//!   flight outnumber the threads, up to the configured count.
+//!   flight outnumber the threads, up to the configured count. If the first
+//!   worker cannot start, the requesting thread compiles that job. If pool
+//!   growth fails, existing workers drain the queue.
 //! - Compiler threads belong to the isolate: dropping the queue stops and
 //!   cancels and joins them, and requests not yet started are dropped outside
 //!   the queue lock. A compiler panic
@@ -49,9 +52,9 @@
 //! - [`crate::jit::JitCompilerHook`] — the compiler a request runs.
 //! - [`crate::jit_roots`] — the roots a pending compilation retains.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+mod pool;
+use pool::CompilerPool;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::JitCompileCancellation;
@@ -60,10 +63,6 @@ use crate::jit::JitCompileRequest;
 use crate::jit::{JitCompileError, JitCompileStatus, JitCompilerHook};
 use crate::jit_compile_lifetime::CompilationSources;
 use crate::jit_roots::CompilationRoot;
-
-/// Stack reserved for each compiler thread: the same depth the isolate thread
-/// gives a compilation that runs on it.
-const COMPILER_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 /// What the isolate keeps for one compilation in flight.
 pub(crate) struct PendingCompile {
@@ -196,99 +195,6 @@ impl BakeProducts {
     }
 }
 
-/// A compiler panic, carried to the isolate thread.
-type CompilerPanic = Box<dyn std::any::Any + Send>;
-
-#[derive(Default)]
-struct PoolQueue {
-    requests: VecDeque<CompileJob>,
-    results: Vec<Result<FinishedCompile, CompilerPanic>>,
-    stopping: bool,
-}
-
-struct PoolShared {
-    queue: Mutex<PoolQueue>,
-    wake: Condvar,
-    /// Set while `queue.results` holds anything; read without the lock.
-    finished: AtomicBool,
-}
-
-impl PoolShared {
-    fn lock(&self) -> MutexGuard<'_, PoolQueue> {
-        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-struct CompilerPool {
-    shared: Arc<PoolShared>,
-    threads: Vec<std::thread::JoinHandle<()>>,
-}
-
-impl CompilerPool {
-    fn new() -> Self {
-        Self {
-            shared: Arc::new(PoolShared {
-                queue: Mutex::default(),
-                wake: Condvar::new(),
-                finished: AtomicBool::new(false),
-            }),
-            threads: Vec::new(),
-        }
-    }
-
-    /// Start one more compiler thread.
-    fn spawn_thread(&mut self) {
-        let shared = Arc::clone(&self.shared);
-        if let Ok(thread) = std::thread::Builder::new()
-            .name(format!("otter-jit-compiler-{}", self.threads.len()))
-            .stack_size(COMPILER_THREAD_STACK_BYTES)
-            .spawn(move || compile_requests(&shared))
-        {
-            self.threads.push(thread);
-        }
-    }
-}
-
-impl Drop for CompilerPool {
-    fn drop(&mut self) {
-        let requests = {
-            let mut queue = self.shared.lock();
-            queue.stopping = true;
-            std::mem::take(&mut queue.requests)
-        };
-        // Snapshot and hook destructors must never run under the queue lock.
-        drop(requests);
-        self.shared.wake.notify_all();
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
-    }
-}
-
-/// One compiler thread: take requests until the pool stops.
-fn compile_requests(shared: &PoolShared) {
-    loop {
-        let job = {
-            let mut queue = shared.lock();
-            loop {
-                if queue.stopping {
-                    return;
-                }
-                if let Some(job) = queue.requests.pop_front() {
-                    break job;
-                }
-                queue = shared
-                    .wake
-                    .wait(queue)
-                    .unwrap_or_else(PoisonError::into_inner);
-            }
-        };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile(job)));
-        shared.lock().results.push(result);
-        shared.finished.store(true, Ordering::Release);
-    }
-}
-
 fn compile(job: CompileJob) -> FinishedCompile {
     let started = Instant::now();
     let code_object_id = job.code_object_id;
@@ -397,9 +303,7 @@ impl OptimizingCompileQueue {
 
     /// Whether a compiler thread has handed back a result not yet collected.
     pub(crate) fn has_finished(&self) -> bool {
-        self.pool
-            .as_ref()
-            .is_some_and(|pool| pool.shared.finished.load(Ordering::Acquire))
+        self.pool.as_ref().is_some_and(CompilerPool::has_finished)
     }
 
     /// Hand `request` to the compiler. With no compiler threads it compiles
@@ -424,16 +328,15 @@ impl OptimizingCompileQueue {
         if self.threads == 0 {
             return Some((pending, compile(job)));
         }
+        let in_flight = self.pending.len() + 1;
+        let pool = self.pool.get_or_insert_with(CompilerPool::new);
+        if !pool.ensure_worker(self.threads.min(in_flight)) {
+            return Some((pending, compile(job)));
+        }
         self.pending_functions
             .insert(pending.function_id, code_object_id);
         self.pending.insert(code_object_id, pending);
-        let in_flight = self.pending.len();
-        let pool = self.pool.get_or_insert_with(CompilerPool::new);
-        if pool.threads.len() < self.threads.min(in_flight) {
-            pool.spawn_thread();
-        }
-        pool.shared.lock().requests.push_back(job);
-        pool.shared.wake.notify_one();
+        pool.enqueue(job);
         None
     }
 
@@ -443,11 +346,7 @@ impl OptimizingCompileQueue {
         let Some(pool) = &self.pool else {
             return Vec::new();
         };
-        let results = {
-            let mut queue = pool.shared.lock();
-            pool.shared.finished.store(false, Ordering::Release);
-            std::mem::take(&mut queue.results)
-        };
+        let results = pool.take_results();
         let mut finished = Vec::with_capacity(results.len());
         for result in results {
             let compiled = result.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
@@ -469,7 +368,9 @@ impl OptimizingCompileQueue {
                 pending.cancellation.cancel();
             }
         }
-        self.acknowledge_queued_cancellations();
+        if let Some(pool) = &self.pool {
+            pool.acknowledge_queued_cancellations();
+        }
     }
 
     /// Cancel every request for teardown, source-space replacement or pressure.
@@ -477,7 +378,9 @@ impl OptimizingCompileQueue {
         for pending in self.pending.values() {
             pending.cancellation.cancel();
         }
-        self.acknowledge_queued_cancellations();
+        if let Some(pool) = &self.pool {
+            pool.acknowledge_queued_cancellations();
+        }
     }
 
     /// Mark only cancelled owners that outlived an actual pressure census.
@@ -487,35 +390,6 @@ impl OptimizingCompileQueue {
                 pending.retry_code_reclamation = true;
             }
         }
-    }
-
-    fn acknowledge_queued_cancellations(&self) {
-        let Some(pool) = &self.pool else {
-            return;
-        };
-        let cancelled = {
-            let mut queue = pool.shared.lock();
-            let requests = std::mem::take(&mut queue.requests);
-            let mut cancelled = Vec::new();
-            for job in requests {
-                if job.cancellation.is_cancelled() {
-                    cancelled.push(job);
-                } else {
-                    queue.requests.push_back(job);
-                }
-            }
-            cancelled
-        };
-        if cancelled.is_empty() {
-            return;
-        }
-        let finished = cancelled
-            .into_iter()
-            .map(cancel_queued_job)
-            .map(Ok)
-            .collect::<Vec<_>>();
-        pool.shared.lock().results.extend(finished);
-        pool.shared.finished.store(true, Ordering::Release);
     }
 
     /// Visit the roots of every compilation in flight.
@@ -538,238 +412,4 @@ impl OptimizingCompileQueue {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::code_space::CodeSpace;
-    use crate::jit_roots::CalleeIdentityCell;
-    use crate::{ExecutionContext, Value, source_registry::SourceRegistry};
-    use otter_resource::ResourceAccount;
-    use std::sync::{Weak, atomic::AtomicUsize, mpsc};
-
-    #[derive(Debug)]
-    struct CancellingHook {
-        entered: mpsc::Sender<u32>,
-        invocations: AtomicUsize,
-        active_root: Weak<CalleeIdentityCell>,
-        acknowledged: AtomicBool,
-    }
-
-    impl JitCompilerHook for CancellingHook {
-        fn compile_function(
-            &self,
-            _request: JitCompileRequest,
-        ) -> Result<JitCompileStatus, JitCompileError> {
-            panic!("queue fixture compiles only optimizing jobs")
-        }
-
-        fn compile_optimized_function(
-            &self,
-            request: JitCompileRequest,
-        ) -> Result<JitCompileStatus, JitCompileError> {
-            self.invocations.fetch_add(1, Ordering::Relaxed);
-            self.entered.send(request.snapshot.code_block.id).unwrap();
-            while !request.cancellation.is_cancelled() {
-                std::thread::yield_now();
-            }
-            assert!(
-                self.active_root.upgrade().is_some(),
-                "roots outlive active readers"
-            );
-            self.acknowledged.store(true, Ordering::Relaxed);
-            Ok(JitCompileStatus::Cancelled)
-        }
-    }
-
-    fn request(
-        context: &ExecutionContext,
-        code_object_id: u64,
-    ) -> (JitCompileRequest, PendingCompile, Weak<CalleeIdentityCell>) {
-        let snapshot = context
-            .jit_compile_snapshot(context.function_base())
-            .unwrap();
-        let sources = CompilationSources::retain(context, &snapshot).unwrap();
-        let cancellation = JitCompileCancellation::default();
-        let root = Arc::new(CalleeIdentityCell::holding(Value::undefined()));
-        let weak = Arc::downgrade(&root);
-        let pending = PendingCompile {
-            function_id: snapshot.code_block.id,
-            osr_pc: None,
-            tier: crate::jit_debug::JitDebugTier::Optimizing,
-            function: snapshot.code_block.clone(),
-            products: Arc::new(BakeProducts(Mutex::new(BakeOutput {
-                roots: vec![CompilationRoot::CalleeIdentity(root)],
-                sources: Some(sources),
-                ..BakeOutput::default()
-            }))),
-            cancellation: cancellation.clone(),
-            retry_code_reclamation: false,
-            feedback_epoch: None,
-            queued_ns: 0,
-            perf_name: None,
-        };
-        let request = JitCompileRequest {
-            cancellation,
-            snapshot,
-            debug: crate::JitDebugRequest::disabled(),
-            artifact_identity: None,
-            osr_pc: None,
-            code_object_id,
-        };
-        (request, pending, weak)
-    }
-
-    #[test]
-    fn cancellation_skips_queued_hooks_and_holds_active_owners_until_drop_ack() {
-        let space = Arc::new(CodeSpace::default());
-        let account = ResourceAccount::default();
-        let contexts = ["active.js", "queued.js"].map(|name| {
-            space
-                .link_evictable_module(
-                    crate::test_support::minimal_bytecode_module(name),
-                    SourceRegistry::default(),
-                    &account,
-                )
-                .unwrap()
-        });
-        let (active, active_pending, active_root) = request(&contexts[0], 1);
-        let (queued, queued_pending, queued_root) = request(&contexts[1], 2);
-        let queued_id = queued.snapshot.code_block.id;
-        let (entered, entries) = mpsc::channel();
-        let hook = Arc::new(CancellingHook {
-            entered,
-            invocations: AtomicUsize::new(0),
-            active_root: active_root.clone(),
-            acknowledged: AtomicBool::new(false),
-        });
-        let mut queue = OptimizingCompileQueue::default();
-        queue.set_threads(1);
-        assert!(
-            queue
-                .submit(
-                    hook.clone(),
-                    CompileInput::Request(Box::new(active)),
-                    1,
-                    active_pending
-                )
-                .is_none()
-        );
-        assert_eq!(entries.recv().unwrap(), contexts[0].function_base());
-        assert!(
-            queue
-                .submit(
-                    hook.clone(),
-                    CompileInput::Request(Box::new(queued)),
-                    2,
-                    queued_pending
-                )
-                .is_none()
-        );
-        // Both chunks are retained only by the pending owners, not requests'
-        // CodeBlock Arcs. The worker cannot complete before cancellation.
-        drop(contexts);
-        assert!(space.eviction_candidates().is_empty());
-        queue.invalidate(&[queued_id]);
-        assert_eq!(queue.pending_count(), 2, "a queued ACK still owns its job");
-        assert!(
-            queue.is_pending(queued_id),
-            "pending survives until terminal ACK consumption"
-        );
-        assert!(queued_root.upgrade().is_some());
-        queue.mark_cancelled_for_reclamation_retry();
-        assert!(queue.pending[&2].retry_code_reclamation);
-        assert!(!queue.pending[&1].retry_code_reclamation);
-        let finished = queue.take_finished();
-        assert_eq!(
-            queue.pending_count(),
-            1,
-            "the active compiler still owns its job"
-        );
-        assert_eq!(finished.len(), 1);
-        assert_eq!(finished[0].0.function_id, queued_id);
-        assert_eq!(
-            finished[0].1.pre_hook_exit,
-            Some(crate::JitDebugPreHookExit::Cancelled)
-        );
-        assert_eq!(finished[0].1.duration, Duration::ZERO);
-        assert!(matches!(
-            finished[0].1.status,
-            Ok(JitCompileStatus::Cancelled)
-        ));
-        assert!(active_root.upgrade().is_some());
-        drop(finished);
-        assert!(queued_root.upgrade().is_none());
-        assert_eq!(space.eviction_candidates().len(), 1);
-        // Drop must cancel the active token before joining, and preserve its
-        // roots through the hook's final cancellation check/acknowledgement.
-        drop(queue);
-        assert!(active_root.upgrade().is_none());
-        assert_eq!(space.eviction_candidates().len(), 2);
-        assert_eq!(hook.invocations.load(Ordering::Relaxed), 1);
-        assert!(hook.acknowledged.load(Ordering::Relaxed));
-        assert!(
-            entries.try_recv().is_err(),
-            "cancelled FIFO job never enters its hook"
-        );
-    }
-
-    #[test]
-    fn active_hook_cancellation_does_not_claim_a_pre_hook_refusal() {
-        let space = Arc::new(CodeSpace::default());
-        let context = space
-            .link_evictable_module(
-                crate::test_support::minimal_bytecode_module("active-cancel.js"),
-                SourceRegistry::default(),
-                &ResourceAccount::default(),
-            )
-            .unwrap();
-        let (active, pending, root) = request(&context, 1);
-        let token = pending.cancellation.clone();
-        let (entered, entries) = mpsc::channel();
-        let hook = Arc::new(CancellingHook {
-            entered,
-            invocations: AtomicUsize::new(0),
-            active_root: root.clone(),
-            acknowledged: AtomicBool::new(false),
-        });
-        let mut queue = OptimizingCompileQueue::default();
-        queue.set_threads(1);
-        assert!(
-            queue
-                .submit(
-                    hook.clone(),
-                    CompileInput::Request(Box::new(active)),
-                    1,
-                    pending
-                )
-                .is_none()
-        );
-        assert_eq!(
-            entries.recv_timeout(Duration::from_secs(5)).unwrap(),
-            context.function_base()
-        );
-        token.cancel();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let finished = loop {
-            let rows = queue.take_finished();
-            if !rows.is_empty() {
-                break rows;
-            }
-            assert!(Instant::now() < deadline, "active cancellation did not ACK");
-            std::thread::yield_now();
-        };
-        assert_eq!(finished.len(), 1);
-        assert_eq!(finished[0].1.pre_hook_exit, None);
-        assert!(matches!(
-            finished[0].1.status,
-            Ok(JitCompileStatus::Cancelled)
-        ));
-        assert_eq!(hook.invocations.load(Ordering::Relaxed), 1);
-        assert!(hook.acknowledged.load(Ordering::Relaxed));
-        assert!(
-            root.upgrade().is_some(),
-            "active products outlive hook acknowledgement"
-        );
-        drop(finished);
-        assert!(root.upgrade().is_none());
-    }
-}
+mod tests;

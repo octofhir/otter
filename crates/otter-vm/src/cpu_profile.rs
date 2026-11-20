@@ -1,15 +1,23 @@
 //! Bounded opt-in VM stack sampling for CPU-profile artifacts.
 //!
-//! The profiler samples the active VM stack every configured number of
-//! bytecode dispatch ticks. It owns no signals, helper threads, raw frame
-//! pointers, or user-configurable memory knobs.
+//! The profiler retains a wall-clock-paced sample of the active JavaScript
+//! stack. Sampling fires from two cooperative checkpoints on the mutator
+//! thread: bytecode dispatch and the compiled back-edge poll. The back-edge
+//! checkpoint covers native Template and Graph execution, so hot compiled
+//! functions appear in the profile by source name through the published
+//! native frame chain instead of being a sampling blind spot. It owns no
+//! signals, helper threads, raw frame pointers, or user-configurable memory
+//! knobs.
 //!
 //! # Contents
-//! - [`CpuProfiler`] — dispatch-loop sampler and lifetime admission state.
+//! - [`CpuProfiler`] — checkpoint sampler and lifetime admission state.
 //! - [`CpuProfile`] — owned sample batches returned to embedders.
 //!
 //! # Invariants
-//! - Disabled profilers cost only an `Option` check in the dispatch loop.
+//! - Disabled profilers cost only an `Option` check at each checkpoint.
+//! - At most one sample is retained per configured interval; checkpoints
+//!   between due samples only read the clock (dispatch additionally gates
+//!   the clock read behind a fixed tick countdown).
 //! - One profiler lifetime retains at most [`CPU_PROFILE_SAMPLE_LIMIT`] samples
 //!   and [`CPU_PROFILE_RETAINED_BYTE_LIMIT`] logical sample bytes.
 //! - One sample owns at most [`CPU_PROFILE_MAX_FRAMES`] frames and
@@ -23,6 +31,8 @@
 //! # See also
 //! - `crate::native_stack_snapshot` for the common physical and inline frame walk.
 //! - [`crate::run_control::StackFrameSnapshot`]
+//! - [`crate::runtime_activation::RuntimeCall::backedge_poll`] for the compiled
+//!   sampling checkpoint.
 
 use serde::Serialize;
 
@@ -38,11 +48,16 @@ const CPU_PROFILE_SAMPLE_BYTE_LIMIT: usize = 1024 * 1024;
 const CPU_PROFILE_MAX_FRAMES: usize = 255;
 /// Conservative outer-vector and allocator overhead charged to every sample.
 const CPU_PROFILE_SAMPLE_OVERHEAD_BYTES: usize = 128;
+/// Dispatch ticks between clock reads while profiling. The dispatch hook
+/// fires per instruction, so the wall-clock check itself is gated behind a
+/// fixed countdown; the resulting position skid is bounded by this many
+/// interpreted instructions.
+const DISPATCH_CLOCK_CHECK_TICKS: u64 = 1024;
 
 /// Owned VM stack profile captured during one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CpuProfile {
-    /// Bytecode dispatch ticks between sample attempts.
+    /// Minimum wall-clock microseconds between retained samples.
     pub interval: u64,
     /// Top-frame first stack samples.
     pub samples: Vec<Vec<StackFrameSnapshot>>,
@@ -62,11 +77,11 @@ impl CpuProfile {
     }
 }
 
-/// Dispatch-loop VM stack sampler.
+/// Cooperative checkpoint VM stack sampler.
 #[derive(Debug)]
 pub(crate) struct CpuProfiler {
     interval: u64,
-    ticks_until_sample: u64,
+    ticks_until_clock_check: u64,
     samples: Vec<Vec<StackFrameSnapshot>>,
     time_deltas_us: Vec<u64>,
     last_sample_at: std::time::Instant,
@@ -77,13 +92,14 @@ pub(crate) struct CpuProfiler {
 }
 
 impl CpuProfiler {
-    /// Create a profiler that samples every `interval` bytecode ticks.
+    /// Create a profiler that retains at most one sample per `interval`
+    /// wall-clock microseconds.
     #[must_use]
     pub(crate) fn new(interval: u64) -> Self {
         let interval = interval.max(1);
         Self {
             interval,
-            ticks_until_sample: interval,
+            ticks_until_clock_check: DISPATCH_CLOCK_CHECK_TICKS,
             samples: Vec::new(),
             time_deltas_us: Vec::new(),
             last_sample_at: std::time::Instant::now(),
@@ -94,18 +110,47 @@ impl CpuProfiler {
         }
     }
 
-    /// Tick the sampler and capture a stack when the interval expires.
+    /// Dispatch checkpoint: gate the clock read behind a fixed tick countdown,
+    /// then sample when the interval is due.
     ///
     /// Kept out of line: the dispatch loop calls this per instruction behind a
     /// loop-invariant "profiler installed" branch, and inlining the sampling
     /// body there costs hot-loop registers and instruction cache.
     #[inline(never)]
-    pub(crate) fn maybe_sample(&mut self, vm: &crate::Interpreter, context: &ExecutionContext) {
-        if self.ticks_until_sample > 1 {
-            self.ticks_until_sample -= 1;
+    pub(crate) fn maybe_sample_dispatch(
+        &mut self,
+        vm: &crate::Interpreter,
+        context: &ExecutionContext,
+    ) {
+        if self.ticks_until_clock_check > 1 {
+            self.ticks_until_clock_check -= 1;
             return;
         }
-        self.ticks_until_sample = self.interval;
+        self.ticks_until_clock_check = DISPATCH_CLOCK_CHECK_TICKS;
+        self.sample_if_due(vm, context);
+    }
+
+    /// Compiled back-edge checkpoint: the poll already batches thousands of
+    /// back edges, so the clock is read directly. This is the sampling point
+    /// that covers native Template and Graph execution.
+    #[inline(never)]
+    pub(crate) fn maybe_sample_poll(
+        &mut self,
+        vm: &crate::Interpreter,
+        context: &ExecutionContext,
+    ) {
+        self.sample_if_due(vm, context);
+    }
+
+    fn sample_if_due(&mut self, vm: &crate::Interpreter, context: &ExecutionContext) {
+        let now = std::time::Instant::now();
+        if now
+            .saturating_duration_since(self.last_sample_at)
+            .as_micros()
+            < u128::from(self.interval)
+        {
+            return;
+        }
 
         let Some(remaining) = CPU_PROFILE_RETAINED_BYTE_LIMIT.checked_sub(self.retained_bytes)
         else {
@@ -128,7 +173,7 @@ impl CpuProfiler {
                 return;
             }
         };
-        let _ = self.try_record_sample(capture, std::time::Instant::now());
+        let _ = self.try_record_sample(capture, now);
     }
 
     fn try_record_sample(&mut self, capture: CapturedSample, now: std::time::Instant) -> bool {
@@ -350,5 +395,46 @@ mod tests {
         assert!(profile.samples.is_empty());
         assert_eq!(profile.dropped_samples, 1);
         assert_eq!(profile.truncated_frames, 0);
+    }
+
+    fn pacing_fixture() -> (crate::Interpreter, ExecutionContext) {
+        let vm = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+        let context = ExecutionContext::from_module(
+            crate::test_support::minimal_bytecode_module("cpu-profile-pacing.js"),
+            crate::source_registry::SourceRegistry::default(),
+        )
+        .expect("fixture context");
+        (vm, context)
+    }
+
+    #[test]
+    fn wall_clock_pacing_admits_one_sample_per_interval() {
+        let (vm, context) = pacing_fixture();
+        let mut profiler = CpuProfiler::new(60_000_000);
+        profiler.maybe_sample_poll(&vm, &context);
+        assert_eq!(profiler.drain().sample_count(), 0);
+
+        let mut profiler = CpuProfiler::new(1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        profiler.maybe_sample_poll(&vm, &context);
+        assert_eq!(profiler.samples.len(), 1);
+        // The capture itself can outlast a 1µs interval; pacing is proven by
+        // raising the interval so the next checkpoint is not due.
+        profiler.interval = 60_000_000;
+        profiler.maybe_sample_poll(&vm, &context);
+        assert_eq!(profiler.drain().sample_count(), 1);
+    }
+
+    #[test]
+    fn dispatch_checkpoint_gates_the_clock_behind_the_tick_countdown() {
+        let (vm, context) = pacing_fixture();
+        let mut profiler = CpuProfiler::new(1);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        for _ in 1..DISPATCH_CLOCK_CHECK_TICKS {
+            profiler.maybe_sample_dispatch(&vm, &context);
+        }
+        assert_eq!(profiler.drain().sample_count(), 0);
+        profiler.maybe_sample_dispatch(&vm, &context);
+        assert_eq!(profiler.drain().sample_count(), 1);
     }
 }

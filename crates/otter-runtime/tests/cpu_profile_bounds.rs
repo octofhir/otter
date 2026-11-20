@@ -14,7 +14,7 @@ use otter_runtime::{JitSelection, Runtime, SourceInput};
 fn deep_samples_are_bounded_and_report_truncated_frames() {
     let mut runtime = Runtime::builder()
         .jit_selection(JitSelection::InterpreterOnly)
-        .max_stack_depth(512)
+        .max_stack_depth(4096)
         .cpu_profile_interval(Some(1))
         .build()
         .expect("runtime");
@@ -26,7 +26,7 @@ function dive(depth) {
   if (depth === 0) return 7;
   return dive(depth - 1);
 }
-dive(260);
+dive(2000);
 "#,
             ),
             "<cpu-profile-bounds>",

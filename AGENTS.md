@@ -273,8 +273,21 @@ Fast iteration tips:
   These incremental checks default to stress stride 1 and preserve an explicit
   stress value and Cargo target. Run the full gate and required targeted
   Test262 checks once the coherent change is ready, rather than after each edit.
-- For closing moving-GC checks, use `target/checked/otter` with
-  `python3 scripts/dev/gc-stress.py target/checked/otter benchmarks/results/<fresh-dir> --all --strides 1-16`.
+- The essential per-slice checks are bounded (minutes): `cargo fmt --all`,
+  `cargo clippy --all-targets --all-features -- -D warnings`, the affected unit
+  tests (`cargo test -p otter-vm/-p otter-runtime/-p otter-jit`), the retired-
+  instruction A/B, `python3 scripts/dev/quick_difftest.py <otter>` (interpreter
+  vs tiered across the whole corpus, no GC-stress, one process per mode — the
+  fast semantic-divergence oracle), and `just quick all` (focused moving-GC
+  regressions at stride 1). Use these for slices that leave GC rooting, codegen,
+  and the frame ABI unchanged (profiling, diagnostics, docs, pure-Rust host
+  logic).
+- The full-corpus `otter-difftest` at GC stride 1 and the exhaustive
+  `gc-stress.py --all --strides 1-16` matrix are hours-long: heavy corpus
+  programs under stride-1 stress exceed the per-process timeout even on a clean
+  tree, so they are NOT a per-slice default. Reserve them for slices that change
+  GC roots, codegen, or the frame ABI, and prefer a targeted corpus subset:
+  `python3 scripts/dev/gc-stress.py target/checked/otter benchmarks/results/<fresh-dir> <corpus-files...> --strides 1-16`.
   `--repeat 100` repeats every corpus/tier/stride case for flake diagnosis;
   `runs.jsonl` preserves each completed observation during an interrupted run.
   Console output and printed completion are compared with the unstressed
@@ -600,10 +613,16 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     whole-mutator comparison. See `docs/site/src/content/docs/engine/gc-observation.md`.
 - CPU profile + folded flamegraph stacks:
   - `cargo run -p otter-cli -- run <file> --cpu-prof --cpu-prof-dir /tmp/otter-prof`
-  - Optional: `--cpu-prof-interval 1000 --cpu-prof-name my-run`
+  - Optional: `--cpu-prof-interval 1000 --cpu-prof-name my-run` (`--cpu-prof-interval`
+    is the minimum wall-clock microseconds between retained samples).
   - Produces both `.cpuprofile` (DevTools/Speedscope) and `.folded` (inferno/flamegraph.pl).
-  - Stack samples are captured by an opt-in bytecode-dispatch sampler from live
-    VM frames. Native JIT execution is currently a sampling blind spot.
+  - Stack samples are captured by an opt-in wall-clock-paced sampler at two
+    cooperative mutator checkpoints: bytecode dispatch and the compiled
+    back-edge poll. The poll checkpoint resolves the published native frame
+    chain, so hot Template/Graph functions appear by source name. Remaining
+    blind spots: straight-line native code without back-edges between polls,
+    and time inside native leaf calls, which is attributed to the calling
+    JS frame at the next checkpoint.
   - The direct synchronous runtime used by `--cpu-prof` does not enforce
     `--timeout` yet; bound potentially hanging profiler runs externally.
   - Baseline overhead sanity check (`cpu-prof` should stay opt-in): compare `/usr/bin/time -p target/release/otter run <file>` vs `/usr/bin/time -p target/release/otter run --cpu-prof --cpu-prof-dir /tmp/otter-prof <file>` and watch `real` / `sys` delta.

@@ -513,7 +513,10 @@ impl Interpreter {
         }
     }
 
-    /// Enable the VM stack profiler, sampling every `interval` bytecode ticks.
+    /// Enable the VM stack profiler, retaining at most one sample per
+    /// `interval` wall-clock microseconds. Samples fire from bytecode
+    /// dispatch and compiled back-edge polls, so native JIT execution is
+    /// covered.
     pub fn enable_cpu_profiler(&mut self, interval: u64) {
         self.cpu_profiler = Some(cpu_profile::CpuProfiler::new(interval));
     }

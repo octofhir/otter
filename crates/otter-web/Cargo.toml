@@ -19,7 +19,8 @@ hmac = { version = "0.12", default-features = false }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 wasmtime = { version = "46", default-features = false, features = ["cranelift", "runtime", "gc", "gc-drc", "wat", "std"] }
-wasm-encoder = "0.253"
+# Keep asm.js emission and WAT fixtures on Wasmtime's wasm-tools release.
+wasm-encoder = "0.251"
 oxc_allocator = { workspace = true }
 oxc_ast = { workspace = true }
 oxc_parser = { workspace = true }
@@ -38,6 +39,6 @@ otter-bytecode = { workspace = true }
 otter-syntax = { workspace = true }
 otter-vm = { workspace = true }
 tokio = { workspace = true }
-wat = "1"
+wat = "~1.251.0"
 
 [lints]

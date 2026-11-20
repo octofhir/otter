@@ -59,6 +59,13 @@ impl RuntimeCall<'_> {
             function.source_work().charge(batch.saturating_mul(span));
         }
         let checkpoint = vm.jit_backedge_poll()?;
+        // The compiled back-edge poll is the CPU profiler's native sampling
+        // checkpoint: the published chain names the executing compiled frames.
+        if vm.cpu_profiler.is_some() {
+            let mut profiler = vm.cpu_profiler.take().unwrap();
+            profiler.maybe_sample_poll(vm, context);
+            vm.cpu_profiler = Some(profiler);
+        }
         if code_object_id != 0
             && !vm
                 .jit_code_registry
@@ -111,6 +118,55 @@ mod tests {
         }
         fn entry_addr(&self) -> Option<usize> {
             Some(0x1000)
+        }
+    }
+
+    #[test]
+    fn cpu_profiler_samples_the_published_compiled_frame_at_poll() {
+        for tier in [NativeFrameKind::Baseline, NativeFrameKind::Optimizing] {
+            let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
+            let context = ExecutionContext::from_module(
+                crate::test_support::minimal_bytecode_module("profiled-poll.js"),
+                crate::source_registry::SourceRegistry::default(),
+            )
+            .unwrap();
+            let mut stack = ActivationStack::new();
+            assert!(
+                vm.jit_code_registry
+                    .register(41, Arc::new(PollCode(tier)))
+                    .is_ok()
+            );
+            let mut header = VmFrameHeader::interpreter(0, 0);
+            header.kind = tier;
+            let mut frame = Frame::new(
+                header,
+                0,
+                crate::Value::undefined(),
+                crate::Value::undefined(),
+            );
+            frame.code_object_id = 41;
+            // SAFETY: the fixture frame outlives the poll and its publication.
+            unsafe { vm.jit_push_native_frame(&mut frame) }.unwrap();
+            vm.enable_cpu_profiler(1);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let mut runtime = RuntimeCall {
+                vm: NonNull::from(&mut vm),
+                stack: NonNull::from(&mut stack),
+                context: crate::code_space::ResolvedCtx::Ambient(&context),
+                frame: NonNull::from(&mut frame),
+                _exclusive: PhantomData,
+            };
+            assert_eq!(
+                runtime.backedge_poll().unwrap(),
+                BackedgePollOutcome::Continue
+            );
+            let profile = vm.drain_cpu_profile().expect("installed profiler");
+            assert_eq!(profile.sample_count(), 1, "one due poll retains one sample");
+            let sample = &profile.samples[0];
+            assert_eq!(sample.len(), 1);
+            assert_eq!(sample[0].function_id, 0);
+            assert_eq!(sample[0].function_name, "<main>");
+            vm.jit_pop_native_frame();
         }
     }
 

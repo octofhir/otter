@@ -848,6 +848,69 @@ fn jit_snapshot_preserves_transition_guards_and_publication() {
 }
 
 #[test]
+fn settled_overwrite_evicts_superseded_transition_at_capacity() {
+    let mut interpreter = crate::Interpreter::new().expect("fixture interpreter bootstrap");
+    let slot = PropertyIcSlot::new(PropertyIcKind::Store);
+    let mut settled = Vec::new();
+    let mut atom = AtomId::from_global(0);
+    // Four distinct source shapes, each appending `x` once: the site fills to
+    // capacity with append transitions keyed on the pre-transition shapes.
+    for prefix in 0..4 {
+        let mut obj = object::alloc_object_old_for_fixture(interpreter.gc_heap_mut()).unwrap();
+        assert!(object::set_prototype(&mut obj, interpreter.gc_heap_mut(), None).unwrap());
+        for p in 0..prefix {
+            interpreter
+                .create_data_property(&mut obj, &format!("p{p}"), Value::boolean(false))
+                .unwrap();
+        }
+        let from_handle = object::keyed_shape(obj, interpreter.gc_heap());
+        let mut value = Value::number_i32(1);
+        let to_handle = interpreter
+            .shape_child_rooting_object_value(from_handle, "x", &mut obj, &mut value)
+            .unwrap();
+        atom = interpreter
+            .gc_heap()
+            .read_payload(to_handle, object::ShapeBody::transition_atom);
+        let property = AtomizedPropertyKey::new(PropertyAtom::new(atom), "x");
+        let transition = object::capture_store_property_transition_with_shape(
+            &mut obj,
+            interpreter.gc_heap_mut(),
+            property,
+            &mut value,
+            to_handle,
+        )
+        .expect("own-add preparation")
+        .expect("resident own-add transition");
+        assert_eq!(
+            slot.install(IcHandler::store_transition(from_handle, &transition).unwrap()),
+            InstallOutcome::Installed
+        );
+        settled.push(obj);
+    }
+    assert_eq!(slot.entry_count(), 4);
+    assert!(!slot.is_megamorphic());
+    // Each receiver now permanently holds `x`. Its settled own-field overwrite
+    // supersedes the append transition that produced its shape, so the site
+    // stays polymorphic-4 instead of going terminally megamorphic.
+    let property = AtomizedPropertyKey::new(PropertyAtom::new(atom), "x");
+    for obj in &settled {
+        let handler =
+            IcHandler::store_existing(*obj, interpreter.gc_heap(), property).expect("settled slot");
+        assert_eq!(handler.kind, IcHandlerKind::StoreField);
+        assert_eq!(slot.install(handler), InstallOutcome::Installed);
+        assert!(!slot.is_megamorphic());
+        assert_eq!(slot.entry_count(), 4);
+    }
+    assert_eq!(slot.stats().store_disables, 0);
+    assert!(
+        slot.live()
+            .iter()
+            .all(|entry| entry.kind() == IcHandlerKind::StoreField),
+        "every surviving entry is a plain own-field store"
+    );
+}
+
+#[test]
 fn full_collection_forgets_entries_naming_dead_shapes() {
     let mut heap = fresh_heap();
     let slot = PropertyIcSlot::new(PropertyIcKind::Load);

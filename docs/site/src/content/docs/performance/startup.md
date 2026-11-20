@@ -16,7 +16,7 @@ Run:
 
 ```bash
 cargo bench -p otter-vm --bench bootstrap -- --sample-size 30 --measurement-time 2 --warm-up-time 1
-cargo bench -p otter-runtime --bench startup -- --sample-size 30 --measurement-time 2 --warm-up-time 1
+cargo bench -p otter-cli --bench startup -- --sample-size 30 --measurement-time 2 --warm-up-time 1
 cargo bench -p otter-cli --bench cold_start -- --sample-size 10 --measurement-time 2 --warm-up-time 1
 ```
 

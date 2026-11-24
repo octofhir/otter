@@ -195,7 +195,8 @@ pub(crate) fn compile_function_impl(
     let static_home = std::mem::take(&mut parent.next_fn_static_home);
     let source_text_span = std::mem::take(&mut parent.next_fn_source_text_span);
     let lazy_method = std::mem::take(&mut parent.next_fn_lazy_method);
-    let eager = std::mem::take(&mut parent.next_fn_eager);
+    let eager = std::mem::take(&mut parent.next_fn_eager)
+        || parent.capture.eager_functions.contains(&span.0);
     let declaration = std::mem::take(&mut parent.next_fn_declaration);
     let module = Rc::clone(&parent.top_mut().module);
     let body_has_strict_directive = body.is_some_and(|b| b.has_use_strict_directive());

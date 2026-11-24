@@ -32,6 +32,8 @@
 //!   over-promotes).
 //! - Each open scope accumulates binding facts in one table. Closing it
 //!   resolves which names escape and publishes sorted facts for lowering.
+//! - The original AST identifies early-call function literals for both lazy-body
+//!   preparation and code generation.
 //! - Facts are keyed by AST node address and valid while the unit's AST lives;
 //!   every function body and static block the compiler lowers belongs to the
 //!   analyzed unit.
@@ -170,6 +172,9 @@ pub(crate) struct CaptureFacts {
     reads_dot_arguments: bool,
     /// Every function and arrow of the unit, parents before children.
     functions: Vec<FunctionNode>,
+    /// Function literals likely to run during initialization. Preparse and lowering
+    /// use the same decision even after expression wrappers have been erased.
+    pub(crate) eager_functions: FxHashSet<u32>,
     /// Function nodes by span start.
     function_by_start: FxHashMap<u32, u32>,
 }
@@ -465,6 +470,8 @@ struct Frame {
     facts: ScopeFacts,
     /// References, declarations and writes keyed by the unit's name id.
     names: FxHashMap<NameId, u8>,
+    /// Grouped function initializers in this frame, indexed by binding name.
+    grouped_initializers: FxHashMap<NameId, u32>,
     class_depth: u32,
     class_body_depth: u32,
     /// Inside a class field initializer or computed field key.
@@ -479,6 +486,7 @@ impl Frame {
             key,
             facts: ScopeFacts::default(),
             names: FxHashMap::default(),
+            grouped_initializers: FxHashMap::default(),
             class_depth: 0,
             class_body_depth: 0,
             field_depth: 0,
@@ -506,8 +514,6 @@ struct Builder<'s> {
     function_stack: Vec<u32>,
     /// Span starts of functions that are method or accessor values.
     method_values: FxHashSet<u32>,
-    /// Span starts of function expressions run where they stand.
-    immediate: FxHashSet<u32>,
     /// The unit's early-error passes, fed every node of this one walk.
     early: Option<crate::strict_validation::EarlyErrors>,
 }
@@ -605,7 +611,9 @@ impl Builder<'_> {
             }
             for name in facts.escape_writes() {
                 let id = self.facts.intern(name);
-                self.top().mark(id, ASSIGNED);
+                let frame = self.top();
+                frame.grouped_initializers.remove(&id);
+                frame.mark(id, ASSIGNED);
             }
             if facts.escape_eval() {
                 self.top().facts.nested_eval = true;
@@ -706,6 +714,7 @@ impl Builder<'_> {
     /// Return a finished frame's name table, emptied, for the next scope.
     fn recycle(&mut self, mut frame: Frame) {
         frame.names.clear();
+        frame.grouped_initializers.clear();
         frame.class_depth = 0;
         frame.class_body_depth = 0;
         frame.field_depth = 0;
@@ -746,7 +755,9 @@ impl Builder<'_> {
 
     fn note_write(&mut self, name: &str) {
         let id = self.facts.intern(name);
-        self.top().mark(id, ASSIGNED);
+        let frame = self.top();
+        frame.grouped_initializers.remove(&id);
+        frame.mark(id, ASSIGNED);
     }
 }
 
@@ -777,7 +788,7 @@ impl<'a> Visit<'a> for Builder<'_> {
                 .and_then(|skips| skips.get(it.span.start))
                 .map(|facts| (it.span.start, facts));
             let blank = if self.method_values.contains(&it.span.start)
-                || self.immediate.contains(&it.span.start)
+                || self.facts.eager_functions.contains(&it.span.start)
             {
                 None
             } else {
@@ -851,17 +862,10 @@ impl<'a> Visit<'a> for Builder<'_> {
 
     fn visit_new_expression(&mut self, it: &oxc_ast::ast::NewExpression<'a>) {
         if let Some(start) = immediate_function(&it.callee) {
-            self.immediate.insert(start);
+            self.facts.eager_functions.insert(start);
         }
         early!(self, blocks.enter_new_expression(it));
         walk::walk_new_expression(self, it);
-    }
-
-    fn visit_parenthesized_expression(&mut self, it: &oxc_ast::ast::ParenthesizedExpression<'a>) {
-        if let Some(start) = immediate_function(&it.expression) {
-            self.immediate.insert(start);
-        }
-        walk::walk_parenthesized_expression(self, it);
     }
 
     fn visit_static_block(&mut self, it: &oxc_ast::ast::StaticBlock<'a>) {
@@ -964,6 +968,17 @@ impl<'a> Visit<'a> for Builder<'_> {
             pattern_leaves(&it.id, &mut |name| self.note_write(name));
         }
         walk::walk_variable_declarator(self, it);
+        // Keep a grouped initializer cold until this frame also calls its name.
+        if let (
+            BindingPattern::BindingIdentifier(binding),
+            Some(Expression::ParenthesizedExpression(group)),
+        ) = (&it.id, &it.init)
+            && let Some(start) = immediate_function(&group.expression)
+            && let Some(&node) = self.facts.function_by_start.get(&start)
+        {
+            let name = self.facts.intern(&binding.name);
+            self.top().grouped_initializers.insert(name, node);
+        }
     }
 
     fn visit_block_statement(&mut self, it: &oxc_ast::ast::BlockStatement<'a>) {
@@ -1120,8 +1135,26 @@ impl<'a> Visit<'a> for Builder<'_> {
     }
 
     fn visit_call_expression(&mut self, it: &oxc_ast::ast::CallExpression<'a>) {
-        if let Some(start) = immediate_function(&it.callee) {
-            self.immediate.insert(start);
+        // This selects when to compile the literal. The emitted call still
+        // resolves the live method and evaluates its arguments normally.
+        let target = match it.callee.get_inner_expression() {
+            Expression::StaticMemberExpression(member)
+                if matches!(member.property.name.as_str(), "call" | "apply") =>
+            {
+                &member.object
+            }
+            other => other,
+        };
+        if let Some(start) = immediate_function(target) {
+            self.facts.eager_functions.insert(start);
+        } else if let Expression::Identifier(binding) = target.get_inner_expression()
+            && !self.top().grouped_initializers.is_empty()
+            && let Some(name) = self.facts.id_of(binding.name.as_str())
+            && let Some(index) = self.top().grouped_initializers.remove(&name)
+        {
+            let node = &mut self.facts.functions[index as usize];
+            node.blank = None;
+            self.facts.eager_functions.insert(node.span.0);
         }
         // A method called on `arguments` receives it as `this`.
         if member_of_arguments(&it.callee) {

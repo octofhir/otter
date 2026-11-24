@@ -10,6 +10,7 @@
 //! - `Ok(false)` means an ECMAScript descriptor rejection, never allocation failure.
 //! - Actual receiver and incoming fields are rewritten through every allocation.
 //! - Rejecting and identical descriptors do not allocate or retire watched proofs.
+//! - A shaped definition carries its proven slot offset across shape preparation.
 //! - Prepared metadata stays rooted until a non-allocating publication.
 //! - No object payload borrow encloses allocation or collection.
 //!
@@ -45,8 +46,8 @@ fn resolve_string(
     heap: &GcHeap,
     key: &str,
     descriptor: &PartialPropertyDescriptor,
-) -> Result<(Option<u32>, SlotData), bool> {
-    let offset = heap.read_payload(object, |body| body_offset_of(heap, body, key));
+    offset: Option<u32>,
+) -> Result<SlotData, bool> {
     let slot = if let Some(offset) = offset {
         let current = heap.read_payload(object, |body| body.slot_data(heap, offset as usize));
         let Some(updated) = descriptor_core::validate_and_apply_partial(&current, descriptor, heap)
@@ -67,7 +68,7 @@ fn resolve_string(
         }
         SlotData::from_descriptor(descriptor.complete_for_new_property())
     };
-    Ok((offset, slot))
+    Ok(slot)
 }
 
 pub(super) fn define_string(
@@ -76,7 +77,8 @@ pub(super) fn define_string(
     key: &str,
     mut descriptor: PartialPropertyDescriptor,
 ) -> Result<bool, otter_gc::OutOfMemory> {
-    let (offset, source) = match resolve_string(*object, heap, key, &descriptor) {
+    let offset = heap.read_payload(*object, |body| body_offset_of(heap, body, key));
+    let source = match resolve_string(*object, heap, key, &descriptor, offset) {
         Ok(resolved) => resolved,
         Err(outcome) => return Ok(outcome),
     };
@@ -179,9 +181,10 @@ pub(super) fn define_string_with_shape(
     heap: &mut GcHeap,
     key: &str,
     mut descriptor: PartialPropertyDescriptor,
+    offset: Option<u32>,
     mut next_shape: ShapeHandle,
 ) -> Result<bool, otter_gc::OutOfMemory> {
-    let (offset, source) = match resolve_string(*object, heap, key, &descriptor) {
+    let source = match resolve_string(*object, heap, key, &descriptor, offset) {
         Ok(resolved) => resolved,
         Err(outcome) => return Ok(outcome),
     };

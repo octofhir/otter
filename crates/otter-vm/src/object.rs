@@ -6585,9 +6585,10 @@ pub(crate) fn define_own_property_partial_with_shape(
     heap: &mut otter_gc::GcHeap,
     key: &str,
     descriptor: PartialPropertyDescriptor,
+    offset: Option<u32>,
     next_shape: ShapeHandle,
 ) -> Result<bool, otter_gc::OutOfMemory> {
-    descriptor_install::define_string_with_shape(obj_ref, heap, key, descriptor, next_shape)
+    descriptor_install::define_string_with_shape(obj_ref, heap, key, descriptor, offset, next_shape)
 }
 
 /// Field-presence-aware §10.1.6.3 for symbol-keyed properties.
@@ -7140,29 +7141,18 @@ fn ordinary_string_key_entries(heap: &otter_gc::GcHeap, body: &ObjectBody) -> Ve
     order_string_key_entries(insertion_order)
 }
 
-/// Ordered `(key, flags, is_accessor)` for every string-keyed slot of a shaped
-/// hidden class, in slot-offset order.
-///
-/// Drives attribute-encoding shape transitions (`freeze` / `seal` /
-/// `defineProperty` redefine): the runtime rebuilds the class by replaying
-/// these slots with modified attributes, so an in-place attribute change
-/// re-points the object at a matching shape instead of diverging from it.
-/// For a `defineProperty` redefine of an existing string-keyed slot, return
-/// the post-merge `(flags, is_accessor, offset)` so the caller can transition
-/// the hidden class to record the change. `None` when the key is absent or the
-/// redefine is rejected — the in-place path then handles those (rejection
-/// returns `false`; an absent key is an append handled elsewhere).
+/// Validate an update at a known slot and report its resulting layout.
+/// The source shape owns the offset until the descriptor is published.
 #[must_use]
 pub(crate) fn redefine_merged_attrs(
     obj: JsObject,
     heap: &otter_gc::GcHeap,
-    key: &str,
+    offset: u32,
     descriptor: &PartialPropertyDescriptor,
-) -> Option<(PropertyFlags, bool, u32)> {
-    let offset = heap.read_payload(obj, |body| body_offset_of(heap, body, key))?;
+) -> Option<(PropertyFlags, bool)> {
     let existing = heap.read_payload(obj, |body| body.slot_data(heap, offset as usize));
     let merged = descriptor_core::validate_and_apply_partial(&existing, descriptor, heap)?;
-    Some((merged.flags, !merged.kind.is_data(), offset))
+    Some((merged.flags, !merged.kind.is_data()))
 }
 
 /// The key a replayed hidden-class slot is added under.

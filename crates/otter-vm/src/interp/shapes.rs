@@ -7,7 +7,8 @@
 //!
 //! # Invariants
 //! Shape children are interned via the shape runtime; allocating a
-//! child must root any live object value passed alongside it.
+//! child must root any live object value passed alongside it. A descriptor
+//! update reuses the current shape while the slot kind and attributes match.
 //!
 //! # See also
 //! `object::prototype_validity` for dependencies on prepared prototype chains.
@@ -211,6 +212,7 @@ impl Interpreter {
                 &mut self.gc_heap,
                 key,
                 descriptor,
+                None,
                 next_shape,
             )?
         } else {
@@ -231,61 +233,63 @@ impl Interpreter {
         key: &str,
         descriptor: object::PartialPropertyDescriptor,
     ) -> Result<bool, VmError> {
-        let completed = descriptor.complete_for_new_property();
         let shape = object::shape(*obj_ref, &self.gc_heap);
-        // Append a brand-new own property: extend the transition chain. The
-        // shape-child computation allocates, so the descriptor's payload
-        // values ride anchor slots across it.
-        if self.should_add_property(*obj_ref, key)
+        if object::shape_body::is_dictionary_of(shape) {
+            return object::define_own_property_partial(
+                obj_ref,
+                &mut self.gc_heap,
+                key,
+                descriptor,
+            )
+            .map_err(VmError::from);
+        }
+
+        let slot = self.shape_slot_for_key(shape, key);
+        let (target, descriptor) = if let Some(slot) = slot {
+            let Some((flags, is_accessor)) =
+                object::redefine_merged_attrs(*obj_ref, &self.gc_heap, slot.offset, &descriptor)
+            else {
+                return Ok(false);
+            };
+            if (flags, is_accessor) == (slot.flags, slot.is_accessor) {
+                (shape, descriptor)
+            } else {
+                let mut ordered = object::shape_ordered_slot_attrs(&self.gc_heap, shape);
+                let changed = &mut ordered[slot.offset as usize];
+                changed.1 = flags;
+                changed.2 = is_accessor;
+                self.with_descriptor_anchored(descriptor, |this| {
+                    let state = object::state(*obj_ref, &this.gc_heap).with_dictionary(false);
+                    this.rebuild_shape_from_slots(obj_ref, &ordered, state, &mut |_| {})
+                })?
+            }
+        } else if object::is_extensible(*obj_ref, &self.gc_heap)
             && object::shape_property_count(shape, &self.gc_heap) < object::MAX_FAST_PROPERTIES
         {
+            let completed = descriptor.complete_for_new_property();
             let flags = completed.flags;
             let is_accessor = matches!(completed.kind, object::DescriptorKind::Accessor { .. });
-            let (next_shape, descriptor) = self.with_descriptor_anchored(descriptor, |this| {
+            self.with_descriptor_anchored(descriptor, |this| {
                 this.shape_child_rooting_object_descriptor(shape, key, obj_ref, flags, is_accessor)
-            })?;
-            return object::define_own_property_partial_with_shape(
+            })?
+        } else {
+            return object::define_own_property_partial(
                 obj_ref,
                 &mut self.gc_heap,
                 key,
                 descriptor,
-                next_shape,
             )
             .map_err(VmError::from);
-        }
-        // Redefine an existing slot on a shaped object: rebuild the hidden
-        // class with the merged attributes. The final shape remains the sole
-        // ordinary descriptor owner.
-        if !object::shape_body::is_dictionary_of(shape)
-            && let Some((flags, is_accessor, offset)) =
-                object::redefine_merged_attrs(*obj_ref, &self.gc_heap, key, &descriptor)
-        {
-            let mut ordered = object::shape_ordered_slot_attrs(&self.gc_heap, shape);
-            if let Some(slot) = ordered.get_mut(offset as usize) {
-                slot.1 = flags;
-                slot.2 = is_accessor;
-            }
-            // The shape rebuild allocates; the descriptor's payload values
-            // ride anchor slots (a trace through shared references into the
-            // stack-local descriptor is not a root the collector can
-            // rewrite).
-            let (redefine_shape, descriptor) =
-                self.with_descriptor_anchored(descriptor, |this| {
-                    let mut no_extra_roots = |_: &mut dyn FnMut(*mut RawGc)| {};
-                    let state = object::state(*obj_ref, &this.gc_heap).with_dictionary(false);
-                    this.rebuild_shape_from_slots(obj_ref, &ordered, state, &mut no_extra_roots)
-                })?;
-            return object::define_own_property_partial_with_shape(
-                obj_ref,
-                &mut self.gc_heap,
-                key,
-                descriptor,
-                redefine_shape,
-            )
-            .map_err(VmError::from);
-        }
-        object::define_own_property_partial(obj_ref, &mut self.gc_heap, key, descriptor)
-            .map_err(VmError::from)
+        };
+        object::define_own_property_partial_with_shape(
+            obj_ref,
+            &mut self.gc_heap,
+            key,
+            descriptor,
+            slot.map(|slot| slot.offset),
+            target,
+        )
+        .map_err(VmError::from)
     }
 
     /// Give a dictionary-mode object — and every dictionary-mode object on its
@@ -511,11 +515,19 @@ impl Interpreter {
     /// nothing has interned names no shape key.
     #[must_use]
     pub(crate) fn shape_offset_of(&self, shape: object::ShapeHandle, key: &str) -> Option<u32> {
+        self.shape_slot_for_key(shape, key).map(|slot| slot.offset)
+    }
+
+    fn shape_slot_for_key(
+        &self,
+        shape: object::ShapeHandle,
+        key: &str,
+    ) -> Option<object::shape_body::ShapeSlot> {
         let atom = crate::isolate_names::names(&self.gc_heap).lookup(key);
         if atom == crate::property_atom::AtomId::NONE {
             return None;
         }
-        self.shape_slot_of_atom(shape, atom).map(|slot| slot.offset)
+        self.shape_slot_of_atom(shape, atom)
     }
 
     /// The slot `shape` gives `atom`, through the isolate's lookup cache

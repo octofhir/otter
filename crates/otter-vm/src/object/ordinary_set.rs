@@ -37,14 +37,18 @@ pub(super) fn string(
     value: Value,
     next_shape: Option<ShapeHandle>,
 ) -> Result<bool, otter_gc::OutOfMemory> {
+    if let Some(shape) = next_shape {
+        let descriptor = PartialPropertyDescriptor::from_full(&PropertyDescriptor::data(
+            value, true, true, true,
+        ));
+        return descriptor_install::define_string_with_shape(
+            object, heap, key, descriptor, None, shape,
+        );
+    }
     let Some(descriptor) = descriptor(lookup_own(*object, heap, key), value) else {
         return Ok(false);
     };
-    if let Some(shape) = next_shape {
-        descriptor_install::define_string_with_shape(object, heap, key, descriptor, shape)
-    } else {
-        descriptor_install::define_string(object, heap, key, descriptor)
-    }
+    descriptor_install::define_string(object, heap, key, descriptor)
 }
 
 pub(super) fn symbol(

@@ -135,7 +135,16 @@ pub(crate) fn append_chunk(text: &mut String, pending: &mut Option<u16>, mut uni
         *pending = Some(last);
         units = rest;
     }
-    text.extend(escaped_chars(units));
+    // Ordinary BMP units need exactly one scalar. Enter the escape iterator
+    // only when this leaf actually contains a surrogate or the marker.
+    while let Some((&unit, tail)) = units.split_first() {
+        if (0xD800..=MARKER).contains(&unit) {
+            text.extend(escaped_chars(units));
+            break;
+        }
+        text.push(char::from_u32(u32::from(unit)).expect("ordinary BMP scalar"));
+        units = tail;
+    }
 }
 
 /// UTF-8 length of the escaped spelling of `units`.

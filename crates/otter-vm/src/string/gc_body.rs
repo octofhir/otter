@@ -1550,19 +1550,44 @@ fn flat_content_range(body: &JsStringBody, start: u32, len: u32) -> Option<FlatC
     })
 }
 
-/// Uncached body walk backing [`to_utf16_vec`]. Always re-materialises.
+/// Copy a string's UTF-16 units in source order.
 fn materialize_utf16_vec(
     heap: &impl crate::heap_read::HeapRead,
     string: JsStringHandle,
 ) -> Vec<u16> {
-    let len = heap.read_payload(string, |b| b.len);
-    let mut out: Vec<u16> = Vec::with_capacity(len as usize);
-    let mut stack: Vec<(JsStringHandle, u32, u32)> = Vec::new();
-    stack.push((string, 0, len));
+    let len = heap.read_payload(string, |body| body.len);
+    to_utf16_vec_slice(heap, string, 0, len)
+}
+
+fn to_utf16_vec_slice(
+    heap: &impl crate::heap_read::HeapRead,
+    string: JsStringHandle,
+    start: u32,
+    length: u32,
+) -> Vec<u16> {
+    let mut out = Vec::with_capacity(length as usize);
+    visit_chunks(heap, string, start, length, |chunk| match chunk {
+        CodeUnits::Utf16(units) => out.extend_from_slice(units),
+        CodeUnits::Latin1(bytes) => out.extend(bytes.iter().copied().map(u16::from)),
+    });
+    out
+}
+
+/// Visit borrowed ranges of leaves, at their stored width, without flattening
+/// or collecting. A caller that decodes UTF-16 must carry a trailing high
+/// surrogate across adjacent leaves.
+pub(super) fn visit_chunks(
+    heap: &impl crate::heap_read::HeapRead,
+    string: JsStringHandle,
+    start: u32,
+    length: u32,
+    mut visit: impl FnMut(CodeUnits<'_>),
+) {
+    let mut stack = smallvec::SmallVec::<[_; 8]>::new();
+    stack.push((string, start, length));
     while let Some((node, start, length)) = stack.pop() {
         enum Resolved {
-            Flat,
-            Latin1,
+            Done,
             Sliced {
                 parent: JsStringHandle,
                 abs_start: u32,
@@ -1585,15 +1610,15 @@ fn materialize_utf16_vec(
                 // pre-existing `String.prototype.slice` clamping.
                 let s = (start as usize).min(units.len());
                 let e = s.saturating_add(length as usize).min(units.len());
-                out.extend_from_slice(&units[s..e]);
-                Resolved::Flat
+                visit(CodeUnits::Utf16(&units[s..e]));
+                Resolved::Done
             }
             JsStringBodyRepr::SeqLatin1 => {
                 let bytes = b.seq_latin1_bytes();
                 let s = (start as usize).min(bytes.len());
                 let e = s.saturating_add(length as usize).min(bytes.len());
-                out.extend(bytes[s..e].iter().map(|&b| u16::from(b)));
-                Resolved::Latin1
+                visit(CodeUnits::Latin1(&bytes[s..e]));
+                Resolved::Done
             }
             JsStringBodyRepr::Sliced {
                 parent,
@@ -1609,7 +1634,7 @@ fn materialize_utf16_vec(
             },
         });
         match resolved {
-            Resolved::Flat | Resolved::Latin1 => {}
+            Resolved::Done => {}
             Resolved::Sliced { parent, abs_start } => {
                 stack.push((parent, abs_start, length));
             }
@@ -1634,80 +1659,6 @@ fn materialize_utf16_vec(
             }
         }
     }
-    out
-}
-
-/// Substring view as `Vec<u16>` — internal helper for hash
-/// computation on collapsed slices.
-fn to_utf16_vec_slice(heap: &GcHeap, parent: JsStringHandle, start: u32, length: u32) -> Vec<u16> {
-    let mut out: Vec<u16> = Vec::with_capacity(length as usize);
-    let mut stack: Vec<(JsStringHandle, u32, u32)> = Vec::new();
-    stack.push((parent, start, length));
-    while let Some((node, s, l)) = stack.pop() {
-        enum Resolved {
-            Done,
-            Sliced {
-                parent: JsStringHandle,
-                abs_start: u32,
-            },
-            Cons {
-                left: JsStringHandle,
-                right: JsStringHandle,
-                left_len: u32,
-            },
-        }
-        let resolved = heap.read_payload(node, |b| match b.repr() {
-            JsStringBodyRepr::SeqFlat => {
-                let units = b.seq_flat_units();
-                let lo = s as usize;
-                let hi = lo + l as usize;
-                out.extend_from_slice(&units[lo..hi]);
-                Resolved::Done
-            }
-            JsStringBodyRepr::SeqLatin1 => {
-                let bytes = b.seq_latin1_bytes();
-                let lo = s as usize;
-                let hi = lo + l as usize;
-                out.extend(bytes[lo..hi].iter().map(|&b| u16::from(b)));
-                Resolved::Done
-            }
-            JsStringBodyRepr::Sliced {
-                parent,
-                start: pstart,
-            } => Resolved::Sliced {
-                parent,
-                abs_start: pstart + s,
-            },
-            JsStringBodyRepr::Cons { left, right, .. } => Resolved::Cons {
-                left,
-                right,
-                left_len: heap.read_payload(left, |lb| lb.len),
-            },
-        });
-        match resolved {
-            Resolved::Done => {}
-            Resolved::Sliced { parent, abs_start } => {
-                stack.push((parent, abs_start, l));
-            }
-            Resolved::Cons {
-                left,
-                right,
-                left_len,
-            } => {
-                let split = left_len.min(s.saturating_add(l));
-                let left_take = split.saturating_sub(s);
-                let right_take = l.saturating_sub(left_take);
-                let right_start = s.saturating_sub(left_len);
-                if right_take > 0 {
-                    stack.push((right, right_start, right_take));
-                }
-                if left_take > 0 {
-                    stack.push((left, s, left_take));
-                }
-            }
-        }
-    }
-    out
 }
 
 /// Borrowed view over a directly-stored (non-cons, non-sliced) flat body's

@@ -23,6 +23,7 @@ oxc_ast_visit = { workspace = true }
 oxc_resolver = { workspace = true }
 dirs = { workspace = true }
 json5 = { workspace = true }
+memchr = "2"
 jsonc-parser = { workspace = true }
 otter-http-client = { workspace = true }
 serde = { workspace = true }

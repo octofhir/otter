@@ -132,7 +132,7 @@ impl Runtime {
             false,
             false,
             false,
-            false,
+            None,
             otter_compiler::CompileOptions::default(),
         )
         .map_err(|err| crate::map_compile_error(err, specifier))?;

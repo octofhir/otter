@@ -28,6 +28,8 @@
 //! - [Frontend and compilation](../../../docs/book/src/engine/frontend.md)
 
 mod diagnostic;
+mod dynamic_function;
+pub use dynamic_function::with_dynamic_function_program;
 mod module_text;
 pub use module_text::{module_attribute_type, module_literal_text};
 
@@ -222,7 +224,14 @@ pub fn with_program_timing<R>(
     f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
 ) -> Result<(R, Duration), SyntaxError> {
     let started = Instant::now();
-    with_program_goal_after_parse(source, kind, SourceGoal::Module, || started.elapsed(), f)
+    with_program_goal_after_parse(
+        source,
+        kind,
+        SourceGoal::Module,
+        None,
+        || started.elapsed(),
+        f,
+    )
 }
 
 /// Parse `source` once under an explicit [`SourceGoal`] and pass the
@@ -242,7 +251,7 @@ pub fn with_program_goal<R>(
     goal: SourceGoal,
     f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
 ) -> Result<R, SyntaxError> {
-    with_program_goal_after_parse(source, kind, goal, || (), f).map(|(result, ())| result)
+    with_program_goal_after_parse(source, kind, goal, None, || (), f).map(|(result, ())| result)
 }
 
 fn parse_once<'a>(
@@ -263,6 +272,7 @@ fn with_program_goal_after_parse<R, T>(
     source: &str,
     kind: SourceKind,
     goal: SourceGoal,
+    mut parameters_end: Option<usize>,
     after_parse: impl FnOnce() -> T,
     f: impl for<'a> FnOnce(&'a Program<'a>) -> R,
 ) -> Result<(R, T), SyntaxError> {
@@ -274,6 +284,9 @@ fn with_program_goal_after_parse<R, T>(
         let ret = parse_once(&allocator, src, kind, goal);
         if ret.diagnostics.is_empty() {
             let parse_metadata = after_parse();
+            if let Some(end) = parameters_end {
+                dynamic_function::check_delimiters(&ret.program, end)?;
+            }
             return Ok((f(&ret.program), parse_metadata));
         }
         // §13.15.1 web-compat host exemption — a sloppy Script-goal
@@ -284,22 +297,23 @@ fn with_program_goal_after_parse<R, T>(
         // "evaluate the call, then throw ReferenceError" (and back to
         // the early SyntaxError in strict code). One site per retry —
         // the parser stops at the first fatal error.
-        if goal == SourceGoal::Script
-            && attempts < MAX_PARSE_PATCHES
-            && let Some(next) = patch_call_assignment_target(src, kind, &ret.diagnostics)
-        {
-            patched = Some(next);
-            attempts += 1;
-            continue;
-        }
         // §14.13.1 — `let` is a legal LabelIdentifier in sloppy code, but
         // OXC commits to a `let` declaration on the unescaped keyword and
         // reports a fatal parse error with no AST. Retry with the keyword
         // written as an escape, which OXC parses as the label it is.
         if goal == SourceGoal::Script
             && attempts < MAX_PARSE_PATCHES
-            && let Some(next) = patch_let_label(src, &ret.diagnostics)
+            && let Some((next, edited)) = patch_call_assignment_target(src, kind, &ret.diagnostics)
+                .or_else(|| patch_let_label(src, &ret.diagnostics))
         {
+            if let Some(end) = &mut parameters_end {
+                if edited.end <= *end {
+                    // Both compatibility rewrites expand the matched token range.
+                    *end += next.len() - src.len();
+                } else if edited.start < *end {
+                    return Err(dynamic_function::delimiter_error());
+                }
+            }
             patched = Some(next);
             attempts += 1;
             continue;
@@ -327,7 +341,7 @@ fn patch_call_assignment_target(
     source: &str,
     kind: SourceKind,
     diagnostics: &[oxc_diagnostics::OxcDiagnostic],
-) -> Option<String> {
+) -> Option<(String, std::ops::Range<usize>)> {
     let diagnostic = diagnostics
         .iter()
         .find(|diagnostic| diagnostic.to_string() == "Cannot assign to this expression")?;
@@ -351,7 +365,7 @@ fn patch_call_assignment_target(
     next.push_str(").");
     next.push_str(INVALID_ASSIGNMENT_TARGET_PROPERTY);
     next.push_str(&source[end..]);
-    Some(next)
+    Some((next, start..end))
 }
 
 /// `true` when the source following an assignment target begins —
@@ -397,14 +411,17 @@ const ESCAPED_LET: &str = "l\\u0065t";
 /// takes the identifier path and yields the LabeledStatement the grammar
 /// calls for. Strict code still rejects the label — `otter-compiler`'s
 /// early-error pass tests the cooked name, so both spellings throw there.
-fn patch_let_label(source: &str, diagnostics: &[oxc_diagnostics::OxcDiagnostic]) -> Option<String> {
+fn patch_let_label(
+    source: &str,
+    diagnostics: &[oxc_diagnostics::OxcDiagnostic],
+) -> Option<(String, std::ops::Range<usize>)> {
     let label = diagnostics.first()?.labels.as_slice().first()?;
     let (start, end) = let_label_keyword_span(source, label.offset() as usize)?;
     let mut next = String::with_capacity(source.len() + ESCAPED_LET.len());
     next.push_str(source.get(..start)?);
     next.push_str(ESCAPED_LET);
     next.push_str(source.get(end..)?);
-    Some(next)
+    Some((next, start..end))
 }
 
 /// The byte span of the `let` keyword of a `let:` label when `offset` —

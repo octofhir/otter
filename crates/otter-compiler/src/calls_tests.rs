@@ -228,7 +228,7 @@ fn caller_chain_const_metadata_does_not_prove_a_live_initialized_value() {
         false,
         false,
         false,
-        false,
+        None,
         crate::CompileOptions::default(),
     )
     .expect("caller-chain method fixture");

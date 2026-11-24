@@ -115,6 +115,29 @@ pub(crate) fn encode(units: &[u16]) -> String {
     escaped_chars(units).collect()
 }
 
+/// Append a wide rope leaf, preserving a possible surrogate pair across
+/// the boundary. An empty leaf leaves the previous pending unit alone.
+pub(crate) fn append_chunk(text: &mut String, pending: &mut Option<u16>, mut units: &[u16]) {
+    let Some((&first, rest)) = units.split_first() else {
+        return;
+    };
+    if let Some(high) = pending.take() {
+        if is_low_surrogate(first) {
+            text.extend(escaped_chars(&[high, first]));
+            units = rest;
+        } else {
+            text.extend(escaped_chars(&[high]));
+        }
+    }
+    if let Some((&last, rest)) = units.split_last()
+        && is_high_surrogate(last)
+    {
+        *pending = Some(last);
+        units = rest;
+    }
+    text.extend(escaped_chars(units));
+}
+
 /// UTF-8 length of the escaped spelling of `units`.
 #[must_use]
 pub(crate) fn encoded_len(units: &[u16]) -> usize {

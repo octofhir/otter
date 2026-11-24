@@ -5,7 +5,7 @@
 //!
 //! # Contents
 //! - Indirect eval execution and writeback.
-//! - `Function` constructor argument coercion and body synthesis.
+//! - `Function` argument coercion and a single source with an explicit parameter boundary.
 //! - [`EmbeddedCommonJs`] / [`CommonJsBody`] — the two origins of a CommonJS
 //!   wrapper: a file body wrapped and compiled now, or a builtin compiled at
 //!   product build time.
@@ -171,7 +171,7 @@ impl Interpreter {
                     in_class_field_initializer,
                     super_property_allowed,
                     super_call_allowed,
-                    function_constructor: false,
+                    dynamic_parameters_end: None,
                     embedded: None,
                     commonjs_file: false,
                 },
@@ -584,25 +584,18 @@ impl Interpreter {
     ) -> Result<ExecutionContext, VmError> {
         let prefix = source.kind.source_prefix();
         let (params, body) = (&source.params, &source.body);
-        // §20.2.1.1.1 steps 20-21 — the parameter text and the body text
-        // are each parsed on their own before the assembled source is.
-        // Without that, a parameter list that swallows the generated
-        // `) {` (an unterminated comment, an open template literal, a
-        // nested `function (`) assembles into a program that parses,
-        // and the caller smuggles source past the parameter list.
-        let probe_options = EvalCompileOptions {
-            function_constructor: true,
-            ..EvalCompileOptions::default()
-        };
-        let params_probe = format!("({prefix} anonymous({params}\n) {{\n\n}})");
-        self.compile_escaped_source(&params_probe, probe_options.clone())?;
-        let body_probe = format!("({prefix} anonymous(\n) {{\n{body}\n}})");
-        self.compile_escaped_source(&body_probe, probe_options)?;
-        let text = format!("({prefix} anonymous({params}\n) {{\n{body}\n}})");
+        // The compiler checks the formal-parameter and body spans against the
+        // delimiters we insert. Neither fragment can consume the other.
+        let mut text = format!("({prefix} anonymous({params}\n)");
+        let parameters_end = text.len();
+        text.reserve(body.len() + " {\n\n})".len());
+        text.push_str(" {\n");
+        text.push_str(body);
+        text.push_str("\n})");
         let mut module = self.compile_escaped_source(
             &text,
             EvalCompileOptions {
-                function_constructor: true,
+                dynamic_parameters_end: Some(parameters_end),
                 ..EvalCompileOptions::default()
             },
         )?;

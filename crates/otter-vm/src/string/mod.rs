@@ -660,18 +660,35 @@ impl JsString {
     /// [`Self::from_key_spelling`] restores the string.
     #[must_use]
     pub(crate) fn to_key_spelling(self, heap: &GcHeap) -> String {
-        // Latin-1 holds neither a surrogate nor the escape marker.
-        if let Some(s) = self.with_latin1(heap, |bytes| {
-            if bytes.is_ascii() {
-                // SAFETY: ASCII bytes are valid UTF-8.
-                unsafe { String::from_utf8_unchecked(bytes.to_vec()) }
-            } else {
-                bytes.iter().map(|&b| b as char).collect()
+        fn append_latin1(text: &mut String, bytes: &[u8]) {
+            for chunk in bytes.chunks(256) {
+                if chunk.is_ascii() {
+                    // SAFETY: every byte in this chunk is ASCII.
+                    text.push_str(unsafe { std::str::from_utf8_unchecked(chunk) });
+                } else {
+                    text.extend(chunk.iter().copied().map(char::from));
+                }
             }
-        }) {
-            return s;
         }
-        self.with_utf16(heap, crate::wtf16_escape::encode)
+
+        let mut text = String::with_capacity(self.cached_len as usize);
+        let mut pending = None;
+        gc_body::visit_chunks(heap, self.handle, 0, self.cached_len, |chunk| match chunk {
+            gc_body::CodeUnits::Utf16(units) => {
+                crate::wtf16_escape::append_chunk(&mut text, &mut pending, units)
+            }
+            gc_body::CodeUnits::Latin1(bytes) if !bytes.is_empty() => {
+                if let Some(high) = pending.take() {
+                    text.extend(crate::wtf16_escape::escaped_chars(&[high]));
+                }
+                append_latin1(&mut text, bytes);
+            }
+            gc_body::CodeUnits::Latin1(_) => {}
+        });
+        if let Some(high) = pending {
+            text.extend(crate::wtf16_escape::escaped_chars(&[high]));
+        }
+        text
     }
 
     /// Render as a lossy Rust `String` for display / diagnostics.

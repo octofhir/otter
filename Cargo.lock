@@ -2782,6 +2782,7 @@ dependencies = [
  "json5",
  "jsonc-parser",
  "libc",
+ "memchr",
  "nix",
  "otter-bytecode",
  "otter-compiler",

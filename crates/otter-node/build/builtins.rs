@@ -146,7 +146,7 @@ fn emit_builtin(src: &Path, dir: &Path, builtin: &Builtin) -> Result<(), BuildEr
         false,
         false,
         false,
-        false,
+        None,
         otter_compiler::CompileOptions::default(),
     )?;
     module.module = builtin.url.to_owned();

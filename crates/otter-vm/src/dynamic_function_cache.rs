@@ -15,7 +15,7 @@
 //!   code eviction still reclaims the chunk once nothing runs it. Bases are
 //!   never reused: a lookup that finds the chunk gone drops the entry.
 //! - Only successful links are entered, under the exact parameter and body
-//!   text whose separate probes passed.
+//!   text whose parser-checked boundaries match the synthesized function.
 //! - A source containing a template literal is never entered: each
 //!   evaluation of a dynamic function's source is a new Parse Node, so its
 //!   template objects must be fresh (§13.2.8.4 GetTemplateObject).

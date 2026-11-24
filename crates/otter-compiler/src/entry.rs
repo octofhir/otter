@@ -116,7 +116,7 @@ pub fn compile_eval_source(
     in_class_field_initializer: bool,
     super_property_allowed: bool,
     super_call_allowed: bool,
-    function_constructor: bool,
+    dynamic_parameters_end: Option<usize>,
     options: CompileOptions,
 ) -> Result<BytecodeModule, CompileError> {
     // §19.2.1.1 PerformEval parses the body with the Script goal.
@@ -124,6 +124,7 @@ pub fn compile_eval_source(
     // semantic pass (inner `Err`), whereas oxc rejects `new.target` at
     // parse time (outer `Err`). Flatten both into one `CompileError` so
     // the wrap-and-retry below can recover either.
+    let function_constructor = dynamic_parameters_end.is_some();
     let source = input.text();
     let source_is_linked = matches!(input, CompileSource::Scoped { .. });
     let compile = |program: &Program<'_>| {
@@ -165,6 +166,11 @@ pub fn compile_eval_source(
         && let Some(result) = crate::prepared_eval::compile_prepared(source, release, kind, compile)
     {
         return result;
+    }
+    if let Some(end) = dynamic_parameters_end {
+        return otter_syntax::with_dynamic_function_program(source, kind, end, compile)
+            .map_err(CompileError::from)?
+            .map(|(bytecode, _)| bytecode);
     }
     let direct = match otter_syntax::with_program_goal(
         source,

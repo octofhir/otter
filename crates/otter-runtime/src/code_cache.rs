@@ -306,7 +306,7 @@ pub(crate) fn eval_is_cacheable(source: &str, options: &otter_vm::EvalCompileOpt
         && options.embedded.is_none()
         && !options.commonjs_file
         && !options.script_goal
-        && !options.function_constructor
+        && options.dynamic_parameters_end.is_none()
 }
 
 /// The key a cached `eval` of `source` under `options` is stored under: the

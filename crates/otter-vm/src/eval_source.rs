@@ -28,24 +28,13 @@
 //! # See also
 //! - `eval_ops` — the three call sites that own both ends of the escape.
 
-use crate::wtf16_escape::{self, decode_units};
+use crate::wtf16_escape::decode_units;
 use otter_bytecode::{BytecodeModule, Constant};
 
 /// Encode a WTF-16 source string as UTF-8 the parser can accept.
 #[must_use]
 pub(crate) fn encode_string(string: crate::JsString, heap: &otter_gc::GcHeap) -> String {
-    // Latin-1 cannot contain a surrogate or the escape marker. Use the
-    // existing narrow storage directly, without caching a widened copy.
-    string
-        .with_latin1(heap, |bytes| {
-            if bytes.is_ascii() {
-                return std::str::from_utf8(bytes)
-                    .expect("ASCII is UTF-8")
-                    .to_owned();
-            }
-            bytes.iter().copied().map(char::from).collect()
-        })
-        .unwrap_or_else(|| string.with_utf16(heap, wtf16_escape::encode))
+    string.to_key_spelling(heap)
 }
 
 /// Restore escaped code units in every literal a compiled module carries.
@@ -85,6 +74,7 @@ fn decode_source_text(text: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wtf16_escape;
 
     fn round_trip(units: &[u16]) -> Vec<u16> {
         let encoded = wtf16_escape::encode(units);

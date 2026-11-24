@@ -1745,11 +1745,13 @@ pub struct EvalCompileOptions {
     /// inside a derived class constructor, making `super()` legal in
     /// the eval body.
     pub super_call_allowed: bool,
-    /// §20.2.1.1 CreateDynamicFunction — the source is a synthesized
-    /// `(function anonymous(...) {...})` whose outer function gets NO
+    /// For CreateDynamicFunction (§20.2.1.1), the source is a synthesized
+    /// `(function anonymous(...) {...})` whose outer function gets no
     /// self-name binding (`typeof anonymous` inside the body is
     /// `"undefined"`).
-    pub function_constructor: bool,
+    /// The offset just after the generated closing parenthesis of the formal
+    /// parameters. The parser must prove both fragments end at their own delimiters.
+    pub dynamic_parameters_end: Option<usize>,
     /// The build-produced compile of a builtin CommonJS wrapper whose text is
     /// the source being compiled. The host answers with that module after
     /// verifying it, or with its own configured compiler's output for the

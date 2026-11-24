@@ -182,7 +182,7 @@ fn compile_eval_with_options(
         options.in_class_field_initializer,
         options.super_property_allowed,
         options.super_call_allowed,
-        options.function_constructor,
+        options.dynamic_parameters_end,
         policy,
     )
 }
@@ -195,16 +195,12 @@ fn compile_eval_with_options(
 /// `import()` resolving a relative specifier — as the file it came from rather
 /// than as anonymous eval code. Only a name with no whitespace in it counts.
 fn source_url_comment(source: &str) -> Option<&str> {
-    let mut found = None;
-    for marker in ["//# sourceURL=", "//@ sourceURL="] {
-        if let Some(at) = source.rfind(marker)
-            && found.is_none_or(|(previous, _)| at > previous)
-        {
-            found = Some((at, at + marker.len()));
-        }
-    }
-    let (_, start) = found?;
-    let rest = &source[start..];
+    const SUFFIX: &str = " sourceURL=";
+    let bytes = source.as_bytes();
+    let marker = memchr::memrchr2_iter(b'#', b'@', bytes).find(|&at| {
+        bytes[..at].ends_with(b"//") && bytes[at + 1..].starts_with(SUFFIX.as_bytes())
+    })?;
+    let rest = &source[marker + 1 + SUFFIX.len()..];
     let end = rest
         .find(['\n', '\r', '\u{2028}', '\u{2029}'])
         .unwrap_or(rest.len());

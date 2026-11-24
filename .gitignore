@@ -35,6 +35,7 @@ tests/test262-results/
 # Local/generated benchmark artifacts (harness + scripts are tracked)
 benchmarks/results/
 benchmarks/.suite-cache/
+benchmarks/.profile-tmp/
 test262_results/
 scratch/
 *.cpuprofile

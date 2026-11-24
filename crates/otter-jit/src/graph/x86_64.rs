@@ -106,14 +106,7 @@ struct Codegen<'a> {
     sink: Option<BooleanSink>,
 }
 
-/// Where a boolean producer fused with its block's branch delivers its
-/// answer: it jumps to the successor the answer selects instead of
-/// materializing `true` or `false` for the branch to test.
-#[derive(Clone, Copy)]
-struct BooleanSink {
-    if_true: DynamicLabel,
-    if_false: DynamicLabel,
-}
+use super::emission::BooleanSink;
 
 /// Encode the production graph, with one entry and one recovery contract.
 #[allow(clippy::too_many_arguments)]
@@ -375,6 +368,7 @@ impl<'a> Codegen<'a> {
             }
         }
         for (position, &block) in order.iter().enumerate() {
+            let next = order.get(position + 1).copied();
             let label = self.labels[&block];
             dynasm!(self.ops ; .arch x64 ; =>label);
             for alias in forwarders.remove(&block).unwrap_or_default() {
@@ -397,7 +391,7 @@ impl<'a> Codegen<'a> {
                     self.emit_move(mov.from, mov.to);
                 }
                 if let Some(&control) = self.fused.get(&node) {
-                    self.sink = Some(self.branch_sink(control));
+                    self.sink = Some(self.branch_sink(control, next));
                     let emitted = self.audited(node, |codegen| codegen.emit_node(node));
                     self.sink = None;
                     emitted?;
@@ -410,13 +404,12 @@ impl<'a> Codegen<'a> {
             let control = data.control.expect("terminated block");
             self.node_offsets.push((self.ops.offset().0, control));
             if fused_control == Some(control) {
-                // The producer already jumped to the branch's successors.
+                // The producer already selected the branch's successor.
                 continue;
             }
             for mov in self.allocation.node(control).moves.clone() {
                 self.emit_move(mov.from, mov.to);
             }
-            let next = order.get(position + 1).copied();
             self.audited(control, |codegen| {
                 codegen.emit_control(block, control, next)
             })?;
@@ -511,7 +504,7 @@ impl<'a> Codegen<'a> {
             }
             Kind::LoadGlobalBinding(byte_pc) => self.emit_global_binding(node, *byte_pc)?,
             Kind::LoadGlobalThis => self.emit_global_this(node),
-            Kind::LoadLiteral(byte_pc) => {
+            Kind::LoadLiteral { byte_pc, .. } => {
                 let byte_pc = *byte_pc;
                 let source = self.view_of(node);
                 let cell = source
@@ -535,7 +528,9 @@ impl<'a> Codegen<'a> {
             Kind::AllocationGroup(index) => self.emit_allocation_group(node, *index)?,
             Kind::AllocationProjection(byte) => self.emit_allocation_projection(node, *byte),
             Kind::NativeLeaf(stub) => self.emit_native_leaf(node, *stub)?,
-            Kind::PrimitiveAdd => self.emit_primitive_add(node)?,
+            Kind::PrimitiveAdd { input_strings } => {
+                self.emit_primitive_add(node, *input_strings)?
+            }
             Kind::NumberToString => self.emit_number_to_string(node)?,
             Kind::NativeAllocLeaf(stub) => self.emit_native_alloc_leaf(node, *stub)?,
             Kind::BigIntBinary(operator) => self.emit_bigint_binary(node, *operator)?,

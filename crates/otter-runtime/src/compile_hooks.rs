@@ -9,6 +9,8 @@
 //! # See also
 //! - [`crate::Runtime`] owns the runtime session.
 
+use otter_resource::CompileSource;
+
 use crate::*;
 
 /// Render a compile failure as the message a JS `SyntaxError` carries. The
@@ -67,36 +69,40 @@ pub(super) fn standard_eval_hook(
     compile_hook: Option<std::sync::Arc<dyn RuntimeCompileHook>>,
     code_cache: hooks::CodeCacheSlot,
 ) -> otter_vm::EvalHook {
-    std::sync::Arc::new(move |source: &str, options: EvalCompileOptions| {
-        if let Some(unit) = options.embedded {
-            return embedded_commonjs_module(unit, compile_hook.as_deref());
-        }
-        if options.commonjs_file && compile_hook.is_none() {
-            return commonjs_file_module(source, &options);
-        }
-        // §16.1.6 ScriptEvaluation — host-requested script
-        // execution ($262.evalScript) compiles under script
-        // GDI semantics, not eval semantics.
-        if options.script_goal {
-            return otter_compiler::compile_script_source(
-                source,
-                SourceKind::JavaScript,
-                "<evalScript>",
-            )
-            .map(otter_vm::CompiledEvalSource::Fresh)
-            .map_err(compile_error_message);
-        }
-        if compile_hook.is_none()
-            && code_cache::eval_is_cacheable(source, &options)
-            && let Some(cache) = code_cache.get()
-        {
-            return code_cache::cached_eval(&*cache, source, &options, || {
-                compile_eval_with_options(source, &options).map_err(compile_error_message)
-            });
-        }
-        let module = compile_eval_with_options(source, &options).map_err(compile_error_message)?;
-        Ok(otter_vm::CompiledEvalSource::Fresh(module))
-    })
+    std::sync::Arc::new(
+        move |input: CompileSource<'_>, options: EvalCompileOptions| {
+            let source = input.text();
+            if let Some(unit) = options.embedded {
+                return embedded_commonjs_module(unit, compile_hook.as_deref());
+            }
+            if options.commonjs_file && compile_hook.is_none() {
+                return commonjs_file_module(source, &options);
+            }
+            // §16.1.6 ScriptEvaluation — host-requested script
+            // execution ($262.evalScript) compiles under script
+            // GDI semantics, not eval semantics.
+            if options.script_goal {
+                return otter_compiler::compile_script_source(
+                    source,
+                    SourceKind::JavaScript,
+                    "<evalScript>",
+                )
+                .map(otter_vm::CompiledEvalSource::Fresh)
+                .map_err(compile_error_message);
+            }
+            if compile_hook.is_none()
+                && code_cache::eval_is_cacheable(source, &options)
+                && let Some(cache) = code_cache.get()
+            {
+                return code_cache::cached_eval(&*cache, source, &options, || {
+                    compile_eval_with_options(input, &options).map_err(compile_error_message)
+                });
+            }
+            let module =
+                compile_eval_with_options(input, &options).map_err(compile_error_message)?;
+            Ok(otter_vm::CompiledEvalSource::Fresh(module))
+        },
+    )
 }
 
 /// A builtin CommonJS wrapper the product build compiled: the configured
@@ -144,7 +150,8 @@ pub(super) fn commonjs_file_module(
     {
         return Ok(otter_vm::CompiledEvalSource::Verified(verified));
     }
-    let module = compile_eval_with_options(source, options).map_err(compile_error_message)?;
+    let module = compile_eval_with_options(CompileSource::Borrowed(source), options)
+        .map_err(compile_error_message)?;
     if let (Some(cache), Some(key)) = (&cache, &key) {
         cache.store(key, &module);
     }
@@ -155,13 +162,19 @@ pub(super) fn commonjs_file_module(
 /// §19.2.1.3 — a direct eval compiles against its call site's context chain;
 /// indirect eval, `Function`, and the CommonJS wrapper carry none.
 fn compile_eval_with_options(
-    source: &str,
+    input: CompileSource<'_>,
     options: &EvalCompileOptions,
 ) -> Result<otter_bytecode::BytecodeModule, otter_compiler::CompileError> {
+    let specifier = source_url_comment(input.text()).unwrap_or("<eval>");
+    let policy = if options.commonjs_file {
+        compile_cache::COMMONJS_FUNCTIONS
+    } else {
+        LAZY_FUNCTIONS
+    };
     otter_compiler::compile_eval_source(
-        source,
+        input,
         SourceKind::JavaScript,
-        source_url_comment(source).unwrap_or("<eval>"),
+        specifier,
         options.force_strict,
         options.forbid_var_arguments,
         options.caller_chain.as_ref(),
@@ -170,7 +183,7 @@ fn compile_eval_with_options(
         options.super_property_allowed,
         options.super_call_allowed,
         options.function_constructor,
-        LAZY_FUNCTIONS,
+        policy,
     )
 }
 

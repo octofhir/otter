@@ -2508,7 +2508,14 @@ impl<'a> Builder<'a> {
             Op::LoadString | Op::LoadBigInt
                 if self.view.literal_cells.contains_key(&instruction.byte_pc) =>
             {
-                let value = self.add(Kind::LoadLiteral(instruction.byte_pc), &[], Repr::Tagged);
+                let value = self.add(
+                    Kind::LoadLiteral {
+                        byte_pc: instruction.byte_pc,
+                        is_string: instruction.op == Op::LoadString,
+                    },
+                    &[],
+                    Repr::Tagged,
+                );
                 self.write(instruction.writes[0], value);
             }
             Op::TestTypeOf => {
@@ -2806,8 +2813,24 @@ impl<'a> Builder<'a> {
                     tagged
                 };
             }
-            let [a, b] = operands;
-            let result = self.add(Kind::PrimitiveAdd, &[a, b], Repr::Tagged);
+            let input_strings = if numbers[0] != numbers[1] {
+                // The number was converted after checking the other input.
+                [true, true]
+            } else {
+                operands.map(|node| match self.graph.node(node).kind {
+                    Kind::LoadLiteral {
+                        is_string: true, ..
+                    }
+                    | Kind::NumberToString => true,
+                    Kind::PrimitiveAdd { input_strings } => input_strings[0] || input_strings[1],
+                    _ => false,
+                })
+            };
+            let result = self.add(
+                Kind::PrimitiveAdd { input_strings },
+                &operands,
+                Repr::Tagged,
+            );
             self.write(instruction.writes[0], result);
             return;
         }

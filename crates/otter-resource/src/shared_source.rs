@@ -74,9 +74,27 @@ impl SharedSource {
     /// cannot be admitted, or [`SharedSourceError::LengthOverflow`] on a target
     /// whose addressable source length cannot be represented by the ledger.
     pub fn admit(account: &ResourceAccount, source: String) -> Result<Self, SharedSourceError> {
-        let amount = source_amount(source.len())?;
-        let lease = account.reserve_exact(ResourceClass::SourceModuleBytes, amount)?;
-        Ok(Self::from_parts(source.into_boxed_str(), lease))
+        Self::try_admit(account, source).map_err(|(_, error)| error)
+    }
+
+    /// Admit source without losing the caller's text on resource refusal.
+    ///
+    /// # Errors
+    /// Returns the unchanged text with its admission error. This permits a
+    /// caller to finish syntax diagnostics before reporting the resource limit.
+    pub fn try_admit(
+        account: &ResourceAccount,
+        source: String,
+    ) -> Result<Self, (String, SharedSourceError)> {
+        let lease = source_amount(source.len()).and_then(|amount| {
+            account
+                .reserve_exact(ResourceClass::SourceModuleBytes, amount)
+                .map_err(SharedSourceError::from)
+        });
+        match lease {
+            Ok(lease) => Ok(Self::from_parts(source.into_boxed_str(), lease)),
+            Err(error) => Err((source, error)),
+        }
     }
 
     /// Read one complete UTF-8 source through a fixed-size stack buffer.

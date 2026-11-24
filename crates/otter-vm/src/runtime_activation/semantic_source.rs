@@ -59,6 +59,9 @@ impl RuntimeCall<'_> {
         &self,
         function_id: u32,
     ) -> Result<crate::code_space::ResolvedCtx<'_>, VmError> {
+        if function_id == self.bound_function_id {
+            return Ok(crate::code_space::ResolvedCtx::Ambient(&self.context));
+        }
         // SAFETY: RuntimeCall retains the VM; the owner lookup reads its cache
         // and ends before any exclusive VM borrow.
         unsafe { self.vm.as_ref() }.owner_of(&self.context, function_id)

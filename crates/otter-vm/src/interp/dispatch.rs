@@ -270,13 +270,7 @@ impl Interpreter {
                 entry_context
             } else {
                 foreign_context = match entry_context.for_function(function_id) {
-                    Ok(code_space::ResolvedCtx::Owned(owned)) => {
-                        // Foreign chunks linked after this loop started (eval
-                        // during this turn) carry IC sites past the entry chunk's
-                        // range.
-                        self.ensure_method_feedback_context(&owned);
-                        Some(owned)
-                    }
+                    Ok(code_space::ResolvedCtx::Owned(owned)) => Some(owned),
                     _ => None,
                 };
                 foreign_context

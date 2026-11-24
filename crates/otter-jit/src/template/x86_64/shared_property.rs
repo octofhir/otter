@@ -317,16 +317,10 @@ fn emit_write_barrier_preserving(
     let done = ops.new_dynamic_label();
     let layout = view.gc_barrier;
     let settled = layout.young_flag | layout.remembered_flag;
+    crate::x86_64::gc_barrier::emit_young_edge(ops, layout, child, [done, slow]);
     dynasm!(ops ; .arch x64
-        ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
-        ; mov r10, [r10 + crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
-        ; cmp BYTE [r10], 0 ; je >generational
-        // While marking runs, a white old child owes the insertion barrier.
-        ; test BYTE [Rq(child) + layout.header_flags_byte as i32], layout.young_flag as i8 ; jnz >generational
-        ; test BYTE [Rq(child) + layout.header_flags_byte as i32], layout.mark_color_bits as i8 ; jz =>slow
-        ; generational:
-        ; test BYTE [Rq(parent) + layout.header_flags_byte as i32], settled as i8 ; jnz =>done
-        ; test BYTE [Rq(child) + layout.header_flags_byte as i32], layout.young_flag as i8 ; jz =>done
+        ; test BYTE [Rq(parent) + layout.header_flags_byte as i32], settled as i8
+        ; jnz =>done
         ; =>slow);
     // Nine volatile words and sixteen vector registers, a multiple of 16.
     const SAVE: i32 = 9 * 8 + 16 * 16 + 8;
@@ -927,7 +921,8 @@ fn emit_concat(ops: &mut Assembler, view: &JitCompileSnapshot, label: DynamicLab
         [
             crate::allocation::AllocationValue::Register(CONCAT_LHS),
             crate::allocation::AllocationValue::Register(CONCAT_RHS),
-        ],
+        ]
+        .into(),
         crate::allocation::LabRegisters {
             buffer: 6,
             candidate: CONCAT_RESULT,

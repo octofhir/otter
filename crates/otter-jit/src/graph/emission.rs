@@ -20,9 +20,32 @@ use dynasmrt::DynamicLabel;
 use otter_vm::native_abi::{ExitAction, ExitReason, SafepointRecord};
 
 use super::ir::NodeId;
-use super::ir::{BlockId, BranchKind, Graph, Kind};
+use super::ir::{BlockId, BranchKind, Condition, Graph, Kind};
 use super::regalloc::{Allocation, Move};
 use crate::artifact::relocation::RelocationCapture;
+
+/// Successors of a fused predicate and the block immediately after it.
+#[derive(Clone, Copy)]
+pub(crate) struct BooleanSink {
+    pub(crate) if_true: DynamicLabel,
+    pub(crate) if_false: DynamicLabel,
+    pub(crate) next: Option<DynamicLabel>,
+}
+
+impl BooleanSink {
+    /// Use the layout's next block as fallthrough whenever it is a successor.
+    pub(crate) fn conditional(
+        self,
+        condition: Condition,
+    ) -> (Condition, DynamicLabel, Option<DynamicLabel>) {
+        if self.next == Some(self.if_true) {
+            (condition.negate(), self.if_false, None)
+        } else {
+            let otherwise = (self.next != Some(self.if_false)).then_some(self.if_false);
+            (condition, self.if_true, otherwise)
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExitSite {
@@ -96,7 +119,8 @@ pub(crate) fn fused_branches(
     graph: &Graph,
     allocation: &Allocation,
 ) -> rustc_hash::FxHashMap<NodeId, NodeId> {
-    let mut reads: rustc_hash::FxHashMap<NodeId, u32> = rustc_hash::FxHashMap::default();
+    let mut reads = vec![0u8; graph.nodes.len()];
+    let mut seen_states = vec![false; graph.frame_states.len()];
     for block in &graph.blocks {
         let nodes = block
             .phis
@@ -108,10 +132,19 @@ pub(crate) fn fused_branches(
                 continue;
             }
             let data = graph.node(node);
-            let states = [data.eager, data.lazy].into_iter().flatten();
-            let values = states.flat_map(|state| graph.state_values(state));
-            for value in data.inputs.iter().copied().chain(values) {
-                *reads.entry(value).or_default() += 1;
+            for value in &data.inputs {
+                let count = &mut reads[value.0 as usize];
+                *count = count.saturating_add(1);
+            }
+            for state in [data.eager, data.lazy].into_iter().flatten() {
+                if !std::mem::replace(&mut seen_states[state.0 as usize], true) {
+                    for value in graph.state_values(state) {
+                        let count = &mut reads[value.0 as usize];
+                        // A frame state is already a second consumer if
+                        // this value is also the branch's condition.
+                        *count = count.saturating_add(1);
+                    }
+                }
             }
         }
     }
@@ -138,7 +171,7 @@ pub(crate) fn fused_branches(
             .copied()
             .find(|&node| !allocation.node(node).skipped);
         if last == Some(producer)
-            && reads.get(&producer) == Some(&1)
+            && reads[producer.0 as usize] == 1
             && allocation.node(control).moves.is_empty()
             && !allocation.definition_spills.contains(&producer)
             && matches!(

@@ -59,6 +59,8 @@ pub struct RuntimeCall<'a> {
     pub(super) stack: NonNull<ActivationStack>,
     pub(super) context: crate::code_space::ResolvedCtx<'a>,
     pub(super) frame: NonNull<Frame>,
+    /// Function for which the bound context was selected.
+    bound_function_id: u32,
     _exclusive: PhantomData<&'a mut ()>,
 }
 
@@ -99,6 +101,7 @@ impl<'a> RuntimeCall<'a> {
             stack,
             context,
             frame,
+            bound_function_id: function_id,
             _exclusive: PhantomData,
         })
     }

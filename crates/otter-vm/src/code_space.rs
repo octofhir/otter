@@ -88,7 +88,7 @@ use otter_resource::{ResourceAccount, ResourceClass, ResourceError, ResourceLeas
 
 use crate::ExecutionContext;
 use crate::executable::ExecutableModule;
-use crate::property_atom::AtomTable;
+use crate::property_atom::{AtomTable, AtomTableLayout};
 use crate::source_registry::SourceRegistry;
 
 #[path = "code_space_snapshot.rs"]
@@ -178,13 +178,15 @@ impl DormantChunk {
             }
         }
         let executable = Arc::new(executable);
+        let atom_layout = AtomTableLayout::for_constants(&module.constants);
         let metadata_bytes = (std::mem::size_of::<ChunkPayload>() as u64)
             .saturating_add(std::mem::size_of::<AtomTable>() as u64)
-            .saturating_add(AtomTable::allocation_bytes(&module.constants));
+            .saturating_add(atom_layout.bytes());
         let mut retained_lease = account
             .reserve_exact(ResourceClass::SourceModuleBytes, metadata_bytes)
             .ok()?;
-        let atoms = AtomTable::from_constants(&module.constants, &mut retained_lease).ok()?;
+        let atoms =
+            AtomTable::from_constants(&module.constants, atom_layout, &mut retained_lease).ok()?;
         atoms.adopt_ids(&self.atom_ids);
         let atoms = Arc::new(atoms);
         let metadata_bytes = payload_metadata_bytes(&atoms);
@@ -541,32 +543,6 @@ fn ensure_function_id_capacity(base: u32, function_count: usize) -> Result<u32, 
     Ok(count)
 }
 
-fn ensure_property_ic_capacity(
-    module: &BytecodeModule,
-    base: u32,
-) -> Result<(), BytecodeLinkError> {
-    let site_count = module
-        .functions
-        .iter()
-        .map(|function| {
-            function
-                .code
-                .iter()
-                .filter(|instruction| crate::executable::has_property_ic_site(instruction.op))
-                .count()
-        })
-        .try_fold(0usize, usize::checked_add)
-        .ok_or(BytecodeLinkError::PropertyIcCapacity {
-            base,
-            site_count: usize::MAX,
-        })?;
-    let count = u32::try_from(site_count)
-        .map_err(|_| BytecodeLinkError::PropertyIcCapacity { base, site_count })?;
-    base.checked_add(count)
-        .ok_or(BytecodeLinkError::PropertyIcCapacity { base, site_count })?;
-    Ok(())
-}
-
 fn build_chunk(
     verified: VerifiedBytecodeModule,
     sources: SourceRegistry,
@@ -586,13 +562,15 @@ fn build_chunk(
         executable = executable.with_alias(alias);
     }
     let executable = Arc::new(executable);
+    let atom_layout = AtomTableLayout::for_constants(&module.constants);
     let metadata_bytes = (std::mem::size_of::<ChunkPayload>() as u64)
         .saturating_add(std::mem::size_of::<AtomTable>() as u64)
-        .saturating_add(AtomTable::allocation_bytes(&module.constants));
+        .saturating_add(atom_layout.bytes());
     let mut retained_lease =
         account.reserve_exact(ResourceClass::SourceModuleBytes, metadata_bytes)?;
     let atoms = Arc::new(AtomTable::from_constants(
         &module.constants,
+        atom_layout,
         &mut retained_lease,
     )?);
     let metadata_bytes = payload_metadata_bytes(&atoms);
@@ -732,7 +710,6 @@ impl CodeSpace {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (function_base, property_ic_base) = self.next_bases()?;
         let function_count = ensure_function_id_capacity(function_base, module.functions.len())?;
-        ensure_property_ic_capacity(&module, property_ic_base)?;
 
         rebase_module(&mut module, function_base)?;
         let verified = VerifiedBytecodeModule::new_at_base(module, function_base)?;
@@ -802,7 +779,6 @@ impl CodeSpace {
         let (function_base, property_ic_base) = self.next_bases()?;
         let function_count =
             ensure_function_id_capacity(function_base, verified.module().functions.len())?;
-        ensure_property_ic_capacity(verified.module(), property_ic_base)?;
 
         let verified = verified.rebase_to(function_base)?;
         let chunk = build_chunk(

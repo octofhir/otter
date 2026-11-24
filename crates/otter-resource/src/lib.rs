@@ -47,6 +47,7 @@
 
 mod account;
 mod class;
+mod compile_scope;
 mod error;
 mod limits;
 mod shared_source;
@@ -54,6 +55,7 @@ mod snapshot;
 
 pub use account::{ResourceAccount, ResourceLease, ResourceLeaseSet, ResourceReservation};
 pub use class::ResourceClass;
+pub use compile_scope::{CompileSource, SourceCompileScope};
 pub use error::ResourceError;
 pub use limits::{ResourceLimits, ResourceLimitsBuilder};
 pub use shared_source::{AccountedBytes, SharedSource, SharedSourceBuilder, SharedSourceError};

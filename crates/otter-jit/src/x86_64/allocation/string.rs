@@ -20,12 +20,15 @@
 //! insertion barrier for a white one while marking runs) before anything
 //! else runs. A tenured site read at run time misses before any write.
 //!
+//! Same-width copies access only complete words and the exact tail, and
+//! Latin-1 widening initializes each full destination unit.
+//!
 //! # See also
 //! - `otter_vm::jit::JitStringLayout` owns the current physical string recipe.
 //! - `super` owns the shared LAB probe, publication and per-type accounting.
 
 use super::{emit_bump_probe_in, emit_publish, emit_value, validate_inputs};
-use crate::allocation::{AllocationValue, ConcatPlacement, LabRegisters};
+use crate::allocation::{AllocationValue, ConcatInputs, ConcatPlacement, LabRegisters};
 use crate::entry::{ALLOC_WINDOW_LAB_OFFSET, ALLOC_WINDOW_OLD_LAB_OFFSET};
 use crate::x86_64::values::emit_load_u64;
 use dynasmrt::{DynamicLabel, DynasmApi, DynasmLabelApi, dynasm, x64::Assembler};
@@ -57,11 +60,15 @@ pub(crate) fn emit_concat(
     ops: &mut Assembler,
     context: u8,
     p: JitStringLayout,
-    inputs: [AllocationValue; 2],
+    inputs: ConcatInputs,
     r: LabRegisters,
     placement: ConcatPlacement,
     slow: DynamicLabel,
 ) -> Option<DynamicLabel> {
+    let ConcatInputs {
+        values: inputs,
+        input_strings,
+    } = inputs;
     validate_inputs(r, &inputs);
     debug_assert_eq!(r.size, 11);
     debug_assert!(
@@ -84,15 +91,18 @@ pub(crate) fn emit_concat(
     let done = ops.new_dynamic_label();
     let empty_a = ops.new_dynamic_label();
     let empty_b = ops.new_dynamic_label();
-    for input in inputs {
-        emit_value(ops, r.buffer, input);
-        emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
-        dynasm!(ops ; .arch x64 ; test Rq(r.buffer),r11 ; jnz =>slow
-            ; test Rq(r.buffer),Rq(r.buffer) ; jz =>slow
-            ; cmp BYTE [Rq(r.buffer)],p.string_type_tag as i8 ; jne =>slow);
-    }
     emit_value(ops, r.buffer, a);
     emit_value(ops, r.end, b);
+    if input_strings != [true; 2] {
+        emit_load_u64(ops, 11, otter_vm::value::tag::NOT_CELL_MASK);
+    }
+    for (register, proven_string) in [r.buffer, r.end].into_iter().zip(input_strings) {
+        if !proven_string {
+            dynasm!(ops ; .arch x64 ; test Rq(register),r11 ; jnz =>slow
+                ; test Rq(register),Rq(register) ; jz =>slow
+                ; cmp BYTE [Rq(register)],p.string_type_tag as i8 ; jne =>slow);
+        }
+    }
     dynasm!(ops ; .arch x64
         ; mov Rd(r.scratch),[Rq(r.buffer)+p.string_len_byte as i32]
         ; test Rd(r.scratch),Rd(r.scratch) ; jz =>empty_a
@@ -204,7 +214,7 @@ pub(crate) fn emit_substring_latin1(
         ; lea Rq(r.end),[Rq(r.end)+r10+p.string_body_size as i32]
         ; lea Rq(r.buffer),[Rq(r.candidate)+p.string_body_size as i32]
         ; mov Rd(r.size),Rd(count));
-    emit_copy_loop(ops, r, false, true);
+    emit_copy_bytes(ops, r);
     let young = ConcatPlacement::Site(otter_vm::jit::JitAllocationSite {
         id: 0,
         record: 0,
@@ -297,38 +307,72 @@ fn emit_flat(
     dynasm!(ops ; .arch x64 ; movq xmm15,Rq(r.candidate)
         ; lea Rq(r.buffer),[Rq(r.candidate)+p.string_body_size as i32]);
     for input in inputs {
-        let wide = ops.new_dynamic_label();
-        let next = ops.new_dynamic_label();
         emit_value(ops, r.end, input);
-        dynasm!(ops ; .arch x64 ; mov Rd(r.size),[Rq(r.end)+p.string_len_byte as i32]
-            ; cmp BYTE [Rq(r.end)+p.string_repr_byte as i32],p.seq_flat_tag as i8
-            ; lea Rq(r.end),[Rq(r.end)+p.string_body_size as i32]
-            ; je =>wide);
-        emit_copy_loop(ops, r, false, latin);
-        dynasm!(ops ; .arch x64 ; jmp =>next ; =>wide);
-        emit_copy_loop(ops, r, true, latin);
-        dynasm!(ops ; .arch x64 ; =>next);
+        dynasm!(ops ; .arch x64
+            ; mov Rd(r.size), [Rq(r.end) + p.string_len_byte as i32]);
+        if latin {
+            dynasm!(ops ; .arch x64
+                ; lea Rq(r.end), [Rq(r.end) + p.string_body_size as i32]);
+            emit_copy_bytes(ops, r);
+        } else {
+            let wide = ops.new_dynamic_label();
+            let next = ops.new_dynamic_label();
+            dynasm!(ops ; .arch x64
+                ; cmp BYTE [Rq(r.end) + p.string_repr_byte as i32], p.seq_flat_tag as i8
+                ; lea Rq(r.end), [Rq(r.end) + p.string_body_size as i32]
+                ; je =>wide);
+            emit_widen_latin1(ops, r);
+            dynasm!(ops ; .arch x64
+                ; jmp =>next ; =>wide
+                ; add Rd(r.size), Rd(r.size));
+            emit_copy_bytes(ops, r);
+            dynasm!(ops ; .arch x64 ; =>next);
+        }
     }
     dynasm!(ops ; .arch x64 ; movq Rq(r.candidate),xmm15);
     publish(ops, context, r, placement);
 }
 
-/// Copy `Rd(r.size)` units from `Rq(r.end)` to `Rq(r.buffer)`: one byte or
-/// two per source unit, one or two per destination unit.
-fn emit_copy_loop(ops: &mut Assembler, r: LabRegisters, wide: bool, latin: bool) {
-    let copying = ops.new_dynamic_label();
+/// Copy a proved byte range in words, then an exact 4/2/1-byte tail.
+/// Neither the source nor the destination needs alignment or readable padding.
+fn emit_copy_bytes(ops: &mut Assembler, r: LabRegisters) {
+    let words = ops.new_dynamic_label();
+    let tail = ops.new_dynamic_label();
+    dynasm!(ops ; .arch x64
+        ; cmp Rd(r.size), 8 ; jb =>tail
+        ; =>words
+        ; mov r10, [Rq(r.end)]
+        ; mov [Rq(r.buffer)], r10
+        ; add Rq(r.end), 8 ; add Rq(r.buffer), 8
+        ; sub Rd(r.size), 8 ; cmp Rd(r.size), 8 ; jae =>words
+        ; =>tail
+        ; test Rd(r.size), 4 ; jz >halfword
+        ; mov r10d, [Rq(r.end)]
+        ; mov [Rq(r.buffer)], r10d
+        ; add Rq(r.end), 4 ; add Rq(r.buffer), 4
+        ; halfword:
+        ; test Rd(r.size), 2 ; jz >byte
+        ; movzx r10d, WORD [Rq(r.end)]
+        ; mov [Rq(r.buffer)], r10w
+        ; add Rq(r.end), 2 ; add Rq(r.buffer), 2
+        ; byte:
+        ; test Rd(r.size), 1 ; jz >done
+        ; movzx r10d, BYTE [Rq(r.end)]
+        ; mov [Rq(r.buffer)], r10b
+        ; inc Rq(r.end) ; inc Rq(r.buffer)
+        ; done:);
+}
+
+/// Widen Latin-1 to WTF-16 without touching any neighboring byte.
+fn emit_widen_latin1(ops: &mut Assembler, r: LabRegisters) {
+    let loop_head = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
     dynasm!(ops ; .arch x64
-        ; test Rd(r.size),Rd(r.size) ; jz =>done ; =>copying
-        ; movzx r10d,BYTE [Rq(r.end)] ; mov [Rq(r.buffer)],r10b
-        ; inc Rq(r.end) ; inc Rq(r.buffer));
-    if wide {
-        dynasm!(ops ; .arch x64 ; movzx r10d,BYTE [Rq(r.end)] ; inc Rq(r.end));
-    } else {
-        dynasm!(ops ; .arch x64 ; xor r10d,r10d);
-    }
-    if !latin {
-        dynasm!(ops ; .arch x64 ; mov [Rq(r.buffer)],r10b ; inc Rq(r.buffer));
-    }
-    dynasm!(ops ; .arch x64 ; dec Rd(r.size) ; jnz =>copying ; =>done);
+        ; test Rd(r.size), Rd(r.size) ; jz =>done
+        ; =>loop_head
+        ; movzx r10d, BYTE [Rq(r.end)]
+        ; mov [Rq(r.buffer)], r10w
+        ; inc Rq(r.end) ; add Rq(r.buffer), 2
+        ; dec Rd(r.size) ; jnz =>loop_head
+        ; =>done);
 }

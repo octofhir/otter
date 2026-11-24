@@ -131,7 +131,7 @@ fn concat_number_conversion_requires_a_current_string_guard() {
             .expect("retain cached number conversion");
         let add = nodes
             .iter()
-            .position(|node| node.kind == Kind::PrimitiveAdd)
+            .position(|node| matches!(node.kind, Kind::PrimitiveAdd { .. }))
             .expect("retain native primitive addition");
         assert!(guard < conversion && conversion < add);
         assert_eq!(nodes[guard].pc, 1);

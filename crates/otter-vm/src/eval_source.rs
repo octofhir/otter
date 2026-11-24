@@ -11,11 +11,11 @@
 //! them in the compiled module. Literal text is the only place an unpaired
 //! surrogate can legally appear (it is not an identifier character), and every
 //! literal reaches the runtime as a WTF-16 constant, so the two ends of the
-//! escape are [`encode`] over the source and [`decode_module`] over the
+//! escape are [`encode_string`] over the source and [`decode_module`] over the
 //! constants.
 //!
 //! # Contents
-//! - [`encode`] — WTF-16 source to parser-ready UTF-8.
+//! - [`encode_string`] — JS string source to parser-ready UTF-8.
 //! - [`decode_module`] — restore the escaped code units in a compiled module.
 //!
 //! # Invariants
@@ -33,8 +33,19 @@ use otter_bytecode::{BytecodeModule, Constant};
 
 /// Encode a WTF-16 source string as UTF-8 the parser can accept.
 #[must_use]
-pub(crate) fn encode(units: &[u16]) -> String {
-    wtf16_escape::encode(units)
+pub(crate) fn encode_string(string: crate::JsString, heap: &otter_gc::GcHeap) -> String {
+    // Latin-1 cannot contain a surrogate or the escape marker. Use the
+    // existing narrow storage directly, without caching a widened copy.
+    string
+        .with_latin1(heap, |bytes| {
+            if bytes.is_ascii() {
+                return std::str::from_utf8(bytes)
+                    .expect("ASCII is UTF-8")
+                    .to_owned();
+            }
+            bytes.iter().copied().map(char::from).collect()
+        })
+        .unwrap_or_else(|| string.with_utf16(heap, wtf16_escape::encode))
 }
 
 /// Restore escaped code units in every literal a compiled module carries.
@@ -76,7 +87,7 @@ mod tests {
     use super::*;
 
     fn round_trip(units: &[u16]) -> Vec<u16> {
-        let encoded = encode(units);
+        let encoded = wtf16_escape::encode(units);
         let mut decoded: Vec<u16> = encoded.encode_utf16().collect();
         decode_units(&mut decoded);
         decoded
@@ -86,7 +97,7 @@ mod tests {
     fn unpaired_surrogates_survive_the_parser_encoding() {
         for unit in [0xD800u16, 0xDBFF, 0xDC00, 0xDFFF] {
             let source = ['/' as u16, '\\' as u16, unit, '/' as u16];
-            assert!(!encode(&source).contains('\u{FFFD}'));
+            assert!(!wtf16_escape::encode(&source).contains('\u{FFFD}'));
             assert_eq!(round_trip(&source), source);
         }
     }
@@ -99,7 +110,7 @@ mod tests {
         // A well-formed pair is not an escape, and a source without either is
         // handed to the parser untouched.
         let pair: Vec<u16> = "x\u{1F600}y".encode_utf16().collect();
-        assert_eq!(encode(&pair), "x\u{1F600}y");
+        assert_eq!(wtf16_escape::encode(&pair), "x\u{1F600}y");
         assert_eq!(round_trip(&pair), pair);
     }
 }

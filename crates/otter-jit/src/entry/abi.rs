@@ -84,6 +84,8 @@ pub(crate) const VM_THREAD_ARRAY_INDEX_PROTECTOR_CELL_OFFSET: u32 =
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const VM_THREAD_ARRAY_BUFFER_DETACH_PROTECTOR_CELL_OFFSET: u32 =
     std::mem::offset_of!(VmThread, array_buffer_detach_protector_cell) as u32;
+pub(crate) const VM_THREAD_CONCAT_CACHE_OFFSET: u32 =
+    std::mem::offset_of!(VmThread, concat_cache) as u32;
 pub(crate) const VM_THREAD_NUMBER_STRINGS_OFFSET: u32 =
     std::mem::offset_of!(VmThread, number_strings) as u32;
 pub(crate) const VM_THREAD_INDEX_ATOMS_OFFSET: u32 =

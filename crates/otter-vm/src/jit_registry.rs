@@ -67,6 +67,11 @@
 //! # See also
 //! - [`crate::native_abi::CodeRegistryView`] — the published lookup surface.
 
+#[path = "jit_registry/function_entries.rs"]
+mod function_entries;
+pub(crate) use function_entries::EntryDirectory;
+use function_entries::{FunctionEntries, assert_layout};
+
 use crate::jit::{
     JitCodeGenerationSnapshot, JitDirectCallPlan, JitDirectCallThisMode, JitFunctionCode,
 };
@@ -167,14 +172,10 @@ pub struct JitCodeRegistry {
     /// Permanent generated-call linkage cells by bytecode function. Callers
     /// bake these addresses once; tier publication switches only the contained
     /// generation-cell pointer.
-    function_entry_cells: rustc_hash::FxHashMap<u32, Box<FunctionEntryCell>>,
-    /// The same cells' addresses, by function, for compiler threads.
-    entry_directory: std::sync::Arc<EntryDirectory>,
+    function_entry_cells: FunctionEntries,
     /// Functions retraining after a deopt: their stable cells select the
     /// interpreter while their baseline generation stays installed.
     retraining: rustc_hash::FxHashSet<u32>,
-    /// Indexed linkage addresses published through the stable registry view.
-    function_entries: Vec<u64>,
     /// Last cumulative generated-call counters merged into VM tier policy.
     generated_feedback_seen: rustc_hash::FxHashMap<u64, GeneratedFeedbackSeen>,
     /// Generations whose counters can still move: installed generations
@@ -214,10 +215,8 @@ impl JitCodeRegistry {
             counting_generations: Vec::new(),
             counting_members: rustc_hash::FxHashSet::default(),
             retained_bytes: 0,
-            function_entry_cells: rustc_hash::FxHashMap::default(),
-            entry_directory: std::sync::Arc::default(),
+            function_entry_cells: FunctionEntries::default(),
             retraining: rustc_hash::FxHashSet::default(),
-            function_entries: Vec::new(),
             generated_feedback_seen: rustc_hash::FxHashMap::default(),
             epochs: rustc_hash::FxHashMap::default(),
             subscriptions: crate::code_dependencies::ShapeSubscriptions::default(),
@@ -240,7 +239,7 @@ impl JitCodeRegistry {
         function_id: u32,
         function: &otter_bytecode::Function,
     ) {
-        if let Some(cell) = self.function_entry_cells.get_mut(&function_id) {
+        if let Some(cell) = self.function_entry_cells.get_mut(function_id) {
             debug_assert_eq!(cell.param_count, function.param_count);
             cell.relayout_lazy_body(
                 function
@@ -271,6 +270,18 @@ impl JitCodeRegistry {
         );
     }
 
+    /// Link one dense batch with one directory publication.
+    pub(crate) fn link_functions<'a>(
+        &mut self,
+        functions: impl IntoIterator<Item = &'a otter_bytecode::Function>,
+        realm_id: u32,
+    ) {
+        let headers = functions
+            .into_iter()
+            .map(|function| (crate::code_space::FunctionHeader::of(function), realm_id));
+        self.function_entry_cells.link(headers, &mut self.view);
+    }
+
     fn ensure_function_entry(
         &mut self,
         function_id: u32,
@@ -279,37 +290,18 @@ impl JitCodeRegistry {
         call_flags: u32,
         realm_id: u32,
     ) {
-        let cell = self
-            .function_entry_cells
-            .entry(function_id)
-            .or_insert_with(|| {
-                FunctionEntryCell::new(
-                    function_id,
-                    param_count,
-                    register_count,
-                    call_flags,
-                    realm_id,
-                )
-            });
-        assert_eq!(
-            cell.param_count, param_count,
-            "linked function parameter layout is immutable"
-        );
-        assert_eq!(
-            cell.register_count, register_count,
-            "linked function register layout is immutable"
-        );
-        let index = function_id as usize;
-        if self.function_entries.len() <= index {
-            self.function_entries.resize(index + 1, 0);
+        if let Some(cell) = self.function_entry_cells.get(function_id) {
+            assert_layout(cell, param_count, register_count);
+            return;
         }
-        self.function_entries[index] = std::ptr::from_ref(cell.as_ref()) as u64;
-        let address = std::ptr::from_ref(cell.as_ref()) as usize;
-        self.entry_directory
-            .borrow_mut()
-            .insert(function_id, address);
-        self.view.function_entries = self.function_entries.as_ptr() as u64;
-        self.view.function_entry_count = self.function_entries.len() as u64;
+        let header = crate::code_space::FunctionHeader {
+            id: function_id,
+            param_count,
+            register_count,
+            call_flags,
+        };
+        self.function_entry_cells
+            .link([(header, realm_id)], &mut self.view);
     }
 
     /// Install the ledger charged for installed code objects' retained bytes.
@@ -573,7 +565,10 @@ impl JitCodeRegistry {
         if let Some((entry_cell, param_count, register_count)) = entry_cell {
             let function_id = entry_cell.native_frame_header.function_id;
             self.ensure_function_entry(function_id, param_count, register_count, 0, 0);
-            let function_entry = &self.function_entry_cells[&function_id];
+            let function_entry = self
+                .function_entry_cells
+                .get(function_id)
+                .expect("linked function cell");
             if function_entry.param_count != param_count
                 || function_entry.register_count != register_count
             {
@@ -705,7 +700,7 @@ impl JitCodeRegistry {
 
     /// The function entry cells' directory, shared with compiler threads.
     pub(crate) fn entry_directory(&self) -> std::sync::Arc<EntryDirectory> {
-        std::sync::Arc::clone(&self.entry_directory)
+        self.function_entry_cells.directory()
     }
 
     /// Read the registry-owned publication without scanning generation history.
@@ -716,7 +711,7 @@ impl JitCodeRegistry {
         &self,
         function_id: u32,
     ) -> Option<(&FunctionEntryCell, &CodeEntryCell)> {
-        let function = self.function_entry_cells.get(&function_id)?;
+        let function = self.function_entry_cells.get(function_id)?;
         let address = function.current_generation();
         if address == 0 {
             return None;
@@ -1039,7 +1034,7 @@ impl JitCodeRegistry {
             let function_id = cell.native_frame_header.function_id;
             let function_entry = self
                 .function_entry_cells
-                .get(&function_id)
+                .get(function_id)
                 .expect("every generation retains its permanent function cell");
             let registered = self.codes.get(&code_object_id);
             let (entries, returns, deopts) = cell.generated_feedback();
@@ -1086,7 +1081,7 @@ impl JitCodeRegistry {
     pub(crate) fn counted_entries(&self, function_id: u32) -> u64 {
         let routed = self
             .function_entry_cells
-            .get(&function_id)
+            .get(function_id)
             .map_or(0, |function| {
                 function.interpreter_destination().generated_feedback().0
             });
@@ -1275,7 +1270,7 @@ impl JitCodeRegistry {
     /// publish it through the permanent function cell.
     fn refresh_function_entry(&mut self, function_id: u32) {
         if self.retraining.contains(&function_id) {
-            if let Some(function_entry) = self.function_entry_cells.get(&function_id) {
+            if let Some(function_entry) = self.function_entry_cells.get(function_id) {
                 function_entry.restore_interpreter();
             }
             return;
@@ -1304,7 +1299,7 @@ impl JitCodeRegistry {
             })
             .max_by_key(|(priority, _)| *priority)
             .map_or(0, |(_, cell)| cell);
-        let Some(function_entry) = self.function_entry_cells.get(&function_id) else {
+        let Some(function_entry) = self.function_entry_cells.get(function_id) else {
             return;
         };
         if target == 0 {
@@ -1472,11 +1467,6 @@ fn retained_call_entry_offset(code: &dyn JitFunctionCode) -> Option<u32> {
     }
     u32::try_from(offset).ok()
 }
-
-/// Every function entry cell's address by function, written as the registry
-/// links functions; cells live as long as the registry.
-pub(crate) type EntryDirectory =
-    crate::mutator_owned::MutatorCell<rustc_hash::FxHashMap<u32, usize>>;
 
 /// The direct-call plan of `function`'s published generation in
 /// `function_entry`, when that generation has an entry. Reads atomics only:
@@ -1727,7 +1717,10 @@ mod tests {
         // SAFETY: entry cells are boxed and retained for the registry lifetime.
         let cell = unsafe { &*(cell_addr as *const CodeEntryCell) };
         assert_eq!(cell.code_object_id, 13);
-        let function_cell = &registry.function_entry_cells[&cell.native_frame_header.function_id];
+        let function_cell = registry
+            .function_entry_cells
+            .get(cell.native_frame_header.function_id)
+            .unwrap();
         assert_eq!(function_cell.param_count, 2);
         assert_eq!(function_cell.register_count, 9);
         assert!(cell.try_acquire().is_some());
@@ -1794,8 +1787,13 @@ mod tests {
     fn linked_interpreter_entries_survive_directory_growth_and_invalidation() {
         let mut registry = JitCodeRegistry::new_boxed();
         registry.ensure_function_entry(0, 2, 9, 5, 0);
-        let stable = registry.function_entries[0];
-        let destination = registry.function_entry_cells[&0].current_generation();
+        let directory = registry.entry_directory();
+        let stable = directory.borrow()[0];
+        let destination = registry
+            .function_entry_cells
+            .get(0)
+            .unwrap()
+            .current_generation();
         let (_, entry) = registry.published_function_entry(0).unwrap();
         assert_eq!(entry.native_frame_header.kind, NativeFrameKind::Interpreter);
         assert_eq!(entry.native_frame_header.register_count, 9);
@@ -1811,19 +1809,27 @@ mod tests {
         assert_eq!(registry.view.function_entry_count, 4096);
         assert_eq!(
             registry.view.function_entries,
-            registry.function_entries.as_ptr() as u64
+            directory.borrow().as_ptr() as u64
         );
-        assert_eq!(registry.function_entries[0], stable);
+        assert_eq!(directory.borrow()[0], stable);
         assert_eq!(
-            registry.function_entry_cells[&0].current_generation(),
+            registry
+                .function_entry_cells
+                .get(0)
+                .unwrap()
+                .current_generation(),
             destination
         );
         registry.invalidate_all();
         assert_eq!(
-            registry.function_entry_cells[&0].current_generation(),
+            registry
+                .function_entry_cells
+                .get(0)
+                .unwrap()
+                .current_generation(),
             destination
         );
-        // SAFETY: every address is owned by a permanent registry box.
+        // SAFETY: every address is owned by a permanent registry page.
         let directory = unsafe {
             std::slice::from_raw_parts(registry.view.function_entries as *const u64, 4096)
         };
@@ -1932,9 +1938,13 @@ mod tests {
                 .register_generation(201, caller, 2, 12, Some(1), Box::new([]),)
                 .is_ok()
         );
-        let stable_addr = std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64;
+        let stable_addr = std::ptr::from_ref(registry.function_entry_cells.get(7).unwrap()) as u64;
         assert_eq!(
-            registry.function_entry_cells[&7].current_generation(),
+            registry
+                .function_entry_cells
+                .get(7)
+                .unwrap()
+                .current_generation(),
             registry.entry_cell_addr(101).unwrap()
         );
 
@@ -1952,19 +1962,26 @@ mod tests {
             102
         );
         assert_eq!(
-            std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64,
+            std::ptr::from_ref(registry.function_entry_cells.get(7).unwrap()) as u64,
             stable_addr,
             "promotion must preserve the caller-baked function-cell address"
         );
         assert_eq!(
-            registry.function_entry_cells[&7].current_generation(),
+            registry
+                .function_entry_cells
+                .get(7)
+                .unwrap()
+                .current_generation(),
             registry.entry_cell_addr(102).unwrap(),
             "optimizing tier becomes the published target"
         );
         // SAFETY: generation cells are stable for the registry lifetime.
         let optimizing_cell =
             unsafe { &*(registry.entry_cell_addr(102).unwrap() as *const CodeEntryCell) };
-        assert_eq!(registry.function_entry_cells[&7].register_count, 9);
+        assert_eq!(
+            registry.function_entry_cells.get(7).unwrap().register_count,
+            9
+        );
         assert_eq!(optimizing_cell.native_frame_header.register_count, 9);
 
         assert_eq!(registry.invalidate_code_object(102), vec![7]);
@@ -1977,7 +1994,11 @@ mod tests {
             101
         );
         assert_eq!(
-            registry.function_entry_cells[&7].current_generation(),
+            registry
+                .function_entry_cells
+                .get(7)
+                .unwrap()
+                .current_generation(),
             registry.entry_cell_addr(101).unwrap(),
             "invalidating the optimizer republishes the installed baseline"
         );
@@ -1999,7 +2020,11 @@ mod tests {
         );
         assert_eq!(registry.invalidate_code_object(101), vec![7]);
         assert_eq!(
-            registry.function_entry_cells[&7].current_generation(),
+            registry
+                .function_entry_cells
+                .get(7)
+                .unwrap()
+                .current_generation(),
             registry.entry_cell_addr(103).unwrap(),
             "refreshing baseline must preserve the independent optimizing generation"
         );
@@ -2057,8 +2082,13 @@ mod tests {
                     .is_ok()
             );
         }
-        let stable_source = std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64;
-        let ordinary_destination = registry.function_entry_cells[&12].current_generation();
+        let stable_source =
+            std::ptr::from_ref(registry.function_entry_cells.get(7).unwrap()) as u64;
+        let ordinary_destination = registry
+            .function_entry_cells
+            .get(12)
+            .unwrap()
+            .current_generation();
         assert_eq!(registry.invalidate_function(7), [7, 10, 11]);
         for id in 301..=304 {
             assert!(!registry.is_current_generation(id));
@@ -2077,13 +2107,17 @@ mod tests {
             );
         }
         assert_eq!(
-            std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64,
+            std::ptr::from_ref(registry.function_entry_cells.get(7).unwrap()) as u64,
             stable_source,
             "ordinary callers retain the permanent source entry address"
         );
         assert!(registry.is_current_generation(305));
         assert_eq!(
-            registry.function_entry_cells[&12].current_generation(),
+            registry
+                .function_entry_cells
+                .get(12)
+                .unwrap()
+                .current_generation(),
             ordinary_destination
         );
     }

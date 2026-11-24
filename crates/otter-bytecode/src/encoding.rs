@@ -45,8 +45,8 @@
 use crate::{
     ExceptionHandler, FunctionCode, Instruction, Op, Operand, SpanEntry,
     opcode_schema::{
-        OperandKind, OperandShapeError, RelativeTargetBase, SuccessorSpec, decode_operand_word,
-        opcode_schema, operand_kind_at, verify_operand_shape,
+        OpcodeSchema, OperandKind, OperandShape, OperandShapeError, OperandSpec,
+        RelativeTargetBase, SuccessorSpec, opcode_schema, verify_operand_shape,
     },
     wordcode::{INLINE_OPERAND_WORDS, Instruction as WordInstruction},
 };
@@ -57,37 +57,68 @@ use crate::{
 /// Returns [`VerifyError`] for malformed/noncanonical operand storage,
 /// operand-shape or branch-target violations, or a reachable function end.
 pub fn verify_wordcode_function(code: &FunctionCode) -> Result<(), VerifyError> {
-    let len = i64::try_from(code.len()).map_err(|_| VerifyError::FunctionTooLarge)?;
+    measure_wordcode_bytes(code, true).map(drop)
+}
+
+/// Validate every word and its schema, check control flow when requested, and
+/// compute the serialized length. Consumers can record each instruction's byte
+/// PC from this same scan.
+pub(crate) fn scan_wordcode<E>(
+    code: &FunctionCode,
+    check_control_flow: bool,
+    map_error: impl Fn(VerifyError) -> E,
+    mut inspect: impl FnMut(usize, &'static OpcodeSchema, &[u32], u32) -> Result<(), E>,
+) -> Result<u32, E> {
+    let len = i64::try_from(code.len()).map_err(|_| map_error(VerifyError::FunctionTooLarge))?;
     let (instructions, overflow_operand_words) = code.raw_parts();
     let mut next_overflow_offset = 0;
-    let mut decoded_operands = DecodedOperands::with_capacity(instructions.len());
+    let mut can_reach_end = false;
+    let mut byte_pc = 0u32;
     for (instruction_index, instr) in instructions.iter().enumerate() {
-        let start = decoded_operands.operands.len();
-        decode_wordcode_operands(
+        let words = verify_operand_storage(
             instr,
             overflow_operand_words,
             &mut next_overflow_offset,
             instruction_index,
-            &mut decoded_operands.operands,
-        )?;
-        let operands = &decoded_operands.operands[start..];
-        verify_operand_shape(instr.op, operands).map_err(|error| {
-            VerifyError::InvalidOperandShape {
-                instruction_index,
-                error,
-            }
-        })?;
+        )
+        .map_err(&map_error)?;
         let schema = opcode_schema(instr.op);
-        for successor in schema.successor_shape.exact() {
-            if let SuccessorSpec::RelativeTarget { operand_index, .. } = successor {
-                verify_wordcode_target(operands, instruction_index, *operand_index, None, len)?;
+        verify_wordcode_shape(schema.operand_shape, words, instruction_index)
+            .map_err(&map_error)?;
+        if check_control_flow {
+            for successor in schema.successor_shape.exact() {
+                match successor {
+                    SuccessorSpec::RelativeTarget { operand_index, .. } => {
+                        let target = resolve_wordcode_target(
+                            words
+                                .get(*operand_index)
+                                .map(|&word| Operand::Imm32(word as i32)),
+                            words.len(),
+                            instruction_index,
+                            *operand_index,
+                            len,
+                        )
+                        .map_err(&map_error)?;
+                        can_reach_end |= target == instructions.len();
+                    }
+                    SuccessorSpec::Fallthrough => {
+                        can_reach_end |= instruction_index + 1 == instructions.len();
+                    }
+                    SuccessorSpec::FrameReturn => {}
+                }
             }
         }
-        decoded_operands.ends.push(decoded_operands.operands.len());
+        inspect(instruction_index, schema, words, byte_pc)?;
+        byte_pc = byte_pc
+            .checked_add(u32::from(wordcode_instruction_bytes(instr)))
+            .ok_or_else(|| map_error(VerifyError::FunctionTooLarge))?;
     }
-    verify_wordcode_overflow_consumed(next_overflow_offset, overflow_operand_words.len())?;
-    verify_reachable_end(instructions, &decoded_operands, [0])?;
-    Ok(())
+    verify_wordcode_overflow_consumed(next_overflow_offset, overflow_operand_words.len())
+        .map_err(&map_error)?;
+    if check_control_flow && (instructions.is_empty() || can_reach_end) {
+        verify_reachable_end(code, [0]).map_err(&map_error)?;
+    }
+    Ok(byte_pc)
 }
 
 /// Verify a function's exception handler table against its verified code.
@@ -96,7 +127,7 @@ pub fn verify_wordcode_function(code: &FunctionCode) -> Result<(), VerifyError> 
 /// Returns [`VerifyError`] for a range outside the code, a target outside the
 /// code or inside its own range, ranges that overlap without nesting or list
 /// an enclosing range first, or a path from a target that runs off the end.
-pub fn verify_exception_handlers(
+pub(crate) fn verify_exception_handlers(
     code: &FunctionCode,
     handlers: &[ExceptionHandler],
 ) -> Result<(), VerifyError> {
@@ -150,78 +181,38 @@ pub fn verify_exception_handlers(
     if handlers.is_empty() {
         return Ok(());
     }
-    let (instructions, overflow_operand_words) = code.raw_parts();
-    let mut next_overflow_offset = 0;
-    let mut decoded_operands = DecodedOperands::with_capacity(instructions.len());
-    for (instruction_index, instr) in instructions.iter().enumerate() {
-        decode_wordcode_operands(
-            instr,
-            overflow_operand_words,
-            &mut next_overflow_offset,
-            instruction_index,
-            &mut decoded_operands.operands,
-        )?;
-        decoded_operands.ends.push(decoded_operands.operands.len());
-    }
-    verify_reachable_end(
-        instructions,
-        &decoded_operands,
-        handlers.iter().map(|handler| handler.target as usize),
-    )
-}
-
-/// Every instruction's decoded operands in one buffer, delimited by the end
-/// offset of each instruction's run.
-struct DecodedOperands {
-    operands: Vec<Operand>,
-    ends: Vec<usize>,
-}
-
-impl DecodedOperands {
-    fn with_capacity(instructions: usize) -> Self {
-        Self {
-            operands: Vec::with_capacity(instructions.saturating_mul(3)),
-            ends: Vec::with_capacity(instructions),
-        }
-    }
-
-    /// Operands of instruction `index`.
-    fn of(&self, index: usize) -> &[Operand] {
-        let start = index
-            .checked_sub(1)
-            .map_or(0, |previous| self.ends[previous]);
-        &self.operands[start..self.ends[index]]
-    }
-}
-
-fn verify_wordcode_target(
-    operands: &[Operand],
-    instruction_index: usize,
-    operand_index: usize,
-    absent_value: Option<i32>,
-    instruction_count: i64,
-) -> Result<(), VerifyError> {
-    resolve_wordcode_target(
-        operands,
-        instruction_index,
-        operand_index,
-        absent_value,
-        instruction_count,
-    )?;
-    Ok(())
+    verify_reachable_end(code, handlers.iter().map(|handler| handler.target as usize))
 }
 
 fn resolve_wordcode_target(
-    operands: &[Operand],
+    operand: Option<Operand>,
+    operand_count: usize,
     instruction_index: usize,
     operand_index: usize,
-    absent_value: Option<i32>,
     instruction_count: i64,
-) -> Result<Option<usize>, VerifyError> {
-    let delta = checked_wordcode_imm32_operand(operands, instruction_index, operand_index)?;
-    if absent_value == Some(delta) {
-        return Ok(None);
-    }
+) -> Result<usize, VerifyError> {
+    let delta = match operand {
+        Some(Operand::Imm32(value)) => value,
+        Some(operand) => {
+            return Err(VerifyError::InvalidOperandShape {
+                instruction_index,
+                error: OperandShapeError::Kind {
+                    index: operand_index,
+                    expected: OperandKind::Imm32,
+                    actual: OperandKind::of(&operand),
+                },
+            });
+        }
+        None => {
+            return Err(VerifyError::InvalidOperandShape {
+                instruction_index,
+                error: OperandShapeError::Count {
+                    expected: operand_index.saturating_add(1),
+                    actual: operand_count,
+                },
+            });
+        }
+    };
     let base = i64::try_from(instruction_index)
         .map_err(|_| VerifyError::FunctionTooLarge)?
         .checked_add(1)
@@ -235,46 +226,19 @@ fn resolve_wordcode_target(
             target,
         });
     }
-    let target = usize::try_from(target).map_err(|_| VerifyError::FunctionTooLarge)?;
-    Ok(Some(target))
+    usize::try_from(target).map_err(|_| VerifyError::FunctionTooLarge)
 }
 
-fn checked_wordcode_imm32_operand(
-    operands: &[Operand],
-    instruction_index: usize,
-    operand_index: usize,
-) -> Result<i32, VerifyError> {
-    match operands.get(operand_index).copied() {
-        Some(Operand::Imm32(value)) => Ok(value),
-        Some(operand) => Err(VerifyError::InvalidOperandShape {
-            instruction_index,
-            error: OperandShapeError::Kind {
-                index: operand_index,
-                expected: OperandKind::Imm32,
-                actual: OperandKind::of(&operand),
-            },
-        }),
-        None => Err(VerifyError::InvalidOperandShape {
-            instruction_index,
-            error: OperandShapeError::Count {
-                expected: operand_index.saturating_add(1),
-                actual: operands.len(),
-            },
-        }),
-    }
-}
-
-fn decode_wordcode_operands(
-    instruction: &WordInstruction,
-    overflow_operand_words: &[u32],
+fn verify_operand_storage<'a>(
+    instruction: &'a WordInstruction,
+    overflow_operand_words: &'a [u32],
     next_overflow_offset: &mut usize,
     instruction_index: usize,
-    operands: &mut Vec<Operand>,
-) -> Result<(), VerifyError> {
-    let (op, raw_operand_count, inline_operand_words, raw_overflow_offset) =
-        instruction.raw_parts();
+) -> Result<&'a [u32], VerifyError> {
+    let (raw_operand_count, inline_operand_words, raw_overflow_offset) =
+        instruction.operand_storage();
     let operand_count = usize::from(raw_operand_count);
-    let operand_words = if operand_count <= INLINE_OPERAND_WORDS {
+    if operand_count <= INLINE_OPERAND_WORDS {
         if raw_overflow_offset != u32::MAX {
             return Err(VerifyError::InvalidOperandStorage {
                 instruction_index,
@@ -297,7 +261,7 @@ fn decode_wordcode_operands(
                 });
             }
         }
-        &inline_operand_words[..operand_count]
+        Ok(&inline_operand_words[..operand_count])
     } else {
         if raw_overflow_offset == u32::MAX {
             return Err(VerifyError::InvalidOperandStorage {
@@ -355,47 +319,68 @@ fn decode_wordcode_operands(
             });
         }
         *next_overflow_offset = overflow_end;
-        &overflow_operand_words[overflow_offset..overflow_end]
-    };
+        Ok(&overflow_operand_words[overflow_offset..overflow_end])
+    }
+}
 
-    if let Some(expected) = opcode_schema(op).operand_shape.fixed()
-        && operand_count != expected.len()
-    {
-        return Err(VerifyError::InvalidOperandShape {
+/// Validate schema sizes and register ranges directly on canonical operand
+/// words. The wordcode derives kinds from the schema and carries no kind tags.
+fn verify_wordcode_shape(
+    shape: OperandShape,
+    words: &[u32],
+    instruction_index: usize,
+) -> Result<(), VerifyError> {
+    let shape_error = |error| VerifyError::InvalidOperandShape {
+        instruction_index,
+        error,
+    };
+    let count_error = |expected| {
+        shape_error(OperandShapeError::Count {
+            expected,
+            actual: words.len(),
+        })
+    };
+    let prefix = shape.prefix().expect("wordcode schema has a prefix");
+    let (prefix_words, tail_words) = words
+        .split_at_checked(prefix.len())
+        .ok_or_else(|| count_error(prefix.len()))?;
+    for (index, (&word, spec)) in prefix_words.iter().zip(prefix).enumerate() {
+        verify_wordcode_register(word, spec, instruction_index, index)?;
+    }
+    if let Some((count_index, tail)) = shape.variadic() {
+        let count = prefix_words[count_index];
+        let expected = prefix
+            .len()
+            .checked_add(count as usize)
+            .ok_or_else(|| shape_error(OperandShapeError::VariadicCountOverflow { count }))?;
+        if words.len() != expected {
+            return Err(count_error(expected));
+        }
+        for (index, &word) in tail_words.iter().enumerate() {
+            verify_wordcode_register(word, &tail, instruction_index, prefix.len() + index)?;
+        }
+    } else if !tail_words.is_empty() {
+        return Err(count_error(prefix.len()));
+    }
+    Ok(())
+}
+
+#[inline]
+fn verify_wordcode_register(
+    word: u32,
+    spec: &OperandSpec,
+    instruction_index: usize,
+    operand_index: usize,
+) -> Result<(), VerifyError> {
+    if spec.kind == OperandKind::Register && word > u32::from(u16::MAX) {
+        return Err(VerifyError::InvalidOperandStorage {
             instruction_index,
-            error: OperandShapeError::Count {
-                expected: expected.len(),
-                actual: operand_count,
+            error: OperandStorageError::InvalidOperandWord {
+                operand_index,
+                expected: spec.kind,
+                word,
             },
         });
-    }
-
-    operands.reserve(operand_count);
-    for (operand_index, word) in operand_words.iter().copied().enumerate() {
-        let Some(kind) = operand_kind_at(op, operand_index) else {
-            let expected = opcode_schema(op)
-                .operand_shape
-                .prefix()
-                .map_or(0, |prefix| prefix.len());
-            return Err(VerifyError::InvalidOperandShape {
-                instruction_index,
-                error: OperandShapeError::Count {
-                    expected,
-                    actual: operand_count,
-                },
-            });
-        };
-        let Some(operand) = decode_operand_word(kind, word) else {
-            return Err(VerifyError::InvalidOperandStorage {
-                instruction_index,
-                error: OperandStorageError::InvalidOperandWord {
-                    operand_index,
-                    expected: kind,
-                    word,
-                },
-            });
-        };
-        operands.push(operand);
     }
     Ok(())
 }
@@ -416,11 +401,10 @@ fn verify_wordcode_overflow_consumed(
 /// Walk normal successors from `roots`; no reachable path may run off the
 /// end of the code.
 fn verify_reachable_end(
-    instructions: &[WordInstruction],
-    operands: &DecodedOperands,
+    code: &FunctionCode,
     roots: impl IntoIterator<Item = usize>,
 ) -> Result<(), VerifyError> {
-    let len = instructions.len();
+    let len = code.len();
     let count = i64::try_from(len).map_err(|_| VerifyError::FunctionTooLarge)?;
     let mut seen = vec![false; len];
     let mut worklist = Vec::new();
@@ -434,16 +418,17 @@ fn verify_reachable_end(
         }
     }
     while let Some(index) = worklist.pop() {
-        for successor in opcode_schema(instructions[index].op)
-            .successor_shape
-            .exact()
-        {
+        let instruction = &code[index];
+        for successor in opcode_schema(instruction.op).successor_shape.exact() {
             let target = match successor {
                 SuccessorSpec::Fallthrough => index + 1,
-                SuccessorSpec::RelativeTarget { operand_index, .. } => {
-                    resolve_wordcode_target(operands.of(index), index, *operand_index, None, count)?
-                        .ok_or(VerifyError::FunctionTooLarge)?
-                }
+                SuccessorSpec::RelativeTarget { operand_index, .. } => resolve_wordcode_target(
+                    code.operand(instruction, *operand_index),
+                    instruction.operand_count(),
+                    index,
+                    *operand_index,
+                    count,
+                )?,
                 SuccessorSpec::FrameReturn => continue,
             };
             if target >= len {
@@ -833,10 +818,7 @@ pub fn layout_function(instructions: &[Instruction]) -> Result<FunctionLayout, V
         instr_to_byte_pc.push(byte_pc);
         let mut byte_len = 2_u32;
         for operand in instr.operands.iter() {
-            let operand_len = match operand {
-                Operand::Register(_) => 3,
-                Operand::ConstIndex(_) | Operand::Imm32(_) => 5,
-            };
+            let operand_len = u32::from(operand_wire_bytes(OperandKind::of(operand)));
             byte_len = byte_len
                 .checked_add(operand_len)
                 .ok_or(VerifyError::FunctionTooLarge)?;
@@ -857,8 +839,20 @@ pub fn layout_function(instructions: &[Instruction]) -> Result<FunctionLayout, V
 /// # Errors
 /// Returns [`VerifyError`] for invalid wordcode or u32 metadata overflow.
 pub fn layout_wordcode_function(code: &FunctionCode) -> Result<FunctionLayout, VerifyError> {
-    verify_wordcode_function(code)?;
-    measure_wordcode_function(code)
+    let mut instr_to_byte_pc = Vec::with_capacity(code.len());
+    let total_bytes = scan_wordcode(
+        code,
+        true,
+        |error| error,
+        |_, _, _, pc| {
+            instr_to_byte_pc.push(pc);
+            Ok(())
+        },
+    )?;
+    Ok(FunctionLayout {
+        total_bytes,
+        instr_to_byte_pc: instr_to_byte_pc.into_boxed_slice(),
+    })
 }
 
 /// Calculate a wordcode function's serialized byte-PC layout without
@@ -874,46 +868,78 @@ pub fn layout_wordcode_function(code: &FunctionCode) -> Result<FunctionLayout, V
 /// operand-shape violations, or u32 metadata overflow. Control-flow targets
 /// are intentionally not checked here.
 pub fn measure_wordcode_function(code: &FunctionCode) -> Result<FunctionLayout, VerifyError> {
-    let mut byte_pc = 0_u32;
     let mut instr_to_byte_pc = Vec::with_capacity(code.len());
-    let (instructions, overflow_operand_words) = code.raw_parts();
-    let mut next_overflow_offset = 0;
-    let mut operands = Vec::new();
-    for (instruction_index, instruction) in instructions.iter().enumerate() {
-        operands.clear();
-        decode_wordcode_operands(
-            instruction,
-            overflow_operand_words,
-            &mut next_overflow_offset,
-            instruction_index,
-            &mut operands,
-        )?;
-        verify_operand_shape(instruction.op, &operands).map_err(|error| {
-            VerifyError::InvalidOperandShape {
-                instruction_index,
-                error,
-            }
-        })?;
-        instr_to_byte_pc.push(byte_pc);
-        let mut byte_len = 2_u32;
-        for operand in &operands {
-            let operand_len = match operand {
-                Operand::Register(_) => 3,
-                Operand::ConstIndex(_) | Operand::Imm32(_) => 5,
-            };
-            byte_len = byte_len
-                .checked_add(operand_len)
-                .ok_or(VerifyError::FunctionTooLarge)?;
-        }
-        byte_pc = byte_pc
-            .checked_add(byte_len)
-            .ok_or(VerifyError::FunctionTooLarge)?;
-    }
-    verify_wordcode_overflow_consumed(next_overflow_offset, overflow_operand_words.len())?;
+    let total_bytes = scan_wordcode(
+        code,
+        false,
+        |error| error,
+        |_, _, _, pc| {
+            instr_to_byte_pc.push(pc);
+            Ok(())
+        },
+    )?;
     Ok(FunctionLayout {
-        total_bytes: byte_pc,
+        total_bytes,
         instr_to_byte_pc: instr_to_byte_pc.into_boxed_slice(),
     })
+}
+
+/// Admit wordcode and return its serialized length without an instruction map.
+pub(crate) fn measure_wordcode_bytes(
+    code: &FunctionCode,
+    check_control_flow: bool,
+) -> Result<u32, VerifyError> {
+    scan_wordcode(code, check_control_flow, |error| error, |_, _, _, _| Ok(()))
+}
+
+/// Serialized width of a structurally verified instruction. This includes
+/// the opcode, operand count, and each operand's wire tag and payload.
+#[must_use]
+pub fn wordcode_instruction_bytes(instruction: &WordInstruction) -> u16 {
+    let width = WORDCODE_WIDTHS[instruction.op as usize];
+    width.prefix + (instruction.operand_count() as u16 - width.operands) * width.tail
+}
+
+#[derive(Clone, Copy)]
+struct WordcodeWidth {
+    prefix: u16,
+    operands: u16,
+    tail: u16,
+}
+
+const WORDCODE_WIDTHS: [WordcodeWidth; crate::opcode_schema::OPCODE_SCHEMA.len()] = {
+    use crate::opcode_schema::OPCODE_SCHEMA;
+
+    let mut widths = [WordcodeWidth {
+        prefix: 2,
+        operands: 0,
+        tail: 0,
+    }; OPCODE_SCHEMA.len()];
+    let mut row = 0;
+    while row < widths.len() {
+        let shape = OPCODE_SCHEMA[row].operand_shape;
+        let prefix = match shape {
+            OperandShape::Fixed(prefix) | OperandShape::Variadic { prefix, .. } => prefix,
+        };
+        let mut index = 0;
+        while index < prefix.len() {
+            widths[row].prefix += operand_wire_bytes(prefix[index].kind);
+            index += 1;
+        }
+        widths[row].operands = prefix.len() as u16;
+        if let Some((_, tail)) = shape.variadic() {
+            widths[row].tail = operand_wire_bytes(tail.kind);
+        }
+        row += 1;
+    }
+    widths
+};
+
+const fn operand_wire_bytes(kind: OperandKind) -> u16 {
+    match kind {
+        OperandKind::Register => 3,
+        OperandKind::ConstIndex | OperandKind::Imm32 => 5,
+    }
 }
 
 fn verify_logical_target(
@@ -1380,6 +1406,10 @@ mod tests {
     #[test]
     fn wordcode_verifier_accepts_canonical_dense_overflow_storage() {
         let mut builder = crate::FunctionCodeBuilder::new();
+        builder.push(
+            Op::LoadString,
+            &[Operand::Register(0), Operand::ConstIndex(0)],
+        );
         for destination in [0, 5] {
             builder.push(
                 Op::MakeClass,
@@ -1396,7 +1426,13 @@ mod tests {
         let code = builder.finish();
 
         assert_eq!(verify_wordcode_function(&code), Ok(()));
-        assert!(layout_wordcode_function(&code).is_ok());
+        assert_eq!(
+            layout_wordcode_function(&code),
+            Ok(FunctionLayout {
+                total_bytes: 46,
+                instr_to_byte_pc: Box::new([0, 10, 27, 44]),
+            })
+        );
     }
 
     #[test]

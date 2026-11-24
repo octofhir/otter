@@ -92,6 +92,8 @@ pub use entry::{
 };
 pub use errors::CompileError;
 pub use lazy::{CompileOptions, LazyCompileRequest, compile_lazy_function};
+pub use otter_resource::CompileSource;
+mod prepared_eval;
 pub use module_state::{ImportRequest, ModuleHostInfo};
 pub use ts_erasure::unwrap_ts_expr;
 

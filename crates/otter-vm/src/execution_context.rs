@@ -417,6 +417,7 @@ impl ExecutionContext {
     }
 
     /// Executable lookup by global VM function id in this context's chunk.
+    #[inline]
     #[must_use]
     pub(crate) fn exec_function(&self, function_id: u32) -> Option<&CodeBlock> {
         let local = self.local_function_index(function_id)?;
@@ -539,6 +540,7 @@ impl ExecutionContext {
     /// this chunk. The range remains globally unique for generated property
     /// cells and method-only feedback identities.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn property_ic_site_end(&self) -> usize {
         self.payload.executable.property_ic_site_end() as usize
     }
@@ -574,12 +576,9 @@ impl ExecutionContext {
         stats
     }
 
-    /// Directory entries mapping this chunk's globally dense method site ids
-    /// to method markers in their owning CodeBlock feedback vectors.
-    pub(crate) fn feedback_slot_addresses(
-        &self,
-    ) -> Vec<(usize, crate::executable::FeedbackSlotAddress)> {
-        self.payload.executable.feedback_slot_addresses()
+    #[cfg(test)]
+    pub(crate) fn property_ic_sites(&self) -> std::ops::Range<usize> {
+        self.payload.executable.property_ic_sites()
     }
 
     /// Dense property IC site for a named property instruction at the

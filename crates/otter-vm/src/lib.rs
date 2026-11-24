@@ -706,9 +706,9 @@ pub struct CodeEvictionStats {
 /// Snapshot of VM-published collection method IC mirror slots.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JitCollectionMethodIcStats {
-    /// Total mirror slots allocated for method call IC sites.
+    /// Sites retaining a method cache or observed targets.
     pub slots: u64,
-    /// Empty/uninitialized mirror slots.
+    /// Observed sites with no method IC installed.
     pub empty_slots: u64,
     /// Slots currently holding collection method feedback.
     pub collection_slots: u64,
@@ -1858,7 +1858,12 @@ impl CompiledEvalSource {
 /// eval, native Function constructors, and CommonJS wrappers. Returns the
 /// module whose `<main>` completion value becomes the dispatch result.
 pub type EvalHook = std::sync::Arc<
-    dyn Fn(&str, EvalCompileOptions) -> Result<CompiledEvalSource, String> + Send + Sync,
+    dyn Fn(
+            otter_resource::CompileSource<'_>,
+            EvalCompileOptions,
+        ) -> Result<CompiledEvalSource, String>
+        + Send
+        + Sync,
 >;
 
 struct StartupPhaseTimer {

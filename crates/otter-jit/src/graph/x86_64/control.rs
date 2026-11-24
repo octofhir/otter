@@ -24,7 +24,7 @@ impl<'a> Codegen<'a> {
 
     /// The successor labels of the truthiness branch `control`, as its own
     /// emission would name them.
-    pub(super) fn branch_sink(&self, control: NodeId) -> super::BooleanSink {
+    pub(super) fn branch_sink(&self, control: NodeId, next: Option<BlockId>) -> super::BooleanSink {
         let Kind::Branch {
             if_true, if_false, ..
         } = self.graph.node(control).kind
@@ -34,6 +34,17 @@ impl<'a> Codegen<'a> {
         super::BooleanSink {
             if_true: self.labels[&self.forwarded(if_true)],
             if_false: self.labels[&self.forwarded(if_false)],
+            next: next.map(|block| self.labels[&block]),
+        }
+    }
+
+    /// Test flags for a fused two-way predicate, preserving layout fallthrough.
+    pub(super) fn emit_sink_condition(&mut self, condition: Condition) {
+        let Some(sink) = self.sink else { return };
+        let (condition, target, otherwise) = sink.conditional(condition);
+        self.emit_branch_condition(condition, false, target);
+        if let Some(otherwise) = otherwise {
+            dynasm!(self.ops ; .arch x64 ; jmp =>otherwise);
         }
     }
 
@@ -62,11 +73,9 @@ impl<'a> Codegen<'a> {
     /// A fused producer's answer computed into `Rq(value)` as a tagged
     /// boolean, delivered to its successors. Nothing when unfused.
     pub(super) fn emit_sink_register(&mut self, value: u8) {
-        if let Some(sink) = self.sink {
-            dynasm!(self.ops ; .arch x64
-                ; cmp Rq(value), otter_vm::value::tag::VALUE_TRUE as i32
-                ; je =>sink.if_true
-                ; jmp =>sink.if_false);
+        if self.sink.is_some() {
+            dynasm!(self.ops ; .arch x64 ; cmp Rq(value), otter_vm::value::tag::VALUE_TRUE as i32);
+            self.emit_sink_condition(Condition::Equal);
         }
     }
     pub(super) fn emit_jump(&mut self, from: BlockId, to: BlockId, next: Option<BlockId>) {

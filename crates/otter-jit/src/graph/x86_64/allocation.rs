@@ -264,6 +264,7 @@ impl Codegen<'_> {
 
 mod lexical;
 
+mod concat_cache;
 mod primitive;
 
 mod group;

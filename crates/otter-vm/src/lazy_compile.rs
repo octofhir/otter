@@ -173,10 +173,12 @@ impl Interpreter {
         body_context.resolve_atoms(crate::isolate_names::names_mut(&mut self.gc_heap));
         let body_base = body_context.function_base();
         let linked = body_context.linked_functions();
-        for function in linked.iter().skip(1) {
-            self.jit_code_registry.link_function(function, realm_id);
-            if realm_id != 0 {
-                self.function_realm_ids_mut().insert(function.id, realm_id);
+        self.jit_code_registry
+            .link_functions(&linked[1..], realm_id);
+        if realm_id != 0 {
+            let mut realms = self.function_realm_ids_mut();
+            for function in &linked[1..] {
+                realms.insert(function.id, realm_id);
             }
         }
         self.jit_code_registry

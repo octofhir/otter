@@ -842,7 +842,7 @@ fn compile_eval(
     chain: Option<&EvalCallerChain>,
 ) -> Result<BytecodeModule, CompileError> {
     let module = compile_eval_source(
-        source,
+        crate::CompileSource::Borrowed(source),
         SyntaxSourceKind::JavaScript,
         "eval",
         false,
@@ -958,7 +958,7 @@ fn eval_in_a_derived_constructor_reads_the_this_slot() {
         Some(0),
     );
     let module = compile_eval_source(
-        "super(); this",
+        crate::CompileSource::Borrowed("super(); this"),
         SyntaxSourceKind::JavaScript,
         "eval",
         true,

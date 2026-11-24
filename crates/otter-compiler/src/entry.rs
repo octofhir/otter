@@ -22,6 +22,7 @@
 
 use crate::*;
 use otter_bytecode::EvalCallerChain;
+use otter_resource::CompileSource;
 
 /// Compile source text through a single OXC parse.
 ///
@@ -105,7 +106,7 @@ pub fn compile_script_source_with_forced_strict(
 /// Returns [`CompileError`] when parsing fails or lowering rejects the AST.
 #[allow(clippy::too_many_arguments)]
 pub fn compile_eval_source(
-    source: &str,
+    input: CompileSource<'_>,
     kind: SyntaxSourceKind,
     module_specifier: &str,
     force_strict: bool,
@@ -123,35 +124,55 @@ pub fn compile_eval_source(
     // semantic pass (inner `Err`), whereas oxc rejects `new.target` at
     // parse time (outer `Err`). Flatten both into one `CompileError` so
     // the wrap-and-retry below can recover either.
-    let direct: Result<BytecodeModule, CompileError> = match otter_syntax::with_program_goal(
+    let source = input.text();
+    let source_is_linked = matches!(input, CompileSource::Scoped { .. });
+    let compile = |program: &Program<'_>| {
+        // A parse the compatibility retry patched indexes the patched
+        // text, which a later body compile cannot reparse.
+        let lazy = if program.source_text.len() == source.len() {
+            lazy_unit(options, kind, false)
+        } else {
+            None
+        };
+        let mut parts = ProgramParts::of(program);
+        parts.linked_source = source_is_linked && std::ptr::eq(program.source_text, source);
+        compile_eval_parts(
+            parts,
+            kind,
+            module_specifier,
+            force_strict,
+            forbid_var_arguments,
+            caller_chain,
+            new_target_allowed,
+            in_class_field_initializer,
+            super_property_allowed,
+            super_call_allowed,
+            function_constructor,
+            lazy,
+        )
+    };
+    if options != CompileOptions::Eager
+        && matches!(kind, SyntaxSourceKind::JavaScript)
+        && caller_chain.is_none()
+        && !new_target_allowed
+        && !super_property_allowed
+        && !super_call_allowed
+        && !in_class_field_initializer
+        && !function_constructor
+        && let CompileSource::Scoped {
+            source, release, ..
+        } = input
+        && let Some(result) = crate::prepared_eval::compile_prepared(source, release, kind, compile)
+    {
+        return result;
+    }
+    let direct = match otter_syntax::with_program_goal(
         source,
         kind,
         otter_syntax::SourceGoal::Script,
-        |program| {
-            // A parse the §13.15.1 call-target retry had to patch indexes
-            // the patched text, which a body compile cannot reparse.
-            let lazy = if program.source_text.len() == source.len() {
-                lazy_unit(options, kind, false)
-            } else {
-                None
-            };
-            compile_eval_parts(
-                ProgramParts::of(program),
-                kind,
-                module_specifier,
-                force_strict,
-                forbid_var_arguments,
-                caller_chain,
-                new_target_allowed,
-                in_class_field_initializer,
-                super_property_allowed,
-                super_call_allowed,
-                function_constructor,
-                lazy,
-            )
-        },
+        compile,
     ) {
-        Ok(inner) => inner,
+        Ok(inner) => inner.map(|(bytecode, _)| bytecode),
         Err(parse_err) => Err(CompileError::from(parse_err)),
     };
     match direct {
@@ -203,6 +224,7 @@ pub fn compile_eval_source(
                             span: (program.span.start, program.span.end),
                             strict_directive: body.has_use_strict_directive(),
                             source_text: program.source_text,
+                            linked_source: false,
                         },
                         kind,
                         module_specifier,
@@ -219,6 +241,7 @@ pub fn compile_eval_source(
                 },
             )
             .map_err(CompileError::from)?
+            .map(|(bytecode, _)| bytecode)
         }
         other => other,
     }
@@ -358,7 +381,7 @@ fn compile_eval_parts(
     super_call_allowed: bool,
     function_constructor: bool,
     lazy: Option<crate::compiler::LazyUnit>,
-) -> Result<BytecodeModule, CompileError> {
+) -> Result<(BytecodeModule, Rc<capture::CaptureFacts>), CompileError> {
     if !super_call_allowed && super_property_allowed && statements_contain_super_call(program.body)
     {
         return Err(CompileError::Unsupported {
@@ -468,14 +491,14 @@ pub(crate) fn lazy_unit(
     kind: SyntaxSourceKind,
     module_goal: bool,
 ) -> Option<crate::compiler::LazyUnit> {
-    options.lazy_functions.then_some(crate::compiler::LazyUnit {
+    (options != CompileOptions::Eager).then_some(crate::compiler::LazyUnit {
         module_goal,
         typescript: kind.is_typescript(),
         jsx: matches!(
             kind,
             SyntaxSourceKind::JavaScriptJsx | SyntaxSourceKind::TypeScriptJsx
         ),
-        top_level_eager: false,
+        top_level_eager: options == CompileOptions::LazyNested,
     })
 }
 
@@ -525,7 +548,7 @@ pub(crate) fn compile_program_for_eval(
     super_call_allowed: bool,
     function_constructor: bool,
     lazy: Option<crate::compiler::LazyUnit>,
-) -> Result<BytecodeModule, CompileError> {
+) -> Result<(BytecodeModule, Rc<capture::CaptureFacts>), CompileError> {
     compile_program_parts(
         program,
         source_kind,
@@ -565,6 +588,7 @@ pub(crate) fn compile_program_with_mode(
             lazy,
         },
     )
+    .map(|(bytecode, _)| bytecode)
 }
 
 /// Borrowed program surface: real `Program`s and eval bodies
@@ -579,6 +603,8 @@ pub(crate) struct ProgramParts<'a, 'b> {
     /// are byte offsets into this string, so it backs the §20.2.3.5
     /// [[SourceText]] slice attached to each compiled function.
     pub(crate) source_text: &'a str,
+    /// The caller supplies these exact source coordinates when linking.
+    linked_source: bool,
 }
 
 impl<'a, 'b> ProgramParts<'a, 'b> {
@@ -589,14 +615,15 @@ impl<'a, 'b> ProgramParts<'a, 'b> {
             span: (program.span.start, program.span.end),
             strict_directive: program.has_use_strict_directive(),
             source_text: program.source_text,
+            linked_source: false,
         }
     }
 }
 
 /// Seal per-function facts derived from the finished bodies: the
 /// `[[SourceText]]` ranges and whether each body ignores its `this`.
-fn finish_bytecode(module: &mut BytecodeModule, source: &str) {
-    attach_source_text(module, source);
+fn finish_bytecode(module: &mut BytecodeModule, source: &str, linked_source: bool) {
+    attach_source_text(module, source, linked_source);
     let observed: Vec<bool> = module
         .functions
         .iter()
@@ -614,8 +641,9 @@ fn finish_bytecode(module: &mut BytecodeModule, source: &str) {
 /// fall outside the source or on a non-char boundary (synthesized
 /// functions) leave the range `None`, so `toString` keeps the
 /// `NativeFunction` form for them. The snapshot is retained once per
-/// module instead of one owned slice per function.
-fn attach_source_text(module: &mut BytecodeModule, source: &str) {
+/// module instead of one owned slice per function. A caller that links
+/// the exact text already owns that snapshot; only the ranges are needed.
+fn attach_source_text(module: &mut BytecodeModule, source: &str, linked_source: bool) {
     let mut any_range = false;
     for function in module.functions.iter_mut().skip(1) {
         // A method / accessor reports its `MethodDefinition` source,
@@ -638,7 +666,7 @@ fn attach_source_text(module: &mut BytecodeModule, source: &str) {
             any_range = true;
         }
     }
-    if any_range {
+    if any_range && !linked_source {
         module.function_source = Some(source.to_string());
     }
 }
@@ -858,7 +886,7 @@ pub(crate) fn compile_program_parts(
     source_kind: SyntaxSourceKind,
     module_specifier: &str,
     mode: ProgramMode<'_>,
-) -> Result<BytecodeModule, CompileError> {
+) -> Result<(BytecodeModule, Rc<capture::CaptureFacts>), CompileError> {
     let ProgramMode {
         force_strict,
         eval_mode,
@@ -1158,6 +1186,7 @@ pub(crate) fn compile_program_parts(
     } else {
         Vec::new()
     };
+    let captures = Rc::clone(&cx.capture);
     drop(cx);
 
     let kind = bytecode_source_kind(source_kind);
@@ -1182,8 +1211,8 @@ pub(crate) fn compile_program_parts(
         lazy_environments,
         function_source: None,
     };
-    finish_bytecode(&mut bytecode, source_text);
-    Ok(bytecode)
+    finish_bytecode(&mut bytecode, source_text, program.linked_source);
+    Ok((bytecode, captures))
 }
 
 /// Compile a parsed program as one ES-module fragment.
@@ -1828,7 +1857,7 @@ pub fn compile_module_program(
         lazy_environments,
         function_source: None,
     };
-    finish_bytecode(&mut bytecode, program.source_text);
+    finish_bytecode(&mut bytecode, program.source_text, false);
     Ok(bytecode)
 }
 

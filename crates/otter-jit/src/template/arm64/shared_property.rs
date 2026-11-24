@@ -862,7 +862,8 @@ fn emit_concat(ops: &mut Assembler, view: &JitCompileSnapshot, label: DynamicLab
         [
             crate::allocation::AllocationValue::Register(CONCAT_LHS),
             crate::allocation::AllocationValue::Register(CONCAT_RHS),
-        ],
+        ]
+        .into(),
         crate::allocation::LabRegisters {
             buffer: 11,
             candidate: CONCAT_RESULT,

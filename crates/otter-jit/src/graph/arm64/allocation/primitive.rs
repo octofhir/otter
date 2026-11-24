@@ -102,6 +102,7 @@ impl Codegen<'_> {
         let (from, count) = (a.gp_temps[4], a.gp_temps[5]);
         let p = self.view_of(node).string_layout;
         let slow = self.ops.new_dynamic_label();
+        let unit = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
         let [source, start, end] = values;
         let len = regs.scratch;
@@ -159,9 +160,10 @@ impl Codegen<'_> {
                 ; mov X(from), x16
                 ; sub X(count), X(count), X(from));
         }
-        // Empty and one-unit results are the heap's shared strings.
+        // A one-unit result is already rooted by the isolate's Latin-1
+        // table. Preserve the source for the collecting miss.
         dynasm!(self.ops ; .arch aarch64
-            ; cmp XSP(count), 2 ; b.lt =>slow
+            ; cmp XSP(count), 1 ; b.lo =>slow ; b.eq =>unit
             ; cmp XSP(count), u32::from(p.short_concat_latin1) ; b.hi =>slow);
         crate::arm64::allocation::emit_substring_latin1(
             &mut self.ops,
@@ -172,7 +174,16 @@ impl Codegen<'_> {
             regs,
             slow,
         );
-        dynasm!(self.ops ; .arch aarch64 ; mov X(destination), X(regs.candidate) ; b =>done ; =>slow);
+        dynasm!(self.ops ; .arch aarch64
+            ; mov X(destination), X(regs.candidate) ; b =>done
+            ; =>unit
+            ; ldr x16, [x20, crate::entry::THREAD_OFFSET]
+            ; ldr x16, [x16, crate::entry::VM_THREAD_UNIT_STRINGS_OFFSET]
+            ; cbz x16, =>slow
+            ; add XSP(regs.candidate), XSP(regs.buffer), p.string_body_size
+            ; ldrb w17, [X(regs.candidate), W(from), uxtw]
+            ; ldr X(destination), [x16, x17, lsl #3] ; b =>done
+            ; =>slow);
         self.emit_probe_allocation(node, descriptor, values, Some(destination))?;
         dynasm!(self.ops ; .arch aarch64 ; =>done);
         Ok(())
@@ -242,6 +253,7 @@ impl Codegen<'_> {
     pub(in crate::graph::arm64) fn emit_primitive_add(
         &mut self,
         node: NodeId,
+        input_strings: [bool; 2],
     ) -> Result<(), crate::Unsupported> {
         let values = self.primitive_inputs(node)?;
         let a = self.allocation.node(node);
@@ -253,17 +265,30 @@ impl Codegen<'_> {
             scratch: a.gp_temps[3],
             size: 17,
         };
-        let float = a.fp_temps[0];
-        let strings = self.ops.new_dynamic_label();
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
-        crate::arm64::allocation::emit_value(&mut self.ops, regs.buffer, values[0]);
-        crate::arm64::allocation::emit_value(&mut self.ops, regs.end, values[1]);
-        self.emit_tagged_to_float(regs.buffer, float, strings);
-        self.emit_tagged_to_float(regs.end, 31, strings);
-        dynasm!(self.ops ; .arch aarch64 ; fadd D(float),D(float),d31);
-        self.emit_box_float64(float, destination);
-        dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>strings);
+        // If a proven String participates, this source add cannot be numeric.
+        if !input_strings[0] && !input_strings[1] {
+            let float = a.fp_temps[0];
+            let strings = self.ops.new_dynamic_label();
+            crate::arm64::allocation::emit_value(&mut self.ops, regs.buffer, values[0]);
+            crate::arm64::allocation::emit_value(&mut self.ops, regs.end, values[1]);
+            self.emit_tagged_to_float(regs.buffer, float, strings);
+            self.emit_tagged_to_float(regs.end, 31, strings);
+            dynasm!(self.ops ; .arch aarch64 ; fadd D(float),D(float),d31);
+            self.emit_box_float64(float, destination);
+            dynasm!(self.ops ; .arch aarch64 ; b =>done ; =>strings);
+        }
+
+        let cacheable = input_strings != [false; 2];
+        let initialized = if cacheable {
+            self.ops.new_dynamic_label()
+        } else {
+            done
+        };
+        if cacheable {
+            super::concat_cache::emit_hit(&mut self.ops, values, regs, destination, done);
+        }
         let source = self.view_of(node);
         let layout = source.string_layout;
         let site = source
@@ -284,12 +309,15 @@ impl Codegen<'_> {
             &mut self.ops,
             20,
             layout,
-            values,
+            crate::allocation::ConcatInputs {
+                values,
+                input_strings,
+            },
             regs,
             ConcatPlacement::Site(site),
             slow,
         );
-        dynasm!(self.ops ; .arch aarch64 ; mov X(destination),X(regs.candidate) ; b =>done);
+        dynasm!(self.ops ; .arch aarch64 ; mov X(destination),X(regs.candidate) ; b =>initialized);
         if let Some(old_cons) = old_cons {
             // A pretenured cons may hold a young child, or a white one while
             // marking runs: both edges take the barrier before anything runs.
@@ -303,6 +331,12 @@ impl Codegen<'_> {
                 &[destination, regs.end],
             );
             self.emit_write_barrier_keeping(node, destination, regs.end, &[destination]);
+            dynasm!(self.ops ; .arch aarch64 ; b =>initialized);
+        }
+
+        if cacheable {
+            dynasm!(self.ops ; .arch aarch64 ; =>initialized);
+            super::concat_cache::emit_record(&mut self.ops, values, regs, destination);
             dynasm!(self.ops ; .arch aarch64 ; b =>done);
         }
         dynasm!(self.ops ; .arch aarch64 ; =>slow);

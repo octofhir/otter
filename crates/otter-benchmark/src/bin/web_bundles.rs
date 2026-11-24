@@ -190,8 +190,10 @@ fn compile_once(
 }
 
 fn run_compile(sites: &[String], samples: usize, verbose: bool, eager: bool) {
-    let options = CompileOptions {
-        lazy_functions: !eager,
+    let options = if eager {
+        CompileOptions::Eager
+    } else {
+        CompileOptions::Lazy
     };
     for site in sites {
         let scripts = load_site(site);
@@ -349,9 +351,7 @@ fn run_cache(sites: &[String], samples: usize) {
                     &script.text,
                     SourceKind::JavaScript,
                     &script.name,
-                    CompileOptions {
-                        lazy_functions: true,
-                    },
+                    CompileOptions::Lazy,
                 )
             };
             let Ok(compiled) = compile() else {

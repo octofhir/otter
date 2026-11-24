@@ -136,7 +136,7 @@ fn body(src: &Path, builtin: &Builtin) -> Result<String, BuildError> {
 fn emit_builtin(src: &Path, dir: &Path, builtin: &Builtin) -> Result<(), BuildError> {
     let source = otter_bytecode::commonjs::wrapper_source(&body(src, builtin)?);
     let mut module = otter_compiler::compile_eval_source(
-        &source,
+        otter_compiler::CompileSource::Borrowed(&source),
         otter_syntax::SourceKind::JavaScript,
         "<eval>",
         false,

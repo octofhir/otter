@@ -218,7 +218,7 @@ fn caller_chain_const_metadata_does_not_prove_a_live_initialized_value() {
         var_depth: Some(0),
     };
     let module = crate::compile_eval_source(
-        "o.m(value)",
+        crate::CompileSource::Borrowed("o.m(value)"),
         SyntaxSourceKind::JavaScript,
         "method-eval",
         false,

@@ -71,6 +71,22 @@ impl EmptyLiteralLayout {
 #[path = "allocation/string_group_tests.rs"]
 mod string_group_tests;
 
+/// The arguments to the native concat and the known String inputs.
+#[derive(Clone, Copy)]
+pub(crate) struct ConcatInputs {
+    pub(crate) values: [AllocationValue; 2],
+    pub(crate) input_strings: [bool; 2],
+}
+
+impl From<[AllocationValue; 2]> for ConcatInputs {
+    fn from(values: [AllocationValue; 2]) -> Self {
+        Self {
+            values,
+            input_strings: [false; 2],
+        }
+    }
+}
+
 /// Where one native concatenation places the string it creates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConcatPlacement {

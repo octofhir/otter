@@ -27,7 +27,7 @@ use otter_vm::{JitCompileSnapshot, value::tag};
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
     DOUBLE_OFFSET_HI16, NUMBER_TAG_HI16, THREAD_OFFSET, Unsupported, VALUE_FALSE_LOW,
-    VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_MARKING_FLAG_CELL_OFFSET, reg_offset,
+    VM_THREAD_GC_HEAP_OFFSET, reg_offset,
 };
 
 /// `ldr X(t), [x19, #idx*8]`.
@@ -568,37 +568,18 @@ pub(crate) fn emit_write_barrier_with_context(
     let settled = young | view.gc_barrier.remembered_flag;
     let slow = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
-    let generational = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbz W(child), =>done
-        ; ldr x14, [X(context), THREAD_OFFSET]
-        ; ldr x14, [x14, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
-        ; ldrb w14, [x14]
-        ; cbz w14, =>generational
-        // While marking runs, a white old child owes the insertion barrier.
-        ; ldrb w14, [X(child), flags_byte]
-        ; movz w15, young
-        ; tst w14, w15
-        ; b.ne =>generational
-        ; movz w15, view.gc_barrier.mark_color_bits
-        ; tst w14, w15
-        ; b.eq =>slow
-        ; =>generational
+    dynasm!(ops ; .arch aarch64 ; cbz W(child), =>done);
+    crate::arm64::gc_barrier::emit_young_edge(
+        ops,
+        view.gc_barrier,
+        [context, child, 14],
+        [done, slow],
+    );
+    dynasm!(ops ; .arch aarch64
         ; ldrb w14, [X(parent), flags_byte]
         ; movz w15, settled
         ; tst w14, w15
         ; b.ne =>done
-        // An old, unrecorded parent: only a nursery child owes the remembered
-        // set an entry.
-    );
-    // A cell value is its header's full address.
-    dynasm!(ops
-        ; .arch aarch64
-        ; ldrb w14, [X(child), flags_byte]
-        ; movz w15, young
-        ; tst w14, w15
-        ; b.eq =>done
         ; =>slow
         ; mov x1, X(parent)
         ; mov x2, X(child)
@@ -632,33 +613,13 @@ pub(crate) fn emit_write_barrier_preserving(
     let settled = young | view.gc_barrier.remembered_flag;
     let slow = ops.new_dynamic_label();
     let done = ops.new_dynamic_label();
-    let generational = ops.new_dynamic_label();
-    dynasm!(ops
-        ; .arch aarch64
-        ; cbz W(child), =>done
-        ; ldr x16, [x20, THREAD_OFFSET]
-        ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
-        ; ldrb w16, [x16]
-        ; cbz w16, =>generational
-        // While marking runs, a white old child owes the insertion barrier.
-        ; ldrb w16, [X(child), flags_byte]
-        ; movz w17, young
-        ; tst w16, w17
-        ; b.ne =>generational
-        ; movz w17, view.gc_barrier.mark_color_bits
-        ; tst w16, w17
-        ; b.eq =>slow
-        ; =>generational
+    dynasm!(ops ; .arch aarch64 ; cbz W(child), =>done);
+    crate::arm64::gc_barrier::emit_young_edge(ops, view.gc_barrier, [20, child, 16], [done, slow]);
+    dynasm!(ops ; .arch aarch64
         ; ldrb w16, [X(parent), flags_byte]
         ; movz w17, settled
         ; tst w16, w17
         ; b.ne =>done
-        // An old, unrecorded parent: only a nursery child owes the
-        // remembered set an entry.
-        ; ldrb w16, [X(child), flags_byte]
-        ; movz w17, young
-        ; tst w16, w17
-        ; b.eq =>done
         ; =>slow
     );
     emit_preserving_leaf_call(

@@ -630,7 +630,10 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::LoadThis,
         Kind::LoadNewTarget,
         Kind::LoadClosure,
-        Kind::LoadLiteral(0),
+        Kind::LoadLiteral {
+            byte_pc: 0,
+            is_string: true,
+        },
         Kind::LoadGlobalBinding(0),
         Kind::LoadGlobalThis,
         Kind::LoadWindow(0),
@@ -651,7 +654,9 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::VirtualRestArray(0),
         Kind::NewArrayWithLength,
         Kind::NewRestArray(0),
-        Kind::PrimitiveAdd,
+        Kind::PrimitiveAdd {
+            input_strings: [false; 2],
+        },
         Kind::NumberToString,
         Kind::BigIntBinary(otter_vm::bigint::ops::Operator::Add),
         Kind::PrimitiveCompare(condition),
@@ -921,7 +926,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::LoadThis
         | K::LoadNewTarget
         | K::LoadClosure
-        | K::LoadLiteral(_)
+        | K::LoadLiteral { .. }
         | K::LoadGlobalBinding(_)
         | K::LoadGlobalThis
         | K::LoadWindow(_)
@@ -944,7 +949,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::VirtualRestArray(_)
         | K::NewArrayWithLength
         | K::NewRestArray(_)
-        | K::PrimitiveAdd
+        | K::PrimitiveAdd { .. }
         | K::NumberToString
         | K::NativeAllocLeaf(_)
         | K::BigIntBinary(_)

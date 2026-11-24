@@ -14,7 +14,7 @@
 //! - `super::CodeBlock` owns feedback, CFG and the metadata lease.
 //! - `otter_bytecode::FunctionCode` owns canonical words and their physical lease.
 
-use super::{NO_PROPERTY_IC_SITE, allocation, has_property_ic_site};
+use super::{NO_PROPERTY_IC_SITE, allocation};
 use otter_bytecode::{FunctionCode, wordcode::Instruction};
 use otter_resource::{ResourceError, ResourceLease};
 
@@ -27,30 +27,17 @@ pub struct ExecutableCode {
 }
 
 impl ExecutableCode {
-    pub(super) fn new(
+    pub(super) fn with_sites(
         body: FunctionCode,
         function_id: u32,
-        next_site: &mut u32,
-        lease: &mut ResourceLease,
-    ) -> Result<Self, ResourceError> {
-        let mut sites = allocation::try_vec(body.len(), lease)?;
-        for instruction in body.iter() {
-            let site = if has_property_ic_site(instruction.op) {
-                let site = *next_site;
-                *next_site = next_site
-                    .checked_add(1)
-                    .expect("property IC sites fit admitted module");
-                site
-            } else {
-                NO_PROPERTY_IC_SITE
-            };
-            sites.push(site);
-        }
-        Ok(Self {
+        property_sites: Box<[u32]>,
+    ) -> Self {
+        debug_assert_eq!(body.len(), property_sites.len());
+        Self {
             body,
             function_id,
-            property_sites: sites.into_boxed_slice(),
-        })
+            property_sites,
+        }
     }
 
     pub(super) fn fresh_copy(&self, lease: &mut ResourceLease) -> Result<Self, ResourceError> {

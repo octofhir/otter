@@ -105,8 +105,8 @@ impl Interpreter {
                 }) {
                     return Err(VmError::InvalidOperand);
                 }
-                (0..function.code.len())
-                    .find(|&pc| function.instruction_byte_pc(pc) == Some(frame.byte_pc))
+                function
+                    .instruction_at_byte_pc(frame.byte_pc)
                     .and_then(|pc| u32::try_from(pc).ok())
                     .ok_or(VmError::InvalidOperand)
             })

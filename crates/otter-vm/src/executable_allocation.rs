@@ -54,20 +54,28 @@ pub(crate) fn try_copy<T: Clone>(
 }
 
 pub(crate) fn try_string(source: &str, lease: &mut ResourceLease) -> Result<String, ResourceError> {
+    let mut buffer = try_string_buffer(source.len(), lease)?;
+    buffer.push_str(source);
+    Ok(buffer)
+}
+
+pub(crate) fn try_string_buffer(
+    capacity: usize,
+    lease: &mut ResourceLease,
+) -> Result<String, ResourceError> {
     let mut buffer = String::new();
     buffer
-        .try_reserve_exact(source.len())
+        .try_reserve_exact(capacity)
         .map_err(|cause| ResourceError::Allocation {
             class: ResourceClass::SourceModuleBytes,
-            capacity: source.len(),
-            requested: source.len() as u64,
+            capacity,
+            requested: capacity as u64,
             cause,
         })?;
-    let extra = buffer.capacity().saturating_sub(source.len()) as u64;
+    let extra = buffer.capacity().saturating_sub(capacity) as u64;
     if extra != 0 {
         lease.resize(lease.amount().saturating_add(extra))?;
     }
-    buffer.push_str(source);
     Ok(buffer)
 }
 
@@ -94,36 +102,6 @@ pub(crate) fn try_scopes<'a>(
         )));
     }
     Ok(scopes.into_boxed_slice())
-}
-
-/// UTF-8 bytes of the property-key spelling of `source`.
-pub(crate) fn utf16_bytes(source: &[u16]) -> u64 {
-    crate::wtf16_escape::encoded_len(source) as u64
-}
-
-/// The property-key spelling of `source` (see [`crate::wtf16_escape`]),
-/// allocated against `lease`.
-pub(crate) fn try_utf16(
-    source: &[u16],
-    lease: &mut ResourceLease,
-) -> Result<String, ResourceError> {
-    let requested = utf16_bytes(source);
-    let capacity = requested as usize;
-    let mut buffer = String::new();
-    buffer
-        .try_reserve_exact(capacity)
-        .map_err(|cause| ResourceError::Allocation {
-            class: ResourceClass::SourceModuleBytes,
-            capacity,
-            requested,
-            cause,
-        })?;
-    let extra = buffer.capacity().saturating_sub(capacity) as u64;
-    if extra != 0 {
-        lease.resize(lease.amount().saturating_add(extra))?;
-    }
-    buffer.extend(crate::wtf16_escape::escaped_chars(source));
-    Ok(buffer)
 }
 
 #[cfg(test)]

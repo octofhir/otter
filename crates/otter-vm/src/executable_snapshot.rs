@@ -75,12 +75,13 @@ impl CodeBlock {
         )?;
         let code = self.code.fresh_copy(&mut lease)?;
         let control_flow = self.control_flow.fresh_copy(&mut lease)?;
+        let ops = || self.code.iter().map(|instruction| self.op(instruction));
         let feedback = crate::feedback::FeedbackVector::for_instruction_ops(
-            self.code.iter().map(|instruction| self.op(instruction)),
+            ops(),
+            crate::feedback::FeedbackLayout::for_ops(ops()),
             &mut lease,
         )?;
         let byte_pcs = allocation::try_copy(&self.byte_pcs, &mut lease)?;
-        let byte_spans = allocation::try_copy(&self.byte_spans, &mut lease)?;
         let number_hints = allocation::try_copy(&self.number_hints, &mut lease)?;
         let class_hints = allocation::try_copy(&self.class_hints, &mut lease)?;
         let mut body = Self {
@@ -113,7 +114,6 @@ impl CodeBlock {
             feedback,
             source_work: Arc::new(crate::native_abi::SourceWork::new(account)?),
             byte_pcs,
-            byte_spans,
             number_hints,
             class_hints,
         };

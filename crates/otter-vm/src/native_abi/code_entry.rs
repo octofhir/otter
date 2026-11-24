@@ -98,7 +98,27 @@ impl FunctionEntryCell {
         call_flags: u32,
         realm_id: u32,
     ) -> Box<Self> {
-        let cell = Box::new(Self {
+        let cell = Box::new(Self::unpublished(
+            function_id,
+            param_count,
+            register_count,
+            call_flags,
+            realm_id,
+        ));
+        cell.restore_interpreter();
+        cell
+    }
+
+    /// Build a cell whose address is not yet published. After placing it in
+    /// registry-owned storage, publish the interpreter destination in place.
+    pub(crate) fn unpublished(
+        function_id: u32,
+        param_count: u16,
+        register_count: u16,
+        call_flags: u32,
+        realm_id: u32,
+    ) -> Self {
+        Self {
             generation_cell: AtomicU64::new(0),
             function_id,
             param_count,
@@ -106,9 +126,7 @@ impl FunctionEntryCell {
             call_flags,
             realm_id,
             interpreter: CodeEntryCell::interpreter(function_id, register_count),
-        });
-        cell.restore_interpreter();
-        cell
+        }
     }
 
     /// Publish one current generation cell.

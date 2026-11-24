@@ -48,6 +48,9 @@
 
 mod code_units;
 mod concat;
+/// Shared native layout for the primitive concatenation cache.
+#[doc(hidden)]
+pub mod concat_cache;
 pub mod dispatch;
 pub(crate) mod exotic;
 pub mod gc_body;

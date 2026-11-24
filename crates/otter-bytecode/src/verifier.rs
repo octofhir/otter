@@ -42,21 +42,22 @@
 //!   out a function's proof only after verifying that function (or, for a
 //!   build artifact, measuring it). Only admitted headers reach a VM consumer
 //!   before the body is verified.
+//! - Storage validation and operand-domain checks borrow the same word slice
+//!   for each instruction.
 //! - A function declared `ignores_this` never reads its `this` binding.
 //! - Successful verification does not publish runtime state.
 //!
 //! # See also
-//! - [`crate::encoding::layout_wordcode_function`]
+//! - [`crate::encoding`] validates canonical wordcode and measures its wire size.
 //! - [`crate::binary`]
 
 use crate::encoding::{
-    FunctionLayout, VerifyError, layout_wordcode_function, measure_wordcode_function,
-    verify_exception_handlers,
+    VerifyError, measure_wordcode_bytes, scan_wordcode, verify_exception_handlers,
 };
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use crate::opcode_schema::{ImmediateDomain, RegisterAccess, operand_spec_at, register_access_at};
+use crate::opcode_schema::{ImmediateDomain, OperandKind, RegisterAccess};
 use crate::{
     ArgumentBindingStorage, BytecodeModule, Constant, ContextCoord, Function, Op, Operand,
 };
@@ -98,15 +99,15 @@ impl BytecodeConstantKind {
 /// re-running wordcode or frame-window validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedFunction {
-    layout: FunctionLayout,
+    byte_len: u32,
     register_count: u16,
 }
 
 impl VerifiedFunction {
-    /// Canonical cold byte-PC layout established by wordcode verification.
+    /// Exact serialized length established by verifying the wordcode.
     #[must_use]
-    pub const fn layout(&self) -> &FunctionLayout {
-        &self.layout
+    pub const fn byte_len(&self) -> u32 {
+        self.byte_len
     }
 
     /// Exact register-window width established without saturating arithmetic.
@@ -172,7 +173,7 @@ impl VerifiedBytecodeModule {
     }
 
     /// Own a module the product build compiled and fully verified, whose
-    /// encoded bytes are part of this executable. Its proofs (byte-PC layout
+    /// encoded bytes are part of this executable. Its proofs (serialized length
     /// and register window) are measured again; the admission checks the build
     /// already ran on these exact bytes are not repeated. Bytes read or
     /// received at runtime must go through [`Self::new`].
@@ -290,9 +291,9 @@ impl VerifiedBytecodeModule {
     /// Move this proof to a different dense function-id base without inspecting
     /// wordcode again.
     ///
-    /// Every translated id was already proven to belong to the old dense range;
-    /// layouts, frame windows, operands, and metadata are independent of the
-    /// absolute base and therefore remain valid.
+    /// Every translated id was already proven to belong to the old dense range.
+    /// Serialized lengths, frame windows and operand bounds are independent of
+    /// the absolute base and therefore remain valid.
     ///
     /// # Errors
     /// Returns [`BytecodeRebaseError`] if the new dense range does not fit or
@@ -1088,11 +1089,11 @@ impl std::fmt::Display for ScopeDescriptorDefect {
 fn verify_immediate_right_operands(
     function_index: usize,
     instruction_pc: usize,
-    instruction: &crate::wordcode::Instruction,
-    code: &crate::wordcode::FunctionCode,
+    op: Op,
+    words: &[u32],
 ) -> Result<(), BytecodeVerifyError> {
     if !matches!(
-        instruction.op,
+        op,
         Op::AddImm
             | Op::SubImm
             | Op::BitwiseAndImm
@@ -1102,19 +1103,13 @@ fn verify_immediate_right_operands(
     ) {
         return Ok(());
     }
-    let (Some(Operand::Register(dst)), Some(Operand::Register(lhs))) =
-        (code.operand(instruction, 0), code.operand(instruction, 1))
-    else {
-        // Operand shapes are checked by the wordcode layout pass; anything
-        // else here is reported there.
-        return Ok(());
-    };
-    if dst == lhs {
+    // The instruction's register-shaped words have already been checked.
+    if words[0] == words[1] {
         return Err(BytecodeVerifyError::ImmediateOperandAliasesDestination {
             function_index,
             instruction_pc,
-            op: instruction.op,
-            register: dst,
+            op,
+            register: words[0] as u16,
         });
     }
     Ok(())
@@ -1139,47 +1134,30 @@ pub fn verify_module_at_base(
     module: &BytecodeModule,
     expected_base: u32,
 ) -> Result<(), BytecodeVerifyError> {
-    verify_module_with_proofs(module, expected_base).map(drop)
+    let function_end = admit_module(module, expected_base)?;
+    for (index, function) in module.functions.iter().enumerate() {
+        verify_function(module, function, index, expected_base, function_end)?;
+    }
+    Ok(())
 }
 
-/// A build artifact's proof: its byte-PC layout and register window, measured
+/// A build artifact's proof: its serialized length and register window, measured
 /// without the admission checks the build already ran.
 fn measure_function(
     function: &Function,
     function_index: usize,
 ) -> Result<VerifiedFunction, BytecodeVerifyError> {
     let register_count = register_window(function, function_index)?;
-    let layout = measure_wordcode_function(&function.code).map_err(|error| {
+    let byte_len = measure_wordcode_bytes(&function.code, false).map_err(|error| {
         BytecodeVerifyError::Wordcode {
             function_index,
             error,
         }
     })?;
     Ok(VerifiedFunction {
-        layout,
+        byte_len,
         register_count,
     })
-}
-
-fn verify_module_with_proofs(
-    module: &BytecodeModule,
-    expected_base: u32,
-) -> Result<Box<[VerifiedFunction]>, BytecodeVerifyError> {
-    let function_end = admit_module(module, expected_base)?;
-    module
-        .functions
-        .iter()
-        .enumerate()
-        .map(|(function_index, function)| {
-            verify_function(
-                module,
-                function,
-                function_index,
-                expected_base,
-                function_end,
-            )
-        })
-        .collect()
 }
 
 /// Module-level admission: the function table and every function-id-bearing
@@ -1276,43 +1254,21 @@ fn verify_function(
     {
         return Err(BytecodeVerifyError::ObservedIgnoredThis { function_index });
     }
-    let layout = layout_wordcode_function(&function.code).map_err(|error| {
-        BytecodeVerifyError::Wordcode {
-            function_index,
-            error,
-        }
-    })?;
     let instruction_count = function.code.len();
-    let _ = u32::try_from(instruction_count).map_err(|_| BytecodeVerifyError::Wordcode {
+    let wordcode_error = |error| BytecodeVerifyError::Wordcode {
         function_index,
-        error: VerifyError::FunctionTooLarge,
-    })?;
-    verify_exception_handlers(&function.code, &function.handlers).map_err(|error| {
-        BytecodeVerifyError::Wordcode {
-            function_index,
-            error,
-        }
-    })?;
-    for (handler_index, handler) in function.handlers.iter().enumerate() {
-        if u32::from(handler.exception) >= register_count {
-            return Err(BytecodeVerifyError::HandlerRegister {
-                function_index,
-                handler_index,
-                register: handler.exception,
-                register_count,
-            });
-        }
-    }
+        error,
+    };
+    let _ = u32::try_from(instruction_count)
+        .map_err(|_| wordcode_error(VerifyError::FunctionTooLarge))?;
 
     verify_source_span(function_index, "function", function.span)?;
     if let Some(span) = function.source_text_span {
         verify_source_span(function_index, "source-text", span)?;
     }
-    if !function.spans.well_formed() {
-        return Err(BytecodeVerifyError::MalformedSpans { function_index });
-    }
+    let mut spans = function.spans.iter();
     let mut previous_span_pc = None;
-    for (span_index, span) in function.spans.iter().enumerate() {
+    for (span_index, span) in spans.by_ref().enumerate() {
         verify_metadata_pc(function_index, "source span", span.pc, instruction_count)?;
         verify_source_span(function_index, "source-map", span.span)?;
         if let Some(previous_pc) = previous_span_pc
@@ -1326,6 +1282,9 @@ fn verify_function(
             });
         }
         previous_span_pc = Some(span.pc);
+    }
+    if !spans.is_complete() {
+        return Err(BytecodeVerifyError::MalformedSpans { function_index });
     }
     for &pc in &function.number_hint_sites {
         verify_metadata_pc(function_index, "number hint", pc, instruction_count)?;
@@ -1346,111 +1305,125 @@ fn verify_function(
     verify_scope_descriptors(function, function_index)?;
     let mapped_context = verify_mapped_arguments(function, function_index, register_count)?;
 
-    for (instruction_pc, instruction) in function.code.iter().enumerate() {
-        if matches!(
-            instruction.op,
-            Op::LoadArgumentsLength | Op::LoadArgumentsElement
-        ) && (!function.needs_arguments
-            || !function.mapped_argument_bindings.is_empty()
-            || function.contains_direct_eval
-            || function.is_async
-            || function.is_generator
-            || function.is_async_generator)
-        {
-            return Err(BytecodeVerifyError::ArgumentsReadMetadata {
+    let derived_this_slot = has_derived_this_slot(function);
+    let byte_len = scan_wordcode(
+        &function.code,
+        true,
+        wordcode_error,
+        |instruction_pc, schema, words, _| {
+            let op = schema.op;
+            if matches!(op, Op::LoadArgumentsLength | Op::LoadArgumentsElement)
+                && (!function.needs_arguments
+                    || !function.mapped_argument_bindings.is_empty()
+                    || function.contains_direct_eval
+                    || function.is_async
+                    || function.is_generator
+                    || function.is_async_generator)
+            {
+                return Err(BytecodeVerifyError::ArgumentsReadMetadata {
+                    function_index,
+                    instruction_pc,
+                });
+            }
+            verify_immediate_right_operands(function_index, instruction_pc, op, words)?;
+            let prefix = schema
+                .operand_shape
+                .prefix()
+                .expect("checked wordcode schema");
+            let tail = schema.operand_shape.variadic().map(|(_, tail)| tail);
+            for (operand_index, &word) in words.iter().enumerate() {
+                let spec = prefix
+                    .get(operand_index)
+                    .copied()
+                    .or(tail)
+                    .expect("checked wordcode arity");
+                let access = spec.register_access;
+                if access != RegisterAccess::None {
+                    let register = if spec.kind == OperandKind::Imm32 {
+                        i64::from(word as i32)
+                    } else {
+                        i64::from(word)
+                    };
+                    // A register pair's second register must be in the window too.
+                    let last = register + i64::from(access.width()) - 1;
+                    if register < 0 || last >= i64::from(register_count) {
+                        return Err(BytecodeVerifyError::RegisterOperand {
+                            function_index,
+                            instruction_pc,
+                            op,
+                            operand_index,
+                            register,
+                            register_count,
+                        });
+                    }
+                }
+                if let Some(domain) = spec.imm_domain {
+                    verify_immediate_operand(
+                        function,
+                        function_index,
+                        instruction_pc,
+                        operand_index,
+                        word as i32,
+                        domain,
+                    )?;
+                }
+                if op.is_const_pool_operand(operand_index) {
+                    if spec.kind != OperandKind::ConstIndex {
+                        return Err(BytecodeVerifyError::OperandDecode {
+                            function_index,
+                            instruction_pc,
+                            operand_index,
+                        });
+                    }
+                    let constant_index = word;
+                    let constant = module.constants.get(constant_index as usize).ok_or(
+                        BytecodeVerifyError::ConstantIndex {
+                            function_index,
+                            instruction_pc,
+                            op,
+                            operand_index,
+                            constant_index,
+                            constant_count: module.constants.len(),
+                        },
+                    )?;
+                    let expected = expected_constant_kind(op);
+                    let actual = BytecodeConstantKind::of(constant);
+                    if actual != expected {
+                        return Err(BytecodeVerifyError::ConstantKind {
+                            function_index,
+                            instruction_pc,
+                            op,
+                            operand_index,
+                            constant_index,
+                            expected,
+                            actual,
+                        });
+                    }
+                }
+            }
+            verify_instruction_semantics(
+                module,
+                function,
                 function_index,
                 instruction_pc,
+                mapped_context,
+                derived_this_slot,
+            )
+        },
+    )?;
+    verify_exception_handlers(&function.code, &function.handlers).map_err(wordcode_error)?;
+    for (handler_index, handler) in function.handlers.iter().enumerate() {
+        if u32::from(handler.exception) >= register_count {
+            return Err(BytecodeVerifyError::HandlerRegister {
+                function_index,
+                handler_index,
+                register: handler.exception,
+                register_count,
             });
         }
-        verify_immediate_right_operands(
-            function_index,
-            instruction_pc,
-            instruction,
-            &function.code,
-        )?;
-        for operand_index in 0..instruction.operand_count() {
-            let operand = function.code.operand(instruction, operand_index).ok_or(
-                BytecodeVerifyError::OperandDecode {
-                    function_index,
-                    instruction_pc,
-                    operand_index,
-                },
-            )?;
-            let access = register_access_at(instruction.op, operand_index);
-            if access != RegisterAccess::None {
-                let register = match operand {
-                    Operand::Register(register) => i64::from(register),
-                    Operand::Imm32(register) => i64::from(register),
-                    Operand::ConstIndex(register) => i64::from(register),
-                };
-                // A register pair's second register must be in the window too.
-                let last = register + i64::from(access.width()) - 1;
-                if register < 0 || last >= i64::from(register_count) {
-                    return Err(BytecodeVerifyError::RegisterOperand {
-                        function_index,
-                        instruction_pc,
-                        op: instruction.op,
-                        operand_index,
-                        register,
-                        register_count,
-                    });
-                }
-            }
-            if let Some(domain) =
-                operand_spec_at(instruction.op, operand_index).and_then(|spec| spec.imm_domain)
-            {
-                verify_immediate_operand(
-                    function,
-                    function_index,
-                    instruction_pc,
-                    operand_index,
-                    operand,
-                    domain,
-                )?;
-            }
-            if instruction.op.is_const_pool_operand(operand_index) {
-                let Operand::ConstIndex(constant_index) = operand else {
-                    return Err(BytecodeVerifyError::OperandDecode {
-                        function_index,
-                        instruction_pc,
-                        operand_index,
-                    });
-                };
-                let constant = module.constants.get(constant_index as usize).ok_or(
-                    BytecodeVerifyError::ConstantIndex {
-                        function_index,
-                        instruction_pc,
-                        op: instruction.op,
-                        operand_index,
-                        constant_index,
-                        constant_count: module.constants.len(),
-                    },
-                )?;
-                let expected = expected_constant_kind(instruction.op);
-                let actual = BytecodeConstantKind::of(constant);
-                if actual != expected {
-                    return Err(BytecodeVerifyError::ConstantKind {
-                        function_index,
-                        instruction_pc,
-                        op: instruction.op,
-                        operand_index,
-                        constant_index,
-                        expected,
-                        actual,
-                    });
-                }
-            }
-        }
-        verify_instruction_semantics(
-            module,
-            function,
-            function_index,
-            instruction_pc,
-            mapped_context,
-        )?;
     }
     Ok(VerifiedFunction {
-        layout,
+        byte_len,
         register_count: register_count as u16,
     })
 }
@@ -1565,16 +1538,9 @@ fn verify_immediate_operand(
     function_index: usize,
     instruction_pc: usize,
     operand_index: usize,
-    operand: Operand,
+    value: i32,
     domain: ImmediateDomain,
 ) -> Result<(), BytecodeVerifyError> {
-    let Operand::Imm32(value) = operand else {
-        return Err(BytecodeVerifyError::OperandDecode {
-            function_index,
-            instruction_pc,
-            operand_index,
-        });
-    };
     if !domain.admits(value) {
         return Err(BytecodeVerifyError::ImmediateOperand {
             function_index,
@@ -1602,17 +1568,18 @@ fn verify_instruction_semantics(
     function_index: usize,
     instruction_pc: usize,
     mapped_context: Option<u16>,
+    derived_this_slot: bool,
 ) -> Result<(), BytecodeVerifyError> {
     let instruction = &function.code[instruction_pc];
     match instruction.op {
-        Op::ReturnDerived if !has_derived_this_slot(function) => {
+        Op::ReturnDerived if !derived_this_slot => {
             Err(BytecodeVerifyError::DerivedConstructorReturn {
                 function_index,
                 instruction_pc,
                 op: instruction.op,
             })
         }
-        Op::Return | Op::ReturnValue | Op::ReturnUndefined if has_derived_this_slot(function) => {
+        Op::Return | Op::ReturnValue | Op::ReturnUndefined if derived_this_slot => {
             Err(BytecodeVerifyError::DerivedConstructorReturn {
                 function_index,
                 instruction_pc,
@@ -1851,11 +1818,11 @@ mod tests {
         let verified = VerifiedBytecodeModule::new(module).expect("valid carrier");
         assert_eq!(verified.function_base(), 0);
         assert_eq!(verified.function(0).unwrap().register_count(), 6);
-        let main_layout = verified.function(0).unwrap().layout().clone();
+        let main_byte_len = verified.function(0).unwrap().byte_len();
 
         let rebased = verified.rebase_to(7).expect("proof-preserving rebase");
         assert_eq!(rebased.function_base(), 7);
-        assert_eq!(rebased.function(0).unwrap().layout(), &main_layout);
+        assert_eq!(rebased.function(0).unwrap().byte_len(), main_byte_len);
         assert_eq!(rebased.module().functions[0].id, 7);
         assert_eq!(rebased.module().functions[1].id, 8);
         assert_eq!(

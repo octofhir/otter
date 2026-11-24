@@ -10,12 +10,13 @@
 //! - [`SpanIter`] — decodes entries in order.
 //!
 //! # Invariants
-//! - Each entry is three zigzag LEB128 deltas: PC from the previous PC, start
-//!   from the previous start, end from this start. The first entry is relative
-//!   to `(0, 0)`.
-//! - Iteration stops at the first entry that does not decode; only
-//!   [`SpanTable::well_formed`] tells a complete table from a truncated one,
-//!   so a table from untrusted bytes is checked before it is trusted.
+//! - An entry is three zigzag LEB128 deltas: PC and start from the previous
+//!   entry, end from this start. Each block of 64 entries begins at (0, 0).
+//! - A trailer gives the first logical PC and byte offset for each block
+//!   after the first; its size follows from the entry count. Sequential
+//!   verification checks every checkpoint against the actual stream.
+//! - An untrusted table must pass [`SpanTable::well_formed`] and the verifier's
+//!   logical-PC checks before execution relies on it.
 //!
 //! # See also
 //! - [`crate::binary`] stores the table bytes verbatim.
@@ -25,6 +26,21 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::SpanEntry;
+
+const BLOCK_ENTRIES: usize = 64;
+const CHECKPOINT_BYTES: usize = 12;
+type Checkpoint = [u8; CHECKPOINT_BYTES];
+
+fn checkpoint_pc(checkpoint: &Checkpoint) -> u32 {
+    u32::from_le_bytes(checkpoint[..4].try_into().expect("checkpoint PC"))
+}
+
+fn checkpoint_offset(checkpoint: &Checkpoint) -> Option<usize> {
+    usize::try_from(u64::from_le_bytes(
+        checkpoint[4..].try_into().expect("checkpoint offset"),
+    ))
+    .ok()
+}
 
 /// One function's `(pc, span)` entries, delta-encoded.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -40,19 +56,43 @@ impl SpanTable {
     /// Panics when there are more than `u32::MAX` entries.
     #[must_use]
     pub fn new(entries: &[SpanEntry]) -> Self {
-        let mut bytes = Vec::with_capacity(entries.len() * 3);
-        let (mut pc, mut start) = (0, 0);
+        Self::encode(entries.iter().copied(), entries.len())
+    }
+
+    fn encode(entries: impl Iterator<Item = SpanEntry>, capacity: usize) -> Self {
+        let mut bytes = Vec::with_capacity(capacity.saturating_mul(3));
+        let mut checkpoints = Vec::new();
+        let (mut pc, mut start, mut count) = (0, 0, 0usize);
         for entry in entries {
+            if count != 0 && count.is_multiple_of(BLOCK_ENTRIES) {
+                checkpoints.extend_from_slice(&entry.pc.to_le_bytes());
+                checkpoints.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                (pc, start) = (0, 0);
+            }
             push_delta(&mut bytes, pc, entry.pc);
             push_delta(&mut bytes, start, entry.span.0);
             push_delta(&mut bytes, entry.span.0, entry.span.1);
             pc = entry.pc;
             start = entry.span.0;
+            count += 1;
         }
+        bytes.extend_from_slice(&checkpoints);
         Self {
-            count: u32::try_from(entries.len()).expect("span count fits u32"),
+            count: u32::try_from(count).expect("span count fits u32"),
             bytes: bytes.into_boxed_slice(),
         }
+    }
+
+    /// Transform source coordinates while keeping logical PCs unchanged.
+    #[must_use]
+    pub fn map_spans(&self, mut map: impl FnMut((u32, u32)) -> (u32, u32)) -> Self {
+        Self::encode(
+            self.iter().map(|entry| SpanEntry {
+                pc: entry.pc,
+                span: map(entry.span),
+            }),
+            self.len(),
+        )
     }
 
     /// A table from its stored parts, unchecked; see [`Self::well_formed`].
@@ -79,27 +119,60 @@ impl SpanTable {
         &self.bytes
     }
 
-    /// Decode the entries in order.
+    fn parts(&self) -> Option<(&[u8], &[Checkpoint])> {
+        let checkpoints = self.len().saturating_sub(1) / BLOCK_ENTRIES;
+        let data_len = self
+            .bytes
+            .len()
+            .checked_sub(checkpoints * CHECKPOINT_BYTES)?;
+        let (data, index) = self.bytes.split_at(data_len);
+        Some((data, index.as_chunks::<CHECKPOINT_BYTES>().0))
+    }
+
+    /// Decode the entries in order, validating block boundaries along the way.
     #[must_use]
     pub fn iter(&self) -> SpanIter<'_> {
-        SpanIter {
-            bytes: &self.bytes,
-            remaining: self.count,
-            pc: 0,
-            start: 0,
+        if let Some((data, checkpoints)) = self.parts() {
+            SpanIter::new(data, self.count, checkpoints)
+        } else {
+            let mut malformed = SpanIter::new(&[], 0, &[]);
+            malformed.failed = true;
+            malformed
         }
+    }
+
+    /// Source span at a logical instruction. Before the first entry, use that
+    /// entry's span. For equal PCs, the last matching entry wins.
+    #[must_use]
+    pub fn span_at(&self, pc: u32) -> Option<(u32, u32)> {
+        let (data, checkpoints) = self.parts()?;
+        let block = checkpoints.partition_point(|checkpoint| checkpoint_pc(checkpoint) <= pc);
+        let start = if block == 0 {
+            0
+        } else {
+            checkpoint_offset(&checkpoints[block - 1])?
+        };
+        let end = match checkpoints.get(block) {
+            Some(checkpoint) => checkpoint_offset(checkpoint)?,
+            None => data.len(),
+        };
+        let count = (self.len() - block * BLOCK_ENTRIES).min(BLOCK_ENTRIES) as u32;
+        let mut entries = SpanIter::new(data.get(start..end)?, count, &[]);
+        let first = entries.next()?;
+        Some(
+            entries
+                .take_while(|entry| entry.pc <= pc)
+                .last()
+                .map_or(first.span, |entry| entry.span),
+        )
     }
 
     /// Whether exactly `len()` entries decode and consume every byte.
     #[must_use]
     pub fn well_formed(&self) -> bool {
         let mut iter = self.iter();
-        for _ in 0..self.count {
-            if iter.next().is_none() {
-                return false;
-            }
-        }
-        iter.bytes.is_empty()
+        for _ in &mut iter {}
+        iter.is_complete()
     }
 
     /// Heap bytes this table retains.
@@ -117,7 +190,9 @@ impl std::fmt::Debug for SpanTable {
 
 impl FromIterator<SpanEntry> for SpanTable {
     fn from_iter<I: IntoIterator<Item = SpanEntry>>(entries: I) -> Self {
-        Self::new(&entries.into_iter().collect::<Vec<_>>())
+        let entries = entries.into_iter();
+        let capacity = entries.size_hint().0;
+        Self::encode(entries, capacity)
     }
 }
 
@@ -147,11 +222,44 @@ impl<'de> Deserialize<'de> for SpanTable {
 pub struct SpanIter<'a> {
     bytes: &'a [u8],
     remaining: u32,
+    block_entries: usize,
+    data_len: usize,
+    checkpoints: &'a [Checkpoint],
     pc: u32,
     start: u32,
+    failed: bool,
 }
 
-impl SpanIter<'_> {
+impl<'a> SpanIter<'a> {
+    fn new(bytes: &'a [u8], remaining: u32, checkpoints: &'a [Checkpoint]) -> Self {
+        Self {
+            bytes,
+            remaining,
+            block_entries: 0,
+            data_len: bytes.len(),
+            checkpoints,
+            pc: 0,
+            start: 0,
+            failed: false,
+        }
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        !self.failed && self.remaining == 0 && self.bytes.is_empty() && self.checkpoints.is_empty()
+    }
+
+    fn begin_block(&mut self) -> Option<u32> {
+        let (&checkpoint, rest) = self.checkpoints.split_first()?;
+        let offset = self.data_len - self.bytes.len();
+        if checkpoint_offset(&checkpoint)? != offset {
+            return None;
+        }
+        self.checkpoints = rest;
+        self.block_entries = 0;
+        (self.pc, self.start) = (0, 0);
+        Some(checkpoint_pc(&checkpoint))
+    }
+
     fn delta(&mut self, from: u32) -> Option<u32> {
         let mut zigzag = 0u64;
         let mut shift = 0;
@@ -180,7 +288,15 @@ impl Iterator for SpanIter<'_> {
             return None;
         }
         let entry = (|| {
+            let checkpoint = if self.block_entries == BLOCK_ENTRIES {
+                Some(self.begin_block()?)
+            } else {
+                None
+            };
             let pc = self.delta(self.pc)?;
+            if checkpoint.is_some_and(|expected| expected != pc) {
+                return None;
+            }
             let start = self.delta(self.start)?;
             let end = self.delta(start)?;
             Some(SpanEntry {
@@ -191,11 +307,13 @@ impl Iterator for SpanIter<'_> {
         match entry {
             Some(entry) => {
                 self.remaining -= 1;
+                self.block_entries += 1;
                 self.pc = entry.pc;
                 self.start = entry.span.0;
                 Some(entry)
             }
             None => {
+                self.failed = true;
                 self.remaining = 0;
                 None
             }

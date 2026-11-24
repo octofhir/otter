@@ -89,7 +89,7 @@ use crate::Unsupported;
 use crate::artifact::relocation::{RelocationCapture, RelocationTarget};
 use crate::entry::{
     NATIVE_FRAME_SELF_OFFSET, NATIVE_FRAME_THIS_OFFSET, THREAD_OFFSET, VALUE_HOLE,
-    VM_THREAD_GC_HEAP_OFFSET, VM_THREAD_MARKING_FLAG_CELL_OFFSET,
+    VM_THREAD_GC_HEAP_OFFSET,
 };
 use crate::field_store::FieldStoreOwner;
 use crate::template::arm64::values::{emit_load_symbol_u64, emit_load_u64};
@@ -229,14 +229,7 @@ struct Codegen<'a> {
     deferred_audited: usize,
 }
 
-/// Where a boolean producer fused with its block's branch delivers its
-/// answer: it jumps to the successor the answer selects instead of
-/// materializing `true` or `false` for the branch to test.
-#[derive(Clone, Copy)]
-struct BooleanSink {
-    if_true: DynamicLabel,
-    if_false: DynamicLabel,
-}
+use super::emission::BooleanSink;
 
 /// Body bytes between islands: a segment plus its island stays inside the
 /// ±32 KiB a `tbz`/`tbnz` reaches, which cell tests branch to exits with.
@@ -965,6 +958,7 @@ impl<'a> Codegen<'a> {
             }
         }
         for (position, &block) in order.iter().enumerate() {
+            let next = order.get(position + 1).copied();
             self.maybe_island();
             let label = self.labels[&block];
             dynasm!(self.ops ; .arch aarch64 ; =>label);
@@ -998,7 +992,7 @@ impl<'a> Codegen<'a> {
                     self.emit_move(m.from, m.to);
                 }
                 if let Some(&control) = self.fused.get(&node) {
-                    self.sink = Some(self.branch_sink(control));
+                    self.sink = Some(self.branch_sink(control, next));
                     let emitted = self.audited(node, |codegen| codegen.emit_node(node));
                     self.sink = None;
                     emitted?;
@@ -1017,13 +1011,12 @@ impl<'a> Codegen<'a> {
             let control = data.control.expect("a terminated block");
             self.node_offsets.push((self.ops.offset().0, control));
             if fused_control == Some(control) {
-                // The producer already jumped to the branch's successors.
+                // The producer already selected the branch's successor.
                 continue;
             }
             for m in self.allocation.node(control).moves.clone() {
                 self.emit_move(m.from, m.to);
             }
-            let next = order.get(position + 1).copied();
             self.audited(control, |codegen| {
                 codegen.emit_control(block, control, next)
             })?;
@@ -1146,7 +1139,7 @@ impl<'a> Codegen<'a> {
                 let destination = Self::gp(result.expect("global object result"));
                 self.emit_global_this(node, destination);
             }
-            Kind::LoadLiteral(byte_pc) => {
+            Kind::LoadLiteral { byte_pc, .. } => {
                 let destination = Self::gp(result.expect("a result"));
                 let byte_pc = *byte_pc;
                 let cell = self
@@ -2658,7 +2651,9 @@ impl<'a> Codegen<'a> {
             }
             Kind::AllocationGroup(index) => self.emit_allocation_group(node, *index)?,
             Kind::AllocationProjection(byte) => self.emit_allocation_projection(node, *byte),
-            Kind::PrimitiveAdd => self.emit_primitive_add(node)?,
+            Kind::PrimitiveAdd { input_strings } => {
+                self.emit_primitive_add(node, *input_strings)?
+            }
             Kind::NumberToString => self.emit_number_to_string(node)?,
             Kind::NativeAllocLeaf(stub) => self.emit_native_alloc_leaf(node, *stub)?,
             Kind::BigIntBinary(operator) => self.emit_bigint_binary(node, *operator)?,
@@ -4889,27 +4884,19 @@ impl<'a> Codegen<'a> {
         );
         let slow = self.ops.new_dynamic_label();
         let done = self.ops.new_dynamic_label();
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; tst X(value), #0xfffe_0000_0000_0007
-            ; b.ne =>done
-            ; ldr x16, [x20, THREAD_OFFSET]
-            ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
-            ; ldrb w16, [x16]
-            ; cbz w16, >generational
-            // While marking runs, a white old child owes the insertion barrier.
-            ; ldrb w16, [X(value), flags_byte]
-            ; movz w17, u32::from(young)
-            ; tst w16, w17
-            ; b.ne >generational
-            ; movz w17, self.view.gc_barrier.mark_color_bits
-            ; tst w16, w17
-            ; b.eq =>slow
-            ; generational:
-            ; ldrb w16, [X(value), flags_byte]
-            ; movz w17, u32::from(young)
-            ; tst w16, w17
-            ; b.eq =>done
+        crate::template::arm64::values::emit_cell_test(
+            &mut self.ops,
+            value,
+            crate::template::arm64::values::CellTest::IsNotCell,
+            done,
+        );
+        crate::arm64::gc_barrier::emit_young_edge(
+            &mut self.ops,
+            self.view.gc_barrier,
+            [20, value, 16],
+            [done, slow],
+        );
+        dynasm!(self.ops ; .arch aarch64
             // The slot joins the interval the slab's next scavenge re-traces;
             // an empty interval is `[u32::MAX, 0)`.
             ; ldur w16, [X(base), dirty_start]
@@ -4975,37 +4962,19 @@ impl<'a> Codegen<'a> {
             crate::template::arm64::values::CellTest::IsNotCell,
             done,
         );
-        let generational = self.ops.new_dynamic_label();
-        dynasm!(self.ops
-            ; .arch aarch64
-            ; ldr x16, [x20, THREAD_OFFSET]
-            ; ldr x16, [x16, VM_THREAD_MARKING_FLAG_CELL_OFFSET]
-            ; ldrb w16, [x16]
-            ; cbz w16, =>generational
-            // While marking runs, a white old child owes the insertion barrier.
-            ; ldrb w16, [X(value), flags_byte]
-            ; movz w17, u32::from(young)
-            ; tst w16, w17
-            ; b.ne =>generational
-            ; movz w17, self.view.gc_barrier.mark_color_bits
-            ; tst w16, w17
-            ; b.eq =>slow
-            ; =>generational
+        crate::arm64::gc_barrier::emit_young_edge(
+            &mut self.ops,
+            self.view.gc_barrier,
+            [20, value, 16],
+            [done, slow],
+        );
+        dynasm!(self.ops ; .arch aarch64
             ; ldrb w16, [X(object), flags_byte]
             ; movz w17, u32::from(settled)
             ; tst w16, w17
-            ; b.ne =>done
-            ; ldrb w16, [X(value), flags_byte]
+            ; b.eq =>slow
+            ; =>done
         );
-        if young.is_power_of_two() {
-            dynasm!(self.ops ; .arch aarch64 ; tbnz w16, young.trailing_zeros(), =>slow);
-        } else {
-            dynasm!(self.ops ; .arch aarch64
-                ; movz w17, u32::from(young)
-                ; tst w16, w17
-                ; b.ne =>slow);
-        }
-        dynasm!(self.ops ; .arch aarch64 ; =>done);
         let live = self.slow_path_registers(node, keep);
         self.deferred
             .push(Box::new(move |codegen: &mut Codegen<'a>| {
@@ -5847,7 +5816,7 @@ impl<'a> Codegen<'a> {
 
     /// The successor labels of the truthiness branch `control`, as its own
     /// emission would name them.
-    fn branch_sink(&self, control: NodeId) -> BooleanSink {
+    fn branch_sink(&self, control: NodeId, next: Option<BlockId>) -> BooleanSink {
         let Kind::Branch {
             if_true, if_false, ..
         } = self.graph.node(control).kind
@@ -5862,6 +5831,18 @@ impl<'a> Codegen<'a> {
         BooleanSink {
             if_true: self.labels[&if_true],
             if_false: self.labels[&if_false],
+            next: next.map(|block| self.labels[&block]),
+        }
+    }
+
+    /// Test flags for a fused two-way predicate, preserving layout fallthrough.
+    fn emit_sink_condition(&mut self, condition: Condition) {
+        let Some(sink) = self.sink else { return };
+        let (condition, target, otherwise) = sink.conditional(condition);
+        let target = self.cond_target(target);
+        self.emit_branch_condition(condition, false, target);
+        if let Some(otherwise) = otherwise {
+            dynasm!(self.ops ; .arch aarch64 ; b =>otherwise);
         }
     }
 
@@ -5894,16 +5875,9 @@ impl<'a> Codegen<'a> {
     /// A fused producer's answer computed into `X(value)` as a tagged
     /// boolean, delivered to its successors. Nothing when unfused.
     fn emit_sink_register(&mut self, value: u8) {
-        if let Some(sink) = self.sink {
-            let falsy = self.ops.new_dynamic_label();
-            dynasm!(self.ops
-                ; .arch aarch64
-                ; cmp XSP(value), VALUE_TRUE as u32
-                ; b.ne =>falsy
-                ; b =>sink.if_true
-                ; =>falsy
-                ; b =>sink.if_false
-            );
+        if self.sink.is_some() {
+            dynasm!(self.ops ; .arch aarch64 ; cmp XSP(value), VALUE_TRUE as u32);
+            self.emit_sink_condition(Condition::Equal);
         }
     }
 

@@ -489,6 +489,9 @@ impl Interpreter {
         thread.array_buffer_detach_protector_cell =
             self.jit_array_buffer_detach_protector_addr() as u64;
         thread.number_strings = self.jit_number_strings_addr() as u64;
+        thread.concat_cache = crate::isolate_names::IsolateNames::of(&self.gc_heap)
+            .concat_cache
+            .addr();
         thread.index_atoms = self.jit_index_atoms_addr() as u64;
         thread.unit_strings = self.jit_unit_strings_addr() as u64;
         thread.typed_array_length_protector_cell =

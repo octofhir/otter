@@ -32,6 +32,7 @@ pub(crate) mod field_type;
 pub(crate) mod field_word;
 pub(crate) mod fields;
 pub(crate) mod frame;
+pub(crate) mod gc_barrier;
 pub(crate) mod index;
 pub(crate) mod instanceof;
 pub(crate) mod js_call;

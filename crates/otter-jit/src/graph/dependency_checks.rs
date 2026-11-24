@@ -23,6 +23,9 @@
 //! - A block entered from outside the graph (function or OSR entry) or with
 //!   no predecessor starts unchecked; a join is checked only when every
 //!   predecessor leaves checked.
+//! - One transfer is computed for each block. The fixed point reads only
+//!   those transfers and predecessor state, with no scan of IR nodes.
+//! - Method uses include each distinct eager/lazy frame state once.
 //! - A method load of a proved receiver whose value nothing reads, frame
 //!   states included, goes like a proof.
 //! - Each removed proof is dominated, within an effect-free stretch, by a
@@ -109,9 +112,10 @@ fn method_validity(
         .map(|validity| validity.address)
 }
 
-/// Every node some node or frame state of the graph reads.
-fn used_values(graph: &Graph) -> rustc_hash::FxHashSet<NodeId> {
-    let mut used = rustc_hash::FxHashSet::default();
+/// Every node some active node or distinct frame state reads.
+fn used_values(graph: &Graph) -> Vec<bool> {
+    let mut used = vec![false; graph.nodes.len()];
+    let mut seen_states = vec![false; graph.frame_states.len()];
     for block in &graph.blocks {
         for &node in block
             .phis
@@ -120,9 +124,16 @@ fn used_values(graph: &Graph) -> rustc_hash::FxHashSet<NodeId> {
             .chain(block.control.iter())
         {
             let data = graph.node(node);
-            used.extend(data.inputs.iter().copied());
+            for input in &data.inputs {
+                used[input.0 as usize] = true;
+            }
             for state in [data.eager, data.lazy].into_iter().flatten() {
-                used.extend(graph.state_values(state));
+                if std::mem::replace(&mut seen_states[state.0 as usize], true) {
+                    continue;
+                }
+                for value in graph.state_values(state) {
+                    used[value.0 as usize] = true;
+                }
             }
         }
     }
@@ -150,11 +161,23 @@ pub(crate) fn place(
     inline_views: &[Arc<JitCompileSnapshot>],
 ) -> Box<[CodeDependency]> {
     let mut facts = BTreeSet::new();
-    let mut methods = rustc_hash::FxHashSet::default();
-    for block in &graph.blocks {
+    let mut methods = vec![false; graph.nodes.len()];
+    let mut breaks = vec![false; graph.nodes.len()];
+    // None preserves the incoming state. The last check or break in the
+    // block sets a constant state for all incoming paths.
+    let mut transfer = vec![None; graph.blocks.len()];
+    for (index, block) in graph.blocks.iter().enumerate() {
         for &node in &block.body {
-            if let Some(address) = method_validity(view, inline_views, graph, node) {
-                methods.insert(node);
+            let address = method_validity(view, inline_views, graph, node);
+            let breaks_fact = breaks_facts(graph, node);
+            breaks[node.0 as usize] = breaks_fact;
+            if breaks_fact {
+                transfer[index] = Some(false);
+            } else if address.is_some() || is_proof(&graph.node(node).kind) {
+                transfer[index] = Some(true);
+            }
+            if let Some(address) = address {
+                methods[node.0 as usize] = true;
                 facts.insert((
                     CodeDependencyKind::PrototypeValidity as u16,
                     0,
@@ -207,21 +230,10 @@ pub(crate) fn place(
                 .iter()
                 .all(|predecessor| checked_out[predecessor.0 as usize])
     };
-    let transfer = |graph: &Graph, block: usize, mut checked: bool| -> bool {
-        for &node in &graph.blocks[block].body {
-            if is_proof(&graph.node(node).kind) || methods.contains(&node) {
-                checked = true;
-            }
-            if breaks_facts(graph, node) {
-                checked = false;
-            }
-        }
-        checked
-    };
     loop {
         let mut changed = false;
         for block in 0..count {
-            let out = transfer(graph, block, entry_state(graph, &checked_out, block));
+            let out = transfer[block].unwrap_or_else(|| entry_state(graph, &checked_out, block));
             if out != checked_out[block] {
                 checked_out[block] = out;
                 changed = true;
@@ -236,8 +248,8 @@ pub(crate) fn place(
     // flag test.
     let used = used_values(graph);
     let value_free = |graph: &Graph, node: NodeId| {
-        methods.contains(&node)
-            && !used.contains(&node)
+        methods[node.0 as usize]
+            && !used[node.0 as usize]
             && matches!(
                 graph.node(node).kind,
                 Kind::LoadGuardedMethod {
@@ -259,17 +271,13 @@ pub(crate) fn place(
                     tests.push(node);
                     checked = true;
                 }
-            } else if methods.contains(&node) {
-                if !checked {
-                    guarded_loads.push((block, node));
-                    checked = true;
-                }
-            } else if breaks_facts(graph, node) {
-                checked = false;
+            } else if methods[node.0 as usize] && !checked {
+                guarded_loads.push((block, node));
+                checked = true;
             }
             // A guarded birth may itself widen observed field summaries;
             // a guarded generated call can execute arbitrary JavaScript.
-            if breaks_facts(graph, node) {
+            if breaks[node.0 as usize] {
                 checked = false;
             }
         }
@@ -544,7 +552,9 @@ mod tests {
             Kind::NewObject,
             Kind::NewArrayEmpty,
             Kind::NewArrayLiteral,
-            Kind::PrimitiveAdd,
+            Kind::PrimitiveAdd {
+                input_strings: [false; 2],
+            },
             Kind::CopyContext,
         ] {
             append(&mut graph, entry, kind);
@@ -573,7 +583,9 @@ mod tests {
                 &Kind::NewObject,
                 &Kind::NewArrayEmpty,
                 &Kind::NewArrayLiteral,
-                &Kind::PrimitiveAdd,
+                &Kind::PrimitiveAdd {
+                    input_strings: [false; 2]
+                },
                 &Kind::CopyContext,
                 &literal,
                 &Kind::CheckDependencies,

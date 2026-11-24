@@ -10,7 +10,8 @@
 //!
 //! # Contents
 //! - [`IsolateNames`] — the interner, the dense canonical key strings and
-//!   the integer-key atom cache and the one weak shape interner.
+//!   the integer-key atom cache, the one weak shape interner and ephemeral
+//!   primitive concatenations.
 //! - [`names`] / [`names_mut`] — the interner of a heap's isolate.
 //! - [`IndexAtomCacheLayout`] — the integer-key atom cache as generated
 //!   keyed accesses read it, through `VmThread::index_atoms`.
@@ -27,6 +28,8 @@
 //! - The integer-key atom cache box never moves for the heap's life. A line
 //!   whose key matches holds that key's permanent atom plus one, so
 //!   generated code may trust a hit without any other check.
+//! - Primitive concat memo entries are discarded before collection and
+//!   never add roots.
 //! - Shape tables hold only old-space handles; current-turn pins are strong,
 //!   and all remaining shape entries are pruned before physical sweep.
 //!
@@ -113,6 +116,7 @@ pub(crate) struct IsolateNames {
     /// shape has keyed the atom.
     key_strings: Vec<Cell<JsStringHandle>>,
     index_atoms: Box<IndexAtomCache>,
+    pub(crate) concat_cache: crate::string::concat_cache::ConcatCache,
 }
 
 impl otter_gc::IsolateData for IsolateNames {
@@ -124,6 +128,10 @@ impl otter_gc::IsolateData for IsolateNames {
             }
         }
     }
+    fn prepare_collection(&self) {
+        self.concat_cache.clear();
+    }
+
     fn sweep_weak(&self, heap: &GcHeap) {
         self.shapes.sweep_dead(heap);
     }
@@ -141,6 +149,7 @@ impl IsolateNames {
             shapes: Default::default(),
             key_strings: Vec::new(),
             index_atoms: IndexAtomCache::new(),
+            concat_cache: crate::string::concat_cache::ConcatCache::empty(),
         });
     }
 

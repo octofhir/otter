@@ -1,35 +1,35 @@
 //! Isolate feedback ownership and high-level inline-cache operations.
 //!
 //! # Contents
-//! - Dense global method-site directory installation.
+//! - On-demand method feedback keyed by canonical property sites.
 //! - Executable builtin-method IC banks.
 //! - Single-writer bounded method-target distributions. A named load or store
 //!   site's distribution names the getters or setters its receivers reached
 //!   through an inherited accessor; a site id belongs to one instruction, so
 //!   the two uses never share an entry.
-//! - Range purge for tombstoned code chunks.
+//! - Range purge for tombstoned code chunks, including their method ICs.
 //!
 //! # Invariants
 //! - Property IC programs live only in their owning CodeBlock feedback slot.
-//!   This directory retains method-only state keyed by the existing global
-//!   site identity.
+//!   The method directory contains only sites that observed an accessor,
+//!   method target or specialized method IC.
 //! - A site id maps to exactly one canonical instruction for the lifetime of
-//!   a live chunk. Tombstoned ranges remain reserved and hold no slot address
-//!   or executable IC state.
+//!   a live chunk. The site comes from the instruction or its generated
+//!   code. Tombstoned ranges remain reserved and hold no feedback.
 //! - Generated-call plans remain separate from observational feedback.
 //! - Store banks stop on allocation failure; only allocation-free guard misses
 //!   may advance to another recipe with the same receiver handle.
 //!
 //! # See also
 //! - [`crate::feedback::FeedbackVector`]
-//! - [`crate::executable::FeedbackSlotAddress`]
+//! - [`ExecutionContext::property_ic_site`]
 
-use crate::executable::FeedbackSlotAddress;
 use crate::method_ops::MethodCallIc;
 use crate::{
     ExecutionContext, Interpreter, JitCollectionMethodIcStats, MAX_POLY_METHOD_TARGETS,
     MethodCallFeedback, MethodSite, PolyMethodTarget,
 };
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 /// The callee identity a method-site distribution records.
@@ -41,136 +41,55 @@ pub(crate) enum MethodFeedbackTarget {
     NativeLeaf(crate::native_abi::RuntimeStubId),
 }
 
-/// Isolate-local method-feedback directory. Property programs and counters are
-/// owned directly by CodeBlock slots and never enter this structure.
+/// Mutator-owned feedback published only for the named sites that execute.
 #[derive(Default)]
 pub(crate) struct MethodFeedbackDirectory {
-    slots: Vec<Option<FeedbackSlotAddress>>,
-    method_targets: Vec<Option<MethodCallFeedback>>,
-    method_ics: Vec<Option<MethodCallIc>>,
-    /// Chunks whose slot addresses are already installed, keyed by executable
-    /// address. A chunk's sites are immutable once linked, so installation
-    /// happens once per chunk, not once per dispatch entry, and the membership
-    /// probe stays O(1) however many chunks an isolate has linked. Held
-    /// weakly: the allocation behind a `Weak` is never reused while the `Weak`
-    /// lives, so an address cannot alias a later chunk until its entry is
-    /// purged with the tombstoned range.
-    installed_chunks:
-        rustc_hash::FxHashMap<usize, std::sync::Weak<crate::executable::ExecutableModule>>,
-    /// The two most recently installed chunk identities. A call and its
-    /// return alternate between the caller's and the callee's chunk on every
-    /// entry, so these answer nearly every probe without hashing. Each names
-    /// an `installed_chunks` entry, whose `Weak` keeps the address from being
-    /// reused until a purge, which clears them.
-    recent_chunks: [std::sync::atomic::AtomicUsize; 2],
+    sites: FxHashMap<usize, MethodFeedbackSlot>,
+}
+
+#[derive(Default)]
+struct MethodFeedbackSlot {
+    targets: Option<MethodCallFeedback>,
+    ic: Option<MethodCallIc>,
 }
 
 impl MethodFeedbackDirectory {
     pub(crate) fn evict_site_range(&mut self, start: u32, end: u32) {
-        let start = start as usize;
-        let end = (end as usize).min(self.slots.len());
-        for site in start..end {
-            self.slots[site] = None;
-            self.method_targets[site] = None;
-            self.method_ics[site] = None;
+        for site in start as usize..end as usize {
+            self.sites.remove(&site);
         }
-        self.installed_chunks
-            .retain(|_, chunk| chunk.strong_count() != 0);
-        self.recent_chunks = Default::default();
-    }
-
-    #[inline]
-    /// Whether `context`'s chunk is one of the two most recently installed:
-    /// nearly every probe, answered without writing the directory.
-    fn installed_recently(&self, context: &ExecutionContext) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        let identity = std::sync::Arc::as_ptr(context.executable_module()) as usize;
-        if self.recent_chunks[0].load(Relaxed) == identity {
-            return true;
+        if self.sites.capacity() > self.sites.len().saturating_mul(4).max(1024) {
+            self.sites.shrink_to_fit();
         }
-        if self.recent_chunks[1].load(Relaxed) == identity {
-            let first = self.recent_chunks[0].load(Relaxed);
-            self.recent_chunks[0].store(identity, Relaxed);
-            self.recent_chunks[1].store(first, Relaxed);
-            return true;
-        }
-        false
-    }
-
-    fn install_context(&mut self, context: &ExecutionContext) {
-        if self.installed_recently(context) {
-            return;
-        }
-        let identity = std::sync::Arc::as_ptr(context.executable_module()) as usize;
-        self.install_new_context(context, identity);
-        let first = *self.recent_chunks[0].get_mut();
-        self.recent_chunks = [identity.into(), first.into()];
-    }
-
-    #[inline(never)]
-    fn install_new_context(&mut self, context: &ExecutionContext, identity: usize) {
-        let executable = context.executable_module();
-        match self.installed_chunks.entry(identity) {
-            std::collections::hash_map::Entry::Occupied(installed)
-                if installed.get().strong_count() != 0 =>
-            {
-                return;
-            }
-            std::collections::hash_map::Entry::Occupied(mut stale) => {
-                stale.insert(std::sync::Arc::downgrade(executable));
-            }
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                vacant.insert(std::sync::Arc::downgrade(executable));
-            }
-        }
-        let site_count = context.property_ic_site_end();
-        if self.slots.len() < site_count {
-            self.slots.resize_with(site_count, || None);
-        }
-        if self.method_targets.len() < site_count {
-            self.method_targets.resize_with(site_count, || None);
-        }
-        if self.method_ics.len() < site_count {
-            self.method_ics.resize(site_count, None);
-        }
-        for (site, address) in context.feedback_slot_addresses() {
-            if let Some(slot) = self.slots.get_mut(site) {
-                slot.get_or_insert(address);
-            }
-        }
-    }
-
-    fn address(&self, site: usize) -> Option<&FeedbackSlotAddress> {
-        self.slots.get(site)?.as_ref()
     }
 
     #[must_use]
     pub(crate) fn method_ic(&self, site: usize) -> Option<MethodCallIc> {
-        self.method_ics.get(site).copied().flatten()
+        self.sites.get(&site)?.ic
     }
 
-    pub(crate) fn install_method_ic(&mut self, site: usize, ic: MethodCallIc) -> bool {
-        let Some(slot) = self.method_ics.get_mut(site) else {
-            return false;
-        };
-        *slot = Some(ic);
-        true
+    pub(crate) fn install_method_ic(&mut self, site: usize, ic: MethodCallIc) {
+        self.sites.entry(site).or_default().ic = Some(ic);
     }
 
     pub(crate) fn clear_method_ic(&mut self, site: usize) {
-        if let Some(slot) = self.method_ics.get_mut(site) {
-            *slot = None;
+        if let std::collections::hash_map::Entry::Occupied(mut entry) = self.sites.entry(site) {
+            if entry.get().targets.is_some() {
+                entry.get_mut().ic = None;
+            } else {
+                entry.remove();
+            }
         }
     }
 
     #[must_use]
     pub(crate) fn collection_method_stats(&self) -> JitCollectionMethodIcStats {
         let mut stats = JitCollectionMethodIcStats {
-            slots: self.method_ics.len() as u64,
+            slots: self.sites.len() as u64,
             ..JitCollectionMethodIcStats::default()
         };
-        for slot in &self.method_ics {
-            if let Some(MethodCallIc::Collection(ic)) = slot {
+        for slot in self.sites.values() {
+            if let Some(MethodCallIc::Collection(ic)) = slot.ic {
                 stats.collection_slots = stats.collection_slots.saturating_add(1);
                 if ic.leaf_stub_id.is_some() {
                     stats.leaf_stub_slots = stats.leaf_stub_slots.saturating_add(1);
@@ -178,7 +97,7 @@ impl MethodFeedbackDirectory {
                 if ic.alloc_stub_id.is_some() {
                     stats.alloc_stub_slots = stats.alloc_stub_slots.saturating_add(1);
                 }
-            } else {
+            } else if slot.ic.is_none() {
                 stats.empty_slots = stats.empty_slots.saturating_add(1);
             }
         }
@@ -186,8 +105,11 @@ impl MethodFeedbackDirectory {
     }
 
     pub(crate) fn method_targets(&self, site: usize) -> Option<MethodCallFeedback> {
-        self.address(site)?.is_method().then_some(())?;
-        self.method_targets.get(site)?.clone()
+        self.targets(site).cloned()
+    }
+
+    fn targets(&self, site: usize) -> Option<&MethodCallFeedback> {
+        self.sites.get(&site)?.targets.as_ref()
     }
 
     /// Whether the site's bounded distribution already names `recv_shape`
@@ -197,13 +119,13 @@ impl MethodFeedbackDirectory {
         let live = |proof: &crate::MethodLookupProof| {
             proof.validity.as_ref().is_none_or(|cell| cell.is_valid())
         };
-        match self.method_targets.get(site) {
-            Some(Some(MethodCallFeedback::Mono {
+        match self.targets(site) {
+            Some(MethodCallFeedback::Mono {
                 recv_shape: seen,
                 prototype,
                 ..
-            })) => *seen == recv_shape && live(prototype),
-            Some(Some(MethodCallFeedback::Poly(targets))) => targets
+            }) => *seen == recv_shape && live(prototype),
+            Some(MethodCallFeedback::Poly(targets)) => targets
                 .iter()
                 .find(|seen| seen.recv_shape == recv_shape && live(&seen.prototype))
                 .map(|seen| seen.hits.bump())
@@ -221,68 +143,52 @@ impl MethodFeedbackDirectory {
         recv_shape: crate::object::ShapeId,
         target: MethodFeedbackTarget,
     ) -> bool {
-        if !self
-            .address(site)
-            .is_some_and(FeedbackSlotAddress::is_method)
-        {
-            return false;
-        }
         let live = |proof: &crate::MethodLookupProof| {
             proof.validity.as_ref().is_none_or(|cell| cell.is_valid())
         };
-        match (self.method_targets.get(site), target) {
+        match (self.targets(site), target) {
             (
-                Some(Some(MethodCallFeedback::Mono {
+                Some(MethodCallFeedback::Mono {
                     method_fid,
                     recv_shape: seen,
                     prototype,
                     ..
-                })),
+                }),
                 MethodFeedbackTarget::Function(fid),
             ) => *method_fid == fid && *seen == recv_shape && live(prototype),
             (
-                Some(Some(MethodCallFeedback::MonoNativeLeaf {
+                Some(MethodCallFeedback::MonoNativeLeaf {
                     stub_id,
                     recv_shape: seen,
                     prototype,
                     ..
-                })),
+                }),
                 MethodFeedbackTarget::NativeLeaf(id),
             ) => *stub_id == id && *seen == recv_shape && live(prototype),
-            (
-                Some(Some(MethodCallFeedback::Poly(targets))),
-                MethodFeedbackTarget::Function(fid),
-            ) => targets
-                .iter()
-                .find(|seen| {
-                    seen.method_fid == fid && seen.recv_shape == recv_shape && live(&seen.prototype)
-                })
-                .map(|seen| seen.hits.bump())
-                .is_some(),
+            (Some(MethodCallFeedback::Poly(targets)), MethodFeedbackTarget::Function(fid)) => {
+                targets
+                    .iter()
+                    .find(|seen| {
+                        seen.method_fid == fid
+                            && seen.recv_shape == recv_shape
+                            && live(&seen.prototype)
+                    })
+                    .map(|seen| seen.hits.bump())
+                    .is_some()
+            }
             _ => false,
         }
     }
 
     fn method_targets_saturated(&self, site: usize) -> bool {
-        self.address(site)
-            .is_some_and(FeedbackSlotAddress::is_method)
-            && matches!(
-                self.method_targets.get(site),
-                Some(Some(MethodCallFeedback::Megamorphic))
-            )
+        matches!(self.targets(site), Some(MethodCallFeedback::Megamorphic))
     }
 
     /// Stop capturing a site whose targets no guard chain can name. Baked
     /// chains stay valid: their guards still prove exactly the targets they
     /// recorded, and every other receiver already takes the generic call.
     fn saturate_method_targets(&mut self, site: usize) {
-        if self
-            .address(site)
-            .is_some_and(FeedbackSlotAddress::is_method)
-            && let Some(slot) = self.method_targets.get_mut(site)
-        {
-            *slot = Some(MethodCallFeedback::Megamorphic);
-        }
+        self.sites.entry(site).or_default().targets = Some(MethodCallFeedback::Megamorphic);
     }
 
     fn record_method_native_leaf(
@@ -291,16 +197,8 @@ impl MethodFeedbackDirectory {
         stub_id: crate::native_abi::RuntimeStubId,
         method_site: MethodSite,
     ) -> bool {
-        if !self
-            .address(site)
-            .is_some_and(FeedbackSlotAddress::is_method)
-        {
-            return false;
-        }
-        let Some(feedback) = self.method_targets.get_mut(site) else {
-            return false;
-        };
-        record_method_native_leaf_distribution(feedback, stub_id, method_site)
+        let targets = &mut self.sites.entry(site).or_default().targets;
+        record_method_native_leaf_distribution(targets, stub_id, method_site)
     }
 
     fn record_method_target(
@@ -309,16 +207,8 @@ impl MethodFeedbackDirectory {
         method_fid: u32,
         method_site: MethodSite,
     ) -> bool {
-        if !self
-            .address(site)
-            .is_some_and(FeedbackSlotAddress::is_method)
-        {
-            return false;
-        }
-        if let Some(targets) = self.method_targets.get_mut(site) {
-            return record_method_distribution(targets, method_fid, method_site);
-        }
-        false
+        let targets = &mut self.sites.entry(site).or_default().targets;
+        record_method_distribution(targets, method_fid, method_site)
     }
 }
 
@@ -445,12 +335,6 @@ fn record_method_distribution(
 }
 
 impl Interpreter {
-    pub(crate) fn ensure_method_feedback_context(&mut self, context: &ExecutionContext) {
-        if !self.method_feedback().installed_recently(context) {
-            self.method_feedback_mut().install_context(context);
-        }
-    }
-
     #[must_use]
     pub(crate) fn method_target_feedback(&self, site: usize) -> Option<MethodCallFeedback> {
         self.method_feedback().method_targets(site)
@@ -523,7 +407,6 @@ impl Interpreter {
         let Some(site) = context.property_ic_site(function_id, pc) else {
             return;
         };
-        self.ensure_method_feedback_context(context);
         if self.method_target_feedback_saturated(site) {
             return;
         }

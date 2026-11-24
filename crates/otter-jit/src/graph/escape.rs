@@ -13,7 +13,6 @@
 //!   track their fields through the graph and rewrite it.
 //! - [`fold_conversions`] — a number boxed and unboxed again is the number,
 //!   or the direct conversion between its two representations.
-//! - [`remove_dead_values`] — drop pure values nothing reads.
 //!
 //! # Invariants
 //! - An object is elided only when every use is a field write or read whose
@@ -978,56 +977,6 @@ pub(crate) fn fold_conversions(graph: &mut Graph, layout: &[BlockId]) {
                 *value = replacement;
             }
         });
-    }
-}
-
-/// Drop the pure body values no node and no frame state reads, until none
-/// is left. Phis stay: a loop header's state may name them.
-pub(crate) fn remove_dead_values(graph: &mut Graph, layout: &[BlockId]) {
-    loop {
-        let mut used: FxHashSet<NodeId> = FxHashSet::default();
-        for &block in layout {
-            let data = graph.block(block);
-            for &node in data
-                .phis
-                .iter()
-                .chain(&data.body)
-                .chain(data.control.iter())
-            {
-                let node_data = graph.node(node);
-                used.extend(node_data.inputs.iter().copied());
-                for state in [node_data.eager, node_data.lazy].into_iter().flatten() {
-                    used.extend(graph.state_values(state));
-                }
-            }
-        }
-        let mut removed = false;
-        for &block in layout {
-            let dead = |node: &NodeId| {
-                let data = graph.node(*node);
-                let properties = data.kind.properties();
-                data.repr != Repr::None
-                    && !properties.effectful
-                    && !properties.eager_deopt
-                    && !properties.lazy_deopt
-                    && !properties.call
-                    && !used.contains(node)
-            };
-            let keep: Vec<NodeId> = graph
-                .block(block)
-                .body
-                .iter()
-                .copied()
-                .filter(|node| !dead(node))
-                .collect();
-            if keep.len() != graph.block(block).body.len() {
-                removed = true;
-                graph.block_mut(block).body = keep;
-            }
-        }
-        if !removed {
-            return;
-        }
     }
 }
 

@@ -51,9 +51,13 @@ use std::sync::OnceLock;
 /// that does not run as soon as it is created compiles its body on its
 /// first call. It shapes the bytecode the cache stores, so it lives in a
 /// file the cache fingerprint covers.
-pub(crate) const LAZY_FUNCTIONS: otter_compiler::CompileOptions = otter_compiler::CompileOptions {
-    lazy_functions: true,
-};
+pub(crate) const LAZY_FUNCTIONS: otter_compiler::CompileOptions =
+    otter_compiler::CompileOptions::Lazy;
+
+/// A CommonJS file creates its wrapper and immediately calls it. Its disk
+/// entry includes that first body, while nested cold functions remain lazy.
+pub(super) const COMMONJS_FUNCTIONS: otter_compiler::CompileOptions =
+    otter_compiler::CompileOptions::LazyNested;
 
 use otter_bytecode::{BytecodeModule, VerifiedBytecodeModule};
 use otter_syntax::SourceKind;

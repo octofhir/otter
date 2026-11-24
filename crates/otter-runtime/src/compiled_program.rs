@@ -122,7 +122,7 @@ impl Runtime {
     ) -> Result<CompiledProgram, OtterError> {
         let wrapped = otter_bytecode::commonjs::wrapper_source(&source.text);
         let mut module = otter_compiler::compile_eval_source(
-            &wrapped,
+            otter_compiler::CompileSource::Borrowed(&wrapped),
             otter_syntax::SourceKind::JavaScript,
             "<eval>",
             false,

@@ -30,6 +30,7 @@ pub(crate) mod binding;
 pub(crate) mod field_type;
 pub(crate) mod field_word;
 pub(crate) mod frame;
+pub(crate) mod gc_barrier;
 pub(crate) mod index;
 pub(crate) mod inline_guard;
 pub(crate) mod instanceof;

@@ -141,8 +141,7 @@ pub(crate) struct LazyUnit {
     pub(crate) typescript: bool,
     pub(crate) jsx: bool,
     /// Functions created by the unit's top level compile now; deeper ones
-    /// stay lazy. Only the differential tests ask for it: it is the eager
-    /// reference a lazily compiled top-level function is checked against.
+    /// can stay lazy. A CommonJS wrapper is called immediately after linking.
     pub(crate) top_level_eager: bool,
 }
 
@@ -253,7 +252,10 @@ struct WalkState {
 }
 
 impl Compiler {
-    pub(crate) fn new(top: FunctionContext, capture: crate::capture::CaptureFacts) -> Self {
+    pub(crate) fn new(
+        top: FunctionContext,
+        capture: impl Into<Rc<crate::capture::CaptureFacts>>,
+    ) -> Self {
         Self {
             stack: vec![top],
             eval_chain: None,
@@ -283,7 +285,7 @@ impl Compiler {
             class_hint_name_ids: HashMap::default(),
             declared_classes: HashMap::default(),
             pending_class_hint_sites: Vec::new(),
-            capture: Rc::new(capture),
+            capture: capture.into(),
             skips: None,
         }
     }

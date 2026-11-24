@@ -2,7 +2,7 @@
 //!
 //! # Contents
 //! - Immediate and ordinary-cell comparisons produce tagged booleans inline.
-//! - Proven ordinary/nullish bounds compare the immediate tags alone.
+//! - Proven ordinary/nullish bounds need only one tag bit.
 //! - Native functions use the existing total typeof leaf for HTML-DDA identity.
 //!
 //! # Invariants
@@ -26,23 +26,20 @@ impl<'a> Codegen<'a> {
         let input = Self::gp(self.allocation.node(node).inputs[0]);
         let destination = Self::gp(self.allocation.node(node).result.expect("a boolean result"));
         if object_or_nullish {
-            dynasm!(self.ops ; .arch aarch64
-                ; orr x16, X(input), tag::UNDEFINED_TAG
-                ; cmp x16, VALUE_UNDEFINED as u32
-            );
-            if let Some(sink) = self.sink {
-                let (equal, differ) = if negate {
-                    (sink.if_false, sink.if_true)
+            // Ordinary cells have no OTHER_TAG bit; null and undefined do.
+            dynasm!(self.ops ; .arch aarch64 ; tst X(input), tag::OTHER_TAG);
+            if self.sink.is_some() {
+                let condition = if negate {
+                    Condition::Equal
                 } else {
-                    (sink.if_true, sink.if_false)
+                    Condition::NotEqual
                 };
-                let equal = self.cond_target(equal);
-                dynasm!(self.ops ; .arch aarch64 ; b.eq =>equal ; b =>differ);
+                self.emit_sink_condition(condition);
             } else {
                 if negate {
-                    dynasm!(self.ops ; .arch aarch64 ; cset W(destination), ne);
-                } else {
                     dynasm!(self.ops ; .arch aarch64 ; cset W(destination), eq);
+                } else {
+                    dynasm!(self.ops ; .arch aarch64 ; cset W(destination), ne);
                 }
                 dynasm!(self.ops ; .arch aarch64 ; orr XSP(destination), X(destination), VALUE_FALSE);
             }

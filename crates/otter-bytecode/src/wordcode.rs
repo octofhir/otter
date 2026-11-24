@@ -118,6 +118,15 @@ impl Instruction {
         )
     }
 
+    /// Borrow the storage fields without copying the inline operand array.
+    pub(crate) const fn operand_storage(&self) -> (u8, &[u32; INLINE_OPERAND_WORDS], u32) {
+        (
+            self.operand_count,
+            &self.inline_operand_words,
+            self.overflow_operand_offset,
+        )
+    }
+
     /// Number of schema-typed operand words.
     #[must_use]
     pub const fn operand_count(self) -> usize {

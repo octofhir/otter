@@ -13,8 +13,8 @@
 //! - [`InstructionFeedbackRecorder`] — a vector-bound recording view that
 //!   advances the owning vector epoch on material transitions.
 //! - Fixed-layout call and executable property-IC slots selected by opcode at
-//!   CodeBlock construction; method sites combine a load IC with their method
-//!   directory marker.
+//!   CodeBlock construction and packed into contiguous banks. A method
+//!   site owns both a load IC and ordinary-call feedback.
 //!
 //! # Invariants
 //! - **Monotonic.** Bits are only ever set, never cleared. A site that has ever
@@ -63,6 +63,11 @@ use smallvec::SmallVec;
 use crate::Value;
 use crate::property_ic::{IcHandler, InstallOutcome, PropertyIcKind, PropertyIcSlot};
 use crate::tier_policy::PROFILED_CALL_TARGET_CAPACITY;
+
+#[path = "feedback_storage.rs"]
+mod storage;
+use storage::FeedbackBanks;
+pub(crate) use storage::FeedbackLayout;
 
 /// At least one operand was an exact Int32 numeric value, excluding `-0`.
 pub const ARITH_INT32: u8 = 1 << 0;
@@ -432,64 +437,6 @@ impl AtomicCallFeedback {
                 CALL_DISTRIBUTION_MEGAMORPHIC => Some(CallSiteDistribution::Megamorphic),
                 _ => unreachable!("invalid atomic call feedback state"),
             };
-        }
-    }
-}
-
-/// Opcode-selected feedback storage. Boxes are allocated once while the
-/// CodeBlock is built. Property payloads own bounded IC programs and may retain
-/// traced transition shapes; call payloads remain fixed atomic records.
-///
-/// A method call owns both: the load of its method, and the call targets it
-/// ran, where `f.call(...)` records
-/// [`OrdinaryCallTarget::FunctionPrototypeCall`] for the receiver `f`, which a
-/// generated site calls directly.
-#[derive(Debug)]
-enum TypedFeedbackSlot {
-    None,
-    Property(Box<PropertyIcSlot>),
-    Method(Box<PropertyIcSlot>, Box<AtomicCallFeedback>),
-    Call(Box<AtomicCallFeedback>),
-    /// The isolate's allocation site of an object or array literal, or of
-    /// the strings a `+` concatenation creates; zero until the site's first
-    /// allocation registers it.
-    AllocationSite(AtomicU16),
-}
-
-impl TypedFeedbackSlot {
-    fn for_op(op: Op) -> Self {
-        match op {
-            Op::LoadProperty | Op::HasNamedProperty => {
-                Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Load)))
-            }
-            Op::StoreProperty | Op::StorePropertyStrict => {
-                Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Store)))
-            }
-            // An element site keeps a named cache for the one symbol key it
-            // may serve.
-            Op::LoadElement => Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Load))),
-            Op::StoreElement | Op::StoreElementStrict => {
-                Self::Property(Box::new(PropertyIcSlot::new(PropertyIcKind::Store)))
-            }
-            Op::CallMethodValue => Self::Method(
-                Box::new(PropertyIcSlot::new(PropertyIcKind::Load)),
-                Box::default(),
-            ),
-            Op::Call
-            | Op::TailCall
-            | Op::CallWithThis
-            | Op::CallForwardArguments
-            | Op::CallSpread
-            | Op::New
-            | Op::NewSpread
-            | Op::SuperConstruct
-            | Op::SuperConstructSpread => Self::Call(Box::default()),
-            Op::NewObjectLiteral
-            | Op::NewArray
-            | Op::NewArrayBoilerplate
-            | Op::Add
-            | Op::AddImm => Self::AllocationSite(AtomicU16::new(0)),
-            _ => Self::None,
         }
     }
 }
@@ -1082,55 +1029,33 @@ impl InstructionFeedback {
 #[derive(Debug)]
 pub struct FeedbackVector {
     cells: Box<[InstructionFeedback]>,
-    typed_slots: Box<[TypedFeedbackSlot]>,
+    banks: FeedbackBanks,
     epoch: AtomicU32,
 }
 
 impl FeedbackVector {
-    /// Heap bytes the two dense per-instruction tables retain for the owning
-    /// code block's lifetime, including boxed out-of-line slot payloads.
+    /// Heap bytes retained by the instruction cells and typed banks.
     #[must_use]
     pub(crate) fn retained_bytes(&self) -> u64 {
-        let mut total = (std::mem::size_of_val::<[InstructionFeedback]>(&self.cells) as u64)
-            .saturating_add(std::mem::size_of_val::<[TypedFeedbackSlot]>(&self.typed_slots) as u64);
-        for slot in &self.typed_slots {
-            total = total.saturating_add(match slot {
-                TypedFeedbackSlot::None | TypedFeedbackSlot::AllocationSite(_) => 0,
-                TypedFeedbackSlot::Property(payload) => {
-                    std::mem::size_of_val::<PropertyIcSlot>(payload) as u64
-                }
-                TypedFeedbackSlot::Method(payload, call) => {
-                    (std::mem::size_of_val::<PropertyIcSlot>(payload)
-                        + std::mem::size_of_val::<AtomicCallFeedback>(call))
-                        as u64
-                }
-                TypedFeedbackSlot::Call(payload) => {
-                    std::mem::size_of_val::<AtomicCallFeedback>(payload) as u64
-                }
-            });
-        }
-        total
+        (std::mem::size_of_val(&*self.cells) as u64).saturating_add(self.banks.retained_bytes())
     }
 
     /// Allocate one zeroed feedback cell per canonical instruction.
     #[must_use]
     pub fn with_instruction_count(instruction_count: usize) -> Self {
+        let mut cells = Vec::with_capacity(instruction_count);
+        cells.resize_with(instruction_count, InstructionFeedback::default);
         Self {
-            cells: (0..instruction_count)
-                .map(|_| InstructionFeedback::default())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            typed_slots: (0..instruction_count)
-                .map(|_| TypedFeedbackSlot::None)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            cells: cells.into_boxed_slice(),
+            banks: FeedbackBanks::default(),
             epoch: AtomicU32::new(0),
         }
     }
 
-    /// Allocate dense cells plus bytecode-kind-selected out-of-line payloads.
+    /// Allocate dense cells and opcode-selected payloads from admitted geometry.
     pub(crate) fn for_instruction_ops<I>(
         ops: I,
+        layout: FeedbackLayout,
         lease: &mut otter_resource::ResourceLease,
     ) -> Result<Self, otter_resource::ResourceError>
     where
@@ -1138,45 +1063,13 @@ impl FeedbackVector {
         I::IntoIter: ExactSizeIterator,
     {
         let ops = ops.into_iter();
-        let mut typed_slots = crate::executable::allocation::try_vec(ops.len(), lease)?;
-        typed_slots.extend(ops.map(TypedFeedbackSlot::for_op));
-        let mut cells = crate::executable::allocation::try_vec(typed_slots.len(), lease)?;
-        cells.resize_with(typed_slots.len(), InstructionFeedback::default);
+        let mut cells = crate::executable::allocation::try_vec(ops.len(), lease)?;
+        cells.resize_with(ops.len(), InstructionFeedback::default);
+        let banks = FeedbackBanks::new(ops, layout, lease)?;
         Ok(Self {
             cells: cells.into_boxed_slice(),
-            typed_slots: typed_slots.into_boxed_slice(),
+            banks,
             epoch: AtomicU32::new(0),
-        })
-    }
-
-    /// Physical requested geometry of a fresh opcode-selected feedback vector.
-    pub(crate) fn allocation_bytes(ops: impl IntoIterator<Item = Op>) -> u64 {
-        ops.into_iter().fold(0u64, |bytes, op| {
-            let payload = match op {
-                Op::LoadProperty
-                | Op::HasNamedProperty
-                | Op::StoreProperty
-                | Op::StorePropertyStrict => std::mem::size_of::<PropertyIcSlot>(),
-                Op::CallMethodValue => {
-                    std::mem::size_of::<PropertyIcSlot>()
-                        + std::mem::size_of::<AtomicCallFeedback>()
-                }
-                Op::Call
-                | Op::TailCall
-                | Op::CallWithThis
-                | Op::CallForwardArguments
-                | Op::CallSpread
-                | Op::New
-                | Op::NewSpread
-                | Op::SuperConstruct
-                | Op::SuperConstructSpread => std::mem::size_of::<AtomicCallFeedback>(),
-                _ => 0,
-            };
-            bytes.saturating_add(
-                (std::mem::size_of::<InstructionFeedback>()
-                    + std::mem::size_of::<TypedFeedbackSlot>()
-                    + payload) as u64,
-            )
         })
     }
 
@@ -1200,12 +1093,7 @@ impl FeedbackVector {
         index: usize,
         kind: PropertyIcKind,
     ) -> Option<PropertyFeedbackSlot<'_>> {
-        let feedback = match self.typed_slots.get(index)? {
-            TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback, _) => {
-                feedback
-            }
-            _ => return None,
-        };
+        let feedback = self.banks.property(index)?;
         (feedback.kind() == kind).then_some(PropertyFeedbackSlot {
             vector: self,
             slot: feedback,
@@ -1218,31 +1106,21 @@ impl FeedbackVector {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn is_method_slot(&self, index: usize) -> bool {
-        matches!(
-            self.typed_slots.get(index),
-            Some(TypedFeedbackSlot::Method(..))
-        )
+        self.banks.is_method(index)
     }
 
-    /// Allocation-site cell of one object or array literal instruction.
+    /// Allocation-site cell of one object or array literal or concatenation.
     #[must_use]
     pub(crate) fn allocation_site(&self, index: usize) -> Option<&AtomicU16> {
-        let TypedFeedbackSlot::AllocationSite(site) = self.typed_slots.get(index)? else {
-            return None;
-        };
-        Some(site)
+        self.banks.allocation(index)
     }
 
-    /// Ordinary-call payload for one `Call`, `New`, or `SuperConstruct`
-    /// instruction, or the `Function.prototype.call` target of a method call.
+    /// Ordinary-call payload for one call instruction.
     #[must_use]
     pub(crate) fn call_slot(&self, index: usize) -> Option<CallFeedbackSlot<'_>> {
-        let (TypedFeedbackSlot::Call(feedback) | TypedFeedbackSlot::Method(_, feedback)) =
-            self.typed_slots.get(index)?
-        else {
-            return None;
-        };
-        Some(CallFeedbackSlot { feedback })
+        self.banks
+            .call(index)
+            .map(|feedback| CallFeedbackSlot { feedback })
     }
 
     /// Record bounded ordinary-call state through one intent-level operation.
@@ -1323,12 +1201,7 @@ impl FeedbackVector {
     }
 
     fn property_ic_slots(&self) -> impl Iterator<Item = &PropertyIcSlot> {
-        self.typed_slots.iter().filter_map(|slot| match slot {
-            TypedFeedbackSlot::Property(feedback) | TypedFeedbackSlot::Method(feedback, _) => {
-                Some(&**feedback)
-            }
-            _ => None,
-        })
+        self.banks.properties()
     }
 
     pub(crate) fn property_stats(&self) -> crate::property_ic::PropertyIcStats {
@@ -1417,13 +1290,15 @@ mod tests {
 
     fn feedback_for(ops: impl IntoIterator<Item = Op>) -> FeedbackVector {
         let ops: Vec<_> = ops.into_iter().collect();
+        let layout = FeedbackLayout::for_ops(ops.iter().copied());
         let mut lease = otter_resource::ResourceAccount::default()
             .reserve_exact(
                 otter_resource::ResourceClass::SourceModuleBytes,
-                FeedbackVector::allocation_bytes(ops.iter().copied()),
+                layout.bytes(),
             )
             .expect("admit feedback fixture geometry");
-        FeedbackVector::for_instruction_ops(ops, &mut lease).expect("prepare feedback fixture")
+        FeedbackVector::for_instruction_ops(ops, layout, &mut lease)
+            .expect("prepare feedback fixture")
     }
 
     #[test]

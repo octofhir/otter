@@ -320,7 +320,10 @@ pub(crate) enum Kind {
     LoadClosure,
     /// The string or BigInt literal loaded at this byte PC, read from its
     /// isolate-owned cell.
-    LoadLiteral(u32),
+    LoadLiteral {
+        byte_pc: u32,
+        is_string: bool,
+    },
     /// Live global binding at this source body's byte PC. A pre-effect
     /// guard resumes the canonical binding operation at that exact site.
     LoadGlobalBinding(u32),
@@ -393,8 +396,11 @@ pub(crate) enum Kind {
     /// activation's actual arguments past them.
     NewRestArray(u16),
 
-    /// Number/String primitive addition with a collecting string miss.
-    PrimitiveAdd,
+    /// Primitive addition with a collecting string miss. Each true operand
+    /// fact comes from an immutable literal or a dominating String proof.
+    PrimitiveAdd {
+        input_strings: [bool; 2],
+    },
     /// `ToString` of a Number: its decimal string from the isolate's cache,
     /// converted through a collecting miss.
     NumberToString,
@@ -1100,7 +1106,7 @@ impl Kind {
             | Self::LoadNewTarget
             | Self::LoadClosure
             | Self::LoadArgumentCount
-            | Self::LoadLiteral(_)
+            | Self::LoadLiteral { .. }
             | Self::LoadCellValue(_)
             | Self::LoadWindow(_)
             | Self::Phi
@@ -1218,7 +1224,7 @@ impl Kind {
             },
             Self::PrimitiveCompare(_) => eager,
             Self::AllocationGroup(_)
-            | Self::PrimitiveAdd
+            | Self::PrimitiveAdd { .. }
             | Self::NumberToString
             | Self::NativeAllocLeaf(_)
             | Self::BigIntBinary(_)
@@ -1458,7 +1464,7 @@ impl Kind {
             Self::NewClosure => &[abi::STUB_JIT_MAKE_FN, abi::STUB_JIT_MAKE_CLOSURE],
             Self::NewArrayWithLength => &[abi::STUB_ARRAY_CONSTRUCT_ALLOC],
             Self::NewRestArray(_) => &[abi::STUB_REST_ARRAY_ALLOC],
-            Self::PrimitiveAdd => &[abi::STUB_STRING_CONCAT_ALLOC, abi::STUB_WRITE_BARRIER],
+            Self::PrimitiveAdd { .. } => &[abi::STUB_STRING_CONCAT_ALLOC, abi::STUB_WRITE_BARRIER],
             Self::NumberToString => &[abi::STUB_NUMBER_TO_STRING_ALLOC],
             Self::BigIntBinary(_) => &[abi::STUB_BIGINT_BINARY_ALLOC],
             Self::CallJs { tail: true, .. } => &[
@@ -1528,11 +1534,11 @@ impl Kind {
                 fp_temps: 0,
                 fixed_gp_clobbers: SmallVec::new(),
             },
-            Self::PrimitiveAdd => Constraints {
+            Self::PrimitiveAdd { input_strings } => Constraints {
                 inputs: (0..input_count).map(|_| InputPolicy::Home).collect(),
                 result: ResultPolicy::Register,
                 gp_temps: 4,
-                fp_temps: 1,
+                fp_temps: u8::from(!input_strings[0] && !input_strings[1]),
                 fixed_gp_clobbers: SmallVec::new(),
             },
             Self::NumberToString => Constraints {
@@ -1615,7 +1621,7 @@ impl Kind {
             | Self::LoadThis
             | Self::LoadNewTarget
             | Self::LoadClosure
-            | Self::LoadLiteral(_)
+            | Self::LoadLiteral { .. }
             | Self::LoadCellValue(_)
             | Self::LoadGlobalThis
             | Self::LoadWindow(_) => simple(0, ResultPolicy::Register),

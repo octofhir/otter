@@ -12,6 +12,8 @@
 //! A collecting entry roots its ABI operands and current safepoint, then builds
 //! strings through the production handle arena. No raw value crosses a GC.
 //! No object coercion, JS or property protocol runs inside these Probes.
+//! Successful concats record the current rooted operands after allocation;
+//! the heap forgets the observation before a later collection.
 //! Ordering never allocates in the managed heap, flattens a body or fills caches;
 //! the existing general numeric parser may use temporary Rust text storage.
 //! The third concat operand is `undefined` or the Int32 id of the site whose
@@ -24,6 +26,7 @@
 //! - `crate::number::parse` is the one StringNumericLiteral parser.
 
 use super::*;
+use crate::native_abi::NativeResultStatus;
 
 /// Concatenate explicit admitted primitives using current typed safepoint roots.
 /// `site` is `undefined` or the Int32 id of the instruction's allocation site.
@@ -243,51 +246,67 @@ fn concat(
     let _roots = vm
         .gc_heap
         .register_extra_roots(otter_gc::ExtraRoots::new(&roots));
-    if let Some(fast) = vm.try_concat_string_int32(roots.value(0), roots.value(1), placement) {
-        return match fast {
-            Ok(value) => NativeResultPair::success(value),
-            Err(_) => NativeResultPair::out_of_memory(),
-        };
-    }
-    vm.with_handle_scope(|vm, scope| {
-        let lhs = vm.scoped_value(scope, roots.value(0));
-        let rhs = vm.scoped_value(scope, roots.value(1));
-        let left = vm.escape_scoped(lhs);
-        let left = match left.as_string(&vm.gc_heap) {
-            Some(string) => Ok(string),
-            None => vm.js_string_for_concat(left, placement),
-        };
-        let left = match left {
-            Ok(string) => vm.scoped_value(scope, Value::string(string)),
-            Err(crate::VmError::OutOfMemory { .. }) => return NativeResultPair::out_of_memory(),
-            Err(_) => return NativeResultPair::miss(),
-        };
-        let right = vm.escape_scoped(rhs);
-        let right = match right.as_string(&vm.gc_heap) {
-            Some(string) => Ok(string),
-            None => vm.js_string_for_concat(right, placement),
-        };
-        let right = match right {
-            Ok(string) => vm.scoped_value(scope, Value::string(string)),
-            Err(crate::VmError::OutOfMemory { .. }) => return NativeResultPair::out_of_memory(),
-            Err(_) => return NativeResultPair::miss(),
-        };
-        let left = vm
-            .escape_scoped(left)
-            .as_string(&vm.gc_heap)
-            .expect("scoped converted string");
-        let right = vm
-            .escape_scoped(right)
-            .as_string(&vm.gc_heap)
-            .expect("scoped converted string");
-        match crate::JsString::concat_at(left, right, &mut vm.gc_heap, placement) {
-            Ok(value) => NativeResultPair::success(Value::string(value)),
-            Err(crate::string::StringConcatError::StringTooLong { .. }) => NativeResultPair::miss(),
-            Err(crate::string::StringConcatError::OutOfMemory(_)) => {
-                NativeResultPair::out_of_memory()
+    let result =
+        if let Some(fast) = vm.try_concat_string_int32(roots.value(0), roots.value(1), placement) {
+            match fast {
+                Ok(value) => NativeResultPair::success(value),
+                Err(_) => NativeResultPair::out_of_memory(),
             }
-        }
-    })
+        } else {
+            vm.with_handle_scope(|vm, scope| {
+                let lhs = vm.scoped_value(scope, roots.value(0));
+                let rhs = vm.scoped_value(scope, roots.value(1));
+                let left = vm.escape_scoped(lhs);
+                let left = match left.as_string(&vm.gc_heap) {
+                    Some(string) => Ok(string),
+                    None => vm.js_string_for_concat(left, placement),
+                };
+                let left = match left {
+                    Ok(string) => vm.scoped_value(scope, Value::string(string)),
+                    Err(crate::VmError::OutOfMemory { .. }) => {
+                        return NativeResultPair::out_of_memory();
+                    }
+                    Err(_) => return NativeResultPair::miss(),
+                };
+                let right = vm.escape_scoped(rhs);
+                let right = match right.as_string(&vm.gc_heap) {
+                    Some(string) => Ok(string),
+                    None => vm.js_string_for_concat(right, placement),
+                };
+                let right = match right {
+                    Ok(string) => vm.scoped_value(scope, Value::string(string)),
+                    Err(crate::VmError::OutOfMemory { .. }) => {
+                        return NativeResultPair::out_of_memory();
+                    }
+                    Err(_) => return NativeResultPair::miss(),
+                };
+                let left = vm
+                    .escape_scoped(left)
+                    .as_string(&vm.gc_heap)
+                    .expect("scoped converted string");
+                let right = vm
+                    .escape_scoped(right)
+                    .as_string(&vm.gc_heap)
+                    .expect("scoped converted string");
+                match crate::JsString::concat_at(left, right, &mut vm.gc_heap, placement) {
+                    Ok(value) => NativeResultPair::success(Value::string(value)),
+                    Err(crate::string::StringConcatError::StringTooLong { .. }) => {
+                        NativeResultPair::miss()
+                    }
+                    Err(crate::string::StringConcatError::OutOfMemory(_)) => {
+                        NativeResultPair::out_of_memory()
+                    }
+                }
+            })
+        };
+    if result.validate(NativeResultDomain::Probe) == Some(NativeResultStatus::Success)
+        && !vm.gc_heap.marking().is_marking()
+        && let Some(data) = crate::isolate_names::IsolateNames::get(&vm.gc_heap)
+    {
+        data.concat_cache
+            .insert(roots.value(0), roots.value(1), result.payload_value());
+    }
+    result
 }
 
 /// Return exact primitive ordering without managed allocation or user coercion.

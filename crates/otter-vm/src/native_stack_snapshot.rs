@@ -51,8 +51,8 @@ impl FrameSite {
             } => {
                 let owner = context.for_function(function_id).ok()?;
                 let function = owner.exec_function(function_id)?;
-                (0..function.code.len())
-                    .find(|&index| function.instruction_byte_pc(index) == Some(byte_pc))
+                function
+                    .instruction_at_byte_pc(byte_pc)
                     .and_then(|index| u32::try_from(index).ok())
                     .map(|pc| (function_id, pc))
             }

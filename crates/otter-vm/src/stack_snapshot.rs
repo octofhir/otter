@@ -10,6 +10,7 @@
 //!
 //! # Invariants
 //! - Foreign function ids are resolved through their owning execution context.
+//! - Source positions use the shared compiler span table in logical PCs.
 //! - A borrowed view lives only for its callback invocation; it never outlives
 //!   an owned sibling context used to resolve that frame.
 //! - Parent frames report the call-site instruction immediately before their
@@ -46,24 +47,15 @@ pub(crate) fn visit_frame_snapshot(
     let owner = context.for_function(function_id).ok();
     let owner = owner.as_deref();
     let function = owner.and_then(|owner| owner.function(function_id));
-    let exec_function = owner.and_then(|owner| owner.exec_function(function_id));
     let function_name = function.map_or("<unknown>", |function| function.name.as_str());
-
-    let byte_pc = exec_function
-        .and_then(|function| function.instruction_byte_pc(instruction))
-        .unwrap_or(0);
-    let span = exec_function
-        .and_then(|function| {
-            let spans = function.byte_spans();
-            let index = spans.partition_point(|span| span.pc <= byte_pc);
-            if index == 0 {
-                spans.first().map(|span| span.span)
-            } else {
-                Some(spans[index - 1].span)
-            }
-        })
-        .or_else(|| function.map(|function| function.span))
-        .unwrap_or((0, 0));
+    let span = function.map_or((0, 0), |function| {
+        let pc = if instruction < function.code.len() {
+            instruction as u32
+        } else {
+            0
+        };
+        function.spans.span_at(pc).unwrap_or(function.span)
+    });
     let module = function
         .filter(|function| !function.module_url.is_empty())
         .map_or_else(

@@ -290,7 +290,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::Select(_)
         | Kind::LoadNewTarget
         | Kind::LoadClosure
-        | Kind::LoadLiteral(_)
+        | Kind::LoadLiteral { .. }
         | Kind::LoadCellValue(_)
         | Kind::AllocationProjection(_)
         | Kind::PrimitiveCompare(_)
@@ -486,7 +486,7 @@ fn heap_effects(kind: &Kind) -> Effects {
         | Kind::NewArrayWithLength
         | Kind::NewRestArray(_)
         | Kind::NewReceiver(_) => Effects::writes(&[H::Dependencies], &[H::Movement]),
-        Kind::PrimitiveAdd
+        Kind::PrimitiveAdd { .. }
         | Kind::NumberToString
         | Kind::NativeAllocLeaf(_)
         | Kind::BigIntBinary(_)

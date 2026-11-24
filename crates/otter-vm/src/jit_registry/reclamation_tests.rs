@@ -110,9 +110,13 @@ fn reclamation_retires_candidate_tiers_and_splices_but_preserves_caller_entries(
             .register_generation(id, code(id, fid, tier, spliced), 1, 4, Some(1), roots)
             .unwrap();
     }
-    let source_cell = std::ptr::from_ref(registry.function_entry_cells[&7].as_ref()) as u64;
-    let caller_cell = std::ptr::from_ref(registry.function_entry_cells[&20].as_ref()) as u64;
-    let caller_generation = registry.function_entry_cells[&20].current_generation();
+    let source_cell = std::ptr::from_ref(registry.function_entry_cells.get(7).unwrap()) as u64;
+    let caller_cell = std::ptr::from_ref(registry.function_entry_cells.get(20).unwrap()) as u64;
+    let caller_generation = registry
+        .function_entry_cells
+        .get(20)
+        .unwrap()
+        .current_generation();
     let caller_entry = registry.entry_cells[&305]
         .cell
         .entry_addr
@@ -139,11 +143,15 @@ fn reclamation_retires_candidate_tiers_and_splices_but_preserves_caller_entries(
         assert_eq!(registry.codes[&id].state, CodeLifetimeState::Installed);
     }
     assert_eq!(
-        std::ptr::from_ref(registry.function_entry_cells[&20].as_ref()) as u64,
+        std::ptr::from_ref(registry.function_entry_cells.get(20).unwrap()) as u64,
         caller_cell
     );
     assert_eq!(
-        registry.function_entry_cells[&20].current_generation(),
+        registry
+            .function_entry_cells
+            .get(20)
+            .unwrap()
+            .current_generation(),
         caller_generation
     );
     assert_eq!(

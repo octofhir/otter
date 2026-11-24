@@ -16,8 +16,8 @@
 //! - [`NameInterner`] — append-only name → id map owned by one isolate.
 //! - [`PropertyAtom`] — compact identity for one property name.
 //! - [`AtomizedPropertyKey`] — borrowed runtime view: atom id plus text.
-//! - [`AtomTableBuilder`] and [`AtomTable`] — transient build step and frozen
-//!   execution table for decoded strings and named-property atoms.
+//! - [`AtomTableLayout`] and [`AtomTable`] — admitted spelling geometry and
+//!   frozen execution table for decoded strings and named-property atoms.
 //!
 //! # Invariants
 //! - Atom ids are global within one isolate: two chunks that spell the same
@@ -34,8 +34,9 @@
 //!   that links or adopts it. Resolution is idempotent, so a code space adopted
 //!   by a different interpreter re-keys to that interpreter's interner instead
 //!   of carrying foreign ids into its shapes.
-//! - The atom text is borrowed from a frozen [`AtomTable`], which lives as long
-//!   as its linked chunk.
+//! - Each slot stores the end of its spelling in the chunk’s single UTF-8
+//!   buffer. Slot order is constant order, including non-string constants.
+//!   Every endpoint is a character boundary.
 //! - A symbol mints its atom the first time it keys a hidden-class slot and
 //!   keeps it in its body; symbol atoms have no spelling.
 //! - Decoded atom arrays and spellings are prepared fallibly after the owning
@@ -332,113 +333,83 @@ impl<'a> AtomizedPropertyKey<'a> {
 /// property touches one entry rather than two parallel arrays.
 #[derive(Debug)]
 struct AtomSlot {
-    /// Decoded UTF-8 spelling, `None` for non-string constants.
-    text: Option<String>,
-    /// Global atom id, [`AtomId::UNRESOLVED`] until an interpreter resolves
-    /// the chunk against its interner. Non-string slots keep the sentinel.
+    /// End of this spelling in the blob, or the preceding end for a
+    /// non-string constant. Empty strings still carry a string slot.
+    end: usize,
+    is_string: bool,
     id: AtomicU32,
 }
 
-/// Transient builder for [`AtomTable`].
-///
-/// The owning chunk admits array/spelling geometry before this builder
-/// prepares buffers fallibly. Runtime dispatch receives only the frozen table;
-/// no atom identity is published by preparation.
-#[derive(Debug, Default)]
-pub(crate) struct AtomTableBuilder {
-    slots: Vec<AtomSlot>,
+/// Exact initial allocation requested before any spelling is decoded.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AtomTableLayout {
+    slots: usize,
+    text_bytes: usize,
 }
 
-impl AtomTableBuilder {
-    /// Build atom metadata from a bytecode constant pool.
-    pub(crate) fn from_constants(
-        constants: &[Constant],
-        lease: &mut otter_resource::ResourceLease,
-    ) -> Result<Self, otter_resource::ResourceError> {
-        let mut builder = Self {
-            slots: crate::executable::allocation::try_vec(constants.len(), lease)?,
-        };
-        for constant in constants {
-            builder.push(constant, lease)?;
-        }
-        Ok(builder)
-    }
-
-    fn push(
-        &mut self,
-        constant: &Constant,
-        lease: &mut otter_resource::ResourceLease,
-    ) -> Result<(), otter_resource::ResourceError> {
-        let text = match constant {
-            Constant::String { utf16 } => {
-                Some(crate::executable::allocation::try_utf16(utf16, lease)?)
-            }
-            _ => None,
-        };
-        self.slots.push(AtomSlot {
-            text,
-            id: AtomicU32::new(AtomId::UNRESOLVED),
+impl AtomTableLayout {
+    pub(crate) fn for_constants(constants: &[Constant]) -> Self {
+        let text_bytes = constants.iter().fold(0usize, |total, constant| {
+            total.saturating_add(match constant {
+                Constant::String { utf16 } => crate::wtf16_escape::encoded_len(utf16),
+                _ => 0,
+            })
         });
-        Ok(())
+        Self {
+            slots: constants.len(),
+            text_bytes,
+        }
     }
 
-    /// Seal the transient buffers into an immutable execution table whose atom
-    /// ids are still unresolved.
-    #[must_use]
-    pub(crate) fn freeze(self) -> AtomTable {
-        AtomTable {
-            slots: self.slots.into_boxed_slice(),
-        }
+    pub(crate) fn bytes(self) -> u64 {
+        crate::executable::allocation::array_bytes::<AtomSlot>(self.slots)
+            .saturating_add(self.text_bytes as u64)
     }
 }
 
-/// Frozen atom table published with an [`crate::ExecutionContext`].
+/// Frozen string spellings and isolate-resolved names, in constant order.
 #[derive(Debug)]
 pub(crate) struct AtomTable {
     slots: Box<[AtomSlot]>,
+    text: String,
 }
 
 impl AtomTable {
-    /// Build and freeze an unresolved atom table from a bytecode constant pool.
+    /// Prepare the spelling buffer once; every slot borrows a range of it.
     pub(crate) fn from_constants(
         constants: &[Constant],
+        layout: AtomTableLayout,
         lease: &mut otter_resource::ResourceLease,
     ) -> Result<Self, otter_resource::ResourceError> {
-        Ok(AtomTableBuilder::from_constants(constants, lease)?.freeze())
+        use crate::executable::allocation::{try_string_buffer, try_vec};
+        let mut slots = try_vec(layout.slots, lease)?;
+        let mut text = try_string_buffer(layout.text_bytes, lease)?;
+        for constant in constants {
+            let is_string = if let Constant::String { utf16 } = constant {
+                text.extend(crate::wtf16_escape::escaped_chars(utf16));
+                true
+            } else {
+                false
+            };
+            slots.push(AtomSlot {
+                end: text.len(),
+                is_string,
+                id: AtomicU32::new(AtomId::UNRESOLVED),
+            });
+        }
+        debug_assert_eq!(text.len(), layout.text_bytes);
+        Ok(Self {
+            slots: slots.into_boxed_slice(),
+            text,
+        })
     }
 
-    /// Requested physical metadata geometry before any decoding allocation.
-    pub(crate) fn allocation_bytes(constants: &[Constant]) -> u64 {
-        constants.iter().fold(
-            crate::executable::allocation::array_bytes::<AtomSlot>(constants.len()),
-            |bytes, constant| {
-                bytes.saturating_add(match constant {
-                    Constant::String { utf16 } => crate::executable::allocation::utf16_bytes(utf16),
-                    _ => 0,
-                })
-            },
-        )
-    }
-
-    /// Heap bytes this table retains for the owning chunk's lifetime: the
-    /// slot array plus every decoded string spelling.
+    /// Heap bytes retained by the slot and spelling buffers.
     #[must_use]
     pub(crate) fn retained_bytes(&self) -> u64 {
-        let mut total = std::mem::size_of_val::<[AtomSlot]>(&self.slots) as u64;
-        for slot in &self.slots {
-            if let Some(text) = &slot.text {
-                total = total.saturating_add(text.capacity() as u64);
-            }
-        }
-        total
+        (std::mem::size_of_val(&*self.slots) as u64).saturating_add(self.text.capacity() as u64)
     }
 
-    /// Resolve every string constant to `names`' global atom id.
-    ///
-    /// Idempotent: resolving twice against the same interner rewrites the same
-    /// ids, and resolving against a different interner re-keys the whole table.
-    /// That is what makes adopting a foreign code space sound — the adopting
-    /// interpreter's ids are the only ones its shapes ever see.
     /// The atom id of every slot, in constant order.
     pub(crate) fn ids(&self) -> impl ExactSizeIterator<Item = u32> + '_ {
         self.slots
@@ -454,25 +425,42 @@ impl AtomTable {
         }
     }
 
+    /// Resolve names in constant order against the linking or adopting
+    /// isolate's interner.
     pub(crate) fn resolve(&self, names: &mut NameInterner) {
+        let mut start = 0;
         for slot in &self.slots {
-            if let Some(text) = slot.text.as_deref() {
+            if slot.is_string {
+                let text = &self.text[start..slot.end];
                 slot.id.store(names.intern(text).raw(), Ordering::Relaxed);
             }
+            start = slot.end;
         }
+    }
+
+    fn spelling(&self, index: usize, slot: &AtomSlot) -> Option<&str> {
+        if !slot.is_string {
+            return None;
+        }
+        let start = self.slots[..index]
+            .last()
+            .map_or(0, |previous| previous.end);
+        Some(&self.text[start..slot.end])
     }
 
     /// Resolve a string constant as a borrowed UTF-8 string.
     #[must_use]
     pub(crate) fn string_constant_str(&self, idx: u32) -> Option<&str> {
-        self.slots.get(idx as usize)?.text.as_deref()
+        let index = idx as usize;
+        self.spelling(index, self.slots.get(index)?)
     }
 
     /// Resolve a string constant as an atomized property key.
     #[must_use]
     pub(crate) fn property_atom(&self, idx: u32) -> Option<AtomizedPropertyKey<'_>> {
-        let slot = self.slots.get(idx as usize)?;
-        let text = slot.text.as_deref()?;
+        let index = idx as usize;
+        let slot = self.slots.get(index)?;
+        let text = self.spelling(index, slot)?;
         let id = slot.id.load(Ordering::Relaxed);
         // Every named-property dispatch passes here, so the check that the
         // chunk was linked or adopted is a debug-build invariant. In release
@@ -494,18 +482,15 @@ impl AtomTable {
 mod tests {
     use super::*;
 
-    fn atom_builder(constants: &[Constant]) -> AtomTableBuilder {
+    fn atom_table(constants: &[Constant]) -> AtomTable {
+        let layout = AtomTableLayout::for_constants(constants);
         let mut lease = otter_resource::ResourceAccount::default()
             .reserve_exact(
                 otter_resource::ResourceClass::SourceModuleBytes,
-                AtomTable::allocation_bytes(constants),
+                layout.bytes(),
             )
             .expect("admit atom fixture metadata");
-        AtomTableBuilder::from_constants(constants, &mut lease).expect("prepare atom fixture")
-    }
-
-    fn atom_table(constants: &[Constant]) -> AtomTable {
-        atom_builder(constants).freeze()
+        AtomTable::from_constants(constants, layout, &mut lease).expect("prepare atom fixture")
     }
 
     static_assertions::assert_impl_all!(NameInterner: Send, Sync);
@@ -529,7 +514,7 @@ mod tests {
         ];
 
         let mut names = NameInterner::default();
-        let table = atom_builder(&constants).freeze();
+        let table = atom_table(&constants);
         table.resolve(&mut names);
 
         assert_eq!(table.string_constant_str(0), None);

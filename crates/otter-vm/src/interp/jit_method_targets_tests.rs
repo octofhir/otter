@@ -132,7 +132,6 @@ fn method_targets_keep_one_body_through_real_nested_baking() {
             )
             .expect("verified method sources");
         let base = context.function_base();
-        vm.ensure_method_feedback_context(&context);
         let mut stack = ActivationStack::new();
         vm.with_runtime_turn(&mut stack, |turn| {
             let (vm, stack) = turn.into_parts();

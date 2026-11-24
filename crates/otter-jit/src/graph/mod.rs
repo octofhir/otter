@@ -74,6 +74,7 @@ mod branch_thread;
 pub(crate) mod builder;
 pub(crate) mod bytecode;
 pub(crate) mod call;
+mod dead_values;
 mod dependency_checks;
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 mod division;
@@ -83,6 +84,7 @@ pub(crate) mod effects;
 pub(crate) mod emission;
 pub(crate) mod escape;
 pub(crate) mod feedback;
+mod field_joins;
 mod field_store_selection;
 mod fold;
 pub(crate) mod frame;
@@ -199,7 +201,7 @@ pub(crate) fn compile(
     check_cancellation(cancellation)?;
     escape::fold_conversions(&mut built.graph, &built.layout);
     check_cancellation(cancellation)?;
-    escape::remove_dead_values(&mut built.graph, &built.layout);
+    dead_values::remove(&mut built.graph, &built.layout);
     check_cancellation(cancellation)?;
     phi_repr::untag_phis(&mut built.graph, &built.layout, &built.loop_headers);
     check_cancellation(cancellation)?;
@@ -221,6 +223,8 @@ pub(crate) fn compile(
     check_cancellation(cancellation)?;
     redundancy::eliminate(&mut built.graph, &built.layout);
     check_cancellation(cancellation)?;
+    field_joins::forward(&mut built.graph, &built.layout, built.osr_entry);
+    check_cancellation(cancellation)?;
     // A forwarded store leaves its value's conversions to fold again.
     escape::fold_conversions(&mut built.graph, &built.layout);
     check_cancellation(cancellation)?;
@@ -238,7 +242,7 @@ pub(crate) fn compile(
     straighten::merge(&mut built.graph, &mut built.layout, osr_entry.as_slice());
     check_cancellation(cancellation)?;
     if named_store::refine(&mut built.graph, &built.layout, view, &built.inline_views) {
-        escape::remove_dead_values(&mut built.graph, &built.layout);
+        dead_values::remove(&mut built.graph, &built.layout);
     }
     check_cancellation(cancellation)?;
     field_store_selection::finalize(&mut built.graph, &built.layout, view, &built.inline_views);

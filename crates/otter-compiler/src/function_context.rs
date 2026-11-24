@@ -67,6 +67,8 @@ pub(crate) struct FunctionContext {
     /// The pc the latest patched branch lands on: a value an expression
     /// leaves there may come from more than its last instruction.
     branch_landing: Option<u32>,
+    /// Source positions change only at run boundaries; equal adjacent spans
+    /// reuse the preceding entry.
     pub(crate) spans: Vec<SpanEntry>,
     pub(crate) scratch: u16,
     /// Stack of lexical scopes, outermost first.
@@ -397,13 +399,11 @@ impl FunctionContext {
         span: (u32, u32),
     ) -> u32 {
         let pc = self.next_pc();
-        let operands = if let Some(reg) = cond_reg {
-            vec![Operand::Imm32(0), Operand::Register(reg)]
+        if let Some(reg) = cond_reg {
+            self.push_raw(op, &[Operand::Imm32(0), Operand::Register(reg)], span);
         } else {
-            vec![Operand::Imm32(0)]
-        };
-        self.code.push(op, operands.as_slice());
-        self.spans.push(SpanEntry { pc, span });
+            self.push_raw(op, &[Operand::Imm32(0)], span);
+        }
         pc
     }
 
@@ -521,7 +521,13 @@ impl FunctionContext {
     fn push_raw(&mut self, op: Op, operands: &[Operand], span: (u32, u32)) {
         let pc = self.next_pc();
         self.code.push(op, operands);
-        self.spans.push(SpanEntry { pc, span });
+        if self
+            .spans
+            .last()
+            .is_none_or(|previous| previous.span != span)
+        {
+            self.spans.push(SpanEntry { pc, span });
+        }
     }
 
     /// Emit `op` whose operand `ctx_index` names the context in `ctx`.

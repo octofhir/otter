@@ -210,6 +210,9 @@ impl GcHeap {
     }
 
     pub(super) fn prepare_collection_observations(&self) {
+        if let Some(data) = &self.isolate_data {
+            data.prepare_collection();
+        }
         for (index, source) in self.extra_roots.iter().enumerate() {
             if !self.extra_roots[..index]
                 .iter()

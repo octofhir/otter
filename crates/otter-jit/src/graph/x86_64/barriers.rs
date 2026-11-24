@@ -43,16 +43,10 @@ impl Codegen<'_> {
         let done = self.ops.new_dynamic_label();
         let layout = self.view.gc_barrier;
         let settled = layout.young_flag | layout.remembered_flag;
+        crate::x86_64::gc_barrier::emit_young_edge(&mut self.ops, layout, child, [done, slow]);
         dynasm!(self.ops ; .arch x64
-            ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
-            ; mov r10, [r10 + crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
-            ; cmp BYTE [r10], 0 ; je >generational
-            // While marking runs, a white old child owes the insertion barrier.
-            ; test BYTE [Rq(child) + layout.header_flags_byte as i32], layout.young_flag as i8 ; jnz >generational
-            ; test BYTE [Rq(child) + layout.header_flags_byte as i32], layout.mark_color_bits as i8 ; jz =>slow
-            ; generational:
-            ; test BYTE [Rq(parent) + layout.header_flags_byte as i32], settled as i8 ; jnz =>done
-            ; test BYTE [Rq(child) + layout.header_flags_byte as i32], layout.young_flag as i8 ; jnz =>slow
+            ; test BYTE [Rq(parent) + layout.header_flags_byte as i32], settled as i8
+            ; jz =>slow
             ; =>done);
         let live = self.slow_path_registers(node, keep);
         self.deferred.push(Box::new(move |codegen| {
@@ -180,15 +174,9 @@ impl Codegen<'_> {
         );
         self.load_immediate(10, tag::NOT_CELL_MASK);
         dynasm!(self.ops ; .arch x64
-            ; test Rq(value), r10 ; jnz =>done ; test Rq(value), Rq(value) ; jz =>done
-            ; mov r10, [r15 + crate::entry::THREAD_OFFSET as i32]
-            ; mov r10, [r10 + crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET as i32]
-            ; cmp BYTE [r10], 0 ; je >generational
-            // While marking runs, a white old child owes the insertion barrier.
-            ; test BYTE [Rq(value) + layout.header_flags_byte as i32], layout.young_flag as i8 ; jnz >generational
-            ; test BYTE [Rq(value) + layout.header_flags_byte as i32], layout.mark_color_bits as i8 ; jz =>slow
-            ; generational:
-            ; test BYTE [Rq(value) + layout.header_flags_byte as i32], layout.young_flag as i8 ; jz =>done
+            ; test Rq(value), r10 ; jnz =>done ; test Rq(value), Rq(value) ; jz =>done);
+        crate::x86_64::gc_barrier::emit_young_edge(&mut self.ops, layout, value, [done, slow]);
+        dynasm!(self.ops ; .arch x64
             // The slot joins the interval the slab's next scavenge re-traces;
             // an empty interval is `[u32::MAX, 0)`.
             ; mov r10d, [Rq(base) + dirty_start] ; cmp r10d, Rd(index)

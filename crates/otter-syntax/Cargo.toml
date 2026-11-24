@@ -10,6 +10,8 @@ description = "OXC-only JS/TS frontend for the Otter foundation engine."
 workspace = true
 
 [dependencies]
+otter-resource = { workspace = true }
+self_cell = "1.2.2"
 oxc_allocator = { workspace = true }
 oxc_ast = { workspace = true }
 oxc_parser = { workspace = true }

@@ -366,8 +366,9 @@ impl BakeEnv {
             .function_entries
             .read_briefly()
             .or_else(|| self.contend())?
-            .get(&function.id)
-            .copied()?;
+            .get(function.id as usize)
+            .copied()
+            .filter(|&address| address != 0)?;
         // SAFETY: directory addresses name registry-lifetime entry cells.
         crate::jit_registry::published_plan(
             unsafe { &*(address as *const crate::native_abi::FunctionEntryCell) },

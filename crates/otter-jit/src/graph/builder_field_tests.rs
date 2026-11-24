@@ -1140,7 +1140,7 @@ fn selected_inline_append_keeps_numeric_source_and_recovery() {
         owners[0].observes(),
         "physical F64 must widen an old raw-Int32 summary, even for integral words"
     );
-    crate::graph::escape::remove_dead_values(&mut graph, &layout);
+    crate::graph::dead_values::remove(&mut graph, &layout);
     assert!(!graph.block(merge).body.contains(&boxed));
     assert!(!graph.block(merge).body.contains(&barrier));
 }

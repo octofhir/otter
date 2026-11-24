@@ -448,9 +448,9 @@ pub struct RuntimeExecutionStats {
     pub jit_receiver_alloc_canonical: u64,
     /// Receiver allocation deoptimizations.
     pub jit_receiver_alloc_deopts: u64,
-    /// VM-published collection method IC mirror slots.
+    /// Observed sites retaining a method IC or target distribution.
     pub jit_collection_method_ic_slots: u64,
-    /// Empty collection method IC mirror slots.
+    /// Observed sites with no installed method IC.
     pub jit_collection_method_ic_empty_slots: u64,
     /// Live collection method IC mirror slots.
     pub jit_collection_method_ic_collection_slots: u64,

@@ -31,6 +31,9 @@
 //! - Generator body completion is classified after its published dispatch
 //!   finishes. Fresh iterator-result allocation retains the current JavaScript
 //!   operation's local error domain.
+//! - Own data iterator-result fields on an ordinary object require no
+//!   collecting or observable operations. Other records share one rooted
+//!   outcome across the ordered `done` and `value` reads.
 //! - IteratorClose holds its iterator and discovered `return` method in
 //!   canonical handles, reloading the receiver after accessor/call re-entry.
 //!
@@ -533,39 +536,32 @@ impl Interpreter {
         Ok(())
     }
 
-    /// Read a property off an iterator result record through the
-    /// ordinary `[[Get]]`, so an accessor getter runs and propagates
-    /// its abrupt completion. Spec: IteratorComplete / IteratorValue.
-    fn iter_result_get(
+    /// Read one iterator-result property through ordinary [[Get]]. Both
+    /// property reads share the result's handle, so an observable getter
+    /// can move the result before the next read.
+    fn iter_result_get_scoped(
         &mut self,
         stack: &mut ActivationStack,
         context: &ExecutionContext,
-        record: Value,
+        scope: &crate::handles::HandleScope,
+        result: crate::handles::Local<'_>,
         name: &'static str,
     ) -> Result<Value, CommittedValueError> {
-        self.with_handle_scope(|interp, scope| {
-            let record = interp.scoped_value(scope, record);
-            let key = crate::VmPropertyKey::String(name);
-            match interp.ordinary_get_value(
-                stack,
-                Some(context),
-                interp.escape_scoped(record),
-                interp.escape_scoped(record),
-                &key,
-                0,
-            )? {
-                crate::VmGetOutcome::Value(v) => Ok(v),
-                crate::VmGetOutcome::InvokeGetter { getter } => interp
-                    .run_callable_sync_rooted(
-                        stack,
-                        Some(context),
-                        &getter,
-                        interp.escape_scoped(record),
-                        SmallVec::new(),
-                    )
-                    .map_err(CommittedValueError::completed_call),
-            }
-        })
+        let key = VmPropertyKey::String(name);
+        // The Get walk rewrites its base slot as it follows prototypes.
+        let base = self.scoped_value(scope, self.escape_scoped(result));
+        match self.ordinary_get_value_scoped(stack, Some(context), scope, base, result, &key, 0)? {
+            VmGetOutcome::Value(value) => Ok(value),
+            VmGetOutcome::InvokeGetter { getter } => self
+                .run_callable_sync_rooted(
+                    stack,
+                    Some(context),
+                    &getter,
+                    self.escape_scoped(result),
+                    SmallVec::new(),
+                )
+                .map_err(CommittedValueError::completed_call),
+        }
     }
 
     /// The callback a `map` / `filter` / `flatMap` helper holds, read from
@@ -927,30 +923,11 @@ impl Interpreter {
                         self.err_type(("iterator result is not an object".to_string()).into()),
                     ));
                 }
-                // §7.4.5 IteratorComplete / §7.4.6 IteratorValue read
-                // `done` then (when not done) `value` through the
-                // ordinary `[[Get]]`, so an accessor result object fires
-                // its getters and an abrupt completion propagates rather
-                // than silently reading `undefined` (which would never
-                // terminate a `done`-less iterator).
-                // A `done` getter allocates; the result object rides the
-                // anchor stack to the `value` read.
-                let result_slot = self.push_iteration_anchor(result) - 1;
-                let done = match self.iter_result_get(stack, context, result, "done") {
-                    Ok(done) => done.to_boolean(&self.gc_heap),
-                    Err(err) => {
-                        self.pop_iteration_anchors_to(result_slot);
-                        return Err(err);
-                    }
-                };
-                let result = self.iteration_anchor(result_slot);
-                self.pop_iteration_anchors_to(result_slot);
-                if done {
-                    self.gc_heap.with_payload(*iter, |state| state.exhaust());
-                    return Ok((Value::undefined(), true));
+                if let Some(value) = iterator_step_read(self, stack, context, &result)? {
+                    return Ok((value, false));
                 }
-                let value = self.iter_result_get(stack, context, result, "value")?;
-                Ok((value, false))
+                self.gc_heap.with_payload(*iter, |state| state.exhaust());
+                Ok((Value::undefined(), true))
             }
             IteratorStateSnapshot::RegExpString {
                 matcher,
@@ -2519,16 +2496,7 @@ impl Interpreter {
                 self.err_type(("iterator result is not an object".to_string()).into()),
             ));
         }
-        // §7.4.6 IteratorStep — anchor the result on the GC root
-        // stack across the subsequent `done` / `value` property
-        // reads. Without this, a GC triggered inside an accessor
-        // getter (or by allocations on the way to the slot lookup)
-        // could reclaim the IterResult — its shape/keys would then
-        // dangle when the second read walks the same shape chain.
-        let anchor_depth = self.push_iteration_anchor(result);
-        let outcome = iterator_step_read(self, stack, context, &result);
-        self.pop_iteration_anchors_to(anchor_depth - 1);
-        outcome
+        iterator_step_read(self, stack, context, &result)
     }
 
     /// IteratorClose while preserving an incoming abrupt completion.
@@ -4413,21 +4381,35 @@ impl Interpreter {
     }
 }
 
+/// IteratorComplete followed by IteratorValue. A plain record with own data
+/// fields completes without publishing a handle or calling JavaScript.
 fn iterator_step_read(
     interp: &mut Interpreter,
     stack: &mut ActivationStack,
     context: &ExecutionContext,
     result: &Value,
 ) -> Result<Option<Value>, CommittedValueError> {
-    interp.with_handle_scope(|interp, scope| {
-        let result = interp.scoped_value(scope, *result);
-        let done_value =
-            interp.iter_result_get(stack, context, interp.escape_scoped(result), "done")?;
-        if done_value.to_boolean(interp.gc_heap()) {
+    if let Some(object) = result.as_object()
+        && !crate::object::state(object, interp.gc_heap()).is_opaque()
+        && let crate::object::PropertyLookup::Data { value: done, .. } =
+            interp.lookup_own_vm_property_key(object, &VmPropertyKey::String("done"))
+    {
+        if done.to_boolean(interp.gc_heap()) {
             return Ok(None);
         }
-        let value =
-            interp.iter_result_get(stack, context, interp.escape_scoped(result), "value")?;
+        if let crate::object::PropertyLookup::Data { value, .. } =
+            interp.lookup_own_vm_property_key(object, &VmPropertyKey::String("value"))
+        {
+            return Ok(Some(value));
+        }
+    }
+    interp.with_handle_scope(|interp, scope| {
+        let result = interp.scoped_value(scope, *result);
+        let done = interp.iter_result_get_scoped(stack, context, scope, result, "done")?;
+        if done.to_boolean(interp.gc_heap()) {
+            return Ok(None);
+        }
+        let value = interp.iter_result_get_scoped(stack, context, scope, result, "value")?;
         Ok(Some(value))
     })
 }

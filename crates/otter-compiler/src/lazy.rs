@@ -1,14 +1,14 @@
 //! Body compile of a lazily compiled function.
 //!
-//! A script or module compiled with [`CompileOptions::lazy_functions`]
+//! A script or module compiled with [`CompileOptions::Lazy`]
 //! lowers each function that does not run as soon as it is created to a
 //! [`otter_bytecode::LazyFunction`] record: the call-visible shape plus a
 //! placeholder body. The VM compiles the real body on the function's first
-//! call through [`compile_lazy_function`]: it parses the function's source
-//! range again inside a small wrapper that restores the syntactic context
-//! (method, accessor, arrow inside an async function, strict code), and
-//! lowers it against the closure's context chain the way a direct eval body
-//! is lowered against its caller's.
+//! call through [`compile_lazy_function`]. Within a source scope it may use
+//! the original AST and binding analysis. Otherwise it parses the range
+//! inside a wrapper restoring the syntactic context (method, accessor,
+//! async/generator arrow or strict code). Both lower against the closure's
+//! context chain the way a direct eval body is lowered against its caller's.
 //!
 //! # Contents
 //! - [`CompileOptions`] — per-unit compile policy.
@@ -39,11 +39,16 @@ use otter_bytecode::{
 };
 
 /// Per-unit compile policy.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CompileOptions {
-    /// Functions that do not run as soon as they are created compile their
-    /// bodies on first call.
-    pub lazy_functions: bool,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CompileOptions {
+    /// Compile all functions with the source unit.
+    #[default]
+    Eager,
+    /// Defer functions that do not run as soon as they are created.
+    Lazy,
+    /// Compile functions created directly by the unit's entry, such as a
+    /// CommonJS wrapper. Their cold descendants may still compile lazily.
+    LazyNested,
 }
 
 /// Everything the body compile of one lazily compiled function needs.
@@ -84,42 +89,48 @@ pub fn compile_lazy_function(
             node: "lazy function range outside its source".to_string(),
             span: lazy.range,
         })?;
-    let (prefix, suffix) = wrapper(function, &lazy);
-    let mut wrapped = String::with_capacity(prefix.len() + text.len() + suffix.len());
-    wrapped.push_str(&prefix);
-    wrapped.push_str(text);
-    wrapped.push_str(suffix);
-    // Functions inside whose facts the record carries are left unparsed.
-    let delta =
-        i64::from(u32::try_from(prefix.len()).expect("wrapper prefix is short")) - i64::from(start);
-    let skips = function.preparse.as_deref().map(|preparse| {
-        let (table, blanks) = crate::preparse::SkipTable::new(preparse, delta);
-        crate::preparse::blank(&mut wrapped, &blanks);
-        table
-    });
     let kind = match (lazy.typescript, lazy.jsx) {
         (false, false) => SyntaxSourceKind::JavaScript,
         (false, true) => SyntaxSourceKind::JavaScriptJsx,
         (true, false) => SyntaxSourceKind::TypeScript,
         (true, true) => SyntaxSourceKind::TypeScriptJsx,
     };
-    let goal = if lazy.module_goal {
-        otter_syntax::SourceGoal::Module
+    let mut module = if let Some(module) = crate::prepared_eval::lower_cached(&request, lazy, kind)
+    {
+        module?
     } else {
-        otter_syntax::SourceGoal::Script
+        let (prefix, suffix) = wrapper(function, &lazy);
+        let mut wrapped = String::with_capacity(prefix.len() + text.len() + suffix.len());
+        wrapped.push_str(&prefix);
+        wrapped.push_str(text);
+        wrapped.push_str(suffix);
+        // Functions inside whose facts the record carries are left unparsed.
+        let delta = i64::from(u32::try_from(prefix.len()).expect("wrapper prefix is short"))
+            - i64::from(start);
+        let skips = function.preparse.as_deref().map(|preparse| {
+            let (table, blanks) = crate::preparse::SkipTable::new(preparse, delta);
+            crate::preparse::blank(&mut wrapped, &blanks);
+            table
+        });
+        let goal = if lazy.module_goal {
+            otter_syntax::SourceGoal::Module
+        } else {
+            otter_syntax::SourceGoal::Script
+        };
+        // Wrapper-local offset `o` maps to source offset `o + shift`; every
+        // node the body compile reads lies inside the function's own text.
+        let prefix_len = u32::try_from(prefix.len()).expect("wrapper prefix is short");
+        let shift = Shift {
+            from: prefix_len,
+            to: start,
+        };
+        let mut module = otter_syntax::with_program_goal(&wrapped, kind, goal, |program| {
+            lower(program, &request, lazy, kind, skips)
+        })
+        .map_err(CompileError::from)??;
+        shift.module(&mut module);
+        module
     };
-    // Wrapper-local offset `o` maps to source offset `o + shift`; every
-    // node the body compile reads lies inside the function's own text.
-    let prefix_len = u32::try_from(prefix.len()).expect("wrapper prefix is short");
-    let shift = Shift {
-        from: prefix_len,
-        to: start,
-    };
-    let mut module = otter_syntax::with_program_goal(&wrapped, kind, goal, |program| {
-        lower(program, &request, lazy, kind, skips)
-    })
-    .map_err(CompileError::from)??;
-    shift.module(&mut module);
     let first = module
         .functions
         .first_mut()
@@ -187,14 +198,7 @@ impl Shift {
                     i64::from(self.to) - i64::from(self.from),
                 );
             }
-            function.spans = function
-                .spans
-                .iter()
-                .map(|entry| SpanEntry {
-                    pc: entry.pc,
-                    span: self.span(entry.span),
-                })
-                .collect();
+            function.spans = function.spans.map_spans(|span| self.span(span));
         }
     }
 }
@@ -253,7 +257,7 @@ fn wrapper(function: &Function, lazy: &LazyFunction) -> (String, &'static str) {
 }
 
 /// The function node the wrapper parsed back.
-enum Target<'b, 'a> {
+pub(crate) enum Target<'b, 'a> {
     Function(&'b oxc_ast::ast::Function<'a>),
     Arrow(&'b oxc_ast::ast::ArrowFunctionExpression<'a>),
 }
@@ -330,11 +334,26 @@ fn lower(
     kind: SyntaxSourceKind,
     skips: Option<crate::preparse::SkipTable>,
 ) -> Result<BytecodeModule, CompileError> {
-    let function = request.function;
     let target = find_target(program, lazy.form).ok_or_else(|| CompileError::Unsupported {
         node: "lazy function text does not parse back into its form".to_string(),
         span: lazy.range,
     })?;
+    let capture = Rc::new(capture::CaptureFacts::of_unit_skipping(
+        &program.body,
+        skips.as_ref(),
+    ));
+    lower_target(target, request, lazy, kind, capture, skips)
+}
+
+pub(crate) fn lower_target(
+    target: Target<'_, '_>,
+    request: &LazyCompileRequest<'_>,
+    lazy: LazyFunction,
+    kind: SyntaxSourceKind,
+    capture: Rc<capture::CaptureFacts>,
+    skips: Option<crate::preparse::SkipTable>,
+) -> Result<BytecodeModule, CompileError> {
+    let function = request.function;
     let module = Rc::new(RefCell::new(ModuleBuilder::default()));
     // The creating frame, reduced to what the body compile reads from it:
     // strictness, `super` side, the `.arguments` fact, and (for module
@@ -361,7 +380,6 @@ fn lower(
     top.module_state = request
         .environment
         .map(|environment| module_state_from(environment, request.resolutions, request.module_url));
-    let capture = capture::CaptureFacts::of_unit_skipping(&program.body, skips.as_ref());
     let mut cx = Compiler::new(top, capture);
     cx.skips = skips.map(Rc::new);
     cx.eval_chain = Some(request.chain.clone());

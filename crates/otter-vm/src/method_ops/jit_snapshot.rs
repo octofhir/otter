@@ -343,13 +343,7 @@ mod tests {
         .expect("valid method-site fixture");
         let mut vm = Interpreter::new().expect("fixture interpreter bootstrap");
         vm.gc_heap.set_gc_stress(0, false);
-        vm.ensure_method_feedback_context(&context);
-        let site = context
-            .feedback_slot_addresses()
-            .into_iter()
-            .find(|(_, address)| address.is_method())
-            .unwrap()
-            .0;
+        let site = context.property_ic_sites().next().unwrap();
         vm.with_handle_scope(|vm, scope| {
             let prototype =
                 vm.scoped_value(scope, Value::object(vm.default_array_prototype().unwrap()));
@@ -375,14 +369,14 @@ mod tests {
             let proto = vm.escape_scoped(prototype).as_object().unwrap();
             let (hit, _) = object::lookup_own_slot(proto, &vm.gc_heap, "push");
             let hit = hit.unwrap();
-            assert!(vm.method_feedback_mut().install_method_ic(
+            vm.method_feedback_mut().install_method_ic(
                 site,
                 MethodCallIc::Array(ArrayMethodCallIc {
                     proto_shape: hit.shape_id,
                     proto_slot: hit.slot,
                     tag: crate::array_prototype::ArrayMethodTag::Push,
-                })
-            ));
+                }),
+            );
             assert!(
                 Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm), None)
                     .jit_array_method_call(site, 1)

@@ -2357,16 +2357,10 @@ impl JitElementAccess {
     }
 }
 
-/// Static GC layout the optimizing tier needs to emit an inline generational
-/// write barrier for a pointer-valued `StoreProperty`. All `#[repr(C)]` /
-/// `const` values, isolate-independent, so baked once from the executable
-/// snapshot rather than per-compile.
-///
-/// The barrier marks the parent object's card dirty when an old parent gains a
-/// young child (the generational remembered set the scavenger reads). The
-/// insertion (marking) barrier is dormant under the Phase-1 STW collector, so
-/// only the card-mark is emitted; it allocates nothing and never moves GC.
-#[derive(Debug, Clone, Copy, Default)]
+/// Collector header layout used by both native tiers. Inline checks identify
+/// an old, unremembered parent of a nursery child or an old white child
+/// during marking. The committed, non-collecting barrier owns the effects.
+#[derive(Debug, Clone, Copy)]
 pub struct JitGcBarrierLayout {
     /// `GcHeader` flag-byte offset from the header base
     /// (`HEADER_FLAGS_BYTE_OFFSET`).
@@ -2381,6 +2375,19 @@ pub struct JitGcBarrierLayout {
     /// marking runs, only a child with none set, white, owes the insertion
     /// barrier's runtime call.
     pub mark_color_bits: u32,
+}
+
+impl JitGcBarrierLayout {
+    /// Header geometry of the collector linked into this process.
+    #[must_use]
+    pub const fn current() -> Self {
+        Self {
+            header_flags_byte: otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32,
+            young_flag: otter_gc::header::GENERATION_YOUNG_FLAG as u32,
+            remembered_flag: otter_gc::header::REMEMBERED_FLAG as u32,
+            mark_color_bits: otter_gc::header::MARK_COLOR_BITS as u32,
+        }
+    }
 }
 
 /// Mutable JIT feedback overlay for one authoritative CodeBlock instruction.
@@ -2546,7 +2553,7 @@ impl JitCompileSnapshot {
             shape_property_count_byte: 0,
             shape_lookup: Default::default(),
             object_exotic_handle_byte: 0,
-            gc_barrier: JitGcBarrierLayout::default(),
+            gc_barrier: JitGcBarrierLayout::current(),
             shape_prototype_byte: 0,
             shape_stable_byte: 0,
             shape_field_type_byte: 0,

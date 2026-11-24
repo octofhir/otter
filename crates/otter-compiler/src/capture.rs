@@ -30,6 +30,8 @@
 //!   binding a name as a parameter, `var`, `arguments` or top-level declaration
 //!   hides it from its ancestors; block-level shadowing does not (that only
 //!   over-promotes).
+//! - Each open scope accumulates binding facts in one table. Closing it
+//!   resolves which names escape and publishes sorted facts for lowering.
 //! - Facts are keyed by AST node address and valid while the unit's AST lives;
 //!   every function body and static block the compiler lowers belongs to the
 //!   analyzed unit.
@@ -59,7 +61,10 @@ struct IdSet(Box<[NameId]>);
 
 impl IdSet {
     fn of(ids: impl Iterator<Item = NameId>) -> Self {
-        let mut ids: Vec<NameId> = ids.collect();
+        Self::from_unsorted(ids.collect())
+    }
+
+    fn from_unsorted(mut ids: Vec<NameId>) -> Self {
         ids.sort_unstable();
         Self(ids.into_boxed_slice())
     }
@@ -227,7 +232,11 @@ impl CaptureFacts {
             builder.visit_statement(stmt);
         }
         let mut unit = builder.frames.pop().expect("unit frame");
-        unit.facts.inner = IdSet::of(unit.inner.iter().copied());
+        unit.facts.inner = IdSet::of(
+            unit.names
+                .iter()
+                .filter_map(|(&name, &flags)| (flags & NESTED_REFERENCE != 0).then_some(name)),
+        );
         let mut facts = builder.facts;
         facts.unit = unit.facts;
         for positions in &mut facts.references {
@@ -438,21 +447,24 @@ enum FrameKind {
     StaticBlock,
 }
 
+/// Names referenced in the scope, including references escaping nested scopes.
+const REFERENCED: u8 = 1 << 0;
+/// Parameters, top-level declarations and the implicit arguments binding.
+const BOUND: u8 = 1 << 1;
+/// A var declaration at any block depth.
+const VAR: u8 = 1 << 2;
+/// Assigned here or by nested code resolving outside its own scope.
+const ASSIGNED: u8 = 1 << 3;
+/// Referenced by nested code, including class field initializers.
+const NESTED_REFERENCE: u8 = 1 << 4;
+
 #[derive(Debug)]
 struct Frame {
     kind: FrameKind,
     key: usize,
     facts: ScopeFacts,
-    /// Names referenced in the scope and not bound by a nested scope.
-    refs: FxHashSet<NameId>,
-    /// Parameters, top-level declarations and `arguments`.
-    bound: FxHashSet<NameId>,
-    /// `var`s at any block depth, static blocks included.
-    vars: FxHashSet<NameId>,
-    /// Names assigned in the scope and not bound by a nested scope.
-    writes: FxHashSet<NameId>,
-    /// Names nested functions reference, becoming `facts.inner`.
-    inner: FxHashSet<NameId>,
+    /// References, declarations and writes keyed by the unit's name id.
+    names: FxHashMap<NameId, u8>,
     class_depth: u32,
     class_body_depth: u32,
     /// Inside a class field initializer or computed field key.
@@ -466,16 +478,16 @@ impl Frame {
             kind,
             key,
             facts: ScopeFacts::default(),
-            refs: FxHashSet::default(),
-            bound: FxHashSet::default(),
-            vars: FxHashSet::default(),
-            writes: FxHashSet::default(),
-            inner: FxHashSet::default(),
+            names: FxHashMap::default(),
             class_depth: 0,
             class_body_depth: 0,
             field_depth: 0,
             in_params: false,
         }
+    }
+
+    fn mark(&mut self, name: NameId, flags: u8) {
+        *self.names.entry(name).or_default() |= flags;
     }
 }
 
@@ -488,7 +500,7 @@ struct Builder<'s> {
     arguments_read: Option<u32>,
     /// Functions whose bodies were left out of the text, by span start.
     skips: Option<&'s crate::preparse::SkipTable>,
-    /// Finished frames whose set allocations the next scopes reuse.
+    /// Finished frames whose name tables the next scopes reuse.
     spare_frames: Vec<Frame>,
     /// The function node being walked, innermost last.
     function_stack: Vec<u32>,
@@ -554,9 +566,11 @@ impl Builder<'_> {
         self.top().in_params = false;
         // Every name the parameter list declares covers the whole function.
         let frame = self.top();
-        frame.bound.extend(frame.facts.own.iter().copied());
+        for &name in &frame.facts.own {
+            *frame.names.entry(name).or_default() |= BOUND;
+        }
         if kind == FrameKind::Function {
-            frame.bound.insert(ARGUMENTS);
+            frame.mark(ARGUMENTS, BOUND);
         }
         for stmt in body.statements() {
             match stmt {
@@ -564,20 +578,20 @@ impl Builder<'_> {
                     for declarator in &declaration.declarations {
                         pattern_leaves(&declarator.id, &mut |name| {
                             let id = self.facts.intern(name);
-                            self.top().bound.insert(id);
+                            self.top().mark(id, BOUND);
                         });
                     }
                 }
                 Statement::FunctionDeclaration(function) => {
                     if let Some(id) = &function.id {
                         let id = self.facts.intern(&id.name);
-                        self.top().bound.insert(id);
+                        self.top().mark(id, BOUND);
                     }
                 }
                 Statement::ClassDeclaration(class) => {
                     if let Some(id) = &class.id {
                         let id = self.facts.intern(&id.name);
-                        self.top().bound.insert(id);
+                        self.top().mark(id, BOUND);
                     }
                 }
                 _ => {}
@@ -587,11 +601,11 @@ impl Builder<'_> {
         if let Some((_, facts)) = skipped {
             for name in facts.escape() {
                 let id = self.facts.intern(name);
-                self.top().refs.insert(id);
+                self.top().mark(id, REFERENCED);
             }
             for name in facts.escape_writes() {
                 let id = self.facts.intern(name);
-                self.top().writes.insert(id);
+                self.top().mark(id, ASSIGNED);
             }
             if facts.escape_eval() {
                 self.top().facts.nested_eval = true;
@@ -628,29 +642,47 @@ impl Builder<'_> {
     fn exit(&mut self, range: (u32, u32)) {
         let mut frame = self.frames.pop().expect("scope frame");
         let parent = self.top();
-        if frame.kind == FrameKind::StaticBlock {
-            parent.vars.extend(frame.vars.iter().copied());
-        } else {
-            frame.bound.extend(frame.vars.iter().copied());
+        let is_static_block = frame.kind == FrameKind::StaticBlock;
+        let bound = if is_static_block { BOUND } else { BOUND | VAR };
+        let escape_eval = frame.facts.nested_eval
+            && frame
+                .names
+                .get(&EVAL)
+                .is_none_or(|flags| flags & bound == 0);
+        let mut inner = Vec::new();
+        let mut escape = Vec::new();
+        let mut assigned = Vec::new();
+        let mut escape_writes = Vec::new();
+        for (&name, &flags) in &frame.names {
+            let mut parent_flags = 0;
+            if is_static_block && flags & VAR != 0 {
+                parent_flags |= VAR;
+            }
+            if flags & NESTED_REFERENCE != 0 {
+                inner.push(name);
+            }
+            if flags & ASSIGNED != 0 {
+                assigned.push(name);
+            }
+            if flags & bound == 0 {
+                if flags & REFERENCED != 0 {
+                    escape.push(name);
+                    parent_flags |= REFERENCED | NESTED_REFERENCE;
+                }
+                if flags & ASSIGNED != 0 {
+                    escape_writes.push(name);
+                    parent_flags |= ASSIGNED;
+                }
+            }
+            if parent_flags != 0 {
+                parent.mark(name, parent_flags);
+            }
         }
-        frame.refs.retain(|id| !frame.bound.contains(id));
-        frame.facts.escape_writes = IdSet::of(
-            frame
-                .writes
-                .iter()
-                .copied()
-                .filter(|id| !frame.bound.contains(id)),
-        );
-        parent
-            .writes
-            .extend(frame.facts.escape_writes.iter().copied());
-        frame.facts.assigned = IdSet::of(frame.writes.iter().copied());
-        let escape_eval = frame.facts.nested_eval && !frame.bound.contains(&EVAL);
-        parent.refs.extend(frame.refs.iter().copied());
-        parent.inner.extend(frame.refs.iter().copied());
         parent.facts.nested_eval |= escape_eval;
-        frame.facts.escape = IdSet::of(frame.refs.iter().copied());
-        frame.facts.inner = IdSet::of(frame.inner.iter().copied());
+        frame.facts.escape = IdSet::from_unsorted(escape);
+        frame.facts.escape_writes = IdSet::from_unsorted(escape_writes);
+        frame.facts.assigned = IdSet::from_unsorted(assigned);
+        frame.facts.inner = IdSet::from_unsorted(inner);
         frame.facts.escape_eval = escape_eval;
         frame.facts.range = range;
         self.facts
@@ -659,7 +691,7 @@ impl Builder<'_> {
         self.recycle(frame);
     }
 
-    /// A frame for a new scope, reusing a finished frame's set allocations.
+    /// A frame for a new scope, reusing a finished frame's name table.
     fn fresh_frame(&mut self, kind: FrameKind, key: usize) -> Frame {
         match self.spare_frames.pop() {
             Some(mut frame) => {
@@ -671,13 +703,9 @@ impl Builder<'_> {
         }
     }
 
-    /// Return a finished frame's sets, emptied, for the next scope.
+    /// Return a finished frame's name table, emptied, for the next scope.
     fn recycle(&mut self, mut frame: Frame) {
-        frame.refs.clear();
-        frame.bound.clear();
-        frame.vars.clear();
-        frame.writes.clear();
-        frame.inner.clear();
+        frame.names.clear();
         frame.class_depth = 0;
         frame.class_body_depth = 0;
         frame.field_depth = 0;
@@ -718,7 +746,7 @@ impl Builder<'_> {
 
     fn note_write(&mut self, name: &str) {
         let id = self.facts.intern(name);
-        self.top().writes.insert(id);
+        self.top().mark(id, ASSIGNED);
     }
 }
 
@@ -922,7 +950,7 @@ impl<'a> Visit<'a> for Builder<'_> {
             for declarator in &it.declarations {
                 pattern_leaves(&declarator.id, &mut |name| {
                     let id = self.facts.intern(name);
-                    self.top().vars.insert(id);
+                    self.top().mark(id, VAR);
                 });
             }
         }
@@ -1079,10 +1107,12 @@ impl<'a> Visit<'a> for Builder<'_> {
         let id = self.facts.intern_ident(it.name);
         self.facts.reference(id, it.span.start);
         let frame = self.top();
-        frame.refs.insert(id);
-        if frame.field_depth > 0 {
-            frame.inner.insert(id);
-        }
+        let flags = if frame.field_depth > 0 {
+            REFERENCED | NESTED_REFERENCE
+        } else {
+            REFERENCED
+        };
+        frame.mark(id, flags);
         if id == ARGUMENTS {
             let member_read = self.arguments_read.take() == Some(it.span.start);
             self.note_arguments(member_read);

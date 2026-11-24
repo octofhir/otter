@@ -1,19 +1,20 @@
-//! Truthiness branches test the value their condition converts.
+//! Reduce truthiness branches to the predicate their condition computed.
 //!
 //! A branch on `!x` or on `ToBoolean(x)` takes the same edges as a branch on
 //! `x` itself, the first with its successors swapped: `Branch(Truthy)`
 //! already applies ToBoolean. Rewriting the branch to read `x` leaves the
 //! conversion without the branch as a user, and the allocator drops a pure
 //! node no one reads, so `if (!(a instanceof B))` tests the instanceof answer
-//! directly instead of materializing and negating it first.
+//! directly instead of materializing and negating it first. Typed numeric
+//! comparisons feed their operands and condition directly to the control
+//! node. Only the other consumers of the comparison need a tagged answer.
 //!
 //! # Contents
 //! - [`fold_branch_negations`] — the rewrite over every block's branch.
 //!
 //! # Invariants
-//! - Only `Branch { kind: Truthy }` changes, and only its input and the order
-//!   of its two successors. The CFG's edges, and so every phi, stay as they
-//!   were.
+//! - Only `Branch { kind: Truthy }` changes. Predicate selection and
+//!   successor swaps preserve every CFG edge and phi assignment.
 //! - A conversion other nodes still read stays in place for them.
 //!
 //! # See also
@@ -45,17 +46,31 @@ pub(crate) fn fold_branch_negations(graph: &mut Graph) {
             }
             condition = graph.node(condition).inputs[0];
         }
-        if condition == graph.node(control).inputs[0] {
-            continue;
-        }
+        let predicate = graph.node(condition);
+        let comparison = match predicate.kind {
+            Kind::Int32Compare(condition) => Some(BranchKind::Int32(condition)),
+            Kind::Float64Compare(condition) => Some(BranchKind::Float64(condition)),
+            _ => None,
+        };
+        let inputs = if comparison.is_some() {
+            predicate.inputs.clone()
+        } else {
+            smallvec::smallvec![condition]
+        };
         let node = graph.node_mut(control);
-        node.inputs[0] = condition;
-        if negated
-            && let Kind::Branch {
-                if_true, if_false, ..
-            } = &mut node.kind
+        node.inputs = inputs;
+        if let Kind::Branch {
+            kind,
+            if_true,
+            if_false,
+        } = &mut node.kind
         {
-            std::mem::swap(if_true, if_false);
+            if let Some(comparison) = comparison {
+                *kind = comparison;
+            }
+            if negated {
+                std::mem::swap(if_true, if_false);
+            }
         }
     }
 }

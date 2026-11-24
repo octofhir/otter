@@ -113,13 +113,15 @@ impl CodeSpaceSnapshot {
                     ..
                 }) => {
                     let executable = Arc::new(executable.fresh_isolate_copy(account)?);
+                    let atom_layout = AtomTableLayout::for_constants(&module.constants);
                     let metadata_bytes = (std::mem::size_of::<ChunkPayload>() as u64)
                         .saturating_add(std::mem::size_of::<AtomTable>() as u64)
-                        .saturating_add(AtomTable::allocation_bytes(&module.constants));
+                        .saturating_add(atom_layout.bytes());
                     let mut retained_lease =
                         account.reserve_exact(ResourceClass::SourceModuleBytes, metadata_bytes)?;
                     let atoms = Arc::new(AtomTable::from_constants(
                         &module.constants,
+                        atom_layout,
                         &mut retained_lease,
                     )?);
                     let metadata_bytes = payload_metadata_bytes(&atoms);

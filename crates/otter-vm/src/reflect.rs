@@ -123,9 +123,8 @@ pub fn call(
             let removed = interp.ordinary_delete_value(stack, context, target, &key, 0)?;
             Ok(Value::boolean(removed))
         }
-        // §28.1.6 Reflect.get(target, propertyKey[, receiver])
-        // <https://tc39.es/ecma262/#sec-reflect.get>
-        M::Get => {
+        // §28.1.6 Reflect.get and §28.1.9 Reflect.has prepare the same key.
+        M::Get | M::Has => {
             // Step 1 type check runs before key coercion (observable
             // order), but the key coercion can run user code and move
             // the heap — re-read the target from the rooted argument
@@ -153,10 +152,22 @@ pub fn call(
             };
             let target =
                 expect_object_value(args.first()).map_err(CommittedValueError::JavaScript)?;
+            if matches!(method, M::Has) {
+                let present =
+                    interp.ordinary_has_property_value(stack, Some(context), target, &key, 0)?;
+                return Ok(Value::boolean(present));
+            }
             let receiver = args.get(2).cloned().unwrap_or(target);
             match interp.ordinary_get_value(stack, Some(context), target, receiver, &key, 0)? {
                 VmGetOutcome::Value(v) => Ok(v),
                 VmGetOutcome::InvokeGetter { getter } => {
+                    // A proxy trap's lookup can run user code before [[Get]]
+                    // falls through to an accessor. Read the live receiver.
+                    let receiver = args
+                        .get(2)
+                        .or_else(|| args.first())
+                        .copied()
+                        .expect("an object target was validated");
                     let argv: SmallVec<[Value; 8]> = SmallVec::new();
                     interp
                         .run_callable_sync_rooted(stack, Some(context), &getter, receiver, argv)
@@ -197,21 +208,6 @@ pub fn call(
             let target =
                 expect_object_value(args.first()).map_err(CommittedValueError::JavaScript)?;
             interp.ordinary_get_prototype_value(stack, context, target, 0)
-        }
-        // §28.1.9 Reflect.has(target, propertyKey)
-        // <https://tc39.es/ecma262/#sec-reflect.has>
-        M::Has => {
-            // Step 1 type check runs before key coercion (observable
-            // order), but the key coercion can run user code and move
-            // the heap — re-read the target from the rooted argument
-            // slot afterwards so the local copy is never stale.
-            expect_object_value(args.first()).map_err(CommittedValueError::JavaScript)?;
-            let key = coerce_property_key(interp, stack, context, args.get(1))?;
-            let target =
-                expect_object_value(args.first()).map_err(CommittedValueError::JavaScript)?;
-            let present =
-                interp.ordinary_has_property_value(stack, Some(context), target, &key, 0)?;
-            Ok(Value::boolean(present))
         }
         // §28.1.10 Reflect.isExtensible(target)
         // <https://tc39.es/ecma262/#sec-reflect.isextensible>

@@ -179,20 +179,27 @@ impl Interpreter {
             let target_handle = interp.scoped_value(scope, proxy.target(&interp.gc_heap));
             let handler_handle = interp.scoped_value(scope, proxy.handler(&interp.gc_heap));
             let trap_key = VmPropertyKey::String(trap);
-            let handler = interp.escape_scoped(handler_handle);
-            let trap_value =
-                match interp.ordinary_get_value(stack, context, handler, handler, &trap_key, 0)? {
-                    VmGetOutcome::Value(value) => value,
-                    VmGetOutcome::InvokeGetter { getter } => interp
-                        .run_callable_sync_rooted(
-                            stack,
-                            context,
-                            &getter,
-                            interp.escape_scoped(handler_handle),
-                            SmallVec::new(),
-                        )
-                        .map_err(CommittedValueError::completed_call)?,
-                };
+            let base_handle = interp.scoped_value(scope, interp.escape_scoped(handler_handle));
+            let trap_value = match interp.ordinary_get_value_scoped(
+                stack,
+                context,
+                scope,
+                base_handle,
+                handler_handle,
+                &trap_key,
+                0,
+            )? {
+                VmGetOutcome::Value(value) => value,
+                VmGetOutcome::InvokeGetter { getter } => interp
+                    .run_callable_sync_rooted(
+                        stack,
+                        context,
+                        &getter,
+                        interp.escape_scoped(handler_handle),
+                        SmallVec::new(),
+                    )
+                    .map_err(CommittedValueError::completed_call)?,
+            };
             let trap_handle = interp.scoped_value(scope, trap_value);
             let trap_value = interp.escape_scoped(trap_handle);
             if trap_value.is_nullish() {
@@ -224,6 +231,15 @@ impl Interpreter {
         &mut self,
         key: &VmPropertyKey,
     ) -> Result<Value, VmError> {
+        // An atom already used as a property key owns a canonical string.
+        // Exposing the same primitive value to a trap needs no new allocation.
+        if let VmPropertyKey::Atom(key) = key
+            && key.symbol_handle().is_none()
+            && let Some(handle) =
+                crate::isolate_names::IsolateNames::of(&self.gc_heap).key_string(key.atom().id())
+        {
+            return Ok(Value::string(JsString::from_handle(handle, &self.gc_heap)));
+        }
         if let Some(key) = key.string_name() {
             Ok(Value::string(JsString::from_key_spelling(
                 key,
@@ -234,6 +250,26 @@ impl Interpreter {
         } else {
             unreachable!("every non-string property key is a symbol")
         }
+    }
+
+    /// The key after an observable trap call. String spellings and atom
+    /// identities are stable throughout reentry. Re-read a symbol from its
+    /// collector-updated handle.
+    fn proxy_key_after_call<'a>(
+        &self,
+        key: &'a VmPropertyKey<'a>,
+        handle: Local<'_>,
+    ) -> Result<VmPropertyKey<'a>, CommittedValueError> {
+        Ok(match key {
+            VmPropertyKey::Atom(atom) => VmPropertyKey::Atom(*atom),
+            VmPropertyKey::String(text) => VmPropertyKey::String(text),
+            VmPropertyKey::OwnedString(text) => VmPropertyKey::String(text),
+            VmPropertyKey::Symbol(_) => VmPropertyKey::Symbol(
+                self.escape_scoped(handle)
+                    .as_symbol(&self.gc_heap)
+                    .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?,
+            ),
+        })
     }
 
     pub(crate) fn lookup_own_vm_property_key(

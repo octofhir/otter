@@ -33,6 +33,10 @@
 //!   register after compilation and linking. Bindings a sloppy eval creates
 //!   land in the var-scope context's eval extension through the body's own
 //!   `DeclareEvalVar`; the runtime adopts nothing.
+//! - An indirect eval lends one admitted source to its compiler and linked
+//!   code. Optional parser state lasts for that execution scope, even on a
+//!   link or execution error; escaping closures still carry ordinary lazy
+//!   records and reparse on their first later call.
 //! - Every other compiled `<main>` (indirect eval, host scripts, `Function`,
 //!   the CommonJS wrapper) runs as a SELF closure over no context.
 //!
@@ -44,6 +48,7 @@ use crate::ValueWindow;
 use crate::activation_stack::ActivationStack;
 use crate::runtime_activation::CommittedValueError;
 use otter_bytecode::{BytecodeModule, Operand};
+use otter_resource::{CompileSource, SharedSource, SourceCompileScope};
 use smallvec::SmallVec;
 
 use crate::promise::JsPromise;
@@ -79,33 +84,47 @@ impl DynamicFunctionKind {
 }
 
 impl Interpreter {
-    /// One admitted exact source owner for an actual dynamically compiled body.
-    /// Compile-only parameter/body probes never enter this retained owner.
-    fn sources_for_dynamic_body(
-        &self,
-        urls: impl IntoIterator<Item = String>,
-        source: String,
-    ) -> Result<crate::source_registry::SourceRegistry, VmError> {
-        let text = otter_resource::SharedSource::admit(&self.resource_account, source)
-            .map_err(|error| self.err_owned_source(error))?;
-        let entries = urls.into_iter().map(|url| (url, text.clone())).collect();
-        crate::source_registry::SourceRegistry::new(entries, &self.resource_account)
-            .map_err(|error| self.err_resource(error))
+    fn admit_dynamic_source(&self, source: String) -> Result<SharedSource, VmError> {
+        SharedSource::admit(&self.resource_account, source)
+            .map_err(|error| self.err_owned_source(error))
     }
 
+    /// Publish dynamic source once. Keep a separate [[SourceText]] only when
+    /// the compiler provided different text, such as its decoded WTF-16
+    /// transport spelling. Lazy bodies and ordinary functions share the
+    /// exact source owner after publication.
     fn sources_for_dynamic_module(
         &self,
-        module: &BytecodeModule,
-        source: String,
+        module: &mut BytecodeModule,
+        text: SharedSource,
     ) -> Result<crate::source_registry::SourceRegistry, VmError> {
-        let urls = std::iter::once(module.module.clone()).chain(
-            module
-                .functions
-                .iter()
-                .filter(|function| !function.module_url.is_empty())
-                .map(|function| function.module_url.clone()),
-        );
-        self.sources_for_dynamic_body(urls, source)
+        if module.function_source.as_deref() == Some(text.as_ref()) {
+            module.function_source = None;
+        }
+        let mut aliases = module
+            .functions
+            .iter()
+            .map(|function| function.module_url.as_str())
+            .filter(|url| !url.is_empty() && *url != module.module)
+            .peekable();
+        let registry = if aliases.peek().is_none() {
+            crate::source_registry::SourceRegistry::with_prologue(
+                module.module.clone(),
+                text,
+                0,
+                &self.resource_account,
+            )
+        } else {
+            let mut entries = std::collections::BTreeMap::new();
+            entries.insert(module.module.clone(), text.clone());
+            for url in aliases {
+                if !entries.contains_key(url) {
+                    entries.insert(url.to_owned(), text.clone());
+                }
+            }
+            crate::source_registry::SourceRegistry::new(entries, &self.resource_account)
+        };
+        registry.map_err(|error| self.err_resource(error))
     }
 
     /// `Eval dst, src, ctx, flags` — §19.2.1.1 PerformEval with
@@ -130,21 +149,19 @@ impl Interpreter {
         let super_call_allowed = flags & 32 != 0;
         let top_idx = stack.len() - 1;
         let value = *read_register(&stack[top_idx], src_reg)?;
-        if let Some(s) = value.as_string(&self.gc_heap) {
-            let source = s.to_lossy_string(&self.gc_heap);
+        let result = if let Some(s) = value.as_string(&self.gc_heap) {
+            let source = crate::eval_source::encode_string(s, &self.gc_heap);
             if is_native_syntax_hint(&source) {
                 let frame = stack.last_mut().ok_or(VmError::InvalidOperand)?;
                 write_register(frame, dst, Value::undefined())?;
                 frame.advance_pc()?;
                 return Ok(());
             }
-        }
-        let result = if value.as_string(&self.gc_heap).is_some() {
             let force_strict = context.function_is_strict(stack[top_idx].function_id);
             let caller_context = *read_register(&stack[top_idx], ctx_reg)?;
             let caller_chain = self.eval_caller_chain(context, caller_context)?;
             self.run_direct_eval(
-                &value,
+                source,
                 EvalCompileOptions {
                     force_strict,
                     forbid_var_arguments,
@@ -196,21 +213,16 @@ impl Interpreter {
     /// scopes through the body's own context operations.
     fn run_direct_eval(
         &mut self,
-        value: &Value,
+        source: String,
         options: EvalCompileOptions,
         ctx_reg: u16,
         new_target_suppressed: bool,
         stack: &mut ActivationStack,
     ) -> Result<Value, VmError> {
-        let Some(s) = value.as_string(&self.gc_heap) else {
-            // §19.2.1.1 step 2 — non-string operands are returned
-            // unchanged.
-            return Ok(*value);
-        };
-        let source = s.with_utf16(&self.gc_heap, crate::eval_source::encode);
         let top_idx = stack.len().checked_sub(1).ok_or(VmError::InvalidOperand)?;
-        let module = self.compile_escaped_source(&source, options)?;
-        let sources = self.sources_for_dynamic_module(&module, source)?;
+        let mut module = self.compile_escaped_source(&source, options)?;
+        let text = self.admit_dynamic_source(source)?;
+        let sources = self.sources_for_dynamic_module(&mut module, text)?;
         let context = self
             .link_evictable_module(module, sources)
             .map_err(|error| self.err_link(error))?;
@@ -293,11 +305,28 @@ impl Interpreter {
             // unchanged — `eval(42) === 42`.
             return Ok(*value);
         };
-        let source = s.with_utf16(&self.gc_heap, crate::eval_source::encode);
+        let source = crate::eval_source::encode_string(s, &self.gc_heap);
         if is_native_syntax_hint(&source) {
             return Ok(Value::undefined());
         }
-        let (module, kept) = self.compile_escaped_source_kept(&source, options)?;
+        let source = match otter_resource::SharedSource::try_admit(&self.resource_account, source) {
+            Ok(source) => source,
+            Err((text, error)) => {
+                // A compiler or syntax error remains primary. Resource
+                // refusal precludes retaining the source and its parse.
+                self.compile_escaped_source(&text, options)?;
+                return Err(self.err_owned_source(error));
+            }
+        };
+        let mut source = SourceCompileScope::new(source);
+        // Escaped WTF-16 needs its separate [[SourceText]] spelling.
+        // Ordinary UTF-8 can keep just the ranges into the linked source.
+        let input = if crate::wtf16_escape::is_escaped(source.source()) {
+            CompileSource::Borrowed(source.source())
+        } else {
+            source.input()
+        };
+        let (mut module, kept) = self.compile_escaped_source_kept(input, options)?;
         if let Some(kept) = kept {
             let url = module.module.clone();
             self.keep_script_cache(&url, kept);
@@ -305,7 +334,7 @@ impl Interpreter {
         // Linking (not a standalone context) keeps the eval chunk's
         // function ids global, so closures and classes escaping the
         // eval stay callable from any later frame.
-        let sources = self.sources_for_dynamic_module(&module, source)?;
+        let sources = self.sources_for_dynamic_module(&mut module, source.source().clone())?;
         let context = self
             .link_evictable_module(module, sources)
             .map_err(|error| self.err_link(error))?;
@@ -437,7 +466,8 @@ impl Interpreter {
                     commonjs_file: true,
                     ..EvalCompileOptions::default()
                 };
-                let compiled = self.compile_eval_source(&source, options)?;
+                let compiled =
+                    self.compile_eval_source(CompileSource::Borrowed(&source), options)?;
                 let text = otter_resource::SharedSource::admit(&self.resource_account, source)
                     .map_err(|error| self.err_owned_source(error))?;
                 let sources = crate::source_registry::SourceRegistry::with_prologue(
@@ -456,7 +486,8 @@ impl Interpreter {
                     embedded: Some(unit),
                     ..EvalCompileOptions::default()
                 };
-                let compiled = self.compile_eval_source(unit.source, options)?;
+                let compiled =
+                    self.compile_eval_source(CompileSource::Borrowed(unit.source), options)?;
                 let text = otter_resource::SharedSource::from_static(unit.source);
                 let sources = crate::source_registry::SourceRegistry::with_prologue(
                     module_url.to_owned(),
@@ -568,14 +599,15 @@ impl Interpreter {
         let body_probe = format!("({prefix} anonymous(\n) {{\n{body}\n}})");
         self.compile_escaped_source(&body_probe, probe_options)?;
         let text = format!("({prefix} anonymous({params}\n) {{\n{body}\n}})");
-        let module = self.compile_escaped_source(
+        let mut module = self.compile_escaped_source(
             &text,
             EvalCompileOptions {
                 function_constructor: true,
                 ..EvalCompileOptions::default()
             },
         )?;
-        let sources = self.sources_for_dynamic_module(&module, text)?;
+        let text = self.admit_dynamic_source(text)?;
+        let sources = self.sources_for_dynamic_module(&mut module, text)?;
         let context = self
             .link_evictable_module(module, sources)
             .map_err(|error| self.err_link(error))?;
@@ -599,7 +631,7 @@ impl Interpreter {
             // Escaped here rather than after assembly: the surrounding source
             // the caller builds is ASCII punctuation, so escaping each part
             // leaves one consistently escaped program.
-            return Ok(s.with_utf16(&self.gc_heap, crate::eval_source::encode));
+            return Ok(crate::eval_source::encode_string(s, &self.gc_heap));
         }
         if primitive.is_symbol() {
             return Err(CommittedValueError::JavaScript(self.err_type(
@@ -636,7 +668,7 @@ impl Interpreter {
         source: &str,
         options: EvalCompileOptions,
     ) -> Result<BytecodeModule, VmError> {
-        self.compile_escaped_source_kept(source, options)
+        self.compile_escaped_source_kept(CompileSource::Borrowed(source), options)
             .map(|(module, _)| module)
     }
 
@@ -644,7 +676,7 @@ impl Interpreter {
     /// holds for the module, when it keeps one.
     fn compile_escaped_source_kept(
         &self,
-        source: &str,
+        source: CompileSource<'_>,
         options: EvalCompileOptions,
     ) -> Result<(BytecodeModule, Option<crate::KeptScript>), VmError> {
         let (mut module, kept) = self.compile_eval_source(source, options)?.into_parts();
@@ -654,7 +686,7 @@ impl Interpreter {
 
     fn compile_eval_source(
         &self,
-        source: &str,
+        source: CompileSource<'_>,
         options: EvalCompileOptions,
     ) -> Result<crate::CompiledEvalSource, VmError> {
         let hook = self.eval_hook.as_ref().ok_or_else(|| {
@@ -764,13 +796,6 @@ mod tests {
         }
     }
 
-    fn source_value(interp: &mut Interpreter, source: &str) -> Value {
-        Value::string(
-            crate::string::JsString::from_str(source, interp.gc_heap_mut())
-                .expect("short eval test source fits"),
-        )
-    }
-
     fn direct_options() -> EvalCompileOptions {
         EvalCompileOptions {
             caller_chain: Some(otter_bytecode::EvalCallerChain::default()),
@@ -782,7 +807,7 @@ mod tests {
     fn direct_eval_shared_stack_reclaims_every_nested_completion_path() {
         let mut interp = Interpreter::new().expect("fixture interpreter bootstrap");
         interp.set_eval_hook(Some(std::sync::Arc::new(|source, _| {
-            Ok(crate::CompiledEvalSource::Fresh(eval_module(source)))
+            Ok(crate::CompiledEvalSource::Fresh(eval_module(source.text())))
         })));
 
         // Register 1 holds the caller's (absent) context.
@@ -802,18 +827,16 @@ mod tests {
         interp.with_runtime_turn(&mut stack, |turn| {
             let (interp, stack) = turn.into_parts();
 
-            let ok = source_value(interp, "ok");
             assert_eq!(
                 interp
-                    .run_direct_eval(&ok, direct_options(), 1, false, stack)
+                    .run_direct_eval("ok".into(), direct_options(), 1, false, stack)
                     .expect("direct eval succeeds"),
                 Value::number_i32(42)
             );
             assert_caller_only(interp, stack);
 
-            let thrown_source = source_value(interp, "throw");
             let thrown = interp
-                .run_direct_eval(&thrown_source, direct_options(), 1, false, stack)
+                .run_direct_eval("throw".into(), direct_options(), 1, false, stack)
                 .expect_err("eval throw escapes its activation floor");
             assert!(matches!(thrown, VmError::Uncaught));
             assert_eq!(
@@ -822,9 +845,8 @@ mod tests {
             );
             assert_caller_only(interp, stack);
 
-            let invalid = source_value(interp, "invalid");
             let error = interp
-                .run_direct_eval(&invalid, direct_options(), 1, false, stack)
+                .run_direct_eval("invalid".into(), direct_options(), 1, false, stack)
                 .expect_err("invalid bytecode leaves cleanup to the eval boundary");
             assert!(matches!(error, VmError::InvalidOperand));
             assert_caller_only(interp, stack);

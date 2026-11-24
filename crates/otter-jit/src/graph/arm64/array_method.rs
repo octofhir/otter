@@ -42,11 +42,12 @@
 use super::{
     ARRAY_INDEX_PROTECTOR, Codegen, DeoptReason, DynamicLabel, IntrinsicMethod, NUMBER_TAG, NodeId,
     RelocationTarget, THREAD_OFFSET, VALUE_HOLE, VALUE_UNDEFINED, VM_THREAD_GC_HEAP_OFFSET,
-    VM_THREAD_MARKING_FLAG_CELL_OFFSET, emit_load_symbol_u64,
+    emit_load_symbol_u64,
 };
 use crate::Unsupported;
 use crate::allocation::LabRegisters;
 use crate::arm64::allocation::emit_grow_tagged_slab;
+use crate::entry::VM_THREAD_MARKING_FLAG_CELL_OFFSET;
 use dynasmrt::{DynasmApi, DynasmLabelApi, dynasm};
 use otter_vm::jit::{JitArrayStorage, JitGuardedReceiver, JitMethodHolder};
 

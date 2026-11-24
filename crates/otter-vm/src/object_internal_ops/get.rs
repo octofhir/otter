@@ -16,6 +16,8 @@
 //!   FunctionID, while deferred namespace evaluation requires a real source.
 //! - Array expando misses continue through the actual Array prototype with
 //!   the original receiver; bag storage never supplies a prototype or receiver.
+//! - Ordinary shapes answer own slots without touching host or String-wrapper
+//!   state. Host namespaces and String wrappers carry the opaque lookup bit.
 //! - Proxy Has retains its target and property key before trap lookup; false
 //!   results validate the captured target after reentry or revocation.
 //!
@@ -34,6 +36,38 @@ use crate::{
 use smallvec::SmallVec;
 
 impl Interpreter {
+    /// Prepare host-only lookup effects, sharing the shape proof between
+    /// [[Get]] and [[HasProperty]]. A deferred module may move the base.
+    fn prepare_object_lookup(
+        &mut self,
+        stack: &mut ActivationStack,
+        context: Option<&ExecutionContext>,
+        base: Value,
+        base_handle: Local<'_>,
+        obj: crate::JsObject,
+        key: &VmPropertyKey,
+    ) -> Result<(crate::JsObject, bool), CommittedValueError> {
+        let opaque = object::state(obj, &self.gc_heap).is_opaque();
+        if opaque
+            && object::deferred_namespace_target(obj, &self.gc_heap).is_some()
+            && !Self::deferred_key_is_symbol_like(key)
+            && !object::deferred_namespace_is_populated(obj, &self.gc_heap)
+        {
+            self.ensure_deferred_namespace_ready(
+                stack,
+                context.ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?,
+                &base,
+                true,
+            )?;
+            let obj = self
+                .escape_scoped(base_handle)
+                .as_object()
+                .ok_or(CommittedValueError::Fatal(VmError::InvalidOperand))?;
+            return Ok((obj, opaque));
+        }
+        Ok((obj, opaque))
+    }
+
     pub(crate) fn ordinary_get_value(
         &mut self,
         stack: &mut ActivationStack,
@@ -78,55 +112,34 @@ impl Interpreter {
             return Ok(VmGetOutcome::Value(Value::undefined()));
         }
         let base = self.escape_scoped(base_handle);
-        // TC39 import defer — accessing a deferred namespace evaluates
-        // its module, then reads delegate to the module environment.
-        if let Some(object) = base.as_object()
-            && object::deferred_namespace_target(object, &self.gc_heap).is_some()
-            && !Self::deferred_key_is_symbol_like(key)
-            && !object::deferred_namespace_is_populated(object, &self.gc_heap)
-        {
-            self.ensure_deferred_namespace_ready(
-                stack,
-                context
-                    .ok_or(VmError::InvalidOperand)
-                    .map_err(CommittedValueError::Fatal)?,
-                &base,
-                true,
-            )?;
-        }
-        let base = self.escape_scoped(base_handle);
         if let Some(obj) = base.as_object() {
-            // §10.4.6.8 [[Get]] — a Module Namespace Exotic Object
-            // resolves string keys through the wrapped environment;
-            // symbol keys (e.g. @@toStringTag) fall through to its own
-            // properties.
-            if object::module_namespace_env(obj, &self.gc_heap).is_some()
-                && let Some(name) = key.string_name()
-            {
-                // §10.4.6.8 [[Get]] — resolve the export through the
-                // module's ResolveExport table to the defining module's
-                // live binding. A re-exported / star-exported name reads
-                // the source env, not a snapshot.
-                return match self
-                    .module_namespace_get_binding(obj, name)
+            let (obj, opaque) =
+                self.prepare_object_lookup(stack, context, base, base_handle, obj, key)?;
+            if opaque {
+                // A module namespace resolves string keys against live
+                // bindings. Symbol keys use its ordinary own properties.
+                if object::module_namespace_env(obj, &self.gc_heap).is_some()
+                    && let Some(name) = key.string_name()
+                {
+                    return match self
+                        .module_namespace_get_binding(obj, name)
+                        .map_err(CommittedValueError::JavaScript)?
+                    {
+                        Some(value) if value.is_hole() => {
+                            Err(CommittedValueError::JavaScript(self.err_this_uninit(
+                                (format!("Cannot access '{name}' before initialization")).into(),
+                            )))
+                        }
+                        Some(value) => Ok(VmGetOutcome::Value(value)),
+                        None => Ok(VmGetOutcome::Value(Value::undefined())),
+                    };
+                }
+                if let Some(value) = self
+                    .string_object_exotic_get(obj, key)
                     .map_err(CommittedValueError::JavaScript)?
                 {
-                    // step 9 — reading an export still in its TDZ
-                    // (uninitialized binding slot) is a ReferenceError.
-                    Some(value) if value.is_hole() => {
-                        Err(CommittedValueError::JavaScript(self.err_this_uninit(
-                            (format!("Cannot access '{name}' before initialization")).into(),
-                        )))
-                    }
-                    Some(value) => Ok(VmGetOutcome::Value(value)),
-                    None => Ok(VmGetOutcome::Value(Value::undefined())),
-                };
-            }
-            if let Some(value) = self
-                .string_object_exotic_get(obj, key)
-                .map_err(CommittedValueError::JavaScript)?
-            {
-                return Ok(VmGetOutcome::Value(value));
+                    return Ok(VmGetOutcome::Value(value));
+                }
             }
             return match self.lookup_own_vm_property_key(obj, key) {
                 object::PropertyLookup::Data { value, .. } => Ok(VmGetOutcome::Value(value)),
@@ -171,9 +184,7 @@ impl Interpreter {
                 crate::object_internal_ops::ProxyTrap::Trapped(value) => {
                     let value = self.scoped_value(scope, value);
                     let target = self.escape_scoped(target_handle);
-                    let key_value = self.escape_scoped(key_handle);
-                    let key = property_key_value_to_vm_key(self, &key_value, &self.gc_heap)
-                        .map_err(CommittedValueError::JavaScript)?;
+                    let key = self.proxy_key_after_call(key, key_handle)?;
                     let descriptor = self.ordinary_get_own_property_descriptor_value(
                         stack,
                         context,
@@ -188,16 +199,19 @@ impl Interpreter {
                 }
                 crate::object_internal_ops::ProxyTrap::NoTrap {
                     target: fallthrough_target,
-                } => self.continue_ordinary_get_value_scoped(
-                    stack,
-                    context,
-                    scope,
-                    base_handle,
-                    receiver_handle,
-                    fallthrough_target,
-                    key,
-                    hops + 1,
-                ),
+                } => {
+                    let key = self.proxy_key_after_call(key, key_handle)?;
+                    self.continue_ordinary_get_value_scoped(
+                        stack,
+                        context,
+                        scope,
+                        base_handle,
+                        receiver_handle,
+                        fallthrough_target,
+                        &key,
+                        hops + 1,
+                    )
+                }
             };
         }
         if let Some(arr) = base.as_array() {
@@ -1350,33 +1364,20 @@ impl Interpreter {
             return Ok(false);
         }
         let base = self.escape_scoped(base_handle);
-        if let Some(object) = base.as_object()
-            && object::deferred_namespace_target(object, &self.gc_heap).is_some()
-            && !Self::deferred_key_is_symbol_like(key)
-            && !object::deferred_namespace_is_populated(object, &self.gc_heap)
-        {
-            self.ensure_deferred_namespace_ready(
-                stack,
-                context
-                    .ok_or(VmError::InvalidOperand)
-                    .map_err(CommittedValueError::Fatal)?,
-                &base,
-                true,
-            )?;
-        }
-        let base = self.escape_scoped(base_handle);
         if let Some(obj) = base.as_object() {
-            // §10.4.6.7 [[HasProperty]] — namespace string keys exist iff
-            // the environment exports them; symbol keys check own props.
-            if object::module_namespace_env(obj, &self.gc_heap).is_some()
-                && let Some(name) = key.string_name()
-            {
-                // §10.4.6.7 — a string key exists iff it is one of the
-                // module's resolved exported names (TDZ-independent).
-                return Ok(self
-                    .module_namespace_export_names(obj)
-                    .iter()
-                    .any(|exported| exported == name));
+            let (obj, opaque) =
+                self.prepare_object_lookup(stack, context, base, base_handle, obj, key)?;
+            if opaque {
+                // §10.4.6.7: namespace string keys exist iff the module
+                // exports them, independent of initialization.
+                if object::module_namespace_env(obj, &self.gc_heap).is_some()
+                    && let Some(name) = key.string_name()
+                {
+                    return Ok(self
+                        .module_namespace_export_names(obj)
+                        .iter()
+                        .any(|exported| exported == name));
+                }
             }
             if !matches!(
                 self.lookup_own_vm_property_key(obj, key),
@@ -1388,10 +1389,11 @@ impl Interpreter {
             // slots are not in the ordinary property table; consult the
             // exotic [[GetOwnProperty]] so `in`, for-in, and
             // getOwnPropertyDescriptor agree on one funnel.
-            if self
-                .string_object_exotic_descriptor(obj, key)
-                .map_err(CommittedValueError::JavaScript)?
-                .is_some()
+            if opaque
+                && self
+                    .string_object_exotic_descriptor(obj, key)
+                    .map_err(CommittedValueError::JavaScript)?
+                    .is_some()
             {
                 return Ok(true);
             }
@@ -1429,9 +1431,7 @@ impl Interpreter {
                 crate::object_internal_ops::ProxyTrap::Trapped(value) => {
                     let result = value.to_boolean(&self.gc_heap);
                     if !result {
-                        let key_value = self.escape_scoped(key_handle);
-                        let key = property_key_value_to_vm_key(self, &key_value, &self.gc_heap)
-                            .map_err(CommittedValueError::JavaScript)?;
+                        let key = self.proxy_key_after_call(key, key_handle)?;
                         let configurable = self
                             .ordinary_get_own_property_descriptor_value(
                                 stack,
@@ -1462,9 +1462,7 @@ impl Interpreter {
                 crate::object_internal_ops::ProxyTrap::NoTrap {
                     target: fallthrough_target,
                 } => {
-                    let key_value = self.escape_scoped(key_handle);
-                    let key = property_key_value_to_vm_key(self, &key_value, &self.gc_heap)
-                        .map_err(CommittedValueError::JavaScript)?;
+                    let key = self.proxy_key_after_call(key, key_handle)?;
                     self.continue_ordinary_has_property_value_scoped(
                         stack,
                         context,

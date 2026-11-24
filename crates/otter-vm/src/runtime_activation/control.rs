@@ -153,6 +153,7 @@ mod tests {
                 vm: NonNull::from(&mut vm),
                 stack: NonNull::from(&mut stack),
                 context: crate::code_space::ResolvedCtx::Ambient(&context),
+                bound_function_id: frame.header.function_id,
                 frame: NonNull::from(&mut frame),
                 _exclusive: PhantomData,
             };
@@ -199,6 +200,7 @@ mod tests {
                     vm: NonNull::from(vm),
                     stack: NonNull::from(stack),
                     context: crate::code_space::ResolvedCtx::Ambient(&context),
+                    bound_function_id: frame.header.function_id,
                     frame: NonNull::from(frame),
                     _exclusive: PhantomData,
                 };

@@ -4,11 +4,12 @@
 //! - [`CodeBlockControlFlow`] — immutable basic-block, loop-header, and
 //!   exception-handler tables built from verified schema wordcode and the
 //!   function's handler table.
+//! - [`ControlFlowLayout`] / [`ControlFlowBuilder`] — the shared count and fill passes.
 //! - [`CodeBlockControlFlowView`] — borrowed read-only access for JIT consumers.
 //!
 //! # Invariants
 //! - Every PC is a canonical instruction index, never a serialized byte PC.
-//! - Targets are resolved once after wordcode verification; dispatch and JIT
+//! - Target decoding stays in executable preparation; dispatch and JIT
 //!   lowering do not reinterpret relative branch operands.
 //! - Handler entries keep the verified table order, innermost first, so the
 //!   first entry covering a PC is the handler a throw there lands in. Every
@@ -22,9 +23,11 @@
 //! - [`otter_bytecode::opcode_schema`]
 
 use otter_bytecode::{
-    ExceptionHandler, FunctionCode, Operand,
+    ExceptionHandler, FunctionCode, Op, Operand,
     opcode_schema::{ControlFlow, SuccessorSpec, opcode_schema},
 };
+
+use otter_resource::{ResourceError, ResourceLease};
 
 /// Borrowed access to one CodeBlock's immutable logical control-flow tables.
 #[derive(Debug, Clone, Copy)]
@@ -68,64 +71,94 @@ impl<'a> CodeBlockControlFlowView<'a> {
     }
 }
 
-/// Immutable logical-PC tables shared by interpreter and JIT consumers.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct CodeBlockControlFlow {
-    block_starts: Box<[u32]>,
-    loop_headers: Box<[u32]>,
-    loop_latches: Box<[(u32, u32)]>,
-    handlers: Box<[ExceptionHandler]>,
+/// Capacity of the logical flow tables derived from admitted instructions.
+#[derive(Clone, Copy)]
+pub(crate) struct ControlFlowLayout {
+    instruction_count: u32,
+    block_starts: usize,
+    loop_latches: usize,
+    handlers: usize,
 }
 
-impl CodeBlockControlFlow {
-    /// Heap bytes the four precomputed tables retain for the owning code
-    /// block's lifetime.
-    pub(crate) fn retained_bytes(&self) -> u64 {
-        (std::mem::size_of_val::<[u32]>(&self.block_starts) as u64)
-            .saturating_add(std::mem::size_of_val::<[u32]>(&self.loop_headers) as u64)
-            .saturating_add(std::mem::size_of_val::<[(u32, u32)]>(&self.loop_latches) as u64)
-            .saturating_add(std::mem::size_of_val::<[ExceptionHandler]>(&self.handlers) as u64)
+impl ControlFlowLayout {
+    pub(crate) fn new(instructions: usize, handlers: usize) -> Self {
+        Self {
+            instruction_count: instructions as u32,
+            block_starts: usize::from(instructions != 0).saturating_add(handlers),
+            loop_latches: 0,
+            handlers,
+        }
     }
 
-    /// Build tables from wordcode and a handler table that have already
-    /// passed verification.
-    pub(crate) fn from_verified_wordcode(
-        code: &FunctionCode,
-        handlers: &[ExceptionHandler],
-        lease: &mut otter_resource::ResourceLease,
-    ) -> Result<Self, otter_resource::ResourceError> {
+    pub(crate) fn count(&mut self, code: &FunctionCode, index: usize, op: Op) {
+        let (blocks, latches) = (&mut self.block_starts, &mut self.loop_latches);
+        visit_boundaries(
+            code,
+            index,
+            op,
+            self.instruction_count,
+            |_| *blocks = blocks.saturating_add(1),
+            |_, _| *latches = latches.saturating_add(1),
+        );
+    }
+
+    pub(crate) fn bytes(self) -> u64 {
+        use super::allocation::array_bytes;
+        array_bytes::<u32>(self.block_starts)
+            .saturating_add(array_bytes::<u32>(self.loop_latches))
+            .saturating_add(array_bytes::<(u32, u32)>(self.loop_latches))
+            .saturating_add(array_bytes::<ExceptionHandler>(self.handlers))
+    }
+}
+
+/// Fills the admitted tables in logical order, then compacts their duplicates.
+pub(crate) struct ControlFlowBuilder {
+    layout: ControlFlowLayout,
+    block_starts: Vec<u32>,
+    loop_latches: Vec<(u32, u32)>,
+}
+
+impl ControlFlowBuilder {
+    pub(crate) fn new(
+        layout: ControlFlowLayout,
+        lease: &mut ResourceLease,
+    ) -> Result<Self, ResourceError> {
         use super::allocation::try_vec;
-        let (block_capacity, latch_capacity) = Self::capacities(code, handlers);
-        let mut block_starts = try_vec(block_capacity, lease)?;
-        let mut loop_latches = try_vec(latch_capacity, lease)?;
-        let instruction_count = code.len() as u32;
-        if instruction_count != 0 {
+        let mut block_starts = try_vec(layout.block_starts, lease)?;
+        let loop_latches = try_vec(layout.loop_latches, lease)?;
+        if layout.instruction_count != 0 {
             block_starts.push(0);
         }
-        for (index, instruction) in code.iter().enumerate() {
-            let pc = index as u32;
-            let next_pc = pc + 1;
-            let schema = opcode_schema(instruction.op);
-            for successor in schema.successor_shape.exact() {
-                if let SuccessorSpec::RelativeTarget { operand_index, .. } = successor {
-                    let target = relative_target(code, index, *operand_index);
-                    if target < instruction_count {
-                        block_starts.push(target);
-                    }
-                    if target < pc {
-                        loop_latches.push((target, pc));
-                    }
-                }
-            }
-            if next_pc < instruction_count
-                && !matches!(
-                    schema.control_flow,
-                    ControlFlow::Fallthrough | ControlFlow::Call
-                )
-            {
-                block_starts.push(next_pc);
-            }
-        }
+        Ok(Self {
+            layout,
+            block_starts,
+            loop_latches,
+        })
+    }
+
+    pub(crate) fn record(&mut self, code: &FunctionCode, index: usize, op: Op) {
+        let (blocks, latches) = (&mut self.block_starts, &mut self.loop_latches);
+        visit_boundaries(
+            code,
+            index,
+            op,
+            self.layout.instruction_count,
+            |pc| blocks.push(pc),
+            |target, pc| latches.push((target, pc)),
+        );
+    }
+
+    pub(crate) fn finish(
+        self,
+        handlers: &[ExceptionHandler],
+        lease: &mut ResourceLease,
+    ) -> Result<CodeBlockControlFlow, ResourceError> {
+        use super::allocation::try_vec;
+        let Self {
+            layout,
+            mut block_starts,
+            mut loop_latches,
+        } = self;
         block_starts.extend(handlers.iter().map(|handler| handler.target));
         block_starts.sort_unstable();
         block_starts.dedup();
@@ -143,54 +176,34 @@ impl CodeBlockControlFlow {
             }
         }
         loop_latches.truncate(written);
-        let mut loop_headers = try_vec(latch_capacity, lease)?;
+        let mut loop_headers = try_vec(layout.loop_latches, lease)?;
         loop_headers.extend(loop_latches.iter().map(|&(header, _)| header));
-        Ok(Self {
+        Ok(CodeBlockControlFlow {
             block_starts: block_starts.into_boxed_slice(),
             loop_headers: loop_headers.into_boxed_slice(),
             loop_latches: loop_latches.into_boxed_slice(),
             handlers: super::allocation::try_copy(handlers, lease)?,
         })
     }
+}
 
-    fn capacities(code: &FunctionCode, handlers: &[ExceptionHandler]) -> (usize, usize) {
-        let instruction_count = code.len() as u32;
-        let mut blocks = usize::from(instruction_count != 0).saturating_add(handlers.len());
-        let mut latches = 0usize;
-        for (index, instruction) in code.iter().enumerate() {
-            let pc = index as u32;
-            let schema = opcode_schema(instruction.op);
-            for successor in schema.successor_shape.exact() {
-                if let SuccessorSpec::RelativeTarget { operand_index, .. } = successor {
-                    let target = relative_target(code, index, *operand_index);
-                    if target < instruction_count {
-                        blocks = blocks.saturating_add(1);
-                    }
-                    if target < pc {
-                        latches = latches.saturating_add(1);
-                    }
-                }
-            }
-            if pc + 1 < instruction_count
-                && !matches!(
-                    schema.control_flow,
-                    ControlFlow::Fallthrough | ControlFlow::Call
-                )
-            {
-                blocks = blocks.saturating_add(1);
-            }
-        }
-        (blocks, latches)
-    }
+/// Immutable logical-PC tables shared by interpreter and JIT consumers.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CodeBlockControlFlow {
+    block_starts: Box<[u32]>,
+    loop_headers: Box<[u32]>,
+    loop_latches: Box<[(u32, u32)]>,
+    handlers: Box<[ExceptionHandler]>,
+}
 
-    /// Bounded preparation geometry admitted before building these tables.
-    pub(crate) fn allocation_bytes(code: &FunctionCode, handlers: &[ExceptionHandler]) -> u64 {
-        use super::allocation::array_bytes;
-        let (blocks, latches) = Self::capacities(code, handlers);
-        array_bytes::<u32>(blocks)
-            .saturating_add(array_bytes::<u32>(latches))
-            .saturating_add(array_bytes::<(u32, u32)>(latches))
-            .saturating_add(array_bytes::<ExceptionHandler>(handlers.len()))
+impl CodeBlockControlFlow {
+    /// Heap bytes the four precomputed tables retain for the owning code
+    /// block's lifetime.
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        (std::mem::size_of_val::<[u32]>(&self.block_starts) as u64)
+            .saturating_add(std::mem::size_of_val::<[u32]>(&self.loop_headers) as u64)
+            .saturating_add(std::mem::size_of_val::<[(u32, u32)]>(&self.loop_latches) as u64)
+            .saturating_add(std::mem::size_of_val::<[ExceptionHandler]>(&self.handlers) as u64)
     }
 
     /// Copy fixed admitted tables into a different isolate without a new CFG walk.
@@ -234,6 +247,37 @@ impl CodeBlockControlFlow {
     }
 }
 
+fn visit_boundaries(
+    code: &FunctionCode,
+    index: usize,
+    op: Op,
+    instruction_count: u32,
+    mut block: impl FnMut(u32),
+    mut latch: impl FnMut(u32, u32),
+) {
+    let pc = index as u32;
+    let schema = opcode_schema(op);
+    for successor in schema.successor_shape.exact() {
+        if let SuccessorSpec::RelativeTarget { operand_index, .. } = successor {
+            let target = relative_target(code, index, *operand_index);
+            if target < instruction_count {
+                block(target);
+            }
+            if target < pc {
+                latch(target, pc);
+            }
+        }
+    }
+    if pc + 1 < instruction_count
+        && !matches!(
+            schema.control_flow,
+            ControlFlow::Fallthrough | ControlFlow::Call
+        )
+    {
+        block(pc + 1);
+    }
+}
+
 fn relative_target(code: &FunctionCode, instruction_index: usize, operand_index: usize) -> u32 {
     let instruction = &code[instruction_index];
     let Some(Operand::Imm32(delta)) = code.operand(instruction, operand_index) else {
@@ -248,13 +292,23 @@ mod tests {
     use super::*;
 
     fn cfg(code: &FunctionCode, handlers: &[ExceptionHandler]) -> CodeBlockControlFlow {
+        let mut layout = ControlFlowLayout::new(code.len(), handlers.len());
+        for (index, instruction) in code.iter().enumerate() {
+            layout.count(code, index, instruction.op);
+        }
         let mut lease = otter_resource::ResourceAccount::default()
             .reserve_exact(
                 otter_resource::ResourceClass::SourceModuleBytes,
-                CodeBlockControlFlow::allocation_bytes(code, handlers),
+                layout.bytes(),
             )
             .expect("admit control-flow fixture geometry");
-        CodeBlockControlFlow::from_verified_wordcode(code, handlers, &mut lease)
+        let mut builder =
+            ControlFlowBuilder::new(layout, &mut lease).expect("prepare control-flow fixture");
+        for (index, instruction) in code.iter().enumerate() {
+            builder.record(code, index, instruction.op);
+        }
+        builder
+            .finish(handlers, &mut lease)
             .expect("prepare control-flow fixture")
     }
 

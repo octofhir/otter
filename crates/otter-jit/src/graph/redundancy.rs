@@ -424,8 +424,17 @@ pub(crate) fn eliminate(graph: &mut Graph, layout: &[BlockId]) -> usize {
             }
         }
     }
+    rewrite_uses(graph, layout, &replaced);
+    replaced.len()
+}
+
+pub(super) fn rewrite_uses(
+    graph: &mut Graph,
+    layout: &[BlockId],
+    replaced: &FxHashMap<NodeId, NodeId>,
+) {
     if replaced.is_empty() {
-        return 0;
+        return;
     }
     // A replacement may itself have been replaced by a dominating node.
     let resolve = |mut node: NodeId| {
@@ -461,7 +470,6 @@ pub(crate) fn eliminate(graph: &mut Graph, layout: &[BlockId]) -> usize {
             }
         }
     }
-    replaced.len()
 }
 
 #[cfg(test)]

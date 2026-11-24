@@ -2524,6 +2524,7 @@ dependencies = [
  "num-bigint 0.4.6",
  "otter-bytecode",
  "otter-regex",
+ "otter-resource",
  "otter-syntax",
  "oxc_allocator",
  "oxc_ast",
@@ -2817,11 +2818,13 @@ dependencies = [
 name = "otter-syntax"
 version = "0.1.0"
 dependencies = [
+ "otter-resource",
  "oxc_allocator",
  "oxc_ast",
  "oxc_diagnostics",
  "oxc_parser",
  "oxc_span",
+ "self_cell",
  "serde",
  "thiserror",
 ]

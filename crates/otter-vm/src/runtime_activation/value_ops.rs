@@ -918,7 +918,6 @@ mod tests {
         let context = vm
             .link_module(module, crate::source_registry::SourceRegistry::default())
             .expect("valid bytecode fixture");
-        vm.ensure_method_feedback_context(&context);
         let mut receiver = vm
             .allocate_object_literal_value(0)
             .expect("ordinary receiver");
@@ -1003,7 +1002,6 @@ mod tests {
                 crate::source_registry::SourceRegistry::default(),
             )
             .expect("valid bytecode fixture");
-        vm.ensure_method_feedback_context(&context);
         let mut receiver = vm
             .allocate_object_literal_value(0)
             .expect("ordinary method receiver");
@@ -1097,7 +1095,6 @@ mod tests {
                 crate::source_registry::SourceRegistry::default(),
             )
             .expect("valid bytecode fixture");
-        vm.ensure_method_feedback_context(&context);
         let mut first = vm
             .allocate_object_literal_value(0)
             .expect("first ordinary receiver");
@@ -1281,7 +1278,6 @@ mod tests {
                 crate::source_registry::SourceRegistry::default(),
             )
             .expect("valid bytecode fixture");
-        vm.ensure_method_feedback_context(&context);
         let mut first = Value::undefined();
         let mut second = Value::undefined();
         let mut first_rhs = Value::undefined();
@@ -1430,7 +1426,6 @@ mod tests {
                 crate::source_registry::SourceRegistry::default(),
             )
             .expect("valid bytecode fixture");
-        vm.ensure_method_feedback_context(&context);
         let mut prototype = Value::object(
             vm.alloc_runtime_rooted_object_with_roots(&mut [], &mut [])
                 .expect("clean terminal prototype"),
@@ -1507,7 +1502,6 @@ mod tests {
         let context = vm
             .link_module(module, crate::source_registry::SourceRegistry::default())
             .expect("valid bytecode fixture");
-        vm.ensure_method_feedback_context(&context);
         let receiver = vm
             .allocate_object_literal_value(0)
             .expect("ordinary receiver");

@@ -34,10 +34,15 @@ pub use module_text::{module_attribute_type, module_literal_text};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use oxc_allocator::Allocator;
+mod parser_arena;
+mod retained_program;
+
+pub use retained_program::RetainedProgram;
+
 use oxc_ast::ast::Program;
 use oxc_parser::{ParseOptions, Parser};
 use oxc_span::SourceType;
+use parser_arena::ParserArena;
 use serde::{Deserialize, Serialize};
 
 pub use diagnostic::{SyntaxDiagnostic, SyntaxError};
@@ -240,6 +245,20 @@ pub fn with_program_goal<R>(
     with_program_goal_after_parse(source, kind, goal, || (), f).map(|(result, ())| result)
 }
 
+fn parse_once<'a>(
+    allocator: &'a oxc_allocator::Allocator,
+    source: &'a str,
+    kind: SourceKind,
+    goal: SourceGoal,
+) -> oxc_parser::ParserReturn<'a> {
+    Parser::new(allocator, source, kind.to_oxc_with_goal(goal))
+        .with_options(ParseOptions {
+            parse_regular_expression: true,
+            ..Default::default()
+        })
+        .parse()
+}
+
 fn with_program_goal_after_parse<R, T>(
     source: &str,
     kind: SourceKind,
@@ -251,13 +270,8 @@ fn with_program_goal_after_parse<R, T>(
     let mut attempts = 0usize;
     loop {
         let src = patched.as_deref().unwrap_or(source);
-        let allocator = Allocator::default();
-        let parser =
-            Parser::new(&allocator, src, kind.to_oxc_with_goal(goal)).with_options(ParseOptions {
-                parse_regular_expression: true,
-                ..Default::default()
-            });
-        let ret = parser.parse();
+        let allocator = ParserArena::acquire();
+        let ret = parse_once(&allocator, src, kind, goal);
         if ret.diagnostics.is_empty() {
             let parse_metadata = after_parse();
             return Ok((f(&ret.program), parse_metadata));
@@ -426,7 +440,7 @@ fn keyword_is_freestanding(source: &str, start: usize) -> bool {
 /// statement whose expression — modulo parentheses — is a plain (non-
 /// optional-chain) CallExpression.
 fn snippet_is_plain_call(snippet: &str, kind: SourceKind) -> bool {
-    let allocator = Allocator::default();
+    let allocator = ParserArena::acquire();
     let parser = Parser::new(
         &allocator,
         snippet,

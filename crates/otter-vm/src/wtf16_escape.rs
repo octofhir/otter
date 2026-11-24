@@ -118,6 +118,9 @@ pub(crate) fn encode(units: &[u16]) -> String {
 /// UTF-8 length of the escaped spelling of `units`.
 #[must_use]
 pub(crate) fn encoded_len(units: &[u16]) -> usize {
+    if units.iter().all(|&unit| unit <= 0x7f) {
+        return units.len();
+    }
     escaped_chars(units).map(char::len_utf8).sum()
 }
 

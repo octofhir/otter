@@ -426,10 +426,8 @@ impl Interpreter {
         function_count: u32,
     ) -> Result<ExecutionContext, crate::BytecodeLinkError> {
         context.resolve_atoms(crate::isolate_names::names_mut(&mut self.gc_heap));
-        for function in context.linked_functions() {
-            self.jit_code_registry
-                .link_function(function, self.active_realm_id);
-        }
+        self.jit_code_registry
+            .link_functions(context.linked_functions(), self.active_realm_id);
         if self.active_realm_id != 0 {
             let base = context.function_base();
             let end = base.checked_add(function_count).ok_or(
@@ -489,7 +487,6 @@ impl Interpreter {
         let _extra_roots_guard = self.gc_heap.register_extra_roots(extra_roots);
         self.pending_uncaught_throw = None;
         self.clear_throw_provenance();
-        self.ensure_method_feedback_context(context);
         match self.run_inner(context) {
             Ok(v) => Ok(v),
             Err((error, frames)) => Err(RunError {
@@ -1084,7 +1081,6 @@ impl Interpreter {
         resume_site: ThrowSite,
     ) -> Result<DispatchOutcome, VmError> {
         debug_assert!(stack.is_runtime_rooted_by(self));
-        self.ensure_method_feedback_context(context);
         let (error, site) = match resume_error {
             Some(error) => (error, resume_site),
             None => match self.dispatch_loop_inner(context, entered, stack, floor) {
@@ -1348,11 +1344,9 @@ mod tests {
                 .insert(context.constant_cache_key(0), Value::undefined());
             vm.literal_cells_mut()
                 .insert(context.constant_cache_key(1), Value::undefined());
-            vm.ensure_method_feedback_context(context);
-            for (site, address) in context.feedback_slot_addresses() {
-                assert!(address.is_method());
+            for site in context.property_ic_sites() {
                 vm.saturate_method_site_feedback(site);
-                assert!(vm.method_feedback_mut().install_method_ic(
+                vm.method_feedback_mut().install_method_ic(
                     site,
                     crate::method_ops::MethodCallIc::Collection(
                         crate::method_ops::CollectionMethodCallIc {
@@ -1364,7 +1358,7 @@ mod tests {
                             alloc_stub_id: None,
                         },
                     ),
-                ));
+                );
                 method_sites.push((context.function_base(), site));
             }
         }

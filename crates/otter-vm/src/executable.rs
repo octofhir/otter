@@ -16,13 +16,13 @@
 //! - `frame.pc` is the dense instruction index into `CodeBlock::code`.
 //! - Serialized byte coordinates live only in the CodeBlock's cold metadata;
 //!   hot instruction records carry the canonical logical instruction PC.
-//! - Cold byte PCs are a one-way logical-PC source/profiling map; execution has
-//!   no byte-PC-to-instruction reverse lookup.
+//! - Diagnostics and native metadata translate byte PCs through the executable
+//!   layout. Source spans are read directly in logical instruction coordinates.
 //! - Operand payloads are untagged 32-bit words already covered by the
 //!   [`VerifiedBytecodeModule`] proof. Typed hot accessors read them without
 //!   repeating schema or function-table lookup.
-//! - Executable construction consumes retained layouts and register-window
-//!   sizes; it never re-runs hostile-input validation.
+//! - Executable construction consumes the retained wire length and register
+//!   window; it never re-runs hostile-input validation.
 //! - Up to four operand words live in the canonical instruction. Longer forms
 //!   use the same shared body's overflow table; CodeBlock owns no second stream.
 //! - Branch-class `Imm32` operands hold instruction-index deltas relative to
@@ -57,17 +57,21 @@ pub use execution_code::{CodeBlockInstruction, ExecutableCode};
 pub(crate) mod allocation;
 #[path = "code_block_cfg.rs"]
 pub(crate) mod code_block_cfg;
+#[path = "code_block_prepare.rs"]
+mod code_block_prepare;
 #[path = "executable_snapshot.rs"]
 mod executable_snapshot;
 
+use crate::BytecodeLinkError;
 use otter_bytecode::{
     ArgumentBindingStorage, ArgumentsObjectKind, Function, FunctionCodeBuilder, Op, Operand,
-    SpanEntry, VerifiedFunction, encoding::measure_wordcode_function,
+    VerifiedFunction, encoding::measure_wordcode_function,
 };
 use otter_resource::{ResourceAccount, ResourceClass, ResourceError, ResourceLease};
 use std::sync::{Arc, OnceLock};
 
 use code_block_cfg::CodeBlockControlFlow;
+use code_block_prepare::{CodeBlockLayout, PreparedTables};
 
 pub(crate) const NO_PROPERTY_IC_SITE: u32 = u32::MAX;
 
@@ -90,19 +94,6 @@ pub(crate) struct ExecutableModule {
     /// The account every built block's lease is charged to.
     account: ResourceAccount,
     _table_lease: ResourceLease,
-}
-
-/// Directory entry naming a globally dense site whose call-target distribution
-/// the isolate keeps: a method call, or a named load or store whose receivers
-/// reach an accessor.
-#[derive(Debug, Clone)]
-pub(crate) struct FeedbackSlotAddress;
-
-impl FeedbackSlotAddress {
-    #[must_use]
-    pub(crate) fn is_method(&self) -> bool {
-        true
-    }
 }
 
 /// Whether `op` owns a dense named-property IC site.
@@ -137,46 +128,47 @@ impl ExecutableModule {
         bytecode: Arc<crate::code_space::LinkedBytecode>,
         property_ic_base: u32,
         account: &ResourceAccount,
-    ) -> Result<Self, ResourceError> {
+    ) -> Result<Self, BytecodeLinkError> {
         let count = bytecode.functions.len();
-        let table_lease = account.reserve_exact(
+        let has_lazy = bytecode
+            .functions
+            .iter()
+            .any(|function| function.lazy.is_some());
+        let forward_count = if has_lazy { count } else { 0 };
+        let mut table_lease = account.reserve_exact(
             ResourceClass::SourceModuleBytes,
             (std::mem::size_of::<ExecutableModule>() as u64)
                 .saturating_add(allocation::array_bytes::<OnceLock<Arc<CodeBlock>>>(count))
-                .saturating_add(allocation::array_bytes::<u32>(count)),
+                .saturating_add(allocation::array_bytes::<u32>(count))
+                .saturating_add(allocation::array_bytes::<OnceLock<u32>>(forward_count)),
         )?;
         let mut next = property_ic_base;
-        let ic_bases = bytecode
-            .functions
-            .iter()
-            .map(|function| {
-                let base = next;
-                let sites = function
-                    .code
-                    .iter()
-                    .filter(|instruction| has_property_ic_site(instruction.op))
-                    .count();
-                next = next
-                    .checked_add(u32::try_from(sites).expect("property IC sites exceed u32"))
-                    .expect("property IC site table exceeds u32");
-                base
-            })
-            .collect();
-        let forwards = if bytecode
-            .functions
-            .iter()
-            .any(|function| function.lazy.is_some())
-        {
-            (0..count).map(|_| OnceLock::new()).collect()
-        } else {
-            Box::default()
-        };
+        let mut ic_bases = allocation::try_vec(count, &mut table_lease)?;
+        for function in &bytecode.functions {
+            ic_bases.push(next);
+            let sites = function
+                .code
+                .iter()
+                .filter(|instruction| has_property_ic_site(instruction.op))
+                .count();
+            next = u32::try_from(sites)
+                .ok()
+                .and_then(|sites| next.checked_add(sites))
+                .ok_or(BytecodeLinkError::PropertyIcCapacity {
+                    base: property_ic_base,
+                    site_count: ((next - property_ic_base) as usize).saturating_add(sites),
+                })?;
+        }
+        let mut functions = allocation::try_vec(count, &mut table_lease)?;
+        functions.resize_with(count, OnceLock::new);
+        let mut forwards = allocation::try_vec(forward_count, &mut table_lease)?;
+        forwards.resize_with(forward_count, OnceLock::new);
         Ok(Self {
-            functions: (0..count).map(|_| OnceLock::new()).collect(),
+            functions: functions.into_boxed_slice(),
             bytecode,
-            ic_bases,
+            ic_bases: ic_bases.into_boxed_slice(),
             property_ic_site_end: next,
-            forwards,
+            forwards: forwards.into_boxed_slice(),
             alias: None,
             account: account.clone(),
             _table_lease: table_lease,
@@ -241,6 +233,7 @@ impl ExecutableModule {
     /// Function-table lookup by chunk-local function index, building the
     /// function's CodeBlock on first use. `None` for a missing index or a
     /// function that fails verification or admission.
+    #[inline]
     #[must_use]
     pub(crate) fn function(&self, local_index: u32) -> Option<&CodeBlock> {
         self.function_slot(local_index).map(Arc::as_ref)
@@ -252,19 +245,26 @@ impl ExecutableModule {
         self.function_slot(local_index).cloned()
     }
 
+    #[inline]
     fn function_slot(&self, local_index: u32) -> Option<&Arc<CodeBlock>> {
-        let slot = self.functions.get(local_index as usize)?;
-        if let Some(block) = slot.get() {
-            return Some(block);
-        }
         let index = local_index as usize;
+        let slot = self.functions.get(index)?;
+        slot.get().or_else(|| self.build_function_slot(index, slot))
+    }
+
+    /// Only the first execution or compilation prepares the admitted body.
+    #[cold]
+    fn build_function_slot<'a>(
+        &self,
+        index: usize,
+        slot: &'a OnceLock<Arc<CodeBlock>>,
+    ) -> Option<&'a Arc<CodeBlock>> {
         let proof = self.bytecode.verified().function(index).ok()?;
-        let mut site = self.ic_bases[index];
         let mut block = CodeBlock::from_verified_bytecode(
             &self.bytecode.functions[index],
             proof,
             &self.bytecode.module,
-            &mut site,
+            self.ic_bases[index],
             &self.account,
         )
         .ok()?;
@@ -301,32 +301,14 @@ impl ExecutableModule {
             })
     }
 
-    /// Directory entries for the method-call sites in this chunk, read off
-    /// the bytecode so no function has to be built.
-    pub(crate) fn feedback_slot_addresses(&self) -> Vec<(usize, FeedbackSlotAddress)> {
-        let mut slots = Vec::new();
-        for (function, &base) in self.bytecode.functions.iter().zip(&*self.ic_bases) {
-            let mut site = base as usize;
-            for instruction in function.code.iter() {
-                if !has_property_ic_site(instruction.op) {
-                    continue;
-                }
-                // A named load or store records the getters or setters its
-                // receivers reach through an inherited accessor, the way a
-                // method call records its methods.
-                if matches!(
-                    instruction.op,
-                    Op::CallMethodValue
-                        | Op::LoadProperty
-                        | Op::StoreProperty
-                        | Op::StorePropertyStrict
-                ) {
-                    slots.push((site, FeedbackSlotAddress));
-                }
-                site += 1;
-            }
-        }
-        slots
+    #[cfg(test)]
+    pub(crate) fn property_ic_sites(&self) -> std::ops::Range<usize> {
+        let start = self
+            .ic_bases
+            .first()
+            .copied()
+            .unwrap_or(self.property_ic_site_end);
+        start as usize..self.property_ic_site_end as usize
     }
 
     /// Full-collector weak pass over every property IC of these functions.
@@ -401,8 +383,8 @@ impl CodeBlock {
     }
 
     /// Heap bytes this code block retains beyond `size_of::<Self>()`: the
-    /// IC numbering, control-flow and span
-    /// tables, feedback vector, and annotation-hint tables.
+    /// IC numbering, control-flow and byte-PC tables, feedback vector, and
+    /// annotation-hint tables.
     #[must_use]
     pub(crate) fn retained_bytes(&self) -> u64 {
         (std::mem::size_of_val::<[ExecMappedArgumentBinding]>(&self.mapped_argument_bindings)
@@ -419,7 +401,6 @@ impl CodeBlock {
             .saturating_add(self.control_flow.retained_bytes())
             .saturating_add(self.feedback.retained_bytes())
             .saturating_add(std::mem::size_of_val::<[u32]>(&self.byte_pcs) as u64)
-            .saturating_add(std::mem::size_of_val::<[SpanEntry]>(&self.byte_spans) as u64)
             .saturating_add(std::mem::size_of_val::<[u64]>(&self.number_hints) as u64)
             .saturating_add(std::mem::size_of_val::<[(u32, u32)]>(&self.class_hints) as u64)
     }
@@ -498,12 +479,7 @@ impl CodeBlock {
                 + crate::object::SHAPE_BODY_PROPERTY_COUNT_OFFSET as u32,
             object_exotic_handle_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::OBJECT_BODY_EXOTIC_HANDLE_OFFSET as u32,
-            gc_barrier: crate::jit::JitGcBarrierLayout {
-                header_flags_byte: otter_gc::header::HEADER_FLAGS_BYTE_OFFSET as u32,
-                young_flag: otter_gc::header::GENERATION_YOUNG_FLAG as u32,
-                remembered_flag: otter_gc::header::REMEMBERED_FLAG as u32,
-                mark_color_bits: u32::from(otter_gc::header::MARK_COLOR_BITS),
-            },
+            gc_barrier: crate::jit::JitGcBarrierLayout::current(),
             shape_prototype_byte: otter_gc::header::HEADER_SIZE as u32
                 + crate::object::SHAPE_BODY_PROTOTYPE_OFFSET as u32,
             shape_stable_byte: otter_gc::header::HEADER_SIZE as u32
@@ -732,26 +708,21 @@ impl CodeBlock {
         wordcode
             .admit_storage(&account)
             .expect("admit fixture wordcode");
+        let layout = CodeBlockLayout::measure(&wordcode, handlers);
         let mut fixture_lease = account
             .reserve_exact(
                 ResourceClass::SourceModuleBytes,
-                crate::feedback::FeedbackVector::allocation_bytes(
-                    instructions.iter().map(|i| i.op),
-                )
-                .saturating_add(CodeBlockControlFlow::allocation_bytes(&wordcode, handlers))
-                .saturating_add(allocation::array_bytes::<u32>(instructions.len())),
+                layout.bytes(wordcode.len()),
             )
             .expect("admit fixture metadata");
-        let code = ExecutableCode::new(wordcode.clone(), id, &mut 0, &mut fixture_lease)
-            .expect("prepare fixture code");
-        let feedback = crate::feedback::FeedbackVector::for_instruction_ops(
-            instructions.iter().map(|instruction| instruction.op),
-            &mut fixture_lease,
-        )
-        .expect("prepare fixture feedback");
-        let control_flow =
-            CodeBlockControlFlow::from_verified_wordcode(&wordcode, handlers, &mut fixture_lease)
-                .expect("prepare fixture control flow");
+        let PreparedTables {
+            code,
+            control_flow,
+            feedback,
+            ..
+        } = layout
+            .prepare(&wordcode, id, 0, handlers, &mut fixture_lease)
+            .expect("prepare fixture instruction tables");
         let mut body = Self {
             _lease: account
                 .reserve_exact(
@@ -789,7 +760,6 @@ impl CodeBlock {
                 crate::native_abi::SourceWork::new(&account).expect("admit fixture work cell"),
             ),
             byte_pcs: byte_pcs.into_boxed_slice(),
-            byte_spans: Box::new([]),
             number_hints: Box::new([]),
             class_hints: Box::new([]),
         };
@@ -797,13 +767,6 @@ impl CodeBlock {
             .resize((std::mem::size_of::<Self>() as u64).saturating_add(body.retained_bytes()))
             .expect("admit fixture body tables");
         Arc::new(body)
-    }
-
-    /// Byte-offset source-map entries, sorted by `pc`. Empty when the
-    /// underlying [`Function::spans`] is empty.
-    #[must_use]
-    pub(crate) fn byte_spans(&self) -> &[SpanEntry] {
-        &self.byte_spans
     }
 
     /// Fetch an instruction by its dense `code` index.
@@ -1277,9 +1240,9 @@ impl<'a> From<&'a Vec<Operand>> for OperandView<'a> {
 
 /// One immutable, schema-verified executable function body.
 ///
-/// Construction verifies the compiler DTO directly in logical instruction-index
-/// coordinates, then builds schema-typed words. Cold byte-PC layout is computed
-/// without materialising or decoding the self-describing serialized stream.
+/// Construction consumes verified compiler wordcode in logical instruction
+/// coordinates. The byte-PC map comes from each verified opcode shape without
+/// materializing the self-describing serialized stream.
 #[derive(Debug)]
 pub struct CodeBlock {
     /// Global VM function id (chunk base + local table index).
@@ -1353,9 +1316,6 @@ pub struct CodeBlock {
     source_work: Arc<crate::native_abi::SourceWork>,
     /// Cold serialized byte PCs parallel to `code`.
     byte_pcs: Box<[u32]>,
-    /// Source-map entries with `pc` expressed as a byte offset into the
-    /// encoded stream. Empty when the underlying [`Function::spans`] is empty.
-    pub(crate) byte_spans: Box<[SpanEntry]>,
     /// One bit per instruction index: the compiler saw TypeScript `number` on
     /// both operands of this site. Empty when the body carries no annotations.
     ///
@@ -1443,21 +1403,20 @@ impl CodeBlock {
         function: &Function,
         proof: &VerifiedFunction,
         module_url: &str,
-        next_property_ic_site: &mut u32,
+        property_ic_site_base: u32,
         account: &ResourceAccount,
     ) -> Result<Self, ResourceError> {
         let register_count = proof.register_count();
-        let code_byte_len = proof.layout().total_bytes;
+        let code_byte_len = proof.byte_len();
         let count = function.code.len();
         let module_url = if function.module_url.is_empty() {
             module_url
         } else {
             &function.module_url
         };
+        let layout = CodeBlockLayout::measure(&function.code, &function.handlers);
         let mut requested = (std::mem::size_of::<Self>() as u64)
-            .saturating_add(allocation::array_bytes::<u32>(count))
-            .saturating_add(allocation::array_bytes::<u32>(count))
-            .saturating_add(allocation::array_bytes::<SpanEntry>(function.spans.len()))
+            .saturating_add(layout.bytes(count))
             .saturating_add(allocation::array_bytes::<ExecMappedArgumentBinding>(
                 function.mapped_argument_bindings.len(),
             ))
@@ -1465,13 +1424,6 @@ impl CodeBlock {
                 function.scopes.len(),
             ))
             .saturating_add(module_url.len() as u64)
-            .saturating_add(crate::feedback::FeedbackVector::allocation_bytes(
-                function.code.iter().map(|instruction| instruction.op),
-            ))
-            .saturating_add(CodeBlockControlFlow::allocation_bytes(
-                &function.code,
-                &function.handlers,
-            ))
             .saturating_add(allocation::array_bytes::<(u32, u32)>(
                 function.class_hint_sites.len(),
             ));
@@ -1488,22 +1440,21 @@ impl CodeBlock {
             }
         }
         let mut lease = account.reserve_exact(ResourceClass::SourceModuleBytes, requested)?;
-        let instr_to_byte_pc = allocation::try_copy(&proof.layout().instr_to_byte_pc, &mut lease)?;
-        let control_flow = CodeBlockControlFlow::from_verified_wordcode(
+        let PreparedTables {
+            code,
+            control_flow,
+            feedback,
+            makes_function,
+            byte_pcs,
+            byte_len,
+        } = layout.prepare(
             &function.code,
+            function.id,
+            property_ic_site_base,
             &function.handlers,
             &mut lease,
         )?;
-        let code = ExecutableCode::new(
-            function.code.clone(),
-            function.id,
-            next_property_ic_site,
-            &mut lease,
-        )?;
-        let feedback = crate::feedback::FeedbackVector::for_instruction_ops(
-            function.code.iter().map(|instruction| instruction.op),
-            &mut lease,
-        )?;
+        debug_assert_eq!(byte_len, code_byte_len);
         let number_hints = if function.number_hint_sites.is_empty() {
             Box::new([]) as Box<[u64]>
         } else {
@@ -1537,23 +1488,8 @@ impl CodeBlock {
             }
         }));
         let mapped_argument_bindings = mapped_argument_bindings.into_boxed_slice();
-        let mut byte_spans = allocation::try_vec(function.spans.len(), &mut lease)?;
-        byte_spans.extend(function.spans.iter().map(|entry| {
-            SpanEntry {
-                pc: instr_to_byte_pc
-                    .get(entry.pc as usize)
-                    .copied()
-                    .unwrap_or(code_byte_len),
-                span: entry.span,
-            }
-        }));
-        let byte_spans = byte_spans.into_boxed_slice();
         let module_url = allocation::try_string(module_url, &mut lease)?.into_boxed_str();
         let scopes = allocation::try_scopes(function.scopes.iter(), &mut lease)?;
-        let makes_function = function
-            .code
-            .iter()
-            .any(|instr| matches!(instr.op, Op::MakeFunction | Op::MakeClosure));
         let observes_this = !function.ignores_this;
         let mut body = Self {
             _lease: lease,
@@ -1584,8 +1520,7 @@ impl CodeBlock {
             control_flow,
             feedback,
             source_work: Arc::new(crate::native_abi::SourceWork::new(account)?),
-            byte_pcs: instr_to_byte_pc,
-            byte_spans,
+            byte_pcs,
             number_hints,
             class_hints,
         };
@@ -1840,7 +1775,9 @@ mod tests {
         let mut lease = account
             .reserve_exact(ResourceClass::SourceModuleBytes, 8)
             .unwrap();
-        let code = ExecutableCode::new(wordcode, 0, &mut 0, &mut lease).unwrap();
+        let mut sites = allocation::try_vec(wordcode.len(), &mut lease).unwrap();
+        sites.resize(wordcode.len(), NO_PROPERTY_IC_SITE);
+        let code = ExecutableCode::with_sites(wordcode, 0, sites.into_boxed_slice());
         let load_int = code.get(0).unwrap();
         let load_number = code.get(1).unwrap();
 

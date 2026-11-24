@@ -5,9 +5,7 @@
 use super::*;
 use otter_bytecode::{EvalCallerChain, EvalCallerScope};
 
-const LAZY: CompileOptions = CompileOptions {
-    lazy_functions: true,
-};
+const LAZY: CompileOptions = CompileOptions::Lazy;
 
 /// One function's code in a form independent of pool and table layout.
 fn render(module: &BytecodeModule, function: &Function) -> String {

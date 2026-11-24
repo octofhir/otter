@@ -10,8 +10,8 @@
 //! - Matched CodeBlock IC handlers commit directly; canonical `[[Set]]`
 //!   resolution runs only on a miss. A miss updates the site's native slot,
 //!   which already-published generated code reads on its next execution.
-//! - Named-property operands live in the shared handle arena. Scope exit
-//!   restores its depth, and every post-allocation read resolves the live slot.
+//! - An ordinary object's data IC hit reads the slot without collecting.
+//!   Calls and collecting misses publish the receiver in the handle arena.
 //! - Every source site records its first attempt before receiver classification
 //!   or user code, including receivers no handler can describe.
 //! - A committed cold data store refreshes the shared own action even at a
@@ -58,19 +58,18 @@ fn named_property_site<'a>(
     let instruction = function
         .instr_at_index(instruction_pc as usize)
         .ok_or(VmError::InvalidOperand)?;
-    if instruction.instruction_pc != instruction_pc {
-        return Err(VmError::InvalidOperand);
-    }
-    let name_operand = match (kind, function.op(instruction)) {
-        (PropertyIcKind::Load, Op::LoadProperty | Op::CallMethodValue) => 2,
-        (PropertyIcKind::Store, Op::StoreProperty) => 1,
+    // The fixed-width forms read their verified opcode fields directly.
+    // A method's variadic argument list may live in the overflow words.
+    let name_index = match (kind, instruction.op) {
+        (PropertyIcKind::Load, Op::LoadProperty) => instruction.const_word(2),
+        (PropertyIcKind::Load, Op::CallMethodValue) => function
+            .const_index(instruction, 2)
+            .ok_or(VmError::InvalidOperand)?,
+        (PropertyIcKind::Store, Op::StoreProperty) => instruction.const_word(1),
         _ => return Err(VmError::InvalidOperand),
     };
-    let name_index = function
-        .const_index(instruction, name_operand)
-        .ok_or(VmError::InvalidOperand)?;
     let key = context
-        .property_atom_for_function(function_id, name_index)
+        .property_atom(name_index)
         .ok_or(VmError::InvalidOperand)?;
     let slot = function
         .property_feedback_at(instruction_pc as usize, kind)
@@ -101,13 +100,28 @@ impl Interpreter {
         slot.record_attempt();
         slot.record_length_receiver(atomized_key.name(), receiver);
         self.record_jit_runtime_property_stub();
+        let object_receiver = receiver.as_object();
+        let mut getter_hit = None;
+        if let Some(object) = object_receiver
+            && !slot.is_megamorphic()
+            && let Some(hit) = slot.probe_load_hit(object, &self.gc_heap)
+        {
+            slot.record_hit();
+            match hit {
+                LoadHit::Value(value) => return Ok(value),
+                LoadHit::Getter(getter) => getter_hit = Some(getter),
+            }
+        }
         let scope_frame = crate::handles::HandleScopeFrame::enter(self);
         let scope = scope_frame.token();
         let receiver_root = self.scoped_value(&scope, receiver);
+        if let Some(getter) = getter_hit {
+            return self.call_ic_getter(stack, context, receiver_root, getter);
+        }
         // Non-object receivers (primitives, proxies) and saturated sites
         // complete through the full resolution cascade below; the IC layers
         // only serve cache-representable ordinary-object loads.
-        let Some(obj) = receiver.as_object() else {
+        let Some(obj) = object_receiver else {
             match self.projected_load(slot, receiver, atomized_key) {
                 Some(LoadHit::Value(value)) => return Ok(value),
                 Some(LoadHit::Getter(getter)) => {
@@ -151,17 +165,6 @@ impl Interpreter {
             }
             let result = self.load_property_value(context, stack, receiver, atomized_key.name())?;
             return Ok(result);
-        }
-        match slot.probe_load_hit(obj, &self.gc_heap) {
-            Some(LoadHit::Value(value)) => {
-                slot.record_hit();
-                return Ok(value);
-            }
-            Some(LoadHit::Getter(getter)) => {
-                slot.record_hit();
-                return self.call_ic_getter(stack, context, receiver_root, getter);
-            }
-            None => {}
         }
         slot.record_miss();
         // Prototypes on the lookup path get their hidden classes so a handler

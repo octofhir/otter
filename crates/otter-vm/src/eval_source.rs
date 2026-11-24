@@ -41,7 +41,7 @@ pub(crate) fn encode_string(string: crate::JsString, heap: &otter_gc::GcHeap) ->
 pub(crate) fn decode_module(module: &mut BytecodeModule) {
     for constant in &mut module.constants {
         match constant {
-            Constant::String { utf16 } => decode_units(utf16),
+            Constant::String { utf16 } | Constant::StringLiteral { utf16 } => decode_units(utf16),
             Constant::RegExp { pattern_utf16, .. } => decode_units(pattern_utf16),
             Constant::ArrayBoilerplate { elements } => {
                 for element in elements {

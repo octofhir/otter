@@ -501,6 +501,10 @@ impl Writer {
                 self.u8(0);
                 self.utf16(utf16);
             }
+            Constant::StringLiteral { utf16 } => {
+                self.u8(6);
+                self.utf16(utf16);
+            }
             Constant::Number { bits } => {
                 self.u8(1);
                 self.u64(*bits);
@@ -994,6 +998,9 @@ impl<'a> Reader<'a> {
     fn constant(&mut self) -> Option<Constant> {
         Some(match self.u8()? {
             0 => Constant::String {
+                utf16: self.utf16()?,
+            },
+            6 => Constant::StringLiteral {
                 utf16: self.utf16()?,
             },
             1 => Constant::Number { bits: self.u64()? },

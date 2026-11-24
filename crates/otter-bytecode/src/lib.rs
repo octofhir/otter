@@ -2690,10 +2690,15 @@ pub enum SourceKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum Constant {
-    /// String constant. Stored as WTF-16 code units to round-trip
-    /// surrogates losslessly through the JSON dump.
+    /// String used by an operand that needs a name. The same constant
+    /// can also supply a JavaScript string value.
     String {
         /// WTF-16 code units.
+        utf16: Vec<u16>,
+    },
+    /// String used only as a JavaScript value. Linking needs no property atom.
+    StringLiteral {
+        /// Exact WTF-16 code units.
         utf16: Vec<u16>,
     },
     /// Numeric constant stored as raw IEEE-754 bits to round-trip
@@ -3053,7 +3058,7 @@ impl Constant {
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
         match self {
-            Self::String { utf16 } => {
+            Self::String { utf16 } | Self::StringLiteral { utf16 } => {
                 (utf16.capacity() as u64).saturating_mul(std::mem::size_of::<u16>() as u64)
             }
             Self::Number { .. } | Self::FunctionId { .. } => 0,

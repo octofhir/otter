@@ -640,18 +640,21 @@ impl ExecutionContext {
     #[must_use]
     pub fn string_constant_units(&self, idx: u32) -> Option<&[u16]> {
         match self.payload.module.constants.get(idx as usize) {
-            Some(Constant::String { utf16 }) => Some(utf16.as_slice()),
+            Some(Constant::String { utf16 } | Constant::StringLiteral { utf16 }) => {
+                Some(utf16.as_slice())
+            }
             _ => None,
         }
     }
 
-    /// Resolve a string constant as a borrowed UTF-8 string.
+    /// Borrow the encoded spelling of a name operand. Value-only literals
+    /// expose their original units through [`Self::string_constant_units`].
     #[must_use]
     pub fn string_constant_str(&self, idx: u32) -> Option<&str> {
         self.payload.atoms.string_constant_str(idx)
     }
 
-    /// Resolve a string constant in the chunk that owns `function_id`.
+    /// Resolve a name operand in the chunk that owns `function_id`.
     ///
     /// JIT runtime helpers execute with an ambient caller context, but compiled
     /// frames may belong to sibling chunks (Node shims, eval chunks, dynamic

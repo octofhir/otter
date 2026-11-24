@@ -221,7 +221,9 @@ mod tests {
             .constants
             .iter()
             .filter_map(|constant| match constant {
-                Constant::String { utf16 } => Some(String::from_utf16(utf16).unwrap()),
+                Constant::String { utf16 } | Constant::StringLiteral { utf16 } => {
+                    Some(String::from_utf16(utf16).unwrap())
+                }
                 _ => None,
             })
             .collect()
@@ -1089,7 +1091,7 @@ mod tests {
         assert_eq!(main.code[2].op, Op::StoreLocal);
         assert_eq!(main.code[3].op, Op::Return);
         assert_eq!(module.constants.len(), 1);
-        let Constant::String { utf16 } = &module.constants[0] else {
+        let Constant::StringLiteral { utf16 } = &module.constants[0] else {
             panic!("expected String constant");
         };
         assert_eq!(utf16, &vec![b'a' as u16, b'b' as u16, b'c' as u16]);

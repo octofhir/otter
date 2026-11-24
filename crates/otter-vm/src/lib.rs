@@ -1599,8 +1599,7 @@ impl Interpreter {
             .string_constant_units(idx)
             .ok_or_else(|| VmError::InvalidOperand)?;
         let string = JsString::from_utf16_units(units, self.gc_heap_mut())?;
-        // A literal carries the atom linking resolved for its spelling, so
-        // keyed accesses and strict equality on it compare atoms.
+        // A spelling also used by a named operand already has a resolved atom.
         if let Some(atom) = context.property_atom(idx).map(|key| key.atom().id())
             && atom != crate::property_atom::AtomId::NONE
         {

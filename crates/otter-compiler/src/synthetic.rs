@@ -13,10 +13,7 @@
 
 /// Intern an OXC JavaScript string without replacing unpaired surrogates.
 pub(crate) fn intern_js_string(cx: &mut crate::Compiler, value: oxc_str::JSStr<'_>) -> u32 {
-    match value.as_str() {
-        Some(text) => cx.intern_string_constant(text),
-        None => cx.intern_utf16_string_constant(value.encode_utf16().collect()),
-    }
+    cx.intern_string_literal(value)
 }
 
 /// Whether `key` is a string literal holding an unpaired surrogate. No UTF-8 static name

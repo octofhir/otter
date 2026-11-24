@@ -6,9 +6,10 @@
 //! replay — into a `u32` compare instead of a string content compare.
 //!
 //! The bytecode constant pool remains the public/debug source of truth. Each
-//! linked chunk carries an [`AtomTable`] that maps its string constant indexes
+//! linked chunk carries an [`AtomTable`] that maps its name constant indexes
 //! to the owning isolate's global atom ids, resolved once when the chunk is
-//! linked into an interpreter.
+//! linked into an interpreter. A value-only string keeps its original WTF-16
+//! payload and acquires an atom only when runtime key operations need one.
 //!
 //! # Contents
 //! - [`AtomId`] — isolate-global property-key id: a string spelling's, or
@@ -448,7 +449,7 @@ impl AtomTable {
         Some(&self.text[start..slot.end])
     }
 
-    /// Resolve a string constant as a borrowed UTF-8 string.
+    /// Borrow the spelling of a constant used as a name.
     #[must_use]
     pub(crate) fn string_constant_str(&self, idx: u32) -> Option<&str> {
         let index = idx as usize;

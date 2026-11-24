@@ -10,6 +10,8 @@
 //! # Invariants
 //! - Host-provided resolved imports are trusted by lowering; static attribute
 //!   keys are validated before AST requests become `(specifier, attr_type)`.
+//! - A string first seen as a value acquires a name slot in place if a later
+//!   operand needs that spelling. Its index and content hash stay stable.
 //! - The constant pool is append-only. Interning returns the lowest index whose
 //!   entry equals the candidate, exactly as a scan of the pool would; the
 //!   content index only shortens the search.
@@ -145,8 +147,7 @@ pub(crate) struct ModuleBuilder {
     pub(crate) constants: Vec<Constant>,
     /// Content hash → index of the first pool entry with that hash.
     constant_index: rustc_hash::FxHashMap<u64, u32>,
-    /// Code units of the string being interned, reused from one string to
-    /// the next so a string already in the pool costs no allocation.
+    /// Scratch for comparing decoded spellings against the constant pool.
     string_units: Vec<u16>,
     /// Instruction and span buffers a finished function left empty, for
     /// the next function to emit into: a function's buffers grow while it
@@ -187,30 +188,51 @@ impl ModuleBuilder {
     /// [`Self::intern_constant`] of the string constant `value`, which
     /// allocates only when `value` is not in the pool yet.
     pub(crate) fn intern_str_constant(&mut self, value: &str) -> u32 {
-        let mut units = std::mem::take(&mut self.string_units);
-        units.clear();
-        units.extend(value.encode_utf16());
-        let hash = string_hash(&units);
-        let found = match self.constant_index.get(&hash) {
-            Some(&index) => match &self.constants[index as usize] {
-                Constant::String { utf16 } if *utf16 == units => Some(index),
-                _ => self
-                    .constants
-                    .iter()
-                    .position(|constant| {
-                        matches!(constant, Constant::String { utf16 } if *utf16 == units)
-                    })
-                    .map(|index| index as u32),
-            },
-            None => None,
+        self.intern_units(value.encode_utf16(), true)
+    }
+
+    pub(crate) fn intern_string_literal(&mut self, value: oxc_str::JSStr<'_>) -> u32 {
+        if let Some(text) = value.as_str() {
+            self.intern_units(text.encode_utf16(), false)
+        } else {
+            self.intern_units(value.encode_utf16(), false)
+        }
+    }
+
+    fn intern_units(&mut self, units: impl Iterator<Item = u16>, as_name: bool) -> u32 {
+        self.string_units.clear();
+        self.string_units.extend(units);
+        let hash = string_hash(&self.string_units);
+        let matches = |entry: &Constant| {
+            matches!(entry,
+            Constant::String { utf16 } | Constant::StringLiteral { utf16 } if utf16 == &self.string_units)
         };
-        let index = found.unwrap_or_else(|| {
-            self.push_constant(Constant::String {
-                utf16: units.clone(),
-            })
+        let found = self.constant_index.get(&hash).and_then(|&index| {
+            if matches(&self.constants[index as usize]) {
+                Some(index)
+            } else {
+                self.constants
+                    .iter()
+                    .position(matches)
+                    .map(|index| index as u32)
+            }
         });
-        self.string_units = units;
-        index
+        if let Some(index) = found {
+            let entry = &mut self.constants[index as usize];
+            if as_name && let Constant::StringLiteral { utf16 } = entry {
+                *entry = Constant::String {
+                    utf16: std::mem::take(utf16),
+                };
+            }
+            return index;
+        }
+        let utf16 = self.string_units.clone();
+        let constant = if as_name {
+            Constant::String { utf16 }
+        } else {
+            Constant::StringLiteral { utf16 }
+        };
+        self.push_hashed_constant(constant, hash)
     }
 
     /// Empty instruction and span buffers for a function to emit into.
@@ -235,10 +257,13 @@ impl ModuleBuilder {
 
     /// Append `constant` without deduplication and return its index.
     pub(crate) fn push_constant(&mut self, constant: Constant) -> u32 {
+        let hash = constant_hash(&constant);
+        self.push_hashed_constant(constant, hash)
+    }
+
+    fn push_hashed_constant(&mut self, constant: Constant, hash: u64) -> u32 {
         let index = u32::try_from(self.constants.len()).expect("constant pool exceeds u32");
-        self.constant_index
-            .entry(constant_hash(&constant))
-            .or_insert(index);
+        self.constant_index.entry(hash).or_insert(index);
         self.constants.push(constant);
         index
     }
@@ -255,13 +280,13 @@ fn string_hash(units: &[u16]) -> u64 {
 
 fn constant_hash(constant: &Constant) -> u64 {
     use std::hash::{Hash, Hasher};
-    if let Constant::String { utf16 } = constant {
+    if let Constant::String { utf16 } | Constant::StringLiteral { utf16 } = constant {
         return string_hash(utf16);
     }
     let mut hasher = rustc_hash::FxHasher::default();
     std::mem::discriminant(constant).hash(&mut hasher);
     match constant {
-        Constant::String { .. } => unreachable!("hashed above"),
+        Constant::String { .. } | Constant::StringLiteral { .. } => unreachable!("hashed above"),
         Constant::Number { bits } => bits.hash(&mut hasher),
         Constant::FunctionId { index } => index.hash(&mut hasher),
         Constant::BigInt { decimal } => decimal.hash(&mut hasher),

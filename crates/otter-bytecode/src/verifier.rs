@@ -67,6 +67,8 @@ use crate::{
 pub enum BytecodeConstantKind {
     /// WTF-16 string/property/name data.
     String,
+    /// WTF-16 data used only by LoadString.
+    StringLiteral,
     /// IEEE-754 number bits.
     Number,
     /// Function-table id.
@@ -83,6 +85,7 @@ impl BytecodeConstantKind {
     const fn of(constant: &Constant) -> Self {
         match constant {
             Constant::String { .. } => Self::String,
+            Constant::StringLiteral { .. } => Self::StringLiteral,
             Constant::Number { .. } => Self::Number,
             Constant::FunctionId { .. } => Self::FunctionId,
             Constant::BigInt { .. } => Self::BigInt,
@@ -1388,7 +1391,9 @@ fn verify_function(
                     )?;
                     let expected = expected_constant_kind(op);
                     let actual = BytecodeConstantKind::of(constant);
-                    if actual != expected {
+                    if actual != expected
+                        && !(op == Op::LoadString && actual == BytecodeConstantKind::StringLiteral)
+                    {
                         return Err(BytecodeVerifyError::ConstantKind {
                             function_index,
                             instruction_pc,

@@ -442,11 +442,9 @@ impl FunctionContext {
         self.module.borrow_mut().intern_str_constant(value)
     }
 
-    /// Intern a pre-built WTF-16 unit vector.
-    pub(crate) fn intern_utf16_string_constant(&mut self, utf16: Vec<u16>) -> u32 {
-        self.module
-            .borrow_mut()
-            .intern_constant(Constant::String { utf16 })
+    /// Intern the exact units of an OXC literal for a JavaScript value load.
+    pub(crate) fn intern_string_literal(&mut self, value: oxc_str::JSStr<'_>) -> u32 {
+        self.module.borrow_mut().intern_string_literal(value)
     }
 
     pub(crate) fn intern_number_constant(&mut self, value: f64) -> u32 {

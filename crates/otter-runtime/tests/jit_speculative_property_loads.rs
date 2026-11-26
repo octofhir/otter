@@ -928,6 +928,10 @@ let direct = 0;
 for (let call = 0; call < 2000; call++) direct += leaf(original);
 let warmed = 0;
 for (let call = 0; call < 2000; call++) warmed += left(original) + right(original);
+// Enter each caller independently even when the outer loop has spliced both.
+const warmActuals = new Array(20000).fill([original]);
+warmActuals.forEach(Reflect.apply.bind(null, left, undefined));
+warmActuals.forEach(Reflect.apply.bind(null, right, undefined));
 "#;
     const SOURCE: &str = r#"
 const changed = { extra: 0, value: 5 };
@@ -938,6 +942,10 @@ for (let call = 0; call < 10000; call++) {
     total += left(changed) + right(changed);
     retrained += leaf(changed);
 }
+// Let both invalidated callers earn replacement code on their own entries.
+const changedActuals = new Array(4000).fill([changed]);
+changedActuals.forEach(Reflect.apply.bind(null, left, undefined));
+changedActuals.forEach(Reflect.apply.bind(null, right, undefined));
 JSON.stringify([direct, warmed, first, total, retrained]);
 "#;
     let run = compare_with_entry_probes(

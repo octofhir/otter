@@ -838,6 +838,7 @@ fn every_kind() -> Vec<super::ir::Kind> {
         Kind::CheckFunctionPrototypeCall(0),
         Kind::CheckGuardedMethod(0),
         Kind::CheckNative(0, DeoptReason::WrongValue),
+        Kind::CountInlineCall,
         Kind::CheckArgumentsElided,
         Kind::CheckSymbolAtom(0),
         Kind::CheckTaggedBits(0),
@@ -1048,6 +1049,7 @@ fn listed(kind: &super::ir::Kind) {
         | K::CheckFunctionPrototypeCall(_)
         | K::CheckGuardedMethod(_)
         | K::CheckNative(..)
+        | K::CountInlineCall
         | K::CheckArgumentsElided
         | K::CheckSymbolAtom(_)
         | K::CheckTaggedBits(_)

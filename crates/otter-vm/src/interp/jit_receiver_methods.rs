@@ -76,6 +76,7 @@ impl super::Baker<'_> {
                 None,
                 view.call_frequencies.get(&byte_pc).copied(),
                 None,
+                true,
             ) {
                 view.method_targets.insert(byte_pc, vec![method]);
             }

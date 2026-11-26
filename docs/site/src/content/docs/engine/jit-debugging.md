@@ -120,14 +120,21 @@ canonical publication: `installDeclined` identifies the exact function,
 `codeObjectId`, tier and typed `invalidCode` or `resourceBudget` reason. Resource
 refusals include the full centrally computed `requiredBytes` and current
 `availableBytes`; the event is emitted only for an actual post-hook refusal.
-Tier admission uses actually entered source-opcode attempts, immutable compiler
-geometry, compiler attempt counts, and retained-code admission headroom.
-Interpreter dispatch charges one attempt; Template code batches exact source
-prefixes and flushes before reentrant helpers. Expanded lowerings count once per
-source opcode, fused preflight counts zero, and a failed native guard followed by
-interpreter replay counts both entered attempts. Graph code does not add work
-because it is the highest tier. `compilePrepared.sourceWork` records the exact
-visible total, rather than entry or static-span estimates.
+Tier admission uses per-function execution evidence, immutable compiler
+geometry, compiler attempts and retained-code headroom. The interpreter charges
+one unit per dispatched opcode. Template charges estimated body work at entry
+and loop work at backedges. `compilePrepared.sourceWork` records their combined
+total at preparation.
+
+An unfunded entry Graph prepares the root and direct-call proofs. An
+`inlineCandidate` refusal of `deferredUntilUsed` identifies a candidate
+left for later admission. In `optimized-ir.txt`, `CountInlineCall` marks its
+root call bytecode. Several candidate targets can share that one charge.
+Each visit debits the function's shared call budget. At zero the normal VM
+poll can request an expanded generation using fresh feedback. The compact
+generation stays callable during compilation. Successful installation
+unlinks its entry, and published frames keep the old mapping alive through
+return or deopt. OSR can prepare the inline tree on its first request.
 
 Feedback epochs own stable-work origins; generated promotion targets name that
 origin plus outstanding required work. Actual invoked compiler hooks charge an

@@ -3,9 +3,9 @@
 
 Historical compile durations calibrate static compiler geometry. Convert those
 costs once to source-opcode work, rounding every coefficient upward. Runtime
-admission has no duration, entry bonus, or static-span execution estimate.
-Stored holdouts describe the preceding policy; this script does not measure or
-validate the new actual-work policy. Standard library only; no source edits.
+admission compares integer work. The driver below reproduces static costs.
+Stored holdouts describe the preceding policy. Measure current admission with
+a running engine. This calibration uses only the Python standard library.
 """
 
 from __future__ import annotations
@@ -84,7 +84,11 @@ for tier in ("template", "optimizing"):
     )
 coefficients["code_per_register_bytes"] = code_per_register_bytes
 
-# The optimizing tier's per-instruction work is V8's Maglev invocation budget
+# An unfunded entry Graph prepares the root. Later invocations retain the longer stable
+# work window. Native visits to eligible root call sites fund body expansion.
+coefficients["optimizing_first_per_instruction_work"] = 40
+
+# The retry per-instruction work is V8's Maglev invocation budget
 # (`invocation_count_for_maglev`: 400 executions of the function's bytecode),
 # not a compile-cost conversion. An earlier admission compiles paths that have
 # not run yet; their insufficient-feedback deopts and recompiles cost more than
@@ -114,9 +118,12 @@ def minimum_required_work(tier: str, instructions: int, registers: int,
     """
     if min(instructions, registers, parameters, previous_attempts) < 0:
         raise ValueError("static geometry and compiler attempts must be nonnegative")
+    per_instruction = coefficients[f"{tier}_compile_per_instruction_work"]
+    if tier == "optimizing" and previous_attempts == 0:
+        per_instruction = coefficients["optimizing_first_per_instruction_work"]
     compile_work = (
         coefficients[f"{tier}_compile_base_work"]
-        + coefficients[f"{tier}_compile_per_instruction_work"] * instructions
+        + per_instruction * instructions
         + coefficients[f"{tier}_compile_per_register_work"] * registers
         + coefficients[f"{tier}_compile_per_parameter_work"] * parameters
     )

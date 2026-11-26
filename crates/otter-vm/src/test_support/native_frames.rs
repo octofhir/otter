@@ -39,6 +39,7 @@ pub(crate) fn resume_prepared_frame(
     thread.interrupt_cell = vm.jit_interrupt_flag_ptr() as u64;
     thread.gc_heap = vm.jit_gc_heap_ptr() as u64;
     thread.backedge_fuel_cell = vm.jit_backedge_fuel_ptr() as u64;
+    thread.inline_calls_ready = vm.optimizing_tier_policy.inline_calls_ready.as_ptr() as u64;
     thread.global_lexical_epoch_cell = vm.jit_global_lexical_epoch_addr() as u64;
     thread.marking_flag_cell = vm.jit_marking_flag_ptr() as u64;
     thread.array_index_protector_cell = vm.jit_array_index_protector_addr() as u64;

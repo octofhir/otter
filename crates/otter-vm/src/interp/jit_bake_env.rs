@@ -56,6 +56,8 @@ pub(crate) struct BakeEnv {
     /// Optimized entries of the compiled function that bailed, for its
     /// prepared-compile report.
     pub(crate) entry_bail_count: u32,
+    /// Prepare call linkage now and meter visits to eligible inline sites.
+    pub(crate) defer_inline_bodies: bool,
 }
 
 // SAFETY: the shared tables, shape tables and site directory are read only
@@ -101,6 +103,7 @@ impl BakeEnv {
             machine_allocation_allowed: vm.gc_heap.machine_allocation_allowed(),
             retraining: vm.optimizing_tier_policy.retraining_functions(),
             entry_bail_count: 0,
+            defer_inline_bodies: false,
         };
         env.held = env
             .handles()

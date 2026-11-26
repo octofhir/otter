@@ -9,7 +9,10 @@
 //!   feedback, as the candidate tree [`crate::jit_inline_plan`] chooses from.
 //!
 //! # Invariants
-//! - Every candidate consumes the same budget before preparing its descendants.
+//! - An unfunded entry Graph records eligible root call byte PCs without
+//!   walking the inline tree. A reached site charges its source once, even
+//!   when several method targets share that bytecode.
+//! - Every prepared candidate consumes the same budget before preparing its descendants.
 //! - Rejected or failed candidates never replenish work already performed.
 //! - Each body is a fresh owned snapshot; depth bounds recursive preparation.
 //! - A candidate's frequency is its site's calls per entry of the body that
@@ -89,13 +92,18 @@ impl BakeEnv {
 /// site's byte PC and the function it calls.
 pub(super) type InlinePath = smallvec::SmallVec<[(u32, u32); 6]>;
 
+enum InlinePreparation {
+    Immediate,
+    Deferred(rustc_hash::FxHashSet<u32>),
+    Chosen(rustc_hash::FxHashSet<InlinePath>),
+}
+
 pub(super) struct InlineSnapshotBudget {
+    preparation: InlinePreparation,
     remaining: usize,
     /// Frequency of every entered body, outermost first, relative to one
     /// run of the root.
     frequencies: smallvec::SmallVec<[f32; 8]>,
-    /// The chosen inline paths, when a choice was made.
-    chosen: Option<rustc_hash::FxHashSet<InlinePath>>,
     /// The path of the body being baked.
     path: InlinePath,
     /// Depth of the outermost entered body prepared off the chosen paths,
@@ -106,11 +114,18 @@ pub(super) struct InlineSnapshotBudget {
 impl InlineSnapshotBudget {
     pub(super) fn new() -> Self {
         Self {
+            preparation: InlinePreparation::Immediate,
             remaining: 64,
             frequencies: smallvec::SmallVec::new(),
-            chosen: None,
             path: InlinePath::new(),
             unchosen_from: None,
+        }
+    }
+
+    pub(super) fn deferred() -> Self {
+        Self {
+            preparation: InlinePreparation::Deferred(Default::default()),
+            ..Self::new()
         }
     }
 
@@ -118,8 +133,19 @@ impl InlineSnapshotBudget {
     pub(super) fn chosen(chosen: rustc_hash::FxHashSet<InlinePath>) -> Self {
         Self {
             remaining: 256,
-            chosen: Some(chosen),
+            preparation: InlinePreparation::Chosen(chosen),
             ..Self::new()
+        }
+    }
+
+    pub(super) fn deferred_at(&self, byte_pc: u32) -> bool {
+        matches!(&self.preparation, InlinePreparation::Deferred(sites) if sites.contains(&byte_pc))
+    }
+
+    pub(super) fn into_deferred_sites(self) -> rustc_hash::FxHashSet<u32> {
+        match self.preparation {
+            InlinePreparation::Deferred(sites) => sites,
+            _ => Default::default(),
         }
     }
 
@@ -148,16 +174,17 @@ impl InlineSnapshotBudget {
         {
             return false;
         }
+        if let InlinePreparation::Deferred(sites) = &mut self.preparation {
+            sites.extend(byte_pc);
+            return false;
+        }
         self.path.push((byte_pc.unwrap_or(u32::MAX), function_id));
         if byte_pc.is_none() && self.unchosen_from.is_none() {
             self.unchosen_from = Some(self.path.len());
         }
         if !small
             && self.unchosen_from.is_none()
-            && self
-                .chosen
-                .as_ref()
-                .is_some_and(|chosen| !chosen.contains(&self.path))
+            && matches!(&self.preparation, InlinePreparation::Chosen(paths) if !paths.contains(&self.path))
         {
             self.path.pop();
             return false;
@@ -208,6 +235,9 @@ impl FeedbackTree<'_> {
     fn sites(&self, code_block: &crate::CodeBlock) -> Vec<(u32, u32, Option<f32>, SiteKind)> {
         let mut sites = Vec::new();
         for (index, instruction) in code_block.code.iter().enumerate() {
+            if !code_block.admits_graph_splice_at(index as u32) {
+                continue;
+            }
             let op = code_block.op(instruction);
             let Some(byte_pc) = code_block.instruction_byte_pc(index) else {
                 continue;

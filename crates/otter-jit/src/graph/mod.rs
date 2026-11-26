@@ -550,6 +550,7 @@ pub(crate) fn compile_optimized(
             (!dependencies.is_empty()).then(|| view.dependency_flag.clone()),
             dependencies,
             spliced_functions,
+            (!view.deferred_inline_sites.is_empty()).then(|| view.code_block.source_work().clone()),
             plan.register_operands,
             metadata,
         ),

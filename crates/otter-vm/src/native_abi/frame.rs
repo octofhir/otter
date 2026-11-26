@@ -104,6 +104,8 @@ pub struct VmThread {
     pub typed_array_length_protector_cell: u64,
     /// Address of the heap's ephemeral primitive concatenation table.
     pub concat_cache: u64,
+    /// Address of the isolate's one-byte inline admission wakeup.
+    pub inline_calls_ready: u64,
 }
 
 impl VmThread {
@@ -118,6 +120,7 @@ impl VmThread {
             interrupt_cell: 0,
             gc_heap: 0,
             backedge_fuel_cell: 0,
+            inline_calls_ready: 0,
             global_lexical_epoch_cell: 0,
             marking_flag_cell: 0,
             array_index_protector_cell: 0,
@@ -684,7 +687,8 @@ impl Frame {
     }
 }
 
-const _: [(); 136] = [(); std::mem::size_of::<VmThread>()];
+const _: [(); 144] = [(); std::mem::size_of::<VmThread>()];
+const _: [(); 136] = [(); std::mem::offset_of!(VmThread, inline_calls_ready)];
 const _: [(); 8] = [(); std::mem::align_of::<VmThread>()];
 const _: [(); 12] = [(); std::mem::size_of::<VmFrameHeader>()];
 const _: [(); 136] = [(); std::mem::size_of::<Frame>()];

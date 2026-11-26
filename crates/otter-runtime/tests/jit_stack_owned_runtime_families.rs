@@ -20,6 +20,9 @@ use otter_runtime::{
     JitDirectCallLoweringOutcome, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
 };
 
+#[path = "support/interpreted_entries.rs"]
+mod interpreted_entries;
+
 const DIRECT_FAMILIES: &str = r#"
 function BoundaryBase(value) { this.total = value + 1; }
 function scalarBoundary(value) {
@@ -223,15 +226,43 @@ function run(rounds) {
 run(1000);
 "#;
 
+/// Bound the number of actual native invocations for each call spelling.
+/// A production Graph can splice these calls or enter a generated target.
+fn run_context_calls(
+    source: &str,
+    selection: JitSelection,
+    invocations: u64,
+) -> (String, RuntimeExecutionStats) {
+    let mut runtime = Runtime::builder()
+        .jit_compile_threads(0)
+        .jit_selection(selection)
+        .build()
+        .unwrap();
+    let entries = interpreted_entries::InterpretedEntries::observe(&mut runtime);
+    let result = runtime
+        .run_script(SourceInput::from_javascript(source), "jit-context-calls.js")
+        .unwrap();
+    let native = ["plain", "method", "Box"].map(|name| entries.native_calls(name, invocations));
+    assert!(
+        native.iter().all(|&n| n > 0) && native.iter().sum::<u64>() > 1000,
+        "{selection:?}: actual native invocations {native:?}"
+    );
+    let stats = runtime.execution_stats();
+    if selection == JitSelection::Template {
+        assert!(stats.jit_generated_calls > 1000, "{selection:?}: {stats:?}");
+    }
+    (result.completion_string().to_owned(), stats)
+}
+
 #[test]
 fn generated_plain_method_and_construct_calls_create_callee_contexts() {
     let (oracle, _) = run(CONTEXT_CALL_FAMILIES, JitSelection::InterpreterOnly);
     assert_eq!(oracle, "1504500");
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
-        let (compiled, stats) = run(CONTEXT_CALL_FAMILIES, selection);
+        let (compiled, stats) = run_context_calls(CONTEXT_CALL_FAMILIES, selection, 2000);
         assert_eq!(compiled, oracle);
         assert!(
-            stats.jit_generated_calls > 1000,
+            stats.jit_generated_calls > 0,
             "plain/method/construct families must enter generated linkage: {stats:?}"
         );
         assert_eq!(
@@ -290,58 +321,57 @@ fn direct_call_artifacts_link_every_family_to_context_allocating_callees() {
         .expect("artifact completion");
     assert_eq!(completion.completion_string(), "1504500");
     let artifacts = completion.jit_artifacts().expect("artifact batch");
-    let mut generated_kinds = std::collections::BTreeSet::new();
-    let mut context_allocating_callees = std::collections::BTreeSet::new();
-    for bundle in artifacts.bundles() {
-        if let Some(file) = bundle.file(JitArtifactFileName::Relocations) {
-            let relocations: serde_json::Value =
-                serde_json::from_slice(file.contents()).expect("valid relocation JSON");
-            let allocates_context =
-                relocations["relocations"]
-                    .as_array()
-                    .is_some_and(|relocations| {
-                        relocations.iter().any(|relocation| {
-                            relocation["target"]["kind"] == "runtimeStub"
-                                && relocation["target"]["name"] == "create_context_alloc"
+    let bundle = |name: &str| {
+        artifacts
+            .bundles()
+            .iter()
+            .find(|bundle| bundle.manifest().function_name() == name)
+            .unwrap_or_else(|| panic!("missing Template artifact for {name}"))
+    };
+    let json = |name, file| -> serde_json::Value {
+        serde_json::from_slice(bundle(name).file(file).unwrap().contents()).unwrap()
+    };
+    let caller_relocations = json("run", JitArtifactFileName::Relocations);
+    let caller_map = json("run", JitArtifactFileName::CodeMap);
+    let regions = caller_map["regions"].as_array().unwrap();
+    for (callee, operation) in [
+        ("plain", "Call {"),
+        ("method", "MethodCall {"),
+        ("Box", "Construct {"),
+    ] {
+        let fid = bundle(callee).manifest().function_id();
+        assert!(
+            caller_relocations["relocations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|relocation| {
+                    let target = &relocation["target"];
+                    let offset = relocation["startOffset"].as_u64().unwrap();
+                    target["kind"] == "functionEntryCell"
+                        && target["functionId"] == fid
+                        && regions.iter().any(|region| {
+                            region["kind"] == "instruction"
+                                && region["operation"]
+                                    .as_str()
+                                    .is_some_and(|op| op.starts_with(operation))
+                                && region["startOffset"].as_u64().unwrap() <= offset
+                                && offset < region["endOffset"].as_u64().unwrap()
                         })
-                    });
-            let name = bundle.manifest().function_name();
-            if allocates_context && matches!(name, "plain" | "method" | "Box") {
-                context_allocating_callees.insert(name.to_owned());
-            }
-        }
-        let Some(file) = bundle.file(JitArtifactFileName::CodeMap) else {
-            continue;
-        };
-        let map: serde_json::Value =
-            serde_json::from_slice(file.contents()).expect("valid code-map JSON");
-        let Some(regions) = map["regions"].as_array() else {
-            continue;
-        };
-        for direct in regions.iter().filter_map(|region| region.get("directCall")) {
-            if let Some(kind) = direct["callKind"].as_str() {
-                generated_kinds.insert(kind.to_owned());
-            }
-        }
+                }),
+            "the caller's {operation} must load {callee}'s entry cell"
+        );
+        let relocations = json(callee, JitArtifactFileName::Relocations);
+        assert!(
+            relocations["relocations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["target"]["kind"] == "runtimeStub"
+                    && r["target"]["name"] == "create_context_alloc"),
+            "{callee} must allocate the context of its own captured let"
+        );
     }
-    assert_eq!(
-        generated_kinds,
-        ["construct", "method", "plain"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        "every call family must publish a generated direct-call edge"
-    );
-    // Each callee allocates the context of its captured `let` itself; the
-    // caller's edge carries no capture state.
-    assert_eq!(
-        context_allocating_callees,
-        ["Box", "method", "plain"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-        "every callee must allocate its own context"
-    );
 }
 
 const CONTEXT_THROW_FAMILIES: &str = r#"
@@ -391,9 +421,9 @@ fn context_abrupt_paths_commit_once_across_generated_side_exits() {
     let (oracle, _) = run(CONTEXT_THROW_FAMILIES, JitSelection::InterpreterOnly);
     assert_eq!(oracle, "[3,3]");
     for selection in [JitSelection::Template, JitSelection::ProductionTiered] {
-        let (compiled, stats) = run(CONTEXT_THROW_FAMILIES, selection);
+        let (compiled, stats) = run_context_calls(CONTEXT_THROW_FAMILIES, selection, 1001);
         assert_eq!(compiled, oracle);
-        assert!(stats.jit_generated_calls > 1000, "{selection:?}: {stats:?}");
+        assert!(stats.jit_generated_calls > 0, "{selection:?}: {stats:?}");
         // A callee throw unwinds through the throw-routing transition straight
         // to the caller's handler; it is neither a replayed call nor a deopt.
         assert!(

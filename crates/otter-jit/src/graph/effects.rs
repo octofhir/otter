@@ -81,6 +81,8 @@ pub(crate) enum AbstractHeap {
     ContextFacts,
     /// Where movable storage lives; a collection rewrites it.
     Movement,
+    /// Source-owned inline admission counter, outside the JavaScript heap.
+    InlineCallBudget,
 }
 
 impl AbstractHeap {
@@ -89,7 +91,11 @@ impl AbstractHeap {
     pub(crate) fn parent(self) -> Option<Self> {
         Some(match self {
             Self::World => return None,
-            Self::Heap | Self::Frame | Self::Dependencies | Self::Movement => Self::World,
+            Self::Heap
+            | Self::Frame
+            | Self::Dependencies
+            | Self::Movement
+            | Self::InlineCallBudget => Self::World,
             Self::FieldTypes | Self::ChainFacts | Self::ContextFacts => Self::Dependencies,
             Self::Field(_) => Self::Fields,
             Self::ContextSlot(_) => Self::ContextSlots,
@@ -429,6 +435,7 @@ fn heap_effects(kind: &Kind) -> Effects {
                 Effects::reads(heaps)
             }
         }
+        Kind::CountInlineCall => Effects::writes(&[H::InlineCallBudget], &[H::InlineCallBudget]),
         Kind::LoadGlobalBinding(_) => Effects::reads(&[H::Fields, H::MapWords]),
         // The active realm changes only across a call.
         Kind::LoadGlobalThis => Effects::reads(&[H::Frame]),

@@ -1091,7 +1091,7 @@ impl<'a> Builder<'a> {
             && self.inline_plan.admits(body)
             && code.admits_graph_inlining()
             && self.graph.inlined.len() < usize::from(u16::MAX)
-            && self.root_handler_at(outer_pc).is_none()
+            && self.root.code_block.admits_graph_splice_at(outer_pc)
     }
 
     /// How many bodies on the current inline path, the compiled function
@@ -1105,11 +1105,6 @@ impl<'a> Builder<'a> {
             origin = body.parent;
         }
         count
-    }
-
-    /// The exception handler of the compiled function covering `pc`.
-    fn root_handler_at(&self, pc: u32) -> Option<otter_bytecode::ExceptionHandler> {
-        self.root.code_block.control_flow().handler_at(pc)
     }
 
     /// Build `body` in place of the call at the current instruction, whose
@@ -2175,6 +2170,14 @@ impl<'a> Builder<'a> {
 
     fn visit(&mut self, instruction: &Instruction) {
         let op = instruction.op;
+        if self.inline.is_none()
+            && self
+                .view
+                .deferred_inline_sites
+                .contains(&instruction.byte_pc)
+        {
+            self.add(Kind::CountInlineCall, &[], Repr::None);
+        }
         match op {
             Op::Nop => {}
             Op::LoadUndefined => self.set_constant(instruction, UNDEFINED),

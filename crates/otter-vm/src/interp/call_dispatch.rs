@@ -482,6 +482,7 @@ impl Interpreter {
         thread.interrupt_cell = self.jit_interrupt_flag_ptr() as u64;
         thread.gc_heap = self.jit_gc_heap_ptr() as u64;
         thread.backedge_fuel_cell = self.jit_backedge_fuel_ptr() as u64;
+        thread.inline_calls_ready = self.optimizing_tier_policy.inline_calls_ready.as_ptr() as u64;
         thread.global_lexical_epoch_cell = self.jit_global_lexical_epoch_addr() as u64;
         thread.marking_flag_cell = self.jit_marking_flag_ptr() as u64;
         thread.array_index_protector_cell = self.jit_array_index_protector_addr() as u64;

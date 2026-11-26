@@ -857,6 +857,8 @@ pub(crate) enum Kind {
     /// Eager deopt once the activation has materialized its arguments
     /// object: its actual arguments are then that object's elements.
     CheckArgumentsElided,
+    /// Debit a deferred call site before evaluating its source operation.
+    CountInlineCall,
     /// Eager deopt unless input0 is a symbol whose hidden-class atom is the
     /// immediate: the one key an element site's named programs serve.
     CheckSymbolAtom(u32),
@@ -1206,6 +1208,10 @@ impl Kind {
             // A derived constructor changes its physical this binding at
             // super(); lexical capture must read the current binding here.
             Self::LoadThis => Properties {
+                effectful: true,
+                ..Properties::default()
+            },
+            Self::CountInlineCall => Properties {
                 effectful: true,
                 ..Properties::default()
             },
@@ -1705,7 +1711,9 @@ impl Kind {
             | Self::CheckNotHole
             | Self::CheckNative(..) => simple(1, ResultPolicy::None),
             Self::LoadClassConstructor => simple(1, ResultPolicy::Register),
-            Self::CheckArgumentsElided | Self::CheckStackHeadroom => simple(0, ResultPolicy::None),
+            Self::CountInlineCall | Self::CheckArgumentsElided | Self::CheckStackHeadroom => {
+                simple(0, ResultPolicy::None)
+            }
             Self::LoadArgumentCount => simple(0, ResultPolicy::Register),
             Self::LoadActualArgument => simple(1, ResultPolicy::Register),
             Self::SelectArgument { count } => {

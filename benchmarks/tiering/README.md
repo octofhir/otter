@@ -1,15 +1,9 @@
 # Tier-policy calibration
 
-`TierWorkModel` admits native compilation from actually entered source-opcode
-attempts. A function's immutable `CodeBlock` owns one shared `SourceWork` scalar;
-interpreter dispatch and Template execution charge that same allocation. A call
-entry, backedge, static loop span, or skipped branch creates no work by itself.
-Static function geometry predicts compiler work and code-memory cost only.
-Runtime admission uses integer work units; elapsed durations remain diagnostics.
-
-The current actual-work policy has not been performance measured. Historical
-holdouts below belong to the preceding policy and cannot establish that the new
-admission points improve speed, startup, compilation cost, or memory.
+`TierWorkModel` admits native compilation from source-owned execution evidence.
+Interpreter dispatch counts entered opcodes. Template charges body geometry at
+entry and loop work at polls. Baseline admission also credits counted entries.
+These estimates and the native Graph call budget have separate units.
 
 ## Current model
 
@@ -18,14 +12,16 @@ parameters, and `A` earlier compiler invocations for this function and tier.
 The fixed compiler-work estimates are:
 
 - Template: `334 + 23*N + 4*R + 7*P` source-opcode work units.
-- Optimizing Graph: `750 + 400*N + 2*R + 4*P` source-opcode work units.
+- First Graph invocation: `750 + 40*N + 2*R + 4*P`.
+- Subsequent Graph invocations: `750 + 400*N + 2*R + 4*P`.
 
-The Graph per-instruction term is V8's Maglev invocation budget
-(`invocation_count_for_maglev`: 400 executions of the function's bytecode), not
-a compile-cost conversion. Admitting a function earlier compiles paths that have
-not run yet; their insufficient-feedback deopts, retraining and recompiles cost
-more than the compile itself. On the fixed-work TypeScript compiler run the
-previous 88 per instruction cost 6% more instructions than 400.
+An entry Graph first prepares the root and its direct call linkage. Eligible
+call bytecodes debit a source-owned budget when native control reaches them.
+Across compact generations, 16,384 visits fund compilation with the current
+inline tree. A noncollecting store wakes the mutator poll, which submits the
+replacement using the normal source, realm, dependency and resource checks.
+An OSR request already has evidence of a live loop and can prepare its tree
+immediately. Template prepares immediate straight-line leaf candidates.
 
 Predicted code bytes are `560 + 56*N + 16*R` for Template and
 `320 + 38*N + 16*R` for Graph. The memory charge is
@@ -59,18 +55,16 @@ source work. The static code estimate predicts compiler/memory work; it does not
 replace actual retained resource usage or create a second ledger.
 
 For the synthetic geometry `N=1, R=1, P=0, A=0`, required work is 573 Template
-attempts or 1228 Graph attempts. These are geometry examples, not universal call
-thresholds. Only instructions actually entered on a path accumulate work.
+attempts or 868 first-Graph attempts. These are geometry examples, not universal call
+thresholds. Graph expansion counts visits to eligible call sites across compact generations.
 
 `fit_cost_model.py` converts historical compiler-cost coefficients offline using
 12 ns per Template source opcode and 20 ns per Graph source opcode, then takes the
-Graph per-instruction term from the V8 budget above. Each
+first and repeat Graph per-instruction terms from the admission policy. Each
 coefficient is rounded upward: for example, `ceil(4000/12)=334` and
 `ceil(270/12)=23`. The historical 4 ns/byte memory charge converts to the exact
 divisors 3 and 5. The 12/20 denominators are conservative terms retained from the
-prior calibration, not current measurements of every opcode's cost. Neither
-these durations nor an entry bonus or whole-body execution estimate is present
-in runtime admission.
+prior calibration, not current measurements of every opcode's cost. The runtime uses integer work and visits, without reading a clock.
 
 Run `python3 -B benchmarks/tiering/fit_cost_model.py` from any directory. It uses
 only the standard library, prints the current work/code coefficients and clearly
@@ -79,7 +73,7 @@ and selects the retained capacity CDF. It performs no engine run, new benchmark,
 or leave-one-workload-out refit.
 
 For the direct anchor geometry `N=13, R=12, P=2, A=0`, it prints minimum required
-work of 1190 Template attempts and 6185 Graph attempts. This is a static compiler
+work of 1190 Template attempts and 1505 first-Graph attempts. This is a static compiler
 geometry estimate, conditional on sufficient `available_code_bytes`. The script
 also labels predicted code geometry as `estimated_code_bytes`; the old census
 contains no exact retained-lease headroom samples and reports that input as

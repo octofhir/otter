@@ -269,6 +269,8 @@ pub enum JitInlineRejectionReason {
         /// The callee creates a nested function.
         makes_function: bool,
     },
+    /// A compact entry generation measures demand at this eligible call.
+    DeferredUntilUsed,
     /// No immutable compile snapshot exists for the candidate.
     MissingSnapshot,
 }

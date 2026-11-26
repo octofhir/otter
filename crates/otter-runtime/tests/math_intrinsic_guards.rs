@@ -193,6 +193,14 @@ for (let warm = 0; warm < 4010; warm++) {
     guardedInt32InheritedAbs(guardedInheritedMath, -7);
     guardedMathLoop(Math, 16);
 }
+// A native caller enters each measured wrapper even if the warm loop inlines it.
+function warmMathEntry(fn, actuals) {
+    new Array(1024).fill(actuals).forEach(Reflect.apply.bind(null, fn, undefined));
+}
+warmMathEntry(guardedInt32MathAbs, [Math, -7]);
+warmMathEntry(guardedInt32MathMin, [Math, -7, 2]);
+warmMathEntry(guardedInt32MathMax, [Math, -7, 2]);
+warmMathEntry(guardedInt32InheritedAbs, [guardedInheritedMath, -7]);
 "#;
 
 /// Panic unless `setup` captured an optimizing bundle for `function`.

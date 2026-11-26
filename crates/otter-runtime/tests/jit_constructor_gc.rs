@@ -504,11 +504,21 @@ fn run_at_selection(fixture: AllocationFixture, selection: JitSelection) {
         .build()
         .expect("constructor GC runtime");
     runtime.set_tracer(Some(Box::new(Tracer(trace.clone()))));
+    let mut setup = fixture.setup_observed(allocations);
+    // An OSR driver can splice the wrapper into its loop. The collecting
+    // probe enters the wrapper itself and needs that exact native mapping.
+    if selection == JitSelection::ProductionTiered {
+        setup.push_str(match fixture {
+            AllocationFixture::Fixed => {
+                "new Array(1024).fill('warm').forEach(constructGc.bind(null, GcBase));"
+            }
+            AllocationFixture::Spread => {
+                "new Array(1024).fill(warmArgs).forEach(constructSpreadGc.bind(null, SpreadGcBase));"
+            }
+        });
+    }
     let warm = runtime
-        .run_script(
-            SourceInput::from_javascript(fixture.setup_observed(allocations)),
-            MODULE,
-        )
+        .run_script(SourceInput::from_javascript(setup), MODULE)
         .expect("warm constructor linkage");
     assert!(
         records.lock().unwrap().is_empty(),

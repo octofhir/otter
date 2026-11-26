@@ -417,8 +417,8 @@ Pure Rust implementation - no external JavaScript engine dependencies.
     `backendUnsupported`, including the current x86 method resolver/generic path.
     `installDeclined` identifies the exact code object and
     reports `invalidCode` or the full resource requirement and available
-    physical headroom. `compilePrepared.sourceWork` reports entered source-opcode
-    attempts visible before the hook; `compilePrepared` reports `directConstructs`, `directMethodSites` and
+    physical headroom. `compilePrepared.sourceWork` reports interpreter opcode attempts and
+    Template entry/loop work charges visible before the hook. `compilePrepared` reports `directConstructs`, `directMethodSites` and
     `directMethodTargets` separately from body-inline candidate counts, while
   `bindingSites` counts schema-typed global, captured, dynamic, and shadowed
   binding accesses; `bindingHitProofs` counts stable global-declarative cells

@@ -65,7 +65,8 @@ function receiverStrict(value) { 'use strict'; return receiverBinding.call(this,
 function receiverBinding(value) { return [typeof this, this === globalThis, this === value]; }
 const receiverLexical = (function () { const arrow = () => this; return arrow; }).call({lexical: 37});
 globalThis.receiverWarmChild = {marker: 731};
-new Array(5000).fill(0).map(receiverMake).length;
+// Execute the receiver call sites long enough to admit their nested bodies.
+new Array(24000).fill(0).map(receiverMake).length;
 "#;
 const HIT: &str = r#"
 (function receiverHitProbe() {
@@ -466,7 +467,7 @@ fn actual_sloppy_object_splices_keep_loaded_intrinsics_source_recipes_and_moving
         .unwrap();
     assert_eq!(
         run(&mut oracle, SETUP, "receiver:oracle-setup").completion_string(),
-        "5000"
+        "24000"
     );
     let expected_hit = run(&mut oracle, HIT, "receiver:oracle-hit")
         .completion_string()
@@ -500,7 +501,7 @@ fn actual_sloppy_object_splices_keep_loaded_intrinsics_source_recipes_and_moving
     let trace = Arc::new(Mutex::new(Trace::default()));
     runtime.set_tracer(Some(Box::new(Tracer(trace.clone()))));
     let warm = run(&mut runtime, SETUP, "receiver-inline-setup.js");
-    assert_eq!(warm.completion_string(), "5000");
+    assert_eq!(warm.completion_string(), "24000");
     let report = warm.jit_debug_report().unwrap();
     assert!(!report.truncated());
     assert_eq!(report.dropped_events(), 0);

@@ -90,15 +90,14 @@ impl Interpreter {
     /// hand it to the compiler, to replace the function's current native
     /// generation.
     ///
-    /// Compilation leaves the current baseline generation installed. With
+    /// The current Template or compact Graph serves entries during compilation. With
     /// compiler threads the request returns `None` at once and the isolate
     /// installs the result later
     /// ([`Self::install_finished_optimized_compiles`]); without them the body
     /// compiles here and is returned installed. A successful entry-capable
     /// optimizer is published through the function's stable entry cell;
     /// generated callers observe it on their next entry without
-    /// recompilation. A declined optimizer leaves the baseline target
-    /// untouched.
+    /// recompilation. A declined expansion keeps the current entry mapping.
     ///
     /// Unsupported functions return `None`; a retraining function stays in the
     /// interpreter before any compile preparation or allocation begins, and a
@@ -128,7 +127,7 @@ impl Interpreter {
     }
 
     /// [`Self::compile_optimized_jit_function`] once the policy admitted it.
-    fn compile_optimized_jit_function_session(
+    pub(super) fn compile_optimized_jit_function_session(
         &mut self,
         context: &ExecutionContext,
         fid: u32,
@@ -144,6 +143,7 @@ impl Interpreter {
         // Everything the bake reads it reads on a compiler thread; the
         // isolate captures only what is not shared with it.
         let mut env = super::jit_bake_env::BakeEnv::capture(self);
+        env.defer_inline_bodies = osr_pc.is_none() && !function.source_work().inline_calls_funded();
         env.entry_bail_count = self.jit_entry_bail_counts.get(&fid).copied().unwrap_or(0);
         let products = std::sync::Arc::new(crate::jit_compile_queue::BakeProducts::holding(
             env.held_roots(),
@@ -246,6 +246,9 @@ impl Interpreter {
     #[inline]
     pub(crate) fn install_finished_optimized_compiles(&mut self) {
         self.retire_fired_jit_code();
+        if self.optimizing_tier_policy.inline_calls_ready.replace(0) != 0 {
+            self.expand_funded_inline_calls();
+        }
         if self.jit_compile_queue.has_finished() {
             for (pending, finished) in self.jit_compile_queue.take_finished() {
                 let retry_code_reclamation = pending.retry_code_reclamation;
@@ -369,6 +372,7 @@ impl Interpreter {
             // A bake a collection made yield left nothing; nothing cancelled
             // it, so its function compiles again from the current facts.
             if yielded {
+                self.rearm_inline_expansion(fid);
                 rearm(self);
             }
             return None;
@@ -407,6 +411,7 @@ impl Interpreter {
                         crate::jit_registry::JitInstallError::DependencyChanged,
                     );
                     self.jit_optimized_code_cache = None;
+                    self.rearm_inline_expansion(fid);
                     rearm(self);
                     return None;
                 }
@@ -431,6 +436,12 @@ impl Interpreter {
                         if let Some(name) = &perf_name {
                             self.record_jit_perf_map(name, code.as_ref(), "optimizing");
                         }
+                        if code
+                            .inline_call_budget()
+                            .is_some_and(|work| work.inline_calls_funded())
+                        {
+                            self.optimizing_tier_policy.inline_calls_ready.set(1);
+                        }
                         self.jit_optimized_code.insert(fid, Some(code.clone()));
                         self.jit_optimized_declined_epoch.remove(&fid);
                         self.jit_optimized_code_cache = self
@@ -449,6 +460,7 @@ impl Interpreter {
                             crate::jit_registry::JitInstallError::DependencyChanged,
                         );
                         self.jit_optimized_code_cache = None;
+                        self.rearm_inline_expansion(fid);
                         rearm(self);
                         return None;
                     }
@@ -462,6 +474,9 @@ impl Interpreter {
                                 crate::tier_policy::CostedTier::Optimizing,
                                 required_bytes,
                             );
+                            if function.source_work().inline_calls_funded() {
+                                function.source_work().defer_inline_calls_for_pressure();
+                            }
                         }
                         self.record_jit_install_declined(
                             fid,
@@ -481,7 +496,7 @@ impl Interpreter {
         if declined {
             match osr_pc {
                 None => {
-                    self.jit_optimized_code.insert(fid, None);
+                    self.jit_optimized_code.entry(fid).or_insert(None);
                 }
                 Some(_) => {
                     self.jit_optimized_declined_epoch
@@ -604,7 +619,7 @@ impl Interpreter {
             return TemplateCompileOutcome::Deferred;
         };
         let context = &*owner;
-        if self.prepare_template_facts(context, fid).is_none() {
+        if self.prepare_compile_facts(context, fid).is_none() {
             return TemplateCompileOutcome::Deferred;
         }
         let Some(function) = owner.code_block_arc(fid) else {

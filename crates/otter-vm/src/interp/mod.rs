@@ -19,6 +19,7 @@ pub(crate) mod jit_bake_env;
 mod jit_call;
 mod jit_compile;
 mod jit_compile_facts;
+mod jit_inline_admission;
 pub(crate) mod jit_intrinsic_properties;
 mod jit_method_feedback;
 mod jit_retraining;

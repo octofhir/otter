@@ -90,6 +90,10 @@ for (let warm = 0; warm < 20000; warm++) {
   const retained = iterationClosures(lexicalWarmChild);
   retained[0](); retained[1](); retained[2](); retained[3]();
 }
+// The loop can splice the whole constructor into its own OSR generation.
+// Enter the constructor itself to earn the factory splice the probe measures.
+const lexicalActuals = [lexicalWarmChild, lexicalObserve, lexicalWarmReceiver];
+new Array(24000).fill(0).forEach(() => Reflect.construct(LexicalOwner, lexicalActuals));
 "#;
 const PROBE: &str = r#"
 const lexicalProbeChild = makeLexicalChild();

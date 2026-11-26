@@ -24,6 +24,9 @@ use otter_runtime::{
     JitDebugEvent, JitDebugRequest, JitSelection, Runtime, RuntimeExecutionStats, SourceInput,
 };
 
+#[path = "support/interpreted_entries.rs"]
+mod interpreted_entries;
+
 const SOURCE: &str = r#"
 let getterEffects = 0;
 const receiver = {
@@ -116,13 +119,14 @@ function stackOwnedCaller(rounds) {
 String(stackOwnedCaller(5000));
 "#;
 
-fn run_stack_owned_array_spread() -> (String, RuntimeExecutionStats, Vec<JitDebugEvent>) {
+fn run_stack_owned_array_spread() -> (String, RuntimeExecutionStats, Vec<JitDebugEvent>, u64) {
     let mut runtime = Runtime::builder()
         .jit_compile_threads(0)
         .jit_selection(JitSelection::ProductionTiered)
         .jit_debug(JitDebugRequest::events())
         .build()
         .expect("stack-owned spread runtime");
+    let entries = interpreted_entries::InterpretedEntries::observe(&mut runtime);
     let result = runtime
         .run_script(
             SourceInput::from_javascript(STACK_OWNED_ARRAY_SPREAD),
@@ -138,15 +142,16 @@ fn run_stack_owned_array_spread() -> (String, RuntimeExecutionStats, Vec<JitDebu
         result.completion_string().to_owned(),
         runtime.execution_stats(),
         events,
+        entries.native_calls("stackOwnedSpread", 5000),
     )
 }
 
 #[test]
 fn generated_spread_wrapper_completes_without_entry_deopt() {
-    let (completion, stats, events) = run_stack_owned_array_spread();
+    let (completion, stats, events, native_spreads) = run_stack_owned_array_spread();
     assert_eq!(completion, "12507500");
     assert!(
-        stats.jit_generated_template_returns > 1000,
+        stats.jit_generated_template_returns > 0 && native_spreads > 1000,
         "the generated wrapper must complete natively: {stats:?}"
     );
     // An interrupt exit hands the running wrapper to the tier-up policy; any

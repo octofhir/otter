@@ -75,36 +75,6 @@ impl Interpreter {
         literals
     }
 
-    /// [`Self::prepare_compile_facts`] for a template compilation: `fid`, and
-    /// the method targets whose bodies may lend it field proofs.
-    pub(super) fn prepare_template_facts(
-        &mut self,
-        context: &ExecutionContext,
-        fid: u32,
-    ) -> Option<()> {
-        self.prepare_compile_facts(context, fid)?;
-        let owner = context.for_function(fid).ok()?;
-        let function = owner.exec_function(fid)?;
-        let targets: Vec<u32> = function
-            .code
-            .iter()
-            .filter(|instruction| function.op(*instruction) == Op::CallMethodValue)
-            .filter_map(|instruction| instruction.property_ic_site())
-            .filter_map(|site| self.method_target_feedback(site))
-            .flat_map(|feedback| match feedback {
-                crate::MethodCallFeedback::Mono { method_fid, .. } => vec![method_fid],
-                crate::MethodCallFeedback::Poly(targets) => {
-                    targets.iter().map(|target| target.method_fid).collect()
-                }
-                _ => Vec::new(),
-            })
-            .collect();
-        for target in targets {
-            let _ = self.prepare_compile_facts(context, target);
-        }
-        Some(())
-    }
-
     /// Run a compilation's install tasks before its code is published; `false`
     /// when a fact its code reads changed since baking, which declines it.
     pub(super) fn run_install_tasks(&mut self, install: super::jit_bake::InstallTasks) -> bool {

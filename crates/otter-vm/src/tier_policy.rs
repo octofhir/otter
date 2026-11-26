@@ -1,14 +1,15 @@
-//! Deterministic native-tier admission from actually entered source opcodes.
+//! Native-tier admission from per-source work and executed inline candidates.
 //!
 //! # Contents
 //! - [`TierWorkModel`] converts immutable compiler geometry to opcode work.
 //! - [`TierPolicy`] owns feedback origins, compiler attempts and retraining.
-//! - [`crate::native_abi::SourceWork`] is the one shared execution scalar.
+//! - [`crate::native_abi::SourceWork`] owns execution evidence across generations.
 //!
 //! # Invariants
-//! - Interpreter dispatch and Template source paths charge each entered opcode
-//!   attempt once. Entries, backedges and static spans never create work.
-//! - Static geometry predicts compiler work and code-memory cost only.
+//! - Interpreter dispatch counts entered instructions. Template estimates work
+//!   from body geometry at entry and loop spans at backedges.
+//! - Compact Graphs count actual visits to deferred calls. A paid expansion
+//!   uses the usual resource admission and installation checks.
 //! - Wall-clock durations are diagnostics and never enter policy.
 //! - Feedback changes restart the stable work origin; wakeup targets name that
 //!   origin plus required work, preserving already observed work.
@@ -103,7 +104,6 @@ impl TierWorkDecision {
     pub(crate) const fn should_compile(self) -> bool {
         matches!(self.reason, TierWorkReason::Affordable)
     }
-    #[cfg(test)]
     pub(crate) const fn resource_blocked(self) -> bool {
         matches!(self.reason, TierWorkReason::CodeMemoryBudget)
     }
@@ -119,8 +119,8 @@ const ENTRY_WORK: u64 = 32;
 
 /// Fixed integer source-work costs, reproduced by the checked-in fit script.
 /// Conservative historical per-op calibration is converted once, rounding
-/// compiler costs upward; the Graph per-instruction term is an invocation
-/// budget instead. No duration or entry/loop model exists at runtime.
+/// compiler costs upward. Graph uses separate first-invocation and retry
+/// budgets. The runtime needs no clock to decide admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TierWorkModel;
 
@@ -138,6 +138,11 @@ impl TierWorkModel {
         let (base, instruction, register, parameter, code_base, code_instruction, memory_divisor) =
             match input.tier {
                 CostedTier::Template => (334u64, 23u64, 4u64, 7u64, 560u64, 56u64, 3u64),
+                // The first Graph admits the root cheaply; subsequent compiler invocations
+                // require a longer stable window after observing more source paths.
+                CostedTier::Optimizing if input.previous_compile_attempts == 0 => {
+                    (750, 40, 2, 4, 320, 38, 5)
+                }
                 CostedTier::Optimizing => (750u64, 400u64, 2u64, 4u64, 320u64, 38u64, 5u64),
             };
         let compile_work = base
@@ -237,6 +242,8 @@ impl RetrainingActivation {
 
 #[derive(Debug, Default)]
 pub(crate) struct TierPolicy {
+    /// Set by native compact code when a source first earns body inlining.
+    pub(crate) inline_calls_ready: std::cell::Cell<u8>,
     functions: FxHashMap<u32, FunctionTierState>,
     retraining_functions: usize,
 }

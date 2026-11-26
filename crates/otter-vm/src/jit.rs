@@ -947,6 +947,8 @@ pub struct JitCompileSnapshot {
     /// and splices accepted bodies under an identity guard; a failed guard
     /// side-exits at the exact caller PC.
     pub inline_callees: rustc_hash::FxHashMap<u32, JitInlineCallee>,
+    /// Root byte PCs where an eligible call earns expansion of the inline tree.
+    pub deferred_inline_sites: rustc_hash::FxHashSet<u32>,
     /// Calls per entry of this body at each call and method
     /// site with call feedback, keyed by byte PC: what an optimizing caller
     /// weighs its inline candidates by. Baked with the call-site plans.
@@ -1863,9 +1865,8 @@ pub struct JitMethodTarget {
     pub guard: JitMethodGuard,
     /// Exact entry generation and callee frame shape.
     pub callee: Option<JitDirectCallee>,
-    /// The method's fully baked body, for an optimizing caller that builds
-    /// it in place of the call; absent when the method needs an activation
-    /// of its own or the inline budget is spent.
+    /// Instructions of a Template leaf candidate or the fully prepared Graph
+    /// splice. The requested tier owns the contents of this exact target.
     pub body: Option<Arc<JitCompileSnapshot>>,
     /// Optional Template descriptor proof over this exact prepared body.
     /// Present only when `body` is present; final leaf/arity checks still apply.
@@ -2584,6 +2585,7 @@ impl JitCompileSnapshot {
             direct_constructs: rustc_hash::FxHashMap::default(),
             method_targets: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
+            deferred_inline_sites: Default::default(),
             call_frequencies: rustc_hash::FxHashMap::default(),
             invokes: 0.0,
             guarded_method_calls: rustc_hash::FxHashMap::default(),
@@ -2893,6 +2895,11 @@ pub(crate) struct JitExitProfile {
 /// emitted callers branch to an already-installed callee through its guarded
 /// entry cell.
 pub trait JitFunctionCode: std::fmt::Debug + Send + Sync {
+    /// Source cell debited by this generation's deferred inline sites.
+    fn inline_call_budget(&self) -> Option<&crate::native_abi::SourceWork> {
+        None
+    }
+
     /// Immutable metadata for this installed code object.
     fn metadata(&self) -> crate::native_abi::CodeObjectMetadata;
 

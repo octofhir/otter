@@ -335,6 +335,7 @@ fn record_method_distribution(
 }
 
 impl Interpreter {
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn method_target_feedback(&self, site: usize) -> Option<MethodCallFeedback> {
         self.method_feedback().method_targets(site)

@@ -656,6 +656,7 @@ impl CodeBlock {
             direct_constructs: rustc_hash::FxHashMap::default(),
             method_targets: rustc_hash::FxHashMap::default(),
             inline_callees: rustc_hash::FxHashMap::default(),
+            deferred_inline_sites: Default::default(),
             call_frequencies: rustc_hash::FxHashMap::default(),
             invokes: 0.0,
             guarded_method_calls: rustc_hash::FxHashMap::default(),
@@ -1000,6 +1001,13 @@ impl CodeBlock {
     pub fn admits_graph_inlining(&self) -> bool {
         self.instruction_count() <= crate::jit::JIT_MAX_INLINED_INSTRUCTIONS
             && self.control_flow().handlers().is_empty()
+    }
+
+    /// Whether a call at this logical PC can own an inlined Graph activation.
+    /// A protected call must keep its own activation for the caller's handler.
+    #[must_use]
+    pub fn admits_graph_splice_at(&self, pc: u32) -> bool {
+        self.control_flow().handler_at(pc).is_none()
     }
 
     /// Whether legacy `fn.arguments` reads an activation of this body: an

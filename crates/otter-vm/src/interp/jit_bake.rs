@@ -8,7 +8,8 @@
 //!   code is published, and the debug events it records.
 //! - Per-site passes (literals, globals, property CacheIR, element and keyed
 //!   accesses, guarded methods, closures, exit evidence) and the inline-body
-//!   tree (call-site plans, method targets, field types, proved stores).
+//!   tree for Graph. Template candidates carry the leaf instruction stream
+//!   and the receiver fields proven at the call site.
 //!
 //! # Invariants
 //! - Baking has no effect the mutator can observe: it allocates nothing on the
@@ -400,7 +401,7 @@ impl<'a> Baker<'a> {
                     .filter(|targets| {
                         targets
                             .iter()
-                            .filter(|target| target.inline_fields.is_some())
+                            .filter(|target| target.body.is_some())
                             .count()
                             == 1
                     })
@@ -1835,12 +1836,12 @@ impl Baker<'_> {
 
     /// Bake one spliced body's own compile inputs.
     ///
-    /// A body compiled inside another function resolves its constants, global
+    /// A Graph body compiled inside another function resolves its constants, global
     /// cells, hidden classes and call plans against *itself*, exactly as it
     /// would as an outermost function. Only a source in the active realm may
     /// prepare a splice: another realm's body cannot inherit the physical
     /// caller's global cells. Nested candidates share the root budget and use
-    /// this body's own feedback; the compiler decides which bodies to splice.
+    /// this body's own feedback. Template only inspects the immediate leaf.
     fn bake_inline_body(
         &mut self,
         context: &ExecutionContext,
@@ -1866,22 +1867,23 @@ impl Baker<'_> {
         {
             return None;
         }
-        if self.unlinked_body(context, fid) {
-            return None;
-        }
         let result = (|| {
+            if self.unlinked_body(context, fid) {
+                return None;
+            }
             let mut body = context.jit_compile_snapshot(fid)?;
+            if tier == jit_debug::JitDebugTier::Template {
+                // Template's inline emitter accepts only straight-line leaves.
+                // It reads the instruction stream and the method target's own
+                // field proof. Only Graph can splice a call inside this body.
+                return Some(std::sync::Arc::new(body));
+            }
             self.bake_literal_allocations(&mut body, context, fid)
                 .ok()?;
             Self::bake_typed_array_layout(&mut body);
             Self::bake_string_layout(&mut body);
-            self.bake_literal_cells(
-                &mut body,
-                context,
-                fid,
-                tier == jit_debug::JitDebugTier::Template,
-            )
-            .ok()?;
+            self.bake_literal_cells(&mut body, context, fid, false)
+                .ok()?;
             self.bake_global_lexical_loads(&mut body, context, fid);
             self.bake_binding_hit_proofs(&mut body, context, fid);
             self.bake_property_cache_ir(&mut body, context);
@@ -1896,9 +1898,7 @@ impl Baker<'_> {
             self.bake_keyed_name_sites(&mut body);
             Self::bake_context_allocations(&mut body);
             self.bake_closure_allocations(&mut body, context);
-            if tier == jit_debug::JitDebugTier::Optimizing {
-                self.bake_unique_closure_context(&mut body);
-            }
+            self.bake_unique_closure_context(&mut body);
             self.bake_optimized_exit_profile(&mut body, fid);
             Some(std::sync::Arc::new(body))
         })();
@@ -2003,18 +2003,22 @@ impl Baker<'_> {
         fid: u32,
         tier: jit_debug::JitDebugTier,
     ) {
-        let mut budget = if tier == jit_debug::JitDebugTier::Optimizing {
-            InlineSnapshotBudget::chosen(crate::jit_inline_plan::choose_inlined(
-                &mut inline_snapshot_budget::FeedbackTree {
-                    interp: self.env,
-                    context,
-                    root: fid,
-                },
-            ))
-        } else {
-            InlineSnapshotBudget::new()
-        };
+        let mut budget =
+            if self.env.defer_inline_bodies && tier == jit_debug::JitDebugTier::Optimizing {
+                InlineSnapshotBudget::deferred()
+            } else if tier == jit_debug::JitDebugTier::Optimizing {
+                InlineSnapshotBudget::chosen(crate::jit_inline_plan::choose_inlined(
+                    &mut inline_snapshot_budget::FeedbackTree {
+                        interp: self.env,
+                        context,
+                        root: fid,
+                    },
+                ))
+            } else {
+                InlineSnapshotBudget::new()
+            };
         self.bake_call_site_plans(view, context, fid, tier, &mut budget);
+        view.deferred_inline_sites = budget.into_deferred_sites();
     }
 
     /// Call-site plan baking shared by an outermost body and a spliced one.
@@ -2427,7 +2431,9 @@ impl Baker<'_> {
                 // Only the optimizing tier splices a reduced `f.call` target.
                 let tier_splices =
                     !function_prototype_call || tier == jit_debug::JitDebugTier::Optimizing;
-                if inline_ineligible
+                if (tier == jit_debug::JitDebugTier::Optimizing
+                    && !view.code_block.admits_graph_splice_at(instruction_pc))
+                    || inline_ineligible
                     || target_count != 1
                     || !tier_splices
                     || !callee.admits_graph_inlining()
@@ -2448,7 +2454,11 @@ impl Baker<'_> {
                         instruction_pc,
                         tier,
                         Some(callee_fid),
-                        Some(jit_debug::JitInlineRejectionReason::MissingSnapshot),
+                        Some(if budget.deferred_at(call_byte_pc) {
+                            jit_debug::JitInlineRejectionReason::DeferredUntilUsed
+                        } else {
+                            jit_debug::JitInlineRejectionReason::MissingSnapshot
+                        }),
                     );
                     continue;
                 };
@@ -2537,6 +2547,8 @@ impl Baker<'_> {
                 })
                 .collect();
         for snap in method_sites {
+            let allow_body = tier != jit_debug::JitDebugTier::Optimizing
+                || view.code_block.admits_graph_splice_at(snap.instruction_pc);
             let mut method_targets = Vec::with_capacity(snap.targets.len());
             let target_count = u32::try_from(snap.targets.len()).unwrap_or(u32::MAX);
             for (target_index, target) in snap.targets.iter().enumerate() {
@@ -2550,6 +2562,7 @@ impl Baker<'_> {
                     Some(snap.call_byte_pc),
                     view.call_frequencies.get(&snap.call_byte_pc).copied(),
                     snap.accessor_byte,
+                    allow_body,
                 ) {
                     Ok(method) => {
                         let outcome = method.callee.map_or(
@@ -2673,6 +2686,7 @@ impl Baker<'_> {
         call_byte_pc: Option<u32>,
         site_frequency: Option<f32>,
         accessor_byte: Option<u32>,
+        allow_body: bool,
     ) -> Result<jit::JitMethodTarget, jit_debug::JitDirectCallRejectionReason> {
         let method_context = context
             .for_function(target.method_fid)
@@ -2702,14 +2716,16 @@ impl Baker<'_> {
                 receiver_allocation: None,
             }
         });
-        let template_body = call_byte_pc.is_some()
+        let template_body = tier == jit_debug::JitDebugTier::Template
+            && call_byte_pc.is_some()
             && accessor_byte.is_none()
             && !method.requires_argument_frame()
             && !method.makes_function;
         if callee.is_none() && !template_body {
             return Err(jit_debug::JitDirectCallRejectionReason::NoEntryGeneration);
         }
-        let graph_body = tier == jit_debug::JitDebugTier::Optimizing
+        let graph_body = allow_body
+            && tier == jit_debug::JitDebugTier::Optimizing
             && accessor_byte.is_none()
             && callee.is_some()
             && !method.requires_argument_frame()
@@ -2730,11 +2746,11 @@ impl Baker<'_> {
         // A proven holder slot fixes the closure the body runs as, so the
         // body may read that closure's watched context slots as constants.
         if graph_body
+            && let Some(body) = body.as_mut().and_then(std::sync::Arc::get_mut)
             && let Some(closure) = self.proven_method(target)
             && let Some(context) = closure
                 .as_closure_in(&self.env.heap)
                 .map(|closure| closure.context_in(&self.env.heap))
-            && let Some(body) = body.as_mut().and_then(std::sync::Arc::get_mut)
         {
             body.closure_constants = self.bake_closure_constants(context, &body.code_block);
             body.unique_closure_context = None;

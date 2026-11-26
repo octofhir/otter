@@ -116,6 +116,8 @@ pub struct OptimizedCode {
     /// Shape facts the code relies on without re-reading them.
     dependencies: Box<[CodeDependency]>,
     spliced_functions: Box<[u32]>,
+    /// Address-stable source cell debited by compact root call sites.
+    inline_call_budget: Option<std::sync::Arc<otter_vm::native_abi::SourceWork>>,
     /// Operand registers of generic baseline operations whose addresses the
     /// code bakes; same ownership contract.
     _register_operands: Box<[u16]>,
@@ -140,6 +142,7 @@ impl OptimizedCode {
         dependency_flag: Option<std::sync::Arc<otter_vm::code_dependencies::DependencyFlag>>,
         dependencies: Box<[CodeDependency]>,
         spliced_functions: Box<[u32]>,
+        inline_call_budget: Option<std::sync::Arc<otter_vm::native_abi::SourceWork>>,
         register_operands: Box<[u16]>,
         metadata: OptimizedMetadata,
     ) -> Self {
@@ -164,6 +167,7 @@ impl OptimizedCode {
             dependency_flag,
             dependencies,
             spliced_functions,
+            inline_call_budget,
             _register_operands: register_operands,
             metadata,
             code_metadata,
@@ -203,6 +207,10 @@ impl std::fmt::Debug for OptimizedCode {
 }
 
 impl JitFunctionCode for OptimizedCode {
+    fn inline_call_budget(&self) -> Option<&otter_vm::native_abi::SourceWork> {
+        self.inline_call_budget.as_deref()
+    }
+
     fn native_code_address(&self) -> Option<u64> {
         Some(unsafe { self.code.ptr_at(0) as u64 })
     }
@@ -374,6 +382,7 @@ mod tests {
             None,
             Box::default(),
             Box::default(),
+            None,
             Box::new([0; 11]),
             OptimizedMetadata {
                 code_object_id: 91,

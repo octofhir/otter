@@ -162,7 +162,8 @@ globalThis.__recursiveCoercible = {{
     return 0;
   }}
 }};
-new Array(5000).fill(4).map(recursiveA).reduce((sum, value) => sum + value, 0);
+// Drive both arms of mutual recursion through their own native call sites.
+new Array(16000).fill(4).map(recursiveA).reduce((sum, value) => sum + value, 0);
 "#
     )
 }
@@ -223,7 +224,7 @@ fn recursive_splices_keep_distinct_frames_and_move_recovered_aliases_once() {
                 .unwrap();
             assert_eq!(
                 eval(&mut oracle, setup(mutual), "recursive:oracle-setup"),
-                "12497500"
+                "127992000"
             );
             assert_eq!(
                 eval(&mut oracle, HIT.to_owned(), "recursive:oracle-hit"),
@@ -250,7 +251,7 @@ fn recursive_splices_keep_distinct_frames_and_move_recovered_aliases_once() {
                     "recursive:native-setup",
                 )
                 .unwrap();
-            assert_eq!(warm.completion_string(), "12497500");
+            assert_eq!(warm.completion_string(), "127992000");
             let report = warm.jit_debug_report().unwrap();
             assert!(!report.truncated());
             assert_eq!(report.dropped_events(), 0);

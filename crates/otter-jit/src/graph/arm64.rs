@@ -2568,6 +2568,29 @@ impl<'a> Codegen<'a> {
                 let exit = self.eager_exit(node, reason);
                 self.emit_native_identity(value, native_ref, exit);
             }
+            Kind::CountInlineCall => {
+                let done = self.ops.new_dynamic_label();
+                let source = &self.view_of(node).code_block;
+                let address = source.source_work().native_address() as u64;
+                let target = RelocationTarget::SourceWorkCell {
+                    function_id: source.id,
+                };
+                emit_load_symbol_u64(&mut self.ops, &mut self.relocations, 16, address, target);
+                dynasm!(self.ops
+                    ; .arch aarch64
+                    ; ldr x17, [x16, abi::INLINE_CALL_BUDGET_OFFSET as u32]
+                    ; subs x17, x17, 1
+                    ; b.mi =>done
+                    ; str x17, [x16, abi::INLINE_CALL_BUDGET_OFFSET as u32]
+                    ; b.ne =>done
+                    ; ldr x16, [x20, crate::entry::THREAD_OFFSET]
+                    ; ldr x16, [x16, std::mem::offset_of!(abi::VmThread, inline_calls_ready) as u32]
+                    ; cbz x16, =>done
+                    ; movz w17, 1
+                    ; strb w17, [x16]
+                    ; =>done
+                );
+            }
             Kind::CheckArgumentsElided => {
                 let exit = self.eager_exit(node, DeoptReason::WrongValue);
                 dynasm!(self.ops

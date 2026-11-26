@@ -196,12 +196,16 @@ fn case(extra: bool) {
                         }
                         if collecting.load(Ordering::Relaxed) {
                             ctx.interp_mut().gc_heap_mut().set_gc_stress(1, true);
-                            ctx.scope(|mut scope| {
+                            let moved = ctx.scope(|mut scope| {
                                 for _ in 0..8 {
                                     let _ = scope.object()?;
                                 }
                                 Ok(RuntimeValue::undefined())
-                            })
+                            });
+                            // The next probe constructs a young child before its append.
+                            // Restrict forced collection to this callback's rooted window.
+                            ctx.interp_mut().gc_heap_mut().set_gc_stress(0, true);
+                            moved
                         } else {
                             Ok(RuntimeValue::undefined())
                         }

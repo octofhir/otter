@@ -2,7 +2,8 @@
 //!
 //! # Contents
 //! - Direct call linkage and Template field proofs share each prepared body.
-//! - Three nested method edges consume three body admissions and keep their
+//! - Template prepares the immediate method candidates. Graph prepares all
+//!   three nested method edges, which consume three admissions and keep their
 //!   exact allocations through recursive field-type baking.
 //! - Equal function ids on different receiver shapes remain separate targets.
 //!
@@ -73,7 +74,10 @@ fn method_module() -> otter_bytecode::BytecodeModule {
 }
 
 /// Observe physical body and instruction-buffer ownership without retaining it.
-fn body_allocations(view: &jit::JitCompileSnapshot) -> Vec<(u32, usize, usize)> {
+fn body_allocations(
+    view: &jit::JitCompileSnapshot,
+    tier: jit_debug::JitDebugTier,
+) -> Vec<(u32, usize, usize)> {
     let mut pending = vec![view];
     let mut allocations = Vec::new();
     let mut unique = BTreeSet::new();
@@ -96,7 +100,11 @@ fn body_allocations(view: &jit::JitCompileSnapshot) -> Vec<(u32, usize, usize)> 
                 let callee = target.callee.as_ref().expect("published real entry plan");
                 assert_eq!(callee.plan.function_id, body.code_block.id);
                 assert_ne!(callee.plan.entry_cell, 0);
-                assert!(target.inline_fields.is_some(), "same-body Template proof");
+                assert_eq!(
+                    target.inline_fields.is_some(),
+                    tier == jit_debug::JitDebugTier::Template,
+                    "only Template consumes the leaf field proof"
+                );
                 let identity = Arc::as_ptr(body) as usize;
                 assert!(unique.insert(identity), "one allocation per source target");
                 allocations.push((
@@ -206,6 +214,23 @@ fn method_targets_keep_one_body_through_real_nested_baking() {
                     assert!(vm.note_method_target(root_call_pc.unwrap().1, base + 1, site));
                 }
 
+                let population = if two_receiver_shapes { 2 } else { 1 };
+                let mut template = context.jit_compile_snapshot(base).unwrap();
+                let mut budget = InlineSnapshotBudget::new();
+                super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm), None)
+                    .bake_call_site_plans(
+                        &mut template,
+                        &context,
+                        base,
+                        jit_debug::JitDebugTier::Template,
+                        &mut budget,
+                    );
+                assert_eq!(
+                    body_allocations(&template, jit_debug::JitDebugTier::Template).len(),
+                    population
+                );
+                assert_eq!(remaining_body_admissions(&mut budget), 64 - population);
+
                 let mut view = context.jit_compile_snapshot(base).unwrap();
                 let mut budget = InlineSnapshotBudget::new();
                 super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm), None)
@@ -217,7 +242,6 @@ fn method_targets_keep_one_body_through_real_nested_baking() {
                         &mut budget,
                     );
                 let targets = &view.method_targets[&root_call_pc.unwrap().0];
-                let population = if two_receiver_shapes { 2 } else { 1 };
                 assert_eq!(targets.len(), population);
                 for (index, target) in targets.iter().enumerate() {
                     assert_eq!(target.target_index, index as u32);
@@ -228,7 +252,7 @@ fn method_targets_keep_one_body_through_real_nested_baking() {
                     assert_ne!(targets[0].guard.recv_shape, targets[1].guard.recv_shape);
                     assert_ne!(targets[0].guard.method_field, targets[1].guard.method_field);
                 }
-                let before = body_allocations(&view);
+                let before = body_allocations(&view, jit_debug::JitDebugTier::Optimizing);
                 assert_eq!(
                     before.len(),
                     3 * population,
@@ -242,7 +266,7 @@ fn method_targets_keep_one_body_through_real_nested_baking() {
                 super::Baker::new(&crate::interp::jit_bake_env::BakeEnv::capture(vm), None)
                     .bake_field_type_tree(&mut view);
                 assert_eq!(
-                    body_allocations(&view),
+                    body_allocations(&view, jit_debug::JitDebugTier::Optimizing),
                     before,
                     "field finalization must not copy a prepared body or its instructions"
                 );
